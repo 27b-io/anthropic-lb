@@ -1,0 +1,18 @@
+# anthropic-lb configuration
+listen = "127.0.0.1:8082"
+upstream = "https://api.anthropic.com"
+strategy = "dynamic-capacity"
+rate_limit_cooldown_secs = 60
+probe_interval_secs = 300
+
+# "passthrough" = forward caller's auth headers as-is (for OpenClaw managed tokens)
+# Any other value = inject as the account's own token
+# OAuth tokens (sk-ant-oat*) are injected as Authorization: Bearer
+# Standard keys (sk-ant-api*) are injected as X-Api-Key
+[[accounts]]
+name = "primary"
+token = "sk-ant-oat01-YOUR_TOKEN_HERE"
+
+[[accounts]]
+name = "secondary"
+token = "sk-ant-oat01-YOUR_TOKEN_HERE"
