@@ -6,10 +6,11 @@ use axum::{
     routing::any,
     Router,
 };
+use ipnet::IpNet;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -31,6 +32,10 @@ struct Config {
     rate_limit_cooldown_secs: Option<u64>,
     /// Seconds between utilization probes per account (0 = disabled). Default: 300 (5 min)
     probe_interval_secs: Option<u64>,
+    /// Shared secret clients must send as x-api-key to access the proxy. None = open.
+    proxy_key: Option<String>,
+    /// Source IP allowlist. Supports individual IPs and CIDR ranges. None/empty = allow all.
+    allowed_ips: Option<Vec<String>>,
     accounts: Vec<AccountConfig>,
 }
 
@@ -87,6 +92,29 @@ struct AppState {
     robin: AtomicUsize,
     cooldown: Duration,
     state_path: PathBuf,
+    proxy_key: Option<String>,
+    allowed_ips: Vec<IpAllowEntry>,
+}
+
+/// Parsed IP allow entry — either a single IP or a CIDR range.
+enum IpAllowEntry {
+    Addr(IpAddr),
+    Net(IpNet),
+}
+
+impl IpAllowEntry {
+    fn contains(&self, ip: &IpAddr) -> bool {
+        match self {
+            Self::Addr(a) => a == ip,
+            Self::Net(n) => n.contains(ip),
+        }
+    }
+}
+
+impl AppState {
+    fn is_ip_allowed(&self, ip: &IpAddr) -> bool {
+        self.allowed_ips.is_empty() || self.allowed_ips.iter().any(|e| e.contains(ip))
+    }
 }
 
 // ── Persistence ─────────────────────────────────────────────────────
@@ -468,7 +496,23 @@ async fn proxy_handler(
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
     req: Request<Body>,
 ) -> Response {
-    let client_ip = client_addr.ip().to_string();
+    let client_ip = client_addr.ip();
+
+    // IP allowlist check
+    if !state.is_ip_allowed(&client_ip) {
+        warn!(client = %client_ip, "rejected: IP not in allowlist");
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+
+    // Proxy auth: validate x-api-key against proxy_key if configured
+    if let Some(ref key) = state.proxy_key {
+        let provided = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
+        if provided != Some(key.as_str()) {
+            warn!(client = %client_ip, "rejected: invalid or missing proxy key");
+            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
+    }
+
     let (parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
         Ok(b) => b,
@@ -527,11 +571,33 @@ async fn proxy_handler(
                     HeaderValue::from_str(&acct.token).unwrap(),
                 );
             } else if acct.token.starts_with("sk-ant-oat") {
-                // OAuth token → Authorization: Bearer (stealth headers from caller pass through)
+                // OAuth token → Authorization: Bearer
                 headers.insert(
                     "authorization",
                     HeaderValue::from_str(&format!("Bearer {}", acct.token)).unwrap(),
                 );
+                // OAuth tokens require these headers — client won't send them
+                // since it doesn't know the proxy uses OAuth behind the scenes
+                headers.insert(
+                    "anthropic-dangerous-direct-browser-access",
+                    HeaderValue::from_static("true"),
+                );
+                // Ensure oauth beta flag is present in anthropic-beta
+                let existing_beta = headers.get("anthropic-beta")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                if !existing_beta.contains("oauth-2025-04-20") {
+                    let new_beta = if existing_beta.is_empty() {
+                        "oauth-2025-04-20".to_string()
+                    } else {
+                        format!("{},oauth-2025-04-20", existing_beta)
+                    };
+                    headers.insert(
+                        "anthropic-beta",
+                        HeaderValue::from_str(&new_beta).unwrap(),
+                    );
+                }
             } else {
                 // Unknown token type → try x-api-key
                 headers.insert(
@@ -616,7 +682,21 @@ async fn proxy_handler(
 
 // ── Stats endpoint ──────────────────────────────────────────────────
 
-async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn stats_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    if !state.is_ip_allowed(&client_addr.ip()) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    if let Some(ref key) = state.proxy_key {
+        let provided = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
+        if provided != Some(key.as_str()) {
+            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
+    }
+
     let mut out = Vec::new();
     for acct in &state.accounts {
         let info = acct.rate_info.read().await;
@@ -643,6 +723,7 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         "accounts": out,
         "strategy": "dynamic-capacity",
     }))
+    .into_response()
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -671,6 +752,27 @@ async fn main() {
 
     let cooldown = Duration::from_secs(config.rate_limit_cooldown_secs.unwrap_or(60));
 
+    // Parse IP allowlist
+    let allowed_ips: Vec<IpAllowEntry> = config
+        .allowed_ips
+        .unwrap_or_default()
+        .iter()
+        .map(|s| {
+            if let Ok(net) = s.parse::<IpNet>() {
+                IpAllowEntry::Net(net)
+            } else if let Ok(addr) = s.parse::<IpAddr>() {
+                IpAllowEntry::Addr(addr)
+            } else {
+                panic!("invalid allowed_ips entry: {s}");
+            }
+        })
+        .collect();
+    if allowed_ips.is_empty() {
+        warn!("IP allowlist DISABLED — all source IPs accepted");
+    } else {
+        info!(count = allowed_ips.len(), "IP allowlist enabled");
+    }
+
     let accounts: Vec<Account> = config
         .accounts
         .into_iter()
@@ -686,6 +788,12 @@ async fn main() {
             }
         })
         .collect();
+
+    if config.proxy_key.is_some() {
+        info!("proxy authentication enabled (x-api-key)");
+    } else {
+        warn!("proxy authentication DISABLED — proxy is open to all");
+    }
 
     info!(
         num_accounts = accounts.len(),
@@ -704,6 +812,8 @@ async fn main() {
         robin: AtomicUsize::new(0),
         cooldown,
         state_path,
+        proxy_key: config.proxy_key.clone(),
+        allowed_ips,
     });
 
     // Restore persisted state (cooldowns, utilization, request counts)

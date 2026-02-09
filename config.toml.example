@@ -5,6 +5,14 @@ strategy = "dynamic-capacity"
 rate_limit_cooldown_secs = 60
 probe_interval_secs = 300
 
+# Proxy authentication: clients must send this as x-api-key to access the proxy.
+# Omit to leave proxy open (use only behind Tailscale/VPN).
+# proxy_key = "your-secret-key-here"
+
+# IP allowlist: only accept connections from these IPs/CIDRs.
+# Supports individual IPs and CIDR ranges. Omit or leave empty to allow all.
+# allowed_ips = ["100.64.0.0/10", "10.0.0.0/8", "1.2.3.4"]
+
 # "passthrough" = forward caller's auth headers as-is (for OpenClaw managed tokens)
 # Any other value = inject as the account's own token
 # OAuth tokens (sk-ant-oat*) are injected as Authorization: Bearer

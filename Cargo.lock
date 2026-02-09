@@ -19,6 +19,7 @@ dependencies = [
  "bytes",
  "http-body-util",
  "hyper",
+ "ipnet",
  "reqwest",
  "serde",
  "serde_json",
