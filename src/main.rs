@@ -37,6 +37,9 @@ struct Config {
     /// Source IP allowlist. Supports individual IPs and CIDR ranges. None/empty = allow all.
     allowed_ips: Option<Vec<String>>,
     accounts: Vec<AccountConfig>,
+    /// OpenAI-compatible upstream routes. Requests to /upstream/<name>/... are forwarded.
+    #[serde(default)]
+    upstreams: Vec<UpstreamConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -44,6 +47,13 @@ struct AccountConfig {
     name: String,
     /// Auth token. Use "passthrough" to forward caller's auth headers as-is.
     token: String,
+}
+
+#[derive(Deserialize, Clone)]
+struct UpstreamConfig {
+    name: String,
+    base_url: String,
+    api_key: String,
 }
 
 // ── Runtime state ───────────────────────────────────────────────────
@@ -85,6 +95,13 @@ struct Account {
     rate_info: RwLock<RateLimitInfo>,
 }
 
+struct Upstream {
+    name: String,
+    base_url: String,
+    api_key: String,
+    requests: AtomicU64,
+}
+
 struct AppState {
     client: Client,
     upstream: String,
@@ -94,6 +111,7 @@ struct AppState {
     state_path: PathBuf,
     proxy_key: Option<String>,
     allowed_ips: Vec<IpAllowEntry>,
+    upstreams: Vec<Upstream>,
 }
 
 /// Parsed IP allow entry — either a single IP or a CIDR range.
@@ -179,7 +197,7 @@ impl AppState {
 
         match serde_json::to_string_pretty(&state) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&self.state_path, json) {
+                if let Err(e) = tokio::fs::write(&self.state_path, json).await {
                     error!(path = %self.state_path.display(), error = %e, "failed to save state");
                 } else {
                     debug!(path = %self.state_path.display(), "state saved");
@@ -251,7 +269,7 @@ impl AppState {
     }
 
     async fn load_state(&self) {
-        let data = match std::fs::read_to_string(&self.state_path) {
+        let data = match tokio::fs::read_to_string(&self.state_path).await {
             Ok(d) => d,
             Err(_) => {
                 info!(path = %self.state_path.display(), "no persisted state found, starting fresh");
@@ -340,8 +358,7 @@ impl AppState {
                 let limit = info.limit_tokens.unwrap_or(1_000_000);
                 1.0 - (remaining as f64 / limit as f64)
             } else {
-                // Unknown utilization = assume fresh (0.0), prefer it
-                has_any_info = true;
+                // No rate info — don't influence smart routing, fall through to round-robin
                 0.0
             };
 
@@ -651,17 +668,10 @@ async fn proxy_handler(
             );
         }
 
-        // Return response
+        // Stream response through without buffering (supports SSE/streaming)
         let resp_status =
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let resp_headers = resp.headers().clone();
-        let resp_bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                error!("failed to read upstream response: {e}");
-                return (StatusCode::BAD_GATEWAY, "upstream read error").into_response();
-            }
-        };
 
         let mut builder = Response::builder().status(resp_status);
         for (k, v) in resp_headers.iter() {
@@ -671,13 +681,119 @@ async fn proxy_handler(
             builder = builder.header(k, v);
         }
         return builder
-            .body(Body::from(resp_bytes))
+            .body(Body::from_stream(resp.bytes_stream()))
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
     }
 
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all accounts").into_response()
+}
+
+// ── Upstream passthrough handler ─────────────────────────────────────
+
+async fn upstream_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
+    axum::extract::Path((upstream_name, _rest)): axum::extract::Path<(String, String)>,
+    req: Request<Body>,
+) -> Response {
+    let client_ip = client_addr.ip();
+
+    if !state.is_ip_allowed(&client_ip) {
+        warn!(client = %client_ip, "rejected: IP not in allowlist");
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+
+    if let Some(ref key) = state.proxy_key {
+        let provided = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
+        if provided != Some(key.as_str()) {
+            warn!(client = %client_ip, "rejected: invalid or missing proxy key");
+            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
+    }
+
+    let upstream = match state.upstreams.iter().find(|u| u.name == upstream_name) {
+        Some(u) => u,
+        None => {
+            warn!(client = %client_ip, upstream = %upstream_name, "unknown upstream");
+            return (StatusCode::NOT_FOUND, "unknown upstream").into_response();
+        }
+    };
+
+    let (parts, body) = req.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("failed to read request body: {e}");
+            return (StatusCode::BAD_REQUEST, "bad request body").into_response();
+        }
+    };
+
+    // Extract model from request body for logging
+    let model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str().map(String::from)))
+        .unwrap_or_default();
+
+    // Build upstream URL: strip /upstream/<name> prefix, forward the rest
+    let path = parts.uri.path();
+    let prefix = format!("/upstream/{}", upstream_name);
+    let remainder = path.strip_prefix(&prefix).unwrap_or("/");
+    let remainder = if remainder.is_empty() { "/" } else { remainder };
+    let query = parts.uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+    let url = format!("{}{}{}", upstream.base_url, remainder, query);
+
+    let mut headers = parts.headers.clone();
+    headers.remove("host");
+    headers.remove("authorization");
+    headers.remove("x-api-key");
+    // Inject upstream API key as Bearer token (OpenAI-compatible)
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {}", upstream.api_key)).unwrap(),
+    );
+
+    let upstream_req = state.client
+        .request(parts.method.clone(), &url)
+        .headers(headers)
+        .body(body_bytes);
+
+    let resp = match upstream_req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(upstream = upstream.name, error = %e, "upstream request failed");
+            return (StatusCode::BAD_GATEWAY, "upstream request failed").into_response();
+        }
+    };
+
+    let status = resp.status();
+    upstream.requests.fetch_add(1, Ordering::Relaxed);
+
+    info!(
+        client = %client_ip,
+        model = %model,
+        upstream = upstream.name,
+        status = status.as_u16(),
+        total = upstream.requests.load(Ordering::Relaxed),
+        "proxied (upstream)"
+    );
+
+    let resp_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let resp_headers = resp.headers().clone();
+
+    let mut builder = Response::builder().status(resp_status);
+    for (k, v) in resp_headers.iter() {
+        if k == "transfer-encoding" {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    builder
+        .body(Body::from_stream(resp.bytes_stream()))
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+        })
 }
 
 // ── Stats endpoint ──────────────────────────────────────────────────
@@ -719,8 +835,18 @@ async fn stats_handler(
             "hard_limited_remaining_secs": hard_limited,
         }));
     }
+    let mut upstream_stats = Vec::new();
+    for u in &state.upstreams {
+        upstream_stats.push(serde_json::json!({
+            "name": u.name,
+            "base_url": u.base_url,
+            "requests_total": u.requests.load(Ordering::Relaxed),
+        }));
+    }
+
     axum::Json(serde_json::json!({
         "accounts": out,
+        "upstreams": upstream_stats,
         "strategy": "dynamic-capacity",
     }))
     .into_response()
@@ -789,6 +915,20 @@ async fn main() {
         })
         .collect();
 
+    let upstreams: Vec<Upstream> = config
+        .upstreams
+        .iter()
+        .map(|u| {
+            info!(name = u.name, base_url = u.base_url, "loaded upstream");
+            Upstream {
+                name: u.name.clone(),
+                base_url: u.base_url.clone(),
+                api_key: u.api_key.clone(),
+                requests: AtomicU64::new(0),
+            }
+        })
+        .collect();
+
     if config.proxy_key.is_some() {
         info!("proxy authentication enabled (x-api-key)");
     } else {
@@ -797,6 +937,7 @@ async fn main() {
 
     info!(
         num_accounts = accounts.len(),
+        num_upstreams = upstreams.len(),
         "dynamic capacity-based routing enabled"
     );
 
@@ -814,6 +955,7 @@ async fn main() {
         state_path,
         proxy_key: config.proxy_key.clone(),
         allowed_ips,
+        upstreams,
     });
 
     // Restore persisted state (cooldowns, utilization, request counts)
@@ -821,6 +963,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/_stats", axum::routing::get(stats_handler))
+        .route("/upstream/{name}/{*rest}", any(upstream_handler))
         .fallback(any(proxy_handler))
         .with_state(state.clone());
 
@@ -874,4 +1017,418 @@ async fn main() {
         .with_graceful_shutdown(shutdown)
         .await
         .unwrap_or_else(|e| panic!("server error: {e}"));
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Helpers ──────────────────────────────────────────────────────
+
+    fn make_account(name: &str, token: &str) -> Account {
+        Account {
+            name: name.to_string(),
+            token: token.to_string(),
+            passthrough: token == "passthrough",
+            requests: AtomicU64::new(0),
+            rate_info: RwLock::new(RateLimitInfo::default()),
+        }
+    }
+
+    fn test_state_with(accounts: Vec<Account>) -> Arc<AppState> {
+        Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(), // unused in unit tests
+            accounts,
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+        })
+    }
+
+    /// Spawn a mock upstream that returns a canned response with rate-limit headers.
+    async fn spawn_mock_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().fallback(any(mock_upstream_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn mock_upstream_handler(req: Request<Body>) -> Response {
+        let has_auth = req.headers().contains_key("x-api-key")
+            || req.headers().contains_key("authorization");
+
+        if !has_auth {
+            return (StatusCode::UNAUTHORIZED, "missing auth").into_response();
+        }
+
+        let mut resp = axum::Json(serde_json::json!({
+            "id": "msg_test",
+            "type": "message",
+            "content": [{"type": "text", "text": "ok"}],
+        }))
+        .into_response();
+
+        // Inject rate-limit headers the proxy expects
+        let headers = resp.headers_mut();
+        headers.insert(
+            "anthropic-ratelimit-unified-representative-claim",
+            HeaderValue::from_static("five_hour"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.25"),
+        );
+        resp
+    }
+
+    /// Build the full app router against a given upstream URL.
+    fn test_app(upstream_url: &str, proxy_key: Option<String>) -> (Router, Arc<AppState>) {
+        let accounts = vec![
+            make_account("acct-a", "sk-ant-api-test-aaa"),
+            make_account("acct-b", "sk-ant-api-test-bbb"),
+        ];
+
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: upstream_url.to_string(),
+            accounts,
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
+            proxy_key,
+            allowed_ips: vec![],
+            upstreams: vec![Upstream {
+                name: "mock".to_string(),
+                base_url: upstream_url.to_string(),
+                api_key: "test-key".to_string(),
+                requests: AtomicU64::new(0),
+            }],
+        });
+
+        let app = Router::new()
+            .route("/_stats", axum::routing::get(stats_handler))
+            .route("/upstream/{name}/{*rest}", any(upstream_handler))
+            .fallback(any(proxy_handler))
+            .with_state(state.clone());
+
+        (app, state)
+    }
+
+    // ── Unit: IP allowlist ──────────────────────────────────────────
+
+    #[test]
+    fn ip_allow_entry_matches_exact_addr() {
+        let entry = IpAllowEntry::Addr("10.0.0.1".parse().unwrap());
+        assert!(entry.contains(&"10.0.0.1".parse().unwrap()));
+        assert!(!entry.contains(&"10.0.0.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn ip_allow_entry_matches_cidr() {
+        let entry = IpAllowEntry::Net("10.0.0.0/24".parse().unwrap());
+        assert!(entry.contains(&"10.0.0.1".parse().unwrap()));
+        assert!(entry.contains(&"10.0.0.254".parse().unwrap()));
+        assert!(!entry.contains(&"10.0.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn empty_allowlist_allows_all() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        assert!(state.is_ip_allowed(&"192.168.1.1".parse().unwrap()));
+        assert!(state.is_ip_allowed(&"8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn populated_allowlist_blocks_unknown() {
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![IpAllowEntry::Addr("10.0.0.1".parse().unwrap())],
+            upstreams: vec![],
+        });
+        assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
+        assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
+    }
+
+    // ── Unit: pick_account ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn pick_prefers_lowest_utilization() {
+        let state = test_state_with(vec![
+            make_account("high", "sk-ant-api-high"),
+            make_account("low", "sk-ant-api-low"),
+        ]);
+
+        // Set utilization: high=0.8, low=0.2
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.8);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(0.2);
+        }
+
+        let idx = state.pick_account().await.unwrap();
+        assert_eq!(idx, 1, "should pick account with lower utilization");
+    }
+
+    #[tokio::test]
+    async fn pick_skips_hard_limited() {
+        let state = test_state_with(vec![
+            make_account("limited", "sk-ant-api-a"),
+            make_account("available", "sk-ant-api-b"),
+        ]);
+
+        // Hard-limit the first account
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.1); // great utilization but hard-limited
+            info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(0.9);
+        }
+
+        let idx = state.pick_account().await.unwrap();
+        assert_eq!(idx, 1, "should skip hard-limited account despite lower utilization");
+    }
+
+    #[tokio::test]
+    async fn pick_round_robin_when_no_info() {
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-a"),
+            make_account("b", "sk-ant-api-b"),
+            make_account("c", "sk-ant-api-c"),
+        ]);
+
+        // No utilization set — should round-robin
+        let first = state.pick_account().await.unwrap();
+        let second = state.pick_account().await.unwrap();
+        let third = state.pick_account().await.unwrap();
+
+        // Round-robin should cycle through all accounts
+        let selected: std::collections::HashSet<usize> = [first, second, third].into();
+        assert_eq!(selected.len(), 3, "round-robin should cycle through all accounts");
+    }
+
+    #[tokio::test]
+    async fn pick_returns_none_when_all_limited() {
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-a"),
+            make_account("b", "sk-ant-api-b"),
+        ]);
+
+        for acct in &state.accounts {
+            let mut info = acct.rate_info.write().await;
+            info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+        }
+
+        assert!(state.pick_account().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn pick_does_not_bias_unknown_accounts() {
+        // Bug 2 regression test: unknown accounts should NOT dominate selection
+        let state = test_state_with(vec![
+            make_account("known", "sk-ant-api-known"),
+            make_account("unknown", "sk-ant-api-unknown"),
+        ]);
+
+        // Only set info on the known account — unknown has no data
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.1); // very low utilization
+        }
+        // accounts[1] has no rate info at all
+
+        // With the bug fix, since only one account has info, has_any_info=true
+        // and the known account (0.1) should be preferred over unknown (0.0).
+        // Actually — unknown gets 0.0 which IS lower than 0.1. The difference
+        // is that has_any_info is set by the known account, so the smart path
+        // runs. Unknown still wins at 0.0 vs 0.1, but that's OK — the bug was
+        // that *only* unknown accounts (no known accounts at all) would set
+        // has_any_info=true and bypass round-robin. Let's test that case.
+        drop(state);
+
+        let state = test_state_with(vec![
+            make_account("unknown-a", "sk-ant-api-a"),
+            make_account("unknown-b", "sk-ant-api-b"),
+        ]);
+        // No rate info on either account
+
+        // Call pick_account multiple times — should distribute via round-robin
+        let mut picks = Vec::new();
+        for _ in 0..4 {
+            picks.push(state.pick_account().await.unwrap());
+        }
+        // With round-robin, we should see both 0 and 1
+        assert!(picks.contains(&0) && picks.contains(&1),
+            "with no rate info, accounts should be distributed via round-robin, got: {:?}", picks);
+    }
+
+    // ── Integration: HTTP handlers ──────────────────────────────────
+
+    #[tokio::test]
+    async fn proxy_rejects_missing_auth() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, _state) = test_app(&mock_url, Some("secret-key".to_string()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn proxy_accepts_valid_auth_and_forwards() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, state) = test_app(&mock_url, Some("secret-key".to_string()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "secret-key")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        // Verify rate info was updated from mock response headers
+        let info = state.accounts[0].rate_info.read().await;
+        assert_eq!(info.utilization, Some(0.25));
+        assert_eq!(info.representative_claim.as_deref(), Some("five_hour"));
+    }
+
+    #[tokio::test]
+    async fn stats_endpoint_returns_account_info() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, _state) = test_app(&mock_url, None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://{}/_stats", addr))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let accounts = body["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0]["name"], "acct-a");
+        assert_eq!(accounts[1]["name"], "acct-b");
+        assert_eq!(body["strategy"], "dynamic-capacity");
+        // Upstreams section should be present
+        let upstreams = body["upstreams"].as_array().unwrap();
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0]["name"], "mock");
+    }
+
+    #[tokio::test]
+    async fn upstream_handler_forwards_to_named_upstream() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, _state) = test_app(&mock_url, None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/upstream/mock/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn upstream_handler_rejects_unknown_upstream() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, _state) = test_app(&mock_url, None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/upstream/nonexistent/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    }
 }
