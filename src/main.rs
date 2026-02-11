@@ -58,6 +58,7 @@ struct UpstreamConfig {
 
 // ── Runtime state ───────────────────────────────────────────────────
 
+#[derive(Default)]
 struct RateLimitInfo {
     remaining_requests: Option<u64>,
     remaining_tokens: Option<u64>,
@@ -70,21 +71,6 @@ struct RateLimitInfo {
     hard_limited_until: Option<Instant>,
     #[allow(dead_code)]
     last_updated: Option<Instant>,
-}
-
-impl Default for RateLimitInfo {
-    fn default() -> Self {
-        Self {
-            remaining_requests: None,
-            remaining_tokens: None,
-            limit_requests: None,
-            limit_tokens: None,
-            utilization: None,
-            representative_claim: None,
-            hard_limited_until: None,
-            last_updated: None,
-        }
-    }
 }
 
 struct Account {
@@ -160,7 +146,10 @@ struct PersistedAccount {
 
 impl AppState {
     fn now_epoch() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     async fn save_state(&self) {
@@ -211,7 +200,10 @@ impl AppState {
     async fn probe_account(&self, idx: usize) {
         let acct = &self.accounts[idx];
         if acct.passthrough {
-            debug!(account = acct.name, "skipping probe for passthrough account");
+            debug!(
+                account = acct.name,
+                "skipping probe for passthrough account"
+            );
             return;
         }
 
@@ -220,7 +212,10 @@ impl AppState {
             let info = acct.rate_info.read().await;
             if let Some(until) = info.hard_limited_until {
                 if Instant::now() < until {
-                    debug!(account = acct.name, "skipping probe, account is hard-limited");
+                    debug!(
+                        account = acct.name,
+                        "skipping probe, account is hard-limited"
+                    );
                     return;
                 }
             }
@@ -234,7 +229,9 @@ impl AppState {
             "messages": [{"role": "user", "content": "."}]
         });
 
-        let mut req = self.client.post(&url)
+        let mut req = self
+            .client
+            .post(&url)
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
@@ -260,7 +257,11 @@ impl AppState {
                     self.mark_hard_limited(idx, resp.headers()).await;
                 }
                 self.save_state().await;
-                info!(account = acct.name, status = status.as_u16(), "probe complete");
+                info!(
+                    account = acct.name,
+                    status = status.as_u16(),
+                    "probe complete"
+                );
             }
             Err(e) => {
                 warn!(account = acct.name, error = %e, "probe failed");
@@ -302,11 +303,11 @@ impl AppState {
                 if let Some(until_epoch) = pa.hard_limited_until_epoch {
                     if until_epoch > now_epoch {
                         let remaining_secs = until_epoch - now_epoch;
-                        info.hard_limited_until = Some(now_instant + Duration::from_secs(remaining_secs));
+                        info.hard_limited_until =
+                            Some(now_instant + Duration::from_secs(remaining_secs));
                         info!(
                             account = pa.name,
-                            remaining_secs,
-                            "restored hard limit from persisted state"
+                            remaining_secs, "restored hard limit from persisted state"
                         );
                     }
                 }
@@ -403,14 +404,20 @@ impl AppState {
             let name_str = name.as_str();
             if name_str.contains("ratelimit") || name_str.contains("retry") {
                 if let Ok(v) = value.to_str() {
-                    tracing::debug!(account = acct.name, header = name_str, value = v, "rate-limit header");
+                    tracing::debug!(
+                        account = acct.name,
+                        header = name_str,
+                        value = v,
+                        "rate-limit header"
+                    );
                 }
             }
         }
 
         // New unified rate limit headers (Anthropic 2025+)
         // Get the representative claim window to know which utilization to use
-        let rep_claim = headers.get("anthropic-ratelimit-unified-representative-claim")
+        let rep_claim = headers
+            .get("anthropic-ratelimit-unified-representative-claim")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
@@ -583,10 +590,7 @@ async fn proxy_handler(
             // Detect token type by prefix
             if acct.token.starts_with("sk-ant-api") {
                 // Standard API key → x-api-key header
-                headers.insert(
-                    "x-api-key",
-                    HeaderValue::from_str(&acct.token).unwrap(),
-                );
+                headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
             } else if acct.token.starts_with("sk-ant-oat") {
                 // OAuth token → Authorization: Bearer
                 headers.insert(
@@ -600,7 +604,8 @@ async fn proxy_handler(
                     HeaderValue::from_static("true"),
                 );
                 // Ensure oauth beta flag is present in anthropic-beta
-                let existing_beta = headers.get("anthropic-beta")
+                let existing_beta = headers
+                    .get("anthropic-beta")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
@@ -610,17 +615,11 @@ async fn proxy_handler(
                     } else {
                         format!("{},oauth-2025-04-20", existing_beta)
                     };
-                    headers.insert(
-                        "anthropic-beta",
-                        HeaderValue::from_str(&new_beta).unwrap(),
-                    );
+                    headers.insert("anthropic-beta", HeaderValue::from_str(&new_beta).unwrap());
                 }
             } else {
                 // Unknown token type → try x-api-key
-                headers.insert(
-                    "x-api-key",
-                    HeaderValue::from_str(&acct.token).unwrap(),
-                );
+                headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
             }
         }
         // passthrough: caller's auth headers flow through untouched
@@ -669,8 +668,7 @@ async fn proxy_handler(
         }
 
         // Stream response through without buffering (supports SSE/streaming)
-        let resp_status =
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let resp_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let resp_headers = resp.headers().clone();
 
         let mut builder = Response::builder().status(resp_status);
@@ -741,7 +739,11 @@ async fn upstream_handler(
     let prefix = format!("/upstream/{}", upstream_name);
     let remainder = path.strip_prefix(&prefix).unwrap_or("/");
     let remainder = if remainder.is_empty() { "/" } else { remainder };
-    let query = parts.uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+    let query = parts
+        .uri
+        .query()
+        .map(|q| format!("?{}", q))
+        .unwrap_or_default();
     let url = format!("{}{}{}", upstream.base_url, remainder, query);
 
     let mut headers = parts.headers.clone();
@@ -754,7 +756,8 @@ async fn upstream_handler(
         HeaderValue::from_str(&format!("Bearer {}", upstream.api_key)).unwrap(),
     );
 
-    let upstream_req = state.client
+    let upstream_req = state
+        .client
         .request(parts.method.clone(), &url)
         .headers(headers)
         .body(body_bytes);
@@ -871,10 +874,7 @@ async fn main() {
     let config: Config =
         toml::from_str(&config_str).unwrap_or_else(|e| panic!("invalid config: {e}"));
 
-    assert!(
-        !config.accounts.is_empty(),
-        "at least one account required"
-    );
+    assert!(!config.accounts.is_empty(), "at least one account required");
 
     let cooldown = Duration::from_secs(config.rate_limit_cooldown_secs.unwrap_or(60));
 
@@ -986,7 +986,10 @@ async fn main() {
         tokio::spawn(async move {
             // Stagger initial probes: wait 10s then probe all accounts
             tokio::time::sleep(Duration::from_secs(10)).await;
-            info!(interval_secs = probe_interval, "starting utilization probes");
+            info!(
+                interval_secs = probe_interval,
+                "starting utilization probes"
+            );
             loop {
                 for i in 0..n_accounts {
                     probe_state.probe_account(i).await;
@@ -1013,10 +1016,13 @@ async fn main() {
         info!("state saved, shutting down");
     };
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown)
-        .await
-        .unwrap_or_else(|e| panic!("server error: {e}"));
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .unwrap_or_else(|e| panic!("server error: {e}"));
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -1066,8 +1072,8 @@ mod tests {
     }
 
     async fn mock_upstream_handler(req: Request<Body>) -> Response {
-        let has_auth = req.headers().contains_key("x-api-key")
-            || req.headers().contains_key("authorization");
+        let has_auth =
+            req.headers().contains_key("x-api-key") || req.headers().contains_key("authorization");
 
         if !has_auth {
             return (StatusCode::UNAUTHORIZED, "missing auth").into_response();
@@ -1215,7 +1221,10 @@ mod tests {
         }
 
         let idx = state.pick_account().await.unwrap();
-        assert_eq!(idx, 1, "should skip hard-limited account despite lower utilization");
+        assert_eq!(
+            idx, 1,
+            "should skip hard-limited account despite lower utilization"
+        );
     }
 
     #[tokio::test]
@@ -1233,7 +1242,11 @@ mod tests {
 
         // Round-robin should cycle through all accounts
         let selected: std::collections::HashSet<usize> = [first, second, third].into();
-        assert_eq!(selected.len(), 3, "round-robin should cycle through all accounts");
+        assert_eq!(
+            selected.len(),
+            3,
+            "round-robin should cycle through all accounts"
+        );
     }
 
     #[tokio::test]
@@ -1287,8 +1300,11 @@ mod tests {
             picks.push(state.pick_account().await.unwrap());
         }
         // With round-robin, we should see both 0 and 1
-        assert!(picks.contains(&0) && picks.contains(&1),
-            "with no rate info, accounts should be distributed via round-robin, got: {:?}", picks);
+        assert!(
+            picks.contains(&0) && picks.contains(&1),
+            "with no rate info, accounts should be distributed via round-robin, got: {:?}",
+            picks
+        );
     }
 
     // ── Integration: HTTP handlers ──────────────────────────────────
@@ -1301,9 +1317,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = Client::new();
@@ -1326,9 +1345,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = Client::new();
@@ -1357,9 +1379,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = Client::new();
@@ -1390,9 +1415,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = Client::new();
@@ -1415,14 +1443,20 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = Client::new();
         let resp = client
-            .post(format!("http://{}/upstream/nonexistent/v1/chat/completions", addr))
+            .post(format!(
+                "http://{}/upstream/nonexistent/v1/chat/completions",
+                addr
+            ))
             .header("content-type", "application/json")
             .body("{}")
             .send()
