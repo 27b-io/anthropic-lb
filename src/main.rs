@@ -1173,6 +1173,7 @@ async fn openai_chat_handler(
         headers.remove("authorization");
         headers.remove("x-api-key");
         headers.remove("content-length"); // body size changes after translation
+        headers.remove("accept-encoding"); // we need plaintext to translate the response
 
         // Inject required Anthropic headers
         headers.insert("content-type", HeaderValue::from_static("application/json"));
