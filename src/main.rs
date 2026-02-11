@@ -1172,6 +1172,7 @@ async fn openai_chat_handler(
         headers.remove("host");
         headers.remove("authorization");
         headers.remove("x-api-key");
+        headers.remove("content-length"); // body size changes after translation
 
         // Inject required Anthropic headers
         headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -1274,6 +1275,7 @@ async fn openai_chat_handler(
             tokio::spawn(async move {
                 let mut buffer = String::new();
                 let mut ctx = StreamContext::default();
+                let mut sent_done = false;
 
                 while let Ok(Some(chunk)) = resp.chunk().await {
                     buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -1287,6 +1289,9 @@ async fn openai_chat_handler(
                         }
 
                         if let Some(translated) = translate_sse_event(&event, &mut ctx) {
+                            if translated.contains("[DONE]") {
+                                sent_done = true;
+                            }
                             if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
                                 return; // client disconnected
                             }
@@ -1297,12 +1302,17 @@ async fn openai_chat_handler(
                 // Process any remaining data in buffer
                 if !buffer.trim().is_empty() {
                     if let Some(translated) = translate_sse_event(&buffer, &mut ctx) {
+                        if translated.contains("[DONE]") {
+                            sent_done = true;
+                        }
                         let _ = tx.send(Ok(bytes::Bytes::from(translated))).await;
                     }
                 }
 
-                // Ensure [DONE] is always sent
-                let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
+                // Ensure [DONE] is always sent (fallback for abnormal stream termination)
+                if !sent_done {
+                    let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
+                }
             });
 
             return Response::builder()
