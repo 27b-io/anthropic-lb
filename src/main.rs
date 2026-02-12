@@ -936,6 +936,15 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
         }
     }
 
+    // response_format: inject JSON mode instruction into system prompt
+    if let Some(rf) = body.get("response_format") {
+        if rf.get("type").and_then(|t| t.as_str()) == Some("json_object") {
+            system_parts.push(
+                "You must respond with valid JSON only. No markdown, no code fences, no explanation — just raw JSON.".to_string(),
+            );
+        }
+    }
+
     if !system_parts.is_empty() {
         out.insert(
             "system".to_string(),
