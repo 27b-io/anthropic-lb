@@ -16,24 +16,34 @@
 
 ## Overview
 
-Routes requests across multiple Anthropic accounts using dynamic capacity-based selection. Tracks utilization per account and prefers the one with the most headroom. When an account gets rate-limited (429), it cools down and traffic rotates to the next.
+Routes requests across multiple Anthropic accounts using dynamic capacity-based selection. Tracks utilization per account via Anthropic's rate-limit headers and prefers the one with the most headroom. When an account gets rate-limited (429), it cools down and traffic rotates to the next.
 
 ```
-                        ┌──────────────┐
-                        │  anthropic-lb │
-  Client ──► proxy_key ─┤              ├─► Account A (util: 0.12) ──► api.anthropic.com
-              check     │  pick lowest │
-                        │  utilization ├─► Account B (util: 0.67)
-                        │              │
-                        │              ├─► Account C (429 — cooling)
-                        └──────────────┘
+                        ┌──────────────────┐
+                        │   anthropic-lb    │
+  Client ──► auth ──────┤                  ├──► Account A (util: 0.12) ──► api.anthropic.com
+             + budget   │  weighted-bucket │
+             check      │  routing by      ├──► Account B (util: 0.67)
+                        │  headroom        │
+                        │                  ├──► Account C (429 — cooling)
+                        └────────┬─────────┘
+                                 │
+                            shadow log
+                          + token tracking
 ```
 
 | Feature | Description |
 |:--------|:------------|
-| **Dynamic routing** | Selects account with lowest utilization, not round-robin |
+| **Weighted routing** | Headroom-proportional bucket hashing with client affinity |
 | **429 rotation** | Rate-limited accounts cool down, traffic shifts instantly |
-| **Streaming** | SSE/streaming responses flow through without buffering |
+| **5xx retry** | Automatic retry on 500/502/503/504/529 (picks different account) |
+| **Token tracking** | Per-account and per-client input/output/cache token counters |
+| **Client budgets** | Daily per-client token budgets with automatic reset |
+| **Auto-cache** | Injects prompt caching beta header automatically |
+| **Shadow logging** | Optional JSONL file with request metadata, tokens, latency |
+| **Model routing** | Per-account model allowlists with wildcard prefix matching |
+| **Client identification** | Via `X-Client-ID` header or IP-based mapping |
+| **Streaming** | SSE/streaming responses flow through with usage extraction |
 | **State persistence** | Utilization data survives restarts |
 | **Upstream routing** | Forward to OpenAI-compatible APIs via `/upstream/<name>/...` |
 | **~6 MB binary** | Zero runtime dependencies |
@@ -74,14 +84,49 @@ probe_interval_secs = 300
 # IP allowlist (optional — omit to allow all source IPs)
 # allowed_ips = ["100.64.0.0/10", "10.0.0.0/8"]
 
+# Auto-inject prompt caching beta header (default: true)
+# auto_cache = true
+
+# Shadow log — JSONL file with request metadata (optional)
+# shadow_log = "shadow.jsonl"
+
+# Per-client daily token budgets (optional)
+# [client_budgets]
+# "alice" = 5000000    # 5M tokens/day
+# "bob" = 1000000      # 1M tokens/day
+
+# IP-to-client-name mapping (optional, fallback when no X-Client-ID header)
+# [client_names]
+# "10.0.0.5" = "alice-desktop"
+# "10.0.0.6" = "bob-laptop"
+
 [[accounts]]
 name = "primary"
 token = "sk-ant-oat01-..."
+# models = ["claude-sonnet-4-20250514", "claude-opus-*"]
 
 [[accounts]]
 name = "secondary"
 token = "sk-ant-api03-..."
 ```
+
+### Config Reference
+
+| Field | Type | Default | Description |
+|:------|:-----|:--------|:------------|
+| `listen` | `String` | — | Bind address (e.g. `"127.0.0.1:8082"`) |
+| `upstream` | `String` | — | Anthropic API base URL |
+| `rate_limit_cooldown_secs` | `u64` | `60` | Seconds to cool down after 429 |
+| `probe_interval_secs` | `u64` | `300` | Seconds between utilization probes (0 = disabled) |
+| `proxy_key` | `String?` | `None` | Shared secret for proxy access |
+| `allowed_ips` | `[String]?` | `None` | IP/CIDR allowlist |
+| `auto_cache` | `bool` | `true` | Inject prompt caching beta header |
+| `shadow_log` | `String?` | `None` | Path to JSONL shadow log file |
+| `client_names` | `{IP: name}` | `{}` | IP → client ID mapping |
+| `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
+| `accounts[].name` | `String` | — | Display name for the account |
+| `accounts[].token` | `String` | — | API key or `"passthrough"` |
+| `accounts[].models` | `[String]` | `[]` | Model allowlist (empty = all) |
 
 ### Token Types
 
@@ -93,6 +138,29 @@ token = "sk-ant-api03-..."
 
 > [!TIP]
 > Use `passthrough` when clients have their own Anthropic credentials and you only want load-balancing without token injection.
+
+### Model Routing
+
+Restrict accounts to specific models with the `models` field:
+
+```toml
+[[accounts]]
+name = "opus-only"
+token = "sk-ant-oat01-..."
+models = ["claude-opus-*"]  # Wildcard prefix match
+
+[[accounts]]
+name = "sonnet-only"
+token = "sk-ant-api03-..."
+models = ["claude-sonnet-4-20250514"]  # Exact match
+
+[[accounts]]
+name = "general"
+token = "sk-ant-oat01-..."
+# Empty models = serves all models
+```
+
+When a request specifies a model, only accounts whose `models` list matches (exact or prefix wildcard) are considered. Accounts with an empty `models` list serve all models.
 
 ---
 
@@ -120,6 +188,16 @@ export ANTHROPIC_API_KEY=your-proxy-secret
 > [!IMPORTANT]
 > Claude Code sends the proxy key as `x-api-key`. The proxy validates it and swaps in the real account token. No Anthropic credentials or OAuth login needed on the client.
 
+### Client Identification
+
+Clients are identified for usage tracking and budget enforcement:
+
+1. **`X-Client-ID` header** — explicit, takes priority
+2. **`client_names` IP mapping** — fallback based on source IP
+3. **`"-"`** — default when neither is set
+
+Per-client token usage and budget status appear in `/_stats`.
+
 ---
 
 ## Security
@@ -144,8 +222,9 @@ IP check runs first, then proxy key. Both apply to all endpoints including `/_st
 | Route | Method | Description |
 |:------|:-------|:------------|
 | `/*` | Any | Proxied to upstream Anthropic API |
+| `/v1/chat/completions` | POST | OpenAI-compatible → Anthropic translation |
 | `/upstream/{name}/*` | Any | Forwarded to named OpenAI-compatible upstream |
-| `/_stats` | GET | JSON stats (utilization, rate limits, request counts) |
+| `/_stats` | GET | JSON stats (utilization, tokens, budgets) |
 
 All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
 
@@ -163,16 +242,33 @@ All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
       "representative_claim": "five_hour",
       "remaining_requests": 950,
       "remaining_tokens": 4800000,
-      "hard_limited_remaining_secs": null
+      "hard_limited_remaining_secs": null,
+      "token_usage": {
+        "input_tokens": 2450000,
+        "output_tokens": 180000,
+        "cache_creation_input_tokens": 50000,
+        "cache_read_input_tokens": 1200000
+      }
     }
   ],
   "upstreams": [
     {
-      "name": "openrouter",
-      "base_url": "https://openrouter.ai/api",
+      "name": "portkey",
+      "base_url": "https://portkey.example.com/v1",
       "requests_total": 87
     }
   ],
+  "client_usage": {
+    "alice": {
+      "input_tokens": 1200000,
+      "output_tokens": 90000,
+      "cache_creation_input_tokens": 25000,
+      "cache_read_input_tokens": 600000
+    }
+  },
+  "client_budgets": {
+    "alice": { "limit": 5000000, "used": 1915000, "remaining": 3085000 }
+  },
   "strategy": "dynamic-capacity"
 }
 ```
@@ -200,16 +296,46 @@ Requests to `/upstream/openrouter/v1/chat/completions` are forwarded to `https:/
 
 ```
 1. Request arrives → validate proxy_key + IP allowlist
-2. Pick account with lowest utilization (most headroom)
-3. Forward request with that account's auth token
-4. If upstream returns 429 → mark rate-limited, try next account
-5. Cooled-down accounts re-enter rotation after cooldown period
-6. Periodic probes refresh utilization data for each account
-7. State persisted to disk, restored on restart
+2. Identify client (X-Client-ID header → IP mapping → "-")
+3. Check per-client daily token budget (429 if exceeded)
+4. Extract model from request body
+5. Filter accounts by model allowlist
+6. Pick account via headroom-proportional weighted bucket hashing (client affinity)
+7. Inject auth token + auto-cache header
+8. Forward request to upstream Anthropic API
+9. If 429 → mark rate-limited, retry with next account
+10. If 5xx/529 → retry with different account
+11. Extract token usage from response (streaming SSE or JSON body)
+12. Record usage per-account + per-client, update budget
+13. Write shadow log entry (async, non-blocking)
+14. State persisted to disk, restored on restart
 ```
 
 > [!TIP]
 > The proxy reads Anthropic's `anthropic-ratelimit-unified-*` headers to track real utilization per rate-limit window (5h, 7d). This is more accurate than counting requests locally.
+
+---
+
+## Shadow Logging
+
+When `shadow_log` is set, every request writes a JSONL entry with:
+
+```json
+{
+  "ts": "2026-02-13T20:15:00Z",
+  "client": "alice",
+  "account": "primary",
+  "model": "claude-sonnet-4-20250514",
+  "streaming": true,
+  "latency_ms": 2340,
+  "input_tokens": 1500,
+  "output_tokens": 450,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 800
+}
+```
+
+Logging is fire-and-forget via an async channel — handlers never block on disk I/O.
 
 ---
 
@@ -251,7 +377,7 @@ WantedBy=multi-user.target
 ## Testing
 
 ```bash
-# Run all tests (14 tests, ~62% line coverage)
+# Run all tests (62 tests)
 cargo test
 
 # Lint gates (same as CI)
