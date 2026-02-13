@@ -11,6 +11,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
@@ -348,13 +349,33 @@ impl AppState {
 
 impl AppState {
     /// Pick the best available account.
-    /// Strategy: choose the account with the most remaining tokens.
-    /// Falls back to round-robin if no rate limit info is available yet.
-    async fn pick_account(&self) -> Option<usize> {
+    ///
+    /// Strategy (in priority order):
+    /// 1. **Client affinity**: if `affinity_key` is provided, hash it to a preferred account.
+    ///    Use that account as long as it isn't hard-limited. This gives clients consistent
+    ///    routing, reduces cross-account oscillation, and may benefit from upstream caching.
+    /// 2. **Lowest utilization**: pick the account with the most remaining headroom.
+    /// 3. **Round-robin fallback**: when no rate-limit data exists yet.
+    async fn pick_account(&self, affinity_key: Option<&str>) -> Option<usize> {
         let n = self.accounts.len();
         let now = Instant::now();
 
-        // First pass: find account with lowest utilization (most headroom)
+        // Client affinity: deterministic account from hashed client identity
+        if let Some(key) = affinity_key {
+            if !key.is_empty() && key != "-" {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut hasher);
+                let preferred = hasher.finish() as usize % n;
+                let info = self.accounts[preferred].rate_info.read().await;
+                let hard_limited = matches!(info.hard_limited_until, Some(until) if now < until);
+                if !hard_limited {
+                    return Some(preferred);
+                }
+                // Preferred account is hard-limited — fall through to utilization-based selection
+            }
+        }
+
+        // Second pass: find account with lowest utilization (most headroom)
         let mut best_idx: Option<usize> = None;
         let mut best_utilization: f64 = f64::MAX;
         let mut has_any_info = false;
@@ -576,6 +597,9 @@ async fn proxy_handler(
         .unwrap_or("-")
         .to_string();
 
+    // Composite affinity key: sticky routing based on full client identity
+    let affinity_key = format!("{client_ip}:{client_id}:{agent_id}:{session_id}");
+
     let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
@@ -592,7 +616,7 @@ async fn proxy_handler(
 
     let n = state.accounts.len();
     for _attempt in 0..n {
-        let idx = match state.pick_account().await {
+        let idx = match state.pick_account(Some(&affinity_key)).await {
             Some(i) => i,
             None => {
                 warn!("all accounts rate-limited");
@@ -936,6 +960,7 @@ struct StreamContext {
     id: String,
     model: String,
     created: u64,
+    tool_call_index: i32,
 }
 
 impl Default for StreamContext {
@@ -944,6 +969,7 @@ impl Default for StreamContext {
             id: format!("chatcmpl-{}", AppState::now_epoch()),
             model: String::new(),
             created: AppState::now_epoch(),
+            tool_call_index: -1,
         }
     }
 }
@@ -975,7 +1001,7 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
         out.insert("model".to_string(), model.clone());
     }
 
-    // Extract system messages, pass through the rest
+    // Extract system messages, translate tool messages, pass through the rest
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
@@ -986,8 +1012,58 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
                 if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
                     system_parts.push(content.to_string());
                 }
+            } else if role == "assistant" {
+                // Handle assistant messages with tool_calls
+                let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                    if !content.is_empty() {
+                        content_blocks.push(serde_json::json!({"type": "text", "text": content}));
+                    }
+                }
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tool_calls {
+                        if tc.get("type").and_then(|t| t.as_str()) == Some("function") {
+                            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                            let name = tc
+                                .pointer("/function/name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let args_str = tc
+                                .pointer("/function/arguments")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("{}");
+                            let input: serde_json::Value =
+                                serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+                            content_blocks.push(serde_json::json!({
+                                "type": "tool_use",
+                                "id": id,
+                                "name": name,
+                                "input": input,
+                            }));
+                        }
+                    }
+                }
+                if content_blocks.is_empty() {
+                    content_blocks.push(serde_json::json!({"type": "text", "text": ""}));
+                }
+                messages.push(serde_json::json!({"role": "assistant", "content": content_blocks}));
+            } else if role == "tool" {
+                // OpenAI tool result → Anthropic tool_result
+                let tool_call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": content,
+                    }],
+                }));
             } else {
-                // Strip "name" field, keep role + content
+                // user messages: keep role + content
                 let mut clean = serde_json::Map::new();
                 clean.insert(
                     "role".to_string(),
@@ -1034,6 +1110,62 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
         }
     }
 
+    // tools: OpenAI function definitions → Anthropic tools
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        let anthropic_tools: Vec<serde_json::Value> = tools
+            .iter()
+            .filter_map(|t| {
+                if t.get("type").and_then(|v| v.as_str()) == Some("function") {
+                    let func = t.get("function")?;
+                    Some(serde_json::json!({
+                        "name": func.get("name")?,
+                        "description": func.get("description").unwrap_or(&serde_json::Value::Null),
+                        "input_schema": func.get("parameters").unwrap_or(&serde_json::json!({"type": "object"})),
+                    }))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !anthropic_tools.is_empty() {
+            out.insert(
+                "tools".to_string(),
+                serde_json::Value::Array(anthropic_tools),
+            );
+        }
+    }
+
+    // tool_choice translation
+    if let Some(tc) = body.get("tool_choice") {
+        if let Some(tc_str) = tc.as_str() {
+            match tc_str {
+                "auto" => {
+                    out.insert(
+                        "tool_choice".to_string(),
+                        serde_json::json!({"type": "auto"}),
+                    );
+                }
+                "required" => {
+                    out.insert(
+                        "tool_choice".to_string(),
+                        serde_json::json!({"type": "any"}),
+                    );
+                }
+                "none" => {} // Don't send tool_choice, Claude will ignore tools
+                _ => {}
+            }
+        } else if let Some(func_name) = tc
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            out.insert(
+                "tool_choice".to_string(),
+                serde_json::json!({"type": "tool", "name": func_name}),
+            );
+        }
+    }
+
     // stop -> stop_sequences
     if let Some(stop) = body.get("stop") {
         let sequences = if stop.is_array() {
@@ -1059,20 +1191,38 @@ fn translate_anthropic_to_openai(body: &serde_json::Value) -> serde_json::Value 
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-    // Concatenate text content blocks, strip markdown JSON fences
-    let content = body
+    let blocks = body
         .get("content")
         .and_then(|c| c.as_array())
-        .map(|blocks| {
-            let raw = blocks
-                .iter()
-                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("");
-            strip_json_fences(&raw)
-        })
+        .cloned()
         .unwrap_or_default();
+
+    // Concatenate text content blocks, strip markdown JSON fences
+    let content = {
+        let raw = blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        strip_json_fences(&raw)
+    };
+
+    // Extract tool_use blocks → OpenAI tool_calls
+    let tool_calls: Vec<serde_json::Value> = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+        .map(|b| {
+            serde_json::json!({
+                "id": b.get("id").unwrap_or(&serde_json::Value::Null),
+                "type": "function",
+                "function": {
+                    "name": b.get("name").unwrap_or(&serde_json::Value::Null),
+                    "arguments": b.get("input").map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string()),
+                },
+            })
+        })
+        .collect();
 
     let stop_reason = body
         .get("stop_reason")
@@ -1088,6 +1238,20 @@ fn translate_anthropic_to_openai(body: &serde_json::Value) -> serde_json::Value 
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": if content.is_empty() && !tool_calls.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(content) },
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::Value::Array(tool_calls);
+    }
+
+    let finish_reason = if body.get("stop_reason").and_then(|v| v.as_str()) == Some("tool_use") {
+        "tool_calls"
+    } else {
+        map_stop_reason(stop_reason)
+    };
+
     serde_json::json!({
         "id": format!("chatcmpl-{}", id),
         "object": "chat.completion",
@@ -1095,11 +1259,8 @@ fn translate_anthropic_to_openai(body: &serde_json::Value) -> serde_json::Value 
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content,
-            },
-            "finish_reason": map_stop_reason(stop_reason),
+            "message": message,
+            "finish_reason": finish_reason,
         }],
         "usage": {
             "prompt_tokens": input_tokens,
@@ -1145,7 +1306,70 @@ fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
                 None,
             ))
         }
+        "content_block_start" => {
+            // Handle tool_use block start
+            let cb = parsed.get("content_block")?;
+            if cb.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                ctx.tool_call_index += 1;
+                let tc_id = cb.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = cb.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let chunk = serde_json::json!({
+                    "id": ctx.id,
+                    "object": "chat.completion.chunk",
+                    "created": ctx.created,
+                    "model": ctx.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": ctx.tool_call_index,
+                                "id": tc_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": ""},
+                            }],
+                        },
+                        "finish_reason": null,
+                    }],
+                });
+                return Some(format!("data: {}\n\n", chunk));
+            }
+            None
+        }
         "content_block_delta" => {
+            let delta_type = parsed
+                .pointer("/delta/type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if delta_type == "input_json_delta" {
+                // Tool call arguments delta
+                let partial = parsed
+                    .pointer("/delta/partial_json")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if partial.is_empty() {
+                    return None;
+                }
+                let chunk = serde_json::json!({
+                    "id": ctx.id,
+                    "object": "chat.completion.chunk",
+                    "created": ctx.created,
+                    "model": ctx.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": ctx.tool_call_index,
+                                "function": {"arguments": partial},
+                            }],
+                        },
+                        "finish_reason": null,
+                    }],
+                });
+                return Some(format!("data: {}\n\n", chunk));
+            }
+
+            // Text delta
             let text = parsed
                 .pointer("/delta/text")
                 .and_then(|v| v.as_str())
@@ -1164,14 +1388,15 @@ fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
                 .pointer("/delta/stop_reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("end_turn");
-            Some(make_openai_chunk(
-                ctx,
-                serde_json::json!({}),
-                Some(map_stop_reason(stop_reason)),
-            ))
+            let finish = if stop_reason == "tool_use" {
+                "tool_calls"
+            } else {
+                map_stop_reason(stop_reason)
+            };
+            Some(make_openai_chunk(ctx, serde_json::json!({}), Some(finish)))
         }
         "message_stop" => Some("data: [DONE]\n\n".to_string()),
-        _ => None, // ping, content_block_start, content_block_stop
+        _ => None, // ping, content_block_stop
     }
 }
 
@@ -1214,6 +1439,9 @@ async fn openai_chat_handler(
         .unwrap_or("-")
         .to_string();
 
+    // Composite affinity key: sticky routing based on full client identity
+    let affinity_key = format!("{client_ip}:{client_id}:{agent_id}:{session_id}");
+
     let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
@@ -1244,7 +1472,7 @@ async fn openai_chat_handler(
 
     let n = state.accounts.len();
     for _attempt in 0..n {
-        let idx = match state.pick_account().await {
+        let idx = match state.pick_account(Some(&affinity_key)).await {
             Some(i) => i,
             None => {
                 warn!("all accounts rate-limited");
@@ -1671,6 +1899,7 @@ mod tests {
             proxy_key: None,
             allowed_ips: vec![],
             upstreams: vec![],
+            client_names: HashMap::new(),
         })
     }
 
@@ -1738,6 +1967,7 @@ mod tests {
                 api_key: "test-key".to_string(),
                 requests: AtomicU64::new(0),
             }],
+            client_names: HashMap::new(),
         });
 
         let app = Router::new()
@@ -1792,6 +2022,7 @@ mod tests {
             proxy_key: None,
             allowed_ips: vec![IpAllowEntry::Addr("10.0.0.1".parse().unwrap())],
             upstreams: vec![],
+            client_names: HashMap::new(),
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -1816,7 +2047,7 @@ mod tests {
             info.utilization = Some(0.2);
         }
 
-        let idx = state.pick_account().await.unwrap();
+        let idx = state.pick_account(None).await.unwrap();
         assert_eq!(idx, 1, "should pick account with lower utilization");
     }
 
@@ -1838,7 +2069,7 @@ mod tests {
             info.utilization = Some(0.9);
         }
 
-        let idx = state.pick_account().await.unwrap();
+        let idx = state.pick_account(None).await.unwrap();
         assert_eq!(
             idx, 1,
             "should skip hard-limited account despite lower utilization"
@@ -1854,9 +2085,9 @@ mod tests {
         ]);
 
         // No utilization set — should round-robin
-        let first = state.pick_account().await.unwrap();
-        let second = state.pick_account().await.unwrap();
-        let third = state.pick_account().await.unwrap();
+        let first = state.pick_account(None).await.unwrap();
+        let second = state.pick_account(None).await.unwrap();
+        let third = state.pick_account(None).await.unwrap();
 
         // Round-robin should cycle through all accounts
         let selected: std::collections::HashSet<usize> = [first, second, third].into();
@@ -1879,7 +2110,7 @@ mod tests {
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
         }
 
-        assert!(state.pick_account().await.is_none());
+        assert!(state.pick_account(None).await.is_none());
     }
 
     #[tokio::test]
@@ -1915,12 +2146,109 @@ mod tests {
         // Call pick_account multiple times — should distribute via round-robin
         let mut picks = Vec::new();
         for _ in 0..4 {
-            picks.push(state.pick_account().await.unwrap());
+            picks.push(state.pick_account(None).await.unwrap());
         }
         // With round-robin, we should see both 0 and 1
         assert!(
             picks.contains(&0) && picks.contains(&1),
             "with no rate info, accounts should be distributed via round-robin, got: {:?}",
+            picks
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_sticky_same_client_same_account() {
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-a"),
+            make_account("b", "sk-ant-api-b"),
+            make_account("c", "sk-ant-api-c"),
+        ]);
+
+        // Same affinity key should always pick the same account
+        let first = state
+            .pick_account(Some("alice:web:agent1:sess1"))
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            let pick = state
+                .pick_account(Some("alice:web:agent1:sess1"))
+                .await
+                .unwrap();
+            assert_eq!(
+                pick, first,
+                "same affinity key must always pick same account"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_sticky_different_clients_can_differ() {
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-a"),
+            make_account("b", "sk-ant-api-b"),
+            make_account("c", "sk-ant-api-c"),
+            make_account("d", "sk-ant-api-d"),
+        ]);
+
+        // Different affinity keys should distribute across accounts
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..20 {
+            let key = format!("client-{i}:web:agent:sess");
+            seen.insert(state.pick_account(Some(&key)).await.unwrap());
+        }
+        assert!(
+            seen.len() > 1,
+            "different clients should spread across accounts, got: {:?}",
+            seen
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_sticky_falls_back_when_preferred_hard_limited() {
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-a"),
+            make_account("b", "sk-ant-api-b"),
+            make_account("c", "sk-ant-api-c"),
+        ]);
+
+        let key = "sticky-client:web:agent:sess";
+        let preferred = state.pick_account(Some(key)).await.unwrap();
+
+        // Hard-limit the preferred account
+        {
+            let mut info = state.accounts[preferred].rate_info.write().await;
+            info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+        }
+        // Set utilization on remaining accounts so we get deterministic fallback
+        for (i, acct) in state.accounts.iter().enumerate() {
+            if i != preferred {
+                let mut info = acct.rate_info.write().await;
+                info.utilization = Some(0.5);
+            }
+        }
+
+        let fallback = state.pick_account(Some(key)).await.unwrap();
+        assert_ne!(
+            fallback, preferred,
+            "should fall back to a different account when preferred is hard-limited"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_sticky_ignores_dash_affinity() {
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-a"),
+            make_account("b", "sk-ant-api-b"),
+        ]);
+
+        // "-" and "" should be treated as no affinity (round-robin)
+        let mut picks = Vec::new();
+        for _ in 0..4 {
+            picks.push(state.pick_account(Some("-")).await.unwrap());
+        }
+        assert!(
+            picks.contains(&0) && picks.contains(&1),
+            "dash affinity should fall through to round-robin, got: {:?}",
             picks
         );
     }
@@ -2410,6 +2738,7 @@ mod tests {
             proxy_key,
             allowed_ips: vec![],
             upstreams: vec![],
+            client_names: HashMap::new(),
         });
 
         let app = Router::new()
