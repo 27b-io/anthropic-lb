@@ -126,18 +126,20 @@ impl AppState {
         self.allowed_ips.is_empty() || self.allowed_ips.iter().any(|e| e.contains(ip))
     }
 
-    /// Resolve client identity: config map (by IP) → x-client-id header → "-"
+    /// Resolve client identity: x-client-id header → config map (by IP) → "-"
     fn resolve_client_id(&self, ip: &IpAddr, headers: &hyper::HeaderMap) -> String {
-        // 1. Check IP-to-name map in config
+        // 1. Header wins (explicit client identification)
+        if let Some(id) = headers.get("x-client-id").and_then(|v| v.to_str().ok()) {
+            if !id.is_empty() && id != "-" {
+                return id.to_string();
+            }
+        }
+        // 2. Fall back to IP-to-name map in config
         if let Some(name) = self.client_names.get(&ip.to_string()) {
             return name.clone();
         }
-        // 2. Check x-client-id header
-        headers
-            .get("x-client-id")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-")
-            .to_string()
+        // 3. Unknown
+        "-".to_string()
     }
 }
 
