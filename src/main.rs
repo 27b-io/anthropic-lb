@@ -10,6 +10,7 @@ use ipnet::IpNet;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
@@ -41,6 +42,9 @@ struct Config {
     /// OpenAI-compatible upstream routes. Requests to /upstream/<name>/... are forwarded.
     #[serde(default)]
     upstreams: Vec<UpstreamConfig>,
+    /// IP-to-client-name mapping. Falls back to x-client-id header, then "-".
+    #[serde(default)]
+    client_names: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -99,6 +103,7 @@ struct AppState {
     proxy_key: Option<String>,
     allowed_ips: Vec<IpAllowEntry>,
     upstreams: Vec<Upstream>,
+    client_names: HashMap<String, String>,
 }
 
 /// Parsed IP allow entry — either a single IP or a CIDR range.
@@ -119,6 +124,20 @@ impl IpAllowEntry {
 impl AppState {
     fn is_ip_allowed(&self, ip: &IpAddr) -> bool {
         self.allowed_ips.is_empty() || self.allowed_ips.iter().any(|e| e.contains(ip))
+    }
+
+    /// Resolve client identity: config map (by IP) → x-client-id header → "-"
+    fn resolve_client_id(&self, ip: &IpAddr, headers: &hyper::HeaderMap) -> String {
+        // 1. Check IP-to-name map in config
+        if let Some(name) = self.client_names.get(&ip.to_string()) {
+            return name.clone();
+        }
+        // 2. Check x-client-id header
+        headers
+            .get("x-client-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string()
     }
 }
 
@@ -541,12 +560,7 @@ async fn proxy_handler(
     let (parts, body) = req.into_parts();
 
     // Extract client identification headers
-    let client_id = parts
-        .headers
-        .get("x-client-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
+    let client_id = state.resolve_client_id(&client_ip, &parts.headers);
     let agent_id = parts
         .headers
         .get("x-agent-id")
@@ -747,12 +761,7 @@ async fn upstream_handler(
     let (parts, body) = req.into_parts();
 
     // Extract client identification headers
-    let client_id = parts
-        .headers
-        .get("x-client-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
+    let client_id = state.resolve_client_id(&client_ip, &parts.headers);
 
     let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
         Ok(b) => b,
@@ -892,6 +901,26 @@ async fn stats_handler(
 
 // ── OpenAI compatibility ─────────────────────────────────────────────
 
+/// Strip markdown JSON fences from LLM output.
+/// Claude sometimes wraps JSON in ```json ... ``` even when told not to.
+/// Clients using response_format: json_object (e.g. Vercel AI SDK's generateObject)
+/// need raw JSON or their parse step blows up.
+fn strip_json_fences(s: &str) -> String {
+    let trimmed = s.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        // Skip language tag on first line (e.g. "json\n")
+        let after_tag = match rest.find('\n') {
+            Some(pos) => &rest[pos + 1..],
+            None => return s.to_string(),
+        };
+        // Strip closing fence
+        if let Some(content) = after_tag.strip_suffix("```") {
+            return content.trim().to_string();
+        }
+    }
+    s.to_string()
+}
+
 fn map_stop_reason(reason: &str) -> &'static str {
     match reason {
         "end_turn" => "stop",
@@ -1028,17 +1057,18 @@ fn translate_anthropic_to_openai(body: &serde_json::Value) -> serde_json::Value 
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-    // Concatenate text content blocks
+    // Concatenate text content blocks, strip markdown JSON fences
     let content = body
         .get("content")
         .and_then(|c| c.as_array())
         .map(|blocks| {
-            blocks
+            let raw = blocks
                 .iter()
                 .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
                 .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
                 .collect::<Vec<_>>()
-                .join("")
+                .join("");
+            strip_json_fences(&raw)
         })
         .unwrap_or_default();
 
@@ -1168,12 +1198,7 @@ async fn openai_chat_handler(
     let (parts, body) = req.into_parts();
 
     // Extract client identification headers
-    let client_id = parts
-        .headers
-        .get("x-client-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
+    let client_id = state.resolve_client_id(&client_ip, &parts.headers);
     let agent_id = parts
         .headers
         .get("x-agent-id")
@@ -1538,6 +1563,7 @@ async fn main() {
         proxy_key: config.proxy_key.clone(),
         allowed_ips,
         upstreams,
+        client_names: config.client_names.clone(),
     });
 
     // Restore persisted state (cooldowns, utilization, request counts)
@@ -2202,6 +2228,48 @@ mod tests {
         assert_eq!(map_stop_reason("max_tokens"), "length");
         assert_eq!(map_stop_reason("stop_sequence"), "stop");
         assert_eq!(map_stop_reason("unknown"), "stop");
+    }
+
+    // ── Unit: JSON fence stripping ──────────────────────────────────
+
+    #[test]
+    fn strip_json_fences_with_lang_tag() {
+        let input = "```json\n{\"key\": \"value\"}\n```";
+        assert_eq!(strip_json_fences(input), r#"{"key": "value"}"#);
+    }
+
+    #[test]
+    fn strip_json_fences_no_lang_tag() {
+        let input = "```\n{\"key\": \"value\"}\n```";
+        assert_eq!(strip_json_fences(input), r#"{"key": "value"}"#);
+    }
+
+    #[test]
+    fn strip_json_fences_passthrough_plain_json() {
+        let input = r#"{"key": "value"}"#;
+        assert_eq!(strip_json_fences(input), input);
+    }
+
+    #[test]
+    fn strip_json_fences_with_whitespace() {
+        let input = "  ```json\n{\"a\": 1}\n```  ";
+        assert_eq!(strip_json_fences(input), r#"{"a": 1}"#);
+    }
+
+    #[test]
+    fn translate_response_strips_markdown_fences() {
+        let resp = serde_json::json!({
+            "id": "msg_fenced",
+            "content": [{"type": "text", "text": "```json\n{\"skipSearch\": true}\n```"}],
+            "model": "claude-sonnet-4-20250514",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let result = translate_anthropic_to_openai(&resp);
+        assert_eq!(
+            result["choices"][0]["message"]["content"],
+            r#"{"skipSearch": true}"#
+        );
     }
 
     // ── Unit: SSE event translation ─────────────────────────────────
