@@ -53,6 +53,10 @@ struct Config {
     /// Per-client daily token budgets: client_id → max tokens per day. Uncapped if absent.
     #[serde(default)]
     client_budgets: HashMap<String, u64>,
+    /// Utilization soft ceiling (0.0–1.0). Accounts above this are excluded from routing
+    /// unless ALL accounts exceed it. Breaks client affinity stickiness on overloaded accounts.
+    /// Default: 0.90.
+    soft_limit: Option<f64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -135,6 +139,9 @@ struct AppState {
     client_budgets: HashMap<String, u64>,
     /// Budget tracking: client_id → (epoch_day, tokens_used). Resets on new day.
     budget_usage: Mutex<HashMap<String, (u64, u64)>>,
+    /// Utilization soft ceiling. Accounts above this are excluded from routing
+    /// unless all candidates exceed it. Default: 0.90.
+    soft_limit: f64,
 }
 
 impl Account {
@@ -416,8 +423,8 @@ impl AppState {
     async fn pick_account(&self, affinity_key: Option<&str>, model: &str) -> Option<usize> {
         let now = Instant::now();
 
-        // Build candidate list: (index, headroom) for non-hard-limited, model-compatible accounts
-        let mut candidates: Vec<(usize, f64)> = Vec::new();
+        // Build candidate list: (index, headroom, utilization) for non-hard-limited, model-compatible accounts
+        let mut candidates: Vec<(usize, f64, f64)> = Vec::new();
         for (i, acct) in self.accounts.iter().enumerate() {
             // Skip accounts that don't serve this model
             if !acct.serves_model(model) {
@@ -468,7 +475,7 @@ impl AppState {
                 "pick: candidate"
             );
 
-            candidates.push((i, headroom));
+            candidates.push((i, headroom, effective_util));
         }
 
         if candidates.is_empty() {
@@ -476,8 +483,32 @@ impl AppState {
             return None;
         }
 
-        // Total headroom across all candidates
-        let total_headroom: f64 = candidates.iter().map(|(_, h)| h).sum();
+        // Soft-limit: exclude overloaded accounts unless ALL are above the ceiling
+        let healthy: Vec<(usize, f64)> = candidates
+            .iter()
+            .filter(|(_, _, util)| *util < self.soft_limit)
+            .map(|(i, h, _)| (*i, *h))
+            .collect();
+        let effective: Vec<(usize, f64)> = if healthy.is_empty() {
+            candidates.iter().map(|(i, h, _)| (*i, *h)).collect()
+        } else {
+            if healthy.len() < candidates.len() {
+                let excluded: Vec<&str> = candidates
+                    .iter()
+                    .filter(|(_, _, util)| *util >= self.soft_limit)
+                    .map(|(i, _, _)| self.accounts[*i].name.as_str())
+                    .collect();
+                debug!(
+                    soft_limit = self.soft_limit,
+                    excluded = ?excluded,
+                    "pick: soft-limited accounts excluded"
+                );
+            }
+            healthy
+        };
+
+        // Total headroom across effective candidates
+        let total_headroom: f64 = effective.iter().map(|(_, h)| h).sum();
 
         // Compute position in [0, 10000) — either stable (affinity) or scattered (round-robin)
         let position = if let Some(key) = affinity_key {
@@ -495,7 +526,7 @@ impl AppState {
 
         // Walk weighted buckets
         let mut cumulative = 0.0;
-        for &(idx, headroom) in &candidates {
+        for &(idx, headroom) in &effective {
             cumulative += headroom;
             if target < cumulative {
                 trace!(
@@ -505,7 +536,7 @@ impl AppState {
                     target = format!("{:.4}", target),
                     headroom = format!("{:.4}", headroom),
                     total_headroom = format!("{:.4}", total_headroom),
-                    candidates = candidates.len(),
+                    candidates = effective.len(),
                     "pick: selected by weighted bucket"
                 );
                 return Some(idx);
@@ -513,7 +544,7 @@ impl AppState {
         }
 
         // Floating-point edge case: pick last candidate
-        let &(idx, _) = candidates.last().unwrap();
+        let &(idx, _) = effective.last().unwrap();
         trace!(
             account = self.accounts[idx].name,
             affinity_key = affinity_key.unwrap_or("-"),
@@ -2320,6 +2351,7 @@ async fn main() {
         shadow_log_tx,
         client_budgets: config.client_budgets.clone(),
         budget_usage: Mutex::new(HashMap::new()),
+        soft_limit: config.soft_limit.unwrap_or(0.90),
     });
 
     if state.auto_cache {
@@ -2440,6 +2472,7 @@ mod tests {
             shadow_log_tx: None,
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
         })
     }
 
@@ -2513,6 +2546,7 @@ mod tests {
             shadow_log_tx: None,
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
         });
 
         let app = Router::new()
@@ -2573,6 +2607,7 @@ mod tests {
             shadow_log_tx: None,
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -3344,6 +3379,7 @@ mod tests {
             shadow_log_tx: None,
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
         });
 
         let app = Router::new()
@@ -3853,6 +3889,59 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(idx, 1);
     }
 
+    #[tokio::test]
+    async fn soft_limit_excludes_overloaded_accounts() {
+        let acct_a = make_account("healthy", "sk-ant-api-a");
+        let acct_b = make_account("overloaded", "sk-ant-api-b");
+
+        let accounts = vec![acct_a, acct_b];
+
+        // Set utilizations before building state
+        {
+            let mut info = accounts[0].rate_info.write().await;
+            info.utilization = Some(0.30);
+            info.utilization_5h = Some(0.30);
+        }
+        {
+            let mut info = accounts[1].rate_info.write().await;
+            info.utilization = Some(0.95);
+            info.utilization_5h = Some(0.95);
+        }
+
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts,
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            soft_limit: 0.90,
+        });
+
+        // Try many affinity keys — all should route to healthy (idx 0)
+        for i in 0..20 {
+            let key = format!("client-{}", i);
+            let idx = state.pick_account(Some(&key), "any").await.unwrap();
+            assert_eq!(
+                idx, 0,
+                "client '{}' routed to overloaded account despite soft limit",
+                key
+            );
+        }
+    }
+
     // ── Unit: per-client budget ────────────────────────────────────
 
     #[test]
@@ -3884,6 +3973,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             shadow_log_tx: None,
             client_budgets: budgets,
             budget_usage: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
         });
 
         // Within budget
