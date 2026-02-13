@@ -539,6 +539,27 @@ async fn proxy_handler(
     }
 
     let (parts, body) = req.into_parts();
+
+    // Extract client identification headers
+    let client_id = parts
+        .headers
+        .get("x-client-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let agent_id = parts
+        .headers
+        .get("x-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let session_id = parts
+        .headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+
     let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
@@ -658,6 +679,9 @@ async fn proxy_handler(
             let info = acct.rate_info.read().await;
             info!(
                 client = %client_ip,
+                client_id = %client_id,
+                agent = %agent_id,
+                session = %session_id,
                 model = %model,
                 account = acct.name,
                 status = status.as_u16(),
@@ -721,6 +745,15 @@ async fn upstream_handler(
     };
 
     let (parts, body) = req.into_parts();
+
+    // Extract client identification headers
+    let client_id = parts
+        .headers
+        .get("x-client-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+
     let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
@@ -776,6 +809,7 @@ async fn upstream_handler(
 
     info!(
         client = %client_ip,
+        client_id = %client_id,
         model = %model,
         upstream = upstream.name,
         status = status.as_u16(),
@@ -1132,6 +1166,27 @@ async fn openai_chat_handler(
     }
 
     let (parts, body) = req.into_parts();
+
+    // Extract client identification headers
+    let client_id = parts
+        .headers
+        .get("x-client-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let agent_id = parts
+        .headers
+        .get("x-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let session_id = parts
+        .headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+
     let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
@@ -1257,6 +1312,9 @@ async fn openai_chat_handler(
             let info = acct.rate_info.read().await;
             info!(
                 client = %client_ip,
+                client_id = %client_id,
+                agent = %agent_id,
+                session = %session_id,
                 model = %model,
                 account = acct.name,
                 status = status.as_u16(),
