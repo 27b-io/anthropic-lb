@@ -16,7 +16,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -48,6 +48,11 @@ struct Config {
     client_names: HashMap<String, String>,
     /// Auto-inject prompt cache breakpoints for requests without them. Default: true.
     auto_cache: Option<bool>,
+    /// Path for JSONL shadow log of request metadata. None = disabled.
+    shadow_log: Option<String>,
+    /// Per-client daily token budgets: client_id → max tokens per day. Uncapped if absent.
+    #[serde(default)]
+    client_budgets: HashMap<String, u64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -55,6 +60,10 @@ struct AccountConfig {
     name: String,
     /// Auth token. Use "passthrough" to forward caller's auth headers as-is.
     token: String,
+    /// Optional model allowlist. If set, this account only serves these models.
+    /// Supports exact names ("claude-sonnet-4-20250514") and prefixes ("claude-opus-*").
+    #[serde(default)]
+    models: Vec<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -88,8 +97,15 @@ struct Account {
     name: String,
     token: String,
     passthrough: bool,
+    /// Model allowlist — empty means all models allowed.
+    models: Vec<String>,
     requests: AtomicU64,
     rate_info: RwLock<RateLimitInfo>,
+    // Token usage counters (atomic for lock-free concurrent updates)
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+    cache_creation_tokens: AtomicU64,
+    cache_read_tokens: AtomicU64,
 }
 
 struct Upstream {
@@ -111,6 +127,30 @@ struct AppState {
     upstreams: Vec<Upstream>,
     client_names: HashMap<String, String>,
     auto_cache: bool,
+    /// Per-client token usage: client_id → [input, output, cache_creation, cache_read]
+    client_usage: Mutex<HashMap<String, [u64; 4]>>,
+    /// Shadow log sender (fire-and-forget JSONL appends). None = disabled.
+    shadow_log_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Per-client daily token budgets: client_id → max tokens per day.
+    client_budgets: HashMap<String, u64>,
+    /// Budget tracking: client_id → (epoch_day, tokens_used). Resets on new day.
+    budget_usage: Mutex<HashMap<String, (u64, u64)>>,
+}
+
+impl Account {
+    /// Check if this account can serve the given model.
+    fn serves_model(&self, model: &str) -> bool {
+        if self.models.is_empty() || model.is_empty() {
+            return true; // no filter or no model = allow all
+        }
+        self.models.iter().any(|pattern| {
+            if let Some(prefix) = pattern.strip_suffix('*') {
+                model.starts_with(prefix)
+            } else {
+                model == pattern
+            }
+        })
+    }
 }
 
 /// Parsed IP allow entry — either a single IP or a CIDR range.
@@ -373,12 +413,22 @@ impl AppState {
     /// (1.0 - utilization). An affinity key hashes to a stable position in the bucket space,
     /// providing stickiness. As utilization changes, bucket boundaries shift and clients near
     /// the edges naturally migrate — no timers or thresholds needed.
-    async fn pick_account(&self, affinity_key: Option<&str>) -> Option<usize> {
+    async fn pick_account(&self, affinity_key: Option<&str>, model: &str) -> Option<usize> {
         let now = Instant::now();
 
-        // Build candidate list: (index, headroom) for non-hard-limited accounts
+        // Build candidate list: (index, headroom) for non-hard-limited, model-compatible accounts
         let mut candidates: Vec<(usize, f64)> = Vec::new();
         for (i, acct) in self.accounts.iter().enumerate() {
+            // Skip accounts that don't serve this model
+            if !acct.serves_model(model) {
+                trace!(
+                    account = acct.name,
+                    model = model,
+                    "pick: skipping, model not in allowlist"
+                );
+                continue;
+            }
+
             let info = acct.rate_info.read().await;
 
             // Skip hard-limited accounts
@@ -600,6 +650,169 @@ impl AppState {
     }
 }
 
+// ── Token usage extraction ──────────────────────────────────────────
+
+#[derive(Default, Debug, Clone)]
+struct TokenUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Parse usage from an Anthropic API response body (non-streaming JSON).
+    fn from_response_body(body: &serde_json::Value) -> Self {
+        let usage = match body.get("usage") {
+            Some(u) => u,
+            None => return Self::default(),
+        };
+        Self {
+            input_tokens: usage
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_creation_input_tokens: usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_read_input_tokens: usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        }
+    }
+
+    /// Parse usage from SSE chunks (accumulated from streaming response).
+    /// Looks for message_start (input_tokens, cache tokens) and message_delta (output_tokens).
+    fn from_sse_text(text: &str) -> Self {
+        let mut usage = Self::default();
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.starts_with("data: ") {
+                continue;
+            }
+            let data = &line[6..];
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match event_type {
+                "message_start" => {
+                    if let Some(msg_usage) = event.get("message").and_then(|m| m.get("usage")) {
+                        usage.input_tokens = msg_usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        usage.cache_creation_input_tokens = msg_usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        usage.cache_read_input_tokens = msg_usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                    }
+                }
+                "message_delta" => {
+                    if let Some(delta_usage) = event.get("usage") {
+                        usage.output_tokens = delta_usage
+                            .get("output_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                    }
+                }
+                _ => {}
+            }
+        }
+        usage
+    }
+
+    fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_creation_input_tokens == 0
+            && self.cache_read_input_tokens == 0
+    }
+}
+
+impl AppState {
+    /// Record token usage for an account and client.
+    fn record_usage(&self, account_idx: usize, client_id: &str, usage: &TokenUsage) {
+        if usage.is_empty() {
+            return;
+        }
+        let acct = &self.accounts[account_idx];
+        acct.input_tokens
+            .fetch_add(usage.input_tokens, Ordering::Relaxed);
+        acct.output_tokens
+            .fetch_add(usage.output_tokens, Ordering::Relaxed);
+        acct.cache_creation_tokens
+            .fetch_add(usage.cache_creation_input_tokens, Ordering::Relaxed);
+        acct.cache_read_tokens
+            .fetch_add(usage.cache_read_input_tokens, Ordering::Relaxed);
+
+        // Per-client tracking
+        if client_id != "-" {
+            let total = usage.input_tokens + usage.output_tokens;
+            if let Ok(mut map) = self.client_usage.lock() {
+                let entry = map.entry(client_id.to_string()).or_insert([0; 4]);
+                entry[0] += usage.input_tokens;
+                entry[1] += usage.output_tokens;
+                entry[2] += usage.cache_creation_input_tokens;
+                entry[3] += usage.cache_read_input_tokens;
+            }
+            // Budget accounting
+            self.record_budget_usage(client_id, total);
+        }
+    }
+
+    /// Write a shadow log entry (fire-and-forget).
+    fn shadow_log(&self, entry: serde_json::Value) {
+        if let Some(ref tx) = self.shadow_log_tx {
+            if let Ok(line) = serde_json::to_string(&entry) {
+                let _ = tx.send(line);
+            }
+        }
+    }
+
+    /// Check if a client is within their daily token budget. Returns Ok(()) or Err with remaining.
+    fn check_budget(&self, client_id: &str) -> Result<(), u64> {
+        let limit = match self.client_budgets.get(client_id) {
+            Some(&limit) => limit,
+            None => return Ok(()), // no budget configured = unlimited
+        };
+        let today = Self::now_epoch() / 86400;
+        if let Ok(map) = self.budget_usage.lock() {
+            if let Some(&(day, used)) = map.get(client_id) {
+                if day == today && used >= limit {
+                    return Err(limit - (used.min(limit)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Record tokens against a client's daily budget.
+    fn record_budget_usage(&self, client_id: &str, tokens: u64) {
+        if tokens == 0 || !self.client_budgets.contains_key(client_id) {
+            return;
+        }
+        let today = Self::now_epoch() / 86400;
+        if let Ok(mut map) = self.budget_usage.lock() {
+            let entry = map.entry(client_id.to_string()).or_insert((today, 0));
+            if entry.0 != today {
+                *entry = (today, 0); // reset on new day
+            }
+            entry.1 += tokens;
+        }
+    }
+}
+
 // ── Auto-cache injection ────────────────────────────────────────────
 
 struct CacheInjection {
@@ -741,6 +954,7 @@ async fn proxy_handler(
     req: Request<Body>,
 ) -> Response {
     let client_ip = client_addr.ip();
+    let request_start = Instant::now();
 
     // IP allowlist check
     if !state.is_ip_allowed(&client_ip) {
@@ -773,6 +987,12 @@ async fn proxy_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-")
         .to_string();
+
+    // Budget check: reject if client has exceeded their daily token budget
+    if client_id != "-" && state.check_budget(&client_id).is_err() {
+        warn!(client_id = %client_id, "rejected: daily token budget exceeded");
+        return (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response();
+    }
 
     let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
         Ok(b) => b,
@@ -824,7 +1044,7 @@ async fn proxy_handler(
 
     let n = state.accounts.len();
     for _attempt in 0..n {
-        let idx = match state.pick_account(affinity).await {
+        let idx = match state.pick_account(affinity, &model).await {
             Some(i) => i,
             None => {
                 warn!("all accounts rate-limited");
@@ -898,7 +1118,7 @@ async fn proxy_handler(
         upstream_req = upstream_req.headers(headers);
         upstream_req = upstream_req.body(body_bytes.clone());
 
-        let resp = match upstream_req.send().await {
+        let mut resp = match upstream_req.send().await {
             Ok(r) => r,
             Err(e) => {
                 error!(account = acct.name, "upstream request failed: {e}");
@@ -912,11 +1132,22 @@ async fn proxy_handler(
         // Always update rate limit info and persist
         state.update_rate_info(idx, resp.headers()).await;
 
-        // 429 → mark and try next
+        // 429 → mark hard-limited and try next account
         if status == StatusCode::TOO_MANY_REQUESTS {
             state.mark_hard_limited(idx, resp.headers()).await;
             state.save_state().await;
             info!(account = acct.name, "got 429, rotating to next account");
+            continue;
+        }
+
+        // 5xx/529 → transient upstream error, try next account (don't mark hard-limited)
+        if status.is_server_error() || status.as_u16() == 529 {
+            state.save_state().await;
+            warn!(
+                account = acct.name,
+                status = status.as_u16(),
+                "got server error, rotating to next account"
+            );
             continue;
         }
 
@@ -941,7 +1172,9 @@ async fn proxy_handler(
             );
         }
 
-        // Stream response through without buffering (supports SSE/streaming)
+        let latency_ms = request_start.elapsed().as_millis() as u64;
+
+        // Stream response through, extracting token usage
         let resp_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let resp_headers = resp.headers().clone();
 
@@ -952,11 +1185,93 @@ async fn proxy_handler(
             }
             builder = builder.header(k, v);
         }
-        return builder
-            .body(Body::from_stream(resp.bytes_stream()))
-            .unwrap_or_else(|_| {
+
+        // Detect streaming from content-type
+        let is_streaming = resp_headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.contains("text/event-stream"))
+            .unwrap_or(false);
+
+        if is_streaming {
+            // Streaming: tee the byte stream to accumulate SSE text for usage extraction
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+            let state_clone = state.clone();
+            let client_id_clone = client_id.clone();
+            let acct_name = acct.name.clone();
+            let model_clone = model.clone();
+            let client_ip_str = client_ip.to_string();
+            let agent_clone = agent_id.clone();
+            let session_clone = session_id.clone();
+
+            tokio::spawn(async move {
+                let mut sse_buf = Vec::new();
+                while let Ok(Some(chunk)) = resp.chunk().await {
+                    sse_buf.extend_from_slice(&chunk);
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        break; // client disconnected
+                    }
+                }
+                // Parse accumulated SSE data for usage
+                let text = String::from_utf8_lossy(&sse_buf);
+                let usage = TokenUsage::from_sse_text(&text);
+                if !usage.is_empty() {
+                    state_clone.record_usage(idx, &client_id_clone, &usage);
+                }
+                state_clone.shadow_log(serde_json::json!({
+                    "ts": AppState::now_epoch(),
+                    "client": client_ip_str,
+                    "client_id": client_id_clone,
+                    "agent": agent_clone,
+                    "session": session_clone,
+                    "model": model_clone,
+                    "account": acct_name,
+                    "status": status.as_u16(),
+                    "stream": true,
+                    "latency_ms": request_start.elapsed().as_millis() as u64,
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens,
+                }));
+            });
+
+            let body_stream = ReceiverStream::new(rx);
+            return builder
+                .body(Body::from_stream(body_stream))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+                });
+        } else {
+            // Non-streaming: buffer, extract usage, forward
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let mut usage = TokenUsage::default();
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                usage = TokenUsage::from_response_body(&parsed);
+                if !usage.is_empty() {
+                    state.record_usage(idx, &client_id, &usage);
+                }
+            }
+            state.shadow_log(serde_json::json!({
+                "ts": AppState::now_epoch(),
+                "client": client_ip.to_string(),
+                "client_id": client_id,
+                "agent": agent_id,
+                "session": session_id,
+                "model": model,
+                "account": acct.name,
+                "status": status.as_u16(),
+                "stream": false,
+                "latency_ms": latency_ms,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": usage.cache_read_input_tokens,
+            }));
+            return builder.body(Body::from(body_bytes)).unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
+        }
     }
 
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all accounts").into_response()
@@ -1117,6 +1432,12 @@ async fn stats_handler(
             "limit_requests": info.limit_requests,
             "limit_tokens": info.limit_tokens,
             "hard_limited_remaining_secs": hard_limited,
+            "token_usage": {
+                "input_tokens": acct.input_tokens.load(Ordering::Relaxed),
+                "output_tokens": acct.output_tokens.load(Ordering::Relaxed),
+                "cache_creation_input_tokens": acct.cache_creation_tokens.load(Ordering::Relaxed),
+                "cache_read_input_tokens": acct.cache_read_tokens.load(Ordering::Relaxed),
+            },
         }));
     }
     let mut upstream_stats = Vec::new();
@@ -1128,9 +1449,63 @@ async fn stats_handler(
         }));
     }
 
+    // Per-client usage
+    let client_usage: serde_json::Value = state
+        .client_usage
+        .lock()
+        .map(|map| {
+            let obj: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        serde_json::json!({
+                            "input_tokens": v[0],
+                            "output_tokens": v[1],
+                            "cache_creation_input_tokens": v[2],
+                            "cache_read_input_tokens": v[3],
+                        }),
+                    )
+                })
+                .collect();
+            serde_json::Value::Object(obj)
+        })
+        .unwrap_or(serde_json::json!({}));
+
+    // Per-client budget status
+    let budgets: serde_json::Value = if state.client_budgets.is_empty() {
+        serde_json::json!(null)
+    } else {
+        let today = AppState::now_epoch() / 86400;
+        let usage_map = state.budget_usage.lock().ok();
+        let obj: serde_json::Map<String, serde_json::Value> = state
+            .client_budgets
+            .iter()
+            .map(|(client, &limit)| {
+                let used = usage_map
+                    .as_ref()
+                    .and_then(|m| m.get(client))
+                    .filter(|(day, _)| *day == today)
+                    .map(|(_, used)| *used)
+                    .unwrap_or(0);
+                (
+                    client.clone(),
+                    serde_json::json!({
+                        "daily_limit": limit,
+                        "used_today": used,
+                        "remaining": limit.saturating_sub(used),
+                    }),
+                )
+            })
+            .collect();
+        serde_json::Value::Object(obj)
+    };
+
     axum::Json(serde_json::json!({
         "accounts": out,
         "upstreams": upstream_stats,
+        "client_usage": client_usage,
+        "client_budgets": budgets,
         "strategy": "dynamic-capacity",
     }))
     .into_response()
@@ -1416,6 +1791,7 @@ async fn openai_chat_handler(
     req: Request<Body>,
 ) -> Response {
     let client_ip = client_addr.ip();
+    let request_start = Instant::now();
 
     // IP allowlist check
     if !state.is_ip_allowed(&client_ip) {
@@ -1448,6 +1824,12 @@ async fn openai_chat_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-")
         .to_string();
+
+    // Budget check: reject if client has exceeded their daily token budget
+    if client_id != "-" && state.check_budget(&client_id).is_err() {
+        warn!(client_id = %client_id, "rejected: daily token budget exceeded");
+        return (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response();
+    }
 
     let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
         Ok(b) => b,
@@ -1503,7 +1885,7 @@ async fn openai_chat_handler(
 
     let n = state.accounts.len();
     for _attempt in 0..n {
-        let idx = match state.pick_account(affinity).await {
+        let idx = match state.pick_account(affinity, &model).await {
             Some(i) => i,
             None => {
                 warn!("all accounts rate-limited");
@@ -1592,6 +1974,17 @@ async fn openai_chat_handler(
             continue;
         }
 
+        // 5xx/529 → transient upstream error, try next account (don't mark hard-limited)
+        if status.is_server_error() || status.as_u16() == 529 {
+            state.save_state().await;
+            warn!(
+                account = acct.name,
+                status = status.as_u16(),
+                "got server error, rotating to next account"
+            );
+            continue;
+        }
+
         state.save_state().await;
 
         {
@@ -1625,14 +2018,24 @@ async fn openai_chat_handler(
 
         if is_streaming {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+            let state_clone = state.clone();
+            let client_id_clone = client_id.clone();
+            let acct_name = acct.name.clone();
+            let model_clone = model.clone();
+            let client_ip_str = client_ip.to_string();
+            let agent_clone = agent_id.clone();
+            let session_clone = session_id.clone();
 
             tokio::spawn(async move {
                 let mut buffer = String::new();
+                let mut raw_sse = String::new(); // accumulate for usage extraction
                 let mut ctx = StreamContext::default();
                 let mut sent_done = false;
 
                 while let Ok(Some(chunk)) = resp.chunk().await {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    let chunk_str = String::from_utf8_lossy(&chunk);
+                    buffer.push_str(&chunk_str);
+                    raw_sse.push_str(&chunk_str);
 
                     while let Some(pos) = buffer.find("\n\n") {
                         let event = buffer[..pos].to_string();
@@ -1667,6 +2070,29 @@ async fn openai_chat_handler(
                 if !sent_done {
                     let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
                 }
+
+                // Extract and record token usage from accumulated SSE data
+                let usage = TokenUsage::from_sse_text(&raw_sse);
+                if !usage.is_empty() {
+                    state_clone.record_usage(idx, &client_id_clone, &usage);
+                }
+                state_clone.shadow_log(serde_json::json!({
+                    "ts": AppState::now_epoch(),
+                    "client": client_ip_str,
+                    "client_id": client_id_clone,
+                    "agent": agent_clone,
+                    "session": session_clone,
+                    "model": model_clone,
+                    "account": acct_name,
+                    "status": status.as_u16(),
+                    "stream": true,
+                    "openai_compat": true,
+                    "latency_ms": request_start.elapsed().as_millis() as u64,
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens,
+                }));
             });
 
             return Response::builder()
@@ -1704,6 +2130,30 @@ async fn openai_chat_handler(
         };
 
         let openai_resp = translate_anthropic_to_openai(&anthropic_resp);
+
+        // Extract and record token usage from non-streaming response
+        let usage = TokenUsage::from_response_body(&anthropic_resp);
+        if !usage.is_empty() {
+            state.record_usage(idx, &client_id, &usage);
+        }
+        state.shadow_log(serde_json::json!({
+            "ts": AppState::now_epoch(),
+            "client": client_ip.to_string(),
+            "client_id": client_id,
+            "agent": agent_id,
+            "session": session_id,
+            "model": model,
+            "account": acct.name,
+            "status": status.as_u16(),
+            "stream": false,
+            "openai_compat": true,
+            "latency_ms": request_start.elapsed().as_millis() as u64,
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            "cache_read_input_tokens": usage.cache_read_input_tokens,
+        }));
+
         return axum::Json(openai_resp).into_response();
     }
 
@@ -1772,13 +2222,22 @@ async fn main() {
         .into_iter()
         .map(|a| {
             let passthrough = a.token == "passthrough";
-            info!(name = a.name, passthrough, "loaded account");
+            if !a.models.is_empty() {
+                info!(name = a.name, passthrough, models = ?a.models, "loaded account");
+            } else {
+                info!(name = a.name, passthrough, "loaded account");
+            }
             Account {
                 name: a.name,
                 passthrough,
+                models: a.models,
                 token: a.token,
                 requests: AtomicU64::new(0),
                 rate_info: RwLock::new(RateLimitInfo::default()),
+                input_tokens: AtomicU64::new(0),
+                output_tokens: AtomicU64::new(0),
+                cache_creation_tokens: AtomicU64::new(0),
+                cache_read_tokens: AtomicU64::new(0),
             }
         })
         .collect();
@@ -1811,6 +2270,37 @@ async fn main() {
 
     let state_path = PathBuf::from(&config_path).with_extension("state.json");
 
+    // Set up shadow log writer if configured
+    let shadow_log_tx = if let Some(ref path) = config.shadow_log {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let log_path = PathBuf::from(path);
+        info!(path = %log_path.display(), "shadow log enabled");
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut file = match tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    error!(path = %log_path.display(), error = %e, "failed to open shadow log");
+                    return;
+                }
+            };
+            while let Some(line) = rx.recv().await {
+                let data = format!("{}\n", line);
+                if let Err(e) = file.write_all(data.as_bytes()).await {
+                    error!(error = %e, "shadow log write failed");
+                }
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         client: Client::builder()
             .timeout(Duration::from_secs(600))
@@ -1826,6 +2316,10 @@ async fn main() {
         upstreams,
         client_names: config.client_names.clone(),
         auto_cache: config.auto_cache.unwrap_or(true),
+        client_usage: Mutex::new(HashMap::new()),
+        shadow_log_tx,
+        client_budgets: config.client_budgets.clone(),
+        budget_usage: Mutex::new(HashMap::new()),
     });
 
     if state.auto_cache {
@@ -1916,8 +2410,13 @@ mod tests {
             name: name.to_string(),
             token: token.to_string(),
             passthrough: token == "passthrough",
+            models: vec![],
             requests: AtomicU64::new(0),
             rate_info: RwLock::new(RateLimitInfo::default()),
+            input_tokens: AtomicU64::new(0),
+            output_tokens: AtomicU64::new(0),
+            cache_creation_tokens: AtomicU64::new(0),
+            cache_read_tokens: AtomicU64::new(0),
         }
     }
 
@@ -1937,6 +2436,10 @@ mod tests {
             upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
         })
     }
 
@@ -2006,6 +2509,10 @@ mod tests {
             }],
             client_names: HashMap::new(),
             auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
         });
 
         let app = Router::new()
@@ -2062,6 +2569,10 @@ mod tests {
             upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -2090,7 +2601,7 @@ mod tests {
 
         let mut counts = [0u32; 2];
         for _ in 0..1000 {
-            let idx = state.pick_account(None).await.unwrap();
+            let idx = state.pick_account(None, "").await.unwrap();
             counts[idx] += 1;
         }
 
@@ -2121,7 +2632,7 @@ mod tests {
             info.utilization = Some(0.9);
         }
 
-        let idx = state.pick_account(None).await.unwrap();
+        let idx = state.pick_account(None, "").await.unwrap();
         assert_eq!(
             idx, 1,
             "should skip hard-limited account despite lower utilization"
@@ -2140,7 +2651,7 @@ mod tests {
         // Call many times without affinity — Fibonacci scatter should distribute evenly
         let mut counts = [0u32; 3];
         for _ in 0..300 {
-            let idx = state.pick_account(None).await.unwrap();
+            let idx = state.pick_account(None, "").await.unwrap();
             counts[idx] += 1;
         }
 
@@ -2168,7 +2679,7 @@ mod tests {
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
         }
 
-        assert!(state.pick_account(None).await.is_none());
+        assert!(state.pick_account(None, "").await.is_none());
     }
 
     #[tokio::test]
@@ -2189,7 +2700,7 @@ mod tests {
         // known should get ~64% (0.9 / 1.4), unknown ~36% (0.5 / 1.4)
         let mut counts = [0u32; 2];
         for _ in 0..1000 {
-            let idx = state.pick_account(None).await.unwrap();
+            let idx = state.pick_account(None, "").await.unwrap();
             counts[idx] += 1;
         }
 
@@ -2225,9 +2736,9 @@ mod tests {
         }
 
         let key = "192.168.1.1:client-42:agent-7:session-abc";
-        let first = state.pick_account(Some(key)).await.unwrap();
+        let first = state.pick_account(Some(key), "").await.unwrap();
         for _ in 0..100 {
-            let idx = state.pick_account(Some(key)).await.unwrap();
+            let idx = state.pick_account(Some(key), "").await.unwrap();
             assert_eq!(
                 idx, first,
                 "same affinity key must always pick same account"
@@ -2259,7 +2770,7 @@ mod tests {
         let mut primary_keys: Vec<String> = Vec::new();
         for i in 0..500 {
             let key = format!("test-client-{}", i);
-            if state.pick_account(Some(&key)).await.unwrap() == 0 {
+            if state.pick_account(Some(&key), "").await.unwrap() == 0 {
                 primary_keys.push(key);
             }
         }
@@ -2277,7 +2788,7 @@ mod tests {
         // Most of these clients should migrate to backup
         let mut migrated = 0usize;
         for key in &primary_keys {
-            if state.pick_account(Some(key)).await.unwrap() == 1 {
+            if state.pick_account(Some(key), "").await.unwrap() == 1 {
                 migrated += 1;
             }
         }
@@ -2319,7 +2830,7 @@ mod tests {
         let mut counts = [0u32; 3];
         let total = 10000u32;
         for _ in 0..total {
-            let idx = state.pick_account(None).await.unwrap();
+            let idx = state.pick_account(None, "").await.unwrap();
             counts[idx] += 1;
         }
 
@@ -2829,6 +3340,10 @@ mod tests {
             upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
         });
 
         let app = Router::new()
@@ -3183,5 +3698,263 @@ mod tests {
 
         let inj = inject_cache_breakpoints(&mut body);
         assert!(!inj.messages);
+    }
+
+    // ── Unit: token usage extraction ───────────────────────────────
+
+    #[test]
+    fn usage_from_non_streaming_response() {
+        let body = serde_json::json!({
+            "type": "message",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_creation_input_tokens": 20,
+                "cache_read_input_tokens": 30,
+            }
+        });
+        let usage = TokenUsage::from_response_body(&body);
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.cache_creation_input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 30);
+    }
+
+    #[test]
+    fn usage_from_response_no_usage_field() {
+        let body = serde_json::json!({"type": "error"});
+        let usage = TokenUsage::from_response_body(&body);
+        assert!(usage.is_empty());
+    }
+
+    #[test]
+    fn usage_from_sse_stream() {
+        let sse_text = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":150,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":5}}}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"Hello\"}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":75}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+        let usage = TokenUsage::from_sse_text(sse_text);
+        assert_eq!(usage.input_tokens, 150);
+        assert_eq!(usage.output_tokens, 75);
+        assert_eq!(usage.cache_creation_input_tokens, 10);
+        assert_eq!(usage.cache_read_input_tokens, 5);
+    }
+
+    #[test]
+    fn usage_from_empty_sse() {
+        let usage = TokenUsage::from_sse_text("");
+        assert!(usage.is_empty());
+    }
+
+    #[test]
+    fn record_usage_updates_account_and_client() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 20,
+            cache_read_input_tokens: 30,
+        };
+        state.record_usage(0, "test-client", &usage);
+
+        assert_eq!(state.accounts[0].input_tokens.load(Ordering::Relaxed), 100);
+        assert_eq!(state.accounts[0].output_tokens.load(Ordering::Relaxed), 50);
+        assert_eq!(
+            state.accounts[0]
+                .cache_creation_tokens
+                .load(Ordering::Relaxed),
+            20
+        );
+        assert_eq!(
+            state.accounts[0].cache_read_tokens.load(Ordering::Relaxed),
+            30
+        );
+
+        let map = state.client_usage.lock().unwrap();
+        let client = map.get("test-client").unwrap();
+        assert_eq!(client, &[100, 50, 20, 30]);
+    }
+
+    #[test]
+    fn record_usage_ignores_anonymous() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        state.record_usage(0, "-", &usage);
+
+        // Account gets updated
+        assert_eq!(state.accounts[0].input_tokens.load(Ordering::Relaxed), 100);
+        // But no client entry for anonymous
+        let map = state.client_usage.lock().unwrap();
+        assert!(!map.contains_key("-"));
+    }
+
+    // ── Unit: model-based routing ──────────────────────────────────
+
+    #[test]
+    fn account_serves_model_no_filter() {
+        let acct = make_account("a", "sk-ant-api-x");
+        assert!(acct.serves_model("claude-opus-4-20250514"));
+        assert!(acct.serves_model("claude-haiku-4-5-20251001"));
+        assert!(acct.serves_model(""));
+    }
+
+    #[test]
+    fn account_serves_model_exact_match() {
+        let mut acct = make_account("a", "sk-ant-api-x");
+        acct.models = vec!["claude-sonnet-4-20250514".to_string()];
+        assert!(acct.serves_model("claude-sonnet-4-20250514"));
+        assert!(!acct.serves_model("claude-opus-4-20250514"));
+    }
+
+    #[test]
+    fn account_serves_model_prefix_match() {
+        let mut acct = make_account("a", "sk-ant-api-x");
+        acct.models = vec!["claude-opus-*".to_string(), "claude-sonnet-*".to_string()];
+        assert!(acct.serves_model("claude-opus-4-20250514"));
+        assert!(acct.serves_model("claude-sonnet-4-20250514"));
+        assert!(!acct.serves_model("claude-haiku-4-5-20251001"));
+    }
+
+    #[tokio::test]
+    async fn pick_account_filters_by_model() {
+        let mut acct_a = make_account("opus-only", "sk-ant-api-a");
+        acct_a.models = vec!["claude-opus-*".to_string()];
+
+        let acct_b = make_account("any-model", "sk-ant-api-b");
+
+        let state = test_state_with(vec![acct_a, acct_b]);
+
+        // Requesting opus: both accounts eligible
+        let idx = state
+            .pick_account(None, "claude-opus-4-20250514")
+            .await
+            .unwrap();
+        assert!(idx == 0 || idx == 1);
+
+        // Requesting haiku: only acct_b eligible
+        let idx = state
+            .pick_account(None, "claude-haiku-4-5-20251001")
+            .await
+            .unwrap();
+        assert_eq!(idx, 1);
+    }
+
+    // ── Unit: per-client budget ────────────────────────────────────
+
+    #[test]
+    fn budget_check_no_limit_configured() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        assert!(state.check_budget("any-client").is_ok());
+    }
+
+    #[test]
+    fn budget_check_within_limit() {
+        let mut budgets = HashMap::new();
+        budgets.insert("client-a".to_string(), 1000u64);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: budgets,
+            budget_usage: Mutex::new(HashMap::new()),
+        });
+
+        // Within budget
+        assert!(state.check_budget("client-a").is_ok());
+
+        // Record some usage
+        state.record_budget_usage("client-a", 500);
+        assert!(state.check_budget("client-a").is_ok());
+
+        // Exceed budget
+        state.record_budget_usage("client-a", 600);
+        assert!(state.check_budget("client-a").is_err());
+
+        // Unknown client has no budget, always ok
+        assert!(state.check_budget("unknown").is_ok());
+    }
+
+    // ── Integration: 5xx retry ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn proxy_retries_on_server_error() {
+        // Spawn a mock that returns 500 on first request, 200 on second
+        let call_count = Arc::new(AtomicU64::new(0));
+        let count_clone = call_count.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let count = count_clone.fetch_add(1, Ordering::Relaxed);
+                let response = if count == 0 {
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 14\r\n\r\nserver error!!"
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 15\r\n\r\n{\"id\":\"test-1\"}"
+                };
+                use tokio::io::AsyncReadExt;
+                use tokio::io::AsyncWriteExt;
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let upstream_url = format!("http://{}", mock_addr);
+        let (app, _state) = test_app(&upstream_url, None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", app_addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "any")
+            .body(r#"{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        // The first attempt hits 500, second attempt should succeed with 200
+        assert_eq!(resp.status(), 200);
+        // Two calls to upstream (500 + 200)
+        assert_eq!(call_count.load(Ordering::Relaxed), 2);
     }
 }
