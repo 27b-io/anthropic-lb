@@ -7,8 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo build                          # Debug build
 cargo build --release                # Release build (~6MB binary)
-cargo test                           # Run all 32 tests
-cargo test <test_name>               # Run a single test (e.g. cargo test pick_prefers_lowest_utilization)
+cargo test                           # Run all 62 tests
+cargo test <test_name>               # Run a single test (e.g. cargo test pick_account_filters_by_model)
 cargo fmt --check                    # Format check (CI gate)
 RUSTFLAGS="-Dwarnings" cargo clippy --all-targets  # Lint (CI gate, warnings are errors)
 cargo llvm-cov                       # Coverage report (requires cargo-llvm-cov)
@@ -18,12 +18,12 @@ Run the proxy: `./target/release/anthropic-lb config.toml`
 
 ## Architecture
 
-Single-file Rust binary (`src/main.rs`, ~2000 lines) with inline tests. No library crate — everything lives in one file with section markers.
+Single-file Rust binary (`src/main.rs`, ~4000 lines) with inline tests. No library crate — everything lives in one file with section markers.
 
 ### Core Data Flow
 
 ```
-Request → IP allowlist check → proxy_key auth → pick_account() → forward to upstream → parse rate-limit headers → persist state
+Request → IP allowlist check → proxy_key auth → budget check → pick_account(model) → forward to upstream → parse rate-limit headers → extract token usage → shadow log → persist state
 ```
 
 ### Key Sections (in source order)
@@ -33,15 +33,20 @@ Request → IP allowlist check → proxy_key auth → pick_account() → forward
 | **Config** (`Config`, `AccountConfig`, `UpstreamConfig`) | TOML deserialization structs |
 | **Runtime state** (`AppState`, `Account`, `RateLimitInfo`) | Shared via `Arc<AppState>`, per-account `RwLock<RateLimitInfo>`, atomic counters |
 | **Persistence** (`PersistedState`) | JSON state file at `<config_path>.state.json`, saved after every request and on shutdown |
+| **Token usage** (`TokenUsage`, `record_usage`) | Extracts token counts from responses (streaming SSE + non-streaming JSON), tracks per-account and per-client |
+| **Auto-cache** (`inject_cache_breakpoints`) | Injects up to 3 prompt cache breakpoints (last tool, system, last user message) unless cache_control already present |
 | **Handlers** | Four axum handlers: `proxy_handler` (main Anthropic proxy), `upstream_handler` (OpenAI-compatible passthrough), `stats_handler` (`/_stats` JSON), `openai_chat_handler` (OpenAI→Anthropic format translation) |
 | **OpenAI compatibility** (`translate_*`, `StreamContext`) | Translates `/v1/chat/completions` requests/responses between OpenAI and Anthropic formats, including streaming SSE |
-| **Tests** (`mod tests`) | Inline at bottom — unit tests for IP/account selection + integration tests using a mock upstream server |
+| **Tests** (`mod tests`) | Inline at bottom — unit + integration tests using mock upstream servers |
 
 ### Account Selection (`pick_account`)
 
-Two-tier strategy:
-1. **Dynamic capacity**: pick account with lowest `utilization` value (from Anthropic's `anthropic-ratelimit-unified-*` headers). Hard-limited (429) accounts are skipped.
-2. **Round-robin fallback**: when no rate-limit data exists yet.
+Headroom-proportional weighted bucket hashing:
+1. Filter by model compatibility (if account has `models` allowlist)
+2. Skip hard-limited (429) accounts
+3. Each remaining account gets a bucket proportional to `(1.0 - utilization)`
+4. Affinity key (client+session hash) provides sticky routing; no-affinity uses Fibonacci scatter
+5. Retries on 429 (marks hard-limited) and 5xx/529 (rotates without marking)
 
 ### Token Type Detection (by prefix)
 
@@ -52,6 +57,22 @@ Two-tier strategy:
 ### Upstream Routing
 
 Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. Requests to `/upstream/{name}/*` are forwarded with `Authorization: Bearer` API key injection.
+
+### Config Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `listen` | string | required | Bind address (e.g. `"0.0.0.0:8080"`) |
+| `upstream` | string | required | Anthropic API base URL |
+| `proxy_key` | string? | none | Shared secret for `x-api-key` auth |
+| `allowed_ips` | string[]? | none (allow all) | IP/CIDR allowlist |
+| `auto_cache` | bool? | true | Auto-inject prompt cache breakpoints |
+| `shadow_log` | string? | none | Path for JSONL audit trail |
+| `client_names` | map? | {} | IP→client name mapping |
+| `client_budgets` | map? | {} | client_id→daily token limit |
+| `accounts[].name` | string | required | Account display name |
+| `accounts[].token` | string | required | API key, OAuth token, or `"passthrough"` |
+| `accounts[].models` | string[]? | [] (all) | Model allowlist (supports `*` suffix wildcards) |
 
 ## Testing Patterns
 
