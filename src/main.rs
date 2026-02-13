@@ -11,6 +11,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
@@ -71,6 +72,9 @@ struct RateLimitInfo {
     limit_tokens: Option<u64>,
     /// Unified utilization (0.0 = fresh, 1.0 = exhausted). From representative claim window.
     utilization: Option<f64>,
+    /// Per-window utilization for all known windows
+    utilization_7d: Option<f64>,
+    utilization_5h: Option<f64>,
     /// Which window is the binding constraint (e.g. "five_hour", "seven_day")
     representative_claim: Option<String>,
     hard_limited_until: Option<Instant>,
@@ -157,6 +161,10 @@ struct PersistedAccount {
     name: String,
     requests_total: u64,
     utilization: Option<f64>,
+    #[serde(default)]
+    utilization_7d: Option<f64>,
+    #[serde(default)]
+    utilization_5h: Option<f64>,
     representative_claim: Option<String>,
     remaining_requests: Option<u64>,
     remaining_tokens: Option<u64>,
@@ -192,6 +200,8 @@ impl AppState {
                 name: acct.name.clone(),
                 requests_total: acct.requests.load(Ordering::Relaxed),
                 utilization: info.utilization,
+                utilization_7d: info.utilization_7d,
+                utilization_5h: info.utilization_5h,
                 representative_claim: info.representative_claim.clone(),
                 remaining_requests: info.remaining_requests,
                 remaining_tokens: info.remaining_tokens,
@@ -279,9 +289,14 @@ impl AppState {
                     self.mark_hard_limited(idx, resp.headers()).await;
                 }
                 self.save_state().await;
+                let info = acct.rate_info.read().await;
                 info!(
                     account = acct.name,
                     status = status.as_u16(),
+                    utilization = ?info.utilization,
+                    util_7d = ?info.utilization_7d,
+                    util_5h = ?info.utilization_5h,
+                    claim = ?info.representative_claim,
                     "probe complete"
                 );
             }
@@ -316,6 +331,8 @@ impl AppState {
                 acct.requests.store(pa.requests_total, Ordering::Relaxed);
                 let mut info = acct.rate_info.write().await;
                 info.utilization = pa.utilization;
+                info.utilization_7d = pa.utilization_7d;
+                info.utilization_5h = pa.utilization_5h;
                 info.representative_claim = pa.representative_claim.clone();
                 info.remaining_requests = pa.remaining_requests;
                 info.remaining_tokens = pa.remaining_tokens;
@@ -347,73 +364,109 @@ impl AppState {
 }
 
 impl AppState {
-    /// Pick the best available account.
-    /// Strategy: choose the account with the most remaining tokens.
-    /// Falls back to round-robin if no rate limit info is available yet.
-    async fn pick_account(&self) -> Option<usize> {
-        let n = self.accounts.len();
+    /// Pick the best available account using headroom-proportional weighted bucket hashing.
+    ///
+    /// Each non-hard-limited account gets a "bucket" proportional to its available headroom
+    /// (1.0 - utilization). An affinity key hashes to a stable position in the bucket space,
+    /// providing stickiness. As utilization changes, bucket boundaries shift and clients near
+    /// the edges naturally migrate — no timers or thresholds needed.
+    async fn pick_account(&self, affinity_key: Option<&str>) -> Option<usize> {
         let now = Instant::now();
 
-        // First pass: find account with lowest utilization (most headroom)
-        let mut best_idx: Option<usize> = None;
-        let mut best_utilization: f64 = f64::MAX;
-        let mut has_any_info = false;
-        let mut available_count = 0;
-
-        for i in 0..n {
-            let info = self.accounts[i].rate_info.read().await;
+        // Build candidate list: (index, headroom) for non-hard-limited accounts
+        let mut candidates: Vec<(usize, f64)> = Vec::new();
+        for (i, acct) in self.accounts.iter().enumerate() {
+            let info = acct.rate_info.read().await;
 
             // Skip hard-limited accounts
             if let Some(until) = info.hard_limited_until {
                 if now < until {
+                    let remaining = until.duration_since(now);
+                    debug!(
+                        account = acct.name,
+                        hard_limited_secs = remaining.as_secs(),
+                        "pick: skipping hard-limited account"
+                    );
                     continue;
                 }
             }
 
-            available_count += 1;
-
-            // Get effective utilization: known value, legacy conversion, or 0.0 (unknown = fresh)
-            let effective_util = if let Some(util) = info.utilization {
-                has_any_info = true;
-                util
+            // Effective utilization: unified (max of windows), legacy, or 0.5 (unknown)
+            let (effective_util, source) = if let Some(util) = info.utilization {
+                (util, "unified")
             } else if let Some(remaining) = info.remaining_tokens {
-                has_any_info = true;
                 let limit = info.limit_tokens.unwrap_or(1_000_000);
-                1.0 - (remaining as f64 / limit as f64)
+                (1.0 - (remaining as f64 / limit as f64), "legacy")
             } else {
-                // No rate info — don't influence smart routing, fall through to round-robin
-                0.0
+                (0.5, "unknown")
             };
 
-            if effective_util < best_utilization {
-                best_utilization = effective_util;
-                best_idx = Some(i);
-            }
+            let headroom = (1.0 - effective_util).max(0.01);
+
+            debug!(
+                account = acct.name,
+                effective_util = format!("{:.4}", effective_util),
+                headroom = format!("{:.4}", headroom),
+                source = source,
+                claim = ?info.representative_claim,
+                raw_utilization = ?info.utilization,
+                util_7d = ?info.utilization_7d,
+                util_5h = ?info.utilization_5h,
+                "pick: candidate"
+            );
+
+            candidates.push((i, headroom));
         }
 
-        if available_count == 0 {
+        if candidates.is_empty() {
+            debug!("pick: no available accounts");
             return None;
         }
 
-        if has_any_info {
-            if let Some(idx) = best_idx {
+        // Total headroom across all candidates
+        let total_headroom: f64 = candidates.iter().map(|(_, h)| h).sum();
+
+        // Compute position in [0, 10000) — either stable (affinity) or scattered (round-robin)
+        let position = if let Some(key) = affinity_key {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut hasher);
+            (hasher.finish() % 10000) as f64
+        } else {
+            // Fibonacci hash scatter for even distribution without affinity
+            let counter = self.robin.fetch_add(1, Ordering::Relaxed) as u64;
+            (counter.wrapping_mul(11400714819323198485) % 10000) as f64
+        };
+
+        // Normalize position into [0, total_headroom)
+        let target = position / 10000.0 * total_headroom;
+
+        // Walk weighted buckets
+        let mut cumulative = 0.0;
+        for &(idx, headroom) in &candidates {
+            cumulative += headroom;
+            if target < cumulative {
+                debug!(
+                    account = self.accounts[idx].name,
+                    affinity_key = affinity_key.unwrap_or("-"),
+                    position = format!("{:.1}", position),
+                    target = format!("{:.4}", target),
+                    headroom = format!("{:.4}", headroom),
+                    total_headroom = format!("{:.4}", total_headroom),
+                    candidates = candidates.len(),
+                    "pick: selected by weighted bucket"
+                );
                 return Some(idx);
             }
         }
 
-        // Fallback: round-robin
-        let start = self.robin.fetch_add(1, Ordering::Relaxed) % n;
-        for offset in 0..n {
-            let idx = (start + offset) % n;
-            let info = self.accounts[idx].rate_info.read().await;
-            if let Some(until) = info.hard_limited_until {
-                if now < until {
-                    continue;
-                }
-            }
-            return Some(idx);
-        }
-        None
+        // Floating-point edge case: pick last candidate
+        let &(idx, _) = candidates.last().unwrap();
+        debug!(
+            account = self.accounts[idx].name,
+            affinity_key = affinity_key.unwrap_or("-"),
+            "pick: selected last candidate (float edge)"
+        );
+        Some(idx)
     }
 
     /// Update rate limit info from response headers.
@@ -436,8 +489,19 @@ impl AppState {
             }
         }
 
-        // New unified rate limit headers (Anthropic 2025+)
-        // Get the representative claim window to know which utilization to use
+        // Capture per-window utilization (always, regardless of representative claim)
+        if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-utilization") {
+            if let Ok(s) = v.to_str() {
+                info.utilization_7d = s.parse::<f64>().ok().map(|v| v.clamp(0.0, 1.0));
+            }
+        }
+        if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-utilization") {
+            if let Ok(s) = v.to_str() {
+                info.utilization_5h = s.parse::<f64>().ok().map(|v| v.clamp(0.0, 1.0));
+            }
+        }
+
+        // Representative claim tells us which window is the binding constraint
         let rep_claim = headers
             .get("anthropic-ratelimit-unified-representative-claim")
             .and_then(|v| v.to_str().ok())
@@ -445,37 +509,20 @@ impl AppState {
 
         if let Some(ref claim) = rep_claim {
             info.representative_claim = Some(claim.clone());
-            // Map claim to header prefix: "seven_day" -> "7d", "five_hour" -> "5h"
-            let window = match claim.as_str() {
-                "seven_day" => "7d",
-                "five_hour" => "5h",
-                _ => claim.as_str(),
-            };
-            let util_header = format!("anthropic-ratelimit-unified-{}-utilization", window);
-            if let Some(v) = headers.get(util_header.as_str()) {
-                if let Ok(s) = v.to_str() {
-                    info.utilization = s.parse().ok();
-                }
-            }
         }
 
-        // Also check top-level utilization as fallback
-        if info.utilization.is_none() {
-            // Try all known windows
-            for window in &["7d", "5h"] {
-                let header = format!("anthropic-ratelimit-unified-{}-utilization", window);
-                if let Some(v) = headers.get(header.as_str()) {
-                    if let Ok(s) = v.to_str() {
-                        if let Ok(util) = s.parse::<f64>() {
-                            // Use the highest utilization as the binding constraint
-                            let current = info.utilization.unwrap_or(0.0);
-                            if util > current {
-                                info.utilization = Some(util);
-                            }
-                        }
-                    }
-                }
-            }
+        // Use the MAX of all known window utilizations as the effective utilization.
+        // This prevents the bug where accounts with different representative claims
+        // get compared on different time windows (apples vs oranges).
+        let mut max_util: Option<f64> = None;
+        for u in [info.utilization_7d, info.utilization_5h]
+            .into_iter()
+            .flatten()
+        {
+            max_util = Some(max_util.map_or(u, |cur: f64| cur.max(u)));
+        }
+        if max_util.is_some() {
+            info.utilization = max_util;
         }
 
         // Legacy headers (still try them)
@@ -500,6 +547,17 @@ impl AppState {
             }
         }
         info.last_updated = Some(Instant::now());
+
+        debug!(
+            account = acct.name,
+            utilization = ?info.utilization,
+            util_7d = ?info.utilization_7d,
+            util_5h = ?info.utilization_5h,
+            claim = ?info.representative_claim,
+            remaining_requests = ?info.remaining_requests,
+            remaining_tokens = ?info.remaining_tokens,
+            "rate info updated"
+        );
     }
 
     /// Mark an account as hard rate-limited (got a 429).
@@ -510,7 +568,11 @@ impl AppState {
         let cooldown = if let Some(v) = headers.get("retry-after") {
             if let Ok(s) = v.to_str() {
                 if let Ok(secs) = s.parse::<f64>() {
-                    Duration::from_secs_f64(secs)
+                    if secs.is_finite() && secs > 0.0 && secs < 86400.0 {
+                        Duration::from_secs_f64(secs)
+                    } else {
+                        self.cooldown
+                    }
                 } else {
                     self.cooldown
                 }
@@ -590,9 +652,19 @@ async fn proxy_handler(
         .and_then(|v| v.get("model").and_then(|m| m.as_str().map(String::from)))
         .unwrap_or_default();
 
+    // Build affinity key for sticky routing — only use stickiness when there's
+    // meaningful client identification beyond just the IP address
+    let affinity_key = format!("{}:{}:{}:{}", client_ip, client_id, agent_id, session_id);
+    let has_identity = client_id != "-" || agent_id != "-" || session_id != "-";
+    let affinity = if has_identity {
+        Some(affinity_key.as_str())
+    } else {
+        None
+    };
+
     let n = state.accounts.len();
     for _attempt in 0..n {
-        let idx = match state.pick_account().await {
+        let idx = match state.pick_account(affinity).await {
             Some(i) => i,
             None => {
                 warn!("all accounts rate-limited");
@@ -876,6 +948,8 @@ async fn stats_handler(
             "passthrough": acct.passthrough,
             "requests_total": acct.requests.load(Ordering::Relaxed),
             "utilization": info.utilization,
+            "utilization_7d": info.utilization_7d,
+            "utilization_5h": info.utilization_5h,
             "representative_claim": info.representative_claim,
             "remaining_requests": info.remaining_requests,
             "remaining_tokens": info.remaining_tokens,
@@ -1242,9 +1316,19 @@ async fn openai_chat_handler(
 
     let anthropic_body = translate_openai_to_anthropic(&openai_body);
 
+    // Build affinity key for sticky routing — only use stickiness when there's
+    // meaningful client identification beyond just the IP address
+    let affinity_key = format!("{}:{}:{}:{}", client_ip, client_id, agent_id, session_id);
+    let has_identity = client_id != "-" || agent_id != "-" || session_id != "-";
+    let affinity = if has_identity {
+        Some(affinity_key.as_str())
+    } else {
+        None
+    };
+
     let n = state.accounts.len();
     for _attempt in 0..n {
-        let idx = match state.pick_account().await {
+        let idx = match state.pick_account(affinity).await {
             Some(i) => i,
             None => {
                 warn!("all accounts rate-limited");
@@ -1671,6 +1755,7 @@ mod tests {
             proxy_key: None,
             allowed_ips: vec![],
             upstreams: vec![],
+            client_names: HashMap::new(),
         })
     }
 
@@ -1738,6 +1823,7 @@ mod tests {
                 api_key: "test-key".to_string(),
                 requests: AtomicU64::new(0),
             }],
+            client_names: HashMap::new(),
         });
 
         let app = Router::new()
@@ -1792,6 +1878,7 @@ mod tests {
             proxy_key: None,
             allowed_ips: vec![IpAllowEntry::Addr("10.0.0.1".parse().unwrap())],
             upstreams: vec![],
+            client_names: HashMap::new(),
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -1801,12 +1888,14 @@ mod tests {
 
     #[tokio::test]
     async fn pick_prefers_lowest_utilization() {
+        // With weighted buckets, the account with more headroom should get
+        // a proportionally larger share of traffic
         let state = test_state_with(vec![
             make_account("high", "sk-ant-api-high"),
             make_account("low", "sk-ant-api-low"),
         ]);
 
-        // Set utilization: high=0.8, low=0.2
+        // high=0.8 (headroom 0.2), low=0.2 (headroom 0.8) → 80% should go to "low"
         {
             let mut info = state.accounts[0].rate_info.write().await;
             info.utilization = Some(0.8);
@@ -1816,8 +1905,19 @@ mod tests {
             info.utilization = Some(0.2);
         }
 
-        let idx = state.pick_account().await.unwrap();
-        assert_eq!(idx, 1, "should pick account with lower utilization");
+        let mut counts = [0u32; 2];
+        for _ in 0..1000 {
+            let idx = state.pick_account(None).await.unwrap();
+            counts[idx] += 1;
+        }
+
+        // "low" (idx=1) should get ~80% of traffic (±5%)
+        let low_pct = counts[1] as f64 / 1000.0;
+        assert!(
+            (0.75..=0.85).contains(&low_pct),
+            "low-util account should get ~80% traffic, got {:.1}%",
+            low_pct * 100.0
+        );
     }
 
     #[tokio::test]
@@ -1838,7 +1938,7 @@ mod tests {
             info.utilization = Some(0.9);
         }
 
-        let idx = state.pick_account().await.unwrap();
+        let idx = state.pick_account(None).await.unwrap();
         assert_eq!(
             idx, 1,
             "should skip hard-limited account despite lower utilization"
@@ -1847,24 +1947,30 @@ mod tests {
 
     #[tokio::test]
     async fn pick_round_robin_when_no_info() {
+        // With no utilization data, all accounts get headroom=0.5 (equal buckets)
         let state = test_state_with(vec![
             make_account("a", "sk-ant-api-a"),
             make_account("b", "sk-ant-api-b"),
             make_account("c", "sk-ant-api-c"),
         ]);
 
-        // No utilization set — should round-robin
-        let first = state.pick_account().await.unwrap();
-        let second = state.pick_account().await.unwrap();
-        let third = state.pick_account().await.unwrap();
+        // Call many times without affinity — Fibonacci scatter should distribute evenly
+        let mut counts = [0u32; 3];
+        for _ in 0..300 {
+            let idx = state.pick_account(None).await.unwrap();
+            counts[idx] += 1;
+        }
 
-        // Round-robin should cycle through all accounts
-        let selected: std::collections::HashSet<usize> = [first, second, third].into();
-        assert_eq!(
-            selected.len(),
-            3,
-            "round-robin should cycle through all accounts"
-        );
+        // Each should get ~33% (±10%)
+        for (i, &count) in counts.iter().enumerate() {
+            let pct = count as f64 / 300.0;
+            assert!(
+                (0.23..=0.43).contains(&pct),
+                "account {} should get ~33% traffic, got {:.1}%",
+                i,
+                pct * 100.0
+            );
+        }
     }
 
     #[tokio::test]
@@ -1879,49 +1985,177 @@ mod tests {
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
         }
 
-        assert!(state.pick_account().await.is_none());
+        assert!(state.pick_account(None).await.is_none());
     }
 
     #[tokio::test]
     async fn pick_does_not_bias_unknown_accounts() {
-        // Bug 2 regression test: unknown accounts should NOT dominate selection
+        // Unknown accounts get headroom=0.5, known account with 0.1 util gets headroom=0.9
+        // Traffic should favor the known account proportionally
         let state = test_state_with(vec![
             make_account("known", "sk-ant-api-known"),
             make_account("unknown", "sk-ant-api-unknown"),
         ]);
 
-        // Only set info on the known account — unknown has no data
         {
             let mut info = state.accounts[0].rate_info.write().await;
-            info.utilization = Some(0.1); // very low utilization
+            info.utilization = Some(0.1); // headroom = 0.9
         }
-        // accounts[1] has no rate info at all
+        // accounts[1] has no rate info → headroom = 0.5
 
-        // With the bug fix, since only one account has info, has_any_info=true
-        // and the known account (0.1) should be preferred over unknown (0.0).
-        // Actually — unknown gets 0.0 which IS lower than 0.1. The difference
-        // is that has_any_info is set by the known account, so the smart path
-        // runs. Unknown still wins at 0.0 vs 0.1, but that's OK — the bug was
-        // that *only* unknown accounts (no known accounts at all) would set
-        // has_any_info=true and bypass round-robin. Let's test that case.
-        drop(state);
-
-        let state = test_state_with(vec![
-            make_account("unknown-a", "sk-ant-api-a"),
-            make_account("unknown-b", "sk-ant-api-b"),
-        ]);
-        // No rate info on either account
-
-        // Call pick_account multiple times — should distribute via round-robin
-        let mut picks = Vec::new();
-        for _ in 0..4 {
-            picks.push(state.pick_account().await.unwrap());
+        // known should get ~64% (0.9 / 1.4), unknown ~36% (0.5 / 1.4)
+        let mut counts = [0u32; 2];
+        for _ in 0..1000 {
+            let idx = state.pick_account(None).await.unwrap();
+            counts[idx] += 1;
         }
-        // With round-robin, we should see both 0 and 1
+
+        let known_pct = counts[0] as f64 / 1000.0;
         assert!(
-            picks.contains(&0) && picks.contains(&1),
-            "with no rate info, accounts should be distributed via round-robin, got: {:?}",
-            picks
+            (0.57..=0.71).contains(&known_pct),
+            "known account should get ~64% traffic, got {:.1}%",
+            known_pct * 100.0
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_sticky_same_affinity() {
+        // Same affinity key should always return the same account
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-a"),
+            make_account("b", "sk-ant-api-b"),
+            make_account("c", "sk-ant-api-c"),
+        ]);
+
+        // Set some utilization so buckets are non-trivial
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.3);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(0.5);
+        }
+        {
+            let mut info = state.accounts[2].rate_info.write().await;
+            info.utilization = Some(0.7);
+        }
+
+        let key = "192.168.1.1:client-42:agent-7:session-abc";
+        let first = state.pick_account(Some(key)).await.unwrap();
+        for _ in 0..100 {
+            let idx = state.pick_account(Some(key)).await.unwrap();
+            assert_eq!(
+                idx, first,
+                "same affinity key must always pick same account"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_unsticky_on_overload() {
+        // When a preferred account gets overloaded, most clients should migrate.
+        // Primary starts with 61.5% of bucket space (0.8/1.3), then shrinks to
+        // 1.96% (0.01/0.51). So ~97% of previously-primary clients should migrate.
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("backup", "sk-ant-api-b"),
+        ]);
+
+        // Start with primary having lots of headroom
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.2); // headroom = 0.8
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(0.5); // headroom = 0.5
+        }
+
+        // Collect keys that initially pick primary
+        let mut primary_keys: Vec<String> = Vec::new();
+        for i in 0..500 {
+            let key = format!("test-client-{}", i);
+            if state.pick_account(Some(&key)).await.unwrap() == 0 {
+                primary_keys.push(key);
+            }
+        }
+        assert!(
+            primary_keys.len() >= 50,
+            "should find many keys that pick primary"
+        );
+
+        // Now overload primary: util=0.99 (headroom=0.01), backup stays at 0.5 (headroom=0.5)
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.99);
+        }
+
+        // Most of these clients should migrate to backup
+        let mut migrated = 0usize;
+        for key in &primary_keys {
+            if state.pick_account(Some(key)).await.unwrap() == 1 {
+                migrated += 1;
+            }
+        }
+
+        let migration_pct = migrated as f64 / primary_keys.len() as f64;
+        assert!(
+            migration_pct > 0.90,
+            "at least 90% of clients should migrate, got {:.1}% ({}/{})",
+            migration_pct * 100.0,
+            migrated,
+            primary_keys.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_proportional_distribution() {
+        // Verify distribution matches headroom ratios over many calls
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-a"),
+            make_account("b", "sk-ant-api-b"),
+            make_account("c", "sk-ant-api-c"),
+        ]);
+
+        // a=0.2 util (headroom 0.8), b=0.5 util (headroom 0.5), c=0.8 util (headroom 0.2)
+        // Total headroom = 1.5. Expected: a=53.3%, b=33.3%, c=13.3%
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.2);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(0.5);
+        }
+        {
+            let mut info = state.accounts[2].rate_info.write().await;
+            info.utilization = Some(0.8);
+        }
+
+        let mut counts = [0u32; 3];
+        let total = 10000u32;
+        for _ in 0..total {
+            let idx = state.pick_account(None).await.unwrap();
+            counts[idx] += 1;
+        }
+
+        let pcts: Vec<f64> = counts.iter().map(|&c| c as f64 / total as f64).collect();
+        // Expected: ~53.3%, ~33.3%, ~13.3% (±3%)
+        assert!(
+            (0.50..=0.57).contains(&pcts[0]),
+            "account a should get ~53% traffic, got {:.1}%",
+            pcts[0] * 100.0
+        );
+        assert!(
+            (0.30..=0.37).contains(&pcts[1]),
+            "account b should get ~33% traffic, got {:.1}%",
+            pcts[1] * 100.0
+        );
+        assert!(
+            (0.10..=0.17).contains(&pcts[2]),
+            "account c should get ~13% traffic, got {:.1}%",
+            pcts[2] * 100.0
         );
     }
 
@@ -2410,6 +2644,7 @@ mod tests {
             proxy_key,
             allowed_ips: vec![],
             upstreams: vec![],
+            client_names: HashMap::new(),
         });
 
         let app = Router::new()
