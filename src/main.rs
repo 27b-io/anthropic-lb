@@ -22,7 +22,7 @@ use std::{
 };
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -46,6 +46,8 @@ struct Config {
     /// IP-to-client-name mapping. Falls back to x-client-id header, then "-".
     #[serde(default)]
     client_names: HashMap<String, String>,
+    /// Auto-inject prompt cache breakpoints for requests without them. Default: true.
+    auto_cache: Option<bool>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -108,6 +110,7 @@ struct AppState {
     allowed_ips: Vec<IpAllowEntry>,
     upstreams: Vec<Upstream>,
     client_names: HashMap<String, String>,
+    auto_cache: bool,
 }
 
 /// Parsed IP allow entry — either a single IP or a CIDR range.
@@ -221,7 +224,7 @@ impl AppState {
                 if let Err(e) = tokio::fs::write(&self.state_path, json).await {
                     error!(path = %self.state_path.display(), error = %e, "failed to save state");
                 } else {
-                    debug!(path = %self.state_path.display(), "state saved");
+                    trace!(path = %self.state_path.display(), "state saved");
                 }
             }
             Err(e) => error!(error = %e, "failed to serialize state"),
@@ -382,7 +385,7 @@ impl AppState {
             if let Some(until) = info.hard_limited_until {
                 if now < until {
                     let remaining = until.duration_since(now);
-                    debug!(
+                    trace!(
                         account = acct.name,
                         hard_limited_secs = remaining.as_secs(),
                         "pick: skipping hard-limited account"
@@ -403,7 +406,7 @@ impl AppState {
 
             let headroom = (1.0 - effective_util).max(0.01);
 
-            debug!(
+            trace!(
                 account = acct.name,
                 effective_util = format!("{:.4}", effective_util),
                 headroom = format!("{:.4}", headroom),
@@ -445,7 +448,7 @@ impl AppState {
         for &(idx, headroom) in &candidates {
             cumulative += headroom;
             if target < cumulative {
-                debug!(
+                trace!(
                     account = self.accounts[idx].name,
                     affinity_key = affinity_key.unwrap_or("-"),
                     position = format!("{:.1}", position),
@@ -461,7 +464,7 @@ impl AppState {
 
         // Floating-point edge case: pick last candidate
         let &(idx, _) = candidates.last().unwrap();
-        debug!(
+        trace!(
             account = self.accounts[idx].name,
             affinity_key = affinity_key.unwrap_or("-"),
             "pick: selected last candidate (float edge)"
@@ -479,7 +482,7 @@ impl AppState {
             let name_str = name.as_str();
             if name_str.contains("ratelimit") || name_str.contains("retry") {
                 if let Ok(v) = value.to_str() {
-                    tracing::debug!(
+                    tracing::trace!(
                         account = acct.name,
                         header = name_str,
                         value = v,
@@ -548,7 +551,7 @@ impl AppState {
         }
         info.last_updated = Some(Instant::now());
 
-        debug!(
+        trace!(
             account = acct.name,
             utilization = ?info.utilization,
             util_7d = ?info.utilization_7d,
@@ -595,6 +598,139 @@ impl AppState {
             "account hard rate-limited (429), cooling down"
         );
     }
+}
+
+// ── Auto-cache injection ────────────────────────────────────────────
+
+struct CacheInjection {
+    tools: bool,
+    system: bool,
+    messages: bool,
+    skipped: bool,
+}
+
+/// Inject prompt cache breakpoints into an Anthropic API request body.
+///
+/// Strategy: up to 3 breakpoints — last tool, last system block, last user message.
+/// No-op if any `cache_control` is already present anywhere in the body.
+fn inject_cache_breakpoints(body: &mut serde_json::Value) -> CacheInjection {
+    let cache_marker = serde_json::json!({"type": "ephemeral"});
+    let mut result = CacheInjection {
+        tools: false,
+        system: false,
+        messages: false,
+        skipped: false,
+    };
+
+    // Bail if any cache_control already present
+    if has_existing_cache_control(body) {
+        result.skipped = true;
+        return result;
+    }
+
+    // 1. Tools — add cache_control to last tool
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        if let Some(last) = tools.last_mut() {
+            if let Some(obj) = last.as_object_mut() {
+                obj.insert("cache_control".to_string(), cache_marker.clone());
+                result.tools = true;
+            }
+        }
+    }
+
+    // 2. System — string → array conversion, or annotate last block
+    if let Some(system) = body.get_mut("system") {
+        if let Some(text) = system.as_str().map(String::from) {
+            *system = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": cache_marker,
+            }]);
+            result.system = true;
+        } else if let Some(arr) = system.as_array_mut() {
+            if let Some(last) = arr.last_mut() {
+                if let Some(obj) = last.as_object_mut() {
+                    obj.insert("cache_control".to_string(), cache_marker.clone());
+                    result.system = true;
+                }
+            }
+        }
+    }
+
+    // 3. Messages — find last user message, annotate its content
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        if let Some(last_user) = messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        {
+            if let Some(content) = last_user.get_mut("content") {
+                if let Some(text) = content.as_str().map(String::from) {
+                    *content = serde_json::json!([{
+                        "type": "text",
+                        "text": text,
+                        "cache_control": cache_marker,
+                    }]);
+                    result.messages = true;
+                } else if let Some(arr) = content.as_array_mut() {
+                    if let Some(last) = arr.last_mut() {
+                        if let Some(obj) = last.as_object_mut() {
+                            obj.insert("cache_control".to_string(), cache_marker.clone());
+                            result.messages = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Check if any cache_control key exists in tools, system, or messages.
+fn has_existing_cache_control(body: &serde_json::Value) -> bool {
+    // Check tools
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        for tool in tools {
+            if tool.get("cache_control").is_some() {
+                return true;
+            }
+        }
+    }
+    // Check system
+    if let Some(system) = body.get("system") {
+        if system.get("cache_control").is_some() {
+            return true;
+        }
+        if let Some(arr) = system.as_array() {
+            for block in arr {
+                if block.get("cache_control").is_some() {
+                    return true;
+                }
+            }
+        }
+    }
+    // Check messages
+    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages {
+            if msg.get("cache_control").is_some() {
+                return true;
+            }
+            if let Some(content) = msg.get("content") {
+                if content.get("cache_control").is_some() {
+                    return true;
+                }
+                if let Some(arr) = content.as_array() {
+                    for block in arr {
+                        if block.get("cache_control").is_some() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 // ── Handler ─────────────────────────────────────────────────────────
@@ -646,11 +782,35 @@ async fn proxy_handler(
         }
     };
 
-    // Extract model from request body
-    let model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-        .ok()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str().map(String::from)))
-        .unwrap_or_default();
+    // Parse body once for model extraction and optional cache injection
+    let (body_bytes, model) =
+        if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            let model = parsed
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if state.auto_cache {
+                let inj = inject_cache_breakpoints(&mut parsed);
+                if inj.skipped {
+                    debug!("auto-cache: skipped, existing cache_control found");
+                } else if inj.tools || inj.system || inj.messages {
+                    debug!(
+                        tools = inj.tools,
+                        system = inj.system,
+                        messages = inj.messages,
+                        "auto-cache: injected breakpoints"
+                    );
+                }
+            }
+
+            // Re-serialize (only differs from original if cache was injected)
+            let bytes = serde_json::to_vec(&parsed).unwrap_or_else(|_| body_bytes.to_vec());
+            (bytes::Bytes::from(bytes), model)
+        } else {
+            (body_bytes, String::new())
+        };
 
     // Build affinity key for sticky routing — only use stickiness when there's
     // meaningful client identification beyond just the IP address
@@ -692,6 +852,7 @@ async fn proxy_handler(
         // Forward headers
         let mut headers = parts.headers.clone();
         headers.remove("host");
+        headers.remove("content-length"); // body size may change after cache injection
 
         // Auth: passthrough keeps caller's headers, otherwise inject account token
         if !acct.passthrough {
@@ -1314,7 +1475,21 @@ async fn openai_chat_handler(
         .unwrap_or("")
         .to_string();
 
-    let anthropic_body = translate_openai_to_anthropic(&openai_body);
+    let mut anthropic_body = translate_openai_to_anthropic(&openai_body);
+
+    if state.auto_cache {
+        let inj = inject_cache_breakpoints(&mut anthropic_body);
+        if inj.skipped {
+            debug!("auto-cache: skipped, existing cache_control found");
+        } else if inj.tools || inj.system || inj.messages {
+            debug!(
+                tools = inj.tools,
+                system = inj.system,
+                messages = inj.messages,
+                "auto-cache: injected breakpoints"
+            );
+        }
+    }
 
     // Build affinity key for sticky routing — only use stickiness when there's
     // meaningful client identification beyond just the IP address
@@ -1650,7 +1825,12 @@ async fn main() {
         allowed_ips,
         upstreams,
         client_names: config.client_names.clone(),
+        auto_cache: config.auto_cache.unwrap_or(true),
     });
+
+    if state.auto_cache {
+        info!("auto-cache enabled");
+    }
 
     // Restore persisted state (cooldowns, utilization, request counts)
     state.load_state().await;
@@ -1756,6 +1936,7 @@ mod tests {
             allowed_ips: vec![],
             upstreams: vec![],
             client_names: HashMap::new(),
+            auto_cache: true,
         })
     }
 
@@ -1824,6 +2005,7 @@ mod tests {
                 requests: AtomicU64::new(0),
             }],
             client_names: HashMap::new(),
+            auto_cache: true,
         });
 
         let app = Router::new()
@@ -1879,6 +2061,7 @@ mod tests {
             allowed_ips: vec![IpAllowEntry::Addr("10.0.0.1".parse().unwrap())],
             upstreams: vec![],
             client_names: HashMap::new(),
+            auto_cache: true,
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -2645,6 +2828,7 @@ mod tests {
             allowed_ips: vec![],
             upstreams: vec![],
             client_names: HashMap::new(),
+            auto_cache: true,
         });
 
         let app = Router::new()
@@ -2814,5 +2998,190 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Unit: auto-cache injection ─────────────────────────────────
+
+    #[test]
+    fn inject_cache_no_existing() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "system": "You are a helpful assistant.",
+            "tools": [
+                {"name": "get_weather", "description": "Gets weather", "input_schema": {"type": "object"}},
+                {"name": "search", "description": "Searches", "input_schema": {"type": "object"}}
+            ],
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there!"},
+                {"role": "user", "content": "What's the weather?"}
+            ]
+        });
+
+        let inj = inject_cache_breakpoints(&mut body);
+        assert!(!inj.skipped);
+        assert!(inj.tools);
+        assert!(inj.system);
+        assert!(inj.messages);
+
+        // Last tool should have cache_control
+        let tools = body["tools"].as_array().unwrap();
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+
+        // System should be converted to array with cache_control
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["text"], "You are a helpful assistant.");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+
+        // Last user message content should be converted to array
+        let msgs = body["messages"].as_array().unwrap();
+        let last_user = &msgs[2];
+        let content = last_user["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "What's the weather?");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+
+        // First user message should be untouched
+        assert_eq!(msgs[0]["content"], "Hello");
+    }
+
+    #[test]
+    fn inject_cache_system_array() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "system": [
+                {"type": "text", "text": "System prompt part 1"},
+                {"type": "text", "text": "System prompt part 2"}
+            ],
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+
+        let inj = inject_cache_breakpoints(&mut body);
+        assert!(inj.system);
+
+        let system = body["system"].as_array().unwrap();
+        assert!(system[0].get("cache_control").is_none());
+        assert_eq!(system[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn inject_cache_already_present() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "system": [
+                {"type": "text", "text": "Cached system", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+
+        let inj = inject_cache_breakpoints(&mut body);
+        assert!(inj.skipped);
+        assert!(!inj.tools);
+        assert!(!inj.system);
+        assert!(!inj.messages);
+
+        // Verify nothing was modified — messages content is still a string
+        assert_eq!(body["messages"][0]["content"], "Hello");
+    }
+
+    #[test]
+    fn inject_cache_already_present_in_tools() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "tools": [
+                {"name": "t1", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+
+        let inj = inject_cache_breakpoints(&mut body);
+        assert!(inj.skipped);
+    }
+
+    #[test]
+    fn inject_cache_already_present_in_message_content() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        });
+
+        let inj = inject_cache_breakpoints(&mut body);
+        assert!(inj.skipped);
+    }
+
+    #[test]
+    fn inject_cache_empty_body() {
+        let mut body = serde_json::json!({});
+        let inj = inject_cache_breakpoints(&mut body);
+        assert!(!inj.skipped);
+        assert!(!inj.tools);
+        assert!(!inj.system);
+        assert!(!inj.messages);
+    }
+
+    #[test]
+    fn inject_cache_messages_string_content() {
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": "I'm an assistant"},
+                {"role": "user", "content": "Tell me a joke"}
+            ]
+        });
+
+        let inj = inject_cache_breakpoints(&mut body);
+        assert!(inj.messages);
+        assert!(!inj.tools);
+        assert!(!inj.system);
+
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Tell me a joke");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+
+        // Assistant message should be untouched
+        assert_eq!(body["messages"][0]["content"], "I'm an assistant");
+    }
+
+    #[test]
+    fn inject_cache_user_message_array_content() {
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "First part"},
+                    {"type": "text", "text": "Second part"}
+                ]}
+            ]
+        });
+
+        let inj = inject_cache_breakpoints(&mut body);
+        assert!(inj.messages);
+
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert!(content[0].get("cache_control").is_none());
+        assert_eq!(content[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn inject_cache_no_user_messages() {
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": "Hi"}
+            ]
+        });
+
+        let inj = inject_cache_breakpoints(&mut body);
+        assert!(!inj.messages);
     }
 }
