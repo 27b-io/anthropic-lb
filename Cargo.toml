@@ -1,6 +1,6 @@
 [package]
 name = "anthropic-lb"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Load-balancing reverse proxy for multiple Anthropic API accounts with dynamic capacity routing"
 license = "MIT"
