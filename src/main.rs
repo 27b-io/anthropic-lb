@@ -6990,4 +6990,443 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(body["aggregate"].is_object());
         assert_eq!(body["strategy"], "dynamic-capacity");
     }
+
+    // ── Additional comprehensive tests ──────────────────────────────────
+
+    #[test]
+    fn resolve_client_id_prefers_header() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-client-id", HeaderValue::from_static("header-client"));
+
+        let resolved = state.resolve_client_id(&ip, &headers);
+        assert_eq!(resolved, "header-client", "should prefer x-client-id header");
+    }
+
+    #[test]
+    fn resolve_client_id_falls_back_to_ip_map() {
+        let mut client_names = HashMap::new();
+        client_names.insert("192.168.1.100".to_string(), "mapped-client".to_string());
+        let state = Arc::new(AppState {
+            client: Client::new(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names,
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+
+        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+        let headers = hyper::HeaderMap::new();
+
+        let resolved = state.resolve_client_id(&ip, &headers);
+        assert_eq!(resolved, "mapped-client", "should fall back to IP mapping");
+    }
+
+    #[test]
+    fn resolve_client_id_defaults_to_dash() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let ip: IpAddr = "203.0.113.1".parse().unwrap();
+        let headers = hyper::HeaderMap::new();
+
+        let resolved = state.resolve_client_id(&ip, &headers);
+        assert_eq!(resolved, "-", "should default to dash for unknown clients");
+    }
+
+    #[test]
+    fn resolve_client_id_ignores_empty_header() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-client-id", HeaderValue::from_static(""));
+
+        let resolved = state.resolve_client_id(&ip, &headers);
+        assert_eq!(resolved, "-", "should ignore empty x-client-id header");
+    }
+
+    #[test]
+    fn resolve_client_id_ignores_dash_header() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-client-id", HeaderValue::from_static("-"));
+
+        let resolved = state.resolve_client_id(&ip, &headers);
+        assert_eq!(resolved, "-", "should ignore dash as x-client-id header");
+    }
+
+    #[test]
+    fn compute_pressure_status_operator_always_healthy() {
+        let state = Arc::new(AppState {
+            client: Client::new(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: Some("operator-id".to_string()),
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+
+        let status = compute_pressure_status(0.99, "operator-id", &state);
+        assert_eq!(status, "healthy", "operator should always see healthy status");
+    }
+
+    #[test]
+    fn compute_pressure_status_thresholds() {
+        let state = test_state_with(vec![]);
+
+        assert_eq!(compute_pressure_status(0.50, "client", &state), "healthy");
+        assert_eq!(compute_pressure_status(0.75, "client", &state), "elevated");
+        assert_eq!(compute_pressure_status(0.90, "client", &state), "critical");
+        assert_eq!(compute_pressure_status(0.99, "client", &state), "emergency");
+    }
+
+    #[test]
+    fn compute_pressure_status_limit_proximity_upgrade() {
+        let mut limits = HashMap::new();
+        limits.insert("client".to_string(), 0.80);
+        let state = Arc::new(AppState {
+            client: Client::new(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+
+        // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
+        let status = compute_pressure_status(0.65, "client", &state);
+        assert_eq!(status, "elevated", "proximity to limit should upgrade status");
+    }
+
+    #[test]
+    fn status_to_floor_mapping() {
+        assert_eq!(status_to_floor(Some("rejected")), REJECTED_UTIL_FLOOR);
+        assert_eq!(status_to_floor(Some("throttled")), THROTTLE_UTIL_FLOOR);
+        assert_eq!(status_to_floor(Some("allowed_warning")), WARNING_UTIL_FLOOR);
+        assert_eq!(status_to_floor(Some("allowed")), 0.0);
+        assert_eq!(status_to_floor(None), 0.0);
+    }
+
+    #[test]
+    fn status_to_floor_unknown_defaults_to_warning() {
+        let floor = status_to_floor(Some("unknown_status"));
+        assert_eq!(floor, WARNING_UTIL_FLOOR, "unknown status should map to warning floor");
+    }
+
+    #[test]
+    fn claim_penalty_7d_threshold() {
+        // Below threshold: no penalty
+        assert_eq!(claim_penalty_7d(0.50), 0.50);
+        assert_eq!(claim_penalty_7d(0.70), 0.70);
+
+        // Above threshold: quadratic penalty applied
+        let result = claim_penalty_7d(0.80);
+        assert!(result > 0.80, "penalty should increase utilization above threshold");
+
+        let result = claim_penalty_7d(0.90);
+        assert!(result > 1.0, "high utilization should push above 1.0 with penalty");
+    }
+
+    #[test]
+    fn time_adjusted_utilization_stale_data() {
+        let now = 1000000u64;
+        let reset_past = 999000u64; // Reset already happened
+
+        let result = time_adjusted_utilization(
+            Some(0.50),
+            Some(reset_past),
+            Some("allowed"),
+            3600.0,
+            now,
+        );
+
+        assert_eq!(result, None, "stale data (reset in past) should return None");
+    }
+
+    #[test]
+    fn time_adjusted_utilization_near_reset() {
+        let now = 1000000u64;
+        let reset = now + 1800; // 30 minutes until reset
+        let near_reset_threshold = 3600.0; // 1 hour threshold
+
+        let result = time_adjusted_utilization(
+            Some(0.80),
+            Some(reset),
+            Some("allowed"),
+            near_reset_threshold,
+            now,
+        );
+
+        assert!(result.is_some());
+        let adjusted = result.unwrap();
+        assert!(adjusted < 0.80, "near-reset utilization should be discounted");
+        assert!(adjusted >= 0.04, "should apply minimum discount floor (0.05)");
+    }
+
+    #[test]
+    fn time_adjusted_utilization_mid_block() {
+        let now = 1000000u64;
+        let reset = now + 10800; // 3 hours until reset
+        let near_reset_threshold = 3600.0; // 1 hour threshold
+
+        let result = time_adjusted_utilization(
+            Some(0.80),
+            Some(reset),
+            Some("allowed"),
+            near_reset_threshold,
+            now,
+        );
+
+        assert!(result.is_some());
+        let adjusted = result.unwrap();
+        assert_eq!(adjusted, 0.80, "mid-block utilization should be unchanged");
+    }
+
+    #[test]
+    fn time_adjusted_utilization_status_floor_minimum() {
+        let now = 1000000u64;
+        let reset = now + 100; // Very close to reset
+
+        let result = time_adjusted_utilization(
+            Some(0.80),
+            Some(reset),
+            Some("throttled"), // Floor of 0.98
+            3600.0,
+            now,
+        );
+
+        assert!(result.is_some());
+        let adjusted = result.unwrap();
+        assert_eq!(adjusted, THROTTLE_UTIL_FLOOR, "status floor should override time discount");
+    }
+
+    #[test]
+    fn epoch_to_iso8601_leap_year() {
+        // 2024-02-29T00:00:00Z (leap day) = 1709164800
+        let result = AppState::epoch_to_iso8601(1709164800);
+        assert_eq!(result, "2024-02-29T00:00:00Z", "should handle leap year correctly");
+    }
+
+    #[test]
+    fn epoch_to_iso8601_edge_of_year() {
+        // 2023-12-31T23:59:59Z = 1704067199
+        let result = AppState::epoch_to_iso8601(1704067199);
+        assert_eq!(result, "2023-12-31T23:59:59Z", "should handle end of year correctly");
+    }
+
+    #[test]
+    fn account_serves_model_empty_filter_allows_all() {
+        let acct = make_account("test", "sk-ant-api-x");
+        assert!(acct.serves_model("claude-sonnet-4-20250514"));
+        assert!(acct.serves_model("claude-opus-4-20241113"));
+        assert!(acct.serves_model(""));
+    }
+
+    #[test]
+    fn account_serves_model_prefix_wildcard() {
+        let mut acct = make_account("test", "sk-ant-api-x");
+        acct.models = vec!["claude-opus-*".to_string()];
+
+        assert!(acct.serves_model("claude-opus-4-20241113"));
+        assert!(acct.serves_model("claude-opus-future"));
+        assert!(!acct.serves_model("claude-sonnet-4-20250514"));
+    }
+
+    #[test]
+    fn account_serves_model_multiple_patterns() {
+        let mut acct = make_account("test", "sk-ant-api-x");
+        acct.models = vec![
+            "claude-opus-*".to_string(),
+            "claude-sonnet-4-20250514".to_string(),
+        ];
+
+        assert!(acct.serves_model("claude-opus-4-20241113"));
+        assert!(acct.serves_model("claude-sonnet-4-20250514"));
+        assert!(!acct.serves_model("claude-sonnet-3-5-20240229"));
+        assert!(!acct.serves_model("claude-haiku-3-5-20250219"));
+    }
+
+    #[tokio::test]
+    async fn effective_utilization_prefers_most_constrained() {
+        // When both windows have data, should return max (most constrained)
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.80),
+            utilization_7d: Some(0.60),
+            reset_5h: Some(AppState::now_epoch() + 10000),
+            reset_7d: Some(AppState::now_epoch() + 100000),
+            status_5h: Some("allowed".to_string()),
+            status_7d: Some("allowed".to_string()),
+            ..Default::default()
+        };
+
+        let (util, source) = effective_utilization(&info, AppState::now_epoch());
+        assert!(util > 0.60, "should use higher (5h) utilization");
+        assert_eq!(source, "time_adjusted");
+    }
+
+    #[tokio::test]
+    async fn effective_utilization_7d_penalty_applies() {
+        // 7d window above penalty threshold should be penalized
+        let now = AppState::now_epoch();
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.50),
+            utilization_7d: Some(0.85), // Above CLAIM_PENALTY_THRESHOLD (0.70)
+            reset_5h: Some(now + 10000),
+            reset_7d: Some(now + 100000),
+            status_5h: Some("allowed".to_string()),
+            status_7d: Some("allowed".to_string()),
+            ..Default::default()
+        };
+
+        let (util, _) = effective_utilization(&info, now);
+        assert!(util > 0.85, "7d window above 0.70 should have penalty applied");
+    }
+
+    #[tokio::test]
+    async fn pick_account_rejected_account_gets_no_traffic() {
+        let state = test_state_with(vec![
+            make_account("rejected", "sk-ant-api-a"),
+            make_account("healthy", "sk-ant-api-b"),
+        ]);
+
+        let now = AppState::now_epoch();
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.90);
+            info.reset_5h = Some(now + 10000);
+            info.status_5h = Some("rejected".to_string()); // Rejected = util floor 1.0
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(0.50);
+        }
+
+        // All requests should go to healthy account
+        for _ in 0..100 {
+            let idx = state.pick_account(None, "").await.unwrap();
+            assert_eq!(idx, 1, "rejected account should receive no traffic");
+        }
+    }
+
+    #[test]
+    fn ip_allow_entry_ipv6_support() {
+        let entry = IpAllowEntry::Addr("::1".parse().unwrap());
+        assert!(entry.contains(&"::1".parse().unwrap()));
+        assert!(!entry.contains(&"::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn ip_allow_entry_ipv6_cidr() {
+        let entry = IpAllowEntry::Net("2001:db8::/32".parse().unwrap());
+        assert!(entry.contains(&"2001:db8::1".parse().unwrap()));
+        assert!(entry.contains(&"2001:db8:ffff::1".parse().unwrap()));
+        assert!(!entry.contains(&"2001:db9::1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn pick_account_all_throttled_uses_all() {
+        // When all accounts are throttled (status=throttled, floor=0.98 > soft_limit=0.90),
+        // should use all accounts (graceful degradation)
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-a"),
+            make_account("b", "sk-ant-api-b"),
+        ]);
+
+        let now = AppState::now_epoch();
+        for acct in &state.accounts {
+            let mut info = acct.rate_info.write().await;
+            info.utilization_5h = Some(0.80);
+            info.reset_5h = Some(now + 10000);
+            info.status_5h = Some("throttled".to_string()); // Floor 0.98 > soft_limit 0.90
+        }
+
+        // Both accounts should receive traffic
+        let mut counts = [0u32; 2];
+        for _ in 0..1000 {
+            let idx = state.pick_account(None, "").await.unwrap();
+            counts[idx] += 1;
+        }
+
+        assert!(counts[0] > 0, "first throttled account should get some traffic");
+        assert!(counts[1] > 0, "second throttled account should get some traffic");
+    }
+
+    #[test]
+    fn is_operator_checks_configured_operator() {
+        let state = Arc::new(AppState {
+            client: Client::new(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: Some("special-operator".to_string()),
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+
+        assert!(state.is_operator("special-operator"));
+        assert!(!state.is_operator("regular-client"));
+    }
+
+    #[test]
+    fn is_operator_returns_false_when_no_operator_configured() {
+        let state = test_state_with(vec![]);
+        assert!(!state.is_operator("any-client"));
+    }
+}
 }
