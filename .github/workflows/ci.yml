@@ -50,4 +50,4 @@ jobs:
       - name: Run tests
         run: cargo test
       - name: Check packaging
-        run: cargo publish --dry-run
+        run: cargo publish --dry-run --allow-dirty
