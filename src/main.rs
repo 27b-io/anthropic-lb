@@ -346,24 +346,31 @@ impl AppState {
 
     /// Resolve client identity: x-client-id header → IP map fallback → "-"
     ///
-    /// Header takes precedence to support multiple clients per IP. The operator
-    /// identity is protected: it can only be granted via IP mapping, never via header.
+    /// Header takes precedence to support multiple clients per IP, except:
+    /// the operator identity is always resolved by IP mapping (can't be claimed
+    /// or overridden via header). This is the only privilege escalation vector.
     fn resolve_client_id(&self, ip: &IpAddr, headers: &hyper::HeaderMap) -> String {
         let ip_identity = self.client_names.get(&ip.to_string());
 
-        // 1. Header-based identity (primary — supports multi-client-per-IP)
+        // Operator identity is IP-locked: if this IP maps to the operator, that's final.
+        // No header can override it (preventing both spoofing and accidental downgrade).
+        if let Some(name) = ip_identity {
+            if self.is_operator(name) {
+                return name.clone();
+            }
+        }
+
+        // Header-based identity (primary — supports multi-client-per-IP)
         if let Some(id) = headers.get("x-client-id").and_then(|v| v.to_str().ok()) {
             let id = id.trim();
             if !id.is_empty() && id != "-" {
-                // Block operator spoofing: only the operator's own IP can claim operator identity
-                let is_operator_spoof =
-                    self.is_operator(id) && ip_identity.map(|n| n.as_str()) != Some(id);
-                if !is_operator_spoof {
+                // Block operator spoofing from non-operator IPs
+                if !self.is_operator(id) {
                     return id.to_string();
                 }
             }
         }
-        // 2. Fallback: IP mapping or unknown
+        // Fallback: IP mapping or unknown
         ip_identity.cloned().unwrap_or_else(|| "-".to_string())
     }
 }
@@ -5842,9 +5849,18 @@ data: {\"type\":\"message_stop\"}\n\n";
             "operator identity must not be spoofable via header"
         );
 
-        // Operator's own IP with header "ray" → allowed
+        // Operator's own IP with header "ray" → returns "ray" (IP-locked)
         let op_ip: IpAddr = "10.0.0.1".parse().unwrap();
         assert_eq!(state.resolve_client_id(&op_ip, &headers), "ray");
+
+        // Operator's IP with different header → still "ray" (can't downgrade operator)
+        let mut other_headers = hyper::HeaderMap::new();
+        other_headers.insert("x-client-id", HeaderValue::from_static("gastown"));
+        assert_eq!(
+            state.resolve_client_id(&op_ip, &other_headers),
+            "ray",
+            "operator identity is IP-locked, header cannot override it"
+        );
     }
 
     // ── Effective utilization tests ────────────────────────────────
