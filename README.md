@@ -35,6 +35,9 @@ Routes requests across multiple Anthropic accounts using dynamic capacity-based 
 | Feature | Description |
 |:--------|:------------|
 | **Weighted routing** | Headroom-proportional bucket hashing with client affinity |
+| **Soft utilization ceiling** | Accounts above `soft_limit` excluded from routing, breaking sticky affinity |
+| **Time-adjusted utilization** | Discounts utilization near window reset; accounts about to reset get more traffic |
+| **Status-based routing** | Parses API status headers — `warning`/`throttled`/`rejected` enforce utilization floors |
 | **429 rotation** | Rate-limited accounts cool down, traffic shifts instantly |
 | **5xx retry** | Automatic retry on 500/502/503/504/529 (picks different account) |
 | **Token tracking** | Per-account and per-client input/output/cache token counters |
@@ -44,7 +47,7 @@ Routes requests across multiple Anthropic accounts using dynamic capacity-based 
 | **Model routing** | Per-account model allowlists with wildcard prefix matching |
 | **Client identification** | Via `X-Client-ID` header or IP-based mapping |
 | **Streaming** | SSE/streaming responses flow through with usage extraction |
-| **State persistence** | Utilization data survives restarts |
+| **State persistence** | Utilization + reset times + status survive restarts |
 | **Upstream routing** | Forward to OpenAI-compatible APIs via `/upstream/<name>/...` |
 | **~6 MB binary** | Zero runtime dependencies |
 
@@ -90,6 +93,10 @@ probe_interval_secs = 300
 # Shadow log — JSONL file with request metadata (optional)
 # shadow_log = "shadow.jsonl"
 
+# Utilization soft ceiling (0.0–1.0). Accounts above this are excluded
+# from routing unless all accounts exceed it. Default: 0.90
+# soft_limit = 0.90
+
 # Per-client daily token budgets (optional)
 # [client_budgets]
 # "alice" = 5000000    # 5M tokens/day
@@ -122,6 +129,7 @@ token = "sk-ant-api03-..."
 | `allowed_ips` | `[String]?` | `None` | IP/CIDR allowlist |
 | `auto_cache` | `bool` | `true` | Inject prompt caching beta header |
 | `shadow_log` | `String?` | `None` | Path to JSONL shadow log file |
+| `soft_limit` | `f64` | `0.90` | Utilization ceiling — accounts above are excluded from routing |
 | `client_names` | `{IP: name}` | `{}` | IP → client ID mapping |
 | `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
 | `accounts[].name` | `String` | — | Display name for the account |
@@ -300,19 +308,23 @@ Requests to `/upstream/openrouter/v1/chat/completions` are forwarded to `https:/
 3. Check per-client daily token budget (429 if exceeded)
 4. Extract model from request body
 5. Filter accounts by model allowlist
-6. Pick account via headroom-proportional weighted bucket hashing (client affinity)
-7. Inject auth token + auto-cache header
-8. Forward request to upstream Anthropic API
-9. If 429 → mark rate-limited, retry with next account
-10. If 5xx/529 → retry with different account
-11. Extract token usage from response (streaming SSE or JSON body)
-12. Record usage per-account + per-client, update budget
-13. Write shadow log entry (async, non-blocking)
-14. State persisted to disk, restored on restart
+6. Compute time-adjusted utilization (discount near window reset)
+7. Apply status floors (warning ≥ 0.80, throttled ≥ 0.98, rejected = 1.0)
+8. Exclude accounts above soft_limit utilization ceiling
+9. Pick account via headroom-proportional weighted bucket hashing (client affinity)
+10. Inject auth token + auto-cache header
+11. Forward request to upstream Anthropic API
+12. If 429 → mark rate-limited, retry with next account
+13. If 5xx/529 → retry with different account
+14. Parse rate-limit headers (utilization, reset times, status)
+15. Extract token usage from response (streaming SSE or JSON body)
+16. Record usage per-account + per-client, update budget
+17. Write shadow log entry (async, non-blocking)
+18. State persisted to disk, restored on restart
 ```
 
 > [!TIP]
-> The proxy reads Anthropic's `anthropic-ratelimit-unified-*` headers to track real utilization per rate-limit window (5h, 7d). This is more accurate than counting requests locally.
+> The proxy reads Anthropic's `anthropic-ratelimit-unified-*` headers to track real utilization per rate-limit window (5h, 7d). Near window resets, utilization is time-discounted so accounts about to reset aren't unnecessarily avoided. API status signals (`allowed_warning`, `throttled`, `rejected`) enforce utilization floors regardless of the reported number.
 
 ---
 
@@ -377,7 +389,7 @@ WantedBy=multi-user.target
 ## Testing
 
 ```bash
-# Run all tests (62 tests)
+# Run all tests (87 tests)
 cargo test
 
 # Lint gates (same as CI)
