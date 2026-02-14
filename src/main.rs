@@ -351,8 +351,11 @@ impl AppState {
             return name.clone();
         }
         // 2. Fall back to header (for non-privileged client self-identification)
+        // Reject header values that match any IP-mapped identity to prevent
+        // spoofing of trusted identities (including the operator).
         if let Some(id) = headers.get("x-client-id").and_then(|v| v.to_str().ok()) {
-            if !id.is_empty() && id != "-" {
+            let id = id.trim();
+            if !id.is_empty() && id != "-" && !self.client_names.values().any(|name| name == id) {
                 return id.to_string();
             }
         }
@@ -1361,11 +1364,13 @@ impl AppState {
         let now_epoch = Self::now_epoch();
         let mut nearest_reset: Option<u64> = None;
         let mut all_above = true;
+        let mut any_compatible = false;
 
         for acct in &self.accounts {
             if !acct.serves_model(model) {
                 continue;
             }
+            any_compatible = true;
             let info = acct.rate_info.read().await;
             let (util, _) = effective_utilization(&info, now_epoch);
             if util < limit {
@@ -1387,7 +1392,7 @@ impl AppState {
             }
         }
 
-        if all_above {
+        if all_above && any_compatible {
             let retry_after = nearest_reset.unwrap_or(300).clamp(60, 3600);
             Err(retry_after)
         } else {
@@ -1682,7 +1687,10 @@ async fn proxy_handler(
             (body_bytes, String::new())
         };
 
-    // Pre-request gate: operator bypass, budget, utilization limit, emergency brake
+    // Pre-request gate: operator bypass, budget, utilization limit, emergency brake.
+    // Note: budget + emergency don't need `model` and could run before body parsing,
+    // but those rejections are rare and the JSON parse cost is negligible — not worth
+    // splitting the gate for a few microseconds on an almost-never code path.
     if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
         return resp;
     }
@@ -2213,9 +2221,9 @@ async fn stats_handler(
             let obj: serde_json::Map<String, serde_json::Value> = all_clients
                 .into_iter()
                 .map(|k| {
-                    // Operator hiding: attribute operator data to "_other"
+                    // Operator hiding: attribute operator data to a reserved key
                     let display_key = if state.is_operator(k) {
-                        "_other".to_string()
+                        "_operator".to_string()
                     } else {
                         k.clone()
                     };
@@ -2249,7 +2257,7 @@ async fn stats_handler(
         if let Some(ref rates) = request_rates {
             for (client, (_, ewma)) in rates.iter() {
                 let display_key = if state.is_operator(client) {
-                    "_other".to_string()
+                    "_operator".to_string()
                 } else {
                     client.clone()
                 };
@@ -2264,7 +2272,7 @@ async fn stats_handler(
                         .unwrap_or(0.0);
                     obj.insert(
                         "requests_per_minute".to_string(),
-                        serde_json::json!((cur + ewma.value) * 100.0 / 100.0),
+                        serde_json::json!(cur + ewma.value),
                     );
                 }
             }
@@ -2674,7 +2682,10 @@ async fn openai_chat_handler(
         .unwrap_or("")
         .to_string();
 
-    // Pre-request gate: operator bypass, budget, utilization limit, emergency brake
+    // Pre-request gate: operator bypass, budget, utilization limit, emergency brake.
+    // Note: budget + emergency don't need `model` and could run before body parsing,
+    // but those rejections are rare and the JSON parse cost is negligible — not worth
+    // splitting the gate for a few microseconds on an almost-never code path.
     if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
         return resp;
     }
@@ -2854,6 +2865,7 @@ async fn openai_chat_handler(
             return Response::builder()
                 .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
                 .header("content-type", "application/json")
+                .header("x-budget-status", budget_status)
                 .body(Body::from(error_body))
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
@@ -2967,6 +2979,7 @@ async fn openai_chat_handler(
                 return Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
+                    .header("x-budget-status", budget_status)
                     .body(Body::from(resp_bytes))
                     .unwrap_or_else(|_| {
                         (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
@@ -5780,6 +5793,48 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(state.resolve_client_id(&ip, &headers), "-");
     }
 
+    #[test]
+    fn resolve_header_rejects_trusted_identity_spoofing() {
+        // "ray" is an IP-mapped identity — header-based callers must not claim it
+        let mut client_names = HashMap::new();
+        client_names.insert("10.0.0.1".to_string(), "ray".to_string());
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names,
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+
+        // Someone from a different IP tries to claim "ray" via header → should be rejected
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-client-id", HeaderValue::from_static("ray"));
+        let ip: IpAddr = "192.168.1.99".parse().unwrap();
+        assert_eq!(
+            state.resolve_client_id(&ip, &headers),
+            "-",
+            "spoofed trusted identity should fall through to unknown"
+        );
+    }
+
     // ── Effective utilization tests ────────────────────────────────
 
     #[tokio::test]
@@ -6072,6 +6127,49 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Operator bypasses everything
         assert!(state.is_operator("ray"));
         assert!(state.pre_request_gate("ray", "").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn limit_no_compatible_accounts_passes() {
+        // When no account serves the requested model, check_utilization_limit
+        // should return Ok (let pick_account handle the "no account" error later)
+        let mut limits = HashMap::new();
+        limits.insert("test-client".to_string(), 0.01); // very low limit
+        let mut acct = make_account("a", "sk-ant-api-x");
+        acct.models = vec!["claude-sonnet".to_string()]; // only serves sonnet
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![acct],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        // Request for "claude-opus" — no account serves it → should pass
+        assert!(
+            state
+                .check_utilization_limit("test-client", "claude-opus")
+                .await
+                .is_ok(),
+            "should not 429 when no account serves the requested model"
+        );
     }
 
     #[tokio::test]
