@@ -220,14 +220,9 @@ const STATUS_EMERGENCY_FLOOR: f64 = 0.95;
 
 /// Compute the budget pressure status for a response header.
 /// Returns one of "healthy", "elevated", "critical", "emergency".
-fn compute_pressure_status(
-    effective_util: f64,
-    client_id: &str,
-    client_ip: &IpAddr,
-    state: &AppState,
-) -> &'static str {
-    // Operator always sees healthy (checked by IP)
-    if state.is_operator_ip(client_ip) {
+fn compute_pressure_status(effective_util: f64, client_id: &str, state: &AppState) -> &'static str {
+    // Operator always sees healthy
+    if state.is_operator(client_id) {
         return "healthy";
     }
 
@@ -352,7 +347,6 @@ impl AppState {
     /// Resolve client identity: x-client-id header → IP map fallback → "-"
     ///
     /// Header takes precedence to support multiple clients per IP.
-    /// Operator privilege is a separate IP-based check — not tied to client identity.
     fn resolve_client_id(&self, ip: &IpAddr, headers: &hyper::HeaderMap) -> String {
         if let Some(id) = headers.get("x-client-id").and_then(|v| v.to_str().ok()) {
             let id = id.trim();
@@ -365,15 +359,6 @@ impl AppState {
             .get(&ip.to_string())
             .cloned()
             .unwrap_or_else(|| "-".to_string())
-    }
-
-    /// Operator privilege check — by IP, not by client identity.
-    /// The operator is whoever is at an IP mapped to the operator name in client_names.
-    fn is_operator_ip(&self, ip: &IpAddr) -> bool {
-        match (&self.operator, self.client_names.get(&ip.to_string())) {
-            (Some(op), Some(name)) => op == name,
-            _ => false,
-        }
     }
 }
 
@@ -1438,14 +1423,8 @@ impl AppState {
 
     /// Shared pre-request gate for all Anthropic-proxied requests.
     /// Returns Ok(()) or an error Response (429).
-    /// Operator privilege is checked by IP, not by client identity.
-    async fn pre_request_gate(
-        &self,
-        client_id: &str,
-        client_ip: &IpAddr,
-        model: &str,
-    ) -> Result<(), Response> {
-        if self.is_operator_ip(client_ip) {
+    async fn pre_request_gate(&self, client_id: &str, model: &str) -> Result<(), Response> {
+        if self.is_operator(client_id) {
             return Ok(()); // operator bypasses everything
         }
 
@@ -1710,7 +1689,7 @@ async fn proxy_handler(
     // Note: budget + emergency don't need `model` and could run before body parsing,
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
-    if let Err(resp) = state.pre_request_gate(&client_id, &client_ip, &model).await {
+    if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
         return resp;
     }
 
@@ -1893,7 +1872,7 @@ async fn proxy_handler(
         {
             let info = acct.rate_info.read().await;
             let (eff_util, _) = effective_utilization(&info, AppState::now_epoch());
-            let status_val = compute_pressure_status(eff_util, &client_id, &client_ip, &state);
+            let status_val = compute_pressure_status(eff_util, &client_id, &state);
             builder = builder.header("x-budget-status", status_val);
         }
 
@@ -2705,7 +2684,7 @@ async fn openai_chat_handler(
     // Note: budget + emergency don't need `model` and could run before body parsing,
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
-    if let Err(resp) = state.pre_request_gate(&client_id, &client_ip, &model).await {
+    if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
         return resp;
     }
 
@@ -2858,7 +2837,7 @@ async fn openai_chat_handler(
         let budget_status = {
             let info = acct.rate_info.read().await;
             let (eff_util, _) = effective_utilization(&info, AppState::now_epoch());
-            compute_pressure_status(eff_util, &client_id, &client_ip, &state)
+            compute_pressure_status(eff_util, &client_id, &state)
         };
 
         {
@@ -5817,9 +5796,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn operator_privilege_is_ip_based() {
-        // Operator privilege is determined by IP, not by client_id.
-        // resolve_client_id is pure identity — no privilege logic.
+    fn resolve_multi_client_per_ip() {
+        // Multiple clients share the same IP — header differentiates them.
+        // Operator is identified by client_id, not by IP.
         let mut client_names = HashMap::new();
         client_names.insert("10.0.0.1".to_string(), "ray".to_string());
         let state = Arc::new(AppState {
@@ -5848,28 +5827,22 @@ data: {\"type\":\"message_stop\"}\n\n";
             soft_limit: 1.0,
         });
 
-        let op_ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let other_ip: IpAddr = "192.168.1.99".parse().unwrap();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-        // Operator IP gets privilege regardless of what x-client-id says
-        assert!(state.is_operator_ip(&op_ip));
-        assert!(!state.is_operator_ip(&other_ip));
-
-        // Client identity is always header-first (no operator special-casing)
+        // gastown on same IP as operator → identified as gastown, NOT operator
         let mut headers = hyper::HeaderMap::new();
         headers.insert("x-client-id", HeaderValue::from_static("gastown"));
-        // From operator IP, identity is "gastown" (header wins), but IP still has operator privilege
-        assert_eq!(state.resolve_client_id(&op_ip, &headers), "gastown");
-        assert!(state.is_operator_ip(&op_ip));
-        // From other IP, identity is "gastown", no operator privilege
-        assert_eq!(state.resolve_client_id(&other_ip, &headers), "gastown");
-        assert!(!state.is_operator_ip(&other_ip));
+        assert_eq!(state.resolve_client_id(&ip, &headers), "gastown");
+        assert!(!state.is_operator("gastown"));
 
-        // Someone claiming "ray" from non-operator IP: identity is "ray", but NO operator privilege
-        let mut ray_headers = hyper::HeaderMap::new();
-        ray_headers.insert("x-client-id", HeaderValue::from_static("ray"));
-        assert_eq!(state.resolve_client_id(&other_ip, &ray_headers), "ray");
-        assert!(!state.is_operator_ip(&other_ip)); // still no privilege
+        // ray on same IP → identified as ray, IS operator
+        headers.insert("x-client-id", HeaderValue::from_static("ray"));
+        assert_eq!(state.resolve_client_id(&ip, &headers), "ray");
+        assert!(state.is_operator("ray"));
+
+        // No header → falls back to IP mapping ("ray")
+        let empty = hyper::HeaderMap::new();
+        assert_eq!(state.resolve_client_id(&ip, &empty), "ray");
     }
 
     // ── Effective utilization tests ────────────────────────────────
@@ -6135,8 +6108,6 @@ data: {\"type\":\"message_stop\"}\n\n";
         let now = AppState::now_epoch();
         let mut limits = HashMap::new();
         limits.insert("ray".to_string(), 0.10); // very low limit
-        let mut client_names = HashMap::new();
-        client_names.insert("10.0.0.1".to_string(), "ray".to_string());
         let state = Arc::new(AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
@@ -6150,7 +6121,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             proxy_key: None,
             allowed_ips: vec![],
             upstreams: vec![],
-            client_names,
+            client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
@@ -6163,13 +6134,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             soft_limit: 1.0,
         });
         set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
-        // Operator IP bypasses everything
-        let op_ip: IpAddr = "10.0.0.1".parse().unwrap();
-        assert!(state.is_operator_ip(&op_ip));
-        assert!(state.pre_request_gate("ray", &op_ip, "").await.is_ok());
-        // Non-operator IP does not bypass
-        let other_ip: IpAddr = "192.168.1.99".parse().unwrap();
-        assert!(!state.is_operator_ip(&other_ip));
+        // Operator bypasses everything
+        assert!(state.is_operator("ray"));
+        assert!(state.pre_request_gate("ray", "").await.is_ok());
+        // Non-operator does not bypass
+        assert!(!state.is_operator("gastown"));
     }
 
     #[tokio::test]
@@ -6244,8 +6213,6 @@ data: {\"type\":\"message_stop\"}\n\n";
         let now = AppState::now_epoch();
         let mut limits = HashMap::new();
         limits.insert("ray".to_string(), 0.10);
-        let mut client_names = HashMap::new();
-        client_names.insert("10.0.0.1".to_string(), "ray".to_string());
         let state = Arc::new(AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
@@ -6259,7 +6226,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             proxy_key: None,
             allowed_ips: vec![],
             upstreams: vec![],
-            client_names,
+            client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
@@ -6273,15 +6240,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         });
         set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
         assert!(state.is_emergency_brake_active().await);
-        // Operator IP bypasses pre_request_gate even during emergency
-        let op_ip: IpAddr = "10.0.0.1".parse().unwrap();
-        assert!(state.pre_request_gate("ray", &op_ip, "").await.is_ok());
-        // Non-operator IP gets blocked
-        let other_ip: IpAddr = "192.168.1.99".parse().unwrap();
-        assert!(state
-            .pre_request_gate("gastown", &other_ip, "")
-            .await
-            .is_err());
+        // Operator bypasses pre_request_gate even during emergency
+        assert!(state.pre_request_gate("ray", "").await.is_ok());
+        // Non-operator gets blocked
+        assert!(state.pre_request_gate("gastown", "").await.is_err());
     }
 
     #[tokio::test]
@@ -6390,75 +6352,39 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn pressure_status_healthy() {
         let state = test_state_with(vec![]);
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
-        assert_eq!(
-            compute_pressure_status(0.0, "client1", &ip, &state),
-            "healthy"
-        );
-        assert_eq!(
-            compute_pressure_status(0.50, "client1", &ip, &state),
-            "healthy"
-        );
-        assert_eq!(
-            compute_pressure_status(0.69, "client1", &ip, &state),
-            "healthy"
-        );
+        assert_eq!(compute_pressure_status(0.0, "client1", &state), "healthy");
+        assert_eq!(compute_pressure_status(0.50, "client1", &state), "healthy");
+        assert_eq!(compute_pressure_status(0.69, "client1", &state), "healthy");
     }
 
     #[test]
     fn pressure_status_elevated() {
         let state = test_state_with(vec![]);
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
-        assert_eq!(
-            compute_pressure_status(0.70, "client1", &ip, &state),
-            "elevated"
-        );
-        assert_eq!(
-            compute_pressure_status(0.80, "client1", &ip, &state),
-            "elevated"
-        );
-        assert_eq!(
-            compute_pressure_status(0.84, "client1", &ip, &state),
-            "elevated"
-        );
+        assert_eq!(compute_pressure_status(0.70, "client1", &state), "elevated");
+        assert_eq!(compute_pressure_status(0.80, "client1", &state), "elevated");
+        assert_eq!(compute_pressure_status(0.84, "client1", &state), "elevated");
     }
 
     #[test]
     fn pressure_status_critical() {
         let state = test_state_with(vec![]);
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
-        assert_eq!(
-            compute_pressure_status(0.85, "client1", &ip, &state),
-            "critical"
-        );
-        assert_eq!(
-            compute_pressure_status(0.90, "client1", &ip, &state),
-            "critical"
-        );
-        assert_eq!(
-            compute_pressure_status(0.94, "client1", &ip, &state),
-            "critical"
-        );
+        assert_eq!(compute_pressure_status(0.85, "client1", &state), "critical");
+        assert_eq!(compute_pressure_status(0.90, "client1", &state), "critical");
+        assert_eq!(compute_pressure_status(0.94, "client1", &state), "critical");
     }
 
     #[test]
     fn pressure_status_emergency() {
         let state = test_state_with(vec![]);
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
         assert_eq!(
-            compute_pressure_status(0.95, "client1", &ip, &state),
+            compute_pressure_status(0.95, "client1", &state),
             "emergency"
         );
-        assert_eq!(
-            compute_pressure_status(1.0, "client1", &ip, &state),
-            "emergency"
-        );
+        assert_eq!(compute_pressure_status(1.0, "client1", &state), "emergency");
     }
 
     #[test]
     fn pressure_status_operator_always_healthy() {
-        let mut client_names = HashMap::new();
-        client_names.insert("10.0.0.1".to_string(), "ray".to_string());
         let state = Arc::new(AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
@@ -6472,7 +6398,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             proxy_key: None,
             allowed_ips: vec![],
             upstreams: vec![],
-            client_names,
+            client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
@@ -6484,22 +6410,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
         });
-        // Operator IP always gets "healthy" regardless of utilization
-        let op_ip: IpAddr = "10.0.0.1".parse().unwrap();
-        assert_eq!(
-            compute_pressure_status(0.99, "ray", &op_ip, &state),
-            "healthy"
-        );
-        assert_eq!(
-            compute_pressure_status(1.0, "ray", &op_ip, &state),
-            "healthy"
-        );
-        // Non-operator IP at same utilization gets emergency
-        let other_ip: IpAddr = "192.168.1.99".parse().unwrap();
-        assert_eq!(
-            compute_pressure_status(0.99, "other", &other_ip, &state),
-            "emergency"
-        );
+        // Operator always gets "healthy" regardless of utilization
+        assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
+        assert_eq!(compute_pressure_status(1.0, "ray", &state), "healthy");
+        // Non-operator at same utilization gets emergency
+        assert_eq!(compute_pressure_status(0.99, "other", &state), "emergency");
     }
 
     #[test]
@@ -6531,28 +6446,15 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
         });
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
         // gastown has limit 0.85, 80% of that = 0.68
         // At 0.60, below 0.68 → no upgrade → "healthy"
-        assert_eq!(
-            compute_pressure_status(0.60, "gastown", &ip, &state),
-            "healthy"
-        );
+        assert_eq!(compute_pressure_status(0.60, "gastown", &state), "healthy");
         // At 0.69, above 0.68 → upgrade healthy→elevated
-        assert_eq!(
-            compute_pressure_status(0.69, "gastown", &ip, &state),
-            "elevated"
-        );
+        assert_eq!(compute_pressure_status(0.69, "gastown", &state), "elevated");
         // At 0.70, already elevated, above 0.68 → upgrade elevated→critical
-        assert_eq!(
-            compute_pressure_status(0.70, "gastown", &ip, &state),
-            "critical"
-        );
+        assert_eq!(compute_pressure_status(0.70, "gastown", &state), "critical");
         // Client without limits: no upgrade
-        assert_eq!(
-            compute_pressure_status(0.69, "other", &ip, &state),
-            "healthy"
-        );
+        assert_eq!(compute_pressure_status(0.69, "other", &state), "healthy");
     }
 
     // ── Integration tests for x-budget-status header ──
