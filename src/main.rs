@@ -344,23 +344,27 @@ impl AppState {
         self.allowed_ips.is_empty() || self.allowed_ips.iter().any(|e| e.contains(ip))
     }
 
-    /// Resolve client identity: config map (by IP) → x-client-id header → "-"
+    /// Resolve client identity: x-client-id header → IP map fallback → "-"
+    ///
+    /// Header takes precedence to support multiple clients per IP. The operator
+    /// identity is protected: it can only be granted via IP mapping, never via header.
     fn resolve_client_id(&self, ip: &IpAddr, headers: &hyper::HeaderMap) -> String {
-        // 1. Config-controlled IP mapping wins (trusted, not spoofable)
-        if let Some(name) = self.client_names.get(&ip.to_string()) {
-            return name.clone();
-        }
-        // 2. Fall back to header (for non-privileged client self-identification)
-        // Reject header values that match any IP-mapped identity to prevent
-        // spoofing of trusted identities (including the operator).
+        let ip_identity = self.client_names.get(&ip.to_string());
+
+        // 1. Header-based identity (primary — supports multi-client-per-IP)
         if let Some(id) = headers.get("x-client-id").and_then(|v| v.to_str().ok()) {
             let id = id.trim();
-            if !id.is_empty() && id != "-" && !self.client_names.values().any(|name| name == id) {
-                return id.to_string();
+            if !id.is_empty() && id != "-" {
+                // Block operator spoofing: only the operator's own IP can claim operator identity
+                let is_operator_spoof =
+                    self.is_operator(id) && ip_identity.map(|n| n.as_str()) != Some(id);
+                if !is_operator_spoof {
+                    return id.to_string();
+                }
             }
         }
-        // 3. Unknown
-        "-".to_string()
+        // 2. Fallback: IP mapping or unknown
+        ip_identity.cloned().unwrap_or_else(|| "-".to_string())
     }
 }
 
@@ -5740,7 +5744,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     // ── Client identity resolution tests ──────────────────────────
 
     #[test]
-    fn resolve_ip_map_takes_priority() {
+    fn resolve_header_overrides_ip_map() {
         let mut client_names = HashMap::new();
         client_names.insert("10.0.0.1".to_string(), "ray".to_string());
         let state = Arc::new(AppState {
@@ -5769,11 +5773,15 @@ data: {\"type\":\"message_stop\"}\n\n";
             soft_limit: 1.0,
         });
 
-        // Even though x-client-id header says "gastown", IP map should win
+        // Header overrides IP mapping (supports multiple clients per IP)
         let mut headers = hyper::HeaderMap::new();
         headers.insert("x-client-id", HeaderValue::from_static("gastown"));
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        assert_eq!(state.resolve_client_id(&ip, &headers), "ray");
+        assert_eq!(state.resolve_client_id(&ip, &headers), "gastown");
+
+        // No header → falls back to IP mapping
+        let empty_headers = hyper::HeaderMap::new();
+        assert_eq!(state.resolve_client_id(&ip, &empty_headers), "ray");
     }
 
     #[test]
@@ -5794,8 +5802,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn resolve_header_rejects_trusted_identity_spoofing() {
-        // "ray" is an IP-mapped identity — header-based callers must not claim it
+    fn resolve_header_rejects_operator_spoofing() {
+        // "ray" is the operator, mapped to 10.0.0.1 — can't be claimed from other IPs
         let mut client_names = HashMap::new();
         client_names.insert("10.0.0.1".to_string(), "ray".to_string());
         let state = Arc::new(AppState {
@@ -5818,21 +5826,25 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operator: Some("ray".to_string()),
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
         });
 
-        // Someone from a different IP tries to claim "ray" via header → should be rejected
+        // Non-operator IP tries to claim "ray" → rejected, falls back to "-"
         let mut headers = hyper::HeaderMap::new();
         headers.insert("x-client-id", HeaderValue::from_static("ray"));
         let ip: IpAddr = "192.168.1.99".parse().unwrap();
         assert_eq!(
             state.resolve_client_id(&ip, &headers),
             "-",
-            "spoofed trusted identity should fall through to unknown"
+            "operator identity must not be spoofable via header"
         );
+
+        // Operator's own IP with header "ray" → allowed
+        let op_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(state.resolve_client_id(&op_ip, &headers), "ray");
     }
 
     // ── Effective utilization tests ────────────────────────────────
