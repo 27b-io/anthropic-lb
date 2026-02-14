@@ -92,6 +92,15 @@ struct RateLimitInfo {
     utilization_5h: Option<f64>,
     /// Which window is the binding constraint (e.g. "five_hour", "seven_day")
     representative_claim: Option<String>,
+    /// Epoch seconds when the 5h/7d rate-limit window resets. Used to time-discount
+    /// utilization near reset and to detect stale data (reset already passed).
+    reset_5h: Option<u64>,
+    reset_7d: Option<u64>,
+    /// API-side pressure signal. "allowed" = normal, "allowed_warning" = approaching limits
+    /// (floor 0.80), "throttled" = actively constrained (floor 0.98, soft-excluded),
+    /// "rejected" = hard refusal (floor 1.0, zero bucket share).
+    status_5h: Option<String>,
+    status_7d: Option<String>,
     hard_limited_until: Option<Instant>,
     #[allow(dead_code)]
     last_updated: Option<Instant>,
@@ -216,6 +225,14 @@ struct PersistedAccount {
     #[serde(default)]
     utilization_5h: Option<f64>,
     representative_claim: Option<String>,
+    #[serde(default)]
+    reset_5h: Option<u64>,
+    #[serde(default)]
+    reset_7d: Option<u64>,
+    #[serde(default)]
+    status_5h: Option<String>,
+    #[serde(default)]
+    status_7d: Option<String>,
     remaining_requests: Option<u64>,
     remaining_tokens: Option<u64>,
     limit_requests: Option<u64>,
@@ -253,6 +270,10 @@ impl AppState {
                 utilization_7d: info.utilization_7d,
                 utilization_5h: info.utilization_5h,
                 representative_claim: info.representative_claim.clone(),
+                reset_5h: info.reset_5h,
+                reset_7d: info.reset_7d,
+                status_5h: info.status_5h.clone(),
+                status_7d: info.status_7d.clone(),
                 remaining_requests: info.remaining_requests,
                 remaining_tokens: info.remaining_tokens,
                 limit_requests: info.limit_requests,
@@ -384,6 +405,32 @@ impl AppState {
                 info.utilization_7d = pa.utilization_7d;
                 info.utilization_5h = pa.utilization_5h;
                 info.representative_claim = pa.representative_claim.clone();
+                info.reset_5h = pa.reset_5h;
+                info.reset_7d = pa.reset_7d;
+                info.status_5h = pa.status_5h.clone();
+                info.status_7d = pa.status_7d.clone();
+
+                // Invalidate stale per-window data: if a window's reset is in the past,
+                // the block has reset and our utilization/status numbers are meaningless.
+                // Clear them so pick_account falls through to "unknown" (0.5) rather than
+                // routing on stale data until the first probe refreshes. (Bug #2, #3)
+                let stale_5h = info.reset_5h.is_none_or(|r| r <= now_epoch);
+                let stale_7d = info.reset_7d.is_none_or(|r| r <= now_epoch);
+                if stale_5h {
+                    info.utilization_5h = None;
+                    info.reset_5h = None;
+                    info.status_5h = None;
+                }
+                if stale_7d {
+                    info.utilization_7d = None;
+                    info.reset_7d = None;
+                    info.status_7d = None;
+                }
+                if stale_5h && stale_7d {
+                    // Both windows stale — the derived unified field is also meaningless
+                    info.utilization = None;
+                }
+
                 info.remaining_requests = pa.remaining_requests;
                 info.remaining_tokens = pa.remaining_tokens;
                 info.limit_requests = pa.limit_requests;
@@ -413,6 +460,112 @@ impl AppState {
     }
 }
 
+// ── Time-adjusted utilization ──────────────────────────────────────
+//
+// Anthropic rate limits use fixed time blocks (5h, 7d) that reset at known timestamps.
+// An account at 95% utilization with 5 minutes until reset is about to become fresh,
+// but raw utilization treats it the same as one with 4 hours remaining.
+//
+// We apply a threshold-based discount: only in the near-reset zone at the end of each
+// block does utilization get reduced. Mid-block, raw utilization is used unchanged.
+// This avoids the "compression problem" where a continuous linear discount would make
+// all accounts look similar at mid-block, destroying routing differentiation.
+//
+// Status headers act as circuit breakers — Anthropic can signal pressure (burst limits,
+// concurrent request limits, per-model sub-limits) that raw utilization doesn't capture.
+// These floors can only increase effective utilization, never decrease it.
+
+/// Last 20% of 5h block. Low consequence — resets soon, safe to route here.
+const NEAR_RESET_5H_SECS: f64 = 3600.0;
+/// Last ~3.5% of 7d block. Conservative — overshoot has multi-day consequence.
+const NEAR_RESET_7D_SECS: f64 = 21600.0;
+/// Minimum discount factor — prevents utilization from collapsing to zero near reset.
+const TIME_FRACTION_FLOOR: f64 = 0.05;
+/// Above soft_limit (0.90) so throttled accounts are excluded from routing unless
+/// ALL accounts are throttled. Captures API-side pressure before a hard 429.
+const THROTTLE_UTIL_FLOOR: f64 = 0.98;
+/// Below soft_limit so warned accounts still participate, but with reduced bucket share.
+const WARNING_UTIL_FLOOR: f64 = 0.80;
+/// "rejected" = hard refusal from the API. Treat as fully exhausted — zero bucket share.
+/// Distinct from hard_limited_until (which skips the account entirely) because rejected
+/// status can arrive on one window while the other is still valid.
+const REJECTED_UTIL_FLOOR: f64 = 1.0;
+
+/// Map a rate-limit status string to a utilization floor.
+/// Unknown non-"allowed" values are treated as warning-level pressure and logged,
+/// so new API statuses degrade gracefully before we add explicit support.
+fn status_to_floor(status: Option<&str>) -> f64 {
+    match status {
+        Some("rejected") => REJECTED_UTIL_FLOOR,
+        Some("throttled") => THROTTLE_UTIL_FLOOR,
+        Some("allowed_warning") => WARNING_UTIL_FLOOR,
+        Some("allowed") | None => 0.0,
+        Some(unknown) => {
+            warn!(
+                status = unknown,
+                "unknown rate-limit status, applying warning floor"
+            );
+            WARNING_UTIL_FLOOR
+        }
+    }
+}
+
+/// Compute time-adjusted utilization for a single rate-limit window.
+///
+/// In the near-reset zone (final `near_reset_secs` of the block), raw utilization is
+/// discounted proportionally — an account about to reset is treated as healthier.
+/// Outside the zone, raw utilization is returned unchanged.
+///
+/// Status floors are applied AFTER time discount and can only increase the result:
+/// - "rejected" → 1.0 (fully exhausted, zero bucket share — API is refusing requests)
+/// - "throttled" → 0.98 (effectively soft-excluded above soft_limit=0.90)
+/// - "allowed_warning" → 0.80
+///
+/// Returns `None` if:
+/// - `raw_util` is `None` (no data)
+/// - `reset_epoch` is in the past (stale data — window already reset)
+fn time_adjusted_utilization(
+    raw_util: Option<f64>,
+    reset_epoch: Option<u64>,
+    status: Option<&str>,
+    near_reset_secs: f64,
+    now_epoch: u64,
+) -> Option<f64> {
+    let util = raw_util?;
+
+    if let Some(reset) = reset_epoch {
+        // Stale data guard: if the window already reset, our utilization number is meaningless.
+        // Returning None lets the caller fall through to the other window or the legacy path.
+        // Probes will refresh this within 5 minutes.
+        if reset <= now_epoch {
+            return None;
+        }
+
+        let remaining = (reset - now_epoch) as f64;
+
+        // Threshold-based discount: only kick in near the end of the block.
+        // Outside the zone: discount=1.0 (raw util unchanged, preserves differentiation).
+        // Inside the zone: linear ramp from 1.0 → TIME_FRACTION_FLOOR as reset approaches.
+        let discount = if remaining < near_reset_secs {
+            (remaining / near_reset_secs).max(TIME_FRACTION_FLOOR)
+        } else {
+            1.0
+        };
+        let adjusted = util * discount;
+
+        // Status floor: Anthropic's signal of pressure beyond what utilization numbers show.
+        // Applied after discount so it acts as a hard minimum — can only raise effective util.
+        // Unknown non-"allowed" statuses get WARNING_UTIL_FLOOR defensively (Bug #4).
+        let floor = status_to_floor(status);
+        Some(adjusted.max(floor))
+    } else {
+        // No reset timestamp available — can't do time adjustment, but status floors still apply.
+        // This handles the transition period when we get status headers but not reset headers.
+        let floor = status_to_floor(status);
+        Some(util.max(floor))
+    }
+}
+
 impl AppState {
     /// Pick the best available account using headroom-proportional weighted bucket hashing.
     ///
@@ -422,9 +575,10 @@ impl AppState {
     /// the edges naturally migrate — no timers or thresholds needed.
     async fn pick_account(&self, affinity_key: Option<&str>, model: &str) -> Option<usize> {
         let now = Instant::now();
+        let now_epoch = Self::now_epoch();
 
-        // Build candidate list: (index, headroom, utilization) for non-hard-limited, model-compatible accounts
-        let mut candidates: Vec<(usize, f64, f64)> = Vec::new();
+        // Build candidate list: (index, headroom, utilization, source) for non-hard-limited, model-compatible accounts
+        let mut candidates: Vec<(usize, f64, f64, &str)> = Vec::new();
         for (i, acct) in self.accounts.iter().enumerate() {
             // Skip accounts that don't serve this model
             if !acct.serves_model(model) {
@@ -451,31 +605,74 @@ impl AppState {
                 }
             }
 
-            // Effective utilization: unified (max of windows), legacy, or 0.5 (unknown)
-            let (effective_util, source) = if let Some(util) = info.utilization {
-                (util, "unified")
-            } else if let Some(remaining) = info.remaining_tokens {
-                let limit = info.limit_tokens.unwrap_or(1_000_000);
-                (1.0 - (remaining as f64 / limit as f64), "legacy")
-            } else {
-                (0.5, "unknown")
+            // Compute time-adjusted utilization for each rate-limit window independently.
+            // Each window has its own reset timestamp, threshold, and status signal.
+            // Returns None if data is stale (reset already passed) or absent.
+            let adj_5h = time_adjusted_utilization(
+                info.utilization_5h,
+                info.reset_5h,
+                info.status_5h.as_deref(),
+                NEAR_RESET_5H_SECS,
+                now_epoch,
+            );
+            let adj_7d = time_adjusted_utilization(
+                info.utilization_7d,
+                info.reset_7d,
+                info.status_7d.as_deref(),
+                NEAR_RESET_7D_SECS,
+                now_epoch,
+            );
+
+            // Effective utilization fallback chain:
+            // 1. Both windows adjusted → take the max (most constrained window wins)
+            // 2. Only one window → use it (the other is stale or absent)
+            // 3. Neither window → fall back to raw unified util, then legacy token ratio, then 0.5
+            // This preserves backward compat: accounts without reset headers behave identically
+            // to the pre-time-adjustment algorithm.
+            let (effective_util, source) = match (adj_5h, adj_7d) {
+                (Some(a), Some(b)) => (a.max(b), "time_adjusted"),
+                (Some(a), None) => (a, "time_adjusted_5h"),
+                (None, Some(b)) => (b, "time_adjusted_7d"),
+                (None, None) => {
+                    // Fallback: raw unified (no time adjustment), legacy tokens, or unknown
+                    if let Some(util) = info.utilization {
+                        (util, "unified")
+                    } else if let Some(remaining) = info.remaining_tokens {
+                        let limit = info.limit_tokens.unwrap_or(1_000_000);
+                        (1.0 - (remaining as f64 / limit as f64), "legacy")
+                    } else {
+                        (0.5, "unknown")
+                    }
+                }
             };
 
-            let headroom = (1.0 - effective_util).max(0.01);
+            // Headroom = available capacity. Rejected/exhausted accounts (util >= 1.0) get zero
+            // headroom so they receive no traffic even in all-exhausted degraded mode (Bug #5).
+            // Others are clamped to 0.01 minimum to avoid divide-by-zero and drain gracefully.
+            let headroom = if effective_util >= 1.0 {
+                0.0
+            } else {
+                (1.0 - effective_util).max(0.01)
+            };
 
             trace!(
                 account = acct.name,
                 effective_util = format!("{:.4}", effective_util),
                 headroom = format!("{:.4}", headroom),
                 source = source,
+                adj_5h = ?adj_5h,
+                adj_7d = ?adj_7d,
+                raw_5h = ?info.utilization_5h,
+                raw_7d = ?info.utilization_7d,
+                reset_5h = ?info.reset_5h,
+                reset_7d = ?info.reset_7d,
+                status_5h = ?info.status_5h,
+                status_7d = ?info.status_7d,
                 claim = ?info.representative_claim,
-                raw_utilization = ?info.utilization,
-                util_7d = ?info.utilization_7d,
-                util_5h = ?info.utilization_5h,
                 "pick: candidate"
             );
 
-            candidates.push((i, headroom, effective_util));
+            candidates.push((i, headroom, effective_util, source));
         }
 
         if candidates.is_empty() {
@@ -483,20 +680,23 @@ impl AppState {
             return None;
         }
 
-        // Soft-limit: exclude overloaded accounts unless ALL are above the ceiling
-        let healthy: Vec<(usize, f64)> = candidates
+        // Soft-limit gate: exclude accounts with effective utilization above the ceiling.
+        // This is where status floors have their biggest effect — a "throttled" account gets
+        // floor=0.98 which exceeds soft_limit=0.90, so it's excluded without needing a hard 429.
+        // If ALL accounts exceed the ceiling, we fall through and use everyone (graceful degradation).
+        let healthy: Vec<(usize, f64, &str)> = candidates
             .iter()
-            .filter(|(_, _, util)| *util < self.soft_limit)
-            .map(|(i, h, _)| (*i, *h))
+            .filter(|(_, _, util, _)| *util < self.soft_limit)
+            .map(|(i, h, _, s)| (*i, *h, *s))
             .collect();
-        let effective: Vec<(usize, f64)> = if healthy.is_empty() {
-            candidates.iter().map(|(i, h, _)| (*i, *h)).collect()
+        let effective: Vec<(usize, f64, &str)> = if healthy.is_empty() {
+            candidates.iter().map(|(i, h, _, s)| (*i, *h, *s)).collect()
         } else {
             if healthy.len() < candidates.len() {
                 let excluded: Vec<&str> = candidates
                     .iter()
-                    .filter(|(_, _, util)| *util >= self.soft_limit)
-                    .map(|(i, _, _)| self.accounts[*i].name.as_str())
+                    .filter(|(_, _, util, _)| *util >= self.soft_limit)
+                    .map(|(i, _, _, _)| self.accounts[*i].name.as_str())
                     .collect();
                 debug!(
                     soft_limit = self.soft_limit,
@@ -507,8 +707,13 @@ impl AppState {
             healthy
         };
 
-        // Total headroom across effective candidates
-        let total_headroom: f64 = effective.iter().map(|(_, h)| h).sum();
+        // Total headroom across effective candidates.
+        // If zero (all rejected/exhausted), no account can serve traffic — return None.
+        let total_headroom: f64 = effective.iter().map(|(_, h, _)| h).sum();
+        if total_headroom <= 0.0 {
+            debug!("pick: all candidates exhausted (zero headroom)");
+            return None;
+        }
 
         // Compute position in [0, 10000) — either stable (affinity) or scattered (round-robin)
         let position = if let Some(key) = affinity_key {
@@ -526,29 +731,33 @@ impl AppState {
 
         // Walk weighted buckets
         let mut cumulative = 0.0;
-        for &(idx, headroom) in &effective {
+        for &(idx, headroom, source) in &effective {
             cumulative += headroom;
             if target < cumulative {
-                trace!(
+                let util = candidates.iter().find(|(i, _, _, _)| *i == idx).unwrap().2;
+                debug!(
                     account = self.accounts[idx].name,
-                    affinity_key = affinity_key.unwrap_or("-"),
-                    position = format!("{:.1}", position),
-                    target = format!("{:.4}", target),
-                    headroom = format!("{:.4}", headroom),
-                    total_headroom = format!("{:.4}", total_headroom),
+                    util = format!("{:.3}", util),
+                    headroom = format!("{:.3}", headroom),
+                    share = format!("{:.0}%", headroom / total_headroom * 100.0),
+                    source = source,
                     candidates = effective.len(),
-                    "pick: selected by weighted bucket"
+                    affinity = affinity_key.unwrap_or("-"),
+                    "pick: selected"
                 );
                 return Some(idx);
             }
         }
 
         // Floating-point edge case: pick last candidate
-        let &(idx, _) = effective.last().unwrap();
-        trace!(
+        let &(idx, _, source) = effective.last().unwrap();
+        let util = candidates.iter().find(|(i, _, _, _)| *i == idx).unwrap().2;
+        debug!(
             account = self.accounts[idx].name,
-            affinity_key = affinity_key.unwrap_or("-"),
-            "pick: selected last candidate (float edge)"
+            util = format!("{:.3}", util),
+            source = source,
+            affinity = affinity_key.unwrap_or("-"),
+            "pick: selected (float edge)"
         );
         Some(idx)
     }
@@ -574,15 +783,72 @@ impl AppState {
         }
 
         // Capture per-window utilization (always, regardless of representative claim)
-        if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-utilization") {
+        // Track whether we got utilization for each window — if we did but got no status header,
+        // the pressure has cleared and we must reset the stale status (Bug #1: sticky status fix).
+        let got_7d_util = if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-utilization")
+        {
             if let Ok(s) = v.to_str() {
                 info.utilization_7d = s.parse::<f64>().ok().map(|v| v.clamp(0.0, 1.0));
+                true
+            } else {
+                false
             }
-        }
-        if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-utilization") {
+        } else {
+            false
+        };
+        let got_5h_util = if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-utilization")
+        {
             if let Ok(s) = v.to_str() {
                 info.utilization_5h = s.parse::<f64>().ok().map(|v| v.clamp(0.0, 1.0));
+                true
+            } else {
+                false
             }
+        } else {
+            false
+        };
+
+        // Capture per-window reset timestamps (epoch seconds).
+        // Used by time_adjusted_utilization() to discount near-reset accounts and detect stale data.
+        // Sanity-capped: 5h window can't reset >5h out, 7d can't reset >7d out (Bug #6).
+        let now_epoch = Self::now_epoch();
+        if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-reset") {
+            if let Ok(s) = v.to_str() {
+                if let Ok(epoch) = s.parse::<u64>() {
+                    if epoch <= now_epoch + 18000 {
+                        info.reset_5h = Some(epoch);
+                    }
+                }
+            }
+        }
+        if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-reset") {
+            if let Ok(s) = v.to_str() {
+                if let Ok(epoch) = s.parse::<u64>() {
+                    if epoch <= now_epoch + 604800 {
+                        info.reset_7d = Some(epoch);
+                    }
+                }
+            }
+        }
+
+        // Capture per-window status. These signal API-side pressure (burst limits, concurrent
+        // request limits, per-model sub-limits) that raw utilization percentages don't reflect.
+        // "allowed_warning" → reduce routing share. "throttled" → effectively exclude.
+        // If the API sent utilization for a window but NO status header, clear stale status —
+        // absence of the header means pressure has subsided (Bug #1).
+        if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-status") {
+            if let Ok(s) = v.to_str() {
+                info.status_5h = Some(s.to_string());
+            }
+        } else if got_5h_util {
+            info.status_5h = None;
+        }
+        if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-status") {
+            if let Ok(s) = v.to_str() {
+                info.status_7d = Some(s.to_string());
+            }
+        } else if got_7d_util {
+            info.status_7d = None;
         }
 
         // Representative claim tells us which window is the binding constraint
@@ -637,6 +903,10 @@ impl AppState {
             utilization = ?info.utilization,
             util_7d = ?info.utilization_7d,
             util_5h = ?info.utilization_5h,
+            reset_5h = ?info.reset_5h,
+            reset_7d = ?info.reset_7d,
+            status_5h = ?info.status_5h,
+            status_7d = ?info.status_7d,
             claim = ?info.representative_claim,
             remaining_requests = ?info.remaining_requests,
             remaining_tokens = ?info.remaining_tokens,
@@ -1458,6 +1728,10 @@ async fn stats_handler(
             "utilization_7d": info.utilization_7d,
             "utilization_5h": info.utilization_5h,
             "representative_claim": info.representative_claim,
+            "reset_5h": info.reset_5h,
+            "reset_7d": info.reset_7d,
+            "status_5h": info.status_5h,
+            "status_7d": info.status_7d,
             "remaining_requests": info.remaining_requests,
             "remaining_tokens": info.remaining_tokens,
             "limit_requests": info.limit_requests,
@@ -4046,5 +4320,508 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(resp.status(), 200);
         // Two calls to upstream (500 + 200)
         assert_eq!(call_count.load(Ordering::Relaxed), 2);
+    }
+
+    // ── time_adjusted_utilization unit tests ────────────────────────
+
+    #[test]
+    fn time_adjust_no_reset() {
+        // No reset timestamp → raw util returned unchanged
+        let result = time_adjusted_utilization(Some(0.80), None, None, NEAR_RESET_5H_SECS, 1000000);
+        assert_eq!(result, Some(0.80));
+    }
+
+    #[test]
+    fn time_adjust_outside_threshold() {
+        // 5h reset in 2 hours = 7200s, threshold is 3600s → no discount
+        let now = 1000000u64;
+        let reset = now + 7200;
+        let result =
+            time_adjusted_utilization(Some(0.90), Some(reset), None, NEAR_RESET_5H_SECS, now);
+        assert_eq!(result, Some(0.90));
+    }
+
+    #[test]
+    fn time_adjust_inside_threshold() {
+        // 5h reset in 30 min = 1800s, threshold 3600s → discount = 1800/3600 = 0.50
+        let now = 1000000u64;
+        let reset = now + 1800;
+        let result =
+            time_adjusted_utilization(Some(0.90), Some(reset), None, NEAR_RESET_5H_SECS, now);
+        let expected = 0.90 * 0.50;
+        assert!((result.unwrap() - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn time_adjust_at_threshold_boundary() {
+        // Reset exactly at threshold boundary (1h = 3600s) → discount = 3600/3600 = 1.0
+        let now = 1000000u64;
+        let reset = now + 3600;
+        let result =
+            time_adjusted_utilization(Some(0.90), Some(reset), None, NEAR_RESET_5H_SECS, now);
+        assert_eq!(result, Some(0.90));
+    }
+
+    #[test]
+    fn time_adjust_near_reset_floor() {
+        // Reset in 1 minute = 60s → discount = max(60/3600, 0.05) = 0.05 (floor)
+        let now = 1000000u64;
+        let reset = now + 60;
+        let raw = 60.0 / 3600.0; // 0.0167, below TIME_FRACTION_FLOOR
+        assert!(raw < TIME_FRACTION_FLOOR);
+        let result =
+            time_adjusted_utilization(Some(0.95), Some(reset), None, NEAR_RESET_5H_SECS, now);
+        let expected = 0.95 * TIME_FRACTION_FLOOR;
+        assert!((result.unwrap() - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn time_adjust_past_reset() {
+        // Reset already happened → None (stale data)
+        let now = 1000000u64;
+        let reset = now - 100;
+        let result =
+            time_adjusted_utilization(Some(0.90), Some(reset), None, NEAR_RESET_5H_SECS, now);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn time_adjust_throttled() {
+        // Status=throttled overrides low util → floor at 0.98
+        let now = 1000000u64;
+        let reset = now + 7200;
+        let result = time_adjusted_utilization(
+            Some(0.30),
+            Some(reset),
+            Some("throttled"),
+            NEAR_RESET_5H_SECS,
+            now,
+        );
+        assert_eq!(result, Some(THROTTLE_UTIL_FLOOR));
+    }
+
+    #[test]
+    fn time_adjust_warning() {
+        // Status=allowed_warning overrides low util → floor at 0.80
+        let now = 1000000u64;
+        let reset = now + 7200;
+        let result = time_adjusted_utilization(
+            Some(0.50),
+            Some(reset),
+            Some("allowed_warning"),
+            NEAR_RESET_5H_SECS,
+            now,
+        );
+        assert_eq!(result, Some(WARNING_UTIL_FLOOR));
+    }
+
+    #[test]
+    fn time_adjust_warning_already_higher() {
+        // Util already above warning floor → util wins
+        let now = 1000000u64;
+        let reset = now + 7200;
+        let result = time_adjusted_utilization(
+            Some(0.90),
+            Some(reset),
+            Some("allowed_warning"),
+            NEAR_RESET_5H_SECS,
+            now,
+        );
+        assert_eq!(result, Some(0.90));
+    }
+
+    #[test]
+    fn time_adjust_none_util() {
+        // No utilization data → None
+        let result =
+            time_adjusted_utilization(None, Some(1000000), None, NEAR_RESET_5H_SECS, 999000);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn time_adjust_7d_window() {
+        // 7d reset in 3 hours = 10800s, threshold 21600s → discount = 10800/21600 = 0.50
+        let now = 1000000u64;
+        let reset = now + 10800;
+        let result =
+            time_adjusted_utilization(Some(0.80), Some(reset), None, NEAR_RESET_7D_SECS, now);
+        let expected = 0.80 * 0.50;
+        assert!((result.unwrap() - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn time_adjust_throttled_overrides_discount() {
+        // Near reset AND throttled → discount applies but floor wins
+        let now = 1000000u64;
+        let reset = now + 600;
+        let result = time_adjusted_utilization(
+            Some(0.50),
+            Some(reset),
+            Some("throttled"),
+            NEAR_RESET_5H_SECS,
+            now,
+        );
+        // Discounted: 0.50 * (600/3600) = 0.083, but throttle floor = 0.98
+        assert_eq!(result, Some(THROTTLE_UTIL_FLOOR));
+    }
+
+    #[test]
+    fn time_adjust_status_without_reset() {
+        // Status present but no reset → floor applied to raw util
+        let result = time_adjusted_utilization(
+            Some(0.30),
+            None,
+            Some("throttled"),
+            NEAR_RESET_5H_SECS,
+            1000000,
+        );
+        assert_eq!(result, Some(THROTTLE_UTIL_FLOOR));
+    }
+
+    #[test]
+    fn time_adjust_rejected() {
+        // Status=rejected → floor at 1.0 (fully exhausted, zero bucket share)
+        let now = 1000000u64;
+        let reset = now + 7200;
+        let result = time_adjusted_utilization(
+            Some(0.30),
+            Some(reset),
+            Some("rejected"),
+            NEAR_RESET_5H_SECS,
+            now,
+        );
+        assert_eq!(result, Some(REJECTED_UTIL_FLOOR));
+    }
+
+    #[test]
+    fn time_adjust_rejected_near_reset() {
+        // Even near reset, rejected still maps to 1.0 — API is actively refusing
+        let now = 1000000u64;
+        let reset = now + 60; // 1 minute from reset
+        let result = time_adjusted_utilization(
+            Some(0.95),
+            Some(reset),
+            Some("rejected"),
+            NEAR_RESET_5H_SECS,
+            now,
+        );
+        assert_eq!(result, Some(REJECTED_UTIL_FLOOR));
+    }
+
+    #[test]
+    fn time_adjust_unknown_status_gets_warning_floor() {
+        // Unknown non-"allowed" status → defensive WARNING_UTIL_FLOOR (Bug #4)
+        let now = 1000000u64;
+        let reset = now + 7200;
+        let result = time_adjusted_utilization(
+            Some(0.30),
+            Some(reset),
+            Some("some_future_status"),
+            NEAR_RESET_5H_SECS,
+            now,
+        );
+        assert_eq!(result, Some(WARNING_UTIL_FLOOR));
+    }
+
+    #[test]
+    fn time_adjust_allowed_status_no_floor() {
+        // Explicit "allowed" status → no floor, just raw util
+        let now = 1000000u64;
+        let reset = now + 7200;
+        let result = time_adjusted_utilization(
+            Some(0.30),
+            Some(reset),
+            Some("allowed"),
+            NEAR_RESET_5H_SECS,
+            now,
+        );
+        assert_eq!(result, Some(0.30));
+    }
+
+    #[tokio::test]
+    async fn status_clears_when_header_absent() {
+        // Bug #1: stale status should clear when API sends utilization but no status header
+        let accounts = vec![make_account("acct-a", "sk-ant-api-test-aaa")];
+        let state = test_state_with(accounts);
+
+        // First response: set throttled status
+        let mut headers1 = reqwest::header::HeaderMap::new();
+        headers1.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.30"),
+        );
+        headers1.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            HeaderValue::from_static("throttled"),
+        );
+        headers1.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            HeaderValue::from_static("9999999999"),
+        );
+        state.update_rate_info(0, &headers1).await;
+        {
+            let info = state.accounts[0].rate_info.read().await;
+            assert_eq!(info.status_5h.as_deref(), Some("throttled"));
+        }
+
+        // Second response: utilization header present, NO status header → clears
+        let mut headers2 = reqwest::header::HeaderMap::new();
+        headers2.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.25"),
+        );
+        headers2.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            HeaderValue::from_static("9999999999"),
+        );
+        state.update_rate_info(0, &headers2).await;
+        {
+            let info = state.accounts[0].rate_info.read().await;
+            assert_eq!(
+                info.status_5h, None,
+                "status should clear when header absent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_persists_when_no_util_header() {
+        // If neither util nor status header is present for a window, don't clear status
+        // (the response might be for a different window entirely)
+        let accounts = vec![make_account("acct-a", "sk-ant-api-test-aaa")];
+        let state = test_state_with(accounts);
+
+        // Set throttled status
+        let mut headers1 = reqwest::header::HeaderMap::new();
+        headers1.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.30"),
+        );
+        headers1.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            HeaderValue::from_static("throttled"),
+        );
+        state.update_rate_info(0, &headers1).await;
+
+        // Response with no 5h headers at all (maybe only 7d headers)
+        let headers2 = reqwest::header::HeaderMap::new();
+        state.update_rate_info(0, &headers2).await;
+        {
+            let info = state.accounts[0].rate_info.read().await;
+            assert_eq!(
+                info.status_5h.as_deref(),
+                Some("throttled"),
+                "status should persist when no util header for that window"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_returns_none_when_all_rejected() {
+        // Bug #5: all-rejected accounts should return None (zero total headroom)
+        let now_epoch = AppState::now_epoch();
+        let state = test_state_with(vec![
+            make_account("acct-a", "sk-ant-api-test-aaa"),
+            make_account("acct-b", "sk-ant-api-test-bbb"),
+        ]);
+        for acct in &state.accounts {
+            let mut info = acct.rate_info.write().await;
+            info.utilization_5h = Some(0.50);
+            info.utilization_7d = Some(0.30);
+            info.utilization = Some(0.50);
+            info.status_5h = Some("rejected".to_string());
+            info.reset_5h = Some(now_epoch + 7200);
+            info.reset_7d = Some(now_epoch + 86400);
+        }
+        let result = state.pick_account(None, "").await;
+        assert_eq!(result, None, "all-rejected should return None");
+    }
+
+    #[tokio::test]
+    async fn reset_sanity_rejects_far_future() {
+        // Bug #6: reset timestamp > block duration from now should be rejected
+        let accounts = vec![make_account("acct-a", "sk-ant-api-test-aaa")];
+        let state = test_state_with(accounts);
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        // 5h window: reset 10h from now (> 5h max) → should NOT be stored
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            HeaderValue::from_static("9999999999"),
+        );
+        // 7d window: reset 30d from now (> 7d max) → should NOT be stored
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-reset",
+            HeaderValue::from_static("9999999999"),
+        );
+        state.update_rate_info(0, &headers).await;
+        {
+            let info = state.accounts[0].rate_info.read().await;
+            assert_eq!(
+                info.reset_5h, None,
+                "far-future 5h reset should be rejected"
+            );
+            assert_eq!(
+                info.reset_7d, None,
+                "far-future 7d reset should be rejected"
+            );
+        }
+    }
+
+    // ── pick_account integration tests for time-adjusted routing ────
+
+    #[tokio::test]
+    async fn pick_prefers_near_reset_account() {
+        // Account A: 5h=0.95 reset in 10min, 7d=0.30 (7d binding after discount)
+        // Account B: 5h=0.60 reset in 3h, 7d=0.50
+        // A's 5h gets heavily discounted, 7d=0.30 becomes binding → A has more headroom than B
+        let now_epoch = AppState::now_epoch();
+        let accounts = vec![
+            make_account("acct-a", "sk-ant-api-test-aaa"),
+            make_account("acct-b", "sk-ant-api-test-bbb"),
+        ];
+        let state = test_state_with(accounts);
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.95);
+            info.utilization_7d = Some(0.30);
+            info.utilization = Some(0.95);
+            info.reset_5h = Some(now_epoch + 600); // 10 min
+            info.reset_7d = Some(now_epoch + 86400); // 1 day out
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.60);
+            info.utilization_7d = Some(0.50);
+            info.utilization = Some(0.60);
+            info.reset_5h = Some(now_epoch + 10800); // 3 hours
+            info.reset_7d = Some(now_epoch + 86400);
+        }
+
+        // Run 100 picks without affinity to see distribution
+        let mut a_count = 0;
+        for _ in 0..100 {
+            if let Some(idx) = state.pick_account(None, "").await {
+                if idx == 0 {
+                    a_count += 1;
+                }
+            }
+        }
+        // A's effective = max(adj_5h, adj_7d) = max(0.95*0.167, 0.30) = 0.30
+        // B's effective = max(0.60, 0.50) = 0.60 (5h outside discount zone)
+        // A headroom=0.70, B headroom=0.40 → A gets ~64% of traffic
+        assert!(
+            a_count > 50,
+            "Account A (near-reset 5h) should get majority: got {a_count}/100"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_throttled_excludes() {
+        // Account A: status=throttled (floor=0.98, above soft_limit=0.90)
+        // Account B: healthy
+        let now_epoch = AppState::now_epoch();
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![
+                make_account("acct-a", "sk-ant-api-test-aaa"),
+                make_account("acct-b", "sk-ant-api-test-bbb"),
+            ],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            soft_limit: 0.90, // Key: not 1.0 — throttled (0.98) will be excluded
+        });
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.utilization_7d = Some(0.20);
+            info.utilization = Some(0.30);
+            info.status_5h = Some("throttled".to_string());
+            info.reset_5h = Some(now_epoch + 7200);
+            info.reset_7d = Some(now_epoch + 86400);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.40);
+            info.utilization_7d = Some(0.30);
+            info.utilization = Some(0.40);
+            info.status_5h = Some("allowed".to_string());
+            info.reset_5h = Some(now_epoch + 7200);
+            info.reset_7d = Some(now_epoch + 86400);
+        }
+
+        let mut b_count = 0;
+        for _ in 0..100 {
+            if let Some(idx) = state.pick_account(None, "").await {
+                if idx == 1 {
+                    b_count += 1;
+                }
+            }
+        }
+        // A is throttled → effective=0.98 → excluded by soft_limit=0.90
+        // B gets all traffic
+        assert_eq!(b_count, 100, "Throttled account A should be soft-excluded");
+    }
+
+    #[tokio::test]
+    async fn pick_mid_block_unchanged() {
+        // Both accounts mid-block (3h remaining on 5h) — outside discount zone
+        // Should behave identically to raw utilization
+        let now_epoch = AppState::now_epoch();
+        let accounts = vec![
+            make_account("acct-a", "sk-ant-api-test-aaa"),
+            make_account("acct-b", "sk-ant-api-test-bbb"),
+        ];
+        let state = test_state_with(accounts);
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.80);
+            info.utilization_7d = Some(0.40);
+            info.utilization = Some(0.80);
+            info.reset_5h = Some(now_epoch + 10800); // 3h out
+            info.reset_7d = Some(now_epoch + 86400);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.40);
+            info.utilization_7d = Some(0.30);
+            info.utilization = Some(0.40);
+            info.reset_5h = Some(now_epoch + 10800);
+            info.reset_7d = Some(now_epoch + 86400);
+        }
+
+        let mut b_count = 0;
+        for _ in 0..100 {
+            if let Some(idx) = state.pick_account(None, "").await {
+                if idx == 1 {
+                    b_count += 1;
+                }
+            }
+        }
+        // A: effective=max(0.80, 0.40)=0.80, headroom=0.20
+        // B: effective=max(0.40, 0.30)=0.40, headroom=0.60
+        // B should get ~75% (0.60 / 0.80)
+        assert!(
+            b_count > 60,
+            "Mid-block: B (lower util) should dominate: got {b_count}/100"
+        );
+        assert!(
+            b_count < 90,
+            "Mid-block: A should still get some traffic: B got {b_count}/100"
+        );
     }
 }
