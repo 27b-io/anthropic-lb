@@ -429,8 +429,8 @@ impl AppState {
         let mut remaining = epoch;
         let mut year: u64 = 1970;
         loop {
-            let days_in_year = if (year % 4 == 0 && year % 100 != 0)
-                || year % 400 == 0
+            let days_in_year = if (year.is_multiple_of(4) && !year.is_multiple_of(100))
+                || year.is_multiple_of(400)
             {
                 366
             } else {
@@ -444,7 +444,7 @@ impl AppState {
             year += 1;
         }
         let is_leap =
-            (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
         let days_in_months: [u64; 12] = [
             31,
             if is_leap { 29 } else { 28 },
