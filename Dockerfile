@@ -11,4 +11,4 @@ COPY --from=builder /app/target/release/anthropic-lb /usr/local/bin/
 USER 1000
 EXPOSE 8082
 ENTRYPOINT ["anthropic-lb"]
-CMD ["--config", "/etc/anthropic-lb/config.toml"]
+CMD ["/etc/anthropic-lb/config.toml"]
