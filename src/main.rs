@@ -53,6 +53,16 @@ struct Config {
     /// Per-client daily token budgets: client_id → max tokens per day. Uncapped if absent.
     #[serde(default)]
     client_budgets: HashMap<String, u64>,
+    /// Per-client utilization limits: client_id → max utilization (0.0-1.0).
+    /// Client gets 429 when ALL model-compatible accounts exceed their limit.
+    #[serde(default)]
+    client_utilization_limits: HashMap<String, f64>,
+    /// Client ID of the operator — bypasses all budget/ceiling/emergency checks.
+    /// Must be resolvable via client_names IP mapping (not spoofable via header).
+    operator: Option<String>,
+    /// Emergency brake threshold (0.0-1.0). When ALL accounts exceed this,
+    /// non-operator traffic is blocked. Default: 0.95.
+    emergency_threshold: Option<f64>,
     /// Utilization soft ceiling (0.0–1.0). Accounts above this are excluded from routing
     /// unless ALL accounts exceed it. Breaks client affinity stickiness on overloaded accounts.
     /// Default: 0.90.
@@ -79,31 +89,181 @@ struct UpstreamConfig {
 
 // ── Runtime state ───────────────────────────────────────────────────
 
+/// Per-claim utilization data for a single rate-limit window.
+/// The API can report model-specific sub-budgets (e.g., "seven_day_sonnet")
+/// alongside general windows ("seven_day"). Each gets its own entry.
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct ClaimWindowData {
+    utilization: f64,
+    reset: Option<u64>,
+    status: Option<String>,
+}
+
 #[derive(Default)]
 struct RateLimitInfo {
     remaining_requests: Option<u64>,
     remaining_tokens: Option<u64>,
     limit_requests: Option<u64>,
     limit_tokens: Option<u64>,
-    /// Unified utilization (0.0 = fresh, 1.0 = exhausted). From representative claim window.
+    /// Unified utilization (0.0 = fresh, 1.0 = exhausted). Derived: max across all windows.
     utilization: Option<f64>,
-    /// Per-window utilization for all known windows
+    /// Per-claim 7d windows: "seven_day" (general), "seven_day_sonnet" (model-specific), etc.
+    /// Source of truth for 7d utilization routing.
+    claims_7d: HashMap<String, ClaimWindowData>,
+    /// Derived convenience: max utilization across all claims_7d entries.
+    /// Used for backward-compatible logging/stats. Routing reads claims_7d directly.
     utilization_7d: Option<f64>,
     utilization_5h: Option<f64>,
-    /// Which window is the binding constraint (e.g. "five_hour", "seven_day")
+    /// Which window is the binding constraint (e.g. "five_hour", "seven_day_sonnet")
     representative_claim: Option<String>,
-    /// Epoch seconds when the 5h/7d rate-limit window resets. Used to time-discount
-    /// utilization near reset and to detect stale data (reset already passed).
+    /// Epoch seconds when the 5h rate-limit window resets.
     reset_5h: Option<u64>,
+    /// Derived convenience: min reset across all claims_7d entries.
     reset_7d: Option<u64>,
     /// API-side pressure signal. "allowed" = normal, "allowed_warning" = approaching limits
     /// (floor 0.80), "throttled" = actively constrained (floor 0.98, soft-excluded),
     /// "rejected" = hard refusal (floor 1.0, zero bucket share).
     status_5h: Option<String>,
+    /// Derived convenience: worst status across all claims_7d entries.
     status_7d: Option<String>,
     hard_limited_until: Option<Instant>,
     #[allow(dead_code)]
     last_updated: Option<Instant>,
+}
+
+/// Exponentially weighted moving average with time-constant-based decay.
+/// Handles variable inter-sample intervals correctly — the half-life is
+/// wall-clock time, not dependent on request frequency.
+struct Ewma {
+    value: f64,
+    /// Time constant (seconds). Half-life = tau * ln(2).
+    tau: f64,
+    last_update: Instant,
+}
+
+/// Minimum elapsed time between EWMA updates. Prevents division-by-zero
+/// and inf propagation when requests arrive in the same Instant tick.
+const EWMA_MIN_ELAPSED_SECS: f64 = 0.001;
+
+/// EWMA stale threshold. If no updates for this long, reset to zero.
+const EWMA_STALE_SECS: f64 = 3600.0;
+
+impl Ewma {
+    fn new(tau: f64) -> Self {
+        Self {
+            value: 0.0,
+            tau,
+            last_update: Instant::now(),
+        }
+    }
+
+    fn update(&mut self, now: Instant) -> f64 {
+        let elapsed = now
+            .duration_since(self.last_update)
+            .as_secs_f64()
+            .max(EWMA_MIN_ELAPSED_SECS);
+        self.last_update = now;
+
+        // Stale guard: long idle → reset rather than extrapolate
+        if elapsed > EWMA_STALE_SECS {
+            self.value = 0.0;
+            return self.value;
+        }
+
+        let instant_rate = 60.0 / elapsed; // requests per minute
+        let alpha = 1.0 - (-elapsed / self.tau).exp();
+        self.value = alpha * instant_rate + (1.0 - alpha) * self.value;
+
+        // NaN/inf guard (belt-and-suspenders)
+        if !self.value.is_finite() {
+            self.value = 0.0;
+        }
+        self.value
+    }
+
+    #[cfg(test)]
+    fn value(&self) -> f64 {
+        self.value
+    }
+}
+
+/// EWMA time constants for burn rate windows.
+/// Half-life = tau * ln(2): TAU_5M → ~3.5min half-life, TAU_1H → ~42min, TAU_6H → ~4.2hr.
+const TAU_5M: f64 = 300.0;
+const TAU_1H: f64 = 3600.0;
+const TAU_6H: f64 = 21600.0;
+
+/// Per-account burn rate tracker: requests per minute at three time scales.
+struct BurnRate {
+    rate_5m: Ewma,
+    rate_1h: Ewma,
+    rate_6h: Ewma,
+}
+
+impl BurnRate {
+    fn new() -> Self {
+        Self {
+            rate_5m: Ewma::new(TAU_5M),
+            rate_1h: Ewma::new(TAU_1H),
+            rate_6h: Ewma::new(TAU_6H),
+        }
+    }
+
+    fn update(&mut self, now: Instant) {
+        self.rate_5m.update(now);
+        self.rate_1h.update(now);
+        self.rate_6h.update(now);
+    }
+
+    #[cfg(test)]
+    fn rates(&self) -> (f64, f64, f64) {
+        (
+            self.rate_5m.value(),
+            self.rate_1h.value(),
+            self.rate_6h.value(),
+        )
+    }
+}
+
+/// Default emergency brake threshold. When ALL accounts exceed this, non-operator traffic is blocked.
+const DEFAULT_EMERGENCY_THRESHOLD: f64 = 0.95;
+
+/// Budget status thresholds for X-Budget-Status response header.
+const STATUS_HEALTHY_CEILING: f64 = 0.70;
+const STATUS_ELEVATED_CEILING: f64 = 0.85;
+const STATUS_EMERGENCY_FLOOR: f64 = 0.95;
+
+/// Compute the budget pressure status for a response header.
+/// Returns one of "healthy", "elevated", "critical", "emergency".
+fn compute_pressure_status(effective_util: f64, client_id: &str, state: &AppState) -> &'static str {
+    // Operator always sees healthy
+    if state.is_operator(client_id) {
+        return "healthy";
+    }
+
+    let mut status = if effective_util < STATUS_HEALTHY_CEILING {
+        "healthy"
+    } else if effective_util < STATUS_ELEVATED_CEILING {
+        "elevated"
+    } else if effective_util < STATUS_EMERGENCY_FLOOR {
+        "critical"
+    } else {
+        "emergency"
+    };
+
+    // Upgrade status if client's utilization limit proximity exceeds 80%
+    if let Some(&limit) = state.client_utilization_limits.get(client_id) {
+        if effective_util >= limit * 0.80 {
+            status = match status {
+                "healthy" => "elevated",
+                "elevated" => "critical",
+                "critical" => "emergency",
+                _ => status,
+            };
+        }
+    }
+
+    status
 }
 
 struct Account {
@@ -114,6 +274,8 @@ struct Account {
     models: Vec<String>,
     requests: AtomicU64,
     rate_info: RwLock<RateLimitInfo>,
+    /// Per-account burn rate tracker (requests per minute EWMA)
+    burn_rate: Mutex<BurnRate>,
     // Token usage counters (atomic for lock-free concurrent updates)
     input_tokens: AtomicU64,
     output_tokens: AtomicU64,
@@ -148,6 +310,14 @@ struct AppState {
     client_budgets: HashMap<String, u64>,
     /// Budget tracking: client_id → (epoch_day, tokens_used). Resets on new day.
     budget_usage: Mutex<HashMap<String, (u64, u64)>>,
+    /// Per-client utilization limits: client_id → max effective utilization.
+    client_utilization_limits: HashMap<String, f64>,
+    /// Operator client ID — never throttled by budgets, ceilings, or emergency brake.
+    operator: Option<String>,
+    /// Emergency brake threshold. Default: 0.95.
+    emergency_threshold: f64,
+    /// Per-client request tracking: client_id → (total_requests, rate_ewma)
+    client_request_rates: Mutex<HashMap<String, (u64, Ewma)>>,
     /// Utilization soft ceiling. Accounts above this are excluded from routing
     /// unless all candidates exceed it. Default: 0.90.
     soft_limit: f64,
@@ -189,20 +359,21 @@ impl AppState {
         self.allowed_ips.is_empty() || self.allowed_ips.iter().any(|e| e.contains(ip))
     }
 
-    /// Resolve client identity: x-client-id header → config map (by IP) → "-"
+    /// Resolve client identity: x-client-id header → IP map fallback → "-"
+    ///
+    /// Header takes precedence to support multiple clients per IP.
     fn resolve_client_id(&self, ip: &IpAddr, headers: &hyper::HeaderMap) -> String {
-        // 1. Header wins (explicit client identification)
         if let Some(id) = headers.get("x-client-id").and_then(|v| v.to_str().ok()) {
+            let id = id.trim();
             if !id.is_empty() && id != "-" {
                 return id.to_string();
             }
         }
-        // 2. Fall back to IP-to-name map in config
-        if let Some(name) = self.client_names.get(&ip.to_string()) {
-            return name.clone();
-        }
-        // 3. Unknown
-        "-".to_string()
+        // Fallback: IP mapping or unknown
+        self.client_names
+            .get(&ip.to_string())
+            .cloned()
+            .unwrap_or_else(|| "-".to_string())
     }
 }
 
@@ -233,6 +404,8 @@ struct PersistedAccount {
     status_5h: Option<String>,
     #[serde(default)]
     status_7d: Option<String>,
+    #[serde(default)]
+    claims_7d: HashMap<String, ClaimWindowData>,
     remaining_requests: Option<u64>,
     remaining_tokens: Option<u64>,
     limit_requests: Option<u64>,
@@ -247,6 +420,61 @@ impl AppState {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+
+    /// Convert epoch seconds to ISO 8601 UTC string (no chrono dependency).
+    fn epoch_to_iso8601(epoch: u64) -> String {
+        // Days from epoch, accounting for leap years
+        let secs_per_day: u64 = 86400;
+        let mut remaining = epoch;
+        let mut year: u64 = 1970;
+        loop {
+            let days_in_year = if (year.is_multiple_of(4) && !year.is_multiple_of(100))
+                || year.is_multiple_of(400)
+            {
+                366
+            } else {
+                365
+            };
+            let secs_in_year = days_in_year * secs_per_day;
+            if remaining < secs_in_year {
+                break;
+            }
+            remaining -= secs_in_year;
+            year += 1;
+        }
+        let is_leap =
+            (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+        let days_in_months: [u64; 12] = [
+            31,
+            if is_leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        let mut day_of_year = remaining / secs_per_day;
+        remaining %= secs_per_day;
+        let mut month: u64 = 1;
+        for &dim in &days_in_months {
+            if day_of_year < dim {
+                break;
+            }
+            day_of_year -= dim;
+            month += 1;
+        }
+        let day = day_of_year + 1;
+        let hour = remaining / 3600;
+        remaining %= 3600;
+        let minute = remaining / 60;
+        let second = remaining % 60;
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
     }
 
     async fn save_state(&self) {
@@ -274,6 +502,7 @@ impl AppState {
                 reset_7d: info.reset_7d,
                 status_5h: info.status_5h.clone(),
                 status_7d: info.status_7d.clone(),
+                claims_7d: info.claims_7d.clone(),
                 remaining_requests: info.remaining_requests,
                 remaining_tokens: info.remaining_tokens,
                 limit_requests: info.limit_requests,
@@ -300,7 +529,9 @@ impl AppState {
     }
 
     /// Fire a minimal request (max_tokens=1) to refresh rate limit headers for an account.
-    async fn probe_account(&self, idx: usize) {
+    /// The `model` parameter controls which model is probed, rotating across families
+    /// so that per-model 7d utilization claims get populated for each family.
+    async fn probe_account(&self, idx: usize, model: &str) {
         let acct = &self.accounts[idx];
         if acct.passthrough {
             debug!(
@@ -326,7 +557,7 @@ impl AppState {
 
         let url = format!("{}/v1/messages", self.upstream);
         let body = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": model,
             "max_tokens": 1,
             "system": [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}],
             "messages": [{"role": "user", "content": "."}]
@@ -364,10 +595,12 @@ impl AppState {
                 info!(
                     account = acct.name,
                     status = status.as_u16(),
+                    probe_model = model,
                     utilization = ?info.utilization,
                     util_7d = ?info.utilization_7d,
                     util_5h = ?info.utilization_5h,
                     claim = ?info.representative_claim,
+                    n_claims_7d = info.claims_7d.len(),
                     "probe complete"
                 );
             }
@@ -406,28 +639,65 @@ impl AppState {
                 info.utilization_5h = pa.utilization_5h;
                 info.representative_claim = pa.representative_claim.clone();
                 info.reset_5h = pa.reset_5h;
-                info.reset_7d = pa.reset_7d;
                 info.status_5h = pa.status_5h.clone();
-                info.status_7d = pa.status_7d.clone();
 
-                // Invalidate stale per-window data: if a window's reset is in the past,
-                // the block has reset and our utilization/status numbers are meaningless.
-                // Clear them so pick_account falls through to "unknown" (0.5) rather than
-                // routing on stale data until the first probe refreshes. (Bug #2, #3)
+                // Load claims_7d: either from persisted map or migrate from flat fields
+                if !pa.claims_7d.is_empty() {
+                    info.claims_7d = pa.claims_7d.clone();
+                } else if let Some(util_7d) = pa.utilization_7d {
+                    // Migration: old state file with flat 7d fields only
+                    let key = pa
+                        .representative_claim
+                        .as_deref()
+                        .filter(|c| c.starts_with("seven_day"))
+                        .unwrap_or("seven_day")
+                        .to_string();
+                    info.claims_7d.insert(
+                        key,
+                        ClaimWindowData {
+                            utilization: util_7d,
+                            reset: pa.reset_7d,
+                            status: pa.status_7d.clone(),
+                        },
+                    );
+                }
+
+                // Evict stale claims (reset in the past)
+                info.claims_7d
+                    .retain(|_, c| c.reset.is_some_and(|r| r > now_epoch));
+
+                // Derive flat 7d fields from claims_7d
+                if info.claims_7d.is_empty() {
+                    info.utilization_7d = None;
+                    info.reset_7d = None;
+                    info.status_7d = None;
+                } else {
+                    info.utilization_7d = info
+                        .claims_7d
+                        .values()
+                        .map(|c| c.utilization)
+                        .reduce(f64::max);
+                    info.reset_7d = info.claims_7d.values().filter_map(|c| c.reset).min();
+                    info.status_7d = info
+                        .claims_7d
+                        .values()
+                        .filter_map(|c| c.status.as_ref())
+                        .max_by(|a, b| {
+                            status_to_floor(Some(a))
+                                .partial_cmp(&status_to_floor(Some(b)))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .cloned();
+                }
+
+                // Invalidate stale 5h data
                 let stale_5h = info.reset_5h.is_none_or(|r| r <= now_epoch);
-                let stale_7d = info.reset_7d.is_none_or(|r| r <= now_epoch);
                 if stale_5h {
                     info.utilization_5h = None;
                     info.reset_5h = None;
                     info.status_5h = None;
                 }
-                if stale_7d {
-                    info.utilization_7d = None;
-                    info.reset_7d = None;
-                    info.status_7d = None;
-                }
-                if stale_5h && stale_7d {
-                    // Both windows stale — the derived unified field is also meaningless
+                if stale_5h && info.claims_7d.is_empty() {
                     info.utilization = None;
                 }
 
@@ -490,6 +760,38 @@ const WARNING_UTIL_FLOOR: f64 = 0.80;
 /// Distinct from hard_limited_until (which skips the account entirely) because rejected
 /// status can arrive on one window while the other is still valid.
 const REJECTED_UTIL_FLOOR: f64 = 1.0;
+
+/// Extract the model family from a model ID string.
+/// Used to look up model-specific rate-limit claims (e.g., "seven_day_sonnet").
+/// Returns "" for unrecognized models, which triggers worst-case routing.
+fn model_family(model: &str) -> &str {
+    if model.contains("sonnet") {
+        "sonnet"
+    } else if model.contains("opus") {
+        "opus"
+    } else if model.contains("haiku") {
+        "haiku"
+    } else {
+        ""
+    }
+}
+
+/// Seven-day claim penalty threshold. Below this, no penalty applied.
+const CLAIM_PENALTY_THRESHOLD: f64 = 0.70;
+/// Quadratic penalty multiplier. Calibrated so 90% raw → ~1.033 effective (zero headroom).
+const CLAIM_PENALTY_MULTIPLIER: f64 = 3.33;
+
+/// Apply a quadratic penalty to seven-day utilization above the threshold.
+/// Five-hour windows are NOT penalized because they recover quickly.
+/// Penalty curve: 70%→0.70, 80%→0.833, 85%→0.925, 90%→1.033 (zero headroom).
+fn claim_penalty_7d(adj_7d: f64) -> f64 {
+    if adj_7d > CLAIM_PENALTY_THRESHOLD {
+        let excess = adj_7d - CLAIM_PENALTY_THRESHOLD;
+        adj_7d + excess * excess * CLAIM_PENALTY_MULTIPLIER
+    } else {
+        adj_7d
+    }
+}
 
 /// Map a rate-limit status string to a utilization floor.
 /// Unknown non-"allowed" values are treated as warning-level pressure and logged,
@@ -566,6 +868,92 @@ fn time_adjusted_utilization(
     }
 }
 
+/// Compute effective utilization for an account using the full fallback chain.
+/// Returns (utilization, source_label) for logging/routing.
+///
+/// Fallback chain:
+/// 1. Both windows adjusted → take max (most constrained wins), 7d penalized by claim_penalty_7d
+/// 2. Only one window → use it (the other is stale or absent), 7d penalized
+/// 3. Neither window → raw unified util, then legacy token ratio, then 0.5
+fn effective_utilization(info: &RateLimitInfo, now_epoch: u64, model: &str) -> (f64, &'static str) {
+    // 5h window — always flat (no per-model sub-budgets from API)
+    let adj_5h = time_adjusted_utilization(
+        info.utilization_5h,
+        info.reset_5h,
+        info.status_5h.as_deref(),
+        NEAR_RESET_5H_SECS,
+        now_epoch,
+    );
+
+    // 7d window — model-aware lookup from claims_7d map
+    let adj_7d = if !info.claims_7d.is_empty() {
+        if !model.is_empty() {
+            // Model-specific: try "seven_day_{family}", fallback to "seven_day" (general)
+            let family = model_family(model);
+            let claim = if !family.is_empty() {
+                let specific_key = format!("seven_day_{}", family);
+                info.claims_7d
+                    .get(&specific_key)
+                    .or_else(|| info.claims_7d.get("seven_day"))
+            } else {
+                info.claims_7d.get("seven_day")
+            };
+            claim.and_then(|c| {
+                time_adjusted_utilization(
+                    Some(c.utilization),
+                    c.reset,
+                    c.status.as_deref(),
+                    NEAR_RESET_7D_SECS,
+                    now_epoch,
+                )
+                .map(claim_penalty_7d)
+            })
+        } else {
+            // No model specified (emergency brake, stats) — worst-case across all claims
+            info.claims_7d
+                .values()
+                .filter_map(|c| {
+                    time_adjusted_utilization(
+                        Some(c.utilization),
+                        c.reset,
+                        c.status.as_deref(),
+                        NEAR_RESET_7D_SECS,
+                        now_epoch,
+                    )
+                    .map(claim_penalty_7d)
+                })
+                .reduce(f64::max)
+        }
+    } else {
+        // No claims_7d data — fall back to derived flat fields (migration/compat)
+        time_adjusted_utilization(
+            info.utilization_7d,
+            info.reset_7d,
+            info.status_7d.as_deref(),
+            NEAR_RESET_7D_SECS,
+            now_epoch,
+        )
+        .map(claim_penalty_7d)
+    };
+
+    match (adj_5h, adj_7d) {
+        (Some(a), Some(b)) => (a.max(b), "time_adjusted"),
+        (Some(a), None) => (a, "time_adjusted_5h"),
+        (None, Some(b)) => (b, "time_adjusted_7d"),
+        (None, None) => {
+            // Fallback: raw unified (no time adjustment), legacy tokens, or unknown
+            if let Some(util) = info.utilization {
+                (util, "unified")
+            } else if let Some(remaining) = info.remaining_tokens {
+                let limit = info.limit_tokens.unwrap_or(1_000_000);
+                (1.0 - (remaining as f64 / limit as f64), "legacy")
+            } else {
+                (0.5, "unknown")
+            }
+        }
+    }
+}
+
 impl AppState {
     /// Pick the best available account using headroom-proportional weighted bucket hashing.
     ///
@@ -605,46 +993,9 @@ impl AppState {
                 }
             }
 
-            // Compute time-adjusted utilization for each rate-limit window independently.
-            // Each window has its own reset timestamp, threshold, and status signal.
-            // Returns None if data is stale (reset already passed) or absent.
-            let adj_5h = time_adjusted_utilization(
-                info.utilization_5h,
-                info.reset_5h,
-                info.status_5h.as_deref(),
-                NEAR_RESET_5H_SECS,
-                now_epoch,
-            );
-            let adj_7d = time_adjusted_utilization(
-                info.utilization_7d,
-                info.reset_7d,
-                info.status_7d.as_deref(),
-                NEAR_RESET_7D_SECS,
-                now_epoch,
-            );
-
-            // Effective utilization fallback chain:
-            // 1. Both windows adjusted → take the max (most constrained window wins)
-            // 2. Only one window → use it (the other is stale or absent)
-            // 3. Neither window → fall back to raw unified util, then legacy token ratio, then 0.5
-            // This preserves backward compat: accounts without reset headers behave identically
-            // to the pre-time-adjustment algorithm.
-            let (effective_util, source) = match (adj_5h, adj_7d) {
-                (Some(a), Some(b)) => (a.max(b), "time_adjusted"),
-                (Some(a), None) => (a, "time_adjusted_5h"),
-                (None, Some(b)) => (b, "time_adjusted_7d"),
-                (None, None) => {
-                    // Fallback: raw unified (no time adjustment), legacy tokens, or unknown
-                    if let Some(util) = info.utilization {
-                        (util, "unified")
-                    } else if let Some(remaining) = info.remaining_tokens {
-                        let limit = info.limit_tokens.unwrap_or(1_000_000);
-                        (1.0 - (remaining as f64 / limit as f64), "legacy")
-                    } else {
-                        (0.5, "unknown")
-                    }
-                }
-            };
+            // Compute effective utilization using the shared fallback chain.
+            // This includes claim_penalty_7d on the 7d window.
+            let (effective_util, source) = effective_utilization(&info, now_epoch, model);
 
             // Headroom = available capacity. Rejected/exhausted accounts (util >= 1.0) get zero
             // headroom so they receive no traffic even in all-exhausted degraded mode (Bug #5).
@@ -660,8 +1011,6 @@ impl AppState {
                 effective_util = format!("{:.4}", effective_util),
                 headroom = format!("{:.4}", headroom),
                 source = source,
-                adj_5h = ?adj_5h,
-                adj_7d = ?adj_7d,
                 raw_5h = ?info.utilization_5h,
                 raw_7d = ?info.utilization_7d,
                 reset_5h = ?info.reset_5h,
@@ -782,20 +1131,28 @@ impl AppState {
             }
         }
 
-        // Capture per-window utilization (always, regardless of representative claim)
-        // Track whether we got utilization for each window — if we did but got no status header,
-        // the pressure has cleared and we must reset the stale status (Bug #1: sticky status fix).
-        let got_7d_util = if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-utilization")
-        {
-            if let Ok(s) = v.to_str() {
-                info.utilization_7d = s.parse::<f64>().ok().map(|v| v.clamp(0.0, 1.0));
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        // Parse representative claim FIRST — determines where 7d data is stored.
+        // Model-specific claims (e.g., "seven_day_sonnet") route 7d data to a per-claim
+        // entry so different models don't overwrite each other's utilization.
+        let rep_claim = headers
+            .get("anthropic-ratelimit-unified-representative-claim")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        if let Some(ref claim) = rep_claim {
+            info.representative_claim = Some(claim.clone());
+        }
+
+        // Determine the claim key for 7d data storage.
+        // If claim starts with "seven_day", use it verbatim (e.g., "seven_day_sonnet").
+        // Otherwise default to "seven_day" (general bucket).
+        let claim_key_7d = rep_claim
+            .as_deref()
+            .filter(|c| c.starts_with("seven_day"))
+            .unwrap_or("seven_day");
+
+        // Capture 5h utilization (flat — no per-model sub-budgets observed for 5h).
+        // Track whether we got utilization for sticky status fix (Bug #1).
         let got_5h_util = if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-utilization")
         {
             if let Ok(s) = v.to_str() {
@@ -808,8 +1165,25 @@ impl AppState {
             false
         };
 
+        // Capture 7d utilization → store in claims_7d[claim_key].
+        let got_7d_util = if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-utilization")
+        {
+            if let Ok(s) = v.to_str() {
+                if let Ok(util) = s.parse::<f64>() {
+                    let entry = info.claims_7d.entry(claim_key_7d.to_string()).or_default();
+                    entry.utilization = util.clamp(0.0, 1.0);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Capture per-window reset timestamps (epoch seconds).
-        // Used by time_adjusted_utilization() to discount near-reset accounts and detect stale data.
         // Sanity-capped: 5h window can't reset >5h out, 7d can't reset >7d out (Bug #6).
         let now_epoch = Self::now_epoch();
         if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-reset") {
@@ -821,11 +1195,14 @@ impl AppState {
                 }
             }
         }
+        // 7d reset → store in claims_7d[claim_key]
         if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-reset") {
             if let Ok(s) = v.to_str() {
                 if let Ok(epoch) = s.parse::<u64>() {
                     if epoch <= now_epoch + 604800 {
-                        info.reset_7d = Some(epoch);
+                        if let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
+                            entry.reset = Some(epoch);
+                        }
                     }
                 }
             }
@@ -833,7 +1210,6 @@ impl AppState {
 
         // Capture per-window status. These signal API-side pressure (burst limits, concurrent
         // request limits, per-model sub-limits) that raw utilization percentages don't reflect.
-        // "allowed_warning" → reduce routing share. "throttled" → effectively exclude.
         // If the API sent utilization for a window but NO status header, clear stale status —
         // absence of the header means pressure has subsided (Bug #1).
         if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-status") {
@@ -843,33 +1219,46 @@ impl AppState {
         } else if got_5h_util {
             info.status_5h = None;
         }
+        // 7d status → store in claims_7d[claim_key]
         if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-status") {
             if let Ok(s) = v.to_str() {
-                info.status_7d = Some(s.to_string());
+                if let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
+                    entry.status = Some(s.to_string());
+                }
             }
         } else if got_7d_util {
-            info.status_7d = None;
+            // Status absent but util present → pressure subsided for this claim
+            if let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
+                entry.status = None;
+            }
         }
 
-        // Representative claim tells us which window is the binding constraint
-        let rep_claim = headers
-            .get("anthropic-ratelimit-unified-representative-claim")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        if let Some(ref claim) = rep_claim {
-            info.representative_claim = Some(claim.clone());
+        // Derive flat convenience fields from claims_7d (backward compat for logs/stats).
+        // utilization_7d = max utilization, reset_7d = min reset, status_7d = worst status.
+        if !info.claims_7d.is_empty() {
+            info.utilization_7d = Some(
+                info.claims_7d
+                    .values()
+                    .map(|c| c.utilization)
+                    .fold(0.0_f64, f64::max),
+            );
+            info.reset_7d = info.claims_7d.values().filter_map(|c| c.reset).min();
+            info.status_7d = info
+                .claims_7d
+                .values()
+                .filter_map(|c| c.status.as_deref())
+                .max_by(|a, b| {
+                    status_to_floor(Some(a))
+                        .partial_cmp(&status_to_floor(Some(b)))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|s| s.to_string());
         }
 
-        // Use the MAX of all known window utilizations as the effective utilization.
-        // This prevents the bug where accounts with different representative claims
-        // get compared on different time windows (apples vs oranges).
-        let mut max_util: Option<f64> = None;
-        for u in [info.utilization_7d, info.utilization_5h]
-            .into_iter()
-            .flatten()
-        {
-            max_util = Some(max_util.map_or(u, |cur: f64| cur.max(u)));
+        // Derive unified utilization = max across all windows (5h + all 7d claims).
+        let mut max_util: Option<f64> = info.utilization_5h;
+        for cd in info.claims_7d.values() {
+            max_util = Some(max_util.map_or(cd.utilization, |cur| cur.max(cd.utilization)));
         }
         if max_util.is_some() {
             info.utilization = max_util;
@@ -908,6 +1297,7 @@ impl AppState {
             status_5h = ?info.status_5h,
             status_7d = ?info.status_7d,
             claim = ?info.representative_claim,
+            n_claims_7d = info.claims_7d.len(),
             remaining_requests = ?info.remaining_requests,
             remaining_tokens = ?info.remaining_tokens,
             "rate info updated"
@@ -1112,6 +1502,134 @@ impl AppState {
             entry.1 += tokens;
         }
     }
+
+    /// Check if client_id is the operator.
+    fn is_operator(&self, client_id: &str) -> bool {
+        self.operator.as_deref() == Some(client_id)
+    }
+
+    /// Check if all model-compatible accounts exceed this client's utilization limit.
+    /// Returns Ok(()) if no limit configured or at least one account is below the limit.
+    /// Returns Err(retry_after_secs) if all accounts exceed the limit.
+    async fn check_utilization_limit(&self, client_id: &str, model: &str) -> Result<(), u64> {
+        let limit = match self.client_utilization_limits.get(client_id) {
+            Some(&limit) => limit,
+            None => return Ok(()), // no limit configured
+        };
+
+        let now_epoch = Self::now_epoch();
+        let mut nearest_reset: Option<u64> = None;
+        let mut all_above = true;
+        let mut any_compatible = false;
+
+        for acct in &self.accounts {
+            if !acct.serves_model(model) {
+                continue;
+            }
+            any_compatible = true;
+            let info = acct.rate_info.read().await;
+            let (util, _) = effective_utilization(&info, now_epoch, model);
+            if util < limit {
+                all_above = false;
+                break;
+            }
+            // Track nearest reset for Retry-After
+            if let Some(r) = info.reset_5h {
+                if r > now_epoch {
+                    let secs = r - now_epoch;
+                    nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
+                }
+            }
+            for c in info.claims_7d.values() {
+                if let Some(r) = c.reset {
+                    if r > now_epoch {
+                        let secs = r - now_epoch;
+                        nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
+                    }
+                }
+            }
+        }
+
+        if all_above && any_compatible {
+            let retry_after = nearest_reset.unwrap_or(300).clamp(60, 3600);
+            Err(retry_after)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Check if all accounts are above the emergency threshold.
+    /// Fail-open: returns false if all accounts return (0.5, "unknown") — no data.
+    async fn is_emergency_brake_active(&self) -> bool {
+        let now_epoch = Self::now_epoch();
+        let mut all_above = true;
+        let mut any_known = false;
+
+        for acct in &self.accounts {
+            let info = acct.rate_info.read().await;
+            let (util, source) = effective_utilization(&info, now_epoch, "");
+            if source != "unknown" {
+                any_known = true;
+            }
+            if util < self.emergency_threshold {
+                all_above = false;
+                break;
+            }
+        }
+
+        // Fail-open: if no account has real data, don't activate
+        all_above && any_known
+    }
+
+    /// Shared pre-request gate for all Anthropic-proxied requests.
+    /// Returns Ok(()) or an error Response (429).
+    async fn pre_request_gate(&self, client_id: &str, model: &str) -> Result<(), Response> {
+        if self.is_operator(client_id) {
+            return Ok(()); // operator bypasses everything
+        }
+
+        // 1. Daily token budget (existing)
+        if client_id != "-" && self.check_budget(client_id).is_err() {
+            warn!(client_id = %client_id, "rejected: daily token budget exceeded");
+            return Err(
+                (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response(),
+            );
+        }
+
+        // 2. Utilization limit (new)
+        if let Err(retry_after) = self.check_utilization_limit(client_id, model).await {
+            warn!(
+                client_id = %client_id,
+                retry_after = retry_after,
+                "rejected: utilization limit exceeded"
+            );
+            let mut resp = (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("utilization limit exceeded for client '{client_id}'"),
+            )
+                .into_response();
+            resp.headers_mut().insert(
+                "retry-after",
+                HeaderValue::from_str(&retry_after.to_string()).unwrap(),
+            );
+            return Err(resp);
+        }
+
+        // 3. Emergency brake (new)
+        if self.is_emergency_brake_active().await {
+            warn!(
+                client_id = %client_id,
+                "rejected: emergency brake active"
+            );
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "emergency: all accounts near exhaustion",
+            )
+                .into_response());
+        }
+
+        Ok(())
+    }
 }
 
 // ── Auto-cache injection ────────────────────────────────────────────
@@ -1289,13 +1807,7 @@ async fn proxy_handler(
         .unwrap_or("-")
         .to_string();
 
-    // Budget check: reject if client has exceeded their daily token budget
-    if client_id != "-" && state.check_budget(&client_id).is_err() {
-        warn!(client_id = %client_id, "rejected: daily token budget exceeded");
-        return (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response();
-    }
-
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, 25 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             error!("failed to read request body: {e}");
@@ -1332,6 +1844,14 @@ async fn proxy_handler(
         } else {
             (body_bytes, String::new())
         };
+
+    // Pre-request gate: operator bypass, budget, utilization limit, emergency brake.
+    // Note: budget + emergency don't need `model` and could run before body parsing,
+    // but those rejections are rare and the JSON parse cost is negligible — not worth
+    // splitting the gate for a few microseconds on an almost-never code path.
+    if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
+        return resp;
+    }
 
     // Build affinity key for sticky routing — only use stickiness when there's
     // meaningful client identification beyond just the IP address
@@ -1374,6 +1894,11 @@ async fn proxy_handler(
         let mut headers = parts.headers.clone();
         headers.remove("host");
         headers.remove("content-length"); // body size may change after cache injection
+
+        // Default anthropic-version if client didn't set it
+        if !headers.contains_key("anthropic-version") {
+            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        }
 
         // Auth: passthrough keeps caller's headers, otherwise inject account token
         if !acct.passthrough {
@@ -1433,6 +1958,22 @@ async fn proxy_handler(
         // Always update rate limit info and persist
         state.update_rate_info(idx, resp.headers()).await;
 
+        // Update burn rate (after rate-limit headers are parsed)
+        {
+            let now = Instant::now();
+            if let Ok(mut br) = acct.burn_rate.lock() {
+                br.update(now);
+            }
+            // Per-client request tracking
+            if let Ok(mut rates) = state.client_request_rates.lock() {
+                let entry = rates
+                    .entry(client_id.clone())
+                    .or_insert_with(|| (0, Ewma::new(TAU_1H)));
+                entry.0 += 1;
+                entry.1.update(now);
+            }
+        }
+
         // 429 → mark hard-limited and try next account
         if status == StatusCode::TOO_MANY_REQUESTS {
             state.mark_hard_limited(idx, resp.headers()).await;
@@ -1485,6 +2026,14 @@ async fn proxy_handler(
                 continue;
             }
             builder = builder.header(k, v);
+        }
+
+        // Inject budget status header
+        {
+            let info = acct.rate_info.read().await;
+            let (eff_util, _) = effective_utilization(&info, AppState::now_epoch(), &model);
+            let status_val = compute_pressure_status(eff_util, &client_id, &state);
+            builder = builder.header("x-budget-status", status_val);
         }
 
         // Detect streaming from content-type
@@ -1614,7 +2163,7 @@ async fn upstream_handler(
     // Extract client identification headers
     let client_id = state.resolve_client_id(&client_ip, &parts.headers);
 
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, 25 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             error!("failed to read request body: {e}");
@@ -1711,7 +2260,9 @@ async fn stats_handler(
         }
     }
 
+    let now_epoch = AppState::now_epoch();
     let mut out = Vec::new();
+    let mut total_headroom: Option<u64> = Some(0);
     for acct in &state.accounts {
         let info = acct.rate_info.read().await;
         let hard_limited = match info.hard_limited_until {
@@ -1720,6 +2271,60 @@ async fn stats_handler(
             }
             _ => None,
         };
+
+        // Burn rate from EWMA tracker
+        let (br_5m, br_1h, br_6h) = acct
+            .burn_rate
+            .lock()
+            .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
+            .unwrap_or((0.0, 0.0, 0.0));
+
+        // Headroom: prefer remaining_requests header, else (1-util)*limit, else null
+        let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
+            Some(rem)
+        } else if let (Some(util), Some(limit)) = (info.utilization, info.limit_requests) {
+            Some(((1.0 - util) * limit as f64).max(0.0) as u64)
+        } else {
+            None
+        };
+        match (total_headroom.as_mut(), headroom) {
+            (Some(total), Some(h)) => *total += h,
+            _ => total_headroom = None,
+        }
+
+        // Projected throttle time
+        let (eff_util, _) = effective_utilization(&info, now_epoch, "");
+        let projected_throttle_at: serde_json::Value = if eff_util < 0.5 || br_1h < 0.01 {
+            serde_json::Value::Null
+        } else if let Some(headroom_reqs) = headroom {
+            if headroom_reqs == 0 {
+                // Already at limit — check if hard-limited and report cooldown expiry
+                if let Some(hl_secs) = hard_limited {
+                    serde_json::Value::String(AppState::epoch_to_iso8601(now_epoch + hl_secs))
+                } else {
+                    serde_json::Value::String(AppState::epoch_to_iso8601(now_epoch))
+                }
+            } else {
+                let minutes_remaining = headroom_reqs as f64 / br_1h;
+                let secs_remaining = (minutes_remaining * 60.0) as u64;
+                let projected_epoch = now_epoch + secs_remaining;
+                // If projection is beyond next reset, account will recover → null
+                let mut next_reset = info.reset_5h.unwrap_or(u64::MAX);
+                for c in info.claims_7d.values() {
+                    if let Some(r) = c.reset {
+                        next_reset = next_reset.min(r);
+                    }
+                }
+                if projected_epoch > next_reset && next_reset != u64::MAX {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(AppState::epoch_to_iso8601(projected_epoch))
+                }
+            }
+        } else {
+            serde_json::Value::Null
+        };
+
         out.push(serde_json::json!({
             "name": acct.name,
             "passthrough": acct.passthrough,
@@ -1732,11 +2337,25 @@ async fn stats_handler(
             "reset_7d": info.reset_7d,
             "status_5h": info.status_5h,
             "status_7d": info.status_7d,
+            "claims_7d": info.claims_7d.iter().map(|(k, v)| {
+                (k.clone(), serde_json::json!({
+                    "utilization": v.utilization,
+                    "reset": v.reset,
+                    "status": v.status,
+                }))
+            }).collect::<serde_json::Map<String, serde_json::Value>>(),
             "remaining_requests": info.remaining_requests,
             "remaining_tokens": info.remaining_tokens,
             "limit_requests": info.limit_requests,
             "limit_tokens": info.limit_tokens,
             "hard_limited_remaining_secs": hard_limited,
+            "burn_rate": {
+                "last_5m": (br_5m * 100.0).round() / 100.0,
+                "last_1h": (br_1h * 100.0).round() / 100.0,
+                "last_6h": (br_6h * 100.0).round() / 100.0,
+            },
+            "headroom_requests": headroom,
+            "projected_throttle_at": projected_throttle_at,
             "token_usage": {
                 "input_tokens": acct.input_tokens.load(Ordering::Relaxed),
                 "output_tokens": acct.output_tokens.load(Ordering::Relaxed),
@@ -1754,21 +2373,42 @@ async fn stats_handler(
         }));
     }
 
-    // Per-client usage
+    // Per-client usage (tokens + request rates)
+    let request_rates = state.client_request_rates.lock().ok();
     let client_usage: serde_json::Value = state
         .client_usage
         .lock()
         .map(|map| {
-            let obj: serde_json::Map<String, serde_json::Value> = map
-                .iter()
-                .map(|(k, v)| {
+            // Collect all client IDs from both token usage and request rates
+            let mut all_clients: std::collections::HashSet<&String> = map.keys().collect();
+            if let Some(ref rates) = request_rates {
+                all_clients.extend(rates.keys());
+            }
+
+            let obj: serde_json::Map<String, serde_json::Value> = all_clients
+                .into_iter()
+                .map(|k| {
+                    // Operator hiding: attribute operator data to a reserved key
+                    let display_key = if state.is_operator(k) {
+                        "_operator".to_string()
+                    } else {
+                        k.clone()
+                    };
+                    let tokens = map.get(k).copied().unwrap_or([0; 4]);
+                    let (req_total, req_per_min) = request_rates
+                        .as_ref()
+                        .and_then(|r| r.get(k))
+                        .map(|(total, ewma)| (*total, ewma.value))
+                        .unwrap_or((0, 0.0));
                     (
-                        k.clone(),
+                        display_key,
                         serde_json::json!({
-                            "input_tokens": v[0],
-                            "output_tokens": v[1],
-                            "cache_creation_input_tokens": v[2],
-                            "cache_read_input_tokens": v[3],
+                            "input_tokens": tokens[0],
+                            "output_tokens": tokens[1],
+                            "cache_creation_input_tokens": tokens[2],
+                            "cache_read_input_tokens": tokens[3],
+                            "requests_total": req_total,
+                            "requests_per_minute": (req_per_min * 100.0).round() / 100.0,
                         }),
                     )
                 })
@@ -1776,6 +2416,58 @@ async fn stats_handler(
             serde_json::Value::Object(obj)
         })
         .unwrap_or(serde_json::json!({}));
+
+    // Aggregate: total headroom + per-consumer share
+    let aggregate = {
+        let mut consumers = serde_json::Map::new();
+        let mut total_rpm = 0.0_f64;
+        if let Some(ref rates) = request_rates {
+            for (client, (_, ewma)) in rates.iter() {
+                let display_key = if state.is_operator(client) {
+                    "_operator".to_string()
+                } else {
+                    client.clone()
+                };
+                total_rpm += ewma.value;
+                let entry = consumers.entry(display_key).or_insert_with(
+                    || serde_json::json!({"requests_per_minute": 0.0, "share": 0.0}),
+                );
+                if let Some(obj) = entry.as_object_mut() {
+                    let cur = obj
+                        .get("requests_per_minute")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    obj.insert(
+                        "requests_per_minute".to_string(),
+                        serde_json::json!(cur + ewma.value),
+                    );
+                }
+            }
+            // Compute shares
+            if total_rpm > 0.0 {
+                for (_client, val) in consumers.iter_mut() {
+                    if let Some(obj) = val.as_object_mut() {
+                        let rpm = obj
+                            .get("requests_per_minute")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        obj.insert(
+                            "requests_per_minute".to_string(),
+                            serde_json::json!((rpm * 100.0).round() / 100.0),
+                        );
+                        obj.insert(
+                            "share".to_string(),
+                            serde_json::json!(((rpm / total_rpm) * 1000.0).round() / 1000.0),
+                        );
+                    }
+                }
+            }
+        }
+        serde_json::json!({
+            "total_headroom_requests": total_headroom,
+            "consumers": serde_json::Value::Object(consumers),
+        })
+    };
 
     // Per-client budget status
     let budgets: serde_json::Value = if state.client_budgets.is_empty() {
@@ -1811,6 +2503,7 @@ async fn stats_handler(
         "upstreams": upstream_stats,
         "client_usage": client_usage,
         "client_budgets": budgets,
+        "aggregate": aggregate,
         "strategy": "dynamic-capacity",
     }))
     .into_response()
@@ -2130,13 +2823,7 @@ async fn openai_chat_handler(
         .unwrap_or("-")
         .to_string();
 
-    // Budget check: reject if client has exceeded their daily token budget
-    if client_id != "-" && state.check_budget(&client_id).is_err() {
-        warn!(client_id = %client_id, "rejected: daily token budget exceeded");
-        return (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response();
-    }
-
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, 25 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             error!("failed to read request body: {e}");
@@ -2161,6 +2848,14 @@ async fn openai_chat_handler(
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
+
+    // Pre-request gate: operator bypass, budget, utilization limit, emergency brake.
+    // Note: budget + emergency don't need `model` and could run before body parsing,
+    // but those rejections are rare and the JSON parse cost is negligible — not worth
+    // splitting the gate for a few microseconds on an almost-never code path.
+    if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
+        return resp;
+    }
 
     let mut anthropic_body = translate_openai_to_anthropic(&openai_body);
 
@@ -2272,6 +2967,21 @@ async fn openai_chat_handler(
         acct.requests.fetch_add(1, Ordering::Relaxed);
         state.update_rate_info(idx, resp.headers()).await;
 
+        // Update burn rate (after rate-limit headers are parsed)
+        {
+            let now = Instant::now();
+            if let Ok(mut br) = acct.burn_rate.lock() {
+                br.update(now);
+            }
+            if let Ok(mut rates) = state.client_request_rates.lock() {
+                let entry = rates
+                    .entry(client_id.clone())
+                    .or_insert_with(|| (0, Ewma::new(TAU_1H)));
+                entry.0 += 1;
+                entry.1.update(now);
+            }
+        }
+
         if status == StatusCode::TOO_MANY_REQUESTS {
             state.mark_hard_limited(idx, resp.headers()).await;
             state.save_state().await;
@@ -2291,6 +3001,13 @@ async fn openai_chat_handler(
         }
 
         state.save_state().await;
+
+        // Compute budget pressure status for response header
+        let budget_status = {
+            let info = acct.rate_info.read().await;
+            let (eff_util, _) = effective_utilization(&info, AppState::now_epoch(), &model);
+            compute_pressure_status(eff_util, &client_id, &state)
+        };
 
         {
             let info = acct.rate_info.read().await;
@@ -2315,6 +3032,7 @@ async fn openai_chat_handler(
             return Response::builder()
                 .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
                 .header("content-type", "application/json")
+                .header("x-budget-status", budget_status)
                 .body(Body::from(error_body))
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
@@ -2405,6 +3123,7 @@ async fn openai_chat_handler(
                 .header("content-type", "text/event-stream")
                 .header("cache-control", "no-cache")
                 .header("connection", "keep-alive")
+                .header("x-budget-status", budget_status)
                 .body(Body::from_stream(ReceiverStream::new(rx)))
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
@@ -2427,6 +3146,7 @@ async fn openai_chat_handler(
                 return Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
+                    .header("x-budget-status", budget_status)
                     .body(Body::from(resp_bytes))
                     .unwrap_or_else(|_| {
                         (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
@@ -2459,7 +3179,16 @@ async fn openai_chat_handler(
             "cache_read_input_tokens": usage.cache_read_input_tokens,
         }));
 
-        return axum::Json(openai_resp).into_response();
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("x-budget-status", budget_status)
+            .body(Body::from(
+                serde_json::to_vec(&openai_resp).unwrap_or_default(),
+            ))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+            });
     }
 
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all accounts").into_response()
@@ -2498,6 +3227,26 @@ async fn main() {
         toml::from_str(&config_str).unwrap_or_else(|e| panic!("invalid config: {e}"));
 
     assert!(!config.accounts.is_empty(), "at least one account required");
+
+    // Validate new config fields
+    for (client, limit) in &config.client_utilization_limits {
+        assert!(
+            (0.0..=1.0).contains(limit),
+            "client_utilization_limits.{client}: must be 0.0-1.0, got {limit}"
+        );
+    }
+    if let Some(ref op) = config.operator {
+        assert!(
+            op != "-",
+            "operator cannot be '-' (the unknown-client sentinel)"
+        );
+    }
+    if let Some(thresh) = config.emergency_threshold {
+        assert!(
+            (0.0..=1.0).contains(&thresh),
+            "emergency_threshold must be 0.0-1.0, got {thresh}"
+        );
+    }
 
     let cooldown = Duration::from_secs(config.rate_limit_cooldown_secs.unwrap_or(60));
 
@@ -2539,6 +3288,7 @@ async fn main() {
                 token: a.token,
                 requests: AtomicU64::new(0),
                 rate_info: RwLock::new(RateLimitInfo::default()),
+                burn_rate: Mutex::new(BurnRate::new()),
                 input_tokens: AtomicU64::new(0),
                 output_tokens: AtomicU64::new(0),
                 cache_creation_tokens: AtomicU64::new(0),
@@ -2625,6 +3375,12 @@ async fn main() {
         shadow_log_tx,
         client_budgets: config.client_budgets.clone(),
         budget_usage: Mutex::new(HashMap::new()),
+        client_utilization_limits: config.client_utilization_limits.clone(),
+        operator: config.operator.clone(),
+        emergency_threshold: config
+            .emergency_threshold
+            .unwrap_or(DEFAULT_EMERGENCY_THRESHOLD),
+        client_request_rates: Mutex::new(HashMap::new()),
         soft_limit: config.soft_limit.unwrap_or(0.90),
     });
 
@@ -2662,18 +3418,40 @@ async fn main() {
         let probe_state = state.clone();
         let n_accounts = probe_state.accounts.len();
         tokio::spawn(async move {
+            const PROBE_MODELS: &[&str] = &[
+                "claude-haiku-4-5-20251001",
+                "claude-sonnet-4-5-20250929",
+                "claude-opus-4-6",
+            ];
             // Stagger initial probes: wait 10s then probe all accounts
             tokio::time::sleep(Duration::from_secs(10)).await;
             info!(
                 interval_secs = probe_interval,
                 "starting utilization probes"
             );
+            let mut probe_cycle: usize = 0;
             loop {
                 for i in 0..n_accounts {
-                    probe_state.probe_account(i).await;
+                    // Rotate probe model per account per cycle
+                    let model_idx = (probe_cycle + i) % PROBE_MODELS.len();
+                    let model = PROBE_MODELS[model_idx];
+                    // Skip if account doesn't serve this model family
+                    let acct = &probe_state.accounts[i];
+                    if !acct.serves_model(model) {
+                        // Try next model in rotation
+                        let alt_idx = (model_idx + 1) % PROBE_MODELS.len();
+                        let alt_model = PROBE_MODELS[alt_idx];
+                        if acct.serves_model(alt_model) {
+                            probe_state.probe_account(i, alt_model).await;
+                        }
+                        // else: account serves none of our probe models, skip
+                    } else {
+                        probe_state.probe_account(i, model).await;
+                    }
                     // Small delay between accounts to avoid burst
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
+                probe_cycle = probe_cycle.wrapping_add(1);
                 tokio::time::sleep(Duration::from_secs(probe_interval)).await;
             }
         });
@@ -2719,6 +3497,7 @@ mod tests {
             models: vec![],
             requests: AtomicU64::new(0),
             rate_info: RwLock::new(RateLimitInfo::default()),
+            burn_rate: Mutex::new(BurnRate::new()),
             input_tokens: AtomicU64::new(0),
             output_tokens: AtomicU64::new(0),
             cache_creation_tokens: AtomicU64::new(0),
@@ -2746,6 +3525,10 @@ mod tests {
             shadow_log_tx: None,
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
         })
     }
@@ -2820,10 +3603,20 @@ mod tests {
             shadow_log_tx: None,
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
         });
 
-        let app = Router::new()
+        (build_router(state.clone()), state)
+    }
+
+    /// Build a router from a pre-configured state. Used by integration tests
+    /// that need custom AppState (operator, utilization limits, etc.).
+    fn build_router(state: Arc<AppState>) -> Router {
+        Router::new()
             .route("/_stats", axum::routing::get(stats_handler))
             .route(
                 "/v1/chat/completions",
@@ -2831,9 +3624,23 @@ mod tests {
             )
             .route("/upstream/{name}/{*rest}", any(upstream_handler))
             .fallback(any(proxy_handler))
-            .with_state(state.clone());
+            .with_state(state)
+    }
 
-        (app, state)
+    /// Start a test server and return its address. Spawns the axum server
+    /// with ConnectInfo support for client IP extraction.
+    async fn serve(app: Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        addr
     }
 
     // ── Unit: IP allowlist ──────────────────────────────────────────
@@ -2881,6 +3688,10 @@ mod tests {
             shadow_log_tx: None,
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
@@ -3653,6 +4464,10 @@ mod tests {
             shadow_log_tx: None,
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
         });
 
@@ -4201,6 +5016,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             shadow_log_tx: None,
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 0.90,
         });
 
@@ -4247,6 +5066,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             shadow_log_tx: None,
             client_budgets: budgets,
             budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
         });
 
@@ -4743,6 +5566,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             shadow_log_tx: None,
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 0.90, // Key: not 1.0 — throttled (0.98) will be excluded
         });
         {
@@ -4823,5 +5650,2377 @@ data: {\"type\":\"message_stop\"}\n\n";
             b_count < 90,
             "Mid-block: A should still get some traffic: B got {b_count}/100"
         );
+    }
+
+    // ── Ewma tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn ewma_single_update() {
+        let start = Instant::now();
+        let mut ewma = Ewma {
+            value: 0.0,
+            tau: TAU_5M,
+            last_update: start,
+        };
+        // Simulate one request after 60 seconds
+        let now = start + Duration::from_secs(60);
+        let rate = ewma.update(now);
+        // instant_rate = 60/60 = 1.0 req/min
+        // alpha = 1 - exp(-60/300) = ~0.1813
+        // value = 0.1813 * 1.0 + 0.8187 * 0.0 = ~0.1813
+        assert!(
+            rate > 0.15 && rate < 0.25,
+            "rate should be ~0.18, got {rate}"
+        );
+    }
+
+    #[test]
+    fn ewma_burst() {
+        let start = Instant::now();
+        let mut ewma = Ewma {
+            value: 0.0,
+            tau: TAU_5M,
+            last_update: start,
+        };
+        // 10 rapid requests, 100ms apart
+        for i in 1..=10 {
+            let now = start + Duration::from_millis(i * 100);
+            ewma.update(now);
+        }
+        // instant_rate per update = 60/0.1 = 600 req/min
+        // After 10 updates, value should be significantly elevated
+        assert!(
+            ewma.value() > 1.0,
+            "burst rate should be high, got {}",
+            ewma.value()
+        );
+    }
+
+    #[test]
+    fn ewma_decay() {
+        let start = Instant::now();
+        let mut ewma = Ewma {
+            value: 100.0,
+            tau: TAU_5M,
+            last_update: start,
+        };
+        // One update after 5 minutes (one full tau)
+        let now = start + Duration::from_secs(300);
+        let rate = ewma.update(now);
+        // alpha = 1 - exp(-300/300) = 1 - 1/e ≈ 0.6321
+        // instant_rate = 60/300 = 0.2
+        // value = 0.6321*0.2 + 0.3679*100 = 0.126 + 36.79 ≈ 36.9
+        // The old value decays significantly
+        assert!(rate < 50.0, "should decay from 100, got {rate}");
+        assert!(rate > 20.0, "should retain some memory, got {rate}");
+    }
+
+    #[test]
+    fn ewma_stale_reset() {
+        let start = Instant::now();
+        let mut ewma = Ewma {
+            value: 42.0,
+            tau: TAU_5M,
+            last_update: start,
+        };
+        // Update after 2 hours (well beyond EWMA_STALE_SECS)
+        let now = start + Duration::from_secs(7200);
+        let rate = ewma.update(now);
+        assert_eq!(rate, 0.0, "stale EWMA should reset to 0");
+    }
+
+    #[test]
+    fn ewma_zero_elapsed() {
+        let start = Instant::now();
+        let mut ewma = Ewma {
+            value: 10.0,
+            tau: TAU_5M,
+            last_update: start,
+        };
+        // Same instant — elapsed clamped to EWMA_MIN_ELAPSED_SECS
+        let rate = ewma.update(start);
+        assert!(rate.is_finite(), "zero elapsed should not produce NaN/inf");
+        assert!(rate > 0.0, "should have a positive value");
+    }
+
+    #[test]
+    fn ewma_nan_guard() {
+        let start = Instant::now();
+        let mut ewma = Ewma {
+            value: f64::NAN,
+            tau: TAU_5M,
+            last_update: start,
+        };
+        let now = start + Duration::from_secs(1);
+        let rate = ewma.update(now);
+        assert!(
+            rate.is_finite(),
+            "NaN input should be recovered to finite value"
+        );
+    }
+
+    // ── BurnRate tests ─────────────────────────────────────────────
+
+    #[test]
+    fn burn_rate_single_request() {
+        let start = Instant::now();
+        let mut br = BurnRate {
+            rate_5m: Ewma {
+                value: 0.0,
+                tau: TAU_5M,
+                last_update: start,
+            },
+            rate_1h: Ewma {
+                value: 0.0,
+                tau: TAU_1H,
+                last_update: start,
+            },
+            rate_6h: Ewma {
+                value: 0.0,
+                tau: TAU_6H,
+                last_update: start,
+            },
+        };
+        let now = start + Duration::from_secs(60);
+        br.update(now);
+        let (r5m, r1h, r6h) = br.rates();
+        // All should be positive after one request
+        assert!(r5m > 0.0, "5m rate should be > 0");
+        assert!(r1h > 0.0, "1h rate should be > 0");
+        assert!(r6h > 0.0, "6h rate should be > 0");
+        // Shorter tau → higher alpha → more responsive
+        assert!(r5m > r1h, "5m rate should be more responsive than 1h");
+        assert!(r1h > r6h, "1h rate should be more responsive than 6h");
+    }
+
+    #[test]
+    fn burn_rate_burst() {
+        let start = Instant::now();
+        let mut br = BurnRate {
+            rate_5m: Ewma {
+                value: 0.0,
+                tau: TAU_5M,
+                last_update: start,
+            },
+            rate_1h: Ewma {
+                value: 0.0,
+                tau: TAU_1H,
+                last_update: start,
+            },
+            rate_6h: Ewma {
+                value: 0.0,
+                tau: TAU_6H,
+                last_update: start,
+            },
+        };
+        // 10 requests, 1 second apart
+        for i in 1..=10 {
+            br.update(start + Duration::from_secs(i));
+        }
+        let (r5m, _r1h, r6h) = br.rates();
+        // 5m window should spike much higher than 6h window
+        assert!(
+            r5m > r6h * 2.0,
+            "5m should spike much more than 6h: 5m={r5m}, 6h={r6h}"
+        );
+    }
+
+    #[test]
+    fn burn_rate_decay() {
+        let start = Instant::now();
+        let mut br = BurnRate {
+            rate_5m: Ewma {
+                value: 60.0,
+                tau: TAU_5M,
+                last_update: start,
+            },
+            rate_1h: Ewma {
+                value: 60.0,
+                tau: TAU_1H,
+                last_update: start,
+            },
+            rate_6h: Ewma {
+                value: 60.0,
+                tau: TAU_6H,
+                last_update: start,
+            },
+        };
+        // One update after 5 minutes of silence
+        let now = start + Duration::from_secs(300);
+        br.update(now);
+        let (r5m, _r1h, r6h) = br.rates();
+        // 5m should have decayed much more than 6h
+        assert!(
+            r5m < r6h,
+            "5m should decay faster than 6h: 5m={r5m}, 6h={r6h}"
+        );
+    }
+
+    // ── Claim penalty tests ────────────────────────────────────────
+
+    #[test]
+    fn claim_penalty_at_zero() {
+        assert_eq!(claim_penalty_7d(0.0), 0.0);
+    }
+
+    #[test]
+    fn claim_penalty_below_threshold() {
+        let result = claim_penalty_7d(0.60);
+        assert!(
+            (result - 0.60).abs() < 0.001,
+            "below threshold: no penalty, got {result}"
+        );
+    }
+
+    #[test]
+    fn claim_penalty_at_threshold() {
+        let result = claim_penalty_7d(0.70);
+        assert!(
+            (result - 0.70).abs() < 0.001,
+            "at threshold: no penalty, got {result}"
+        );
+    }
+
+    #[test]
+    fn claim_penalty_at_85() {
+        let result = claim_penalty_7d(0.85);
+        // excess = 0.15, penalty = 0.15^2 * 3.33 = 0.0225 * 3.33 = 0.074925
+        // total = 0.85 + 0.074925 = 0.924925
+        assert!(
+            (result - 0.925).abs() < 0.01,
+            "85% should map to ~0.925, got {result}"
+        );
+    }
+
+    #[test]
+    fn claim_penalty_at_90() {
+        let result = claim_penalty_7d(0.90);
+        // excess = 0.20, penalty = 0.04 * 3.33 = 0.1332
+        // total = 0.90 + 0.1332 = 1.0332
+        assert!(
+            result > 1.0,
+            "90% should map above 1.0 (zero headroom), got {result}"
+        );
+        assert!(
+            (result - 1.033).abs() < 0.01,
+            "90% should map to ~1.033, got {result}"
+        );
+    }
+
+    #[test]
+    fn claim_penalty_at_100() {
+        let result = claim_penalty_7d(1.0);
+        assert!(result.is_finite(), "100% should not produce NaN/inf");
+        // excess = 0.30, penalty = 0.09 * 3.33 = 0.2997
+        // total = 1.0 + 0.2997 = 1.2997
+        assert!(result > 1.0, "100% should be well above 1.0, got {result}");
+    }
+
+    #[test]
+    fn claim_penalty_5h_unaffected() {
+        // Values below threshold pass through as identity
+        assert_eq!(claim_penalty_7d(0.50), 0.50);
+        assert_eq!(claim_penalty_7d(0.69), 0.69);
+        // Boundary: just above threshold does get penalized
+        let penalized = claim_penalty_7d(0.90);
+        assert!(penalized > 0.90, "above threshold should be penalized");
+    }
+
+    // ── Client identity resolution tests ──────────────────────────
+
+    #[test]
+    fn resolve_header_overrides_ip_map() {
+        let mut client_names = HashMap::new();
+        client_names.insert("10.0.0.1".to_string(), "ray".to_string());
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names,
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+
+        // Header overrides IP mapping (supports multiple clients per IP)
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-client-id", HeaderValue::from_static("gastown"));
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(state.resolve_client_id(&ip, &headers), "gastown");
+
+        // No header → falls back to IP mapping
+        let empty_headers = hyper::HeaderMap::new();
+        assert_eq!(state.resolve_client_id(&ip, &empty_headers), "ray");
+    }
+
+    #[test]
+    fn resolve_header_fallback() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-client-id", HeaderValue::from_static("gastown"));
+        let ip: IpAddr = "192.168.1.99".parse().unwrap();
+        assert_eq!(state.resolve_client_id(&ip, &headers), "gastown");
+    }
+
+    #[test]
+    fn resolve_unknown() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let headers = hyper::HeaderMap::new();
+        let ip: IpAddr = "192.168.1.99".parse().unwrap();
+        assert_eq!(state.resolve_client_id(&ip, &headers), "-");
+    }
+
+    #[test]
+    fn resolve_multi_client_per_ip() {
+        // Multiple clients share the same IP — header differentiates them.
+        // Operator is identified by client_id, not by IP.
+        let mut client_names = HashMap::new();
+        client_names.insert("10.0.0.1".to_string(), "ray".to_string());
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names,
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: Some("ray".to_string()),
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // gastown on same IP as operator → identified as gastown, NOT operator
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-client-id", HeaderValue::from_static("gastown"));
+        assert_eq!(state.resolve_client_id(&ip, &headers), "gastown");
+        assert!(!state.is_operator("gastown"));
+
+        // ray on same IP → identified as ray, IS operator
+        headers.insert("x-client-id", HeaderValue::from_static("ray"));
+        assert_eq!(state.resolve_client_id(&ip, &headers), "ray");
+        assert!(state.is_operator("ray"));
+
+        // No header → falls back to IP mapping ("ray")
+        let empty = hyper::HeaderMap::new();
+        assert_eq!(state.resolve_client_id(&ip, &empty), "ray");
+    }
+
+    // ── Effective utilization tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn effective_util_both_windows() {
+        let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.80,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.60),
+            reset_5h: Some(now_epoch + 10000),
+            claims_7d,
+            ..Default::default()
+        };
+        let (util, source) = effective_utilization(&info, now_epoch, "");
+        // 7d at 0.80 → penalized to 0.833. Max(0.60, 0.833) = 0.833
+        assert_eq!(source, "time_adjusted");
+        assert!(
+            util > 0.80,
+            "7d claim penalty should push above raw 0.80, got {util}"
+        );
+        assert!((util - 0.833).abs() < 0.01, "expected ~0.833, got {util}");
+    }
+
+    #[tokio::test]
+    async fn effective_util_5h_only() {
+        let now_epoch = AppState::now_epoch();
+        // 7d claim with reset in the past → stale, evicted by time_adjusted_utilization
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.90,
+                reset: Some(now_epoch - 1),
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.60),
+            reset_5h: Some(now_epoch + 10000),
+            claims_7d,
+            ..Default::default()
+        };
+        let (util, source) = effective_utilization(&info, now_epoch, "");
+        assert_eq!(source, "time_adjusted_5h");
+        assert!(
+            (util - 0.60).abs() < 0.01,
+            "should use 5h value: got {util}"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_util_7d_only() {
+        let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.50,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            // 5h stale
+            utilization_5h: Some(0.40),
+            reset_5h: Some(now_epoch - 1),
+            claims_7d,
+            ..Default::default()
+        };
+        let (util, source) = effective_utilization(&info, now_epoch, "");
+        assert_eq!(source, "time_adjusted_7d");
+        // 0.50 is below CLAIM_PENALTY_THRESHOLD, so no penalty
+        assert!(
+            (util - 0.50).abs() < 0.01,
+            "should use 7d value: got {util}"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_util_fallback_unified() {
+        let now_epoch = AppState::now_epoch();
+        // Both 5h and all 7d claims stale → falls through to unified
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.50,
+                reset: Some(now_epoch - 1),
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.40),
+            reset_5h: Some(now_epoch - 1),
+            claims_7d,
+            utilization: Some(0.65),
+            ..Default::default()
+        };
+        let (util, source) = effective_utilization(&info, now_epoch, "");
+        assert_eq!(source, "unified");
+        assert!(
+            (util - 0.65).abs() < 0.001,
+            "should use unified: got {util}"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_util_fallback_legacy() {
+        let now_epoch = AppState::now_epoch();
+        let info = RateLimitInfo {
+            remaining_tokens: Some(300_000),
+            limit_tokens: Some(1_000_000),
+            ..Default::default()
+        };
+        let (util, source) = effective_utilization(&info, now_epoch, "");
+        assert_eq!(source, "legacy");
+        assert!(
+            (util - 0.70).abs() < 0.01,
+            "should use legacy token ratio: got {util}"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_util_fallback_unknown() {
+        let now_epoch = AppState::now_epoch();
+        let info = RateLimitInfo::default();
+        let (util, source) = effective_utilization(&info, now_epoch, "");
+        assert_eq!(source, "unknown");
+        assert!(
+            (util - 0.50).abs() < 0.001,
+            "should default to 0.5: got {util}"
+        );
+    }
+
+    // ── Per-claim 7d model-specific tests ──────────────────────────
+
+    #[tokio::test]
+    async fn model_specific_routing() {
+        // Sonnet 7d at 0.85 (penalized higher), Opus 7d at 0.10 → Opus sees low util
+        let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day_sonnet".to_string(),
+            ClaimWindowData {
+                utilization: 0.85,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        claims_7d.insert(
+            "seven_day_opus".to_string(),
+            ClaimWindowData {
+                utilization: 0.10,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.30),
+            reset_5h: Some(now_epoch + 10000),
+            claims_7d,
+            ..Default::default()
+        };
+        let (util_sonnet, _) =
+            effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        let (util_opus, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        // Sonnet should be penalized above 0.85
+        assert!(
+            util_sonnet > 0.85,
+            "sonnet should be penalized: got {util_sonnet}"
+        );
+        // Opus at 0.10 → below penalty threshold, should stay at ~0.30 (max with 5h)
+        assert!(util_opus < 0.35, "opus should be low: got {util_opus}");
+        // The gap should be large — this is the whole point of per-claim routing
+        assert!(
+            util_sonnet - util_opus > 0.50,
+            "sonnet-opus gap should be >0.50"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_fallback_general() {
+        // Only "seven_day" (general) claim → used for all models
+        let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.50,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.20),
+            reset_5h: Some(now_epoch + 10000),
+            claims_7d,
+            ..Default::default()
+        };
+        let (util_sonnet, _) =
+            effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        let (util_opus, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        let (util_haiku, _) = effective_utilization(&info, now_epoch, "claude-haiku-4-5-20251001");
+        // All should see the same general claim (0.50, no penalty)
+        assert!(
+            (util_sonnet - 0.50).abs() < 0.01,
+            "sonnet: got {util_sonnet}"
+        );
+        assert!((util_opus - 0.50).abs() < 0.01, "opus: got {util_opus}");
+        assert!((util_haiku - 0.50).abs() < 0.01, "haiku: got {util_haiku}");
+    }
+
+    #[tokio::test]
+    async fn cross_model_isolation() {
+        // Sonnet claim at 0.95 should NOT affect Opus effective_utilization
+        let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day_sonnet".to_string(),
+            ClaimWindowData {
+                utilization: 0.95,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        // No opus claim and no general claim
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.20),
+            reset_5h: Some(now_epoch + 10000),
+            claims_7d,
+            ..Default::default()
+        };
+        let (util_opus, source) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        // Opus has no specific claim and no general fallback → only 5h at 0.20
+        assert_eq!(source, "time_adjusted_5h");
+        assert!(
+            (util_opus - 0.20).abs() < 0.01,
+            "opus should only see 5h: got {util_opus}"
+        );
+
+        let (util_sonnet, _) =
+            effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        assert!(
+            util_sonnet > 0.95,
+            "sonnet should be penalized: got {util_sonnet}"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_brake_worst_case() {
+        // Emergency brake (model="") should use max across all claims
+        let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day_sonnet".to_string(),
+            ClaimWindowData {
+                utilization: 0.95,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        claims_7d.insert(
+            "seven_day_opus".to_string(),
+            ClaimWindowData {
+                utilization: 0.10,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.30),
+            reset_5h: Some(now_epoch + 10000),
+            claims_7d,
+            ..Default::default()
+        };
+        let (util, _) = effective_utilization(&info, now_epoch, "");
+        // Should pick sonnet's 0.95 (penalized even higher)
+        assert!(
+            util > 0.95,
+            "emergency brake should use worst claim: got {util}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_claim_eviction() {
+        // Claim with expired reset should be ignored
+        let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day_sonnet".to_string(),
+            ClaimWindowData {
+                utilization: 0.95,
+                reset: Some(now_epoch - 1), // stale
+                status: None,
+            },
+        );
+        claims_7d.insert(
+            "seven_day_opus".to_string(),
+            ClaimWindowData {
+                utilization: 0.30,
+                reset: Some(now_epoch + 100000), // fresh
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.20),
+            reset_5h: Some(now_epoch + 10000),
+            claims_7d,
+            ..Default::default()
+        };
+        // For sonnet model: sonnet claim is stale, no general fallback → only 5h
+        let (util_sonnet, source) =
+            effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        assert_eq!(source, "time_adjusted_5h");
+        assert!(
+            (util_sonnet - 0.20).abs() < 0.01,
+            "stale sonnet should be ignored: got {util_sonnet}"
+        );
+
+        // For opus model: opus claim is fresh
+        let (util_opus, source) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        assert_eq!(source, "time_adjusted");
+        assert!(
+            (util_opus - 0.30).abs() < 0.01,
+            "fresh opus should be used: got {util_opus}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_family_extraction() {
+        assert_eq!(model_family("claude-sonnet-4-5-20250929"), "sonnet");
+        assert_eq!(model_family("claude-opus-4-6"), "opus");
+        assert_eq!(model_family("claude-haiku-4-5-20251001"), "haiku");
+        assert_eq!(model_family("claude-3-5-sonnet-20240620"), "sonnet");
+        assert_eq!(model_family("unknown-model"), "");
+    }
+
+    #[tokio::test]
+    async fn flat_field_compat_fallback() {
+        // When claims_7d is empty, should fall back to flat utilization_7d fields
+        let now_epoch = AppState::now_epoch();
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.30),
+            reset_5h: Some(now_epoch + 10000),
+            utilization_7d: Some(0.60),
+            reset_7d: Some(now_epoch + 100000),
+            // claims_7d empty — migration/compat path
+            ..Default::default()
+        };
+        let (util, source) = effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        assert_eq!(source, "time_adjusted");
+        assert!((util - 0.60).abs() < 0.01, "should use flat 7d: got {util}");
+    }
+
+    #[tokio::test]
+    async fn claim_aware_routing_prefers_low_model_util() {
+        // Account A: Sonnet 7d at 0.90 (high), Opus 7d at 0.10 (low)
+        // Account B: Sonnet 7d at 0.10 (low), Opus 7d at 0.90 (high)
+        // Routing for Sonnet should prefer B, routing for Opus should prefer A
+        let acct_a = make_account("a", "sk-ant-api-a");
+        let acct_b = make_account("b", "sk-ant-api-b");
+        let state = test_state_with(vec![acct_a, acct_b]);
+        let now = AppState::now_epoch();
+
+        // Set 5h low for both
+        set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.10, 0.10, now + 10000, now + 100000).await;
+
+        // Set model-specific 7d utilization
+        set_model_utilization(&state, 0, "claude-sonnet-4-5-20250929", 0.90, now + 100000).await;
+        set_model_utilization(&state, 0, "claude-opus-4-6", 0.10, now + 100000).await;
+        set_model_utilization(&state, 1, "claude-sonnet-4-5-20250929", 0.10, now + 100000).await;
+        set_model_utilization(&state, 1, "claude-opus-4-6", 0.90, now + 100000).await;
+
+        // Run many picks — Sonnet routing should consistently prefer B (index 1)
+        let mut sonnet_picks = [0u32; 2];
+        let mut opus_picks = [0u32; 2];
+        for i in 0..100 {
+            let key = format!("client_{}", i);
+            if let Some(idx) = state
+                .pick_account(Some(&key), "claude-sonnet-4-5-20250929")
+                .await
+            {
+                sonnet_picks[idx] += 1;
+            }
+            if let Some(idx) = state.pick_account(Some(&key), "claude-opus-4-6").await {
+                opus_picks[idx] += 1;
+            }
+        }
+        // B should get most Sonnet traffic (has lower Sonnet util)
+        assert!(
+            sonnet_picks[1] > sonnet_picks[0],
+            "Sonnet should prefer B: A={}, B={}",
+            sonnet_picks[0],
+            sonnet_picks[1]
+        );
+        // A should get most Opus traffic (has lower Opus util)
+        assert!(
+            opus_picks[0] > opus_picks[1],
+            "Opus should prefer A: A={}, B={}",
+            opus_picks[0],
+            opus_picks[1]
+        );
+    }
+
+    // ── Enforcement tests ──────────────────────────────────────────
+
+    /// Helper: set up account utilization for enforcement tests.
+    async fn set_account_utilization(
+        state: &AppState,
+        idx: usize,
+        util_5h: f64,
+        util_7d: f64,
+        reset_5h: u64,
+        reset_7d: u64,
+    ) {
+        let mut info = state.accounts[idx].rate_info.write().await;
+        info.utilization_5h = Some(util_5h);
+        info.utilization_7d = Some(util_7d);
+        info.utilization = Some(util_5h.max(util_7d));
+        info.reset_5h = Some(reset_5h);
+        info.reset_7d = Some(reset_7d);
+        // Populate claims_7d with a general "seven_day" entry
+        info.claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: util_7d,
+                reset: Some(reset_7d),
+                status: None,
+            },
+        );
+    }
+
+    /// Helper: set per-model 7d utilization (e.g. "seven_day_sonnet").
+    async fn set_model_utilization(
+        state: &AppState,
+        idx: usize,
+        model: &str,
+        util_7d: f64,
+        reset_7d: u64,
+    ) {
+        let family = model_family(model);
+        let key = if family.is_empty() {
+            "seven_day".to_string()
+        } else {
+            format!("seven_day_{}", family)
+        };
+        let mut info = state.accounts[idx].rate_info.write().await;
+        info.claims_7d.insert(
+            key,
+            ClaimWindowData {
+                utilization: util_7d,
+                reset: Some(reset_7d),
+                status: None,
+            },
+        );
+        // Re-derive flat fields
+        info.utilization_7d = info
+            .claims_7d
+            .values()
+            .map(|c| c.utilization)
+            .reduce(f64::max);
+        info.reset_7d = info.claims_7d.values().filter_map(|c| c.reset).min();
+        info.utilization = Some(
+            info.utilization_5h
+                .unwrap_or(0.0)
+                .max(info.utilization_7d.unwrap_or(0.0)),
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_all_below() {
+        let now = AppState::now_epoch();
+        let mut limits = HashMap::new();
+        limits.insert("testclient".to_string(), 0.80);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![
+                make_account("a", "sk-ant-api-x"),
+                make_account("b", "sk-ant-api-y"),
+            ],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.60, 0.50, now + 10000, now + 100000).await;
+        assert!(state
+            .check_utilization_limit("testclient", "")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn limit_all_above() {
+        let now = AppState::now_epoch();
+        let mut limits = HashMap::new();
+        limits.insert("testclient".to_string(), 0.50);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![
+                make_account("a", "sk-ant-api-x"),
+                make_account("b", "sk-ant-api-y"),
+            ],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
+        let result = state.check_utilization_limit("testclient", "").await;
+        assert!(result.is_err(), "all above limit should return Err");
+        let retry = result.unwrap_err();
+        assert!(retry >= 60, "retry-after should be >= 60");
+        assert!(retry <= 3600, "retry-after should be <= 3600");
+    }
+
+    #[tokio::test]
+    async fn limit_one_below() {
+        let now = AppState::now_epoch();
+        let mut limits = HashMap::new();
+        limits.insert("testclient".to_string(), 0.70);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![
+                make_account("a", "sk-ant-api-x"),
+                make_account("b", "sk-ant-api-y"),
+            ],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
+        assert!(state
+            .check_utilization_limit("testclient", "")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn limit_no_config() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        assert!(state.check_utilization_limit("anyone", "").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn limit_operator_bypass() {
+        let now = AppState::now_epoch();
+        let mut limits = HashMap::new();
+        limits.insert("ray".to_string(), 0.10); // very low limit
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operator: Some("ray".to_string()),
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
+        // Operator bypasses everything
+        assert!(state.is_operator("ray"));
+        assert!(state.pre_request_gate("ray", "").await.is_ok());
+        // Non-operator does not bypass
+        assert!(!state.is_operator("gastown"));
+    }
+
+    #[tokio::test]
+    async fn limit_no_compatible_accounts_passes() {
+        // When no account serves the requested model, check_utilization_limit
+        // should return Ok (let pick_account handle the "no account" error later)
+        let mut limits = HashMap::new();
+        limits.insert("test-client".to_string(), 0.01); // very low limit
+        let mut acct = make_account("a", "sk-ant-api-x");
+        acct.models = vec!["claude-sonnet".to_string()]; // only serves sonnet
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![acct],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        // Request for "claude-opus" — no account serves it → should pass
+        assert!(
+            state
+                .check_utilization_limit("test-client", "claude-opus")
+                .await
+                .is_ok(),
+            "should not 429 when no account serves the requested model"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_all_above_threshold() {
+        let now = AppState::now_epoch();
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-x"),
+            make_account("b", "sk-ant-api-y"),
+        ]);
+        set_account_utilization(&state, 0, 0.96, 0.90, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.97, 0.95, now + 10000, now + 100000).await;
+        assert!(state.is_emergency_brake_active().await);
+    }
+
+    #[tokio::test]
+    async fn emergency_one_below() {
+        let now = AppState::now_epoch();
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-x"),
+            make_account("b", "sk-ant-api-y"),
+        ]);
+        set_account_utilization(&state, 0, 0.96, 0.90, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.80, 0.70, now + 10000, now + 100000).await;
+        assert!(!state.is_emergency_brake_active().await);
+    }
+
+    #[tokio::test]
+    async fn emergency_operator_bypass() {
+        let now = AppState::now_epoch();
+        let mut limits = HashMap::new();
+        limits.insert("ray".to_string(), 0.10);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operator: Some("ray".to_string()),
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
+        assert!(state.is_emergency_brake_active().await);
+        // Operator bypasses pre_request_gate even during emergency
+        assert!(state.pre_request_gate("ray", "").await.is_ok());
+        // Non-operator gets blocked
+        assert!(state.pre_request_gate("gastown", "").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn emergency_no_data() {
+        // All accounts have default (0.5, "unknown") — brake should NOT activate (fail-open)
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-x"),
+            make_account("b", "sk-ant-api-y"),
+        ]);
+        assert!(
+            !state.is_emergency_brake_active().await,
+            "brake should fail-open with no data"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_stale_data_with_unified() {
+        // Stale reset times but valid unified utilization at 0.97
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            // Resets in the past → stale per-window data
+            info.utilization_5h = Some(0.97);
+            info.reset_5h = Some(1);
+            info.utilization_7d = Some(0.97);
+            info.reset_7d = Some(1);
+            // But unified utilization is valid
+            info.utilization = Some(0.97);
+        }
+        assert!(
+            state.is_emergency_brake_active().await,
+            "unified fallback should count"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_configurable_threshold() {
+        let now = AppState::now_epoch();
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: 0.80, // custom low threshold
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        set_account_utilization(&state, 0, 0.85, 0.70, now + 10000, now + 100000).await;
+        assert!(
+            state.is_emergency_brake_active().await,
+            "0.85 should exceed custom 0.80 threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_unknown_client_not_operator() {
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: Some("ray".to_string()),
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        // "-" is not the operator
+        assert!(!state.is_operator("-"));
+        assert!(!state.is_operator("gastown"));
+        assert!(state.is_operator("ray"));
+    }
+
+    // ── compute_pressure_status tests ──
+
+    #[test]
+    fn pressure_status_healthy() {
+        let state = test_state_with(vec![]);
+        assert_eq!(compute_pressure_status(0.0, "client1", &state), "healthy");
+        assert_eq!(compute_pressure_status(0.50, "client1", &state), "healthy");
+        assert_eq!(compute_pressure_status(0.69, "client1", &state), "healthy");
+    }
+
+    #[test]
+    fn pressure_status_elevated() {
+        let state = test_state_with(vec![]);
+        assert_eq!(compute_pressure_status(0.70, "client1", &state), "elevated");
+        assert_eq!(compute_pressure_status(0.80, "client1", &state), "elevated");
+        assert_eq!(compute_pressure_status(0.84, "client1", &state), "elevated");
+    }
+
+    #[test]
+    fn pressure_status_critical() {
+        let state = test_state_with(vec![]);
+        assert_eq!(compute_pressure_status(0.85, "client1", &state), "critical");
+        assert_eq!(compute_pressure_status(0.90, "client1", &state), "critical");
+        assert_eq!(compute_pressure_status(0.94, "client1", &state), "critical");
+    }
+
+    #[test]
+    fn pressure_status_emergency() {
+        let state = test_state_with(vec![]);
+        assert_eq!(
+            compute_pressure_status(0.95, "client1", &state),
+            "emergency"
+        );
+        assert_eq!(compute_pressure_status(1.0, "client1", &state), "emergency");
+    }
+
+    #[test]
+    fn pressure_status_operator_always_healthy() {
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: Some("ray".to_string()),
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        // Operator always gets "healthy" regardless of utilization
+        assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
+        assert_eq!(compute_pressure_status(1.0, "ray", &state), "healthy");
+        // Non-operator at same utilization gets emergency
+        assert_eq!(compute_pressure_status(0.99, "other", &state), "emergency");
+    }
+
+    #[test]
+    fn pressure_status_upgrade_near_client_limit() {
+        let mut limits = HashMap::new();
+        limits.insert("gastown".to_string(), 0.85);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        // gastown has limit 0.85, 80% of that = 0.68
+        // At 0.60, below 0.68 → no upgrade → "healthy"
+        assert_eq!(compute_pressure_status(0.60, "gastown", &state), "healthy");
+        // At 0.69, above 0.68 → upgrade healthy→elevated
+        assert_eq!(compute_pressure_status(0.69, "gastown", &state), "elevated");
+        // At 0.70, already elevated, above 0.68 → upgrade elevated→critical
+        assert_eq!(compute_pressure_status(0.70, "gastown", &state), "critical");
+        // Client without limits: no upgrade
+        assert_eq!(compute_pressure_status(0.69, "other", &state), "healthy");
+    }
+
+    // ── Integration tests for x-budget-status header ──
+
+    #[tokio::test]
+    async fn response_includes_budget_status_header() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, _state) = test_app(&mock_url, Some("test-key".to_string()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "test-key")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let budget_status = resp
+            .headers()
+            .get("x-budget-status")
+            .expect("x-budget-status header should be present on proxy response");
+        // Mock returns low utilization (0.25) → healthy
+        assert_eq!(budget_status.to_str().unwrap(), "healthy");
+    }
+
+    #[tokio::test]
+    async fn openai_response_includes_budget_status_header() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, _state) = test_openai_app(&mock_url, Some("test-key".to_string()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "test-key")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let budget_status = resp
+            .headers()
+            .get("x-budget-status")
+            .expect("x-budget-status header should be present on openai-compat response");
+        assert_eq!(budget_status.to_str().unwrap(), "healthy");
+    }
+
+    // ── Stats handler extension tests ──
+
+    #[tokio::test]
+    async fn stats_includes_burn_rate_and_headroom() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, _state) = test_app(&mock_url, Some("test-key".to_string()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+
+        // Send a request to populate rate info and burn rate
+        let _ = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "test-key")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        // Now check stats
+        let resp = client
+            .get(format!("http://{}/_stats", addr))
+            .header("x-api-key", "test-key")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let accounts = body["accounts"].as_array().unwrap();
+        assert!(!accounts.is_empty());
+
+        // burn_rate object should exist on every account
+        let acct = &accounts[0];
+        assert!(
+            acct["burn_rate"].is_object(),
+            "burn_rate should be an object"
+        );
+        assert!(acct["burn_rate"]["last_5m"].is_number());
+        assert!(acct["burn_rate"]["last_1h"].is_number());
+        assert!(acct["burn_rate"]["last_6h"].is_number());
+
+        // headroom_requests: mock doesn't return remaining_requests or limit_requests,
+        // so headroom is null (both inputs absent). That's the expected behavior.
+        // The field should still exist in the JSON output.
+        assert!(
+            acct.get("headroom_requests").is_some(),
+            "headroom_requests field should be present"
+        );
+
+        // projected_throttle_at should be present (null or string depending on utilization)
+        assert!(
+            acct["projected_throttle_at"].is_null() || acct["projected_throttle_at"].is_string(),
+            "projected_throttle_at should be null or ISO 8601 string"
+        );
+
+        // aggregate section
+        assert!(
+            body["aggregate"].is_object(),
+            "aggregate section should exist"
+        );
+        assert!(
+            body["aggregate"].get("total_headroom_requests").is_some(),
+            "total_headroom_requests field should be present"
+        );
+        assert!(body["aggregate"]["consumers"].is_object());
+    }
+
+    #[test]
+    fn epoch_to_iso8601_known_values() {
+        // 2024-01-01T00:00:00Z = 1704067200
+        assert_eq!(
+            AppState::epoch_to_iso8601(1704067200),
+            "2024-01-01T00:00:00Z"
+        );
+        // Unix epoch
+        assert_eq!(AppState::epoch_to_iso8601(0), "1970-01-01T00:00:00Z");
+        // 2026-02-14T12:30:45Z = approximate check
+        let result = AppState::epoch_to_iso8601(1771157445);
+        assert!(
+            result.starts_with("2026-02-"),
+            "expected 2026-02, got {result}"
+        );
+        assert!(result.ends_with('Z'));
+    }
+
+    // ── Task 7: Full integration tests ──
+
+    #[tokio::test]
+    async fn request_rejected_by_utilization_limit() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let now = AppState::now_epoch();
+        let mut limits = HashMap::new();
+        limits.insert("-".to_string(), 0.50); // default client gets 0.50 limit
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: mock_url.clone(),
+            accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test-limit-reject.state.json"),
+            proxy_key: Some("key".to_string()),
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: false,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        // Set utilization above client's limit (0.80 > 0.50)
+        set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
+
+        let app = build_router(state);
+        let addr = serve(app).await;
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "key")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers().get("retry-after").is_some(),
+            "429 from utilization limit should include Retry-After"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_passes_utilization_limit() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let now = AppState::now_epoch();
+        let mut limits = HashMap::new();
+        limits.insert("-".to_string(), 0.90);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: mock_url.clone(),
+            accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test-limit-pass.state.json"),
+            proxy_key: Some("key".to_string()),
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: false,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        // Set utilization below client's limit (0.50 < 0.90)
+        set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
+
+        let app = build_router(state);
+        let addr = serve(app).await;
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "key")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn emergency_brake_blocks_non_operator() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let now = AppState::now_epoch();
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: mock_url.clone(),
+            accounts: vec![
+                make_account("a", "sk-ant-api-test-aaa"),
+                make_account("b", "sk-ant-api-test-bbb"),
+            ],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test-emergency-block.state.json"),
+            proxy_key: Some("key".to_string()),
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: false,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: Some("ray".to_string()),
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        // All accounts above emergency threshold — use 5h only to avoid
+        // claim_penalty_7d pushing effective_util above 1.0 (which would cause
+        // zero headroom in pick_account). 5h=0.96 > emergency threshold (0.95).
+        set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.97, 0.0, now + 10000, now + 100000).await;
+
+        let app = build_router(state);
+        let addr = serve(app).await;
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "key")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("emergency"),
+            "emergency brake response should mention 'emergency': {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_brake_allows_operator() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let now = AppState::now_epoch();
+        let mut client_names = HashMap::new();
+        client_names.insert("127.0.0.1".to_string(), "ray".to_string());
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: mock_url.clone(),
+            accounts: vec![
+                make_account("a", "sk-ant-api-test-aaa"),
+                make_account("b", "sk-ant-api-test-bbb"),
+            ],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test-emergency-operator.state.json"),
+            proxy_key: Some("key".to_string()),
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names,
+            auto_cache: false,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: Some("ray".to_string()),
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        // All accounts above emergency threshold — 5h only (avoid claim penalty on 7d)
+        set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.97, 0.0, now + 10000, now + 100000).await;
+
+        let app = build_router(state);
+        let addr = serve(app).await;
+
+        // Request comes from 127.0.0.1 which maps to "ray" (the operator)
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "key")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "operator should bypass emergency brake"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_handler_enforces_utilization_limit() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let now = AppState::now_epoch();
+        let mut limits = HashMap::new();
+        limits.insert("-".to_string(), 0.50);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: mock_url.clone(),
+            accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test-openai-limit.state.json"),
+            proxy_key: Some("key".to_string()),
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: false,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
+
+        let app = build_router(state);
+        let addr = serve(app).await;
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "key")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "OpenAI-compat handler should enforce utilization limits"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_handler_enforces_emergency_brake() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let now = AppState::now_epoch();
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: mock_url.clone(),
+            accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test-openai-emergency.state.json"),
+            proxy_key: Some("key".to_string()),
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: false,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+        set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
+
+        let app = build_router(state);
+        let addr = serve(app).await;
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "key")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "OpenAI-compat handler should enforce emergency brake"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_new_config_identical_behavior() {
+        // Default config: no operator, no limits, no emergency override
+        // Should behave exactly like before the feature was added
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, _state) = test_app(&mock_url, Some("key".to_string()));
+        let addr = serve(app).await;
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "key")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        // Default config: no limits, no emergency → request should succeed
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        // Budget status header present even with no config (default healthy)
+        assert!(resp.headers().get("x-budget-status").is_some());
+
+        // Stats should still work with aggregate section
+        let stats = client
+            .get(format!("http://{}/_stats", addr))
+            .header("x-api-key", "key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stats.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = stats.json().await.unwrap();
+        assert!(body["accounts"].is_array());
+        assert!(body["aggregate"].is_object());
+        assert_eq!(body["strategy"], "dynamic-capacity");
+    }
+
+    // ── Additional comprehensive tests ──────────────────────────────────
+
+    #[test]
+    fn resolve_client_id_prefers_header() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-client-id", HeaderValue::from_static("header-client"));
+
+        let resolved = state.resolve_client_id(&ip, &headers);
+        assert_eq!(
+            resolved, "header-client",
+            "should prefer x-client-id header"
+        );
+    }
+
+    #[test]
+    fn resolve_client_id_falls_back_to_ip_map() {
+        let mut client_names = HashMap::new();
+        client_names.insert("192.168.1.100".to_string(), "mapped-client".to_string());
+        let state = Arc::new(AppState {
+            client: Client::new(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names,
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+
+        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+        let headers = hyper::HeaderMap::new();
+
+        let resolved = state.resolve_client_id(&ip, &headers);
+        assert_eq!(resolved, "mapped-client", "should fall back to IP mapping");
+    }
+
+    #[test]
+    fn resolve_client_id_defaults_to_dash() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let ip: IpAddr = "203.0.113.1".parse().unwrap();
+        let headers = hyper::HeaderMap::new();
+
+        let resolved = state.resolve_client_id(&ip, &headers);
+        assert_eq!(resolved, "-", "should default to dash for unknown clients");
+    }
+
+    #[test]
+    fn resolve_client_id_ignores_empty_header() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-client-id", HeaderValue::from_static(""));
+
+        let resolved = state.resolve_client_id(&ip, &headers);
+        assert_eq!(resolved, "-", "should ignore empty x-client-id header");
+    }
+
+    #[test]
+    fn resolve_client_id_ignores_dash_header() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-client-id", HeaderValue::from_static("-"));
+
+        let resolved = state.resolve_client_id(&ip, &headers);
+        assert_eq!(resolved, "-", "should ignore dash as x-client-id header");
+    }
+
+    #[test]
+    fn compute_pressure_status_operator_always_healthy() {
+        let state = Arc::new(AppState {
+            client: Client::new(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: Some("operator-id".to_string()),
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+
+        let status = compute_pressure_status(0.99, "operator-id", &state);
+        assert_eq!(
+            status, "healthy",
+            "operator should always see healthy status"
+        );
+    }
+
+    #[test]
+    fn compute_pressure_status_thresholds() {
+        let state = test_state_with(vec![]);
+
+        assert_eq!(compute_pressure_status(0.50, "client", &state), "healthy");
+        assert_eq!(compute_pressure_status(0.75, "client", &state), "elevated");
+        assert_eq!(compute_pressure_status(0.90, "client", &state), "critical");
+        assert_eq!(compute_pressure_status(0.99, "client", &state), "emergency");
+    }
+
+    #[test]
+    fn compute_pressure_status_limit_proximity_upgrade() {
+        let mut limits = HashMap::new();
+        limits.insert("client".to_string(), 0.80);
+        let state = Arc::new(AppState {
+            client: Client::new(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+
+        // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
+        let status = compute_pressure_status(0.65, "client", &state);
+        assert_eq!(
+            status, "elevated",
+            "proximity to limit should upgrade status"
+        );
+    }
+
+    #[test]
+    fn status_to_floor_mapping() {
+        assert_eq!(status_to_floor(Some("rejected")), REJECTED_UTIL_FLOOR);
+        assert_eq!(status_to_floor(Some("throttled")), THROTTLE_UTIL_FLOOR);
+        assert_eq!(status_to_floor(Some("allowed_warning")), WARNING_UTIL_FLOOR);
+        assert_eq!(status_to_floor(Some("allowed")), 0.0);
+        assert_eq!(status_to_floor(None), 0.0);
+    }
+
+    #[test]
+    fn status_to_floor_unknown_defaults_to_warning() {
+        let floor = status_to_floor(Some("unknown_status"));
+        assert_eq!(
+            floor, WARNING_UTIL_FLOOR,
+            "unknown status should map to warning floor"
+        );
+    }
+
+    #[test]
+    fn claim_penalty_7d_threshold() {
+        // Below threshold: no penalty
+        assert_eq!(claim_penalty_7d(0.50), 0.50);
+        assert_eq!(claim_penalty_7d(0.70), 0.70);
+
+        // Above threshold: quadratic penalty applied
+        let result = claim_penalty_7d(0.80);
+        assert!(
+            result > 0.80,
+            "penalty should increase utilization above threshold"
+        );
+
+        let result = claim_penalty_7d(0.90);
+        assert!(
+            result > 1.0,
+            "high utilization should push above 1.0 with penalty"
+        );
+    }
+
+    #[test]
+    fn time_adjusted_utilization_stale_data() {
+        let now = 1000000u64;
+        let reset_past = 999000u64; // Reset already happened
+
+        let result =
+            time_adjusted_utilization(Some(0.50), Some(reset_past), Some("allowed"), 3600.0, now);
+
+        assert_eq!(
+            result, None,
+            "stale data (reset in past) should return None"
+        );
+    }
+
+    #[test]
+    fn time_adjusted_utilization_near_reset() {
+        let now = 1000000u64;
+        let reset = now + 1800; // 30 minutes until reset
+        let near_reset_threshold = 3600.0; // 1 hour threshold
+
+        let result = time_adjusted_utilization(
+            Some(0.80),
+            Some(reset),
+            Some("allowed"),
+            near_reset_threshold,
+            now,
+        );
+
+        assert!(result.is_some());
+        let adjusted = result.unwrap();
+        assert!(
+            adjusted < 0.80,
+            "near-reset utilization should be discounted"
+        );
+        assert!(
+            adjusted >= 0.04,
+            "should apply minimum discount floor (0.05)"
+        );
+    }
+
+    #[test]
+    fn time_adjusted_utilization_mid_block() {
+        let now = 1000000u64;
+        let reset = now + 10800; // 3 hours until reset
+        let near_reset_threshold = 3600.0; // 1 hour threshold
+
+        let result = time_adjusted_utilization(
+            Some(0.80),
+            Some(reset),
+            Some("allowed"),
+            near_reset_threshold,
+            now,
+        );
+
+        assert!(result.is_some());
+        let adjusted = result.unwrap();
+        assert_eq!(adjusted, 0.80, "mid-block utilization should be unchanged");
+    }
+
+    #[test]
+    fn time_adjusted_utilization_status_floor_minimum() {
+        let now = 1000000u64;
+        let reset = now + 100; // Very close to reset
+
+        let result = time_adjusted_utilization(
+            Some(0.80),
+            Some(reset),
+            Some("throttled"), // Floor of 0.98
+            3600.0,
+            now,
+        );
+
+        assert!(result.is_some());
+        let adjusted = result.unwrap();
+        assert_eq!(
+            adjusted, THROTTLE_UTIL_FLOOR,
+            "status floor should override time discount"
+        );
+    }
+
+    #[test]
+    fn epoch_to_iso8601_leap_year() {
+        // 2024-02-29T00:00:00Z (leap day) = 1709164800
+        let result = AppState::epoch_to_iso8601(1709164800);
+        assert_eq!(
+            result, "2024-02-29T00:00:00Z",
+            "should handle leap year correctly"
+        );
+    }
+
+    #[test]
+    fn epoch_to_iso8601_edge_of_year() {
+        // 2023-12-31T23:59:59Z = 1704067199
+        let result = AppState::epoch_to_iso8601(1704067199);
+        assert_eq!(
+            result, "2023-12-31T23:59:59Z",
+            "should handle end of year correctly"
+        );
+    }
+
+    #[test]
+    fn account_serves_model_empty_filter_allows_all() {
+        let acct = make_account("test", "sk-ant-api-x");
+        assert!(acct.serves_model("claude-sonnet-4-20250514"));
+        assert!(acct.serves_model("claude-opus-4-20241113"));
+        assert!(acct.serves_model(""));
+    }
+
+    #[test]
+    fn account_serves_model_prefix_wildcard() {
+        let mut acct = make_account("test", "sk-ant-api-x");
+        acct.models = vec!["claude-opus-*".to_string()];
+
+        assert!(acct.serves_model("claude-opus-4-20241113"));
+        assert!(acct.serves_model("claude-opus-future"));
+        assert!(!acct.serves_model("claude-sonnet-4-20250514"));
+    }
+
+    #[test]
+    fn account_serves_model_multiple_patterns() {
+        let mut acct = make_account("test", "sk-ant-api-x");
+        acct.models = vec![
+            "claude-opus-*".to_string(),
+            "claude-sonnet-4-20250514".to_string(),
+        ];
+
+        assert!(acct.serves_model("claude-opus-4-20241113"));
+        assert!(acct.serves_model("claude-sonnet-4-20250514"));
+        assert!(!acct.serves_model("claude-sonnet-3-5-20240229"));
+        assert!(!acct.serves_model("claude-haiku-3-5-20250219"));
+    }
+
+    #[tokio::test]
+    async fn effective_utilization_prefers_most_constrained() {
+        // When both windows have data, should return max (most constrained)
+        let now = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.60,
+                reset: Some(now + 100000),
+                status: Some("allowed".to_string()),
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.80),
+            reset_5h: Some(now + 10000),
+            status_5h: Some("allowed".to_string()),
+            claims_7d,
+            ..Default::default()
+        };
+
+        let (util, source) = effective_utilization(&info, now, "");
+        assert!(util > 0.60, "should use higher (5h) utilization");
+        assert_eq!(source, "time_adjusted");
+    }
+
+    #[tokio::test]
+    async fn effective_utilization_7d_penalty_applies() {
+        // 7d window above penalty threshold should be penalized
+        let now = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.85,
+                reset: Some(now + 100000),
+                status: Some("allowed".to_string()),
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.50),
+            reset_5h: Some(now + 10000),
+            status_5h: Some("allowed".to_string()),
+            claims_7d,
+            ..Default::default()
+        };
+
+        let (util, _) = effective_utilization(&info, now, "");
+        assert!(
+            util > 0.85,
+            "7d window above 0.70 should have penalty applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_account_rejected_account_gets_no_traffic() {
+        let state = test_state_with(vec![
+            make_account("rejected", "sk-ant-api-a"),
+            make_account("healthy", "sk-ant-api-b"),
+        ]);
+
+        let now = AppState::now_epoch();
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.90);
+            info.reset_5h = Some(now + 10000);
+            info.status_5h = Some("rejected".to_string()); // Rejected = util floor 1.0
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(0.50);
+        }
+
+        // All requests should go to healthy account
+        for _ in 0..100 {
+            let idx = state.pick_account(None, "").await.unwrap();
+            assert_eq!(idx, 1, "rejected account should receive no traffic");
+        }
+    }
+
+    #[test]
+    fn ip_allow_entry_ipv6_support() {
+        let entry = IpAllowEntry::Addr("::1".parse().unwrap());
+        assert!(entry.contains(&"::1".parse().unwrap()));
+        assert!(!entry.contains(&"::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn ip_allow_entry_ipv6_cidr() {
+        let entry = IpAllowEntry::Net("2001:db8::/32".parse().unwrap());
+        assert!(entry.contains(&"2001:db8::1".parse().unwrap()));
+        assert!(entry.contains(&"2001:db8:ffff::1".parse().unwrap()));
+        assert!(!entry.contains(&"2001:db9::1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn pick_account_all_throttled_uses_all() {
+        // When all accounts are throttled (status=throttled, floor=0.98 > soft_limit=0.90),
+        // should use all accounts (graceful degradation)
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-a"),
+            make_account("b", "sk-ant-api-b"),
+        ]);
+
+        let now = AppState::now_epoch();
+        for acct in &state.accounts {
+            let mut info = acct.rate_info.write().await;
+            info.utilization_5h = Some(0.80);
+            info.reset_5h = Some(now + 10000);
+            info.status_5h = Some("throttled".to_string()); // Floor 0.98 > soft_limit 0.90
+        }
+
+        // Both accounts should receive traffic
+        let mut counts = [0u32; 2];
+        for _ in 0..1000 {
+            let idx = state.pick_account(None, "").await.unwrap();
+            counts[idx] += 1;
+        }
+
+        assert!(
+            counts[0] > 0,
+            "first throttled account should get some traffic"
+        );
+        assert!(
+            counts[1] > 0,
+            "second throttled account should get some traffic"
+        );
+    }
+
+    #[test]
+    fn is_operator_checks_configured_operator() {
+        let state = Arc::new(AppState {
+            client: Client::new(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: Some("special-operator".to_string()),
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+        });
+
+        assert!(state.is_operator("special-operator"));
+        assert!(!state.is_operator("regular-client"));
+    }
+
+    #[test]
+    fn is_operator_returns_false_when_no_operator_configured() {
+        let state = test_state_with(vec![]);
+        assert!(!state.is_operator("any-client"));
     }
 }

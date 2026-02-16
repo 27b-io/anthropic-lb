@@ -1,3 +1,5 @@
 /target
 config.toml
 config.state.json
+.vscode/
+.spec-workflow/
