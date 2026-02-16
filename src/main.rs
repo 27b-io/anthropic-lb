@@ -89,27 +89,42 @@ struct UpstreamConfig {
 
 // ── Runtime state ───────────────────────────────────────────────────
 
+/// Per-claim utilization data for a single rate-limit window.
+/// The API can report model-specific sub-budgets (e.g., "seven_day_sonnet")
+/// alongside general windows ("seven_day"). Each gets its own entry.
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct ClaimWindowData {
+    utilization: f64,
+    reset: Option<u64>,
+    status: Option<String>,
+}
+
 #[derive(Default)]
 struct RateLimitInfo {
     remaining_requests: Option<u64>,
     remaining_tokens: Option<u64>,
     limit_requests: Option<u64>,
     limit_tokens: Option<u64>,
-    /// Unified utilization (0.0 = fresh, 1.0 = exhausted). From representative claim window.
+    /// Unified utilization (0.0 = fresh, 1.0 = exhausted). Derived: max across all windows.
     utilization: Option<f64>,
-    /// Per-window utilization for all known windows
+    /// Per-claim 7d windows: "seven_day" (general), "seven_day_sonnet" (model-specific), etc.
+    /// Source of truth for 7d utilization routing.
+    claims_7d: HashMap<String, ClaimWindowData>,
+    /// Derived convenience: max utilization across all claims_7d entries.
+    /// Used for backward-compatible logging/stats. Routing reads claims_7d directly.
     utilization_7d: Option<f64>,
     utilization_5h: Option<f64>,
-    /// Which window is the binding constraint (e.g. "five_hour", "seven_day")
+    /// Which window is the binding constraint (e.g. "five_hour", "seven_day_sonnet")
     representative_claim: Option<String>,
-    /// Epoch seconds when the 5h/7d rate-limit window resets. Used to time-discount
-    /// utilization near reset and to detect stale data (reset already passed).
+    /// Epoch seconds when the 5h rate-limit window resets.
     reset_5h: Option<u64>,
+    /// Derived convenience: min reset across all claims_7d entries.
     reset_7d: Option<u64>,
     /// API-side pressure signal. "allowed" = normal, "allowed_warning" = approaching limits
     /// (floor 0.80), "throttled" = actively constrained (floor 0.98, soft-excluded),
     /// "rejected" = hard refusal (floor 1.0, zero bucket share).
     status_5h: Option<String>,
+    /// Derived convenience: worst status across all claims_7d entries.
     status_7d: Option<String>,
     hard_limited_until: Option<Instant>,
     #[allow(dead_code)]
@@ -389,6 +404,8 @@ struct PersistedAccount {
     status_5h: Option<String>,
     #[serde(default)]
     status_7d: Option<String>,
+    #[serde(default)]
+    claims_7d: HashMap<String, ClaimWindowData>,
     remaining_requests: Option<u64>,
     remaining_tokens: Option<u64>,
     limit_requests: Option<u64>,
@@ -485,6 +502,7 @@ impl AppState {
                 reset_7d: info.reset_7d,
                 status_5h: info.status_5h.clone(),
                 status_7d: info.status_7d.clone(),
+                claims_7d: info.claims_7d.clone(),
                 remaining_requests: info.remaining_requests,
                 remaining_tokens: info.remaining_tokens,
                 limit_requests: info.limit_requests,
@@ -511,7 +529,9 @@ impl AppState {
     }
 
     /// Fire a minimal request (max_tokens=1) to refresh rate limit headers for an account.
-    async fn probe_account(&self, idx: usize) {
+    /// The `model` parameter controls which model is probed, rotating across families
+    /// so that per-model 7d utilization claims get populated for each family.
+    async fn probe_account(&self, idx: usize, model: &str) {
         let acct = &self.accounts[idx];
         if acct.passthrough {
             debug!(
@@ -537,7 +557,7 @@ impl AppState {
 
         let url = format!("{}/v1/messages", self.upstream);
         let body = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": model,
             "max_tokens": 1,
             "system": [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}],
             "messages": [{"role": "user", "content": "."}]
@@ -575,10 +595,12 @@ impl AppState {
                 info!(
                     account = acct.name,
                     status = status.as_u16(),
+                    probe_model = model,
                     utilization = ?info.utilization,
                     util_7d = ?info.utilization_7d,
                     util_5h = ?info.utilization_5h,
                     claim = ?info.representative_claim,
+                    n_claims_7d = info.claims_7d.len(),
                     "probe complete"
                 );
             }
@@ -617,28 +639,65 @@ impl AppState {
                 info.utilization_5h = pa.utilization_5h;
                 info.representative_claim = pa.representative_claim.clone();
                 info.reset_5h = pa.reset_5h;
-                info.reset_7d = pa.reset_7d;
                 info.status_5h = pa.status_5h.clone();
-                info.status_7d = pa.status_7d.clone();
 
-                // Invalidate stale per-window data: if a window's reset is in the past,
-                // the block has reset and our utilization/status numbers are meaningless.
-                // Clear them so pick_account falls through to "unknown" (0.5) rather than
-                // routing on stale data until the first probe refreshes. (Bug #2, #3)
+                // Load claims_7d: either from persisted map or migrate from flat fields
+                if !pa.claims_7d.is_empty() {
+                    info.claims_7d = pa.claims_7d.clone();
+                } else if let Some(util_7d) = pa.utilization_7d {
+                    // Migration: old state file with flat 7d fields only
+                    let key = pa
+                        .representative_claim
+                        .as_deref()
+                        .filter(|c| c.starts_with("seven_day"))
+                        .unwrap_or("seven_day")
+                        .to_string();
+                    info.claims_7d.insert(
+                        key,
+                        ClaimWindowData {
+                            utilization: util_7d,
+                            reset: pa.reset_7d,
+                            status: pa.status_7d.clone(),
+                        },
+                    );
+                }
+
+                // Evict stale claims (reset in the past)
+                info.claims_7d
+                    .retain(|_, c| c.reset.is_some_and(|r| r > now_epoch));
+
+                // Derive flat 7d fields from claims_7d
+                if info.claims_7d.is_empty() {
+                    info.utilization_7d = None;
+                    info.reset_7d = None;
+                    info.status_7d = None;
+                } else {
+                    info.utilization_7d = info
+                        .claims_7d
+                        .values()
+                        .map(|c| c.utilization)
+                        .reduce(f64::max);
+                    info.reset_7d = info.claims_7d.values().filter_map(|c| c.reset).min();
+                    info.status_7d = info
+                        .claims_7d
+                        .values()
+                        .filter_map(|c| c.status.as_ref())
+                        .max_by(|a, b| {
+                            status_to_floor(Some(a))
+                                .partial_cmp(&status_to_floor(Some(b)))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .cloned();
+                }
+
+                // Invalidate stale 5h data
                 let stale_5h = info.reset_5h.is_none_or(|r| r <= now_epoch);
-                let stale_7d = info.reset_7d.is_none_or(|r| r <= now_epoch);
                 if stale_5h {
                     info.utilization_5h = None;
                     info.reset_5h = None;
                     info.status_5h = None;
                 }
-                if stale_7d {
-                    info.utilization_7d = None;
-                    info.reset_7d = None;
-                    info.status_7d = None;
-                }
-                if stale_5h && stale_7d {
-                    // Both windows stale — the derived unified field is also meaningless
+                if stale_5h && info.claims_7d.is_empty() {
                     info.utilization = None;
                 }
 
@@ -701,6 +760,21 @@ const WARNING_UTIL_FLOOR: f64 = 0.80;
 /// Distinct from hard_limited_until (which skips the account entirely) because rejected
 /// status can arrive on one window while the other is still valid.
 const REJECTED_UTIL_FLOOR: f64 = 1.0;
+
+/// Extract the model family from a model ID string.
+/// Used to look up model-specific rate-limit claims (e.g., "seven_day_sonnet").
+/// Returns "" for unrecognized models, which triggers worst-case routing.
+fn model_family(model: &str) -> &str {
+    if model.contains("sonnet") {
+        "sonnet"
+    } else if model.contains("opus") {
+        "opus"
+    } else if model.contains("haiku") {
+        "haiku"
+    } else {
+        ""
+    }
+}
 
 /// Seven-day claim penalty threshold. Below this, no penalty applied.
 const CLAIM_PENALTY_THRESHOLD: f64 = 0.70;
@@ -801,7 +875,8 @@ fn time_adjusted_utilization(
 /// 1. Both windows adjusted → take max (most constrained wins), 7d penalized by claim_penalty_7d
 /// 2. Only one window → use it (the other is stale or absent), 7d penalized
 /// 3. Neither window → raw unified util, then legacy token ratio, then 0.5
-fn effective_utilization(info: &RateLimitInfo, now_epoch: u64) -> (f64, &'static str) {
+fn effective_utilization(info: &RateLimitInfo, now_epoch: u64, model: &str) -> (f64, &'static str) {
+    // 5h window — always flat (no per-model sub-budgets from API)
     let adj_5h = time_adjusted_utilization(
         info.utilization_5h,
         info.reset_5h,
@@ -809,15 +884,57 @@ fn effective_utilization(info: &RateLimitInfo, now_epoch: u64) -> (f64, &'static
         NEAR_RESET_5H_SECS,
         now_epoch,
     );
-    let adj_7d = time_adjusted_utilization(
-        info.utilization_7d,
-        info.reset_7d,
-        info.status_7d.as_deref(),
-        NEAR_RESET_7D_SECS,
-        now_epoch,
-    );
-    // Apply claim penalty to 7d BEFORE the max merge
-    let adj_7d = adj_7d.map(claim_penalty_7d);
+
+    // 7d window — model-aware lookup from claims_7d map
+    let adj_7d = if !info.claims_7d.is_empty() {
+        if !model.is_empty() {
+            // Model-specific: try "seven_day_{family}", fallback to "seven_day" (general)
+            let family = model_family(model);
+            let claim = if !family.is_empty() {
+                let specific_key = format!("seven_day_{}", family);
+                info.claims_7d
+                    .get(&specific_key)
+                    .or_else(|| info.claims_7d.get("seven_day"))
+            } else {
+                info.claims_7d.get("seven_day")
+            };
+            claim.and_then(|c| {
+                time_adjusted_utilization(
+                    Some(c.utilization),
+                    c.reset,
+                    c.status.as_deref(),
+                    NEAR_RESET_7D_SECS,
+                    now_epoch,
+                )
+                .map(claim_penalty_7d)
+            })
+        } else {
+            // No model specified (emergency brake, stats) — worst-case across all claims
+            info.claims_7d
+                .values()
+                .filter_map(|c| {
+                    time_adjusted_utilization(
+                        Some(c.utilization),
+                        c.reset,
+                        c.status.as_deref(),
+                        NEAR_RESET_7D_SECS,
+                        now_epoch,
+                    )
+                    .map(claim_penalty_7d)
+                })
+                .reduce(f64::max)
+        }
+    } else {
+        // No claims_7d data — fall back to derived flat fields (migration/compat)
+        time_adjusted_utilization(
+            info.utilization_7d,
+            info.reset_7d,
+            info.status_7d.as_deref(),
+            NEAR_RESET_7D_SECS,
+            now_epoch,
+        )
+        .map(claim_penalty_7d)
+    };
 
     match (adj_5h, adj_7d) {
         (Some(a), Some(b)) => (a.max(b), "time_adjusted"),
@@ -878,7 +995,7 @@ impl AppState {
 
             // Compute effective utilization using the shared fallback chain.
             // This includes claim_penalty_7d on the 7d window.
-            let (effective_util, source) = effective_utilization(&info, now_epoch);
+            let (effective_util, source) = effective_utilization(&info, now_epoch, model);
 
             // Headroom = available capacity. Rejected/exhausted accounts (util >= 1.0) get zero
             // headroom so they receive no traffic even in all-exhausted degraded mode (Bug #5).
@@ -1014,20 +1131,28 @@ impl AppState {
             }
         }
 
-        // Capture per-window utilization (always, regardless of representative claim)
-        // Track whether we got utilization for each window — if we did but got no status header,
-        // the pressure has cleared and we must reset the stale status (Bug #1: sticky status fix).
-        let got_7d_util = if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-utilization")
-        {
-            if let Ok(s) = v.to_str() {
-                info.utilization_7d = s.parse::<f64>().ok().map(|v| v.clamp(0.0, 1.0));
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        // Parse representative claim FIRST — determines where 7d data is stored.
+        // Model-specific claims (e.g., "seven_day_sonnet") route 7d data to a per-claim
+        // entry so different models don't overwrite each other's utilization.
+        let rep_claim = headers
+            .get("anthropic-ratelimit-unified-representative-claim")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        if let Some(ref claim) = rep_claim {
+            info.representative_claim = Some(claim.clone());
+        }
+
+        // Determine the claim key for 7d data storage.
+        // If claim starts with "seven_day", use it verbatim (e.g., "seven_day_sonnet").
+        // Otherwise default to "seven_day" (general bucket).
+        let claim_key_7d = rep_claim
+            .as_deref()
+            .filter(|c| c.starts_with("seven_day"))
+            .unwrap_or("seven_day");
+
+        // Capture 5h utilization (flat — no per-model sub-budgets observed for 5h).
+        // Track whether we got utilization for sticky status fix (Bug #1).
         let got_5h_util = if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-utilization")
         {
             if let Ok(s) = v.to_str() {
@@ -1040,8 +1165,25 @@ impl AppState {
             false
         };
 
+        // Capture 7d utilization → store in claims_7d[claim_key].
+        let got_7d_util = if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-utilization")
+        {
+            if let Ok(s) = v.to_str() {
+                if let Ok(util) = s.parse::<f64>() {
+                    let entry = info.claims_7d.entry(claim_key_7d.to_string()).or_default();
+                    entry.utilization = util.clamp(0.0, 1.0);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Capture per-window reset timestamps (epoch seconds).
-        // Used by time_adjusted_utilization() to discount near-reset accounts and detect stale data.
         // Sanity-capped: 5h window can't reset >5h out, 7d can't reset >7d out (Bug #6).
         let now_epoch = Self::now_epoch();
         if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-reset") {
@@ -1053,11 +1195,14 @@ impl AppState {
                 }
             }
         }
+        // 7d reset → store in claims_7d[claim_key]
         if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-reset") {
             if let Ok(s) = v.to_str() {
                 if let Ok(epoch) = s.parse::<u64>() {
                     if epoch <= now_epoch + 604800 {
-                        info.reset_7d = Some(epoch);
+                        if let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
+                            entry.reset = Some(epoch);
+                        }
                     }
                 }
             }
@@ -1065,7 +1210,6 @@ impl AppState {
 
         // Capture per-window status. These signal API-side pressure (burst limits, concurrent
         // request limits, per-model sub-limits) that raw utilization percentages don't reflect.
-        // "allowed_warning" → reduce routing share. "throttled" → effectively exclude.
         // If the API sent utilization for a window but NO status header, clear stale status —
         // absence of the header means pressure has subsided (Bug #1).
         if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-status") {
@@ -1075,33 +1219,46 @@ impl AppState {
         } else if got_5h_util {
             info.status_5h = None;
         }
+        // 7d status → store in claims_7d[claim_key]
         if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-status") {
             if let Ok(s) = v.to_str() {
-                info.status_7d = Some(s.to_string());
+                if let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
+                    entry.status = Some(s.to_string());
+                }
             }
         } else if got_7d_util {
-            info.status_7d = None;
+            // Status absent but util present → pressure subsided for this claim
+            if let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
+                entry.status = None;
+            }
         }
 
-        // Representative claim tells us which window is the binding constraint
-        let rep_claim = headers
-            .get("anthropic-ratelimit-unified-representative-claim")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        if let Some(ref claim) = rep_claim {
-            info.representative_claim = Some(claim.clone());
+        // Derive flat convenience fields from claims_7d (backward compat for logs/stats).
+        // utilization_7d = max utilization, reset_7d = min reset, status_7d = worst status.
+        if !info.claims_7d.is_empty() {
+            info.utilization_7d = Some(
+                info.claims_7d
+                    .values()
+                    .map(|c| c.utilization)
+                    .fold(0.0_f64, f64::max),
+            );
+            info.reset_7d = info.claims_7d.values().filter_map(|c| c.reset).min();
+            info.status_7d = info
+                .claims_7d
+                .values()
+                .filter_map(|c| c.status.as_deref())
+                .max_by(|a, b| {
+                    status_to_floor(Some(a))
+                        .partial_cmp(&status_to_floor(Some(b)))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|s| s.to_string());
         }
 
-        // Use the MAX of all known window utilizations as the effective utilization.
-        // This prevents the bug where accounts with different representative claims
-        // get compared on different time windows (apples vs oranges).
-        let mut max_util: Option<f64> = None;
-        for u in [info.utilization_7d, info.utilization_5h]
-            .into_iter()
-            .flatten()
-        {
-            max_util = Some(max_util.map_or(u, |cur: f64| cur.max(u)));
+        // Derive unified utilization = max across all windows (5h + all 7d claims).
+        let mut max_util: Option<f64> = info.utilization_5h;
+        for cd in info.claims_7d.values() {
+            max_util = Some(max_util.map_or(cd.utilization, |cur| cur.max(cd.utilization)));
         }
         if max_util.is_some() {
             info.utilization = max_util;
@@ -1140,6 +1297,7 @@ impl AppState {
             status_5h = ?info.status_5h,
             status_7d = ?info.status_7d,
             claim = ?info.representative_claim,
+            n_claims_7d = info.claims_7d.len(),
             remaining_requests = ?info.remaining_requests,
             remaining_tokens = ?info.remaining_tokens,
             "rate info updated"
@@ -1370,7 +1528,7 @@ impl AppState {
             }
             any_compatible = true;
             let info = acct.rate_info.read().await;
-            let (util, _) = effective_utilization(&info, now_epoch);
+            let (util, _) = effective_utilization(&info, now_epoch, model);
             if util < limit {
                 all_above = false;
                 break;
@@ -1382,10 +1540,12 @@ impl AppState {
                     nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
                 }
             }
-            if let Some(r) = info.reset_7d {
-                if r > now_epoch {
-                    let secs = r - now_epoch;
-                    nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
+            for c in info.claims_7d.values() {
+                if let Some(r) = c.reset {
+                    if r > now_epoch {
+                        let secs = r - now_epoch;
+                        nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
+                    }
                 }
             }
         }
@@ -1407,7 +1567,7 @@ impl AppState {
 
         for acct in &self.accounts {
             let info = acct.rate_info.read().await;
-            let (util, source) = effective_utilization(&info, now_epoch);
+            let (util, source) = effective_utilization(&info, now_epoch, "");
             if source != "unknown" {
                 any_known = true;
             }
@@ -1647,7 +1807,7 @@ async fn proxy_handler(
         .unwrap_or("-")
         .to_string();
 
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, 25 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             error!("failed to read request body: {e}");
@@ -1871,7 +2031,7 @@ async fn proxy_handler(
         // Inject budget status header
         {
             let info = acct.rate_info.read().await;
-            let (eff_util, _) = effective_utilization(&info, AppState::now_epoch());
+            let (eff_util, _) = effective_utilization(&info, AppState::now_epoch(), &model);
             let status_val = compute_pressure_status(eff_util, &client_id, &state);
             builder = builder.header("x-budget-status", status_val);
         }
@@ -2003,7 +2163,7 @@ async fn upstream_handler(
     // Extract client identification headers
     let client_id = state.resolve_client_id(&client_ip, &parts.headers);
 
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, 25 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             error!("failed to read request body: {e}");
@@ -2133,7 +2293,7 @@ async fn stats_handler(
         }
 
         // Projected throttle time
-        let (eff_util, _) = effective_utilization(&info, now_epoch);
+        let (eff_util, _) = effective_utilization(&info, now_epoch, "");
         let projected_throttle_at: serde_json::Value = if eff_util < 0.5 || br_1h < 0.01 {
             serde_json::Value::Null
         } else if let Some(headroom_reqs) = headroom {
@@ -2149,10 +2309,12 @@ async fn stats_handler(
                 let secs_remaining = (minutes_remaining * 60.0) as u64;
                 let projected_epoch = now_epoch + secs_remaining;
                 // If projection is beyond next reset, account will recover → null
-                let next_reset = info
-                    .reset_5h
-                    .unwrap_or(u64::MAX)
-                    .min(info.reset_7d.unwrap_or(u64::MAX));
+                let mut next_reset = info.reset_5h.unwrap_or(u64::MAX);
+                for c in info.claims_7d.values() {
+                    if let Some(r) = c.reset {
+                        next_reset = next_reset.min(r);
+                    }
+                }
                 if projected_epoch > next_reset && next_reset != u64::MAX {
                     serde_json::Value::Null
                 } else {
@@ -2175,6 +2337,13 @@ async fn stats_handler(
             "reset_7d": info.reset_7d,
             "status_5h": info.status_5h,
             "status_7d": info.status_7d,
+            "claims_7d": info.claims_7d.iter().map(|(k, v)| {
+                (k.clone(), serde_json::json!({
+                    "utilization": v.utilization,
+                    "reset": v.reset,
+                    "status": v.status,
+                }))
+            }).collect::<serde_json::Map<String, serde_json::Value>>(),
             "remaining_requests": info.remaining_requests,
             "remaining_tokens": info.remaining_tokens,
             "limit_requests": info.limit_requests,
@@ -2654,7 +2823,7 @@ async fn openai_chat_handler(
         .unwrap_or("-")
         .to_string();
 
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, 25 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             error!("failed to read request body: {e}");
@@ -2836,7 +3005,7 @@ async fn openai_chat_handler(
         // Compute budget pressure status for response header
         let budget_status = {
             let info = acct.rate_info.read().await;
-            let (eff_util, _) = effective_utilization(&info, AppState::now_epoch());
+            let (eff_util, _) = effective_utilization(&info, AppState::now_epoch(), &model);
             compute_pressure_status(eff_util, &client_id, &state)
         };
 
@@ -3249,18 +3418,40 @@ async fn main() {
         let probe_state = state.clone();
         let n_accounts = probe_state.accounts.len();
         tokio::spawn(async move {
+            const PROBE_MODELS: &[&str] = &[
+                "claude-haiku-4-5-20251001",
+                "claude-sonnet-4-5-20250929",
+                "claude-opus-4-6",
+            ];
             // Stagger initial probes: wait 10s then probe all accounts
             tokio::time::sleep(Duration::from_secs(10)).await;
             info!(
                 interval_secs = probe_interval,
                 "starting utilization probes"
             );
+            let mut probe_cycle: usize = 0;
             loop {
                 for i in 0..n_accounts {
-                    probe_state.probe_account(i).await;
+                    // Rotate probe model per account per cycle
+                    let model_idx = (probe_cycle + i) % PROBE_MODELS.len();
+                    let model = PROBE_MODELS[model_idx];
+                    // Skip if account doesn't serve this model family
+                    let acct = &probe_state.accounts[i];
+                    if !acct.serves_model(model) {
+                        // Try next model in rotation
+                        let alt_idx = (model_idx + 1) % PROBE_MODELS.len();
+                        let alt_model = PROBE_MODELS[alt_idx];
+                        if acct.serves_model(alt_model) {
+                            probe_state.probe_account(i, alt_model).await;
+                        }
+                        // else: account serves none of our probe models, skip
+                    } else {
+                        probe_state.probe_account(i, model).await;
+                    }
                     // Small delay between accounts to avoid burst
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
+                probe_cycle = probe_cycle.wrapping_add(1);
                 tokio::time::sleep(Duration::from_secs(probe_interval)).await;
             }
         });
@@ -5850,14 +6041,22 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn effective_util_both_windows() {
         let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.80,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
         let info = RateLimitInfo {
             utilization_5h: Some(0.60),
-            utilization_7d: Some(0.80),
             reset_5h: Some(now_epoch + 10000),
-            reset_7d: Some(now_epoch + 100000),
+            claims_7d,
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch);
+        let (util, source) = effective_utilization(&info, now_epoch, "");
         // 7d at 0.80 → penalized to 0.833. Max(0.60, 0.833) = 0.833
         assert_eq!(source, "time_adjusted");
         assert!(
@@ -5870,15 +6069,23 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn effective_util_5h_only() {
         let now_epoch = AppState::now_epoch();
+        // 7d claim with reset in the past → stale, evicted by time_adjusted_utilization
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.90,
+                reset: Some(now_epoch - 1),
+                status: None,
+            },
+        );
         let info = RateLimitInfo {
             utilization_5h: Some(0.60),
             reset_5h: Some(now_epoch + 10000),
-            // 7d reset in the past → stale
-            utilization_7d: Some(0.90),
-            reset_7d: Some(now_epoch - 1),
+            claims_7d,
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch);
+        let (util, source) = effective_utilization(&info, now_epoch, "");
         assert_eq!(source, "time_adjusted_5h");
         assert!(
             (util - 0.60).abs() < 0.01,
@@ -5889,15 +6096,23 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn effective_util_7d_only() {
         let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.50,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
         let info = RateLimitInfo {
             // 5h stale
             utilization_5h: Some(0.40),
             reset_5h: Some(now_epoch - 1),
-            utilization_7d: Some(0.50),
-            reset_7d: Some(now_epoch + 100000),
+            claims_7d,
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch);
+        let (util, source) = effective_utilization(&info, now_epoch, "");
         assert_eq!(source, "time_adjusted_7d");
         // 0.50 is below CLAIM_PENALTY_THRESHOLD, so no penalty
         assert!(
@@ -5909,16 +6124,24 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn effective_util_fallback_unified() {
         let now_epoch = AppState::now_epoch();
+        // Both 5h and all 7d claims stale → falls through to unified
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.50,
+                reset: Some(now_epoch - 1),
+                status: None,
+            },
+        );
         let info = RateLimitInfo {
-            // Both windows stale
             utilization_5h: Some(0.40),
             reset_5h: Some(now_epoch - 1),
-            utilization_7d: Some(0.50),
-            reset_7d: Some(now_epoch - 1),
+            claims_7d,
             utilization: Some(0.65),
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch);
+        let (util, source) = effective_utilization(&info, now_epoch, "");
         assert_eq!(source, "unified");
         assert!(
             (util - 0.65).abs() < 0.001,
@@ -5934,7 +6157,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             limit_tokens: Some(1_000_000),
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch);
+        let (util, source) = effective_utilization(&info, now_epoch, "");
         assert_eq!(source, "legacy");
         assert!(
             (util - 0.70).abs() < 0.01,
@@ -5946,11 +6169,282 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn effective_util_fallback_unknown() {
         let now_epoch = AppState::now_epoch();
         let info = RateLimitInfo::default();
-        let (util, source) = effective_utilization(&info, now_epoch);
+        let (util, source) = effective_utilization(&info, now_epoch, "");
         assert_eq!(source, "unknown");
         assert!(
             (util - 0.50).abs() < 0.001,
             "should default to 0.5: got {util}"
+        );
+    }
+
+    // ── Per-claim 7d model-specific tests ──────────────────────────
+
+    #[tokio::test]
+    async fn model_specific_routing() {
+        // Sonnet 7d at 0.85 (penalized higher), Opus 7d at 0.10 → Opus sees low util
+        let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day_sonnet".to_string(),
+            ClaimWindowData {
+                utilization: 0.85,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        claims_7d.insert(
+            "seven_day_opus".to_string(),
+            ClaimWindowData {
+                utilization: 0.10,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.30),
+            reset_5h: Some(now_epoch + 10000),
+            claims_7d,
+            ..Default::default()
+        };
+        let (util_sonnet, _) =
+            effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        let (util_opus, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        // Sonnet should be penalized above 0.85
+        assert!(
+            util_sonnet > 0.85,
+            "sonnet should be penalized: got {util_sonnet}"
+        );
+        // Opus at 0.10 → below penalty threshold, should stay at ~0.30 (max with 5h)
+        assert!(util_opus < 0.35, "opus should be low: got {util_opus}");
+        // The gap should be large — this is the whole point of per-claim routing
+        assert!(
+            util_sonnet - util_opus > 0.50,
+            "sonnet-opus gap should be >0.50"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_fallback_general() {
+        // Only "seven_day" (general) claim → used for all models
+        let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.50,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.20),
+            reset_5h: Some(now_epoch + 10000),
+            claims_7d,
+            ..Default::default()
+        };
+        let (util_sonnet, _) =
+            effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        let (util_opus, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        let (util_haiku, _) = effective_utilization(&info, now_epoch, "claude-haiku-4-5-20251001");
+        // All should see the same general claim (0.50, no penalty)
+        assert!(
+            (util_sonnet - 0.50).abs() < 0.01,
+            "sonnet: got {util_sonnet}"
+        );
+        assert!((util_opus - 0.50).abs() < 0.01, "opus: got {util_opus}");
+        assert!((util_haiku - 0.50).abs() < 0.01, "haiku: got {util_haiku}");
+    }
+
+    #[tokio::test]
+    async fn cross_model_isolation() {
+        // Sonnet claim at 0.95 should NOT affect Opus effective_utilization
+        let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day_sonnet".to_string(),
+            ClaimWindowData {
+                utilization: 0.95,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        // No opus claim and no general claim
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.20),
+            reset_5h: Some(now_epoch + 10000),
+            claims_7d,
+            ..Default::default()
+        };
+        let (util_opus, source) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        // Opus has no specific claim and no general fallback → only 5h at 0.20
+        assert_eq!(source, "time_adjusted_5h");
+        assert!(
+            (util_opus - 0.20).abs() < 0.01,
+            "opus should only see 5h: got {util_opus}"
+        );
+
+        let (util_sonnet, _) =
+            effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        assert!(
+            util_sonnet > 0.95,
+            "sonnet should be penalized: got {util_sonnet}"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_brake_worst_case() {
+        // Emergency brake (model="") should use max across all claims
+        let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day_sonnet".to_string(),
+            ClaimWindowData {
+                utilization: 0.95,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        claims_7d.insert(
+            "seven_day_opus".to_string(),
+            ClaimWindowData {
+                utilization: 0.10,
+                reset: Some(now_epoch + 100000),
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.30),
+            reset_5h: Some(now_epoch + 10000),
+            claims_7d,
+            ..Default::default()
+        };
+        let (util, _) = effective_utilization(&info, now_epoch, "");
+        // Should pick sonnet's 0.95 (penalized even higher)
+        assert!(
+            util > 0.95,
+            "emergency brake should use worst claim: got {util}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_claim_eviction() {
+        // Claim with expired reset should be ignored
+        let now_epoch = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day_sonnet".to_string(),
+            ClaimWindowData {
+                utilization: 0.95,
+                reset: Some(now_epoch - 1), // stale
+                status: None,
+            },
+        );
+        claims_7d.insert(
+            "seven_day_opus".to_string(),
+            ClaimWindowData {
+                utilization: 0.30,
+                reset: Some(now_epoch + 100000), // fresh
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.20),
+            reset_5h: Some(now_epoch + 10000),
+            claims_7d,
+            ..Default::default()
+        };
+        // For sonnet model: sonnet claim is stale, no general fallback → only 5h
+        let (util_sonnet, source) =
+            effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        assert_eq!(source, "time_adjusted_5h");
+        assert!(
+            (util_sonnet - 0.20).abs() < 0.01,
+            "stale sonnet should be ignored: got {util_sonnet}"
+        );
+
+        // For opus model: opus claim is fresh
+        let (util_opus, source) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        assert_eq!(source, "time_adjusted");
+        assert!(
+            (util_opus - 0.30).abs() < 0.01,
+            "fresh opus should be used: got {util_opus}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_family_extraction() {
+        assert_eq!(model_family("claude-sonnet-4-5-20250929"), "sonnet");
+        assert_eq!(model_family("claude-opus-4-6"), "opus");
+        assert_eq!(model_family("claude-haiku-4-5-20251001"), "haiku");
+        assert_eq!(model_family("claude-3-5-sonnet-20240620"), "sonnet");
+        assert_eq!(model_family("unknown-model"), "");
+    }
+
+    #[tokio::test]
+    async fn flat_field_compat_fallback() {
+        // When claims_7d is empty, should fall back to flat utilization_7d fields
+        let now_epoch = AppState::now_epoch();
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.30),
+            reset_5h: Some(now_epoch + 10000),
+            utilization_7d: Some(0.60),
+            reset_7d: Some(now_epoch + 100000),
+            // claims_7d empty — migration/compat path
+            ..Default::default()
+        };
+        let (util, source) = effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        assert_eq!(source, "time_adjusted");
+        assert!((util - 0.60).abs() < 0.01, "should use flat 7d: got {util}");
+    }
+
+    #[tokio::test]
+    async fn claim_aware_routing_prefers_low_model_util() {
+        // Account A: Sonnet 7d at 0.90 (high), Opus 7d at 0.10 (low)
+        // Account B: Sonnet 7d at 0.10 (low), Opus 7d at 0.90 (high)
+        // Routing for Sonnet should prefer B, routing for Opus should prefer A
+        let acct_a = make_account("a", "sk-ant-api-a");
+        let acct_b = make_account("b", "sk-ant-api-b");
+        let state = test_state_with(vec![acct_a, acct_b]);
+        let now = AppState::now_epoch();
+
+        // Set 5h low for both
+        set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.10, 0.10, now + 10000, now + 100000).await;
+
+        // Set model-specific 7d utilization
+        set_model_utilization(&state, 0, "claude-sonnet-4-5-20250929", 0.90, now + 100000).await;
+        set_model_utilization(&state, 0, "claude-opus-4-6", 0.10, now + 100000).await;
+        set_model_utilization(&state, 1, "claude-sonnet-4-5-20250929", 0.10, now + 100000).await;
+        set_model_utilization(&state, 1, "claude-opus-4-6", 0.90, now + 100000).await;
+
+        // Run many picks — Sonnet routing should consistently prefer B (index 1)
+        let mut sonnet_picks = [0u32; 2];
+        let mut opus_picks = [0u32; 2];
+        for i in 0..100 {
+            let key = format!("client_{}", i);
+            if let Some(idx) = state
+                .pick_account(Some(&key), "claude-sonnet-4-5-20250929")
+                .await
+            {
+                sonnet_picks[idx] += 1;
+            }
+            if let Some(idx) = state.pick_account(Some(&key), "claude-opus-4-6").await {
+                opus_picks[idx] += 1;
+            }
+        }
+        // B should get most Sonnet traffic (has lower Sonnet util)
+        assert!(
+            sonnet_picks[1] > sonnet_picks[0],
+            "Sonnet should prefer B: A={}, B={}",
+            sonnet_picks[0],
+            sonnet_picks[1]
+        );
+        // A should get most Opus traffic (has lower Opus util)
+        assert!(
+            opus_picks[0] > opus_picks[1],
+            "Opus should prefer A: A={}, B={}",
+            opus_picks[0],
+            opus_picks[1]
         );
     }
 
@@ -5971,6 +6465,52 @@ data: {\"type\":\"message_stop\"}\n\n";
         info.utilization = Some(util_5h.max(util_7d));
         info.reset_5h = Some(reset_5h);
         info.reset_7d = Some(reset_7d);
+        // Populate claims_7d with a general "seven_day" entry
+        info.claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: util_7d,
+                reset: Some(reset_7d),
+                status: None,
+            },
+        );
+    }
+
+    /// Helper: set per-model 7d utilization (e.g. "seven_day_sonnet").
+    async fn set_model_utilization(
+        state: &AppState,
+        idx: usize,
+        model: &str,
+        util_7d: f64,
+        reset_7d: u64,
+    ) {
+        let family = model_family(model);
+        let key = if family.is_empty() {
+            "seven_day".to_string()
+        } else {
+            format!("seven_day_{}", family)
+        };
+        let mut info = state.accounts[idx].rate_info.write().await;
+        info.claims_7d.insert(
+            key,
+            ClaimWindowData {
+                utilization: util_7d,
+                reset: Some(reset_7d),
+                status: None,
+            },
+        );
+        // Re-derive flat fields
+        info.utilization_7d = info
+            .claims_7d
+            .values()
+            .map(|c| c.utilization)
+            .reduce(f64::max);
+        info.reset_7d = info.claims_7d.values().filter_map(|c| c.reset).min();
+        info.utilization = Some(
+            info.utilization_5h
+                .unwrap_or(0.0)
+                .max(info.utilization_7d.unwrap_or(0.0)),
+        );
     }
 
     #[tokio::test]
@@ -7001,7 +7541,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         headers.insert("x-client-id", HeaderValue::from_static("header-client"));
 
         let resolved = state.resolve_client_id(&ip, &headers);
-        assert_eq!(resolved, "header-client", "should prefer x-client-id header");
+        assert_eq!(
+            resolved, "header-client",
+            "should prefer x-client-id header"
+        );
     }
 
     #[test]
@@ -7096,7 +7639,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         });
 
         let status = compute_pressure_status(0.99, "operator-id", &state);
-        assert_eq!(status, "healthy", "operator should always see healthy status");
+        assert_eq!(
+            status, "healthy",
+            "operator should always see healthy status"
+        );
     }
 
     #[test]
@@ -7138,7 +7684,10 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
         let status = compute_pressure_status(0.65, "client", &state);
-        assert_eq!(status, "elevated", "proximity to limit should upgrade status");
+        assert_eq!(
+            status, "elevated",
+            "proximity to limit should upgrade status"
+        );
     }
 
     #[test]
@@ -7153,7 +7702,10 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn status_to_floor_unknown_defaults_to_warning() {
         let floor = status_to_floor(Some("unknown_status"));
-        assert_eq!(floor, WARNING_UTIL_FLOOR, "unknown status should map to warning floor");
+        assert_eq!(
+            floor, WARNING_UTIL_FLOOR,
+            "unknown status should map to warning floor"
+        );
     }
 
     #[test]
@@ -7164,10 +7716,16 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         // Above threshold: quadratic penalty applied
         let result = claim_penalty_7d(0.80);
-        assert!(result > 0.80, "penalty should increase utilization above threshold");
+        assert!(
+            result > 0.80,
+            "penalty should increase utilization above threshold"
+        );
 
         let result = claim_penalty_7d(0.90);
-        assert!(result > 1.0, "high utilization should push above 1.0 with penalty");
+        assert!(
+            result > 1.0,
+            "high utilization should push above 1.0 with penalty"
+        );
     }
 
     #[test]
@@ -7175,15 +7733,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         let now = 1000000u64;
         let reset_past = 999000u64; // Reset already happened
 
-        let result = time_adjusted_utilization(
-            Some(0.50),
-            Some(reset_past),
-            Some("allowed"),
-            3600.0,
-            now,
-        );
+        let result =
+            time_adjusted_utilization(Some(0.50), Some(reset_past), Some("allowed"), 3600.0, now);
 
-        assert_eq!(result, None, "stale data (reset in past) should return None");
+        assert_eq!(
+            result, None,
+            "stale data (reset in past) should return None"
+        );
     }
 
     #[test]
@@ -7202,8 +7758,14 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         assert!(result.is_some());
         let adjusted = result.unwrap();
-        assert!(adjusted < 0.80, "near-reset utilization should be discounted");
-        assert!(adjusted >= 0.04, "should apply minimum discount floor (0.05)");
+        assert!(
+            adjusted < 0.80,
+            "near-reset utilization should be discounted"
+        );
+        assert!(
+            adjusted >= 0.04,
+            "should apply minimum discount floor (0.05)"
+        );
     }
 
     #[test]
@@ -7240,21 +7802,30 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         assert!(result.is_some());
         let adjusted = result.unwrap();
-        assert_eq!(adjusted, THROTTLE_UTIL_FLOOR, "status floor should override time discount");
+        assert_eq!(
+            adjusted, THROTTLE_UTIL_FLOOR,
+            "status floor should override time discount"
+        );
     }
 
     #[test]
     fn epoch_to_iso8601_leap_year() {
         // 2024-02-29T00:00:00Z (leap day) = 1709164800
         let result = AppState::epoch_to_iso8601(1709164800);
-        assert_eq!(result, "2024-02-29T00:00:00Z", "should handle leap year correctly");
+        assert_eq!(
+            result, "2024-02-29T00:00:00Z",
+            "should handle leap year correctly"
+        );
     }
 
     #[test]
     fn epoch_to_iso8601_edge_of_year() {
         // 2023-12-31T23:59:59Z = 1704067199
         let result = AppState::epoch_to_iso8601(1704067199);
-        assert_eq!(result, "2023-12-31T23:59:59Z", "should handle end of year correctly");
+        assert_eq!(
+            result, "2023-12-31T23:59:59Z",
+            "should handle end of year correctly"
+        );
     }
 
     #[test]
@@ -7292,17 +7863,25 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn effective_utilization_prefers_most_constrained() {
         // When both windows have data, should return max (most constrained)
+        let now = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.60,
+                reset: Some(now + 100000),
+                status: Some("allowed".to_string()),
+            },
+        );
         let info = RateLimitInfo {
             utilization_5h: Some(0.80),
-            utilization_7d: Some(0.60),
-            reset_5h: Some(AppState::now_epoch() + 10000),
-            reset_7d: Some(AppState::now_epoch() + 100000),
+            reset_5h: Some(now + 10000),
             status_5h: Some("allowed".to_string()),
-            status_7d: Some("allowed".to_string()),
+            claims_7d,
             ..Default::default()
         };
 
-        let (util, source) = effective_utilization(&info, AppState::now_epoch());
+        let (util, source) = effective_utilization(&info, now, "");
         assert!(util > 0.60, "should use higher (5h) utilization");
         assert_eq!(source, "time_adjusted");
     }
@@ -7311,18 +7890,28 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn effective_utilization_7d_penalty_applies() {
         // 7d window above penalty threshold should be penalized
         let now = AppState::now_epoch();
+        let mut claims_7d = HashMap::new();
+        claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.85,
+                reset: Some(now + 100000),
+                status: Some("allowed".to_string()),
+            },
+        );
         let info = RateLimitInfo {
             utilization_5h: Some(0.50),
-            utilization_7d: Some(0.85), // Above CLAIM_PENALTY_THRESHOLD (0.70)
             reset_5h: Some(now + 10000),
-            reset_7d: Some(now + 100000),
             status_5h: Some("allowed".to_string()),
-            status_7d: Some("allowed".to_string()),
+            claims_7d,
             ..Default::default()
         };
 
-        let (util, _) = effective_utilization(&info, now);
-        assert!(util > 0.85, "7d window above 0.70 should have penalty applied");
+        let (util, _) = effective_utilization(&info, now, "");
+        assert!(
+            util > 0.85,
+            "7d window above 0.70 should have penalty applied"
+        );
     }
 
     #[tokio::test]
@@ -7390,8 +7979,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             counts[idx] += 1;
         }
 
-        assert!(counts[0] > 0, "first throttled account should get some traffic");
-        assert!(counts[1] > 0, "second throttled account should get some traffic");
+        assert!(
+            counts[0] > 0,
+            "first throttled account should get some traffic"
+        );
+        assert!(
+            counts[1] > 0,
+            "second throttled account should get some traffic"
+        );
     }
 
     #[test]
@@ -7428,5 +8023,4 @@ data: {\"type\":\"message_stop\"}\n\n";
         let state = test_state_with(vec![]);
         assert!(!state.is_operator("any-client"));
     }
-}
 }

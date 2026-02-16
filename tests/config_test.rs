@@ -31,7 +31,10 @@ token = "sk-ant-api-test-key"
     let content = fs::read_to_string(path).expect("Failed to read config file");
     let result: Result<toml::Value, _> = toml::from_str(&content);
 
-    assert!(result.is_ok(), "Minimal valid config should parse successfully");
+    assert!(
+        result.is_ok(),
+        "Minimal valid config should parse successfully"
+    );
 
     let config = result.unwrap();
     assert_eq!(config["listen"].as_str().unwrap(), "127.0.0.1:8082");
@@ -80,13 +83,10 @@ models = ["claude-opus-*", "claude-sonnet-4-20250514"]
     );
 
     let config = result.unwrap();
-    assert_eq!(
-        config["rate_limit_cooldown_secs"].as_integer().unwrap(),
-        60
-    );
+    assert_eq!(config["rate_limit_cooldown_secs"].as_integer().unwrap(), 60);
     assert_eq!(config["probe_interval_secs"].as_integer().unwrap(), 300);
     assert_eq!(config["proxy_key"].as_str().unwrap(), "secret-key-123");
-    assert_eq!(config["auto_cache"].as_bool().unwrap(), true);
+    assert!(config["auto_cache"].as_bool().unwrap());
     assert_eq!(config["emergency_threshold"].as_float().unwrap(), 0.90);
     assert_eq!(config["accounts"].as_array().unwrap().len(), 2);
 
@@ -275,10 +275,7 @@ token = "passthrough"
     let content = fs::read_to_string(path).expect("Failed to read config file");
     let result: Result<toml::Value, _> = toml::from_str(&content);
 
-    assert!(
-        result.is_ok(),
-        "Config with passthrough token should parse"
-    );
+    assert!(result.is_ok(), "Config with passthrough token should parse");
 
     let config = result.unwrap();
     let accounts = config["accounts"].as_array().unwrap();
@@ -373,10 +370,7 @@ models = ["claude-opus-*"]
     let content = fs::read_to_string(path).expect("Failed to read config file");
     let result: Result<toml::Value, _> = toml::from_str(&content);
 
-    assert!(
-        result.is_ok(),
-        "Config with multiple accounts should parse"
-    );
+    assert!(result.is_ok(), "Config with multiple accounts should parse");
 
     let config = result.unwrap();
     let accounts = config["accounts"].as_array().unwrap();
@@ -401,10 +395,7 @@ token = "sk-ant-api-test"
     let content = fs::read_to_string(path).expect("Failed to read config file");
     let result: Result<toml::Value, _> = toml::from_str(&content);
 
-    assert!(
-        result.is_ok(),
-        "Config with IPv6 addresses should parse"
-    );
+    assert!(result.is_ok(), "Config with IPv6 addresses should parse");
 
     let config = result.unwrap();
     assert_eq!(config["listen"].as_str().unwrap(), "[::1]:8082");
@@ -430,10 +421,7 @@ token = "sk-ant-api-test"
     let content = fs::read_to_string(path).expect("Failed to read config file");
     let result: Result<toml::Value, _> = toml::from_str(&content);
 
-    assert!(
-        result.is_ok(),
-        "Config with mixed IPv4/IPv6 should parse"
-    );
+    assert!(result.is_ok(), "Config with mixed IPv4/IPv6 should parse");
 
     let config = result.unwrap();
     let ips = config["allowed_ips"].as_array().unwrap();
@@ -451,8 +439,7 @@ fn test_example_config_file_is_valid() {
         return;
     }
 
-    let content = fs::read_to_string(example_path)
-        .expect("Failed to read config.toml.example");
+    let content = fs::read_to_string(example_path).expect("Failed to read config.toml.example");
     let result: Result<toml::Value, _> = toml::from_str(&content);
 
     assert!(
@@ -465,17 +452,31 @@ fn test_example_config_file_is_valid() {
 
     // Verify essential fields exist
     assert!(config.get("listen").is_some(), "listen field should exist");
-    assert!(config.get("upstream").is_some(), "upstream field should exist");
-    assert!(config.get("accounts").is_some(), "accounts field should exist");
+    assert!(
+        config.get("upstream").is_some(),
+        "upstream field should exist"
+    );
+    assert!(
+        config.get("accounts").is_some(),
+        "accounts field should exist"
+    );
 
     // Verify accounts is an array with at least one account
-    let accounts = config["accounts"].as_array().expect("accounts should be an array");
+    let accounts = config["accounts"]
+        .as_array()
+        .expect("accounts should be an array");
     assert!(!accounts.is_empty(), "accounts should not be empty");
 
     // Verify first account has required fields
     let first_account = &accounts[0];
-    assert!(first_account.get("name").is_some(), "account should have name");
-    assert!(first_account.get("token").is_some(), "account should have token");
+    assert!(
+        first_account.get("name").is_some(),
+        "account should have name"
+    );
+    assert!(
+        first_account.get("token").is_some(),
+        "account should have token"
+    );
 }
 
 #[test]
