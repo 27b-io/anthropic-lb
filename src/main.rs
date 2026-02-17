@@ -441,6 +441,10 @@ struct PersistedAccount {
     limit_tokens: Option<u64>,
     /// Absolute unix timestamp (secs) when hard limit expires
     hard_limited_until_epoch: Option<u64>,
+    /// Wall-clock epoch when this account's rate info was last updated.
+    /// Used by sync_from_redis "most recent wins" merge after restart.
+    #[serde(default)]
+    last_updated_epoch: Option<u64>,
 }
 
 impl AppState {
@@ -537,6 +541,7 @@ impl AppState {
                 limit_requests: info.limit_requests,
                 limit_tokens: info.limit_tokens,
                 hard_limited_until_epoch: hard_until_epoch,
+                last_updated_epoch: info.last_updated_epoch,
             });
         }
 
@@ -748,10 +753,9 @@ impl AppState {
                 }
 
                 info.last_updated = Some(now_instant);
-                // Use the persisted timestamp (not now) so sync_from_redis
-                // correctly treats this as stale data that can be overwritten
-                // by fresher Redis state from another replica.
-                info.last_updated_epoch = Some(persisted.saved_at);
+                // Prefer per-account epoch (accurate); fall back to global saved_at
+                // (correct for old state files without per-account timestamps).
+                info.last_updated_epoch = Some(pa.last_updated_epoch.unwrap_or(persisted.saved_at));
                 info!(
                     account = pa.name,
                     utilization = ?pa.utilization,
@@ -8977,6 +8981,8 @@ upstream = "https://api.anthropic.com"
             info.limit_requests = Some(200);
             info.limit_tokens = Some(100000);
             info.representative_claim = Some("five_hour".to_string());
+            // Set a known per-account epoch (older than now — simulates probe from 30s ago)
+            info.last_updated_epoch = Some(now_epoch - 30);
             info.claims_7d.insert(
                 "seven_day".to_string(),
                 ClaimWindowData {
@@ -9063,12 +9069,11 @@ upstream = "https://api.anthropic.com"
             );
             let claim = info.claims_7d.get("seven_day").unwrap();
             assert_eq!(claim.utilization, 0.70);
-            // last_updated_epoch should reflect saved_at, not now()
-            // (so sync_from_redis can correctly overwrite stale persisted data)
+            // last_updated_epoch should be the per-account value, not saved_at or now()
             assert_eq!(
                 info.last_updated_epoch,
-                Some(persisted.saved_at),
-                "last_updated_epoch should be saved_at, not now()"
+                Some(now_epoch - 30),
+                "last_updated_epoch should be the per-account persisted value"
             );
         }
 
