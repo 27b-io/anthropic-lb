@@ -251,7 +251,7 @@ impl BurnRate {
 }
 
 /// Default emergency brake threshold. When ALL accounts exceed this, non-operator traffic is blocked.
-const DEFAULT_EMERGENCY_THRESHOLD: f64 = 0.95;
+const DEFAULT_EMERGENCY_THRESHOLD: f64 = 0.88;
 
 /// Budget status thresholds for X-Budget-Status response header.
 const STATUS_HEALTHY_CEILING: f64 = 0.70;
@@ -813,21 +813,38 @@ fn model_family(model: &str) -> &str {
     }
 }
 
-/// Seven-day claim penalty threshold. Below this, no penalty applied.
-const CLAIM_PENALTY_THRESHOLD: f64 = 0.70;
-/// Quadratic penalty multiplier. Calibrated so 90% raw → ~1.033 effective (zero headroom).
-const CLAIM_PENALTY_MULTIPLIER: f64 = 3.33;
-
-/// Apply a quadratic penalty to seven-day utilization above the threshold.
-/// Five-hour windows are NOT penalized because they recover quickly.
-/// Penalty curve: 70%→0.70, 80%→0.833, 85%→0.925, 90%→1.033 (zero headroom).
-fn claim_penalty_7d(adj_7d: f64) -> f64 {
-    if adj_7d > CLAIM_PENALTY_THRESHOLD {
-        let excess = adj_7d - CLAIM_PENALTY_THRESHOLD;
-        adj_7d + excess * excess * CLAIM_PENALTY_MULTIPLIER
-    } else {
-        adj_7d
+fn resolve_7d_claim<'a>(info: &'a RateLimitInfo, model: &str) -> Option<&'a ClaimWindowData> {
+    if info.claims_7d.is_empty() {
+        return None;
     }
+    if model.is_empty() {
+        return None;
+    }
+    let family = model_family(model);
+    if !family.is_empty() {
+        let key = format!("seven_day_{}", family);
+        info.claims_7d
+            .get(&key)
+            .or_else(|| info.claims_7d.get("seven_day"))
+    } else {
+        info.claims_7d.get("seven_day")
+    }
+}
+
+const TOTAL_7D_SECS: f64 = 604800.0;
+const WASTE_RISK_MIN_REMAINING: u64 = 60;
+
+/// Compute waste risk: how much quota will be wasted if we don't route here.
+/// Higher = more urgency to use this account's remaining 7d budget.
+/// Returns 0.0 when reset data is unavailable or stale.
+fn waste_risk(util: f64, reset_epoch: Option<u64>, now_epoch: u64) -> f64 {
+    let reset = match reset_epoch {
+        Some(r) if r > now_epoch + WASTE_RISK_MIN_REMAINING => r,
+        _ => return 0.0,
+    };
+    let remaining_fraction = ((reset - now_epoch) as f64 / TOTAL_7D_SECS).max(0.001);
+    let unused = (1.0 - util).max(0.0);
+    (unused / remaining_fraction).min(10.0)
 }
 
 /// Map a rate-limit status string to a utilization floor.
@@ -909,8 +926,8 @@ fn time_adjusted_utilization(
 /// Returns (utilization, source_label) for logging/routing.
 ///
 /// Fallback chain:
-/// 1. Both windows adjusted → take max (most constrained wins), 7d penalized by claim_penalty_7d
-/// 2. Only one window → use it (the other is stale or absent), 7d penalized
+/// 1. Both windows adjusted → take max (most constrained wins)
+/// 2. Only one window → use it (the other is stale or absent)
 /// 3. Neither window → raw unified util, then legacy token ratio, then 0.5
 fn effective_utilization(info: &RateLimitInfo, now_epoch: u64, model: &str) -> (f64, &'static str) {
     // 5h window — always flat (no per-model sub-budgets from API)
@@ -925,17 +942,7 @@ fn effective_utilization(info: &RateLimitInfo, now_epoch: u64, model: &str) -> (
     // 7d window — model-aware lookup from claims_7d map
     let adj_7d = if !info.claims_7d.is_empty() {
         if !model.is_empty() {
-            // Model-specific: try "seven_day_{family}", fallback to "seven_day" (general)
-            let family = model_family(model);
-            let claim = if !family.is_empty() {
-                let specific_key = format!("seven_day_{}", family);
-                info.claims_7d
-                    .get(&specific_key)
-                    .or_else(|| info.claims_7d.get("seven_day"))
-            } else {
-                info.claims_7d.get("seven_day")
-            };
-            claim.and_then(|c| {
+            resolve_7d_claim(info, model).and_then(|c| {
                 time_adjusted_utilization(
                     Some(c.utilization),
                     c.reset,
@@ -943,7 +950,6 @@ fn effective_utilization(info: &RateLimitInfo, now_epoch: u64, model: &str) -> (
                     NEAR_RESET_7D_SECS,
                     now_epoch,
                 )
-                .map(claim_penalty_7d)
             })
         } else {
             // No model specified (emergency brake, stats) — worst-case across all claims
@@ -957,7 +963,6 @@ fn effective_utilization(info: &RateLimitInfo, now_epoch: u64, model: &str) -> (
                         NEAR_RESET_7D_SECS,
                         now_epoch,
                     )
-                    .map(claim_penalty_7d)
                 })
                 .reduce(f64::max)
         }
@@ -970,7 +975,6 @@ fn effective_utilization(info: &RateLimitInfo, now_epoch: u64, model: &str) -> (
             NEAR_RESET_7D_SECS,
             now_epoch,
         )
-        .map(claim_penalty_7d)
     };
 
     match (adj_5h, adj_7d) {
@@ -1002,10 +1006,16 @@ impl AppState {
         let now = Instant::now();
         let now_epoch = Self::now_epoch();
 
-        // Build candidate list: (index, headroom, utilization, source) for non-hard-limited, model-compatible accounts
-        let mut candidates: Vec<(usize, f64, f64, &str)> = Vec::new();
+        // Build candidate list with 5h gate and waste_risk for each account
+        struct Candidate<'a> {
+            idx: usize,
+            gate_5h: f64,
+            wr: f64,
+            weight: f64,
+            source: &'a str,
+        }
+        let mut candidates: Vec<Candidate> = Vec::new();
         for (i, acct) in self.accounts.iter().enumerate() {
-            // Skip accounts that don't serve this model
             if !acct.serves_model(model) {
                 trace!(
                     account = acct.name,
@@ -1017,48 +1027,83 @@ impl AppState {
 
             let info = acct.rate_info.read().await;
 
-            // Skip hard-limited accounts
             if let Some(until) = info.hard_limited_until {
                 if now < until {
-                    let remaining = until.duration_since(now);
                     trace!(
                         account = acct.name,
-                        hard_limited_secs = remaining.as_secs(),
+                        hard_limited_secs = until.duration_since(now).as_secs(),
                         "pick: skipping hard-limited account"
                     );
                     continue;
                 }
             }
 
-            // Compute effective utilization using the shared fallback chain.
-            // This includes claim_penalty_7d on the 7d window.
-            let (effective_util, source) = effective_utilization(&info, now_epoch, model);
+            // 5h gate: time-adjusted 5h utilization with status floors
+            let gate_5h = time_adjusted_utilization(
+                info.utilization_5h,
+                info.reset_5h,
+                info.status_5h.as_deref(),
+                NEAR_RESET_5H_SECS,
+                now_epoch,
+            )
+            .unwrap_or_else(|| {
+                // Fallback: raw unified, legacy, or unknown
+                if let Some(util) = info.utilization {
+                    util
+                } else if let Some(remaining) = info.remaining_tokens {
+                    let limit = info.limit_tokens.unwrap_or(1_000_000);
+                    1.0 - (remaining as f64 / limit as f64)
+                } else {
+                    0.5
+                }
+            });
 
-            // Headroom = available capacity. Rejected/exhausted accounts (util >= 1.0) get zero
-            // headroom so they receive no traffic even in all-exhausted degraded mode (Bug #5).
-            // Others are clamped to 0.01 minimum to avoid divide-by-zero and drain gracefully.
-            let headroom = if effective_util >= 1.0 {
-                0.0
+            // 7d waste risk from model-specific claim
+            let (wr, source) = if let Some(claim) = resolve_7d_claim(&info, model) {
+                // Skip if this model's 7d claim is rejected
+                if claim.status.as_deref() == Some("rejected") {
+                    trace!(
+                        account = acct.name,
+                        model = model,
+                        "pick: skipping, 7d claim rejected"
+                    );
+                    continue;
+                }
+                (
+                    waste_risk(claim.utilization, claim.reset, now_epoch),
+                    "waste_risk",
+                )
             } else {
-                (1.0 - effective_util).max(0.01)
+                (0.0, "headroom_only")
             };
+
+            // Weight: waste_risk dampened by 5h headroom
+            let headroom_5h = (1.0 - gate_5h).max(0.01);
+            let weight = if wr > 0.0 {
+                wr * headroom_5h
+            } else {
+                headroom_5h
+            };
+
+            // Zero weight for fully exhausted accounts
+            let weight = if gate_5h >= 1.0 { 0.0 } else { weight };
 
             trace!(
                 account = acct.name,
-                effective_util = format!("{:.4}", effective_util),
-                headroom = format!("{:.4}", headroom),
+                gate_5h = format!("{:.4}", gate_5h),
+                waste_risk = format!("{:.4}", wr),
+                weight = format!("{:.4}", weight),
                 source = source,
-                raw_5h = ?info.utilization_5h,
-                raw_7d = ?info.utilization_7d,
-                reset_5h = ?info.reset_5h,
-                reset_7d = ?info.reset_7d,
-                status_5h = ?info.status_5h,
-                status_7d = ?info.status_7d,
-                claim = ?info.representative_claim,
                 "pick: candidate"
             );
 
-            candidates.push((i, headroom, effective_util, source));
+            candidates.push(Candidate {
+                idx: i,
+                gate_5h,
+                wr,
+                weight,
+                source,
+            });
         }
 
         if candidates.is_empty() {
@@ -1066,38 +1111,29 @@ impl AppState {
             return None;
         }
 
-        // Soft-limit gate: exclude accounts with effective utilization above the ceiling.
-        // This is where status floors have their biggest effect — a "throttled" account gets
-        // floor=0.98 which exceeds soft_limit=0.90, so it's excluded without needing a hard 429.
-        // If ALL accounts exceed the ceiling, we fall through and use everyone (graceful degradation).
-        let healthy: Vec<(usize, f64, &str)> = candidates
-            .iter()
-            .filter(|(_, _, util, _)| *util < self.soft_limit)
-            .map(|(i, h, _, s)| (*i, *h, *s))
-            .collect();
-        let effective: Vec<(usize, f64, &str)> = if healthy.is_empty() {
-            candidates.iter().map(|(i, h, _, s)| (*i, *h, *s)).collect()
-        } else {
-            if healthy.len() < candidates.len() {
-                let excluded: Vec<&str> = candidates
-                    .iter()
-                    .filter(|(_, _, util, _)| *util >= self.soft_limit)
-                    .map(|(i, _, _, _)| self.accounts[*i].name.as_str())
-                    .collect();
-                debug!(
-                    soft_limit = self.soft_limit,
-                    excluded = ?excluded,
-                    "pick: soft-limited accounts excluded"
-                );
+        // Soft-limit gate: exclude accounts with 5h utilization above the ceiling.
+        let has_healthy = candidates.iter().any(|c| c.gate_5h < self.soft_limit);
+        let effective: Vec<&Candidate> = if has_healthy {
+            let excluded: Vec<&str> = candidates
+                .iter()
+                .filter(|c| c.gate_5h >= self.soft_limit)
+                .map(|c| self.accounts[c.idx].name.as_str())
+                .collect();
+            if !excluded.is_empty() {
+                debug!(soft_limit = self.soft_limit, excluded = ?excluded, "pick: soft-limited accounts excluded");
             }
-            healthy
+            candidates
+                .iter()
+                .filter(|c| c.gate_5h < self.soft_limit)
+                .collect()
+        } else {
+            candidates.iter().collect()
         };
 
-        // Total headroom across effective candidates.
-        // If zero (all rejected/exhausted), no account can serve traffic — return None.
-        let total_headroom: f64 = effective.iter().map(|(_, h, _)| h).sum();
-        if total_headroom <= 0.0 {
-            debug!("pick: all candidates exhausted (zero headroom)");
+        // Total weight. If zero (all exhausted), return None.
+        let total_weight: f64 = effective.iter().map(|c| c.weight).sum();
+        if total_weight <= 0.0 {
+            debug!("pick: all candidates exhausted (zero weight)");
             return None;
         }
 
@@ -1107,45 +1143,44 @@ impl AppState {
             key.hash(&mut hasher);
             (hasher.finish() % 10000) as f64
         } else {
-            // Fibonacci hash scatter for even distribution without affinity
             let counter = self.robin.fetch_add(1, Ordering::Relaxed) as u64;
             (counter.wrapping_mul(11400714819323198485) % 10000) as f64
         };
 
-        // Normalize position into [0, total_headroom)
-        let target = position / 10000.0 * total_headroom;
+        // Normalize position into [0, total_weight)
+        let target = position / 10000.0 * total_weight;
 
         // Walk weighted buckets
         let mut cumulative = 0.0;
-        for &(idx, headroom, source) in &effective {
-            cumulative += headroom;
+        for c in &effective {
+            cumulative += c.weight;
             if target < cumulative {
-                let util = candidates.iter().find(|(i, _, _, _)| *i == idx).unwrap().2;
                 debug!(
-                    account = self.accounts[idx].name,
-                    util = format!("{:.3}", util),
-                    headroom = format!("{:.3}", headroom),
-                    share = format!("{:.0}%", headroom / total_headroom * 100.0),
-                    source = source,
+                    account = self.accounts[c.idx].name,
+                    gate_5h = format!("{:.3}", c.gate_5h),
+                    waste_risk = format!("{:.3}", c.wr),
+                    weight = format!("{:.3}", c.weight),
+                    share = format!("{:.0}%", c.weight / total_weight * 100.0),
+                    source = c.source,
                     candidates = effective.len(),
                     affinity = affinity_key.unwrap_or("-"),
                     "pick: selected"
                 );
-                return Some(idx);
+                return Some(c.idx);
             }
         }
 
         // Floating-point edge case: pick last candidate
-        let &(idx, _, source) = effective.last().unwrap();
-        let util = candidates.iter().find(|(i, _, _, _)| *i == idx).unwrap().2;
+        let c = effective.last().unwrap();
         debug!(
-            account = self.accounts[idx].name,
-            util = format!("{:.3}", util),
-            source = source,
+            account = self.accounts[c.idx].name,
+            gate_5h = format!("{:.3}", c.gate_5h),
+            waste_risk = format!("{:.3}", c.wr),
+            source = c.source,
             affinity = affinity_key.unwrap_or("-"),
             "pick: selected (float edge)"
         );
-        Some(idx)
+        Some(c.idx)
     }
 
     /// Update rate limit info from response headers.
@@ -2647,6 +2682,7 @@ async fn stats_handler(
                     "utilization": v.utilization,
                     "reset": v.reset,
                     "status": v.status,
+                    "waste_risk": waste_risk(v.utilization, v.reset, now_epoch),
                 }))
             }).collect::<serde_json::Map<String, serde_json::Value>>(),
             "remaining_requests": info.remaining_requests,
@@ -5364,15 +5400,18 @@ data: {\"type\":\"message_stop\"}\n\n";
         let accounts = vec![acct_a, acct_b];
 
         // Set utilizations before building state
+        let now = AppState::now_epoch();
         {
             let mut info = accounts[0].rate_info.write().await;
             info.utilization = Some(0.30);
             info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now + 10000);
         }
         {
             let mut info = accounts[1].rate_info.write().await;
             info.utilization = Some(0.95);
             info.utilization_5h = Some(0.95);
+            info.reset_5h = Some(now + 10000);
         }
 
         let state = Arc::new(AppState {
@@ -6240,74 +6279,158 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
-    // ── Claim penalty tests ────────────────────────────────────────
+    // ── Waste risk tests ──────────────────────────────────────────
 
     #[test]
-    fn claim_penalty_at_zero() {
-        assert_eq!(claim_penalty_7d(0.0), 0.0);
+    fn waste_risk_normal() {
+        let now = 1_000_000u64;
+        let reset = now + 302400; // 3.5 days remaining (half of 7d)
+        let wr = waste_risk(0.40, Some(reset), now);
+        // unused=0.60, remaining_fraction=302400/604800=0.5, wr=0.60/0.5=1.2
+        assert!((wr - 1.2).abs() < 0.01, "expected ~1.2, got {wr}");
     }
 
     #[test]
-    fn claim_penalty_below_threshold() {
-        let result = claim_penalty_7d(0.60);
+    fn waste_risk_stale_reset() {
+        let now = 1_000_000u64;
+        let wr = waste_risk(0.40, Some(now - 100), now);
+        assert_eq!(wr, 0.0, "stale reset should return 0");
+    }
+
+    #[test]
+    fn waste_risk_no_reset() {
+        let wr = waste_risk(0.40, None, 1_000_000);
+        assert_eq!(wr, 0.0, "no reset should return 0");
+    }
+
+    #[test]
+    fn waste_risk_under_60s_remaining() {
+        let now = 1_000_000u64;
+        let wr = waste_risk(0.40, Some(now + 30), now);
+        assert_eq!(wr, 0.0, "<60s remaining should return 0");
+    }
+
+    #[test]
+    fn waste_risk_fully_utilized() {
+        let now = 1_000_000u64;
+        let wr = waste_risk(1.0, Some(now + 302400), now);
+        assert_eq!(wr, 0.0, "fully utilized should return 0");
+    }
+
+    #[test]
+    fn waste_risk_near_reset_urgency() {
+        let now = 1_000_000u64;
+        // 2 hours remaining, 50% unused — very urgent
+        let wr = waste_risk(0.50, Some(now + 7200), now);
+        // unused=0.50, remaining_fraction=7200/604800=0.0119, wr=0.50/0.0119=42→clamped to 10
+        assert_eq!(wr, 10.0, "near-reset high-unused should clamp to 10");
+    }
+
+    #[test]
+    fn waste_risk_clamped() {
+        let now = 1_000_000u64;
+        // 1 hour remaining, 90% unused
+        let wr = waste_risk(0.10, Some(now + 3600), now);
+        // unused=0.90, remaining_fraction=3600/604800≈0.00595, wr≈151→clamped to 10
+        assert_eq!(wr, 10.0, "should clamp to 10.0");
+    }
+
+    #[test]
+    fn waste_risk_boundary_at_60s() {
+        let now = 1_000_000u64;
+        // Exactly 60s remaining — guard is > 60, so should return 0
+        assert_eq!(waste_risk(0.40, Some(now + 60), now), 0.0);
+        // 61s remaining — just above boundary, should return non-zero
+        assert!(waste_risk(0.40, Some(now + 61), now) > 0.0);
+    }
+
+    #[test]
+    fn waste_risk_util_above_one() {
+        let now = 1_000_000u64;
+        // API can return util > 1.0; unused should clamp to 0
+        let wr = waste_risk(1.05, Some(now + 302400), now);
+        assert_eq!(wr, 0.0, "util > 1.0 should produce zero waste risk");
+    }
+
+    // ── resolve_7d_claim tests ────────────────────────────────────
+
+    #[test]
+    fn resolve_7d_claim_model_specific() {
+        let mut claims = HashMap::new();
+        claims.insert(
+            "seven_day_sonnet".to_string(),
+            ClaimWindowData {
+                utilization: 0.80,
+                reset: Some(1000000),
+                status: None,
+            },
+        );
+        claims.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.50,
+                reset: Some(1000000),
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            claims_7d: claims,
+            ..Default::default()
+        };
+        let claim = resolve_7d_claim(&info, "claude-sonnet-4-5-20250929").unwrap();
         assert!(
-            (result - 0.60).abs() < 0.001,
-            "below threshold: no penalty, got {result}"
+            (claim.utilization - 0.80).abs() < 0.001,
+            "should pick model-specific claim"
         );
     }
 
     #[test]
-    fn claim_penalty_at_threshold() {
-        let result = claim_penalty_7d(0.70);
+    fn resolve_7d_claim_fallback_general() {
+        let mut claims = HashMap::new();
+        claims.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.50,
+                reset: Some(1000000),
+                status: None,
+            },
+        );
+        let info = RateLimitInfo {
+            claims_7d: claims,
+            ..Default::default()
+        };
+        let claim = resolve_7d_claim(&info, "claude-sonnet-4-5-20250929").unwrap();
         assert!(
-            (result - 0.70).abs() < 0.001,
-            "at threshold: no penalty, got {result}"
+            (claim.utilization - 0.50).abs() < 0.001,
+            "should fall back to general"
         );
     }
 
     #[test]
-    fn claim_penalty_at_85() {
-        let result = claim_penalty_7d(0.85);
-        // excess = 0.15, penalty = 0.15^2 * 3.33 = 0.0225 * 3.33 = 0.074925
-        // total = 0.85 + 0.074925 = 0.924925
-        assert!(
-            (result - 0.925).abs() < 0.01,
-            "85% should map to ~0.925, got {result}"
-        );
+    fn resolve_7d_claim_empty_claims() {
+        let info = RateLimitInfo::default();
+        assert!(resolve_7d_claim(&info, "claude-sonnet-4-5-20250929").is_none());
     }
 
     #[test]
-    fn claim_penalty_at_90() {
-        let result = claim_penalty_7d(0.90);
-        // excess = 0.20, penalty = 0.04 * 3.33 = 0.1332
-        // total = 0.90 + 0.1332 = 1.0332
-        assert!(
-            result > 1.0,
-            "90% should map above 1.0 (zero headroom), got {result}"
+    fn resolve_7d_claim_empty_model() {
+        let mut claims = HashMap::new();
+        claims.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: 0.50,
+                reset: Some(1000000),
+                status: None,
+            },
         );
+        let info = RateLimitInfo {
+            claims_7d: claims,
+            ..Default::default()
+        };
         assert!(
-            (result - 1.033).abs() < 0.01,
-            "90% should map to ~1.033, got {result}"
+            resolve_7d_claim(&info, "").is_none(),
+            "empty model should return None"
         );
-    }
-
-    #[test]
-    fn claim_penalty_at_100() {
-        let result = claim_penalty_7d(1.0);
-        assert!(result.is_finite(), "100% should not produce NaN/inf");
-        // excess = 0.30, penalty = 0.09 * 3.33 = 0.2997
-        // total = 1.0 + 0.2997 = 1.2997
-        assert!(result > 1.0, "100% should be well above 1.0, got {result}");
-    }
-
-    #[test]
-    fn claim_penalty_5h_unaffected() {
-        // Values below threshold pass through as identity
-        assert_eq!(claim_penalty_7d(0.50), 0.50);
-        assert_eq!(claim_penalty_7d(0.69), 0.69);
-        // Boundary: just above threshold does get penalized
-        let penalized = claim_penalty_7d(0.90);
-        assert!(penalized > 0.90, "above threshold should be penalized");
     }
 
     // ── Client identity resolution tests ──────────────────────────
@@ -6445,13 +6568,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..Default::default()
         };
         let (util, source) = effective_utilization(&info, now_epoch, "");
-        // 7d at 0.80 → penalized to 0.833. Max(0.60, 0.833) = 0.833
+        // 7d at 0.80 (no penalty). Max(0.60, 0.80) = 0.80
         assert_eq!(source, "time_adjusted");
-        assert!(
-            util > 0.80,
-            "7d claim penalty should push above raw 0.80, got {util}"
-        );
-        assert!((util - 0.833).abs() < 0.01, "expected ~0.833, got {util}");
+        assert!((util - 0.80).abs() < 0.01, "expected ~0.80, got {util}");
     }
 
     #[tokio::test]
@@ -6569,7 +6688,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn model_specific_routing() {
-        // Sonnet 7d at 0.85 (penalized higher), Opus 7d at 0.10 → Opus sees low util
+        // Sonnet 7d at 0.85 (no penalty), Opus 7d at 0.10 → Opus sees low util
         let now_epoch = AppState::now_epoch();
         let mut claims_7d = HashMap::new();
         claims_7d.insert(
@@ -6597,12 +6716,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         let (util_sonnet, _) =
             effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
         let (util_opus, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
-        // Sonnet should be penalized above 0.85
+        // Sonnet 7d at 0.85 (max with 5h 0.30) = 0.85, Opus 7d at 0.10 (max with 5h 0.30) = 0.30
         assert!(
-            util_sonnet > 0.85,
-            "sonnet should be penalized: got {util_sonnet}"
+            (util_sonnet - 0.85).abs() < 0.01,
+            "sonnet should be 0.85: got {util_sonnet}"
         );
-        // Opus at 0.10 → below penalty threshold, should stay at ~0.30 (max with 5h)
+        // Opus at 0.10 → should stay at ~0.30 (max with 5h)
         assert!(util_opus < 0.35, "opus should be low: got {util_opus}");
         // The gap should be large — this is the whole point of per-claim routing
         assert!(
@@ -6674,8 +6793,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         let (util_sonnet, _) =
             effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
         assert!(
-            util_sonnet > 0.95,
-            "sonnet should be penalized: got {util_sonnet}"
+            (util_sonnet - 0.95).abs() < 0.01,
+            "sonnet should be 0.95: got {util_sonnet}"
         );
     }
 
@@ -6707,9 +6826,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..Default::default()
         };
         let (util, _) = effective_utilization(&info, now_epoch, "");
-        // Should pick sonnet's 0.95 (penalized even higher)
+        // Should pick sonnet's 0.95 (no penalty now)
         assert!(
-            util > 0.95,
+            (util - 0.95).abs() < 0.01,
             "emergency brake should use worst claim: got {util}"
         );
     }
@@ -6833,6 +6952,223 @@ data: {\"type\":\"message_stop\"}\n\n";
             "Opus should prefer A: A={}, B={}",
             opus_picks[0],
             opus_picks[1]
+        );
+    }
+
+    // ── pick_account waste_risk routing tests ─────────────────────
+
+    #[tokio::test]
+    async fn pick_account_prefers_expiring_quota() {
+        // Account A: 7d=0.40, reset in 1 day → high waste_risk
+        // Account B: 7d=0.40, reset in 6 days → low waste_risk
+        let acct_a = make_account("a", "sk-ant-api-a");
+        let acct_b = make_account("b", "sk-ant-api-b");
+        let state = test_state_with(vec![acct_a, acct_b]);
+        let now = AppState::now_epoch();
+
+        // Both 5h at 0.30
+        set_account_utilization(&state, 0, 0.30, 0.40, now + 10000, now + 86400).await;
+        set_account_utilization(&state, 1, 0.30, 0.40, now + 10000, now + 518400).await;
+
+        // Override claims with different resets
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.claims_7d.insert(
+                "seven_day_sonnet".to_string(),
+                ClaimWindowData {
+                    utilization: 0.40,
+                    reset: Some(now + 86400),
+                    status: None,
+                },
+            );
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.claims_7d.insert(
+                "seven_day_sonnet".to_string(),
+                ClaimWindowData {
+                    utilization: 0.40,
+                    reset: Some(now + 518400),
+                    status: None,
+                },
+            );
+        }
+
+        let mut picks = [0u32; 2];
+        for i in 0..200 {
+            let key = format!("client_{}", i);
+            if let Some(idx) = state
+                .pick_account(Some(&key), "claude-sonnet-4-5-20250929")
+                .await
+            {
+                picks[idx] += 1;
+            }
+        }
+        assert!(
+            picks[0] > picks[1] * 2,
+            "A (expiring) should get >2x traffic vs B: A={}, B={}",
+            picks[0],
+            picks[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_account_dampens_by_5h() {
+        // Account A: high waste_risk but high 5h → dampened
+        // Account B: lower waste_risk but low 5h → more traffic
+        let acct_a = make_account("a", "sk-ant-api-a");
+        let acct_b = make_account("b", "sk-ant-api-b");
+        let state = test_state_with(vec![acct_a, acct_b]);
+        let now = AppState::now_epoch();
+
+        // A: 5h=0.85, 7d=0.20 (waste_risk ~5.0 with 1.5d remaining)
+        set_account_utilization(&state, 0, 0.85, 0.20, now + 10000, now + 129600).await;
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.claims_7d.insert(
+                "seven_day_sonnet".to_string(),
+                ClaimWindowData {
+                    utilization: 0.20,
+                    reset: Some(now + 129600),
+                    status: None,
+                },
+            );
+        }
+
+        // B: 5h=0.30, 7d=0.50 (waste_risk ~1.2 with 3.5d remaining)
+        set_account_utilization(&state, 1, 0.30, 0.50, now + 10000, now + 302400).await;
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.claims_7d.insert(
+                "seven_day_sonnet".to_string(),
+                ClaimWindowData {
+                    utilization: 0.50,
+                    reset: Some(now + 302400),
+                    status: None,
+                },
+            );
+        }
+
+        let mut picks = [0u32; 2];
+        for i in 0..500 {
+            let key = format!("client_{}", i);
+            if let Some(idx) = state
+                .pick_account(Some(&key), "claude-sonnet-4-5-20250929")
+                .await
+            {
+                picks[idx] += 1;
+            }
+        }
+        // A: wr=0.80/0.2143=3.73, weight=3.73*0.15=0.56
+        // B: wr=0.50/0.50=1.0, weight=1.0*0.70=0.70
+        // B should get more (~55.6% share)
+        assert!(
+            picks[1] > picks[0],
+            "B (low 5h) should get more traffic: A={}, B={}",
+            picks[0],
+            picks[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_account_fallback_no_7d_data() {
+        // No 7d claims → falls back to headroom-only weighting
+        let acct_a = make_account("a", "sk-ant-api-a");
+        let acct_b = make_account("b", "sk-ant-api-b");
+        let state = test_state_with(vec![acct_a, acct_b]);
+        let now = AppState::now_epoch();
+
+        // Set 5h only, no claims_7d
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now + 10000);
+            info.utilization = Some(0.30);
+            info.claims_7d.clear();
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.70);
+            info.reset_5h = Some(now + 10000);
+            info.utilization = Some(0.70);
+            info.claims_7d.clear();
+        }
+
+        let mut picks = [0u32; 2];
+        for i in 0..200 {
+            let key = format!("client_{}", i);
+            if let Some(idx) = state
+                .pick_account(Some(&key), "claude-sonnet-4-5-20250929")
+                .await
+            {
+                picks[idx] += 1;
+            }
+        }
+        // A headroom=0.70, B headroom=0.30. A should get ~70% of traffic
+        assert!(
+            picks[0] > picks[1],
+            "A (lower 5h) should get more: A={}, B={}",
+            picks[0],
+            picks[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_brake_triggers_at_88() {
+        // All accounts at 88% raw 7d → brake engages with new threshold
+        let now = AppState::now_epoch();
+        let acct_a = make_account("a", "sk-ant-api-a");
+        let acct_b = make_account("b", "sk-ant-api-b");
+        let state = test_state_with(vec![acct_a, acct_b]);
+
+        // Verify DEFAULT_EMERGENCY_THRESHOLD is 0.88
+        assert!(
+            (DEFAULT_EMERGENCY_THRESHOLD - 0.88).abs() < 0.001,
+            "default emergency threshold should be 0.88"
+        );
+
+        set_account_utilization(&state, 0, 0.89, 0.89, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.89, 0.89, now + 10000, now + 100000).await;
+
+        // effective_utilization for both should be >= 0.88
+        let info0 = state.accounts[0].rate_info.read().await;
+        let (util0, _) = effective_utilization(&info0, now, "");
+        drop(info0);
+        assert!(
+            util0 >= DEFAULT_EMERGENCY_THRESHOLD,
+            "util should be >= threshold: {util0}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_account_all_7d_rejected_returns_none() {
+        // If all accounts have rejected 7d claims for the model, pick_account returns None
+        let acct_a = make_account("a", "sk-ant-api-a");
+        let acct_b = make_account("b", "sk-ant-api-b");
+        let state = test_state_with(vec![acct_a, acct_b]);
+        let now = AppState::now_epoch();
+
+        for idx in 0..2 {
+            let mut info = state.accounts[idx].rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now + 10000);
+            info.claims_7d.insert(
+                "seven_day_sonnet".to_string(),
+                ClaimWindowData {
+                    utilization: 1.0,
+                    reset: Some(now + 100000),
+                    status: Some("rejected".to_string()),
+                },
+            );
+        }
+
+        let result = state
+            .pick_account(Some("test"), "claude-sonnet-4-5-20250929")
+            .await;
+        assert!(
+            result.is_none(),
+            "all-rejected should return None, got {:?}",
+            result
         );
     }
 
@@ -7717,9 +8053,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
         });
-        // All accounts above emergency threshold — use 5h only to avoid
-        // claim_penalty_7d pushing effective_util above 1.0 (which would cause
-        // zero headroom in pick_account). 5h=0.96 > emergency threshold (0.95).
+        // All accounts above emergency threshold. 5h=0.96 > emergency threshold (0.88).
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.97, 0.0, now + 10000, now + 100000).await;
 
@@ -8135,26 +8469,6 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn claim_penalty_7d_threshold() {
-        // Below threshold: no penalty
-        assert_eq!(claim_penalty_7d(0.50), 0.50);
-        assert_eq!(claim_penalty_7d(0.70), 0.70);
-
-        // Above threshold: quadratic penalty applied
-        let result = claim_penalty_7d(0.80);
-        assert!(
-            result > 0.80,
-            "penalty should increase utilization above threshold"
-        );
-
-        let result = claim_penalty_7d(0.90);
-        assert!(
-            result > 1.0,
-            "high utilization should push above 1.0 with penalty"
-        );
-    }
-
-    #[test]
     fn time_adjusted_utilization_stale_data() {
         let now = 1000000u64;
         let reset_past = 999000u64; // Reset already happened
@@ -8313,8 +8627,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn effective_utilization_7d_penalty_applies() {
-        // 7d window above penalty threshold should be penalized
+    async fn effective_utilization_7d_no_penalty() {
+        // 7d window should pass through without penalty
         let now = AppState::now_epoch();
         let mut claims_7d = HashMap::new();
         claims_7d.insert(
@@ -8335,8 +8649,8 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         let (util, _) = effective_utilization(&info, now, "");
         assert!(
-            util > 0.85,
-            "7d window above 0.70 should have penalty applied"
+            (util - 0.85).abs() < 0.01,
+            "7d window should pass through at 0.85 without penalty: got {util}"
         );
     }
 
