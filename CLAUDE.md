@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo build                          # Debug build
 cargo build --release                # Release build (~6MB binary)
-cargo test                           # Run all 217 tests
+cargo test                           # Run all tests
 cargo test <test_name>               # Run a single test (e.g. cargo test pick_account_filters_by_model)
 cargo fmt --check                    # Format check (CI gate)
 RUSTFLAGS="-Dwarnings" cargo clippy --all-targets  # Lint (CI gate, warnings are errors)
@@ -22,7 +22,7 @@ Single-file Rust binary (`src/main.rs`, ~8500 lines) with inline tests. No libra
 
 ### Core Data Flow
 
-```
+```text
 Request → IP allowlist check → proxy_key auth → pre_request_gate(operator bypass → budget → utilization limit → emergency brake) → pick_account(model) → forward to upstream → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
 ```
 

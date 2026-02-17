@@ -418,7 +418,7 @@ redis_url = "redis://10.0.0.5:6379"
 
 **Key schema** (all keys auto-expire via TTL):
 
-```
+```text
 alb:budget:{client_id}:{epoch_day}  →  u64    (48h TTL)
 alb:hard:{account_name}             →  u64    (cooldown TTL)
 alb:rate:{account_name}             →  JSON   (reset-based TTL)
@@ -500,7 +500,7 @@ WantedBy=multi-user.target
 ## Testing
 
 ```bash
-# Run all tests (217 tests)
+# Run all tests
 cargo test
 
 # Lint gates (same as CI)

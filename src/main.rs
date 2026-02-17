@@ -748,7 +748,10 @@ impl AppState {
                 }
 
                 info.last_updated = Some(now_instant);
-                info.last_updated_epoch = Some(Self::now_epoch());
+                // Use the persisted timestamp (not now) so sync_from_redis
+                // correctly treats this as stale data that can be overwritten
+                // by fresher Redis state from another replica.
+                info.last_updated_epoch = Some(persisted.saved_at);
                 info!(
                     account = pa.name,
                     utilization = ?pa.utilization,
@@ -1530,6 +1533,7 @@ impl AppState {
         let redis = self.redis.as_ref()?;
         use redis::AsyncCommands;
         let mut conn = redis.clone();
+        let mut redis_ok = true;
 
         // Count active replicas via SCAN (non-blocking, unlike KEYS)
         let mut replicas = 0u64;
@@ -1551,32 +1555,43 @@ impl AppState {
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    warn!(error = %e, "redis SCAN failed in cluster_info");
+                    redis_ok = false;
+                    break;
+                }
             }
         }
 
         // Aggregate budget usage from Redis (batch MGET)
         let mut redis_budgets = serde_json::Map::new();
-        if !self.client_budgets.is_empty() {
+        if redis_ok && !self.client_budgets.is_empty() {
             let today = Self::now_epoch() / 86400;
             let client_ids: Vec<&String> = self.client_budgets.keys().collect();
             let budget_keys: Vec<String> = client_ids
                 .iter()
                 .map(|id| format!("alb:budget:{id}:{today}"))
                 .collect();
-            let values: Vec<Option<u64>> = conn.mget(&budget_keys).await.unwrap_or_default();
-            for (i, client_id) in client_ids.iter().enumerate() {
-                let used = values.get(i).copied().flatten().unwrap_or(0);
-                let limit = self.client_budgets[*client_id];
-                redis_budgets.insert(
-                    (*client_id).clone(),
-                    serde_json::json!({ "limit": limit, "used": used }),
-                );
+            match conn.mget::<_, Vec<Option<u64>>>(&budget_keys).await {
+                Ok(values) => {
+                    for (i, client_id) in client_ids.iter().enumerate() {
+                        let used = values.get(i).copied().flatten().unwrap_or(0);
+                        let limit = self.client_budgets[*client_id];
+                        redis_budgets.insert(
+                            (*client_id).clone(),
+                            serde_json::json!({ "limit": limit, "used": used }),
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "redis MGET failed for budget aggregation");
+                    redis_ok = false;
+                }
             }
         }
 
         Some(serde_json::json!({
-            "redis_connected": true,
+            "redis_connected": redis_ok,
             "replicas_seen": replicas,
             "budget_usage": redis_budgets,
         }))
@@ -9048,6 +9063,13 @@ upstream = "https://api.anthropic.com"
             );
             let claim = info.claims_7d.get("seven_day").unwrap();
             assert_eq!(claim.utilization, 0.70);
+            // last_updated_epoch should reflect saved_at, not now()
+            // (so sync_from_redis can correctly overwrite stale persisted data)
+            assert_eq!(
+                info.last_updated_epoch,
+                Some(persisted.saved_at),
+                "last_updated_epoch should be saved_at, not now()"
+            );
         }
 
         {
