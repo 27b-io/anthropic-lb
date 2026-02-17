@@ -67,6 +67,9 @@ struct Config {
     /// unless ALL accounts exceed it. Breaks client affinity stickiness on overloaded accounts.
     /// Default: 0.90.
     soft_limit: Option<f64>,
+    /// Redis/Valkey URL for distributed state. When set, budget enforcement and hard-limit
+    /// propagation use Redis for cross-replica coordination. None = local-only (single instance).
+    redis_url: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -99,6 +102,26 @@ struct ClaimWindowData {
     status: Option<String>,
 }
 
+/// Subset of RateLimitInfo for cross-replica sync via Redis.
+/// Excludes Instant-based fields (non-serializable) and hard_limited_until (synced separately).
+#[derive(Serialize, Deserialize)]
+struct RedisRateInfo {
+    utilization: Option<f64>,
+    utilization_5h: Option<f64>,
+    utilization_7d: Option<f64>,
+    reset_5h: Option<u64>,
+    reset_7d: Option<u64>,
+    status_5h: Option<String>,
+    status_7d: Option<String>,
+    claims_7d: HashMap<String, ClaimWindowData>,
+    representative_claim: Option<String>,
+    remaining_requests: Option<u64>,
+    remaining_tokens: Option<u64>,
+    limit_requests: Option<u64>,
+    limit_tokens: Option<u64>,
+    updated_at: u64,
+}
+
 #[derive(Default)]
 struct RateLimitInfo {
     remaining_requests: Option<u64>,
@@ -129,6 +152,8 @@ struct RateLimitInfo {
     hard_limited_until: Option<Instant>,
     #[allow(dead_code)]
     last_updated: Option<Instant>,
+    /// Wall-clock epoch of last update, for cross-replica age comparison.
+    last_updated_epoch: Option<u64>,
 }
 
 /// Exponentially weighted moving average with time-constant-based decay.
@@ -321,6 +346,10 @@ struct AppState {
     /// Utilization soft ceiling. Accounts above this are excluded from routing
     /// unless all candidates exceed it. Default: 0.90.
     soft_limit: f64,
+    /// Redis connection for distributed state. None = local-only (single instance).
+    redis: Option<redis::aio::ConnectionManager>,
+    /// Cached cluster info from Redis, updated by background sync task.
+    cluster_info_cache: Mutex<Option<serde_json::Value>>,
 }
 
 impl Account {
@@ -412,6 +441,10 @@ struct PersistedAccount {
     limit_tokens: Option<u64>,
     /// Absolute unix timestamp (secs) when hard limit expires
     hard_limited_until_epoch: Option<u64>,
+    /// Wall-clock epoch when this account's rate info was last updated.
+    /// Used by sync_from_redis "most recent wins" merge after restart.
+    #[serde(default)]
+    last_updated_epoch: Option<u64>,
 }
 
 impl AppState {
@@ -508,6 +541,7 @@ impl AppState {
                 limit_requests: info.limit_requests,
                 limit_tokens: info.limit_tokens,
                 hard_limited_until_epoch: hard_until_epoch,
+                last_updated_epoch: info.last_updated_epoch,
             });
         }
 
@@ -719,6 +753,9 @@ impl AppState {
                 }
 
                 info.last_updated = Some(now_instant);
+                // Prefer per-account epoch (accurate); fall back to global saved_at
+                // (correct for old state files without per-account timestamps).
+                info.last_updated_epoch = Some(pa.last_updated_epoch.unwrap_or(persisted.saved_at));
                 info!(
                     account = pa.name,
                     utilization = ?pa.utilization,
@@ -1286,6 +1323,7 @@ impl AppState {
             }
         }
         info.last_updated = Some(Instant::now());
+        info.last_updated_epoch = Some(Self::now_epoch());
 
         trace!(
             account = acct.name,
@@ -1302,6 +1340,48 @@ impl AppState {
             remaining_tokens = ?info.remaining_tokens,
             "rate info updated"
         );
+
+        // Fire-and-forget: publish rate info to Redis for cross-replica sync
+        if let Some(redis) = &self.redis {
+            let rate_data = RedisRateInfo {
+                utilization: info.utilization,
+                utilization_5h: info.utilization_5h,
+                utilization_7d: info.utilization_7d,
+                reset_5h: info.reset_5h,
+                reset_7d: info.reset_7d,
+                status_5h: info.status_5h.clone(),
+                status_7d: info.status_7d.clone(),
+                claims_7d: info.claims_7d.clone(),
+                representative_claim: info.representative_claim.clone(),
+                remaining_requests: info.remaining_requests,
+                remaining_tokens: info.remaining_tokens,
+                limit_requests: info.limit_requests,
+                limit_tokens: info.limit_tokens,
+                updated_at: Self::now_epoch(),
+            };
+            // Compute TTL from earliest reset timestamp
+            let now_epoch = Self::now_epoch();
+            let min_reset = info
+                .reset_5h
+                .into_iter()
+                .chain(info.claims_7d.values().filter_map(|c| c.reset))
+                .min();
+            let ttl = min_reset
+                .map(|r| r.saturating_sub(now_epoch).max(60))
+                .unwrap_or(3600); // default 1h if no reset known
+
+            let mut conn = redis.clone();
+            let key = format!("alb:rate:{}", acct.name);
+            tokio::spawn(async move {
+                if let Ok(json) = serde_json::to_string(&rate_data) {
+                    use redis::AsyncCommands;
+                    let result: redis::RedisResult<()> = conn.set_ex(&key, json, ttl).await;
+                    if let Err(e) = result {
+                        tracing::warn!(error = %e, "redis rate info write failed");
+                    }
+                }
+            });
+        }
     }
 
     /// Mark an account as hard rate-limited (got a 429).
@@ -1332,12 +1412,193 @@ impl AppState {
         info.remaining_requests = Some(0);
         info.remaining_tokens = Some(0);
         info.last_updated = Some(Instant::now());
+        info.last_updated_epoch = Some(Self::now_epoch());
 
         warn!(
             account = acct.name,
             cooldown_secs = cooldown.as_secs(),
             "account hard rate-limited (429), cooling down"
         );
+
+        // Propagate to Redis for cross-replica awareness
+        if let Some(redis) = &self.redis {
+            let mut conn = redis.clone();
+            let key = format!("alb:hard:{}", acct.name);
+            let until_epoch = Self::now_epoch()
+                + cooldown.as_secs()
+                + if cooldown.subsec_nanos() > 0 { 1 } else { 0 };
+            let ttl = cooldown.as_secs().max(1);
+            tokio::spawn(async move {
+                use redis::AsyncCommands;
+                let result: redis::RedisResult<()> = conn.set_ex(&key, until_epoch, ttl).await;
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "redis SETEX failed for hard-limit propagation");
+                }
+            });
+        }
+    }
+
+    /// Sync shared state from Redis: hard limits + rate info.
+    /// Called periodically by background task.
+    async fn sync_from_redis(&self) {
+        let redis = match &self.redis {
+            Some(r) => r,
+            None => return,
+        };
+        use redis::AsyncCommands;
+        let mut conn = redis.clone();
+        let now_epoch = Self::now_epoch();
+        let now_instant = Instant::now();
+
+        // 1. Sync hard limits (MGET for all accounts in one round-trip)
+        let hard_keys: Vec<String> = self
+            .accounts
+            .iter()
+            .map(|a| format!("alb:hard:{}", a.name))
+            .collect();
+
+        if let Ok(values) = conn.mget::<_, Vec<Option<u64>>>(&hard_keys).await {
+            for (i, val) in values.iter().enumerate() {
+                if let Some(until_epoch) = val {
+                    if *until_epoch > now_epoch {
+                        let remaining = Duration::from_secs(until_epoch - now_epoch);
+                        let until_instant = now_instant + remaining;
+                        let mut info = self.accounts[i].rate_info.write().await;
+                        let should_update = match info.hard_limited_until {
+                            Some(local_until) => until_instant > local_until,
+                            None => true,
+                        };
+                        if should_update {
+                            info.hard_limited_until = Some(until_instant);
+                            trace!(
+                                account = self.accounts[i].name,
+                                remaining_secs = remaining.as_secs(),
+                                "synced hard-limit from redis"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Sync rate info (MGET for all accounts in one round-trip)
+        let rate_keys: Vec<String> = self
+            .accounts
+            .iter()
+            .map(|a| format!("alb:rate:{}", a.name))
+            .collect();
+
+        if let Ok(values) = conn.mget::<_, Vec<Option<String>>>(&rate_keys).await {
+            for (i, val) in values.iter().enumerate() {
+                if let Some(json) = val {
+                    if let Ok(remote) = serde_json::from_str::<RedisRateInfo>(json) {
+                        let mut info = self.accounts[i].rate_info.write().await;
+                        // "Most recent wins": only apply remote data if it's newer
+                        // Both ages use wall-clock epoch to avoid mixed-clock-domain bugs
+                        let local_age = info
+                            .last_updated_epoch
+                            .map(|epoch| now_epoch.saturating_sub(epoch))
+                            .unwrap_or(u64::MAX);
+                        let remote_age = now_epoch.saturating_sub(remote.updated_at);
+                        if remote_age < local_age {
+                            info.utilization = remote.utilization;
+                            info.utilization_5h = remote.utilization_5h;
+                            info.utilization_7d = remote.utilization_7d;
+                            info.reset_5h = remote.reset_5h;
+                            info.reset_7d = remote.reset_7d;
+                            info.status_5h = remote.status_5h;
+                            info.status_7d = remote.status_7d;
+                            info.claims_7d = remote.claims_7d;
+                            info.representative_claim = remote.representative_claim;
+                            info.remaining_requests = remote.remaining_requests;
+                            info.remaining_tokens = remote.remaining_tokens;
+                            info.limit_requests = remote.limit_requests;
+                            info.limit_tokens = remote.limit_tokens;
+                            info.last_updated = Some(now_instant);
+                            info.last_updated_epoch = Some(remote.updated_at);
+                            trace!(
+                                account = self.accounts[i].name,
+                                remote_age,
+                                "synced rate info from redis"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Refresh cluster info cache for /_stats endpoint
+        let info = self.cluster_info().await;
+        if let Ok(mut cache) = self.cluster_info_cache.lock() {
+            *cache = info;
+        }
+    }
+    async fn cluster_info(&self) -> Option<serde_json::Value> {
+        let redis = self.redis.as_ref()?;
+        use redis::AsyncCommands;
+        let mut conn = redis.clone();
+        let mut redis_ok = true;
+
+        // Count active replicas via SCAN (non-blocking, unlike KEYS)
+        let mut replicas = 0u64;
+        let mut cursor: u64 = 0;
+        loop {
+            let result: redis::RedisResult<(u64, Vec<String>)> = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg("alb:heartbeat:*")
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut conn)
+                .await;
+            match result {
+                Ok((next_cursor, keys)) => {
+                    replicas += keys.len() as u64;
+                    cursor = next_cursor;
+                    if cursor == 0 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "redis SCAN failed in cluster_info");
+                    redis_ok = false;
+                    break;
+                }
+            }
+        }
+
+        // Aggregate budget usage from Redis (batch MGET)
+        let mut redis_budgets = serde_json::Map::new();
+        if redis_ok && !self.client_budgets.is_empty() {
+            let today = Self::now_epoch() / 86400;
+            let client_ids: Vec<&String> = self.client_budgets.keys().collect();
+            let budget_keys: Vec<String> = client_ids
+                .iter()
+                .map(|id| format!("alb:budget:{id}:{today}"))
+                .collect();
+            match conn.mget::<_, Vec<Option<u64>>>(&budget_keys).await {
+                Ok(values) => {
+                    for (i, client_id) in client_ids.iter().enumerate() {
+                        let used = values.get(i).copied().flatten().unwrap_or(0);
+                        let limit = self.client_budgets[*client_id];
+                        redis_budgets.insert(
+                            (*client_id).clone(),
+                            serde_json::json!({ "limit": limit, "used": used }),
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "redis MGET failed for budget aggregation");
+                    redis_ok = false;
+                }
+            }
+        }
+
+        Some(serde_json::json!({
+            "redis_connected": redis_ok,
+            "replicas_seen": replicas,
+            "budget_usage": redis_budgets,
+        }))
     }
 }
 
@@ -1472,12 +1733,29 @@ impl AppState {
     }
 
     /// Check if a client is within their daily token budget. Returns Ok(()) or Err with remaining.
-    fn check_budget(&self, client_id: &str) -> Result<(), u64> {
+    /// When Redis is available, checks the global counter; falls back to local on error.
+    async fn check_budget(&self, client_id: &str) -> Result<(), u64> {
         let limit = match self.client_budgets.get(client_id) {
             Some(&limit) => limit,
             None => return Ok(()), // no budget configured = unlimited
         };
         let today = Self::now_epoch() / 86400;
+
+        // Try Redis first for cross-replica budget enforcement
+        if let Some(redis) = &self.redis {
+            use redis::AsyncCommands;
+            let key = format!("alb:budget:{client_id}:{today}");
+            let mut conn = redis.clone();
+            match conn.get::<_, Option<u64>>(&key).await {
+                Ok(Some(used)) if used >= limit => return Err(0),
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    warn!(error = %e, "redis budget check failed, falling back to local");
+                }
+            }
+        }
+
+        // Local fallback
         if let Ok(map) = self.budget_usage.lock() {
             if let Some(&(day, used)) = map.get(client_id) {
                 if day == today && used >= limit {
@@ -1489,17 +1767,44 @@ impl AppState {
     }
 
     /// Record tokens against a client's daily budget.
+    /// Updates local state synchronously; writes to Redis asynchronously (fire-and-forget).
     fn record_budget_usage(&self, client_id: &str, tokens: u64) {
         if tokens == 0 || !self.client_budgets.contains_key(client_id) {
             return;
         }
         let today = Self::now_epoch() / 86400;
+
+        // Always update local state (for stats + fallback)
         if let Ok(mut map) = self.budget_usage.lock() {
             let entry = map.entry(client_id.to_string()).or_insert((today, 0));
             if entry.0 != today {
                 *entry = (today, 0); // reset on new day
             }
             entry.1 += tokens;
+        }
+
+        // Fire-and-forget Redis INCRBY for cross-replica budget tracking
+        if let Some(redis) = &self.redis {
+            let mut conn = redis.clone();
+            let key = format!("alb:budget:{client_id}:{today}");
+            tokio::spawn(async move {
+                use redis::AsyncCommands;
+                let result: redis::RedisResult<u64> = conn.incr(&key, tokens).await;
+                match result {
+                    Ok(_) => {
+                        // Always set TTL (idempotent, O(1)) — avoids orphaned keys
+                        // if a previous EXPIRE was missed
+                        let expire_result: redis::RedisResult<bool> =
+                            conn.expire(&key, 172800).await;
+                        if let Err(e) = expire_result {
+                            tracing::warn!(error = %e, "redis EXPIRE failed for budget key");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "redis INCRBY failed for budget tracking");
+                    }
+                }
+            });
         }
     }
 
@@ -1589,7 +1894,7 @@ impl AppState {
         }
 
         // 1. Daily token budget (existing)
-        if client_id != "-" && self.check_budget(client_id).is_err() {
+        if client_id != "-" && self.check_budget(client_id).await.is_err() {
             warn!(client_id = %client_id, "rejected: daily token budget exceeded");
             return Err(
                 (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response(),
@@ -2498,15 +2803,24 @@ async fn stats_handler(
         serde_json::Value::Object(obj)
     };
 
-    axum::Json(serde_json::json!({
+    // Cluster info (when Redis is available)
+    // Read from cache (updated by background sync task) to avoid .await in handler
+    let cluster: Option<serde_json::Value> =
+        state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
+
+    let mut response = serde_json::json!({
         "accounts": out,
         "upstreams": upstream_stats,
         "client_usage": client_usage,
         "client_budgets": budgets,
         "aggregate": aggregate,
         "strategy": "dynamic-capacity",
-    }))
-    .into_response()
+    });
+    if let Some(cluster_info) = cluster {
+        response["cluster"] = cluster_info;
+    }
+
+    axum::Json(response).into_response()
 }
 
 // ── OpenAI compatibility ─────────────────────────────────────────────
@@ -3356,6 +3670,33 @@ async fn main() {
         None
     };
 
+    // Set up Redis connection for distributed state (if configured)
+    let redis = if let Some(ref url) = config.redis_url {
+        match redis::Client::open(url.as_str()) {
+            Ok(client) => {
+                let mgr_config = redis::aio::ConnectionManagerConfig::new()
+                    .set_response_timeout(Some(Duration::from_secs(2)))
+                    .set_connection_timeout(Some(Duration::from_secs(5)));
+                match client.get_connection_manager_with_config(mgr_config).await {
+                    Ok(mgr) => {
+                        info!("redis connected for distributed state");
+                        Some(mgr)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "redis connection failed — running in local-only mode");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "invalid redis_url — running in local-only mode");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         client: Client::builder()
             .timeout(Duration::from_secs(600))
@@ -3382,6 +3723,8 @@ async fn main() {
             .unwrap_or(DEFAULT_EMERGENCY_THRESHOLD),
         client_request_rates: Mutex::new(HashMap::new()),
         soft_limit: config.soft_limit.unwrap_or(0.90),
+        redis,
+        cluster_info_cache: Mutex::new(None),
     });
 
     if state.auto_cache {
@@ -3453,6 +3796,33 @@ async fn main() {
                 }
                 probe_cycle = probe_cycle.wrapping_add(1);
                 tokio::time::sleep(Duration::from_secs(probe_interval)).await;
+            }
+        });
+    }
+
+    // Spawn Redis state sync + heartbeat task (if Redis configured)
+    if state.redis.is_some() {
+        let sync_state = state.clone();
+        let instance_id: u64 = {
+            use std::collections::hash_map::RandomState;
+            use std::hash::{BuildHasher, Hasher};
+            RandomState::new().build_hasher().finish()
+        };
+        tokio::spawn(async move {
+            // Wait for initial startup to complete
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            info!("starting redis state sync (5s interval)");
+            loop {
+                sync_state.sync_from_redis().await;
+                // Heartbeat: register this instance
+                if let Some(redis) = &sync_state.redis {
+                    use redis::AsyncCommands;
+                    let mut conn = redis.clone();
+                    let key = format!("alb:heartbeat:{instance_id}");
+                    let _: redis::RedisResult<()> =
+                        conn.set_ex(&key, AppState::now_epoch(), 30u64).await;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
     }
@@ -3530,6 +3900,8 @@ mod tests {
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         })
     }
 
@@ -3608,6 +3980,8 @@ mod tests {
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
 
         (build_router(state.clone()), state)
@@ -3693,6 +4067,8 @@ mod tests {
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -4469,6 +4845,8 @@ mod tests {
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
 
         let app = Router::new()
@@ -5021,6 +5399,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 0.90,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
 
         // Try many affinity keys — all should route to healthy (idx 0)
@@ -5037,14 +5417,14 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     // ── Unit: per-client budget ────────────────────────────────────
 
-    #[test]
-    fn budget_check_no_limit_configured() {
+    #[tokio::test]
+    async fn budget_check_no_limit_configured() {
         let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
-        assert!(state.check_budget("any-client").is_ok());
+        assert!(state.check_budget("any-client").await.is_ok());
     }
 
-    #[test]
-    fn budget_check_within_limit() {
+    #[tokio::test]
+    async fn budget_check_within_limit() {
         let mut budgets = HashMap::new();
         budgets.insert("client-a".to_string(), 1000u64);
         let state = Arc::new(AppState {
@@ -5071,21 +5451,23 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
 
         // Within budget
-        assert!(state.check_budget("client-a").is_ok());
+        assert!(state.check_budget("client-a").await.is_ok());
 
         // Record some usage
         state.record_budget_usage("client-a", 500);
-        assert!(state.check_budget("client-a").is_ok());
+        assert!(state.check_budget("client-a").await.is_ok());
 
         // Exceed budget
         state.record_budget_usage("client-a", 600);
-        assert!(state.check_budget("client-a").is_err());
+        assert!(state.check_budget("client-a").await.is_err());
 
         // Unknown client has no budget, always ok
-        assert!(state.check_budget("unknown").is_ok());
+        assert!(state.check_budget("unknown").await.is_ok());
     }
 
     // ── Integration: 5xx retry ─────────────────────────────────────
@@ -5571,6 +5953,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 0.90, // Key: not 1.0 — throttled (0.98) will be excluded
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         {
             let mut info = state.accounts[0].rate_info.write().await;
@@ -5956,6 +6340,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
 
         // Header overrides IP mapping (supports multiple clients per IP)
@@ -6016,6 +6402,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
 
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -6545,6 +6933,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.60, 0.50, now + 10000, now + 100000).await;
@@ -6586,6 +6976,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
@@ -6628,6 +7020,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -6672,6 +7066,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
         // Operator bypasses everything
@@ -6713,6 +7109,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         // Request for "claude-opus" — no account serves it → should pass
         assert!(
@@ -6777,6 +7175,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
         assert!(state.is_emergency_brake_active().await);
@@ -6846,6 +7246,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: 0.80, // custom low threshold
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         set_account_utilization(&state, 0, 0.85, 0.70, now + 10000, now + 100000).await;
         assert!(
@@ -6880,6 +7282,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         // "-" is not the operator
         assert!(!state.is_operator("-"));
@@ -6949,6 +7353,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         // Operator always gets "healthy" regardless of utilization
         assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
@@ -6985,6 +7391,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         // gastown has limit 0.85, 80% of that = 0.68
         // At 0.60, below 0.68 → no upgrade → "healthy"
@@ -7197,6 +7605,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         // Set utilization above client's limit (0.80 > 0.50)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -7251,6 +7661,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         // Set utilization below client's limit (0.50 < 0.90)
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -7302,6 +7714,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         // All accounts above emergency threshold — use 5h only to avoid
         // claim_penalty_7d pushing effective_util above 1.0 (which would cause
@@ -7363,6 +7777,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         // All accounts above emergency threshold — 5h only (avoid claim penalty on 7d)
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -7419,6 +7835,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
 
@@ -7470,6 +7888,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
 
@@ -7572,6 +7992,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
 
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
@@ -7636,6 +8058,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
 
         let status = compute_pressure_status(0.99, "operator-id", &state);
@@ -7680,6 +8104,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
 
         // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
@@ -8012,6 +8438,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
         });
 
         assert!(state.is_operator("special-operator"));
@@ -8022,5 +8450,738 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn is_operator_returns_false_when_no_operator_configured() {
         let state = test_state_with(vec![]);
         assert!(!state.is_operator("any-client"));
+    }
+
+    // ── Redis distributed state tests ──────────────────────────────────
+
+    #[tokio::test]
+    async fn cluster_info_returns_none_without_redis() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        assert!(state.cluster_info().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_from_redis_noop_without_redis() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        // Should not panic or error when redis is None
+        state.sync_from_redis().await;
+        // Cluster cache should remain None
+        assert!(state.cluster_info_cache.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn budget_local_fallback_without_redis() {
+        let mut budgets = HashMap::new();
+        budgets.insert("client-a".to_string(), 100u64);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: budgets,
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+        });
+
+        // Budget check uses local path when redis is None
+        assert!(state.check_budget("client-a").await.is_ok());
+        state.record_budget_usage("client-a", 80);
+        assert!(state.check_budget("client-a").await.is_ok());
+        state.record_budget_usage("client-a", 30);
+        assert!(state.check_budget("client-a").await.is_err());
+    }
+
+    #[test]
+    fn redis_rate_info_serialization_roundtrip() {
+        let mut claims = HashMap::new();
+        claims.insert(
+            "claude-sonnet-4-20250514".to_string(),
+            ClaimWindowData {
+                utilization: 0.42,
+                reset: Some(1700000000),
+                status: Some("active".to_string()),
+            },
+        );
+
+        let info = RedisRateInfo {
+            utilization: Some(0.5),
+            utilization_5h: Some(0.3),
+            utilization_7d: Some(0.6),
+            reset_5h: Some(1700000000),
+            reset_7d: Some(1700500000),
+            status_5h: Some("active".to_string()),
+            status_7d: Some("active".to_string()),
+            claims_7d: claims,
+            representative_claim: Some("five_hour".to_string()),
+            remaining_requests: Some(100),
+            remaining_tokens: Some(50000),
+            limit_requests: Some(200),
+            limit_tokens: Some(100000),
+            updated_at: 1700000000,
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: RedisRateInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(info.utilization, deserialized.utilization);
+        assert_eq!(info.utilization_5h, deserialized.utilization_5h);
+        assert_eq!(info.utilization_7d, deserialized.utilization_7d);
+        assert_eq!(info.reset_5h, deserialized.reset_5h);
+        assert_eq!(info.reset_7d, deserialized.reset_7d);
+        assert_eq!(info.updated_at, deserialized.updated_at);
+        assert_eq!(info.claims_7d.len(), deserialized.claims_7d.len());
+        let claim = deserialized
+            .claims_7d
+            .get("claude-sonnet-4-20250514")
+            .unwrap();
+        assert_eq!(claim.utilization, 0.42);
+        assert_eq!(claim.reset, Some(1700000000));
+    }
+
+    #[test]
+    fn redis_rate_info_empty_fields() {
+        let info = RedisRateInfo {
+            utilization: None,
+            utilization_5h: None,
+            utilization_7d: None,
+            reset_5h: None,
+            reset_7d: None,
+            status_5h: None,
+            status_7d: None,
+            claims_7d: HashMap::new(),
+            representative_claim: None,
+            remaining_requests: None,
+            remaining_tokens: None,
+            limit_requests: None,
+            limit_tokens: None,
+            updated_at: 0,
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: RedisRateInfo = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.utilization.is_none());
+        assert!(deserialized.claims_7d.is_empty());
+        assert_eq!(deserialized.updated_at, 0);
+    }
+
+    #[tokio::test]
+    async fn hard_limit_unchanged_by_sync_without_redis() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+
+        // Set a local hard limit
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.hard_limited_until = Some(Instant::now() + Duration::from_secs(30));
+        }
+
+        // sync_from_redis should not touch it when redis is None
+        state.sync_from_redis().await;
+
+        let info = state.accounts[0].rate_info.read().await;
+        assert!(info.hard_limited_until.is_some());
+    }
+
+    #[test]
+    fn record_budget_usage_skips_zero_tokens() {
+        let mut budgets = HashMap::new();
+        budgets.insert("client-a".to_string(), 100u64);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: budgets,
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+        });
+
+        // Recording 0 tokens should be a no-op
+        state.record_budget_usage("client-a", 0);
+        let map = state.budget_usage.lock().unwrap();
+        assert!(map.get("client-a").is_none());
+    }
+
+    #[test]
+    fn record_budget_usage_skips_unknown_client() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        // No budgets configured — recording should be a no-op
+        state.record_budget_usage("unknown-client", 500);
+        let map = state.budget_usage.lock().unwrap();
+        assert!(map.is_empty());
+    }
+
+    // ── Config deserialization (real struct, not toml::Value) ─────
+
+    #[test]
+    fn config_deser_minimal() {
+        let toml = r#"
+listen = "127.0.0.1:8082"
+upstream = "https://api.anthropic.com"
+
+[[accounts]]
+name = "primary"
+token = "sk-ant-api-test"
+"#;
+        let cfg: Config = toml::from_str(toml).expect("minimal config should deserialize");
+        assert_eq!(cfg.listen, "127.0.0.1:8082");
+        assert_eq!(cfg.upstream, "https://api.anthropic.com");
+        assert_eq!(cfg.accounts.len(), 1);
+        assert_eq!(cfg.accounts[0].name, "primary");
+        // Optional fields absent
+        assert!(cfg.proxy_key.is_none());
+        assert!(cfg.redis_url.is_none());
+        assert!(cfg.operator.is_none());
+        assert!(cfg.emergency_threshold.is_none());
+        assert!(cfg.soft_limit.is_none());
+        assert!(cfg.client_budgets.is_empty());
+        assert!(cfg.client_utilization_limits.is_empty());
+        assert!(cfg.client_names.is_empty());
+        assert!(cfg.upstreams.is_empty());
+    }
+
+    #[test]
+    fn config_deser_all_optional_fields() {
+        let toml = r#"
+listen = "0.0.0.0:8082"
+upstream = "https://api.anthropic.com"
+strategy = "dynamic-capacity"
+rate_limit_cooldown_secs = 120
+probe_interval_secs = 600
+proxy_key = "secret"
+allowed_ips = ["10.0.0.0/8", "192.168.1.1"]
+auto_cache = false
+shadow_log = "/tmp/shadow.jsonl"
+operator = "ray"
+emergency_threshold = 0.90
+soft_limit = 0.85
+redis_url = "redis://10.0.0.5:6379"
+
+[client_names]
+"10.0.0.1" = "alice"
+"10.0.0.2" = "bob"
+
+[client_budgets]
+alice = 1000000
+bob = 500000
+
+[client_utilization_limits]
+alice = 0.95
+bob = 0.80
+
+[[accounts]]
+name = "acct-a"
+token = "sk-ant-oat01-token1"
+
+[[accounts]]
+name = "acct-b"
+token = "sk-ant-api-token2"
+models = ["claude-opus-*", "claude-sonnet-4-20250514"]
+
+[[upstreams]]
+name = "openai"
+base_url = "https://api.openai.com"
+api_key = "sk-openai-key"
+"#;
+        let cfg: Config = toml::from_str(toml).expect("full config should deserialize");
+        assert_eq!(cfg.proxy_key.as_deref(), Some("secret"));
+        assert_eq!(cfg.allowed_ips.as_ref().unwrap().len(), 2);
+        assert_eq!(cfg.auto_cache, Some(false));
+        assert_eq!(cfg.shadow_log.as_deref(), Some("/tmp/shadow.jsonl"));
+        assert_eq!(cfg.operator.as_deref(), Some("ray"));
+        assert_eq!(cfg.emergency_threshold, Some(0.90));
+        assert_eq!(cfg.soft_limit, Some(0.85));
+        assert_eq!(cfg.redis_url.as_deref(), Some("redis://10.0.0.5:6379"));
+        assert_eq!(cfg.rate_limit_cooldown_secs, Some(120));
+        assert_eq!(cfg.probe_interval_secs, Some(600));
+        // Maps
+        assert_eq!(cfg.client_names.get("10.0.0.1").unwrap(), "alice");
+        assert_eq!(*cfg.client_budgets.get("alice").unwrap(), 1000000u64);
+        assert_eq!(*cfg.client_utilization_limits.get("alice").unwrap(), 0.95);
+        // Accounts
+        assert_eq!(cfg.accounts.len(), 2);
+        assert_eq!(cfg.accounts[1].models.len(), 2);
+        assert_eq!(cfg.accounts[1].models[0], "claude-opus-*");
+        // Upstreams
+        assert_eq!(cfg.upstreams.len(), 1);
+        assert_eq!(cfg.upstreams[0].name, "openai");
+    }
+
+    #[test]
+    fn config_deser_missing_required_field_fails() {
+        // Missing `upstream`
+        let toml = r#"
+listen = "127.0.0.1:8082"
+
+[[accounts]]
+name = "test"
+token = "sk-ant-api-test"
+"#;
+        let result = toml::from_str::<Config>(toml);
+        assert!(
+            result.is_err(),
+            "missing upstream should fail deserialization"
+        );
+    }
+
+    #[test]
+    fn config_deser_missing_accounts_fails() {
+        let toml = r#"
+listen = "127.0.0.1:8082"
+upstream = "https://api.anthropic.com"
+"#;
+        let result = toml::from_str::<Config>(toml);
+        assert!(
+            result.is_err(),
+            "missing accounts should fail deserialization"
+        );
+    }
+
+    // ── Rate info merge: "most recent wins" ─────────────────────
+
+    #[tokio::test]
+    async fn rate_info_merge_remote_newer_wins() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let now_epoch = AppState::now_epoch();
+
+        // Set local rate info with an older timestamp
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.last_updated_epoch = Some(now_epoch - 60); // 60s ago
+        }
+
+        // Simulate remote data that's newer (10s ago)
+        let remote = RedisRateInfo {
+            utilization: Some(0.80),
+            utilization_5h: Some(0.75),
+            utilization_7d: Some(0.60),
+            reset_5h: Some(now_epoch + 3600),
+            reset_7d: Some(now_epoch + 86400),
+            status_5h: Some("allowed_warning".to_string()),
+            status_7d: Some("allowed".to_string()),
+            claims_7d: HashMap::new(),
+            representative_claim: Some("five_hour".to_string()),
+            remaining_requests: Some(50),
+            remaining_tokens: Some(25000),
+            limit_requests: Some(200),
+            limit_tokens: Some(100000),
+            updated_at: now_epoch - 10, // 10s ago — newer than local
+        };
+
+        // Apply same merge logic as sync_from_redis
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            let local_age = info
+                .last_updated_epoch
+                .map(|epoch| now_epoch.saturating_sub(epoch))
+                .unwrap_or(u64::MAX);
+            let remote_age = now_epoch.saturating_sub(remote.updated_at);
+            assert!(
+                remote_age < local_age,
+                "remote ({}s) should be newer than local ({}s)",
+                remote_age,
+                local_age
+            );
+            // Remote wins — apply
+            info.utilization_5h = remote.utilization_5h;
+            info.last_updated_epoch = Some(remote.updated_at);
+        }
+
+        let info = state.accounts[0].rate_info.read().await;
+        assert_eq!(info.utilization_5h, Some(0.75));
+        assert_eq!(info.last_updated_epoch, Some(now_epoch - 10));
+    }
+
+    #[tokio::test]
+    async fn rate_info_merge_local_newer_preserved() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let now_epoch = AppState::now_epoch();
+
+        // Set local rate info with a recent timestamp (5s ago)
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.last_updated_epoch = Some(now_epoch - 5);
+        }
+
+        // Remote data is older (120s ago)
+        let remote = RedisRateInfo {
+            utilization: Some(0.80),
+            utilization_5h: Some(0.75),
+            utilization_7d: None,
+            reset_5h: None,
+            reset_7d: None,
+            status_5h: None,
+            status_7d: None,
+            claims_7d: HashMap::new(),
+            representative_claim: None,
+            remaining_requests: None,
+            remaining_tokens: None,
+            limit_requests: None,
+            limit_tokens: None,
+            updated_at: now_epoch - 120, // 120s ago — older than local
+        };
+
+        // Apply same merge logic as sync_from_redis
+        {
+            let info = state.accounts[0].rate_info.read().await;
+            let local_age = info
+                .last_updated_epoch
+                .map(|epoch| now_epoch.saturating_sub(epoch))
+                .unwrap_or(u64::MAX);
+            let remote_age = now_epoch.saturating_sub(remote.updated_at);
+            assert!(
+                remote_age >= local_age,
+                "local ({}s) should be newer than remote ({}s)",
+                local_age,
+                remote_age
+            );
+            // Local wins — do NOT apply remote
+        }
+
+        let info = state.accounts[0].rate_info.read().await;
+        assert_eq!(
+            info.utilization_5h,
+            Some(0.30),
+            "local data should be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_info_merge_no_local_epoch_remote_wins() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let now_epoch = AppState::now_epoch();
+
+        // Local has no last_updated_epoch (fresh state)
+        {
+            let info = state.accounts[0].rate_info.read().await;
+            assert!(info.last_updated_epoch.is_none());
+        }
+
+        let remote = RedisRateInfo {
+            utilization: Some(0.50),
+            utilization_5h: Some(0.40),
+            utilization_7d: None,
+            reset_5h: None,
+            reset_7d: None,
+            status_5h: None,
+            status_7d: None,
+            claims_7d: HashMap::new(),
+            representative_claim: None,
+            remaining_requests: None,
+            remaining_tokens: None,
+            limit_requests: None,
+            limit_tokens: None,
+            updated_at: now_epoch - 30,
+        };
+
+        // When local has no epoch, local_age = u64::MAX, so remote always wins
+        {
+            let info = state.accounts[0].rate_info.read().await;
+            let local_age = info
+                .last_updated_epoch
+                .map(|epoch| now_epoch.saturating_sub(epoch))
+                .unwrap_or(u64::MAX);
+            let remote_age = now_epoch.saturating_sub(remote.updated_at);
+            assert!(
+                remote_age < local_age,
+                "remote should win when local has no epoch"
+            );
+        }
+    }
+
+    // ── State persistence round-trip ─────────────────────────────
+
+    #[tokio::test]
+    async fn state_persistence_roundtrip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let state_path = PathBuf::from(tmp.path());
+
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![
+                make_account("primary", "sk-ant-api-aaa"),
+                make_account("secondary", "sk-ant-api-bbb"),
+            ],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: state_path.clone(),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+        });
+
+        // Set up some state to persist
+        let now_epoch = AppState::now_epoch();
+        state.accounts[0].requests.store(42, Ordering::Relaxed);
+        state.accounts[1].requests.store(17, Ordering::Relaxed);
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.65);
+            info.utilization_5h = Some(0.50);
+            info.utilization_7d = Some(0.70);
+            info.reset_5h = Some(now_epoch + 18000); // future
+            info.reset_7d = Some(now_epoch + 604800);
+            info.status_5h = Some("allowed_warning".to_string());
+            info.remaining_requests = Some(100);
+            info.remaining_tokens = Some(50000);
+            info.limit_requests = Some(200);
+            info.limit_tokens = Some(100000);
+            info.representative_claim = Some("five_hour".to_string());
+            // Set a known per-account epoch (older than now — simulates probe from 30s ago)
+            info.last_updated_epoch = Some(now_epoch - 30);
+            info.claims_7d.insert(
+                "seven_day".to_string(),
+                ClaimWindowData {
+                    utilization: 0.70,
+                    reset: Some(now_epoch + 604800),
+                    status: Some("allowed".to_string()),
+                },
+            );
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.20);
+            info.reset_5h = Some(now_epoch + 18000);
+            // hard-limit 60s from now
+            info.hard_limited_until = Some(Instant::now() + Duration::from_secs(60));
+        }
+
+        // Save state
+        state.save_state().await;
+
+        // Verify file exists and is valid JSON
+        let data = tokio::fs::read_to_string(&state_path).await.unwrap();
+        let persisted: PersistedState = serde_json::from_str(&data).unwrap();
+        assert_eq!(persisted.accounts.len(), 2);
+        assert_eq!(persisted.accounts[0].requests_total, 42);
+        assert_eq!(persisted.accounts[1].requests_total, 17);
+        assert!(persisted.saved_at > 0);
+
+        // Create a fresh state and load into it
+        let state2 = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![
+                make_account("primary", "sk-ant-api-aaa"),
+                make_account("secondary", "sk-ant-api-bbb"),
+            ],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path,
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+        });
+
+        // Load state
+        state2.load_state().await;
+
+        // Verify fields survived the round-trip
+        assert_eq!(
+            state2.accounts[0].requests.load(Ordering::Relaxed),
+            42,
+            "request count should persist"
+        );
+        assert_eq!(state2.accounts[1].requests.load(Ordering::Relaxed), 17);
+
+        {
+            let info = state2.accounts[0].rate_info.read().await;
+            assert_eq!(info.utilization, Some(0.65));
+            assert_eq!(info.utilization_5h, Some(0.50));
+            assert_eq!(info.remaining_requests, Some(100));
+            assert_eq!(info.remaining_tokens, Some(50000));
+            assert_eq!(info.limit_requests, Some(200));
+            assert_eq!(info.limit_tokens, Some(100000));
+            assert_eq!(info.representative_claim.as_deref(), Some("five_hour"));
+            assert!(
+                !info.claims_7d.is_empty(),
+                "claims_7d should survive round-trip"
+            );
+            let claim = info.claims_7d.get("seven_day").unwrap();
+            assert_eq!(claim.utilization, 0.70);
+            // last_updated_epoch should be the per-account value, not saved_at or now()
+            assert_eq!(
+                info.last_updated_epoch,
+                Some(now_epoch - 30),
+                "last_updated_epoch should be the per-account persisted value"
+            );
+        }
+
+        {
+            let info = state2.accounts[1].rate_info.read().await;
+            assert_eq!(info.utilization_5h, Some(0.20));
+            // Hard limit should have been restored (future epoch)
+            assert!(
+                info.hard_limited_until.is_some(),
+                "hard_limited_until should survive round-trip"
+            );
+        }
+    }
+
+    // ── Budget day rollover ──────────────────────────────────────
+
+    #[test]
+    fn budget_day_rollover_resets_counter() {
+        let mut budgets = HashMap::new();
+        budgets.insert("client-a".to_string(), 10000u64);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: budgets,
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+        });
+
+        // Pre-populate with yesterday's usage (high usage that would exceed budget)
+        let yesterday = AppState::now_epoch() / 86400 - 1;
+        {
+            let mut map = state.budget_usage.lock().unwrap();
+            map.insert("client-a".to_string(), (yesterday, 9500));
+        }
+
+        // Recording usage today should reset the counter (day rollover)
+        state.record_budget_usage("client-a", 50);
+
+        let map = state.budget_usage.lock().unwrap();
+        let (day, used) = map.get("client-a").unwrap();
+        let today = AppState::now_epoch() / 86400;
+        assert_eq!(*day, today, "day should be today after rollover");
+        assert_eq!(*used, 50, "usage should be 50 (reset, not 9550)");
+    }
+
+    #[tokio::test]
+    async fn budget_check_respects_day_boundary() {
+        let mut budgets = HashMap::new();
+        budgets.insert("client-a".to_string(), 1000u64);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("a", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: budgets,
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operator: None,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+        });
+
+        // Pre-populate with yesterday's exhausted budget
+        let yesterday = AppState::now_epoch() / 86400 - 1;
+        {
+            let mut map = state.budget_usage.lock().unwrap();
+            map.insert("client-a".to_string(), (yesterday, 5000));
+        }
+
+        // Budget check for today should pass — yesterday's usage doesn't count
+        assert!(
+            state.check_budget("client-a").await.is_ok(),
+            "yesterday's exhausted budget should not block today"
+        );
     }
 }

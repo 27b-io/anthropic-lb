@@ -508,3 +508,56 @@ token = "sk-ant-api-test"
     assert_eq!(config["emergency_threshold"].as_float().unwrap(), 0.0);
     assert_eq!(config["soft_limit"].as_float().unwrap(), 1.0);
 }
+
+#[test]
+fn test_config_with_redis_url() {
+    let config_content = r#"
+listen = "127.0.0.1:8082"
+upstream = "https://api.anthropic.com"
+redis_url = "redis://10.0.0.5:6379"
+
+[[accounts]]
+name = "test"
+token = "sk-ant-api-test"
+"#;
+
+    let temp_file = create_temp_config(config_content);
+    let path = temp_file.path();
+
+    let content = fs::read_to_string(path).expect("Failed to read config file");
+    let result: Result<toml::Value, _> = toml::from_str(&content);
+
+    assert!(result.is_ok(), "Config with redis_url should parse");
+
+    let config = result.unwrap();
+    assert_eq!(
+        config["redis_url"].as_str().unwrap(),
+        "redis://10.0.0.5:6379"
+    );
+}
+
+#[test]
+fn test_config_without_redis_url() {
+    let config_content = r#"
+listen = "127.0.0.1:8082"
+upstream = "https://api.anthropic.com"
+
+[[accounts]]
+name = "test"
+token = "sk-ant-api-test"
+"#;
+
+    let temp_file = create_temp_config(config_content);
+    let path = temp_file.path();
+
+    let content = fs::read_to_string(path).expect("Failed to read config file");
+    let result: Result<toml::Value, _> = toml::from_str(&content);
+
+    assert!(result.is_ok(), "Config without redis_url should parse");
+
+    let config = result.unwrap();
+    assert!(
+        config.get("redis_url").is_none(),
+        "redis_url should be absent when not configured"
+    );
+}

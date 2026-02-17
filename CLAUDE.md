@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo build                          # Debug build
 cargo build --release                # Release build (~6MB binary)
-cargo test                           # Run all 62 tests
+cargo test                           # Run all tests
 cargo test <test_name>               # Run a single test (e.g. cargo test pick_account_filters_by_model)
 cargo fmt --check                    # Format check (CI gate)
 RUSTFLAGS="-Dwarnings" cargo clippy --all-targets  # Lint (CI gate, warnings are errors)
@@ -18,12 +18,12 @@ Run the proxy: `./target/release/anthropic-lb config.toml`
 
 ## Architecture
 
-Single-file Rust binary (`src/main.rs`, ~4000 lines) with inline tests. No library crate — everything lives in one file with section markers.
+Single-file Rust binary (`src/main.rs`, ~8500 lines) with inline tests. No library crate — everything lives in one file with section markers.
 
 ### Core Data Flow
 
-```
-Request → IP allowlist check → proxy_key auth → budget check → pick_account(model) → forward to upstream → parse rate-limit headers → extract token usage → shadow log → persist state
+```text
+Request → IP allowlist check → proxy_key auth → pre_request_gate(operator bypass → budget → utilization limit → emergency brake) → pick_account(model) → forward to upstream → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
 ```
 
 ### Key Sections (in source order)
@@ -31,8 +31,8 @@ Request → IP allowlist check → proxy_key auth → budget check → pick_acco
 | Section | What it does |
 |---------|-------------|
 | **Config** (`Config`, `AccountConfig`, `UpstreamConfig`) | TOML deserialization structs |
-| **Runtime state** (`AppState`, `Account`, `RateLimitInfo`) | Shared via `Arc<AppState>`, per-account `RwLock<RateLimitInfo>`, atomic counters |
-| **Persistence** (`PersistedState`) | JSON state file at `<config_path>.state.json`, saved after every request and on shutdown |
+| **Runtime state** (`AppState`, `Account`, `RateLimitInfo`) | Shared via `Arc<AppState>`, per-account `RwLock<RateLimitInfo>`, atomic counters, optional Redis `ConnectionManager` |
+| **Persistence** (`PersistedState`) | JSON state file at `<config_path>.state.json`, saved after every request and on shutdown. Redis for cross-replica state when configured. |
 | **Token usage** (`TokenUsage`, `record_usage`) | Extracts token counts from responses (streaming SSE + non-streaming JSON), tracks per-account and per-client |
 | **Auto-cache** (`inject_cache_breakpoints`) | Injects up to 3 prompt cache breakpoints (last tool, system, last user message) unless cache_control already present |
 | **Handlers** | Four axum handlers: `proxy_handler` (main Anthropic proxy), `upstream_handler` (OpenAI-compatible passthrough), `stats_handler` (`/_stats` JSON), `openai_chat_handler` (OpenAI→Anthropic format translation) |
@@ -68,8 +68,13 @@ Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. R
 | `allowed_ips` | string[]? | none (allow all) | IP/CIDR allowlist |
 | `auto_cache` | bool? | true | Auto-inject prompt cache breakpoints |
 | `shadow_log` | string? | none | Path for JSONL audit trail |
+| `soft_limit` | f64? | 0.90 | Utilization ceiling — accounts above excluded from routing |
 | `client_names` | map? | {} | IP→client name mapping |
 | `client_budgets` | map? | {} | client_id→daily token limit |
+| `client_utilization_limits` | map? | {} | client_id→utilization ceiling (0.0–1.0) |
+| `operator` | string? | none | Client ID that bypasses all enforcement |
+| `emergency_threshold` | f64? | 0.95 | All-accounts utilization threshold for emergency brake |
+| `redis_url` | string? | none | Redis/Valkey URL for distributed state (`redis://` or `rediss://`) |
 | `accounts[].name` | string | required | Account display name |
 | `accounts[].token` | string | required | API key, OAuth token, or `"passthrough"` |
 | `accounts[].models` | string[]? | [] (all) | Model allowlist (supports `*` suffix wildcards) |
