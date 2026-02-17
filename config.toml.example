@@ -27,6 +27,11 @@ probe_interval_secs = 300
 # is automatically blocked. Default: 0.95.
 # emergency_threshold = 0.95
 
+# Redis/Valkey URL for distributed state (multi-replica coordination).
+# When set, budget enforcement and hard-limit propagation use Redis for cross-replica sync.
+# Omit for single-instance deployments (local-only state).
+# redis_url = "redis://10.0.0.5:6379"
+
 # "passthrough" = forward caller's auth headers as-is (for OpenClaw managed tokens)
 # Any other value = inject as the account's own token
 # OAuth tokens (sk-ant-oat*) are injected as Authorization: Bearer
