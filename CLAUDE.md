@@ -41,12 +41,14 @@ Request → IP allowlist check → proxy_key auth → pre_request_gate(operator 
 
 ### Account Selection (`pick_account`)
 
-Headroom-proportional weighted bucket hashing:
+Waste-risk-weighted bucket hashing:
 1. Filter by model compatibility (if account has `models` allowlist)
-2. Skip hard-limited (429) accounts
-3. Each remaining account gets a bucket proportional to `(1.0 - utilization)`
-4. Affinity key (client+session hash) provides sticky routing; no-affinity uses Fibonacci scatter
-5. Retries on 429 (marks hard-limited) and 5xx/529 (rotates without marking)
+2. Skip hard-limited (429) accounts and accounts with rejected 7d claims for the model
+3. Compute 5h gate (time-adjusted utilization with status floors) and 7d waste_risk (unused quota / remaining time fraction)
+4. Bucket weight = `waste_risk × (1 - gate_5h)`, falls back to pure 5h headroom when no 7d data
+5. Soft-limit gates on 5h utilization only
+6. Affinity key (client+session hash) provides sticky routing; no-affinity uses Fibonacci scatter
+7. Retries on 429 (marks hard-limited) and 5xx/529 (rotates without marking)
 
 ### Token Type Detection (by prefix)
 
@@ -73,7 +75,7 @@ Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. R
 | `client_budgets` | map? | {} | client_id→daily token limit |
 | `client_utilization_limits` | map? | {} | client_id→utilization ceiling (0.0–1.0) |
 | `operator` | string? | none | Client ID that bypasses all enforcement |
-| `emergency_threshold` | f64? | 0.95 | All-accounts utilization threshold for emergency brake |
+| `emergency_threshold` | f64? | 0.88 | All-accounts utilization threshold for emergency brake |
 | `redis_url` | string? | none | Redis/Valkey URL for distributed state (`redis://` or `rediss://`) |
 | `accounts[].name` | string | required | Account display name |
 | `accounts[].token` | string | required | API key, OAuth token, or `"passthrough"` |

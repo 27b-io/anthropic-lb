@@ -118,8 +118,8 @@ probe_interval_secs = 300
 # operator = "ray"
 
 # Emergency brake — auto-block non-operator traffic when all accounts
-# exceed this threshold. Default: 0.95
-# emergency_threshold = 0.95
+# exceed this threshold. Default: 0.88
+# emergency_threshold = 0.88
 
 # Redis/Valkey for distributed state across replicas (optional)
 # Supports redis:// (plaintext) and rediss:// (TLS)
@@ -157,7 +157,7 @@ token = "sk-ant-api03-..."
 | `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
 | `client_utilization_limits` | `{name: f64}` | `{}` | Per-client utilization ceiling (0.0–1.0) |
 | `operator` | `String?` | `None` | Client ID that bypasses all enforcement |
-| `emergency_threshold` | `f64` | `0.95` | Utilization threshold for emergency brake |
+| `emergency_threshold` | `f64` | `0.88` | Utilization threshold for emergency brake |
 | `redis_url` | `String?` | `None` | Redis/Valkey URL for distributed state |
 | `accounts[].name` | `String` | — | Display name for the account |
 | `accounts[].token` | `String` | — | API key or `"passthrough"` |
@@ -354,10 +354,10 @@ Requests to `/upstream/openrouter/v1/chat/completions` are forwarded to `https:/
    d. Emergency brake (503 if all accounts above emergency_threshold)
 4. Extract model from request body
 5. Filter accounts by model allowlist
-6. Compute time-adjusted utilization per claim window (5h, 7d per model)
-7. Apply status floors (warning ≥ 0.80, throttled ≥ 0.98, rejected = 1.0)
-8. Exclude accounts above soft_limit utilization ceiling
-9. Pick account via headroom-proportional weighted bucket hashing (client affinity)
+6. Compute 5h gate utilization (time-adjusted with status floors)
+7. Compute 7d waste risk per model (unused quota / remaining time fraction)
+8. Exclude accounts above soft_limit on 5h utilization
+9. Pick account via waste-risk-weighted bucket hashing (dampened by 5h headroom, client affinity)
 10. Inject auth token + auto-cache header
 11. Forward request to upstream Anthropic API
 12. If 429 → mark rate-limited (propagate to Redis), retry with next account
