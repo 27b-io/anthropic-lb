@@ -114,8 +114,8 @@ probe_interval_secs = 300
 # "gastown" = 0.85
 # "openclaw" = 0.95
 
-# Operator — bypasses all budget, utilization, and emergency checks
-# operator = "ray"
+# Operators — bypass all budget, utilization, and emergency checks
+# operators = ["ray", "openclaw", "claude"]
 
 # Emergency brake — auto-block non-operator traffic when all accounts
 # exceed this threshold. Default: 0.95
@@ -156,7 +156,7 @@ token = "sk-ant-api03-..."
 | `client_names` | `{IP: name}` | `{}` | IP → client ID mapping |
 | `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
 | `client_utilization_limits` | `{name: f64}` | `{}` | Per-client utilization ceiling (0.0–1.0) |
-| `operator` | `String?` | `None` | Client ID that bypasses all enforcement |
+| `operators` | `Vec<String>` | `[]` | Client IDs that bypass all enforcement |
 | `emergency_threshold` | `f64` | `0.95` | Utilization threshold for emergency brake |
 | `redis_url` | `String?` | `None` | Redis/Valkey URL for distributed state |
 | `accounts[].name` | `String` | — | Display name for the account |
@@ -249,6 +249,11 @@ IP check runs first, then proxy key. Both apply to all endpoints including `/_st
 
 > [!WARNING]
 > With no `proxy_key` and no `allowed_ips`, the proxy is **open to all**. This is fine behind Tailscale or on localhost, but never expose an open proxy to the internet.
+
+### Known Limitations
+
+- **Client ID spoofing**: `x-client-id` header takes priority over IP-based `client_names` mapping. Any authenticated client can claim any identity, including operator names. This is acceptable because all clients are already inside the trust boundary (IP allowlist + proxy key). If you expose the proxy to untrusted networks, invert the priority in `resolve_client_id()`.
+- **Emergency brake is model-blind**: The brake evaluates worst-case utilization across all model claims. If sonnet is exhausted but haiku has headroom, the brake blocks all traffic including haiku. This is intentional fail-safe behavior.
 
 ---
 

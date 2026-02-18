@@ -57,9 +57,10 @@ struct Config {
     /// Client gets 429 when ALL model-compatible accounts exceed their limit.
     #[serde(default)]
     client_utilization_limits: HashMap<String, f64>,
-    /// Client ID of the operator — bypasses all budget/ceiling/emergency checks.
+    /// Client IDs that bypass all budget/ceiling/emergency checks.
     /// Must be resolvable via client_names IP mapping (not spoofable via header).
-    operator: Option<String>,
+    #[serde(default)]
+    operators: Vec<String>,
     /// Emergency brake threshold (0.0-1.0). When ALL accounts exceed this,
     /// non-operator traffic is blocked. Default: 0.95.
     emergency_threshold: Option<f64>,
@@ -337,8 +338,8 @@ struct AppState {
     budget_usage: Mutex<HashMap<String, (u64, u64)>>,
     /// Per-client utilization limits: client_id → max effective utilization.
     client_utilization_limits: HashMap<String, f64>,
-    /// Operator client ID — never throttled by budgets, ceilings, or emergency brake.
-    operator: Option<String>,
+    /// Operator client IDs — never throttled by budgets, ceilings, or emergency brake.
+    operators: Vec<String>,
     /// Emergency brake threshold. Default: 0.95.
     emergency_threshold: f64,
     /// Per-client request tracking: client_id → (total_requests, rate_ewma)
@@ -1808,9 +1809,9 @@ impl AppState {
         }
     }
 
-    /// Check if client_id is the operator.
+    /// Check if client_id is an operator.
     fn is_operator(&self, client_id: &str) -> bool {
-        self.operator.as_deref() == Some(client_id)
+        self.operators.iter().any(|op| op == client_id)
     }
 
     /// Check if all model-compatible accounts exceed this client's utilization limit.
@@ -3549,10 +3550,10 @@ async fn main() {
             "client_utilization_limits.{client}: must be 0.0-1.0, got {limit}"
         );
     }
-    if let Some(ref op) = config.operator {
+    for op in &config.operators {
         assert!(
             op != "-",
-            "operator cannot be '-' (the unknown-client sentinel)"
+            "operators cannot contain '-' (the unknown-client sentinel)"
         );
     }
     if let Some(thresh) = config.emergency_threshold {
@@ -3717,7 +3718,7 @@ async fn main() {
         client_budgets: config.client_budgets.clone(),
         budget_usage: Mutex::new(HashMap::new()),
         client_utilization_limits: config.client_utilization_limits.clone(),
-        operator: config.operator.clone(),
+        operators: config.operators.clone(),
         emergency_threshold: config
             .emergency_threshold
             .unwrap_or(DEFAULT_EMERGENCY_THRESHOLD),
@@ -3896,7 +3897,7 @@ mod tests {
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -3976,7 +3977,7 @@ mod tests {
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -4063,7 +4064,7 @@ mod tests {
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -4841,7 +4842,7 @@ mod tests {
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -5395,7 +5396,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 0.90,
@@ -5447,7 +5448,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: budgets,
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -5949,7 +5950,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 0.90, // Key: not 1.0 — throttled (0.98) will be excluded
@@ -6336,7 +6337,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -6398,7 +6399,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: Some("ray".to_string()),
+            operators: vec!["ray".to_string()],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -6929,7 +6930,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -6972,7 +6973,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7016,7 +7017,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7062,7 +7063,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operator: Some("ray".to_string()),
+            operators: vec!["ray".to_string()],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7105,7 +7106,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7171,7 +7172,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operator: Some("ray".to_string()),
+            operators: vec!["ray".to_string()],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7242,7 +7243,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: 0.80, // custom low threshold
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7278,7 +7279,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: Some("ray".to_string()),
+            operators: vec!["ray".to_string()],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7349,7 +7350,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: Some("ray".to_string()),
+            operators: vec!["ray".to_string()],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7387,7 +7388,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7601,7 +7602,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7657,7 +7658,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7710,7 +7711,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: Some("ray".to_string()),
+            operators: vec!["ray".to_string()],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7773,7 +7774,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: Some("ray".to_string()),
+            operators: vec!["ray".to_string()],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7831,7 +7832,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7884,7 +7885,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -7988,7 +7989,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -8054,7 +8055,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: Some("operator-id".to_string()),
+            operators: vec!["operator-id".to_string()],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -8100,7 +8101,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -8434,7 +8435,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: Some("special-operator".to_string()),
+            operators: vec!["special-operator".to_string()],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -8450,6 +8451,43 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn is_operator_returns_false_when_no_operator_configured() {
         let state = test_state_with(vec![]);
         assert!(!state.is_operator("any-client"));
+    }
+
+    #[test]
+    fn is_operator_supports_multiple_operators() {
+        let state = Arc::new(AppState {
+            client: Client::new(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operators: vec![
+                "ray".to_string(),
+                "openclaw".to_string(),
+                "claude".to_string(),
+            ],
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+        });
+        assert!(state.is_operator("ray"));
+        assert!(state.is_operator("openclaw"));
+        assert!(state.is_operator("claude"));
+        assert!(!state.is_operator("gastown"));
+        assert!(!state.is_operator("-"));
     }
 
     // ── Redis distributed state tests ──────────────────────────────────
@@ -8493,7 +8531,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: budgets,
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -8623,7 +8661,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client_budgets: budgets,
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -8666,7 +8704,7 @@ token = "sk-ant-api-test"
         // Optional fields absent
         assert!(cfg.proxy_key.is_none());
         assert!(cfg.redis_url.is_none());
-        assert!(cfg.operator.is_none());
+        assert!(cfg.operators.is_empty());
         assert!(cfg.emergency_threshold.is_none());
         assert!(cfg.soft_limit.is_none());
         assert!(cfg.client_budgets.is_empty());
@@ -8687,7 +8725,7 @@ proxy_key = "secret"
 allowed_ips = ["10.0.0.0/8", "192.168.1.1"]
 auto_cache = false
 shadow_log = "/tmp/shadow.jsonl"
-operator = "ray"
+operators = ["ray", "openclaw"]
 emergency_threshold = 0.90
 soft_limit = 0.85
 redis_url = "redis://10.0.0.5:6379"
@@ -8723,7 +8761,7 @@ api_key = "sk-openai-key"
         assert_eq!(cfg.allowed_ips.as_ref().unwrap().len(), 2);
         assert_eq!(cfg.auto_cache, Some(false));
         assert_eq!(cfg.shadow_log.as_deref(), Some("/tmp/shadow.jsonl"));
-        assert_eq!(cfg.operator.as_deref(), Some("ray"));
+        assert_eq!(cfg.operators, vec!["ray", "openclaw"]);
         assert_eq!(cfg.emergency_threshold, Some(0.90));
         assert_eq!(cfg.soft_limit, Some(0.85));
         assert_eq!(cfg.redis_url.as_deref(), Some("redis://10.0.0.5:6379"));
@@ -8956,7 +8994,7 @@ upstream = "https://api.anthropic.com"
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -9035,7 +9073,7 @@ upstream = "https://api.anthropic.com"
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -9114,7 +9152,7 @@ upstream = "https://api.anthropic.com"
             client_budgets: budgets,
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
@@ -9163,7 +9201,7 @@ upstream = "https://api.anthropic.com"
             client_budgets: budgets,
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
-            operator: None,
+            operators: vec![],
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
