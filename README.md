@@ -118,8 +118,8 @@ probe_interval_secs = 300
 # operators = ["ray", "openclaw", "claude"]
 
 # Emergency brake — auto-block non-operator traffic when all accounts
-# exceed this threshold. Default: 0.95
-# emergency_threshold = 0.95
+# exceed this threshold. Default: 0.88
+# emergency_threshold = 0.88
 
 # Redis/Valkey for distributed state across replicas (optional)
 # Supports redis:// (plaintext) and rediss:// (TLS)

@@ -62,7 +62,7 @@ struct Config {
     #[serde(default)]
     operators: Vec<String>,
     /// Emergency brake threshold (0.0-1.0). When ALL accounts exceed this,
-    /// non-operator traffic is blocked. Default: 0.95.
+    /// non-operator traffic is blocked. Default: 0.88.
     emergency_threshold: Option<f64>,
     /// Utilization soft ceiling (0.0–1.0). Accounts above this are excluded from routing
     /// unless ALL accounts exceed it. Breaks client affinity stickiness on overloaded accounts.
@@ -340,7 +340,7 @@ struct AppState {
     client_utilization_limits: HashMap<String, f64>,
     /// Operator client IDs — never throttled by budgets, ceilings, or emergency brake.
     operators: Vec<String>,
-    /// Emergency brake threshold. Default: 0.95.
+    /// Emergency brake threshold. Default: 0.88.
     emergency_threshold: f64,
     /// Per-client request tracking: client_id → (total_requests, rate_ewma)
     client_request_rates: Mutex<HashMap<String, (u64, Ewma)>>,
@@ -988,7 +988,10 @@ fn effective_utilization(info: &RateLimitInfo, now_epoch: u64, model: &str) -> (
                 (util, "unified")
             } else if let Some(remaining) = info.remaining_tokens {
                 let limit = info.limit_tokens.unwrap_or(1_000_000);
-                (1.0 - (remaining as f64 / limit as f64), "legacy")
+                (
+                    (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0),
+                    "legacy",
+                )
             } else {
                 (0.5, "unknown")
             }
