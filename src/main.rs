@@ -842,7 +842,7 @@ fn waste_risk(util: f64, reset_epoch: Option<u64>, now_epoch: u64) -> f64 {
         Some(r) if r > now_epoch + WASTE_RISK_MIN_REMAINING => r,
         _ => return 0.0,
     };
-    let remaining_fraction = ((reset - now_epoch) as f64 / TOTAL_7D_SECS).max(0.001);
+    let remaining_fraction = (reset - now_epoch) as f64 / TOTAL_7D_SECS;
     let unused = (1.0 - util).max(0.0);
     (unused / remaining_fraction).min(10.0)
 }
@@ -1052,7 +1052,7 @@ impl AppState {
                     util
                 } else if let Some(remaining) = info.remaining_tokens {
                     let limit = info.limit_tokens.unwrap_or(1_000_000);
-                    1.0 - (remaining as f64 / limit as f64)
+                    (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
                 } else {
                     0.5
                 }
