@@ -72,7 +72,7 @@ Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. R
 | `client_names` | map? | {} | IP→client name mapping |
 | `client_budgets` | map? | {} | client_id→daily token limit |
 | `client_utilization_limits` | map? | {} | client_id→utilization ceiling (0.0–1.0) |
-| `operator` | string? | none | Client ID that bypasses all enforcement |
+| `operators` | string[]? | [] | Client IDs that bypass all enforcement |
 | `emergency_threshold` | f64? | 0.95 | All-accounts utilization threshold for emergency brake |
 | `redis_url` | string? | none | Redis/Valkey URL for distributed state (`redis://` or `rediss://`) |
 | `accounts[].name` | string | required | Account display name |

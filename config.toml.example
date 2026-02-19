@@ -13,9 +13,9 @@ probe_interval_secs = 300
 # Supports individual IPs and CIDR ranges. Omit or leave empty to allow all.
 # allowed_ips = ["100.64.0.0/10", "10.0.0.0/8", "1.2.3.4"]
 
-# Operator: this client_id is never throttled by utilization limits, budget limits,
-# or the emergency brake. Identity resolved via client_names IP map (not spoofable via header).
-# operator = "ray"
+# Operators: these client_ids are never throttled by utilization limits, budget limits,
+# or the emergency brake. Identity resolved via x-client-id header or client_names IP map.
+# operators = ["ray", "openclaw", "claude"]
 
 # Per-client utilization limits: clients are 429'd when ALL model-compatible accounts
 # exceed their configured limit. Values must be 0.0-1.0.
