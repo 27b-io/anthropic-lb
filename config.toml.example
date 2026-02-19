@@ -24,8 +24,8 @@ probe_interval_secs = 300
 # openclaw = 0.95
 
 # Emergency brake: when ALL accounts exceed this threshold, all non-operator traffic
-# is automatically blocked. Default: 0.95.
-# emergency_threshold = 0.95
+# is automatically blocked. Default: 0.88.
+# emergency_threshold = 0.88
 
 # Redis/Valkey URL for distributed state (multi-replica coordination).
 # When set, budget enforcement and hard-limit propagation use Redis for cross-replica sync.
