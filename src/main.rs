@@ -2356,10 +2356,10 @@ async fn proxy_handler(
                 let mut beta_flags: Vec<&str> = if existing_beta.is_empty() {
                     vec![]
                 } else {
-                    existing_beta.split(',').collect()
+                    existing_beta.split(',').map(|s| s.trim()).collect()
                 };
                 for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
-                    if !existing_beta.contains(flag) {
+                    if !beta_flags.contains(flag) {
                         beta_flags.push(flag);
                     }
                 }
