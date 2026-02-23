@@ -257,6 +257,17 @@ impl BurnRate {
 /// Default emergency brake threshold. When ALL accounts exceed this, non-operator traffic is blocked.
 const DEFAULT_EMERGENCY_THRESHOLD: f64 = 0.88;
 
+/// Max bytes of 429 response body to include in debug logs.
+const MAX_429_BODY_LOG_BYTES: usize = 512;
+
+/// Headers redacted from 429 debug logs.
+const REDACTED_HEADERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "x-api-key",
+    "proxy-authorization",
+];
+
 /// Budget status thresholds for X-Budget-Status response header.
 const STATUS_HEALTHY_CEILING: f64 = 0.70;
 const STATUS_ELEVATED_CEILING: f64 = 0.85;
@@ -1472,6 +1483,8 @@ impl AppState {
             let name = k.as_str();
             name.starts_with("anthropic-ratelimit-requests")
                 || name.starts_with("anthropic-ratelimit-tokens")
+                || name.starts_with("anthropic-ratelimit-unified-")
+                || name.starts_with("x-ratelimit-")
         });
         let should_retry =
             headers.get("x-should-retry").and_then(|v| v.to_str().ok()) == Some("true");
@@ -2399,13 +2412,28 @@ async fn proxy_handler(
             let headers_fmt: Vec<String> = resp
                 .headers()
                 .iter()
-                .map(|(k, v)| format!("{}={}", k.as_str(), v.to_str().unwrap_or("<binary>")))
+                .map(|(k, v)| {
+                    let name = k.as_str();
+                    if REDACTED_HEADERS.contains(&name) {
+                        format!("{}=<redacted>", name)
+                    } else {
+                        format!("{}={}", name, v.to_str().unwrap_or("<binary>"))
+                    }
+                })
                 .collect();
             let body_str = resp
                 .bytes()
                 .await
                 .ok()
-                .and_then(|b| std::str::from_utf8(&b).ok().map(|s| s.to_string()))
+                .map(|b| {
+                    let slice = &b[..b.len().min(MAX_429_BODY_LOG_BYTES)];
+                    let s = std::str::from_utf8(slice).unwrap_or("<binary>").to_string();
+                    if b.len() > MAX_429_BODY_LOG_BYTES {
+                        format!("{}(truncated, {}B total)", s, b.len())
+                    } else {
+                        s
+                    }
+                })
                 .unwrap_or_default();
             debug!(
                 account = acct.name,
@@ -2429,15 +2457,15 @@ async fn proxy_handler(
             continue;
         }
 
-        // Persist state after successful request
-        state.save_state().await;
-
         // Clear hard limit and burst counter — account just served a request successfully
         {
             let mut info = acct.rate_info.write().await;
             info.hard_limited_until = None;
             info.consecutive_burst_429s = 0;
         }
+
+        // Persist state after clearing hard limit so the saved snapshot is clean
+        state.save_state().await;
 
         // Log with capacity info
         {
@@ -3441,13 +3469,28 @@ async fn openai_chat_handler(
             let headers_fmt: Vec<String> = resp
                 .headers()
                 .iter()
-                .map(|(k, v)| format!("{}={}", k.as_str(), v.to_str().unwrap_or("<binary>")))
+                .map(|(k, v)| {
+                    let name = k.as_str();
+                    if REDACTED_HEADERS.contains(&name) {
+                        format!("{}=<redacted>", name)
+                    } else {
+                        format!("{}={}", name, v.to_str().unwrap_or("<binary>"))
+                    }
+                })
                 .collect();
             let body_str = resp
                 .bytes()
                 .await
                 .ok()
-                .and_then(|b| std::str::from_utf8(&b).ok().map(|s| s.to_string()))
+                .map(|b| {
+                    let slice = &b[..b.len().min(MAX_429_BODY_LOG_BYTES)];
+                    let s = std::str::from_utf8(slice).unwrap_or("<binary>").to_string();
+                    if b.len() > MAX_429_BODY_LOG_BYTES {
+                        format!("{}(truncated, {}B total)", s, b.len())
+                    } else {
+                        s
+                    }
+                })
                 .unwrap_or_default();
             debug!(
                 account = acct.name,
@@ -3471,14 +3514,15 @@ async fn openai_chat_handler(
             continue;
         }
 
-        state.save_state().await;
-
         // Clear hard limit and burst counter — account just served a request successfully
         {
             let mut info = acct.rate_info.write().await;
             info.hard_limited_until = None;
             info.consecutive_burst_429s = 0;
         }
+
+        // Persist state after clearing hard limit so the saved snapshot is clean
+        state.save_state().await;
 
         // Compute budget pressure status for response header
         let budget_status = {
