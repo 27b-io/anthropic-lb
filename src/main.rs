@@ -268,6 +268,43 @@ const REDACTED_HEADERS: &[&str] = &[
     "proxy-authorization",
 ];
 
+/// Format 429 response headers and body for a single debug log line.
+/// Redacts sensitive headers, truncates body to MAX_429_BODY_LOG_BYTES.
+async fn log_429_details(account_name: &str, resp: reqwest::Response) {
+    let headers_fmt: Vec<String> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            let name = k.as_str();
+            if REDACTED_HEADERS.contains(&name) {
+                format!("{}=<redacted>", name)
+            } else {
+                format!("{}={}", name, v.to_str().unwrap_or("<binary>"))
+            }
+        })
+        .collect();
+    let body_str = resp
+        .bytes()
+        .await
+        .ok()
+        .map(|b| {
+            let slice = &b[..b.len().min(MAX_429_BODY_LOG_BYTES)];
+            let s = std::str::from_utf8(slice).unwrap_or("<binary>").to_string();
+            if b.len() > MAX_429_BODY_LOG_BYTES {
+                format!("{}(truncated, {}B total)", s, b.len())
+            } else {
+                s
+            }
+        })
+        .unwrap_or_default();
+    debug!(
+        account = account_name,
+        headers = headers_fmt.join(" | "),
+        body = body_str,
+        "429 response details"
+    );
+}
+
 /// Budget status thresholds for X-Budget-Status response header.
 const STATUS_HEALTHY_CEILING: f64 = 0.70;
 const STATUS_ELEVATED_CEILING: f64 = 0.85;
@@ -2420,39 +2457,7 @@ async fn proxy_handler(
         // 429 → mark hard-limited and try next account
         if status == StatusCode::TOO_MANY_REQUESTS {
             state.mark_hard_limited(idx, resp.headers()).await;
-            // Compact header + body dump for diagnostics
-            let headers_fmt: Vec<String> = resp
-                .headers()
-                .iter()
-                .map(|(k, v)| {
-                    let name = k.as_str();
-                    if REDACTED_HEADERS.contains(&name) {
-                        format!("{}=<redacted>", name)
-                    } else {
-                        format!("{}={}", name, v.to_str().unwrap_or("<binary>"))
-                    }
-                })
-                .collect();
-            let body_str = resp
-                .bytes()
-                .await
-                .ok()
-                .map(|b| {
-                    let slice = &b[..b.len().min(MAX_429_BODY_LOG_BYTES)];
-                    let s = std::str::from_utf8(slice).unwrap_or("<binary>").to_string();
-                    if b.len() > MAX_429_BODY_LOG_BYTES {
-                        format!("{}(truncated, {}B total)", s, b.len())
-                    } else {
-                        s
-                    }
-                })
-                .unwrap_or_default();
-            debug!(
-                account = acct.name,
-                headers = headers_fmt.join(" | "),
-                body = body_str,
-                "429 response details"
-            );
+            log_429_details(&acct.name, resp).await;
             state.save_state().await;
             info!(account = acct.name, "got 429, rotating to next account");
             continue;
@@ -3426,10 +3431,10 @@ async fn openai_chat_handler(
                 let mut betas: Vec<&str> = if existing_beta.is_empty() {
                     vec![]
                 } else {
-                    existing_beta.split(',').collect()
+                    existing_beta.split(',').map(|s| s.trim()).collect()
                 };
                 for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
-                    if !betas.iter().any(|b| b.trim() == *flag) {
+                    if !betas.contains(flag) {
                         betas.push(flag);
                     }
                 }
@@ -3477,39 +3482,7 @@ async fn openai_chat_handler(
 
         if status == StatusCode::TOO_MANY_REQUESTS {
             state.mark_hard_limited(idx, resp.headers()).await;
-            // Compact header + body dump for diagnostics
-            let headers_fmt: Vec<String> = resp
-                .headers()
-                .iter()
-                .map(|(k, v)| {
-                    let name = k.as_str();
-                    if REDACTED_HEADERS.contains(&name) {
-                        format!("{}=<redacted>", name)
-                    } else {
-                        format!("{}={}", name, v.to_str().unwrap_or("<binary>"))
-                    }
-                })
-                .collect();
-            let body_str = resp
-                .bytes()
-                .await
-                .ok()
-                .map(|b| {
-                    let slice = &b[..b.len().min(MAX_429_BODY_LOG_BYTES)];
-                    let s = std::str::from_utf8(slice).unwrap_or("<binary>").to_string();
-                    if b.len() > MAX_429_BODY_LOG_BYTES {
-                        format!("{}(truncated, {}B total)", s, b.len())
-                    } else {
-                        s
-                    }
-                })
-                .unwrap_or_default();
-            debug!(
-                account = acct.name,
-                headers = headers_fmt.join(" | "),
-                body = body_str,
-                "429 response details"
-            );
+            log_429_details(&acct.name, resp).await;
             state.save_state().await;
             info!(account = acct.name, "got 429, rotating to next account");
             continue;
@@ -4532,6 +4505,154 @@ mod tests {
             low_pct > 0.70,
             "low-util account should get majority of traffic, got {:.1}%",
             low_pct * 100.0
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_hard_limited_detects_burst_429() {
+        // Burst 429: x-should-retry=true, no retry-after, no rate-limit headers.
+        // Should use short cooldown, NOT poison remaining_tokens/requests.
+        let state = test_state_with(vec![make_account("burst-test", "sk-ant-api-a")]);
+
+        // Pre-set some remaining tokens to verify they aren't poisoned
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.remaining_tokens = Some(5000);
+            info.remaining_requests = Some(10);
+        }
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-should-retry", HeaderValue::from_static("true"));
+        // No retry-after, no anthropic-ratelimit-*, no x-ratelimit-*
+
+        state.mark_hard_limited(0, &headers).await;
+
+        let info = state.accounts[0].rate_info.read().await;
+        assert!(
+            info.hard_limited_until.is_some(),
+            "burst 429 should still set hard_limited_until"
+        );
+        assert_eq!(
+            info.remaining_tokens,
+            Some(5000),
+            "burst 429 should NOT poison remaining_tokens"
+        );
+        assert_eq!(
+            info.remaining_requests,
+            Some(10),
+            "burst 429 should NOT poison remaining_requests"
+        );
+        assert_eq!(info.consecutive_burst_429s, 1);
+    }
+
+    #[tokio::test]
+    async fn mark_hard_limited_capacity_429_poisons_state() {
+        // Capacity 429: has rate-limit headers → should poison remaining_tokens/requests to 0.
+        let state = test_state_with(vec![make_account("cap-test", "sk-ant-api-a")]);
+
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.remaining_tokens = Some(5000);
+            info.remaining_requests = Some(10);
+        }
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-should-retry", HeaderValue::from_static("true"));
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.99"),
+        );
+        // Has rate-limit headers → NOT a burst
+
+        state.mark_hard_limited(0, &headers).await;
+
+        let info = state.accounts[0].rate_info.read().await;
+        assert_eq!(
+            info.remaining_tokens,
+            Some(0),
+            "capacity 429 should poison remaining_tokens to 0"
+        );
+        assert_eq!(
+            info.remaining_requests,
+            Some(0),
+            "capacity 429 should poison remaining_requests to 0"
+        );
+        assert_eq!(
+            info.consecutive_burst_429s, 0,
+            "capacity 429 should reset burst counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_hard_limited_burst_exponential_backoff() {
+        // Consecutive burst 429s should produce increasing cooldowns.
+        let state = test_state_with(vec![make_account("backoff-test", "sk-ant-api-a")]);
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-should-retry", HeaderValue::from_static("true"));
+
+        // Fire 5 consecutive burst 429s
+        let mut cooldowns = Vec::new();
+        for _ in 0..5 {
+            state.mark_hard_limited(0, &headers).await;
+            let info = state.accounts[0].rate_info.read().await;
+            let until = info.hard_limited_until.unwrap();
+            let remaining = until.duration_since(Instant::now());
+            cooldowns.push(remaining.as_secs());
+        }
+
+        // Should be roughly 5, 10, 20, 40, 60 (with some timing slack)
+        assert!(
+            cooldowns[0] <= 6,
+            "1st burst should be ~5s, got {}s",
+            cooldowns[0]
+        );
+        assert!(
+            (9..=11).contains(&cooldowns[1]),
+            "2nd burst should be ~10s, got {}s",
+            cooldowns[1]
+        );
+        assert!(
+            (19..=21).contains(&cooldowns[2]),
+            "3rd burst should be ~20s, got {}s",
+            cooldowns[2]
+        );
+        assert!(
+            (39..=41).contains(&cooldowns[3]),
+            "4th burst should be ~40s, got {}s",
+            cooldowns[3]
+        );
+        assert!(
+            (59..=61).contains(&cooldowns[4]),
+            "5th burst should be ~60s, got {}s",
+            cooldowns[4]
+        );
+
+        let info = state.accounts[0].rate_info.read().await;
+        assert_eq!(info.consecutive_burst_429s, 5);
+    }
+
+    #[tokio::test]
+    async fn mark_hard_limited_retry_after_overrides_default() {
+        // When retry-after is present, it should be used regardless of x-should-retry.
+        let state = test_state_with(vec![make_account("retry-test", "sk-ant-api-a")]);
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("30"));
+
+        state.mark_hard_limited(0, &headers).await;
+
+        let info = state.accounts[0].rate_info.read().await;
+        let until = info.hard_limited_until.unwrap();
+        let remaining = until.duration_since(Instant::now()).as_secs();
+        assert!(
+            (29..=31).contains(&remaining),
+            "retry-after=30 should set ~30s cooldown, got {}s",
+            remaining
+        );
+        assert_eq!(
+            info.consecutive_burst_429s, 0,
+            "non-burst 429 should reset burst counter"
         );
     }
 
