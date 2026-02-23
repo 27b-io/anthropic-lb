@@ -1384,28 +1384,40 @@ impl AppState {
         }
 
         // Legacy headers (still try them)
+        let mut got_legacy = false;
         if let Some(v) = headers.get("x-ratelimit-remaining-requests") {
             if let Ok(s) = v.to_str() {
                 info.remaining_requests = s.parse().ok();
+                got_legacy = true;
             }
         }
         if let Some(v) = headers.get("x-ratelimit-remaining-tokens") {
             if let Ok(s) = v.to_str() {
                 info.remaining_tokens = s.parse().ok();
+                got_legacy = true;
             }
         }
         if let Some(v) = headers.get("x-ratelimit-limit-requests") {
             if let Ok(s) = v.to_str() {
                 info.limit_requests = s.parse().ok();
+                got_legacy = true;
             }
         }
         if let Some(v) = headers.get("x-ratelimit-limit-tokens") {
             if let Ok(s) = v.to_str() {
                 info.limit_tokens = s.parse().ok();
+                got_legacy = true;
             }
         }
-        info.last_updated = Some(Instant::now());
-        info.last_updated_epoch = Some(Self::now_epoch());
+
+        // Only advance last_updated when we actually parsed rate-limit data.
+        // Responses without rate headers (e.g. 5xx) must not clear
+        // stale_after_hard_limit, which relies on last_updated <= hard_limited_until.
+        let parsed_any = got_5h_util || got_7d_util || rep_claim.is_some() || got_legacy;
+        if parsed_any {
+            info.last_updated = Some(Instant::now());
+            info.last_updated_epoch = Some(Self::now_epoch());
+        }
 
         trace!(
             account = acct.name,
