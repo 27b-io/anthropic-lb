@@ -151,6 +151,9 @@ struct RateLimitInfo {
     /// Derived convenience: worst status across all claims_7d entries.
     status_7d: Option<String>,
     hard_limited_until: Option<Instant>,
+    /// Counts consecutive burst 429s (no retry-after) for exponential backoff.
+    /// Reset to 0 on any successful response.
+    consecutive_burst_429s: u32,
     #[allow(dead_code)]
     last_updated: Option<Instant>,
     /// Wall-clock epoch of last update, for cross-replica age comparison.
@@ -253,6 +256,54 @@ impl BurnRate {
 
 /// Default emergency brake threshold. When ALL accounts exceed this, non-operator traffic is blocked.
 const DEFAULT_EMERGENCY_THRESHOLD: f64 = 0.88;
+
+/// Max bytes of 429 response body to include in debug logs.
+const MAX_429_BODY_LOG_BYTES: usize = 512;
+
+/// Headers redacted from 429 debug logs.
+const REDACTED_HEADERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "x-api-key",
+    "proxy-authorization",
+];
+
+/// Format 429 response headers and body for a single debug log line.
+/// Redacts sensitive headers, truncates body to MAX_429_BODY_LOG_BYTES.
+async fn log_429_details(account_name: &str, resp: reqwest::Response) {
+    let headers_fmt: Vec<String> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            let name = k.as_str();
+            if REDACTED_HEADERS.contains(&name) {
+                format!("{}=<redacted>", name)
+            } else {
+                format!("{}={}", name, v.to_str().unwrap_or("<binary>"))
+            }
+        })
+        .collect();
+    let body_str = resp
+        .bytes()
+        .await
+        .ok()
+        .map(|b| {
+            let slice = &b[..b.len().min(MAX_429_BODY_LOG_BYTES)];
+            let s = std::str::from_utf8(slice).unwrap_or("<binary>").to_string();
+            if b.len() > MAX_429_BODY_LOG_BYTES {
+                format!("{}(truncated, {}B total)", s, b.len())
+            } else {
+                s
+            }
+        })
+        .unwrap_or_default();
+    debug!(
+        account = account_name,
+        headers = headers_fmt.join(" | "),
+        body = body_str,
+        "429 response details"
+    );
+}
 
 /// Budget status thresholds for X-Budget-Status response header.
 const STATUS_HEALTHY_CEILING: f64 = 0.70;
@@ -624,6 +675,18 @@ impl AppState {
                 self.update_rate_info(idx, resp.headers()).await;
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     self.mark_hard_limited(idx, resp.headers()).await;
+                } else {
+                    // Non-429: account is responsive, clear hard limit and burst counter
+                    // so pick_account stops treating rate data as stale.
+                    let mut info = acct.rate_info.write().await;
+                    if info.hard_limited_until.is_some() {
+                        info.hard_limited_until = None;
+                        debug!(
+                            account = acct.name,
+                            "cleared hard limit after successful probe"
+                        );
+                    }
+                    info.consecutive_burst_429s = 0;
                 }
                 self.save_state().await;
                 let info = acct.rate_info.read().await;
@@ -1042,30 +1105,47 @@ impl AppState {
                 }
             }
 
+            // Detect stale data: hard limit expired but no fresh response since.
+            // mark_hard_limited poisons remaining_tokens/requests and update_rate_info
+            // on the 429 stores high utilization + "rejected" statuses. Without this
+            // check, those stale values prevent the account from ever being selected
+            // again — only probes can refresh the data, and they run infrequently.
+            let stale_after_hard_limit = info
+                .hard_limited_until
+                .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
+
             // 5h gate: time-adjusted 5h utilization with status floors
-            let gate_5h = time_adjusted_utilization(
-                info.utilization_5h,
-                info.reset_5h,
-                info.status_5h.as_deref(),
-                NEAR_RESET_5H_SECS,
-                now_epoch,
-            )
-            .unwrap_or_else(|| {
-                // Fallback: raw unified, legacy, or unknown
-                if let Some(util) = info.utilization {
-                    util
-                } else if let Some(remaining) = info.remaining_tokens {
-                    let limit = info.limit_tokens.unwrap_or(1_000_000);
-                    (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
-                } else {
-                    0.5
-                }
-            });
+            let gate_5h = if stale_after_hard_limit {
+                // Data is from the 429 era — treat as unknown to give the account
+                // a fair chance. The next successful request will refresh everything.
+                0.5
+            } else {
+                time_adjusted_utilization(
+                    info.utilization_5h,
+                    info.reset_5h,
+                    info.status_5h.as_deref(),
+                    NEAR_RESET_5H_SECS,
+                    now_epoch,
+                )
+                .unwrap_or_else(|| {
+                    // Fallback: raw unified, legacy, or unknown
+                    if let Some(util) = info.utilization {
+                        util
+                    } else if let Some(remaining) = info.remaining_tokens {
+                        let limit = info.limit_tokens.unwrap_or(1_000_000);
+                        (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    }
+                })
+            };
 
             // 7d waste risk from model-specific claim
             let (wr, source) = if let Some(claim) = resolve_7d_claim(&info, model) {
-                // Skip if this model's 7d claim is rejected
-                if claim.status.as_deref() == Some("rejected") {
+                // Skip if this model's 7d claim is rejected AND we have fresh data.
+                // Stale rejections from expired hard limits are ignored — the account
+                // needs a chance to prove it's recovered.
+                if claim.status.as_deref() == Some("rejected") && !stale_after_hard_limit {
                     trace!(
                         account = acct.name,
                         model = model,
@@ -1341,28 +1421,40 @@ impl AppState {
         }
 
         // Legacy headers (still try them)
+        let mut got_legacy = false;
         if let Some(v) = headers.get("x-ratelimit-remaining-requests") {
             if let Ok(s) = v.to_str() {
                 info.remaining_requests = s.parse().ok();
+                got_legacy = true;
             }
         }
         if let Some(v) = headers.get("x-ratelimit-remaining-tokens") {
             if let Ok(s) = v.to_str() {
                 info.remaining_tokens = s.parse().ok();
+                got_legacy = true;
             }
         }
         if let Some(v) = headers.get("x-ratelimit-limit-requests") {
             if let Ok(s) = v.to_str() {
                 info.limit_requests = s.parse().ok();
+                got_legacy = true;
             }
         }
         if let Some(v) = headers.get("x-ratelimit-limit-tokens") {
             if let Ok(s) = v.to_str() {
                 info.limit_tokens = s.parse().ok();
+                got_legacy = true;
             }
         }
-        info.last_updated = Some(Instant::now());
-        info.last_updated_epoch = Some(Self::now_epoch());
+
+        // Only advance last_updated when we actually parsed rate-limit data.
+        // Responses without rate headers (e.g. 5xx) must not clear
+        // stale_after_hard_limit, which relies on last_updated <= hard_limited_until.
+        let parsed_any = got_5h_util || got_7d_util || rep_claim.is_some() || got_legacy;
+        if parsed_any {
+            info.last_updated = Some(Instant::now());
+            info.last_updated_epoch = Some(Self::now_epoch());
+        }
 
         trace!(
             account = acct.name,
@@ -1428,8 +1520,40 @@ impl AppState {
         let acct = &self.accounts[idx];
         let mut info = acct.rate_info.write().await;
 
-        let cooldown = if let Some(v) = headers.get("retry-after") {
-            if let Ok(s) = v.to_str() {
+        let raw_retry_after = headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        // Detect transient burst 429: x-should-retry present but no retry-after
+        // and no rate-limit headers. These are per-minute burst limits, not
+        // capacity exhaustion — use exponential backoff and don't poison state.
+        let has_rate_headers = headers.keys().any(|k| {
+            let name = k.as_str();
+            name.starts_with("anthropic-ratelimit-requests")
+                || name.starts_with("anthropic-ratelimit-tokens")
+                || name.starts_with("anthropic-ratelimit-unified-")
+                || name.starts_with("x-ratelimit-")
+        });
+        let should_retry =
+            headers.get("x-should-retry").and_then(|v| v.to_str().ok()) == Some("true");
+        let is_burst_limit = should_retry && raw_retry_after.is_none() && !has_rate_headers;
+
+        let cooldown = if is_burst_limit {
+            info.consecutive_burst_429s = info.consecutive_burst_429s.saturating_add(1);
+            // Exponential backoff: 5s → 10s → 20s → 40s → 60s (cap).
+            // RPM windows are typically 60s; 1s was too short and caused thrashing.
+            let burst_secs: u64 = match info.consecutive_burst_429s {
+                1 => 5,
+                2 => 10,
+                3 => 20,
+                4 => 40,
+                _ => 60,
+            };
+            Duration::from_secs(burst_secs)
+        } else {
+            info.consecutive_burst_429s = 0;
+            if let Some(ref s) = raw_retry_after {
                 if let Ok(secs) = s.parse::<f64>() {
                     if secs.is_finite() && secs > 0.0 && secs < 86400.0 {
                         Duration::from_secs_f64(secs)
@@ -1442,20 +1566,25 @@ impl AppState {
             } else {
                 self.cooldown
             }
-        } else {
-            self.cooldown
         };
 
         let until = Instant::now() + cooldown;
         info.hard_limited_until = Some(until);
-        info.remaining_requests = Some(0);
-        info.remaining_tokens = Some(0);
+        // Only poison remaining counts when we have actual rate-limit data
+        // confirming exhaustion. Burst 429s have no such data.
+        if !is_burst_limit {
+            info.remaining_requests = Some(0);
+            info.remaining_tokens = Some(0);
+        }
         info.last_updated = Some(Instant::now());
         info.last_updated_epoch = Some(Self::now_epoch());
 
         warn!(
             account = acct.name,
             cooldown_secs = cooldown.as_secs(),
+            retry_after_raw = ?raw_retry_after,
+            burst = is_burst_limit,
+            consecutive_burst = info.consecutive_burst_429s,
             "account hard rate-limited (429), cooling down"
         );
 
@@ -2264,20 +2393,31 @@ async fn proxy_handler(
                     "anthropic-dangerous-direct-browser-access",
                     HeaderValue::from_static("true"),
                 );
-                // Ensure oauth beta flag is present in anthropic-beta
+                // Ensure required OAuth beta flags are present.
+                // Both are required: oauth-2025-04-20 for OAuth auth,
+                // claude-code-20250219 for Claude Code API access quota routing.
+                // Missing claude-code-20250219 causes 429 with unified-overage-disabled.
                 let existing_beta = headers
                     .get("anthropic-beta")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
-                if !existing_beta.contains("oauth-2025-04-20") {
-                    let new_beta = if existing_beta.is_empty() {
-                        "oauth-2025-04-20".to_string()
-                    } else {
-                        format!("{},oauth-2025-04-20", existing_beta)
-                    };
-                    headers.insert("anthropic-beta", HeaderValue::from_str(&new_beta).unwrap());
+                let mut beta_flags: Vec<&str> = if existing_beta.is_empty() {
+                    vec![]
+                } else {
+                    existing_beta
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+                for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
+                    if !beta_flags.contains(flag) {
+                        beta_flags.push(flag);
+                    }
                 }
+                let new_beta = beta_flags.join(",");
+                headers.insert("anthropic-beta", HeaderValue::from_str(&new_beta).unwrap());
             } else {
                 // Unknown token type → try x-api-key
                 headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
@@ -2321,6 +2461,7 @@ async fn proxy_handler(
         // 429 → mark hard-limited and try next account
         if status == StatusCode::TOO_MANY_REQUESTS {
             state.mark_hard_limited(idx, resp.headers()).await;
+            log_429_details(&acct.name, resp).await;
             state.save_state().await;
             info!(account = acct.name, "got 429, rotating to next account");
             continue;
@@ -2337,7 +2478,14 @@ async fn proxy_handler(
             continue;
         }
 
-        // Persist state after successful request
+        // Clear hard limit and burst counter — account just served a request successfully
+        {
+            let mut info = acct.rate_info.write().await;
+            info.hard_limited_until = None;
+            info.consecutive_burst_429s = 0;
+        }
+
+        // Persist state after clearing hard limit so the saved snapshot is clean
         state.save_state().await;
 
         // Log with capacity info
@@ -3287,10 +3435,14 @@ async fn openai_chat_handler(
                 let mut betas: Vec<&str> = if existing_beta.is_empty() {
                     vec![]
                 } else {
-                    existing_beta.split(',').collect()
+                    existing_beta
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect()
                 };
                 for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
-                    if !betas.iter().any(|b| b.trim() == *flag) {
+                    if !betas.contains(flag) {
                         betas.push(flag);
                     }
                 }
@@ -3338,6 +3490,7 @@ async fn openai_chat_handler(
 
         if status == StatusCode::TOO_MANY_REQUESTS {
             state.mark_hard_limited(idx, resp.headers()).await;
+            log_429_details(&acct.name, resp).await;
             state.save_state().await;
             info!(account = acct.name, "got 429, rotating to next account");
             continue;
@@ -3354,6 +3507,14 @@ async fn openai_chat_handler(
             continue;
         }
 
+        // Clear hard limit and burst counter — account just served a request successfully
+        {
+            let mut info = acct.rate_info.write().await;
+            info.hard_limited_until = None;
+            info.consecutive_burst_429s = 0;
+        }
+
+        // Persist state after clearing hard limit so the saved snapshot is clean
         state.save_state().await;
 
         // Compute budget pressure status for response header
@@ -3602,7 +3763,7 @@ async fn main() {
         );
     }
 
-    let cooldown = Duration::from_secs(config.rate_limit_cooldown_secs.unwrap_or(60));
+    let cooldown = Duration::from_secs(config.rate_limit_cooldown_secs.unwrap_or(5));
 
     // Parse IP allowlist
     let allowed_ips: Vec<IpAllowEntry> = config
@@ -3789,7 +3950,12 @@ async fn main() {
         .parse()
         .unwrap_or_else(|e| panic!("invalid listen address: {e}"));
 
-    info!(%addr, "anthropic-lb starting");
+    info!(
+        %addr,
+        rate_limit_cooldown_secs = cooldown.as_secs(),
+        configured = ?config.rate_limit_cooldown_secs,
+        "anthropic-lb starting"
+    );
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -4216,6 +4382,291 @@ mod tests {
         }
 
         assert!(state.pick_account(None, "").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn pick_recovers_after_hard_limit_expires() {
+        // After a hard limit expires with stale data, the account should still be
+        // selectable with 0.5 (unknown) utilization instead of being permanently stuck.
+        let state = test_state_with(vec![make_account("recovering", "sk-ant-api-a")]);
+
+        // Simulate mark_hard_limited: set hard_limited_until in the past (expired),
+        // poison remaining_tokens to 0, set high utilization from the 429 response.
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            let hard_limit_time = Instant::now() - Duration::from_secs(10);
+            info.hard_limited_until = Some(hard_limit_time);
+            info.remaining_tokens = Some(0);
+            info.remaining_requests = Some(0);
+            info.utilization = Some(1.0);
+            info.utilization_5h = Some(1.0);
+            // last_updated before the hard limit → stale_after_hard_limit = true
+            info.last_updated = Some(hard_limit_time - Duration::from_secs(1));
+        }
+
+        let result = state.pick_account(None, "").await;
+        assert!(
+            result.is_some(),
+            "account with expired hard limit should be selectable despite stale high utilization"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_ignores_stale_rejected_claim_after_hard_limit() {
+        // A "rejected" 7d claim from a 429 response should not permanently block the
+        // account once the hard limit has expired without fresh data.
+        let state = test_state_with(vec![make_account("recovering", "sk-ant-api-a")]);
+        let now_epoch = AppState::now_epoch();
+
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            let hard_limit_time = Instant::now() - Duration::from_secs(10);
+            info.hard_limited_until = Some(hard_limit_time);
+            info.last_updated = Some(hard_limit_time - Duration::from_secs(1));
+            info.utilization_5h = Some(0.95);
+            info.reset_5h = Some(now_epoch + 10000);
+            info.claims_7d.insert(
+                "seven_day_sonnet".to_string(),
+                ClaimWindowData {
+                    utilization: 1.0,
+                    reset: Some(now_epoch + 100000),
+                    status: Some("rejected".to_string()),
+                },
+            );
+        }
+
+        let result = state
+            .pick_account(Some("test"), "claude-sonnet-4-5-20250929")
+            .await;
+        assert!(
+            result.is_some(),
+            "stale rejected claim after expired hard limit should not block account"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_still_skips_fresh_rejected_claim() {
+        // If data was refreshed AFTER the hard limit (e.g., by a probe that got fresh
+        // "rejected" status), the account should still be skipped.
+        let state = test_state_with(vec![
+            make_account("rejected", "sk-ant-api-a"),
+            make_account("available", "sk-ant-api-b"),
+        ]);
+        let now_epoch = AppState::now_epoch();
+
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            let hard_limit_time = Instant::now() - Duration::from_secs(300);
+            info.hard_limited_until = Some(hard_limit_time);
+            // last_updated AFTER the hard limit → data is fresh, not stale
+            info.last_updated = Some(Instant::now() - Duration::from_secs(5));
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now_epoch + 10000);
+            info.claims_7d.insert(
+                "seven_day_sonnet".to_string(),
+                ClaimWindowData {
+                    utilization: 1.0,
+                    reset: Some(now_epoch + 100000),
+                    status: Some("rejected".to_string()),
+                },
+            );
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(0.5);
+        }
+
+        let result = state
+            .pick_account(Some("test"), "claude-sonnet-4-5-20250929")
+            .await;
+        assert_eq!(
+            result,
+            Some(1),
+            "fresh rejected claim should still skip the account"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_uses_fresh_data_after_hard_limit_cleared() {
+        // After a probe clears hard_limited_until and refreshes data, the normal
+        // routing logic should apply (not the 0.5 fallback).
+        let state = test_state_with(vec![
+            make_account("low_util", "sk-ant-api-a"),
+            make_account("high_util", "sk-ant-api-b"),
+        ]);
+
+        {
+            // hard_limited_until is None (cleared by probe), fresh data available
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.2);
+            info.last_updated = Some(Instant::now());
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(0.8);
+            info.last_updated = Some(Instant::now());
+        }
+
+        // low_util should get ~80% of traffic (headroom=0.8 vs 0.2)
+        let mut counts = [0u32; 2];
+        for _ in 0..1000 {
+            let idx = state.pick_account(None, "").await.unwrap();
+            counts[idx] += 1;
+        }
+        let low_pct = counts[0] as f64 / 1000.0;
+        assert!(
+            low_pct > 0.70,
+            "low-util account should get majority of traffic, got {:.1}%",
+            low_pct * 100.0
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_hard_limited_detects_burst_429() {
+        // Burst 429: x-should-retry=true, no retry-after, no rate-limit headers.
+        // Should use short cooldown, NOT poison remaining_tokens/requests.
+        let state = test_state_with(vec![make_account("burst-test", "sk-ant-api-a")]);
+
+        // Pre-set some remaining tokens to verify they aren't poisoned
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.remaining_tokens = Some(5000);
+            info.remaining_requests = Some(10);
+        }
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-should-retry", HeaderValue::from_static("true"));
+        // No retry-after, no anthropic-ratelimit-*, no x-ratelimit-*
+
+        state.mark_hard_limited(0, &headers).await;
+
+        let info = state.accounts[0].rate_info.read().await;
+        assert!(
+            info.hard_limited_until.is_some(),
+            "burst 429 should still set hard_limited_until"
+        );
+        assert_eq!(
+            info.remaining_tokens,
+            Some(5000),
+            "burst 429 should NOT poison remaining_tokens"
+        );
+        assert_eq!(
+            info.remaining_requests,
+            Some(10),
+            "burst 429 should NOT poison remaining_requests"
+        );
+        assert_eq!(info.consecutive_burst_429s, 1);
+    }
+
+    #[tokio::test]
+    async fn mark_hard_limited_capacity_429_poisons_state() {
+        // Capacity 429: has rate-limit headers → should poison remaining_tokens/requests to 0.
+        let state = test_state_with(vec![make_account("cap-test", "sk-ant-api-a")]);
+
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.remaining_tokens = Some(5000);
+            info.remaining_requests = Some(10);
+        }
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-should-retry", HeaderValue::from_static("true"));
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.99"),
+        );
+        // Has rate-limit headers → NOT a burst
+
+        state.mark_hard_limited(0, &headers).await;
+
+        let info = state.accounts[0].rate_info.read().await;
+        assert_eq!(
+            info.remaining_tokens,
+            Some(0),
+            "capacity 429 should poison remaining_tokens to 0"
+        );
+        assert_eq!(
+            info.remaining_requests,
+            Some(0),
+            "capacity 429 should poison remaining_requests to 0"
+        );
+        assert_eq!(
+            info.consecutive_burst_429s, 0,
+            "capacity 429 should reset burst counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_hard_limited_burst_exponential_backoff() {
+        // Consecutive burst 429s should produce increasing cooldowns.
+        let state = test_state_with(vec![make_account("backoff-test", "sk-ant-api-a")]);
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-should-retry", HeaderValue::from_static("true"));
+
+        // Fire 5 consecutive burst 429s
+        let mut cooldowns = Vec::new();
+        for _ in 0..5 {
+            state.mark_hard_limited(0, &headers).await;
+            let info = state.accounts[0].rate_info.read().await;
+            let until = info.hard_limited_until.unwrap();
+            let remaining = until.duration_since(Instant::now());
+            cooldowns.push(remaining.as_secs());
+        }
+
+        // Should be roughly 5, 10, 20, 40, 60 (with some timing slack)
+        assert!(
+            cooldowns[0] <= 6,
+            "1st burst should be ~5s, got {}s",
+            cooldowns[0]
+        );
+        assert!(
+            (9..=11).contains(&cooldowns[1]),
+            "2nd burst should be ~10s, got {}s",
+            cooldowns[1]
+        );
+        assert!(
+            (19..=21).contains(&cooldowns[2]),
+            "3rd burst should be ~20s, got {}s",
+            cooldowns[2]
+        );
+        assert!(
+            (39..=41).contains(&cooldowns[3]),
+            "4th burst should be ~40s, got {}s",
+            cooldowns[3]
+        );
+        assert!(
+            (59..=61).contains(&cooldowns[4]),
+            "5th burst should be ~60s, got {}s",
+            cooldowns[4]
+        );
+
+        let info = state.accounts[0].rate_info.read().await;
+        assert_eq!(info.consecutive_burst_429s, 5);
+    }
+
+    #[tokio::test]
+    async fn mark_hard_limited_retry_after_overrides_default() {
+        // When retry-after is present, it should be used regardless of x-should-retry.
+        let state = test_state_with(vec![make_account("retry-test", "sk-ant-api-a")]);
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("30"));
+
+        state.mark_hard_limited(0, &headers).await;
+
+        let info = state.accounts[0].rate_info.read().await;
+        let until = info.hard_limited_until.unwrap();
+        let remaining = until.duration_since(Instant::now()).as_secs();
+        assert!(
+            (29..=31).contains(&remaining),
+            "retry-after=30 should set ~30s cooldown, got {}s",
+            remaining
+        );
+        assert_eq!(
+            info.consecutive_burst_429s, 0,
+            "non-burst 429 should reset burst counter"
+        );
     }
 
     #[tokio::test]
