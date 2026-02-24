@@ -2405,7 +2405,11 @@ async fn proxy_handler(
                 let mut beta_flags: Vec<&str> = if existing_beta.is_empty() {
                     vec![]
                 } else {
-                    existing_beta.split(',').map(|s| s.trim()).collect()
+                    existing_beta
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect()
                 };
                 for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
                     if !beta_flags.contains(flag) {
@@ -3431,7 +3435,11 @@ async fn openai_chat_handler(
                 let mut betas: Vec<&str> = if existing_beta.is_empty() {
                     vec![]
                 } else {
-                    existing_beta.split(',').map(|s| s.trim()).collect()
+                    existing_beta
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect()
                 };
                 for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
                     if !betas.contains(flag) {
@@ -3942,7 +3950,12 @@ async fn main() {
         .parse()
         .unwrap_or_else(|e| panic!("invalid listen address: {e}"));
 
-    info!(%addr, "anthropic-lb starting");
+    info!(
+        %addr,
+        rate_limit_cooldown_secs = cooldown.as_secs(),
+        configured = ?config.rate_limit_cooldown_secs,
+        "anthropic-lb starting"
+    );
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
