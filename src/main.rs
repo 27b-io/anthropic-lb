@@ -3307,12 +3307,11 @@ async fn metrics_handler(
             acct.requests.load(Ordering::Relaxed),
         );
 
-        let hard_limited_secs = match info.hard_limited_until {
-            Some(until) if Instant::now() < until => {
-                until.duration_since(Instant::now()).as_secs() as f64
-            }
-            _ => 0.0,
-        };
+        let hard_limited_secs = info
+            .hard_limited_until
+            .and_then(|until| until.checked_duration_since(Instant::now()))
+            .map(|d| d.as_secs() as f64)
+            .unwrap_or(0.0);
         prom_gauge(
             &mut buf,
             "anthropic_account_hard_limited_remaining_seconds",
@@ -3402,31 +3401,19 @@ async fn metrics_handler(
 
     prom_header(
         &mut buf,
-        "anthropic_consumer_requests_per_minute",
-        "gauge",
-        "Per-consumer request rate",
-    );
-    prom_header(
-        &mut buf,
         "anthropic_consumer_share",
         "gauge",
         "Per-consumer fair share of capacity",
     );
     if let Ok(rates) = state.client_request_rates.lock() {
         let total_rpm: f64 = rates.values().map(|(_, ewma)| ewma.value).sum();
-        for (client, (_, ewma)) in rates.iter() {
-            let display = if state.is_operator(client) {
-                "_operator"
-            } else {
-                client.as_str()
-            };
-            prom_gauge(
-                &mut buf,
-                "anthropic_consumer_requests_per_minute",
-                &[("client", display)],
-                ewma.value,
-            );
-            if total_rpm > 0.0 {
+        if total_rpm > 0.0 {
+            for (client, (_, ewma)) in rates.iter() {
+                let display = if state.is_operator(client) {
+                    "_operator"
+                } else {
+                    client.as_str()
+                };
                 prom_gauge(
                     &mut buf,
                     "anthropic_consumer_share",
