@@ -3011,6 +3011,659 @@ async fn stats_handler(
     axum::Json(response).into_response()
 }
 
+// ── Prometheus text exposition helpers ──────────────────────────────────
+
+/// Format a float for Prometheus: no trailing zeros, NaN and Inf handled.
+fn prom_fmt(v: f64) -> String {
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "+Inf" } else { "-Inf" }.to_string();
+    }
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{}", v)
+    }
+}
+
+fn prom_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn prom_gauge(buf: &mut String, name: &str, labels: &[(&str, &str)], value: f64) {
+    buf.push_str(name);
+    if !labels.is_empty() {
+        buf.push('{');
+        for (i, (k, v)) in labels.iter().enumerate() {
+            if i > 0 {
+                buf.push(',');
+            }
+            buf.push_str(k);
+            buf.push_str("=\"");
+            buf.push_str(&prom_escape(v));
+            buf.push('"');
+        }
+        buf.push('}');
+    }
+    buf.push(' ');
+    buf.push_str(&prom_fmt(value));
+    buf.push('\n');
+}
+
+fn prom_counter(buf: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
+    buf.push_str(name);
+    if !labels.is_empty() {
+        buf.push('{');
+        for (i, (k, v)) in labels.iter().enumerate() {
+            if i > 0 {
+                buf.push(',');
+            }
+            buf.push_str(k);
+            buf.push_str("=\"");
+            buf.push_str(&prom_escape(v));
+            buf.push('"');
+        }
+        buf.push('}');
+    }
+    buf.push(' ');
+    buf.push_str(&value.to_string());
+    buf.push('\n');
+}
+
+fn prom_header(buf: &mut String, name: &str, metric_type: &str, help: &str) {
+    use std::fmt::Write;
+    let _ = writeln!(buf, "# HELP {name} {help}");
+    let _ = writeln!(buf, "# TYPE {name} {metric_type}");
+}
+
+async fn metrics_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    if !state.is_ip_allowed(&client_addr.ip()) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    if let Some(ref key) = state.proxy_key {
+        let provided = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
+        if provided != Some(key.as_str()) {
+            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
+    }
+
+    let now_epoch = AppState::now_epoch();
+    let mut buf = String::with_capacity(4096);
+
+    // Meta
+    prom_header(
+        &mut buf,
+        "anthropic_lb_info",
+        "gauge",
+        "Load balancer info, always 1",
+    );
+    prom_gauge(
+        &mut buf,
+        "anthropic_lb_info",
+        &[("strategy", "dynamic-capacity")],
+        1.0,
+    );
+    buf.push('\n');
+
+    // Account metrics headers
+    prom_header(
+        &mut buf,
+        "anthropic_account_utilization",
+        "gauge",
+        "Account utilization by time window",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_account_burn_rate",
+        "gauge",
+        "Account burn rate (requests/min) by time window",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_account_headroom_requests",
+        "gauge",
+        "Available request headroom",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_account_remaining_requests",
+        "gauge",
+        "Remaining requests in rate-limit window",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_account_remaining_tokens",
+        "gauge",
+        "Remaining tokens in rate-limit window",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_account_limit_requests",
+        "gauge",
+        "Request limit",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_account_limit_tokens",
+        "gauge",
+        "Token limit",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_account_requests_total",
+        "counter",
+        "Total requests routed to account",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_account_hard_limited_remaining_seconds",
+        "gauge",
+        "Seconds until hard limit expires, 0 if not limited",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_account_projected_throttle_seconds",
+        "gauge",
+        "Seconds until projected throttle, NaN if unknown",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_account_token_usage",
+        "counter",
+        "Token usage by type",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_account_passthrough",
+        "gauge",
+        "1 if passthrough account",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_claim_utilization",
+        "gauge",
+        "Per-claim utilization",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_claim_waste_risk",
+        "gauge",
+        "Per-claim waste risk score",
+    );
+    buf.push('\n');
+
+    let mut total_headroom: Option<u64> = Some(0);
+
+    for acct in &state.accounts {
+        let name = acct.name.as_str();
+        let info = acct.rate_info.read().await;
+
+        if let Some(u) = info.utilization_5h {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_utilization",
+                &[("account", name), ("window", "5h")],
+                u,
+            );
+        }
+        if let Some(u) = info.utilization_7d {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_utilization",
+                &[("account", name), ("window", "7d")],
+                u,
+            );
+        }
+
+        let (br_5m, br_1h, br_6h) = acct
+            .burn_rate
+            .lock()
+            .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
+            .unwrap_or((0.0, 0.0, 0.0));
+        prom_gauge(
+            &mut buf,
+            "anthropic_account_burn_rate",
+            &[("account", name), ("window", "5m")],
+            br_5m,
+        );
+        prom_gauge(
+            &mut buf,
+            "anthropic_account_burn_rate",
+            &[("account", name), ("window", "1h")],
+            br_1h,
+        );
+        prom_gauge(
+            &mut buf,
+            "anthropic_account_burn_rate",
+            &[("account", name), ("window", "6h")],
+            br_6h,
+        );
+
+        let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
+            Some(rem)
+        } else if let (Some(util), Some(limit)) = (info.utilization, info.limit_requests) {
+            Some(((1.0 - util) * limit as f64).max(0.0) as u64)
+        } else {
+            None
+        };
+        if let Some(h) = headroom {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_headroom_requests",
+                &[("account", name)],
+                h as f64,
+            );
+        }
+        match (total_headroom.as_mut(), headroom) {
+            (Some(total), Some(h)) => *total += h,
+            _ => total_headroom = None,
+        }
+
+        if let Some(v) = info.remaining_requests {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_remaining_requests",
+                &[("account", name)],
+                v as f64,
+            );
+        }
+        if let Some(v) = info.remaining_tokens {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_remaining_tokens",
+                &[("account", name)],
+                v as f64,
+            );
+        }
+        if let Some(v) = info.limit_requests {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_limit_requests",
+                &[("account", name)],
+                v as f64,
+            );
+        }
+        if let Some(v) = info.limit_tokens {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_limit_tokens",
+                &[("account", name)],
+                v as f64,
+            );
+        }
+
+        prom_counter(
+            &mut buf,
+            "anthropic_account_requests_total",
+            &[("account", name)],
+            acct.requests.load(Ordering::Relaxed),
+        );
+
+        let hard_limited_secs = match info.hard_limited_until {
+            Some(until) if Instant::now() < until => {
+                until.duration_since(Instant::now()).as_secs() as f64
+            }
+            _ => 0.0,
+        };
+        prom_gauge(
+            &mut buf,
+            "anthropic_account_hard_limited_remaining_seconds",
+            &[("account", name)],
+            hard_limited_secs,
+        );
+
+        let (eff_util, _) = effective_utilization(&info, now_epoch, "");
+        let projected_secs: f64 = if eff_util < 0.5 || br_1h < 0.01 {
+            f64::NAN
+        } else if let Some(h) = headroom {
+            if h == 0 {
+                0.0
+            } else {
+                (h as f64 / br_1h) * 60.0
+            }
+        } else {
+            f64::NAN
+        };
+        prom_gauge(
+            &mut buf,
+            "anthropic_account_projected_throttle_seconds",
+            &[("account", name)],
+            projected_secs,
+        );
+
+        prom_counter(
+            &mut buf,
+            "anthropic_account_token_usage",
+            &[("account", name), ("type", "input")],
+            acct.input_tokens.load(Ordering::Relaxed),
+        );
+        prom_counter(
+            &mut buf,
+            "anthropic_account_token_usage",
+            &[("account", name), ("type", "output")],
+            acct.output_tokens.load(Ordering::Relaxed),
+        );
+        prom_counter(
+            &mut buf,
+            "anthropic_account_token_usage",
+            &[("account", name), ("type", "cache_creation")],
+            acct.cache_creation_tokens.load(Ordering::Relaxed),
+        );
+        prom_counter(
+            &mut buf,
+            "anthropic_account_token_usage",
+            &[("account", name), ("type", "cache_read")],
+            acct.cache_read_tokens.load(Ordering::Relaxed),
+        );
+
+        prom_gauge(
+            &mut buf,
+            "anthropic_account_passthrough",
+            &[("account", name)],
+            if acct.passthrough { 1.0 } else { 0.0 },
+        );
+
+        for (claim_key, claim_data) in &info.claims_7d {
+            prom_gauge(
+                &mut buf,
+                "anthropic_claim_utilization",
+                &[("account", name), ("claim", claim_key)],
+                claim_data.utilization,
+            );
+            let wr = waste_risk(claim_data.utilization, claim_data.reset, now_epoch);
+            prom_gauge(
+                &mut buf,
+                "anthropic_claim_waste_risk",
+                &[("account", name), ("claim", claim_key)],
+                wr,
+            );
+        }
+    }
+
+    // Aggregate
+    buf.push('\n');
+    prom_header(
+        &mut buf,
+        "anthropic_total_headroom_requests",
+        "gauge",
+        "Sum of all account headroom",
+    );
+    if let Some(h) = total_headroom {
+        prom_gauge(&mut buf, "anthropic_total_headroom_requests", &[], h as f64);
+    }
+
+    prom_header(
+        &mut buf,
+        "anthropic_consumer_requests_per_minute",
+        "gauge",
+        "Per-consumer request rate",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_consumer_share",
+        "gauge",
+        "Per-consumer fair share of capacity",
+    );
+    if let Ok(rates) = state.client_request_rates.lock() {
+        let total_rpm: f64 = rates.values().map(|(_, ewma)| ewma.value).sum();
+        for (client, (_, ewma)) in rates.iter() {
+            let display = if state.is_operator(client) {
+                "_operator"
+            } else {
+                client.as_str()
+            };
+            prom_gauge(
+                &mut buf,
+                "anthropic_consumer_requests_per_minute",
+                &[("client", display)],
+                ewma.value,
+            );
+            if total_rpm > 0.0 {
+                prom_gauge(
+                    &mut buf,
+                    "anthropic_consumer_share",
+                    &[("client", display)],
+                    ewma.value / total_rpm,
+                );
+            }
+        }
+    }
+
+    // Client usage
+    buf.push('\n');
+    prom_header(
+        &mut buf,
+        "anthropic_client_token_usage",
+        "counter",
+        "Per-client token usage by type",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_client_requests_total",
+        "counter",
+        "Per-client total requests",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_client_requests_per_minute",
+        "gauge",
+        "Per-client request rate (EWMA)",
+    );
+    let request_rates = state.client_request_rates.lock().ok();
+    if let Ok(map) = state.client_usage.lock() {
+        let mut all_clients: std::collections::HashSet<&String> = map.keys().collect();
+        if let Some(ref rates) = request_rates {
+            all_clients.extend(rates.keys());
+        }
+        for client in all_clients {
+            let display = if state.is_operator(client) {
+                "_operator"
+            } else {
+                client.as_str()
+            };
+            let tokens = map.get(client).copied().unwrap_or([0; 4]);
+            prom_counter(
+                &mut buf,
+                "anthropic_client_token_usage",
+                &[("client", display), ("type", "input")],
+                tokens[0],
+            );
+            prom_counter(
+                &mut buf,
+                "anthropic_client_token_usage",
+                &[("client", display), ("type", "output")],
+                tokens[1],
+            );
+            prom_counter(
+                &mut buf,
+                "anthropic_client_token_usage",
+                &[("client", display), ("type", "cache_creation")],
+                tokens[2],
+            );
+            prom_counter(
+                &mut buf,
+                "anthropic_client_token_usage",
+                &[("client", display), ("type", "cache_read")],
+                tokens[3],
+            );
+            let (req_total, req_per_min) = request_rates
+                .as_ref()
+                .and_then(|r| r.get(client))
+                .map(|(total, ewma)| (*total, ewma.value))
+                .unwrap_or((0, 0.0));
+            prom_counter(
+                &mut buf,
+                "anthropic_client_requests_total",
+                &[("client", display)],
+                req_total,
+            );
+            prom_gauge(
+                &mut buf,
+                "anthropic_client_requests_per_minute",
+                &[("client", display)],
+                req_per_min,
+            );
+        }
+    }
+
+    // Client budgets
+    if !state.client_budgets.is_empty() {
+        buf.push('\n');
+        prom_header(
+            &mut buf,
+            "anthropic_client_budget_daily_limit",
+            "gauge",
+            "Configured daily token limit",
+        );
+        prom_header(
+            &mut buf,
+            "anthropic_client_budget_used_today",
+            "gauge",
+            "Tokens used today",
+        );
+        prom_header(
+            &mut buf,
+            "anthropic_client_budget_remaining",
+            "gauge",
+            "Tokens remaining today",
+        );
+        let today = AppState::now_epoch() / 86400;
+        let usage_map = state.budget_usage.lock().ok();
+        for (client, &limit) in &state.client_budgets {
+            let used = usage_map
+                .as_ref()
+                .and_then(|m| m.get(client))
+                .filter(|(day, _)| *day == today)
+                .map(|(_, used)| *used)
+                .unwrap_or(0);
+            prom_gauge(
+                &mut buf,
+                "anthropic_client_budget_daily_limit",
+                &[("client", client)],
+                limit as f64,
+            );
+            prom_gauge(
+                &mut buf,
+                "anthropic_client_budget_used_today",
+                &[("client", client)],
+                used as f64,
+            );
+            prom_gauge(
+                &mut buf,
+                "anthropic_client_budget_remaining",
+                &[("client", client)],
+                limit.saturating_sub(used) as f64,
+            );
+        }
+    }
+
+    // Upstreams
+    buf.push('\n');
+    prom_header(
+        &mut buf,
+        "anthropic_upstream_requests_total",
+        "counter",
+        "Requests per upstream",
+    );
+    for u in &state.upstreams {
+        prom_counter(
+            &mut buf,
+            "anthropic_upstream_requests_total",
+            &[("name", &u.name), ("base_url", &u.base_url)],
+            u.requests.load(Ordering::Relaxed),
+        );
+    }
+
+    // Cluster (Redis)
+    if let Some(cluster_info) = state.cluster_info_cache.lock().ok().and_then(|g| g.clone()) {
+        buf.push('\n');
+        prom_header(
+            &mut buf,
+            "anthropic_cluster_redis_connected",
+            "gauge",
+            "Whether Redis is connected",
+        );
+        let connected = cluster_info
+            .get("redis_connected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        prom_gauge(
+            &mut buf,
+            "anthropic_cluster_redis_connected",
+            &[],
+            if connected { 1.0 } else { 0.0 },
+        );
+
+        prom_header(
+            &mut buf,
+            "anthropic_cluster_replicas_seen",
+            "gauge",
+            "Number of cluster replicas",
+        );
+        let replicas = cluster_info
+            .get("replicas_seen")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        prom_gauge(
+            &mut buf,
+            "anthropic_cluster_replicas_seen",
+            &[],
+            replicas as f64,
+        );
+
+        if let Some(budget_usage) = cluster_info.get("budget_usage").and_then(|v| v.as_object()) {
+            prom_header(
+                &mut buf,
+                "anthropic_cluster_budget_limit",
+                "gauge",
+                "Cluster-wide budget limit",
+            );
+            prom_header(
+                &mut buf,
+                "anthropic_cluster_budget_used",
+                "gauge",
+                "Cluster-wide budget used",
+            );
+            for (client, data) in budget_usage {
+                if let Some(limit) = data.get("limit").and_then(|v| v.as_u64()) {
+                    prom_gauge(
+                        &mut buf,
+                        "anthropic_cluster_budget_limit",
+                        &[("client", client)],
+                        limit as f64,
+                    );
+                }
+                if let Some(used) = data.get("used").and_then(|v| v.as_u64()) {
+                    prom_gauge(
+                        &mut buf,
+                        "anthropic_cluster_budget_used",
+                        &[("client", client)],
+                        used as f64,
+                    );
+                }
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        buf,
+    )
+        .into_response()
+}
+
 // ── OpenAI compatibility ─────────────────────────────────────────────
 
 /// Strip markdown JSON fences from LLM output.
@@ -3937,6 +4590,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/_stats", axum::routing::get(stats_handler))
+        .route("/metrics", axum::routing::get(metrics_handler))
         .route(
             "/v1/chat/completions",
             axum::routing::post(openai_chat_handler),
@@ -4198,6 +4852,7 @@ mod tests {
     fn build_router(state: Arc<AppState>) -> Router {
         Router::new()
             .route("/_stats", axum::routing::get(stats_handler))
+            .route("/metrics", axum::routing::get(metrics_handler))
             .route(
                 "/v1/chat/completions",
                 axum::routing::post(openai_chat_handler),
@@ -9988,6 +10643,144 @@ upstream = "https://api.anthropic.com"
         assert!(
             state.check_budget("client-a").await.is_ok(),
             "yesterday's exhausted budget should not block today"
+        );
+    }
+
+    // ── Unit: Prometheus text exposition helpers ──────────────────────
+
+    #[test]
+    fn prometheus_gauge_formats_correctly() {
+        let mut buf = String::new();
+        prom_gauge(&mut buf, "test_metric", &[("label", "value")], 42.5);
+        assert_eq!(buf, "test_metric{label=\"value\"} 42.5\n");
+    }
+
+    #[test]
+    fn prometheus_gauge_no_labels() {
+        let mut buf = String::new();
+        prom_gauge(&mut buf, "test_metric", &[], 1.0);
+        assert_eq!(buf, "test_metric 1\n");
+    }
+
+    #[test]
+    fn prometheus_counter_formats_correctly() {
+        let mut buf = String::new();
+        prom_counter(&mut buf, "test_total", &[("a", "b")], 100);
+        assert_eq!(buf, "test_total{a=\"b\"} 100\n");
+    }
+
+    #[test]
+    fn prometheus_gauge_nan_renders() {
+        let mut buf = String::new();
+        prom_gauge(&mut buf, "test_metric", &[], f64::NAN);
+        assert_eq!(buf, "test_metric NaN\n");
+    }
+
+    #[test]
+    fn prometheus_gauge_multiple_labels() {
+        let mut buf = String::new();
+        prom_gauge(&mut buf, "m", &[("a", "1"), ("b", "2")], 0.0);
+        assert_eq!(buf, "m{a=\"1\",b=\"2\"} 0\n");
+    }
+
+    #[test]
+    fn prometheus_label_escaping() {
+        let mut buf = String::new();
+        prom_gauge(&mut buf, "m", &[("name", "has\"quotes")], 1.0);
+        assert_eq!(buf, "m{name=\"has\\\"quotes\"} 1\n");
+    }
+
+    // ── Integration: /metrics endpoint ───────────────────────────────
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_prometheus_format() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, state) = test_app(&mock_url, None);
+
+        // Set some state so metrics are interesting
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.42);
+            info.utilization_7d = Some(0.35);
+            info.remaining_requests = Some(1000);
+            info.remaining_tokens = Some(500000);
+            info.limit_requests = Some(4000);
+            info.limit_tokens = Some(2000000);
+        }
+        state.accounts[0].requests.store(123, Ordering::Relaxed);
+        state.accounts[0]
+            .input_tokens
+            .store(90000, Ordering::Relaxed);
+        state.accounts[0]
+            .output_tokens
+            .store(30000, Ordering::Relaxed);
+
+        let addr = serve(app).await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("text/plain"),
+            "content-type should be text/plain, got: {ct}"
+        );
+
+        let body = resp.text().await.unwrap();
+
+        // Account metrics present
+        assert!(
+            body.contains("anthropic_account_utilization{account=\"acct-a\",window=\"5h\"} 0.42"),
+            "missing 5h util:\n{body}"
+        );
+        assert!(
+            body.contains("anthropic_account_utilization{account=\"acct-a\",window=\"7d\"} 0.35"),
+            "missing 7d util:\n{body}"
+        );
+        assert!(
+            body.contains("anthropic_account_remaining_requests{account=\"acct-a\"} 1000"),
+            "missing remaining_requests:\n{body}"
+        );
+        assert!(
+            body.contains("anthropic_account_requests_total{account=\"acct-a\"} 123"),
+            "missing requests_total:\n{body}"
+        );
+        assert!(
+            body.contains("anthropic_account_token_usage{account=\"acct-a\",type=\"input\"} 90000"),
+            "missing input tokens:\n{body}"
+        );
+
+        // Second account should also be present
+        assert!(
+            body.contains("anthropic_account_requests_total{account=\"acct-b\"}"),
+            "missing acct-b:\n{body}"
+        );
+
+        // Meta metric
+        assert!(
+            body.contains("anthropic_lb_info{strategy=\"dynamic-capacity\"} 1"),
+            "missing lb_info:\n{body}"
+        );
+
+        // HELP/TYPE headers present
+        assert!(
+            body.contains("# TYPE anthropic_account_utilization gauge"),
+            "missing TYPE header:\n{body}"
+        );
+
+        // Upstream metrics
+        assert!(
+            body.contains("anthropic_upstream_requests_total{name=\"mock\""),
+            "missing upstream:\n{body}"
         );
     }
 }
