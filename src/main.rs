@@ -3928,11 +3928,25 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
                     .get("tool_call_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                // content can be a string or an array of content parts
+                let content_val = msg.get("content");
+                let content_str = content_val
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        content_val?.as_array().map(|parts| {
+                            parts
+                                .iter()
+                                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("")
+                        })
+                    })
+                    .unwrap_or_default();
                 let block = serde_json::json!({
                     "type": "tool_result",
                     "tool_use_id": tool_call_id,
-                    "content": content,
+                    "content": content_str,
                 });
 
                 // If last message is a user message with tool_result blocks, append
@@ -3954,11 +3968,23 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
             } else if role == "assistant" && msg.get("tool_calls").is_some() {
                 // Assistant message with tool_calls → Anthropic content blocks
                 let mut blocks: Vec<serde_json::Value> = Vec::new();
-                // Preserve any text content
-                if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
-                    if !text.is_empty() {
-                        blocks.push(serde_json::json!({"type": "text", "text": text}));
-                    }
+                // Preserve any text content (string or array form)
+                let text_content = msg.get("content");
+                let preamble = text_content
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        text_content?.as_array().map(|parts| {
+                            parts
+                                .iter()
+                                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("")
+                        })
+                    })
+                    .unwrap_or_default();
+                if !preamble.is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": preamble}));
                 }
                 if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
                     for tc in tool_calls {
@@ -4053,9 +4079,10 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
                 if let Some(desc) = func.get("description") {
                     t["description"] = desc.clone();
                 }
-                if let Some(params) = func.get("parameters") {
-                    t["input_schema"] = params.clone();
-                }
+                t["input_schema"] = func
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
                 Some(t)
             })
             .collect();
@@ -6319,6 +6346,63 @@ mod tests {
         let blocks = msgs[0]["content"].as_array().unwrap();
         // Should fall back to empty object, not panic
         assert_eq!(blocks[0]["input"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn translate_request_tool_no_parameters_gets_empty_schema() {
+        let req = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 100,
+            "tools": [{"type": "function", "function": {"name": "get_time", "description": "Get current time"}}]
+        });
+        let result = translate_openai_to_anthropic(&req);
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["name"], "get_time");
+        // input_schema must always be present for Anthropic API
+        assert_eq!(
+            tools[0]["input_schema"],
+            serde_json::json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
+    fn translate_request_tool_result_array_content() {
+        let req = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [
+                {"role": "tool", "tool_call_id": "c1", "content": [
+                    {"type": "text", "text": "Result A"},
+                    {"type": "text", "text": " Result B"}
+                ]}
+            ],
+            "max_tokens": 100
+        });
+        let result = translate_openai_to_anthropic(&req);
+        let msgs = result["messages"].as_array().unwrap();
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["content"], "Result A Result B");
+    }
+
+    #[test]
+    fn translate_request_assistant_array_content_with_tool_calls() {
+        let req = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [
+                {"role": "assistant", "content": [{"type": "text", "text": "Thinking..."}], "tool_calls": [{
+                    "id": "tc_1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "{}"}
+                }]}
+            ],
+            "max_tokens": 100
+        });
+        let result = translate_openai_to_anthropic(&req);
+        let msgs = result["messages"].as_array().unwrap();
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "Thinking...");
+        assert_eq!(blocks[1]["type"], "tool_use");
     }
 
     // ── Unit: OpenAI response translation ───────────────────────────
