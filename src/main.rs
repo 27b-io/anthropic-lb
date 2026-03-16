@@ -4081,6 +4081,7 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
                 }
                 t["input_schema"] = func
                     .get("parameters")
+                    .filter(|v| !v.is_null())
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
                 Some(t)
@@ -6360,6 +6361,22 @@ mod tests {
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools[0]["name"], "get_time");
         // input_schema must always be present for Anthropic API
+        assert_eq!(
+            tools[0]["input_schema"],
+            serde_json::json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
+    fn translate_request_tool_null_parameters_gets_empty_schema() {
+        let req = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 100,
+            "tools": [{"type": "function", "function": {"name": "ping", "description": "Ping", "parameters": null}}]
+        });
+        let result = translate_openai_to_anthropic(&req);
+        let tools = result["tools"].as_array().unwrap();
         assert_eq!(
             tools[0]["input_schema"],
             serde_json::json!({"type": "object", "properties": {}})
