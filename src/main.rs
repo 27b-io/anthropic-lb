@@ -3949,10 +3949,20 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
                     "content": content_str,
                 });
 
-                // If last message is a user message with tool_result blocks, append
+                // If last message is a user message with tool_result blocks, append.
+                // Only merge into arrays that already contain tool_result blocks —
+                // don't corrupt a regular user message that happens to have array content.
                 let merged = messages.last_mut().and_then(|last| {
                     if last.get("role")?.as_str()? == "user" {
-                        last.get_mut("content")?.as_array_mut()
+                        let arr = last.get_mut("content")?.as_array_mut()?;
+                        let has_tool_result = arr.iter().any(|el| {
+                            el.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                        });
+                        if has_tool_result {
+                            Some(arr)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -6314,6 +6324,35 @@ mod tests {
         assert_eq!(blocks[0]["content"], "72F");
         assert_eq!(blocks[1]["tool_use_id"], "c2");
         assert_eq!(blocks[1]["content"], "45F");
+    }
+
+    #[test]
+    fn translate_request_tool_result_does_not_merge_into_regular_user_msg() {
+        // A user message with array-form content should NOT have tool_results
+        // appended to it — that would corrupt the original message.
+        let req = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "test", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "c1", "content": "done"}
+            ],
+            "max_tokens": 100
+        });
+        let result = translate_openai_to_anthropic(&req);
+        let msgs = result["messages"].as_array().unwrap();
+        // user, assistant, user(tool_result) — three separate messages
+        assert_eq!(msgs.len(), 3);
+        // First user message should be untouched
+        let first_user = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(first_user.len(), 1);
+        assert_eq!(first_user[0]["type"], "text");
+        // Third message is the tool_result
+        let tool_msg = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(tool_msg[0]["type"], "tool_result");
     }
 
     #[test]
