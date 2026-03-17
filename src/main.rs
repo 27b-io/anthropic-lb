@@ -1862,7 +1862,7 @@ impl TokenUsage {
 
 impl AppState {
     /// Record token usage for an account and client.
-    fn record_usage(&self, account_idx: usize, client_id: &str, usage: &TokenUsage) {
+    async fn record_usage(&self, account_idx: usize, client_id: &str, usage: &TokenUsage) {
         if usage.is_empty() {
             return;
         }
@@ -1887,7 +1887,7 @@ impl AppState {
                 entry[3] += usage.cache_read_input_tokens;
             }
             // Budget accounting
-            self.record_budget_usage(client_id, total);
+            self.record_budget_usage(client_id, total).await;
         }
     }
 
@@ -1935,8 +1935,9 @@ impl AppState {
     }
 
     /// Record tokens against a client's daily budget.
-    /// Updates local state synchronously; writes to Redis asynchronously (fire-and-forget).
-    fn record_budget_usage(&self, client_id: &str, tokens: u64) {
+    /// Updates local state synchronously; writes to Redis inline (awaited) to prevent
+    /// TOCTOU races where concurrent requests pass check_budget before the counter updates.
+    async fn record_budget_usage(&self, client_id: &str, tokens: u64) {
         if tokens == 0 || !self.client_budgets.contains_key(client_id) {
             return;
         }
@@ -1951,28 +1952,23 @@ impl AppState {
             entry.1 += tokens;
         }
 
-        // Fire-and-forget Redis INCRBY for cross-replica budget tracking
+        // Await Redis INCRBY (not fire-and-forget) so check_budget always sees latest counter
         if let Some(redis) = &self.redis {
+            use redis::AsyncCommands;
             let mut conn = redis.clone();
             let key = format!("alb:budget:{client_id}:{today}");
-            tokio::spawn(async move {
-                use redis::AsyncCommands;
-                let result: redis::RedisResult<u64> = conn.incr(&key, tokens).await;
-                match result {
-                    Ok(_) => {
-                        // Always set TTL (idempotent, O(1)) — avoids orphaned keys
-                        // if a previous EXPIRE was missed
-                        let expire_result: redis::RedisResult<bool> =
-                            conn.expire(&key, 172800).await;
-                        if let Err(e) = expire_result {
-                            tracing::warn!(error = %e, "redis EXPIRE failed for budget key");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "redis INCRBY failed for budget tracking");
+            let result: redis::RedisResult<u64> = conn.incr(&key, tokens).await;
+            match result {
+                Ok(_) => {
+                    let expire_result: redis::RedisResult<bool> = conn.expire(&key, 172800).await;
+                    if let Err(e) = expire_result {
+                        tracing::warn!(error = %e, "redis EXPIRE failed for budget key");
                     }
                 }
-            });
+                Err(e) => {
+                    tracing::warn!(error = %e, "redis INCRBY failed for budget tracking");
+                }
+            }
         }
     }
 
@@ -2558,7 +2554,9 @@ async fn proxy_handler(
                 let text = String::from_utf8_lossy(&sse_buf);
                 let usage = TokenUsage::from_sse_text(&text);
                 if !usage.is_empty() {
-                    state_clone.record_usage(idx, &client_id_clone, &usage);
+                    state_clone
+                        .record_usage(idx, &client_id_clone, &usage)
+                        .await;
                 }
                 state_clone.shadow_log(serde_json::json!({
                     "ts": AppState::now_epoch(),
@@ -2591,7 +2589,7 @@ async fn proxy_handler(
             if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
                 usage = TokenUsage::from_response_body(&parsed);
                 if !usage.is_empty() {
-                    state.record_usage(idx, &client_id, &usage);
+                    state.record_usage(idx, &client_id, &usage).await;
                 }
             }
             state.shadow_log(serde_json::json!({
@@ -4676,7 +4674,9 @@ async fn openai_chat_handler(
                 // Extract and record token usage from accumulated SSE data
                 let usage = TokenUsage::from_sse_text(&raw_sse);
                 if !usage.is_empty() {
-                    state_clone.record_usage(idx, &client_id_clone, &usage);
+                    state_clone
+                        .record_usage(idx, &client_id_clone, &usage)
+                        .await;
                 }
                 state_clone.shadow_log(serde_json::json!({
                     "ts": AppState::now_epoch(),
@@ -4738,7 +4738,7 @@ async fn openai_chat_handler(
         // Extract and record token usage from non-streaming response
         let usage = TokenUsage::from_response_body(&anthropic_resp);
         if !usage.is_empty() {
-            state.record_usage(idx, &client_id, &usage);
+            state.record_usage(idx, &client_id, &usage).await;
         }
         state.shadow_log(serde_json::json!({
             "ts": AppState::now_epoch(),
@@ -7246,8 +7246,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(usage.is_empty());
     }
 
-    #[test]
-    fn record_usage_updates_account_and_client() {
+    #[tokio::test]
+    async fn record_usage_updates_account_and_client() {
         let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
         let usage = TokenUsage {
             input_tokens: 100,
@@ -7255,7 +7255,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cache_creation_input_tokens: 20,
             cache_read_input_tokens: 30,
         };
-        state.record_usage(0, "test-client", &usage);
+        state.record_usage(0, "test-client", &usage).await;
 
         assert_eq!(state.accounts[0].input_tokens.load(Ordering::Relaxed), 100);
         assert_eq!(state.accounts[0].output_tokens.load(Ordering::Relaxed), 50);
@@ -7275,8 +7275,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(client, &[100, 50, 20, 30]);
     }
 
-    #[test]
-    fn record_usage_ignores_anonymous() {
+    #[tokio::test]
+    async fn record_usage_ignores_anonymous() {
         let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
         let usage = TokenUsage {
             input_tokens: 100,
@@ -7284,7 +7284,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         };
-        state.record_usage(0, "-", &usage);
+        state.record_usage(0, "-", &usage).await;
 
         // Account gets updated
         assert_eq!(state.accounts[0].input_tokens.load(Ordering::Relaxed), 100);
@@ -7450,11 +7450,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(state.check_budget("client-a").await.is_ok());
 
         // Record some usage
-        state.record_budget_usage("client-a", 500);
+        state.record_budget_usage("client-a", 500).await;
         assert!(state.check_budget("client-a").await.is_ok());
 
         // Exceed budget
-        state.record_budget_usage("client-a", 600);
+        state.record_budget_usage("client-a", 600).await;
         assert!(state.check_budget("client-a").await.is_err());
 
         // Unknown client has no budget, always ok
@@ -10806,9 +10806,9 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         // Budget check uses local path when redis is None
         assert!(state.check_budget("client-a").await.is_ok());
-        state.record_budget_usage("client-a", 80);
+        state.record_budget_usage("client-a", 80).await;
         assert!(state.check_budget("client-a").await.is_ok());
-        state.record_budget_usage("client-a", 30);
+        state.record_budget_usage("client-a", 30).await;
         assert!(state.check_budget("client-a").await.is_err());
     }
 
@@ -10902,8 +10902,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(info.hard_limited_until.is_some());
     }
 
-    #[test]
-    fn record_budget_usage_skips_zero_tokens() {
+    #[tokio::test]
+    async fn record_budget_usage_skips_zero_tokens() {
         let mut budgets = HashMap::new();
         budgets.insert("client-a".to_string(), 100u64);
         let state = Arc::new(AppState {
@@ -10935,16 +10935,16 @@ data: {\"type\":\"message_stop\"}\n\n";
         });
 
         // Recording 0 tokens should be a no-op
-        state.record_budget_usage("client-a", 0);
+        state.record_budget_usage("client-a", 0).await;
         let map = state.budget_usage.lock().unwrap();
         assert!(map.get("client-a").is_none());
     }
 
-    #[test]
-    fn record_budget_usage_skips_unknown_client() {
+    #[tokio::test]
+    async fn record_budget_usage_skips_unknown_client() {
         let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
         // No budgets configured — recording should be a no-op
-        state.record_budget_usage("unknown-client", 500);
+        state.record_budget_usage("unknown-client", 500).await;
         let map = state.budget_usage.lock().unwrap();
         assert!(map.is_empty());
     }
@@ -11393,8 +11393,8 @@ upstream = "https://api.anthropic.com"
 
     // ── Budget day rollover ──────────────────────────────────────
 
-    #[test]
-    fn budget_day_rollover_resets_counter() {
+    #[tokio::test]
+    async fn budget_day_rollover_resets_counter() {
         let mut budgets = HashMap::new();
         budgets.insert("client-a".to_string(), 10000u64);
         let state = Arc::new(AppState {
@@ -11433,7 +11433,7 @@ upstream = "https://api.anthropic.com"
         }
 
         // Recording usage today should reset the counter (day rollover)
-        state.record_budget_usage("client-a", 50);
+        state.record_budget_usage("client-a", 50).await;
 
         let map = state.budget_usage.lock().unwrap();
         let (day, used) = map.get("client-a").unwrap();
