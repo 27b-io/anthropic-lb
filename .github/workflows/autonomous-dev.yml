@@ -8,6 +8,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: autonomous-exec-${{ inputs.issue_number }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
   pull-requests: write
