@@ -79,7 +79,7 @@ struct AccountConfig {
     /// Auth token. Use "passthrough" to forward caller's auth headers as-is.
     token: String,
     /// Optional model allowlist. If set, this account only serves these models.
-    /// Supports exact names ("claude-sonnet-4-20250514") and prefixes ("claude-opus-*").
+    /// Supports exact names ("claude-sonnet-4-6") and prefixes ("claude-opus-*").
     #[serde(default)]
     models: Vec<String>,
 }
@@ -1069,7 +1069,12 @@ impl AppState {
     /// (1.0 - utilization). An affinity key hashes to a stable position in the bucket space,
     /// providing stickiness. As utilization changes, bucket boundaries shift and clients near
     /// the edges naturally migrate — no timers or thresholds needed.
-    async fn pick_account(&self, affinity_key: Option<&str>, model: &str) -> Option<usize> {
+    async fn pick_account(
+        &self,
+        affinity_key: Option<&str>,
+        model: &str,
+        skip: &[usize],
+    ) -> Option<usize> {
         let now = Instant::now();
         let now_epoch = Self::now_epoch();
 
@@ -1083,6 +1088,10 @@ impl AppState {
         }
         let mut candidates: Vec<Candidate> = Vec::new();
         for (i, acct) in self.accounts.iter().enumerate() {
+            if skip.contains(&i) {
+                trace!(account = acct.name, "pick: skipping, already tried");
+                continue;
+            }
             if !acct.serves_model(model) {
                 trace!(
                     account = acct.name,
@@ -2335,8 +2344,9 @@ async fn proxy_handler(
     };
 
     let n = state.accounts.len();
+    let mut skip: Vec<usize> = Vec::new();
     for _attempt in 0..n {
-        let idx = match state.pick_account(affinity, &model).await {
+        let idx = match state.pick_account(affinity, &model, &skip).await {
             Some(i) => i,
             None => {
                 warn!("all accounts rate-limited");
@@ -2462,6 +2472,7 @@ async fn proxy_handler(
             log_429_details(&acct.name, resp).await;
             state.save_state().await;
             info!(account = acct.name, "got 429, rotating to next account");
+            skip.push(idx);
             continue;
         }
 
@@ -2473,6 +2484,7 @@ async fn proxy_handler(
                 status = status.as_u16(),
                 "got server error, rotating to next account"
             );
+            skip.push(idx);
             continue;
         }
 
@@ -4450,8 +4462,9 @@ async fn openai_chat_handler(
     };
 
     let n = state.accounts.len();
+    let mut skip: Vec<usize> = Vec::new();
     for _attempt in 0..n {
-        let idx = match state.pick_account(affinity, &model).await {
+        let idx = match state.pick_account(affinity, &model, &skip).await {
             Some(i) => i,
             None => {
                 warn!("all accounts rate-limited");
@@ -4557,6 +4570,7 @@ async fn openai_chat_handler(
             log_429_details(&acct.name, resp).await;
             state.save_state().await;
             info!(account = acct.name, "got 429, rotating to next account");
+            skip.push(idx);
             continue;
         }
 
@@ -4568,6 +4582,7 @@ async fn openai_chat_handler(
                 status = status.as_u16(),
                 "got server error, rotating to next account"
             );
+            skip.push(idx);
             continue;
         }
 
@@ -5368,7 +5383,7 @@ mod tests {
 
         let mut counts = [0u32; 2];
         for _ in 0..1000 {
-            let idx = state.pick_account(None, "").await.unwrap();
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
             counts[idx] += 1;
         }
 
@@ -5399,7 +5414,7 @@ mod tests {
             info.utilization = Some(0.9);
         }
 
-        let idx = state.pick_account(None, "").await.unwrap();
+        let idx = state.pick_account(None, "", &[]).await.unwrap();
         assert_eq!(
             idx, 1,
             "should skip hard-limited account despite lower utilization"
@@ -5418,7 +5433,7 @@ mod tests {
         // Call many times without affinity — Fibonacci scatter should distribute evenly
         let mut counts = [0u32; 3];
         for _ in 0..300 {
-            let idx = state.pick_account(None, "").await.unwrap();
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
             counts[idx] += 1;
         }
 
@@ -5446,7 +5461,7 @@ mod tests {
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
         }
 
-        assert!(state.pick_account(None, "").await.is_none());
+        assert!(state.pick_account(None, "", &[]).await.is_none());
     }
 
     #[tokio::test]
@@ -5469,7 +5484,7 @@ mod tests {
             info.last_updated = Some(hard_limit_time - Duration::from_secs(1));
         }
 
-        let result = state.pick_account(None, "").await;
+        let result = state.pick_account(None, "", &[]).await;
         assert!(
             result.is_some(),
             "account with expired hard limit should be selectable despite stale high utilization"
@@ -5501,7 +5516,7 @@ mod tests {
         }
 
         let result = state
-            .pick_account(Some("test"), "claude-sonnet-4-5-20250929")
+            .pick_account(Some("test"), "claude-sonnet-4-6", &[])
             .await;
         assert!(
             result.is_some(),
@@ -5542,7 +5557,7 @@ mod tests {
         }
 
         let result = state
-            .pick_account(Some("test"), "claude-sonnet-4-5-20250929")
+            .pick_account(Some("test"), "claude-sonnet-4-6", &[])
             .await;
         assert_eq!(
             result,
@@ -5575,7 +5590,7 @@ mod tests {
         // low_util should get ~80% of traffic (headroom=0.8 vs 0.2)
         let mut counts = [0u32; 2];
         for _ in 0..1000 {
-            let idx = state.pick_account(None, "").await.unwrap();
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
             counts[idx] += 1;
         }
         let low_pct = counts[0] as f64 / 1000.0;
@@ -5752,7 +5767,7 @@ mod tests {
         // known should get ~64% (0.9 / 1.4), unknown ~36% (0.5 / 1.4)
         let mut counts = [0u32; 2];
         for _ in 0..1000 {
-            let idx = state.pick_account(None, "").await.unwrap();
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
             counts[idx] += 1;
         }
 
@@ -5788,9 +5803,9 @@ mod tests {
         }
 
         let key = "192.168.1.1:client-42:agent-7:session-abc";
-        let first = state.pick_account(Some(key), "").await.unwrap();
+        let first = state.pick_account(Some(key), "", &[]).await.unwrap();
         for _ in 0..100 {
-            let idx = state.pick_account(Some(key), "").await.unwrap();
+            let idx = state.pick_account(Some(key), "", &[]).await.unwrap();
             assert_eq!(
                 idx, first,
                 "same affinity key must always pick same account"
@@ -5822,7 +5837,7 @@ mod tests {
         let mut primary_keys: Vec<String> = Vec::new();
         for i in 0..500 {
             let key = format!("test-client-{}", i);
-            if state.pick_account(Some(&key), "").await.unwrap() == 0 {
+            if state.pick_account(Some(&key), "", &[]).await.unwrap() == 0 {
                 primary_keys.push(key);
             }
         }
@@ -5840,7 +5855,7 @@ mod tests {
         // Most of these clients should migrate to backup
         let mut migrated = 0usize;
         for key in &primary_keys {
-            if state.pick_account(Some(key), "").await.unwrap() == 1 {
+            if state.pick_account(Some(key), "", &[]).await.unwrap() == 1 {
                 migrated += 1;
             }
         }
@@ -5882,7 +5897,7 @@ mod tests {
         let mut counts = [0u32; 3];
         let total = 10000u32;
         for _ in 0..total {
-            let idx = state.pick_account(None, "").await.unwrap();
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
             counts[idx] += 1;
         }
 
@@ -6069,7 +6084,7 @@ mod tests {
     #[test]
     fn translate_request_extracts_system() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [
                 {"role": "system", "content": "You are helpful"},
                 {"role": "user", "content": "Hello"}
@@ -6087,7 +6102,7 @@ mod tests {
     #[test]
     fn translate_request_multi_system_concat() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [
                 {"role": "system", "content": "Rule 1"},
                 {"role": "system", "content": "Rule 2"},
@@ -6102,7 +6117,7 @@ mod tests {
     #[test]
     fn translate_request_no_system() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [
                 {"role": "user", "content": "Hello"}
             ],
@@ -6115,7 +6130,7 @@ mod tests {
     #[test]
     fn translate_request_default_max_tokens() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "Hello"}]
         });
         let result = translate_openai_to_anthropic(&req);
@@ -6125,7 +6140,7 @@ mod tests {
     #[test]
     fn translate_request_stop_to_stop_sequences() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "Hello"}],
             "max_tokens": 100,
             "stop": ["END", "STOP"]
@@ -6140,7 +6155,7 @@ mod tests {
     #[test]
     fn translate_request_passthrough_params() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "Hello"}],
             "max_tokens": 512,
             "temperature": 0.7,
@@ -6148,7 +6163,7 @@ mod tests {
             "stream": true
         });
         let result = translate_openai_to_anthropic(&req);
-        assert_eq!(result["model"], "claude-sonnet-4-20250514");
+        assert_eq!(result["model"], "claude-sonnet-4-6");
         assert_eq!(result["max_tokens"], 512);
         assert_eq!(result["temperature"], 0.7);
         assert_eq!(result["top_p"], 0.9);
@@ -6158,7 +6173,7 @@ mod tests {
     #[test]
     fn translate_request_strips_name_field() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [
                 {"role": "user", "content": "Hello", "name": "bob"}
             ],
@@ -6172,7 +6187,7 @@ mod tests {
     #[test]
     fn translate_request_tools() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "What's the weather?"}],
             "max_tokens": 100,
             "tools": [{
@@ -6201,7 +6216,7 @@ mod tests {
     fn translate_request_tool_choice_variants() {
         // auto
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "Hi"}],
             "tool_choice": "auto"
         });
@@ -6210,7 +6225,7 @@ mod tests {
 
         // required → any
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "Hi"}],
             "tool_choice": "required"
         });
@@ -6219,7 +6234,7 @@ mod tests {
 
         // specific function
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "Hi"}],
             "tool_choice": {"type": "function", "function": {"name": "search"}}
         });
@@ -6229,7 +6244,7 @@ mod tests {
 
         // none → omitted
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "Hi"}],
             "tool_choice": "none"
         });
@@ -6240,7 +6255,7 @@ mod tests {
     #[test]
     fn translate_request_tool_result_message() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [
                 {"role": "user", "content": "What's the weather?"},
                 {"role": "assistant", "content": null, "tool_calls": [{
@@ -6275,7 +6290,7 @@ mod tests {
     #[test]
     fn translate_request_assistant_tool_calls_with_text() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [
                 {"role": "assistant", "content": "Let me check.", "tool_calls": [{
                     "id": "tc_1",
@@ -6300,7 +6315,7 @@ mod tests {
         // Parallel tool calls produce consecutive role:"tool" messages.
         // Anthropic rejects consecutive same-role messages, so they must merge.
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [
                 {"role": "user", "content": "Weather in SF and NYC?"},
                 {"role": "assistant", "content": null, "tool_calls": [
@@ -6330,7 +6345,7 @@ mod tests {
         // A user message with array-form content should NOT have tool_results
         // appended to it — that would corrupt the original message.
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [
                 {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
                 {"role": "assistant", "content": null, "tool_calls": [{
@@ -6357,7 +6372,7 @@ mod tests {
     #[test]
     fn translate_request_tool_choice_none_removes_tools() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "Hi"}],
             "tools": [{"type": "function", "function": {"name": "search", "description": "Search", "parameters": {"type": "object"}}}],
             "tool_choice": "none"
@@ -6370,7 +6385,7 @@ mod tests {
     #[test]
     fn translate_request_malformed_arguments_json() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [
                 {"role": "assistant", "content": null, "tool_calls": [{
                     "id": "tc_bad",
@@ -6390,7 +6405,7 @@ mod tests {
     #[test]
     fn translate_request_tool_no_parameters_gets_empty_schema() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "Hi"}],
             "max_tokens": 100,
             "tools": [{"type": "function", "function": {"name": "get_time", "description": "Get current time"}}]
@@ -6408,7 +6423,7 @@ mod tests {
     #[test]
     fn translate_request_tool_null_parameters_gets_empty_schema() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "Hi"}],
             "max_tokens": 100,
             "tools": [{"type": "function", "function": {"name": "ping", "description": "Ping", "parameters": null}}]
@@ -6424,7 +6439,7 @@ mod tests {
     #[test]
     fn translate_request_tool_result_array_content() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [
                 {"role": "tool", "tool_call_id": "c1", "content": [
                     {"type": "text", "text": "Result A"},
@@ -6442,7 +6457,7 @@ mod tests {
     #[test]
     fn translate_request_assistant_array_content_with_tool_calls() {
         let req = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [
                 {"role": "assistant", "content": [{"type": "text", "text": "Thinking..."}], "tool_calls": [{
                     "id": "tc_1",
@@ -6468,7 +6483,7 @@ mod tests {
             "id": "msg_abc123",
             "type": "message",
             "content": [{"type": "text", "text": "Hello!"}],
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 10, "output_tokens": 5}
         });
@@ -6485,7 +6500,7 @@ mod tests {
         let resp = serde_json::json!({
             "id": "msg_x",
             "content": [{"type": "text", "text": "ok"}],
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 25, "output_tokens": 15}
         });
@@ -6534,7 +6549,7 @@ mod tests {
         let resp = serde_json::json!({
             "id": "msg_fenced",
             "content": [{"type": "text", "text": "```json\n{\"skipSearch\": true}\n```"}],
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 10, "output_tokens": 5}
         });
@@ -6553,7 +6568,7 @@ mod tests {
             "content": [
                 {"type": "tool_use", "id": "toolu_123", "name": "get_weather", "input": {"location": "SF"}}
             ],
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "stop_reason": "tool_use",
             "usage": {"input_tokens": 20, "output_tokens": 15}
         });
@@ -6581,7 +6596,7 @@ mod tests {
                 {"type": "text", "text": "Let me check."},
                 {"type": "tool_use", "id": "toolu_456", "name": "search", "input": {"q": "rust"}}
             ],
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "stop_reason": "tool_use",
             "usage": {"input_tokens": 10, "output_tokens": 10}
         });
@@ -6599,11 +6614,11 @@ mod tests {
     #[test]
     fn translate_sse_message_start() {
         let mut ctx = StreamContext::default();
-        let raw = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"model\":\"claude-sonnet-4-20250514\",\"role\":\"assistant\"}}";
+        let raw = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\"}}";
         let result = translate_sse_event(raw, &mut ctx).unwrap();
         assert!(result.starts_with("data: "));
         assert_eq!(ctx.id, "chatcmpl-msg_test");
-        assert_eq!(ctx.model, "claude-sonnet-4-20250514");
+        assert_eq!(ctx.model, "claude-sonnet-4-6");
         let chunk: serde_json::Value =
             serde_json::from_str(result.strip_prefix("data: ").unwrap().trim()).unwrap();
         assert_eq!(chunk["choices"][0]["delta"]["role"], "assistant");
@@ -6613,7 +6628,7 @@ mod tests {
     fn translate_sse_content_delta() {
         let mut ctx = StreamContext {
             id: "chatcmpl-test".to_string(),
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             ..Default::default()
         };
         let raw = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello world\"}}";
@@ -6757,7 +6772,7 @@ mod tests {
             "id": "msg_integration",
             "type": "message",
             "content": [{"type": "text", "text": "Hello from Claude"}],
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 10, "output_tokens": 5}
         }))
@@ -6784,7 +6799,7 @@ mod tests {
         }
 
         let events = [
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
@@ -6874,7 +6889,7 @@ mod tests {
         let resp = client
             .post(format!("http://{}/v1/chat/completions", addr))
             .header("content-type", "application/json")
-            .body(r#"{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}"#)
+            .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}"#)
             .send()
             .await
             .unwrap();
@@ -6920,7 +6935,7 @@ mod tests {
         let resp = client
             .post(format!("http://{}/v1/chat/completions", addr))
             .header("content-type", "application/json")
-            .body(r#"{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"Hello"}],"max_tokens":100,"stream":true}"#)
+            .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hello"}],"max_tokens":100,"stream":true}"#)
             .send()
             .await
             .unwrap();
@@ -7010,7 +7025,7 @@ mod tests {
     #[test]
     fn inject_cache_no_existing() {
         let mut body = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "max_tokens": 1024,
             "system": "You are a helpful assistant.",
             "tools": [
@@ -7055,7 +7070,7 @@ mod tests {
     #[test]
     fn inject_cache_system_array() {
         let mut body = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "system": [
                 {"type": "text", "text": "System prompt part 1"},
                 {"type": "text", "text": "System prompt part 2"}
@@ -7076,7 +7091,7 @@ mod tests {
     #[test]
     fn inject_cache_already_present() {
         let mut body = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "system": [
                 {"type": "text", "text": "Cached system", "cache_control": {"type": "ephemeral"}}
             ],
@@ -7098,7 +7113,7 @@ mod tests {
     #[test]
     fn inject_cache_already_present_in_tools() {
         let mut body = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "tools": [
                 {"name": "t1", "cache_control": {"type": "ephemeral"}}
             ],
@@ -7114,7 +7129,7 @@ mod tests {
     #[test]
     fn inject_cache_already_present_in_message_content() {
         let mut body = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "messages": [
                 {"role": "user", "content": [
                     {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
@@ -7297,26 +7312,26 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn account_serves_model_no_filter() {
         let acct = make_account("a", "sk-ant-api-x");
-        assert!(acct.serves_model("claude-opus-4-20250514"));
-        assert!(acct.serves_model("claude-haiku-4-5-20251001"));
+        assert!(acct.serves_model("claude-opus-4-6"));
+        assert!(acct.serves_model("claude-haiku-4-5"));
         assert!(acct.serves_model(""));
     }
 
     #[test]
     fn account_serves_model_exact_match() {
         let mut acct = make_account("a", "sk-ant-api-x");
-        acct.models = vec!["claude-sonnet-4-20250514".to_string()];
-        assert!(acct.serves_model("claude-sonnet-4-20250514"));
-        assert!(!acct.serves_model("claude-opus-4-20250514"));
+        acct.models = vec!["claude-sonnet-4-6".to_string()];
+        assert!(acct.serves_model("claude-sonnet-4-6"));
+        assert!(!acct.serves_model("claude-opus-4-6"));
     }
 
     #[test]
     fn account_serves_model_prefix_match() {
         let mut acct = make_account("a", "sk-ant-api-x");
         acct.models = vec!["claude-opus-*".to_string(), "claude-sonnet-*".to_string()];
-        assert!(acct.serves_model("claude-opus-4-20250514"));
-        assert!(acct.serves_model("claude-sonnet-4-20250514"));
-        assert!(!acct.serves_model("claude-haiku-4-5-20251001"));
+        assert!(acct.serves_model("claude-opus-4-6"));
+        assert!(acct.serves_model("claude-sonnet-4-6"));
+        assert!(!acct.serves_model("claude-haiku-4-5"));
     }
 
     #[tokio::test]
@@ -7330,14 +7345,14 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         // Requesting opus: both accounts eligible
         let idx = state
-            .pick_account(None, "claude-opus-4-20250514")
+            .pick_account(None, "claude-opus-4-6", &[])
             .await
             .unwrap();
         assert!(idx == 0 || idx == 1);
 
         // Requesting haiku: only acct_b eligible
         let idx = state
-            .pick_account(None, "claude-haiku-4-5-20251001")
+            .pick_account(None, "claude-haiku-4-5", &[])
             .await
             .unwrap();
         assert_eq!(idx, 1);
@@ -7396,7 +7411,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Try many affinity keys — all should route to healthy (idx 0)
         for i in 0..20 {
             let key = format!("client-{}", i);
-            let idx = state.pick_account(Some(&key), "any").await.unwrap();
+            let idx = state.pick_account(Some(&key), "any", &[]).await.unwrap();
             assert_eq!(
                 idx, 0,
                 "client '{}' routed to overloaded account despite soft limit",
@@ -7506,7 +7521,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .post(format!("http://{}/v1/messages", app_addr))
             .header("content-type", "application/json")
             .header("x-api-key", "any")
-            .body(r#"{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}"#)
+            .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#)
             .send()
             .await
             .unwrap();
@@ -7828,7 +7843,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             info.reset_5h = Some(now_epoch + 7200);
             info.reset_7d = Some(now_epoch + 86400);
         }
-        let result = state.pick_account(None, "").await;
+        let result = state.pick_account(None, "", &[]).await;
         assert_eq!(result, None, "all-rejected should return None");
     }
 
@@ -7896,7 +7911,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Run 100 picks without affinity to see distribution
         let mut a_count = 0;
         for _ in 0..100 {
-            if let Some(idx) = state.pick_account(None, "").await {
+            if let Some(idx) = state.pick_account(None, "", &[]).await {
                 if idx == 0 {
                     a_count += 1;
                 }
@@ -7967,7 +7982,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         let mut b_count = 0;
         for _ in 0..100 {
-            if let Some(idx) = state.pick_account(None, "").await {
+            if let Some(idx) = state.pick_account(None, "", &[]).await {
                 if idx == 1 {
                     b_count += 1;
                 }
@@ -8007,7 +8022,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         let mut b_count = 0;
         for _ in 0..100 {
-            if let Some(idx) = state.pick_account(None, "").await {
+            if let Some(idx) = state.pick_account(None, "", &[]).await {
                 if idx == 1 {
                     b_count += 1;
                 }
@@ -8328,7 +8343,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d: claims,
             ..Default::default()
         };
-        let claim = resolve_7d_claim(&info, "claude-sonnet-4-5-20250929").unwrap();
+        let claim = resolve_7d_claim(&info, "claude-sonnet-4-6").unwrap();
         assert!(
             (claim.utilization - 0.80).abs() < 0.001,
             "should pick model-specific claim"
@@ -8350,7 +8365,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d: claims,
             ..Default::default()
         };
-        let claim = resolve_7d_claim(&info, "claude-sonnet-4-5-20250929").unwrap();
+        let claim = resolve_7d_claim(&info, "claude-sonnet-4-6").unwrap();
         assert!(
             (claim.utilization - 0.50).abs() < 0.001,
             "should fall back to general"
@@ -8360,7 +8375,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn resolve_7d_claim_empty_claims() {
         let info = RateLimitInfo::default();
-        assert!(resolve_7d_claim(&info, "claude-sonnet-4-5-20250929").is_none());
+        assert!(resolve_7d_claim(&info, "claude-sonnet-4-6").is_none());
     }
 
     #[test]
@@ -8664,8 +8679,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util_sonnet, _) =
-            effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        let (util_sonnet, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
         let (util_opus, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
         // Sonnet 7d at 0.85 (max with 5h 0.30) = 0.85, Opus 7d at 0.10 (max with 5h 0.30) = 0.30
         assert!(
@@ -8700,10 +8714,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util_sonnet, _) =
-            effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        let (util_sonnet, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
         let (util_opus, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
-        let (util_haiku, _) = effective_utilization(&info, now_epoch, "claude-haiku-4-5-20251001");
+        let (util_haiku, _) = effective_utilization(&info, now_epoch, "claude-haiku-4-5");
         // All should see the same general claim (0.50, no penalty)
         assert!(
             (util_sonnet - 0.50).abs() < 0.01,
@@ -8741,8 +8754,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             "opus should only see 5h: got {util_opus}"
         );
 
-        let (util_sonnet, _) =
-            effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        let (util_sonnet, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
         assert!(
             (util_sonnet - 0.95).abs() < 0.01,
             "sonnet should be 0.95: got {util_sonnet}"
@@ -8812,8 +8824,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..Default::default()
         };
         // For sonnet model: sonnet claim is stale, no general fallback → only 5h
-        let (util_sonnet, source) =
-            effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        let (util_sonnet, source) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
         assert_eq!(source, "time_adjusted_5h");
         assert!(
             (util_sonnet - 0.20).abs() < 0.01,
@@ -8831,10 +8842,10 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn model_family_extraction() {
-        assert_eq!(model_family("claude-sonnet-4-5-20250929"), "sonnet");
+        assert_eq!(model_family("claude-sonnet-4-6"), "sonnet");
         assert_eq!(model_family("claude-opus-4-6"), "opus");
-        assert_eq!(model_family("claude-haiku-4-5-20251001"), "haiku");
-        assert_eq!(model_family("claude-3-5-sonnet-20240620"), "sonnet");
+        assert_eq!(model_family("claude-haiku-4-5"), "haiku");
+        assert_eq!(model_family("claude-3-5-sonnet"), "sonnet");
         assert_eq!(model_family("unknown-model"), "");
     }
 
@@ -8850,7 +8861,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             // claims_7d empty — migration/compat path
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch, "claude-sonnet-4-5-20250929");
+        let (util, source) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
         assert_eq!(source, "time_adjusted");
         assert!((util - 0.60).abs() < 0.01, "should use flat 7d: got {util}");
     }
@@ -8870,9 +8881,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         set_account_utilization(&state, 1, 0.10, 0.10, now + 10000, now + 100000).await;
 
         // Set model-specific 7d utilization
-        set_model_utilization(&state, 0, "claude-sonnet-4-5-20250929", 0.90, now + 100000).await;
+        set_model_utilization(&state, 0, "claude-sonnet-4-6", 0.90, now + 100000).await;
         set_model_utilization(&state, 0, "claude-opus-4-6", 0.10, now + 100000).await;
-        set_model_utilization(&state, 1, "claude-sonnet-4-5-20250929", 0.10, now + 100000).await;
+        set_model_utilization(&state, 1, "claude-sonnet-4-6", 0.10, now + 100000).await;
         set_model_utilization(&state, 1, "claude-opus-4-6", 0.90, now + 100000).await;
 
         // Run many picks — Sonnet routing should consistently prefer B (index 1)
@@ -8881,12 +8892,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         for i in 0..100 {
             let key = format!("client_{}", i);
             if let Some(idx) = state
-                .pick_account(Some(&key), "claude-sonnet-4-5-20250929")
+                .pick_account(Some(&key), "claude-sonnet-4-6", &[])
                 .await
             {
                 sonnet_picks[idx] += 1;
             }
-            if let Some(idx) = state.pick_account(Some(&key), "claude-opus-4-6").await {
+            if let Some(idx) = state.pick_account(Some(&key), "claude-opus-4-6", &[]).await {
                 opus_picks[idx] += 1;
             }
         }
@@ -8949,7 +8960,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         for i in 0..200 {
             let key = format!("client_{}", i);
             if let Some(idx) = state
-                .pick_account(Some(&key), "claude-sonnet-4-5-20250929")
+                .pick_account(Some(&key), "claude-sonnet-4-6", &[])
                 .await
             {
                 picks[idx] += 1;
@@ -9004,7 +9015,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         for i in 0..500 {
             let key = format!("client_{}", i);
             if let Some(idx) = state
-                .pick_account(Some(&key), "claude-sonnet-4-5-20250929")
+                .pick_account(Some(&key), "claude-sonnet-4-6", &[])
                 .await
             {
                 picks[idx] += 1;
@@ -9049,7 +9060,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         for i in 0..200 {
             let key = format!("client_{}", i);
             if let Some(idx) = state
-                .pick_account(Some(&key), "claude-sonnet-4-5-20250929")
+                .pick_account(Some(&key), "claude-sonnet-4-6", &[])
                 .await
             {
                 picks[idx] += 1;
@@ -9114,7 +9125,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
 
         let result = state
-            .pick_account(Some("test"), "claude-sonnet-4-5-20250929")
+            .pick_account(Some("test"), "claude-sonnet-4-6", &[])
             .await;
         assert!(
             result.is_none(),
@@ -10522,8 +10533,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn account_serves_model_empty_filter_allows_all() {
         let acct = make_account("test", "sk-ant-api-x");
-        assert!(acct.serves_model("claude-sonnet-4-20250514"));
-        assert!(acct.serves_model("claude-opus-4-20241113"));
+        assert!(acct.serves_model("claude-sonnet-4-6"));
+        assert!(acct.serves_model("claude-opus-4-6"));
         assert!(acct.serves_model(""));
     }
 
@@ -10532,23 +10543,20 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut acct = make_account("test", "sk-ant-api-x");
         acct.models = vec!["claude-opus-*".to_string()];
 
-        assert!(acct.serves_model("claude-opus-4-20241113"));
+        assert!(acct.serves_model("claude-opus-4-6"));
         assert!(acct.serves_model("claude-opus-future"));
-        assert!(!acct.serves_model("claude-sonnet-4-20250514"));
+        assert!(!acct.serves_model("claude-sonnet-4-6"));
     }
 
     #[test]
     fn account_serves_model_multiple_patterns() {
         let mut acct = make_account("test", "sk-ant-api-x");
-        acct.models = vec![
-            "claude-opus-*".to_string(),
-            "claude-sonnet-4-20250514".to_string(),
-        ];
+        acct.models = vec!["claude-opus-*".to_string(), "claude-sonnet-4-6".to_string()];
 
-        assert!(acct.serves_model("claude-opus-4-20241113"));
-        assert!(acct.serves_model("claude-sonnet-4-20250514"));
-        assert!(!acct.serves_model("claude-sonnet-3-5-20240229"));
-        assert!(!acct.serves_model("claude-haiku-3-5-20250219"));
+        assert!(acct.serves_model("claude-opus-4-6"));
+        assert!(acct.serves_model("claude-sonnet-4-6"));
+        assert!(!acct.serves_model("claude-sonnet-3-5"));
+        assert!(!acct.serves_model("claude-haiku-3-5"));
     }
 
     #[tokio::test]
@@ -10626,7 +10634,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         // All requests should go to healthy account
         for _ in 0..100 {
-            let idx = state.pick_account(None, "").await.unwrap();
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
             assert_eq!(idx, 1, "rejected account should receive no traffic");
         }
     }
@@ -10666,7 +10674,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Both accounts should receive traffic
         let mut counts = [0u32; 2];
         for _ in 0..1000 {
-            let idx = state.pick_account(None, "").await.unwrap();
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
             counts[idx] += 1;
         }
 
@@ -10815,7 +10823,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn redis_rate_info_serialization_roundtrip() {
         let mut claims = HashMap::new();
         claims.insert(
-            "claude-sonnet-4-20250514".to_string(),
+            "claude-sonnet-4-6".to_string(),
             ClaimWindowData {
                 utilization: 0.42,
                 reset: Some(1700000000),
@@ -10850,10 +10858,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(info.reset_7d, deserialized.reset_7d);
         assert_eq!(info.updated_at, deserialized.updated_at);
         assert_eq!(info.claims_7d.len(), deserialized.claims_7d.len());
-        let claim = deserialized
-            .claims_7d
-            .get("claude-sonnet-4-20250514")
-            .unwrap();
+        let claim = deserialized.claims_7d.get("claude-sonnet-4-6").unwrap();
         assert_eq!(claim.utilization, 0.42);
         assert_eq!(claim.reset, Some(1700000000));
     }
@@ -11013,7 +11018,7 @@ token = "sk-ant-oat01-token1"
 [[accounts]]
 name = "acct-b"
 token = "sk-ant-api-token2"
-models = ["claude-opus-*", "claude-sonnet-4-20250514"]
+models = ["claude-opus-*", "claude-sonnet-4-6"]
 
 [[upstreams]]
 name = "openai"
