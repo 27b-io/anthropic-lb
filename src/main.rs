@@ -5034,11 +5034,8 @@ async fn main() {
         let probe_state = state.clone();
         let n_accounts = probe_state.accounts.len();
         tokio::spawn(async move {
-            const PROBE_MODELS: &[&str] = &[
-                "claude-haiku-4-5-20251001",
-                "claude-sonnet-4-5-20250929",
-                "claude-opus-4-6",
-            ];
+            const PROBE_MODELS: &[&str] =
+                &["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6"];
             // Stagger initial probes: wait 10s then probe all accounts
             tokio::time::sleep(Duration::from_secs(10)).await;
             info!(
