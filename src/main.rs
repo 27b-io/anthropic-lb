@@ -1935,8 +1935,8 @@ impl AppState {
     }
 
     /// Record tokens against a client's daily budget.
-    /// Updates local state synchronously; writes to Redis inline (awaited) to prevent
-    /// TOCTOU races where concurrent requests pass check_budget before the counter updates.
+    /// Updates local state synchronously; awaits Redis INCRBY inline to prevent TOCTOU races.
+    /// On Redis INCRBY failure, deletes the stale key so check_budget falls through to local.
     async fn record_budget_usage(&self, client_id: &str, tokens: u64) {
         if tokens == 0 || !self.client_budgets.contains_key(client_id) {
             return;
@@ -1966,7 +1966,9 @@ impl AppState {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "redis INCRBY failed for budget tracking");
+                    // Delete stale key so check_budget falls through to local state
+                    tracing::warn!(error = %e, "redis INCRBY failed, deleting stale budget key");
+                    let _: redis::RedisResult<()> = conn.del(&key).await;
                 }
             }
         }
