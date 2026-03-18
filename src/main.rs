@@ -861,6 +861,10 @@ const WARNING_UTIL_FLOOR: f64 = 0.80;
 /// Distinct from hard_limited_until (which skips the account entirely) because rejected
 /// status can arrive on one window while the other is still valid.
 const REJECTED_UTIL_FLOOR: f64 = 1.0;
+/// Affinity override: if the affinity-picked account's weight is below this
+/// fraction of the best candidate's weight, discard affinity and pick the best.
+/// 0.5 means the picked account must have at least 50% of the best's weight.
+const AFFINITY_OVERRIDE_RATIO: f64 = 0.5;
 
 /// Extract the model family from a model ID string.
 /// Used to look up model-specific rate-limit claims (e.g., "seven_day_sonnet").
@@ -1257,10 +1261,7 @@ impl AppState {
         // Affinity override: if the affinity-selected account's weight is much lower
         // than the best candidate's weight, discard affinity and pick the best.
         // Weight encodes both 5h headroom AND 7d waste risk, so this catches
-        // disparities in either signal. Threshold of 0.5 means the picked account
-        // must have at least 50% of the best's weight to keep affinity — otherwise
-        // session stickiness yields to utilization balance.
-        const AFFINITY_OVERRIDE_RATIO: f64 = 0.5;
+        // disparities in either signal (see AFFINITY_OVERRIDE_RATIO).
         if affinity_key.is_some() && effective.len() > 1 {
             let best = effective
                 .iter()
