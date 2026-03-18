@@ -5802,15 +5802,17 @@ mod tests {
 
     #[tokio::test]
     async fn pick_sticky_same_affinity() {
-        // Same affinity key should always return the same account
-        // (utilization gap must be within AFFINITY_OVERRIDE_GAP to preserve stickiness)
+        // Same affinity key should always return the same account when weights
+        // are close enough. AFFINITY_OVERRIDE_RATIO (0.5) compares the picked
+        // account's weight to the best — affinity is preserved when the ratio
+        // exceeds the threshold, i.e. no single account is 2x better.
         let state = test_state_with(vec![
             make_account("a", "sk-ant-api-a"),
             make_account("b", "sk-ant-api-b"),
             make_account("c", "sk-ant-api-c"),
         ]);
 
-        // Set similar utilization so affinity is preserved (gap < 0.15)
+        // Similar utilization → similar weights → ratio stays above 0.5
         {
             let mut info = state.accounts[0].rate_info.write().await;
             info.utilization = Some(0.40);
