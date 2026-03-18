@@ -1243,37 +1243,58 @@ impl AppState {
         // Normalize position into [0, total_weight)
         let target = position / 10000.0 * total_weight;
 
-        // Walk weighted buckets
+        // Walk weighted buckets to find initial pick
+        let mut picked = effective.last().unwrap();
         let mut cumulative = 0.0;
         for c in &effective {
             cumulative += c.weight;
             if target < cumulative {
-                debug!(
-                    account = self.accounts[c.idx].name,
-                    gate_5h = format!("{:.3}", c.gate_5h),
-                    waste_risk = format!("{:.3}", c.wr),
-                    weight = format!("{:.3}", c.weight),
-                    share = format!("{:.0}%", c.weight / total_weight * 100.0),
-                    source = c.source,
-                    candidates = effective.len(),
-                    affinity = affinity_key.unwrap_or("-"),
-                    "pick: selected"
-                );
-                return Some(c.idx);
+                picked = c;
+                break;
             }
         }
 
-        // Floating-point edge case: pick last candidate
-        let c = effective.last().unwrap();
+        // Affinity override: if the affinity-selected account's weight is much lower
+        // than the best candidate's weight, discard affinity and pick the best.
+        // Weight encodes both 5h headroom AND 7d waste risk, so this catches
+        // disparities in either signal. Threshold of 0.5 means the picked account
+        // must have at least 50% of the best's weight to keep affinity — otherwise
+        // session stickiness yields to utilization balance.
+        const AFFINITY_OVERRIDE_RATIO: f64 = 0.5;
+        if affinity_key.is_some() && effective.len() > 1 {
+            let best = effective
+                .iter()
+                .max_by(|a, b| {
+                    a.weight
+                        .partial_cmp(&b.weight)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap();
+            if picked.weight < best.weight * AFFINITY_OVERRIDE_RATIO {
+                debug!(
+                    picked_account = self.accounts[picked.idx].name,
+                    picked_weight = format!("{:.3}", picked.weight),
+                    best_account = self.accounts[best.idx].name,
+                    best_weight = format!("{:.3}", best.weight),
+                    ratio = format!("{:.3}", picked.weight / best.weight),
+                    "pick: affinity override, weight ratio below threshold"
+                );
+                picked = best;
+            }
+        }
+
         debug!(
-            account = self.accounts[c.idx].name,
-            gate_5h = format!("{:.3}", c.gate_5h),
-            waste_risk = format!("{:.3}", c.wr),
-            source = c.source,
+            account = self.accounts[picked.idx].name,
+            gate_5h = format!("{:.3}", picked.gate_5h),
+            waste_risk = format!("{:.3}", picked.wr),
+            weight = format!("{:.3}", picked.weight),
+            share = format!("{:.0}%", picked.weight / total_weight * 100.0),
+            source = picked.source,
+            candidates = effective.len(),
             affinity = affinity_key.unwrap_or("-"),
-            "pick: selected (float edge)"
+            "pick: selected"
         );
-        Some(c.idx)
+        Some(picked.idx)
     }
 
     /// Update rate limit info from response headers.
@@ -5782,24 +5803,25 @@ mod tests {
     #[tokio::test]
     async fn pick_sticky_same_affinity() {
         // Same affinity key should always return the same account
+        // (utilization gap must be within AFFINITY_OVERRIDE_GAP to preserve stickiness)
         let state = test_state_with(vec![
             make_account("a", "sk-ant-api-a"),
             make_account("b", "sk-ant-api-b"),
             make_account("c", "sk-ant-api-c"),
         ]);
 
-        // Set some utilization so buckets are non-trivial
+        // Set similar utilization so affinity is preserved (gap < 0.15)
         {
             let mut info = state.accounts[0].rate_info.write().await;
-            info.utilization = Some(0.3);
+            info.utilization = Some(0.40);
         }
         {
             let mut info = state.accounts[1].rate_info.write().await;
-            info.utilization = Some(0.5);
+            info.utilization = Some(0.45);
         }
         {
             let mut info = state.accounts[2].rate_info.write().await;
-            info.utilization = Some(0.7);
+            info.utilization = Some(0.50);
         }
 
         let key = "192.168.1.1:client-42:agent-7:session-abc";
@@ -5811,6 +5833,230 @@ mod tests {
                 "same affinity key must always pick same account"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pick_affinity_overridden_by_weight_disparity() {
+        // When the affinity-picked account's weight is less than 50% of the best
+        // account's weight, affinity should be overridden. This tests the scenario
+        // where 5h utilization is similar but 7d utilization is vastly different —
+        // the weight formula captures the 7d disparity via waste_risk.
+        let state = test_state_with(vec![
+            make_account("low_7d", "sk-ant-api-a"),
+            make_account("high_7d", "sk-ant-api-b"),
+        ]);
+        let now_epoch = AppState::now_epoch();
+
+        // Both have similar 5h utilization (so gate_5h is similar)
+        // but vastly different 7d utilization via claims_7d.
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.12);
+            info.reset_5h = Some(now_epoch + 10000);
+            info.claims_7d.insert(
+                "seven_day".to_string(),
+                ClaimWindowData {
+                    utilization: 0.30,
+                    reset: Some(now_epoch + 300000),
+                    status: None,
+                },
+            );
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.10);
+            info.reset_5h = Some(now_epoch + 10000);
+            info.claims_7d.insert(
+                "seven_day".to_string(),
+                ClaimWindowData {
+                    utilization: 0.85,
+                    reset: Some(now_epoch + 300000),
+                    status: None,
+                },
+            );
+        }
+
+        // Every affinity key should pick the low-7d account because
+        // its weight is much higher (more waste_risk × similar headroom).
+        for i in 0..200 {
+            let key = format!("sticky-client-{}", i);
+            let idx = state
+                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            assert_eq!(
+                idx, 0,
+                "client {} picked account {} but should pick 'low_7d' (weight ratio < 0.5)",
+                i, idx
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn affinity_override_balanced_no_7d_data() {
+        // Scenario: balanced 5h, no 7d data → affinity preserved
+        // Primary 5h=0.20, Jeff 5h=0.25, no claims_7d
+        // Weights: headroom_only → 0.80 vs 0.75, ratio=0.94 > 0.5
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("jeff", "sk-ant-api-b"),
+        ]);
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.20);
+            info.reset_5h = Some(AppState::now_epoch() + 10000);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.25);
+            info.reset_5h = Some(AppState::now_epoch() + 10000);
+        }
+
+        // With balanced weights, different affinity keys should land on different accounts
+        let mut saw_0 = false;
+        let mut saw_1 = false;
+        for i in 0..500 {
+            let key = format!("balanced-client-{}", i);
+            let idx = state
+                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            if idx == 0 {
+                saw_0 = true;
+            } else {
+                saw_1 = true;
+            }
+            if saw_0 && saw_1 {
+                break;
+            }
+        }
+        assert!(
+            saw_0 && saw_1,
+            "balanced accounts should see traffic on both (affinity preserved)"
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_override_moderate_7d_disparity() {
+        // Scenario: similar 5h, moderate 7d difference → affinity preserved
+        // Primary 5h=0.15, 7d=0.40 vs Jeff 5h=0.15, 7d=0.60
+        // waste_risk ratio isn't extreme enough to trigger override
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("jeff", "sk-ant-api-b"),
+        ]);
+        let now = AppState::now_epoch();
+        set_account_utilization(&state, 0, 0.15, 0.40, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 1, 0.15, 0.60, now + 10000, now + 300000).await;
+
+        let mut saw_0 = false;
+        let mut saw_1 = false;
+        for i in 0..500 {
+            let key = format!("moderate-client-{}", i);
+            let idx = state
+                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            if idx == 0 {
+                saw_0 = true;
+            } else {
+                saw_1 = true;
+            }
+            if saw_0 && saw_1 {
+                break;
+            }
+        }
+        assert!(
+            saw_0 && saw_1,
+            "moderate disparity should preserve affinity on both accounts"
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_override_massive_7d_disparity() {
+        // Scenario: production case — similar 5h, massive 7d gap
+        // Primary 5h=0.13, 7d=0.41 vs Jeff 5h=0.12, 7d=0.79
+        // Weight ratio well below 0.5 → ALL traffic to primary
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("jeff", "sk-ant-api-b"),
+        ]);
+        let now = AppState::now_epoch();
+        set_account_utilization(&state, 0, 0.13, 0.41, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 1, 0.12, 0.79, now + 10000, now + 300000).await;
+
+        for i in 0..200 {
+            let key = format!("production-client-{}", i);
+            let idx = state
+                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            assert_eq!(
+                idx, 0,
+                "client {} routed to jeff despite massive 7d disparity",
+                i
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn affinity_override_one_exhausted() {
+        // Scenario: one account nearly spent on 7d budget
+        // Primary 5h=0.10, 7d=0.10 vs Jeff 5h=0.10, 7d=0.90
+        // Extreme weight ratio → all traffic to primary
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("jeff", "sk-ant-api-b"),
+        ]);
+        let now = AppState::now_epoch();
+        set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 1, 0.10, 0.90, now + 10000, now + 300000).await;
+
+        for i in 0..200 {
+            let key = format!("exhausted-client-{}", i);
+            let idx = state
+                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            assert_eq!(idx, 0, "client {} routed to nearly-exhausted account", i);
+        }
+    }
+
+    #[tokio::test]
+    async fn affinity_override_both_rough() {
+        // Scenario: both accounts in bad shape — affinity preserved
+        // Primary 5h=0.85, 7d=0.20 vs Jeff 5h=0.10, 7d=0.90
+        // Primary has 5h pressure but 7d budget; Jeff has 5h headroom but 7d exhausted
+        // Weights should be close enough to preserve affinity
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("jeff", "sk-ant-api-b"),
+        ]);
+        let now = AppState::now_epoch();
+        set_account_utilization(&state, 0, 0.85, 0.20, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 1, 0.10, 0.90, now + 10000, now + 300000).await;
+
+        let mut saw_0 = false;
+        let mut saw_1 = false;
+        for i in 0..500 {
+            let key = format!("both-rough-{}", i);
+            let idx = state
+                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            if idx == 0 {
+                saw_0 = true;
+            } else {
+                saw_1 = true;
+            }
+            if saw_0 && saw_1 {
+                break;
+            }
+        }
+        assert!(
+            saw_0 && saw_1,
+            "both-rough scenario should preserve affinity on both accounts"
+        );
     }
 
     #[tokio::test]
