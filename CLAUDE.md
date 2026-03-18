@@ -18,12 +18,12 @@ Run the proxy: `./target/release/anthropic-lb config.toml`
 
 ## Architecture
 
-Single-file Rust binary (`src/main.rs`, ~8500 lines) with inline tests. No library crate — everything lives in one file with section markers.
+Single-file Rust binary (`src/main.rs`, ~12000 lines) with inline tests. No library crate — everything lives in one file with section markers.
 
 ### Core Data Flow
 
 ```text
-Request → IP allowlist check → proxy_key auth → pre_request_gate(operator bypass → budget → utilization limit → emergency brake) → pick_account(model) → forward to upstream → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
+Request → IP allowlist check → proxy_key auth → pre_request_gate(operator bypass → budget → utilization limit → emergency brake) → pick_account(affinity, model, skip) → forward to upstream → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
 ```
 
 ### Key Sections (in source order)
@@ -35,7 +35,7 @@ Request → IP allowlist check → proxy_key auth → pre_request_gate(operator 
 | **Persistence** (`PersistedState`) | JSON state file at `<config_path>.state.json`, saved after every request and on shutdown. Redis for cross-replica state when configured. |
 | **Token usage** (`TokenUsage`, `record_usage`) | Extracts token counts from responses (streaming SSE + non-streaming JSON), tracks per-account and per-client |
 | **Auto-cache** (`inject_cache_breakpoints`) | Injects up to 3 prompt cache breakpoints (last tool, system, last user message) unless cache_control already present |
-| **Handlers** | Four axum handlers: `proxy_handler` (main Anthropic proxy), `upstream_handler` (OpenAI-compatible passthrough), `stats_handler` (`/_stats` JSON), `openai_chat_handler` (OpenAI→Anthropic format translation) |
+| **Handlers** | Five axum handlers: `proxy_handler` (main Anthropic proxy), `upstream_handler` (OpenAI-compatible passthrough), `stats_handler` (`/_stats` JSON), `metrics_handler` (`/metrics` Prometheus), `openai_chat_handler` (OpenAI→Anthropic format translation) |
 | **OpenAI compatibility** (`translate_*`, `StreamContext`) | Translates `/v1/chat/completions` requests/responses between OpenAI and Anthropic formats, including streaming SSE |
 | **Tests** (`mod tests`) | Inline at bottom — unit + integration tests using mock upstream servers |
 
@@ -43,10 +43,11 @@ Request → IP allowlist check → proxy_key auth → pre_request_gate(operator 
 
 Headroom-proportional weighted bucket hashing:
 1. Filter by model compatibility (if account has `models` allowlist)
-2. Skip hard-limited (429) accounts
-3. Each remaining account gets a bucket proportional to `(1.0 - utilization)`
-4. Affinity key (client+session hash) provides sticky routing; no-affinity uses Fibonacci scatter
-5. Retries on 429 (marks hard-limited) and 5xx/529 (rotates without marking)
+2. Skip accounts in the `skip` list (already tried in this retry loop)
+3. Skip hard-limited (429) accounts
+4. Each remaining account gets a bucket proportional to `(1.0 - utilization)`
+5. Affinity key (client+session hash) provides sticky routing; no-affinity uses Fibonacci scatter
+6. On 429 or 5xx/529, the failed account index is added to `skip` and `pick_account` is called again, guaranteeing a different account on retry
 
 ### Token Type Detection (by prefix)
 
@@ -73,7 +74,7 @@ Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. R
 | `client_budgets` | map? | {} | client_id→daily token limit |
 | `client_utilization_limits` | map? | {} | client_id→utilization ceiling (0.0–1.0) |
 | `operators` | string[]? | [] | Client IDs that bypass all enforcement |
-| `emergency_threshold` | f64? | 0.95 | All-accounts utilization threshold for emergency brake |
+| `emergency_threshold` | f64? | 0.88 | All-accounts utilization threshold for emergency brake |
 | `redis_url` | string? | none | Redis/Valkey URL for distributed state (`redis://` or `rediss://`) |
 | `accounts[].name` | string | required | Account display name |
 | `accounts[].token` | string | required | API key, OAuth token, or `"passthrough"` |

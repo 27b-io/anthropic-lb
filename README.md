@@ -133,7 +133,7 @@ probe_interval_secs = 300
 [[accounts]]
 name = "primary"
 token = "sk-ant-oat01-..."
-# models = ["claude-sonnet-4-20250514", "claude-opus-*"]
+# models = ["claude-sonnet-4-6", "claude-opus-*"]
 
 [[accounts]]
 name = "secondary"
@@ -157,7 +157,7 @@ token = "sk-ant-api03-..."
 | `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
 | `client_utilization_limits` | `{name: f64}` | `{}` | Per-client utilization ceiling (0.0–1.0) |
 | `operators` | `Vec<String>` | `[]` | Client IDs that bypass all enforcement |
-| `emergency_threshold` | `f64` | `0.95` | Utilization threshold for emergency brake |
+| `emergency_threshold` | `f64` | `0.88` | Utilization threshold for emergency brake |
 | `redis_url` | `String?` | `None` | Redis/Valkey URL for distributed state |
 | `accounts[].name` | `String` | — | Display name for the account |
 | `accounts[].token` | `String` | — | API key or `"passthrough"` |
@@ -187,7 +187,7 @@ models = ["claude-opus-*"]  # Wildcard prefix match
 [[accounts]]
 name = "sonnet-only"
 token = "sk-ant-api03-..."
-models = ["claude-sonnet-4-20250514"]  # Exact match
+models = ["claude-sonnet-4-6"]  # Exact match
 
 [[accounts]]
 name = "general"
@@ -265,6 +265,7 @@ IP check runs first, then proxy key. Both apply to all endpoints including `/_st
 | `/v1/chat/completions` | POST | OpenAI-compatible → Anthropic translation |
 | `/upstream/{name}/*` | Any | Forwarded to named OpenAI-compatible upstream |
 | `/_stats` | GET | JSON stats (utilization, tokens, budgets) |
+| `/metrics` | GET | Prometheus-format metrics |
 
 All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
 
@@ -365,8 +366,8 @@ Requests to `/upstream/openrouter/v1/chat/completions` are forwarded to `https:/
 9. Pick account via headroom-proportional weighted bucket hashing (client affinity)
 10. Inject auth token + auto-cache header
 11. Forward request to upstream Anthropic API
-12. If 429 → mark rate-limited (propagate to Redis), retry with next account
-13. If 5xx/529 → retry with different account
+12. If 429 → mark rate-limited (propagate to Redis), add to skip list, retry with next account
+13. If 5xx/529 → add to skip list, retry with different account
 14. Parse rate-limit headers (utilization per claim, reset times, status)
 15. Extract token usage from response (streaming SSE or JSON body)
 16. Record usage per-account + per-client, update budget (local + Redis)
@@ -388,7 +389,7 @@ When `shadow_log` is set, every request writes a JSONL entry with:
   "ts": "2026-02-13T20:15:00Z",
   "client": "alice",
   "account": "primary",
-  "model": "claude-sonnet-4-20250514",
+  "model": "claude-sonnet-4-6",
   "streaming": true,
   "latency_ms": 2340,
   "input_tokens": 1500,
