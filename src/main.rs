@@ -1258,29 +1258,29 @@ impl AppState {
             }
         }
 
-        // Affinity override: if the affinity-selected account's weight is much lower
-        // than the best candidate's weight, discard affinity and pick the best.
+        // Affinity override: when exactly two candidates remain and the affinity-
+        // picked account's weight is far below the other's, discard affinity.
+        // Restricted to two candidates because with 3+ the proportional bucket
+        // system distributes load adequately — comparing every candidate against
+        // the single best would collapse all sticky traffic to one account.
         // Weight encodes both 5h headroom AND 7d waste risk, so this catches
         // disparities in either signal (see AFFINITY_OVERRIDE_RATIO).
-        if affinity_key.is_some() && effective.len() > 1 {
-            let best = effective
-                .iter()
-                .max_by(|a, b| {
-                    a.weight
-                        .partial_cmp(&b.weight)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap();
-            if picked.weight < best.weight * AFFINITY_OVERRIDE_RATIO {
+        if affinity_key.is_some() && effective.len() == 2 {
+            let other = if picked.idx == effective[0].idx {
+                &effective[1]
+            } else {
+                &effective[0]
+            };
+            if picked.weight < other.weight * AFFINITY_OVERRIDE_RATIO {
                 debug!(
                     picked_account = self.accounts[picked.idx].name,
                     picked_weight = format!("{:.3}", picked.weight),
-                    best_account = self.accounts[best.idx].name,
-                    best_weight = format!("{:.3}", best.weight),
-                    ratio = format!("{:.3}", picked.weight / best.weight),
+                    other_account = self.accounts[other.idx].name,
+                    other_weight = format!("{:.3}", other.weight),
+                    ratio = format!("{:.3}", picked.weight / other.weight),
                     "pick: affinity override, weight ratio below threshold"
                 );
-                picked = best;
+                picked = other;
             }
         }
 
@@ -6059,6 +6059,40 @@ mod tests {
         assert!(
             saw_0 && saw_1,
             "both-rough scenario should preserve affinity on both accounts"
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_override_skipped_with_three_candidates() {
+        // With 3+ candidates the override is disabled — proportional buckets
+        // handle distribution. Even with a large weight disparity, all three
+        // accounts should receive some traffic via affinity routing.
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("steve", "sk-ant-api-b"),
+            make_account("jeff", "sk-ant-api-c"),
+        ]);
+        let now = AppState::now_epoch();
+        // primary is clearly best, steve middling, jeff worst
+        set_account_utilization(&state, 0, 0.13, 0.41, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 1, 0.15, 0.55, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 2, 0.12, 0.79, now + 10000, now + 300000).await;
+
+        let mut saw = [false; 3];
+        for i in 0..1000 {
+            let key = format!("three-way-client-{}", i);
+            let idx = state
+                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            saw[idx] = true;
+            if saw[0] && saw[1] && saw[2] {
+                break;
+            }
+        }
+        assert!(
+            saw[0] && saw[1] && saw[2],
+            "all 3 accounts should receive traffic when override is disabled (3 candidates)"
         );
     }
 
