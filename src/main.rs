@@ -5895,6 +5895,45 @@ mod tests {
         }
     }
 
+    /// Helper: run `pick_account` with varying affinity keys and assert distribution.
+    /// `expect_index: None` → both accounts must be seen (affinity preserved).
+    /// `expect_index: Some(i)` → every pick must equal `i` (override active).
+    async fn assert_affinity_distribution(
+        state: &AppState,
+        prefix: &str,
+        attempts: usize,
+        expect_index: Option<usize>,
+        msg: &str,
+    ) {
+        let mut saw_0 = false;
+        let mut saw_1 = false;
+        for i in 0..attempts {
+            let key = format!("{}-{}", prefix, i);
+            let idx = state
+                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            match expect_index {
+                Some(expected) => {
+                    assert_eq!(idx, expected, "attempt {}: {}", i, msg);
+                }
+                None => {
+                    if idx == 0 {
+                        saw_0 = true;
+                    } else {
+                        saw_1 = true;
+                    }
+                    if saw_0 && saw_1 {
+                        return;
+                    }
+                }
+            }
+        }
+        if expect_index.is_none() {
+            assert!(saw_0 && saw_1, "{}", msg);
+        }
+    }
+
     #[tokio::test]
     async fn affinity_override_balanced_no_7d_data() {
         // Scenario: balanced 5h, no 7d data → affinity preserved
@@ -5915,28 +5954,14 @@ mod tests {
             info.reset_5h = Some(AppState::now_epoch() + 10000);
         }
 
-        // With balanced weights, different affinity keys should land on different accounts
-        let mut saw_0 = false;
-        let mut saw_1 = false;
-        for i in 0..500 {
-            let key = format!("balanced-client-{}", i);
-            let idx = state
-                .pick_account(Some(&key), "claude-opus-4-6", &[])
-                .await
-                .unwrap();
-            if idx == 0 {
-                saw_0 = true;
-            } else {
-                saw_1 = true;
-            }
-            if saw_0 && saw_1 {
-                break;
-            }
-        }
-        assert!(
-            saw_0 && saw_1,
-            "balanced accounts should see traffic on both (affinity preserved)"
-        );
+        assert_affinity_distribution(
+            &state,
+            "balanced-client",
+            500,
+            None,
+            "balanced accounts should see traffic on both (affinity preserved)",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -5952,27 +5977,14 @@ mod tests {
         set_account_utilization(&state, 0, 0.15, 0.40, now + 10000, now + 300000).await;
         set_account_utilization(&state, 1, 0.15, 0.60, now + 10000, now + 300000).await;
 
-        let mut saw_0 = false;
-        let mut saw_1 = false;
-        for i in 0..500 {
-            let key = format!("moderate-client-{}", i);
-            let idx = state
-                .pick_account(Some(&key), "claude-opus-4-6", &[])
-                .await
-                .unwrap();
-            if idx == 0 {
-                saw_0 = true;
-            } else {
-                saw_1 = true;
-            }
-            if saw_0 && saw_1 {
-                break;
-            }
-        }
-        assert!(
-            saw_0 && saw_1,
-            "moderate disparity should preserve affinity on both accounts"
-        );
+        assert_affinity_distribution(
+            &state,
+            "moderate-client",
+            500,
+            None,
+            "moderate disparity should preserve affinity on both accounts",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -5988,18 +6000,14 @@ mod tests {
         set_account_utilization(&state, 0, 0.13, 0.41, now + 10000, now + 300000).await;
         set_account_utilization(&state, 1, 0.12, 0.79, now + 10000, now + 300000).await;
 
-        for i in 0..200 {
-            let key = format!("production-client-{}", i);
-            let idx = state
-                .pick_account(Some(&key), "claude-opus-4-6", &[])
-                .await
-                .unwrap();
-            assert_eq!(
-                idx, 0,
-                "client {} routed to jeff despite massive 7d disparity",
-                i
-            );
-        }
+        assert_affinity_distribution(
+            &state,
+            "production-client",
+            200,
+            Some(0),
+            "routed to jeff despite massive 7d disparity",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -6015,14 +6023,14 @@ mod tests {
         set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
         set_account_utilization(&state, 1, 0.10, 0.90, now + 10000, now + 300000).await;
 
-        for i in 0..200 {
-            let key = format!("exhausted-client-{}", i);
-            let idx = state
-                .pick_account(Some(&key), "claude-opus-4-6", &[])
-                .await
-                .unwrap();
-            assert_eq!(idx, 0, "client {} routed to nearly-exhausted account", i);
-        }
+        assert_affinity_distribution(
+            &state,
+            "exhausted-client",
+            200,
+            Some(0),
+            "routed to nearly-exhausted account",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -6039,27 +6047,14 @@ mod tests {
         set_account_utilization(&state, 0, 0.85, 0.20, now + 10000, now + 300000).await;
         set_account_utilization(&state, 1, 0.10, 0.90, now + 10000, now + 300000).await;
 
-        let mut saw_0 = false;
-        let mut saw_1 = false;
-        for i in 0..500 {
-            let key = format!("both-rough-{}", i);
-            let idx = state
-                .pick_account(Some(&key), "claude-opus-4-6", &[])
-                .await
-                .unwrap();
-            if idx == 0 {
-                saw_0 = true;
-            } else {
-                saw_1 = true;
-            }
-            if saw_0 && saw_1 {
-                break;
-            }
-        }
-        assert!(
-            saw_0 && saw_1,
-            "both-rough scenario should preserve affinity on both accounts"
-        );
+        assert_affinity_distribution(
+            &state,
+            "both-rough",
+            500,
+            None,
+            "both-rough scenario should preserve affinity on both accounts",
+        )
+        .await;
     }
 
     #[tokio::test]
