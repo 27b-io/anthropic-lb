@@ -861,6 +861,15 @@ const WARNING_UTIL_FLOOR: f64 = 0.80;
 /// Distinct from hard_limited_until (which skips the account entirely) because rejected
 /// status can arrive on one window while the other is still valid.
 const REJECTED_UTIL_FLOOR: f64 = 1.0;
+/// Maximum number of BEBO (binary exponential backoff) retry rounds for 529
+/// (overloaded) responses. After exhausting all accounts, the proxy waits and
+/// retries all accounts up to this many additional times. Total attempts through
+/// the full account list = MAX_529_RETRIES + 1.
+const MAX_529_RETRIES: u32 = 3;
+
+/// Base delay for 529 BEBO retries. Doubles each round: 1s, 2s, 4s.
+const RETRY_529_BASE_DELAY: Duration = Duration::from_secs(1);
+
 /// Affinity override: if the affinity-picked account's weight is below this
 /// fraction of the best candidate's weight, discard affinity and pick the best.
 /// 0.5 means the picked account must have at least 50% of the best's weight.
@@ -2399,287 +2408,314 @@ async fn proxy_handler(
     };
 
     let n = state.accounts.len();
-    let mut skip: Vec<usize> = Vec::new();
-    for _attempt in 0..n {
-        let idx = match state.pick_account(affinity, &model, &skip).await {
-            Some(i) => i,
-            None => {
-                warn!("all accounts rate-limited");
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "all upstream accounts rate-limited",
-                )
-                    .into_response();
-            }
-        };
-
-        let acct = &state.accounts[idx];
-        let url = format!(
-            "{}{}",
-            state.upstream,
-            parts
-                .uri
-                .path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or("/")
-        );
-
-        let mut upstream_req = state.client.request(parts.method.clone(), &url);
-
-        // Forward headers
-        let mut headers = parts.headers.clone();
-        headers.remove("host");
-        headers.remove("content-length"); // body size may change after cache injection
-
-        // Default anthropic-version if client didn't set it
-        if !headers.contains_key("anthropic-version") {
-            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-        }
-
-        // Auth: passthrough keeps caller's headers, otherwise inject account token
-        if !acct.passthrough {
-            headers.remove("authorization");
-            headers.remove("x-api-key");
-            // Detect token type by prefix
-            if acct.token.starts_with("sk-ant-api") {
-                // Standard API key → x-api-key header
-                headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
-            } else if acct.token.starts_with("sk-ant-oat") {
-                // OAuth token → Authorization: Bearer
-                headers.insert(
-                    "authorization",
-                    HeaderValue::from_str(&format!("Bearer {}", acct.token)).unwrap(),
-                );
-                // OAuth tokens require these headers — client won't send them
-                // since it doesn't know the proxy uses OAuth behind the scenes
-                headers.insert(
-                    "anthropic-dangerous-direct-browser-access",
-                    HeaderValue::from_static("true"),
-                );
-                // Ensure required OAuth beta flags are present.
-                // Both are required: oauth-2025-04-20 for OAuth auth,
-                // claude-code-20250219 for Claude Code API access quota routing.
-                // Missing claude-code-20250219 causes 429 with unified-overage-disabled.
-                let existing_beta = headers
-                    .get("anthropic-beta")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let mut beta_flags: Vec<&str> = if existing_beta.is_empty() {
-                    vec![]
-                } else {
-                    existing_beta
-                        .split(',')
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                };
-                for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
-                    if !beta_flags.contains(flag) {
-                        beta_flags.push(flag);
-                    }
-                }
-                let new_beta = beta_flags.join(",");
-                headers.insert("anthropic-beta", HeaderValue::from_str(&new_beta).unwrap());
-            } else {
-                // Unknown token type → try x-api-key
-                headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
-            }
-        }
-        // passthrough: caller's auth headers flow through untouched
-
-        upstream_req = upstream_req.headers(headers);
-        upstream_req = upstream_req.body(body_bytes.clone());
-
-        let mut resp = match upstream_req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                error!(account = acct.name, "upstream request failed: {e}");
-                continue;
-            }
-        };
-
-        let status = resp.status();
-        acct.requests.fetch_add(1, Ordering::Relaxed);
-
-        // Always update rate limit info and persist
-        state.update_rate_info(idx, resp.headers()).await;
-
-        // Update burn rate (after rate-limit headers are parsed)
-        {
-            let now = Instant::now();
-            if let Ok(mut br) = acct.burn_rate.lock() {
-                br.update(now);
-            }
-            // Per-client request tracking
-            if let Ok(mut rates) = state.client_request_rates.lock() {
-                let entry = rates
-                    .entry(client_id.clone())
-                    .or_insert_with(|| (0, Ewma::new(TAU_1H)));
-                entry.0 += 1;
-                entry.1.update(now);
-            }
-        }
-
-        // 429 → mark hard-limited and try next account
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            state.mark_hard_limited(idx, resp.headers()).await;
-            log_429_details(&acct.name, resp).await;
-            state.save_state().await;
-            info!(account = acct.name, "got 429, rotating to next account");
-            skip.push(idx);
-            continue;
-        }
-
-        // 5xx/529 → transient upstream error, try next account (don't mark hard-limited)
-        if status.is_server_error() || status.as_u16() == 529 {
-            state.save_state().await;
+    for retry_round in 0..=MAX_529_RETRIES {
+        if retry_round > 0 {
+            let delay = RETRY_529_BASE_DELAY * 2u32.pow(retry_round - 1);
             warn!(
-                account = acct.name,
-                status = status.as_u16(),
-                "got server error, rotating to next account"
+                retry_round = retry_round,
+                delay_ms = delay.as_millis() as u64,
+                "529 backoff: retrying all accounts"
             );
-            skip.push(idx);
-            continue;
+            tokio::time::sleep(delay).await;
         }
+        let mut skip: Vec<usize> = Vec::new();
+        let mut saw_529 = false;
+        for _attempt in 0..n {
+            let idx = match state.pick_account(affinity, &model, &skip).await {
+                Some(i) => i,
+                None => {
+                    warn!("all accounts rate-limited");
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "all upstream accounts rate-limited",
+                    )
+                        .into_response();
+                }
+            };
 
-        // Clear hard limit and burst counter — account just served a request successfully
-        {
-            let mut info = acct.rate_info.write().await;
-            info.hard_limited_until = None;
-            info.consecutive_burst_429s = 0;
-        }
-
-        // Persist state after clearing hard limit so the saved snapshot is clean
-        state.save_state().await;
-
-        // Log with capacity info
-        {
-            let info = acct.rate_info.read().await;
-            info!(
-                client = %client_ip,
-                client_id = %client_id,
-                agent = %agent_id,
-                session = %session_id,
-                model = %model,
-                account = acct.name,
-                status = status.as_u16(),
-                utilization = ?info.utilization,
-                claim = ?info.representative_claim,
-                total = acct.requests.load(Ordering::Relaxed),
-                "proxied"
+            let acct = &state.accounts[idx];
+            let url = format!(
+                "{}{}",
+                state.upstream,
+                parts
+                    .uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("/")
             );
-        }
 
-        let latency_ms = request_start.elapsed().as_millis() as u64;
+            let mut upstream_req = state.client.request(parts.method.clone(), &url);
 
-        // Stream response through, extracting token usage
-        let resp_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let resp_headers = resp.headers().clone();
+            // Forward headers
+            let mut headers = parts.headers.clone();
+            headers.remove("host");
+            headers.remove("content-length"); // body size may change after cache injection
 
-        let mut builder = Response::builder().status(resp_status);
-        for (k, v) in resp_headers.iter() {
-            if k == "transfer-encoding" {
+            // Default anthropic-version if client didn't set it
+            if !headers.contains_key("anthropic-version") {
+                headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+            }
+
+            // Auth: passthrough keeps caller's headers, otherwise inject account token
+            if !acct.passthrough {
+                headers.remove("authorization");
+                headers.remove("x-api-key");
+                // Detect token type by prefix
+                if acct.token.starts_with("sk-ant-api") {
+                    // Standard API key → x-api-key header
+                    headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
+                } else if acct.token.starts_with("sk-ant-oat") {
+                    // OAuth token → Authorization: Bearer
+                    headers.insert(
+                        "authorization",
+                        HeaderValue::from_str(&format!("Bearer {}", acct.token)).unwrap(),
+                    );
+                    // OAuth tokens require these headers — client won't send them
+                    // since it doesn't know the proxy uses OAuth behind the scenes
+                    headers.insert(
+                        "anthropic-dangerous-direct-browser-access",
+                        HeaderValue::from_static("true"),
+                    );
+                    // Ensure required OAuth beta flags are present.
+                    // Both are required: oauth-2025-04-20 for OAuth auth,
+                    // claude-code-20250219 for Claude Code API access quota routing.
+                    // Missing claude-code-20250219 causes 429 with unified-overage-disabled.
+                    let existing_beta = headers
+                        .get("anthropic-beta")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let mut beta_flags: Vec<&str> = if existing_beta.is_empty() {
+                        vec![]
+                    } else {
+                        existing_beta
+                            .split(',')
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    };
+                    for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
+                        if !beta_flags.contains(flag) {
+                            beta_flags.push(flag);
+                        }
+                    }
+                    let new_beta = beta_flags.join(",");
+                    headers.insert("anthropic-beta", HeaderValue::from_str(&new_beta).unwrap());
+                } else {
+                    // Unknown token type → try x-api-key
+                    headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
+                }
+            }
+            // passthrough: caller's auth headers flow through untouched
+
+            upstream_req = upstream_req.headers(headers);
+            upstream_req = upstream_req.body(body_bytes.clone());
+
+            let mut resp = match upstream_req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(account = acct.name, "upstream request failed: {e}");
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            acct.requests.fetch_add(1, Ordering::Relaxed);
+
+            // Always update rate limit info and persist
+            state.update_rate_info(idx, resp.headers()).await;
+
+            // Update burn rate (after rate-limit headers are parsed)
+            {
+                let now = Instant::now();
+                if let Ok(mut br) = acct.burn_rate.lock() {
+                    br.update(now);
+                }
+                // Per-client request tracking
+                if let Ok(mut rates) = state.client_request_rates.lock() {
+                    let entry = rates
+                        .entry(client_id.clone())
+                        .or_insert_with(|| (0, Ewma::new(TAU_1H)));
+                    entry.0 += 1;
+                    entry.1.update(now);
+                }
+            }
+
+            // 429 → mark hard-limited and try next account
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                state.mark_hard_limited(idx, resp.headers()).await;
+                log_429_details(&acct.name, resp).await;
+                state.save_state().await;
+                info!(account = acct.name, "got 429, rotating to next account");
+                skip.push(idx);
                 continue;
             }
-            builder = builder.header(k, v);
-        }
 
-        // Inject budget status header
-        {
-            let info = acct.rate_info.read().await;
-            let (eff_util, _) = effective_utilization(&info, AppState::now_epoch(), &model);
-            let status_val = compute_pressure_status(eff_util, &client_id, &state);
-            builder = builder.header("x-budget-status", status_val);
-        }
+            // 529 → overloaded, try next account; flag for BEBO retry if all exhausted
+            if status.as_u16() == 529 {
+                state.save_state().await;
+                warn!(account = acct.name, "got 529, rotating to next account");
+                saw_529 = true;
+                skip.push(idx);
+                continue;
+            }
 
-        // Detect streaming from content-type
-        let is_streaming = resp_headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|ct| ct.contains("text/event-stream"))
-            .unwrap_or(false);
+            // Other 5xx → transient, try next account (no BEBO retry)
+            if status.is_server_error() {
+                state.save_state().await;
+                warn!(
+                    account = acct.name,
+                    status = status.as_u16(),
+                    "got server error, rotating to next account"
+                );
+                skip.push(idx);
+                continue;
+            }
 
-        if is_streaming {
-            // Streaming: tee the byte stream to accumulate SSE text for usage extraction
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
-            let state_clone = state.clone();
-            let client_id_clone = client_id.clone();
-            let acct_name = acct.name.clone();
-            let model_clone = model.clone();
-            let client_ip_str = client_ip.to_string();
-            let agent_clone = agent_id.clone();
-            let session_clone = session_id.clone();
+            // Clear hard limit and burst counter — account just served a request successfully
+            {
+                let mut info = acct.rate_info.write().await;
+                info.hard_limited_until = None;
+                info.consecutive_burst_429s = 0;
+            }
 
-            tokio::spawn(async move {
-                let mut sse_buf = Vec::new();
-                while let Ok(Some(chunk)) = resp.chunk().await {
-                    sse_buf.extend_from_slice(&chunk);
-                    if tx.send(Ok(chunk)).await.is_err() {
-                        break; // client disconnected
+            // Persist state after clearing hard limit so the saved snapshot is clean
+            state.save_state().await;
+
+            // Log with capacity info
+            {
+                let info = acct.rate_info.read().await;
+                info!(
+                    client = %client_ip,
+                    client_id = %client_id,
+                    agent = %agent_id,
+                    session = %session_id,
+                    model = %model,
+                    account = acct.name,
+                    status = status.as_u16(),
+                    utilization = ?info.utilization,
+                    claim = ?info.representative_claim,
+                    total = acct.requests.load(Ordering::Relaxed),
+                    "proxied"
+                );
+            }
+
+            let latency_ms = request_start.elapsed().as_millis() as u64;
+
+            // Stream response through, extracting token usage
+            let resp_status =
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let resp_headers = resp.headers().clone();
+
+            let mut builder = Response::builder().status(resp_status);
+            for (k, v) in resp_headers.iter() {
+                if k == "transfer-encoding" {
+                    continue;
+                }
+                builder = builder.header(k, v);
+            }
+
+            // Inject budget status header
+            {
+                let info = acct.rate_info.read().await;
+                let (eff_util, _) = effective_utilization(&info, AppState::now_epoch(), &model);
+                let status_val = compute_pressure_status(eff_util, &client_id, &state);
+                builder = builder.header("x-budget-status", status_val);
+            }
+
+            // Detect streaming from content-type
+            let is_streaming = resp_headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| ct.contains("text/event-stream"))
+                .unwrap_or(false);
+
+            if is_streaming {
+                // Streaming: tee the byte stream to accumulate SSE text for usage extraction
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+                let state_clone = state.clone();
+                let client_id_clone = client_id.clone();
+                let acct_name = acct.name.clone();
+                let model_clone = model.clone();
+                let client_ip_str = client_ip.to_string();
+                let agent_clone = agent_id.clone();
+                let session_clone = session_id.clone();
+
+                tokio::spawn(async move {
+                    let mut sse_buf = Vec::new();
+                    while let Ok(Some(chunk)) = resp.chunk().await {
+                        sse_buf.extend_from_slice(&chunk);
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            break; // client disconnected
+                        }
+                    }
+                    // Parse accumulated SSE data for usage
+                    let text = String::from_utf8_lossy(&sse_buf);
+                    let usage = TokenUsage::from_sse_text(&text);
+                    if !usage.is_empty() {
+                        state_clone
+                            .record_usage(idx, &client_id_clone, &usage)
+                            .await;
+                    }
+                    state_clone.shadow_log(serde_json::json!({
+                        "ts": AppState::now_epoch(),
+                        "client": client_ip_str,
+                        "client_id": client_id_clone,
+                        "agent": agent_clone,
+                        "session": session_clone,
+                        "model": model_clone,
+                        "account": acct_name,
+                        "status": status.as_u16(),
+                        "stream": true,
+                        "latency_ms": request_start.elapsed().as_millis() as u64,
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    }));
+                });
+
+                let body_stream = ReceiverStream::new(rx);
+                return builder
+                    .body(Body::from_stream(body_stream))
+                    .unwrap_or_else(|_| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+                    });
+            } else {
+                // Non-streaming: buffer, extract usage, forward
+                let body_bytes = resp.bytes().await.unwrap_or_default();
+                let mut usage = TokenUsage::default();
+                if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                    usage = TokenUsage::from_response_body(&parsed);
+                    if !usage.is_empty() {
+                        state.record_usage(idx, &client_id, &usage).await;
                     }
                 }
-                // Parse accumulated SSE data for usage
-                let text = String::from_utf8_lossy(&sse_buf);
-                let usage = TokenUsage::from_sse_text(&text);
-                if !usage.is_empty() {
-                    state_clone
-                        .record_usage(idx, &client_id_clone, &usage)
-                        .await;
-                }
-                state_clone.shadow_log(serde_json::json!({
+                state.shadow_log(serde_json::json!({
                     "ts": AppState::now_epoch(),
-                    "client": client_ip_str,
-                    "client_id": client_id_clone,
-                    "agent": agent_clone,
-                    "session": session_clone,
-                    "model": model_clone,
-                    "account": acct_name,
+                    "client": client_ip.to_string(),
+                    "client_id": client_id,
+                    "agent": agent_id,
+                    "session": session_id,
+                    "model": model,
+                    "account": acct.name,
                     "status": status.as_u16(),
-                    "stream": true,
-                    "latency_ms": request_start.elapsed().as_millis() as u64,
+                    "stream": false,
+                    "latency_ms": latency_ms,
                     "input_tokens": usage.input_tokens,
                     "output_tokens": usage.output_tokens,
                     "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": usage.cache_read_input_tokens,
                 }));
-            });
-
-            let body_stream = ReceiverStream::new(rx);
-            return builder
-                .body(Body::from_stream(body_stream))
-                .unwrap_or_else(|_| {
+                return builder.body(Body::from(body_bytes)).unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                 });
-        } else {
-            // Non-streaming: buffer, extract usage, forward
-            let body_bytes = resp.bytes().await.unwrap_or_default();
-            let mut usage = TokenUsage::default();
-            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                usage = TokenUsage::from_response_body(&parsed);
-                if !usage.is_empty() {
-                    state.record_usage(idx, &client_id, &usage).await;
-                }
             }
-            state.shadow_log(serde_json::json!({
-                "ts": AppState::now_epoch(),
-                "client": client_ip.to_string(),
-                "client_id": client_id,
-                "agent": agent_id,
-                "session": session_id,
-                "model": model,
-                "account": acct.name,
-                "status": status.as_u16(),
-                "stream": false,
-                "latency_ms": latency_ms,
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                "cache_read_input_tokens": usage.cache_read_input_tokens,
-            }));
-            return builder.body(Body::from(body_bytes)).unwrap_or_else(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-            });
+        }
+        // If no 529s in this round, don't retry (e.g. all were 429s or errors)
+        if !saw_529 {
+            break;
         }
     }
 
@@ -4517,329 +4553,357 @@ async fn openai_chat_handler(
     };
 
     let n = state.accounts.len();
-    let mut skip: Vec<usize> = Vec::new();
-    for _attempt in 0..n {
-        let idx = match state.pick_account(affinity, &model, &skip).await {
-            Some(i) => i,
-            None => {
-                warn!("all accounts rate-limited");
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "all upstream accounts rate-limited",
-                )
-                    .into_response();
-            }
-        };
-
-        let acct = &state.accounts[idx];
-        let url = format!("{}/v1/messages", state.upstream);
-
-        let mut headers = parts.headers.clone();
-        headers.remove("host");
-        headers.remove("authorization");
-        headers.remove("x-api-key");
-        headers.remove("content-length"); // body size changes after translation
-        headers.remove("accept-encoding"); // we need plaintext to translate the response
-
-        // Inject required Anthropic headers
-        headers.insert("content-type", HeaderValue::from_static("application/json"));
-        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-
-        // Auth injection with claude-code beta header for OAuth
-        if !acct.passthrough {
-            if acct.token.starts_with("sk-ant-api") {
-                headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
-            } else if acct.token.starts_with("sk-ant-oat") {
-                headers.insert(
-                    "authorization",
-                    HeaderValue::from_str(&format!("Bearer {}", acct.token)).unwrap(),
-                );
-                headers.insert(
-                    "anthropic-dangerous-direct-browser-access",
-                    HeaderValue::from_static("true"),
-                );
-                // OAuth tokens need both beta flags for non-Claude-Code clients
-                let existing_beta = headers
-                    .get("anthropic-beta")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let mut betas: Vec<&str> = if existing_beta.is_empty() {
-                    vec![]
-                } else {
-                    existing_beta
-                        .split(',')
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                };
-                for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
-                    if !betas.contains(flag) {
-                        betas.push(flag);
-                    }
-                }
-                headers.insert(
-                    "anthropic-beta",
-                    HeaderValue::from_str(&betas.join(",")).unwrap(),
-                );
-            } else {
-                headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
-            }
+    for retry_round in 0..=MAX_529_RETRIES {
+        if retry_round > 0 {
+            let delay = RETRY_529_BASE_DELAY * 2u32.pow(retry_round - 1);
+            warn!(
+                retry_round = retry_round,
+                delay_ms = delay.as_millis() as u64,
+                "529 backoff: retrying all accounts"
+            );
+            tokio::time::sleep(delay).await;
         }
+        let mut skip: Vec<usize> = Vec::new();
+        let mut saw_529 = false;
+        for _attempt in 0..n {
+            let idx = match state.pick_account(affinity, &model, &skip).await {
+                Some(i) => i,
+                None => {
+                    warn!("all accounts rate-limited");
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "all upstream accounts rate-limited",
+                    )
+                        .into_response();
+                }
+            };
 
-        let upstream_req = state
-            .client
-            .request(reqwest::Method::POST, &url)
-            .headers(reqwest_headers(&headers))
-            .body(anthropic_body.to_string());
+            let acct = &state.accounts[idx];
+            let url = format!("{}/v1/messages", state.upstream);
 
-        let mut resp = match upstream_req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                error!(account = acct.name, "upstream request failed: {e}");
+            let mut headers = parts.headers.clone();
+            headers.remove("host");
+            headers.remove("authorization");
+            headers.remove("x-api-key");
+            headers.remove("content-length"); // body size changes after translation
+            headers.remove("accept-encoding"); // we need plaintext to translate the response
+
+            // Inject required Anthropic headers
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+
+            // Auth injection with claude-code beta header for OAuth
+            if !acct.passthrough {
+                if acct.token.starts_with("sk-ant-api") {
+                    headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
+                } else if acct.token.starts_with("sk-ant-oat") {
+                    headers.insert(
+                        "authorization",
+                        HeaderValue::from_str(&format!("Bearer {}", acct.token)).unwrap(),
+                    );
+                    headers.insert(
+                        "anthropic-dangerous-direct-browser-access",
+                        HeaderValue::from_static("true"),
+                    );
+                    // OAuth tokens need both beta flags for non-Claude-Code clients
+                    let existing_beta = headers
+                        .get("anthropic-beta")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let mut betas: Vec<&str> = if existing_beta.is_empty() {
+                        vec![]
+                    } else {
+                        existing_beta
+                            .split(',')
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    };
+                    for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
+                        if !betas.contains(flag) {
+                            betas.push(flag);
+                        }
+                    }
+                    headers.insert(
+                        "anthropic-beta",
+                        HeaderValue::from_str(&betas.join(",")).unwrap(),
+                    );
+                } else {
+                    headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
+                }
+            }
+
+            let upstream_req = state
+                .client
+                .request(reqwest::Method::POST, &url)
+                .headers(reqwest_headers(&headers))
+                .body(anthropic_body.to_string());
+
+            let mut resp = match upstream_req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(account = acct.name, "upstream request failed: {e}");
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            acct.requests.fetch_add(1, Ordering::Relaxed);
+            state.update_rate_info(idx, resp.headers()).await;
+
+            // Update burn rate (after rate-limit headers are parsed)
+            {
+                let now = Instant::now();
+                if let Ok(mut br) = acct.burn_rate.lock() {
+                    br.update(now);
+                }
+                if let Ok(mut rates) = state.client_request_rates.lock() {
+                    let entry = rates
+                        .entry(client_id.clone())
+                        .or_insert_with(|| (0, Ewma::new(TAU_1H)));
+                    entry.0 += 1;
+                    entry.1.update(now);
+                }
+            }
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                state.mark_hard_limited(idx, resp.headers()).await;
+                log_429_details(&acct.name, resp).await;
+                state.save_state().await;
+                info!(account = acct.name, "got 429, rotating to next account");
+                skip.push(idx);
                 continue;
             }
-        };
 
-        let status = resp.status();
-        acct.requests.fetch_add(1, Ordering::Relaxed);
-        state.update_rate_info(idx, resp.headers()).await;
-
-        // Update burn rate (after rate-limit headers are parsed)
-        {
-            let now = Instant::now();
-            if let Ok(mut br) = acct.burn_rate.lock() {
-                br.update(now);
+            // 529 → overloaded, try next account; flag for BEBO retry if all exhausted
+            if status.as_u16() == 529 {
+                state.save_state().await;
+                warn!(account = acct.name, "got 529, rotating to next account");
+                saw_529 = true;
+                skip.push(idx);
+                continue;
             }
-            if let Ok(mut rates) = state.client_request_rates.lock() {
-                let entry = rates
-                    .entry(client_id.clone())
-                    .or_insert_with(|| (0, Ewma::new(TAU_1H)));
-                entry.0 += 1;
-                entry.1.update(now);
-            }
-        }
 
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            state.mark_hard_limited(idx, resp.headers()).await;
-            log_429_details(&acct.name, resp).await;
+            // Other 5xx → transient, try next account (no BEBO retry)
+            if status.is_server_error() {
+                state.save_state().await;
+                warn!(
+                    account = acct.name,
+                    status = status.as_u16(),
+                    "got server error, rotating to next account"
+                );
+                skip.push(idx);
+                continue;
+            }
+
+            // Clear hard limit and burst counter — account just served a request successfully
+            {
+                let mut info = acct.rate_info.write().await;
+                info.hard_limited_until = None;
+                info.consecutive_burst_429s = 0;
+            }
+
+            // Persist state after clearing hard limit so the saved snapshot is clean
             state.save_state().await;
-            info!(account = acct.name, "got 429, rotating to next account");
-            skip.push(idx);
-            continue;
-        }
 
-        // 5xx/529 → transient upstream error, try next account (don't mark hard-limited)
-        if status.is_server_error() || status.as_u16() == 529 {
-            state.save_state().await;
-            warn!(
-                account = acct.name,
-                status = status.as_u16(),
-                "got server error, rotating to next account"
-            );
-            skip.push(idx);
-            continue;
-        }
+            // Compute budget pressure status for response header
+            let budget_status = {
+                let info = acct.rate_info.read().await;
+                let (eff_util, _) = effective_utilization(&info, AppState::now_epoch(), &model);
+                compute_pressure_status(eff_util, &client_id, &state)
+            };
 
-        // Clear hard limit and burst counter — account just served a request successfully
-        {
-            let mut info = acct.rate_info.write().await;
-            info.hard_limited_until = None;
-            info.consecutive_burst_429s = 0;
-        }
-
-        // Persist state after clearing hard limit so the saved snapshot is clean
-        state.save_state().await;
-
-        // Compute budget pressure status for response header
-        let budget_status = {
-            let info = acct.rate_info.read().await;
-            let (eff_util, _) = effective_utilization(&info, AppState::now_epoch(), &model);
-            compute_pressure_status(eff_util, &client_id, &state)
-        };
-
-        {
-            let info = acct.rate_info.read().await;
-            info!(
-                client = %client_ip,
-                client_id = %client_id,
-                agent = %agent_id,
-                session = %session_id,
-                model = %model,
-                account = acct.name,
-                status = status.as_u16(),
-                utilization = ?info.utilization,
-                openai_compat = true,
-                stream = is_streaming,
-                "proxied (openai-compat)"
-            );
-        }
-
-        // Non-2xx: return error as-is (not SSE even if streaming was requested)
-        if !status.is_success() {
-            let error_body = resp.bytes().await.unwrap_or_default();
-            return Response::builder()
-                .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
-                .header("content-type", "application/json")
-                .header("x-budget-status", budget_status)
-                .body(Body::from(error_body))
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                });
-        }
-
-        if is_streaming {
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
-            let state_clone = state.clone();
-            let client_id_clone = client_id.clone();
-            let acct_name = acct.name.clone();
-            let model_clone = model.clone();
-            let client_ip_str = client_ip.to_string();
-            let agent_clone = agent_id.clone();
-            let session_clone = session_id.clone();
-
-            tokio::spawn(async move {
-                let mut buffer = String::new();
-                let mut raw_sse = String::new(); // accumulate for usage extraction
-                let mut ctx = StreamContext::default();
-                let mut sent_done = false;
-
-                while let Ok(Some(chunk)) = resp.chunk().await {
-                    let chunk_str = String::from_utf8_lossy(&chunk);
-                    buffer.push_str(&chunk_str);
-                    raw_sse.push_str(&chunk_str);
-
-                    while let Some(pos) = buffer.find("\n\n") {
-                        let event = buffer[..pos].to_string();
-                        buffer = buffer[pos + 2..].to_string();
-
-                        if event.trim().is_empty() {
-                            continue;
-                        }
-
-                        if let Some(translated) = translate_sse_event(&event, &mut ctx) {
-                            if translated.contains("[DONE]") {
-                                sent_done = true;
-                            }
-                            if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
-                                return; // client disconnected
-                            }
-                        }
-                    }
-                }
-
-                // Process any remaining data in buffer
-                if !buffer.trim().is_empty() {
-                    if let Some(translated) = translate_sse_event(&buffer, &mut ctx) {
-                        if translated.contains("[DONE]") {
-                            sent_done = true;
-                        }
-                        let _ = tx.send(Ok(bytes::Bytes::from(translated))).await;
-                    }
-                }
-
-                // Ensure [DONE] is always sent (fallback for abnormal stream termination)
-                if !sent_done {
-                    let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
-                }
-
-                // Extract and record token usage from accumulated SSE data
-                let usage = TokenUsage::from_sse_text(&raw_sse);
-                if !usage.is_empty() {
-                    state_clone
-                        .record_usage(idx, &client_id_clone, &usage)
-                        .await;
-                }
-                state_clone.shadow_log(serde_json::json!({
-                    "ts": AppState::now_epoch(),
-                    "client": client_ip_str,
-                    "client_id": client_id_clone,
-                    "agent": agent_clone,
-                    "session": session_clone,
-                    "model": model_clone,
-                    "account": acct_name,
-                    "status": status.as_u16(),
-                    "stream": true,
-                    "openai_compat": true,
-                    "latency_ms": request_start.elapsed().as_millis() as u64,
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                    "cache_read_input_tokens": usage.cache_read_input_tokens,
-                }));
-            });
-
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "text/event-stream")
-                .header("cache-control", "no-cache")
-                .header("connection", "keep-alive")
-                .header("x-budget-status", budget_status)
-                .body(Body::from_stream(ReceiverStream::new(rx)))
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                });
-        }
-
-        // Non-streaming: buffer, translate, return
-        let resp_bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                error!("failed to read upstream response: {e}");
-                return (StatusCode::BAD_GATEWAY, "failed to read upstream response")
-                    .into_response();
+            {
+                let info = acct.rate_info.read().await;
+                info!(
+                    client = %client_ip,
+                    client_id = %client_id,
+                    agent = %agent_id,
+                    session = %session_id,
+                    model = %model,
+                    account = acct.name,
+                    status = status.as_u16(),
+                    utilization = ?info.utilization,
+                    openai_compat = true,
+                    stream = is_streaming,
+                    "proxied (openai-compat)"
+                );
             }
-        };
 
-        let anthropic_resp: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
-            Ok(v) => v,
-            Err(_) => {
+            // Non-2xx: return error as-is (not SSE even if streaming was requested)
+            if !status.is_success() {
+                let error_body = resp.bytes().await.unwrap_or_default();
                 return Response::builder()
-                    .status(StatusCode::OK)
+                    .status(
+                        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                    )
                     .header("content-type", "application/json")
                     .header("x-budget-status", budget_status)
-                    .body(Body::from(resp_bytes))
+                    .body(Body::from(error_body))
                     .unwrap_or_else(|_| {
                         (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                     });
             }
-        };
 
-        let openai_resp = translate_anthropic_to_openai(&anthropic_resp);
+            if is_streaming {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+                let state_clone = state.clone();
+                let client_id_clone = client_id.clone();
+                let acct_name = acct.name.clone();
+                let model_clone = model.clone();
+                let client_ip_str = client_ip.to_string();
+                let agent_clone = agent_id.clone();
+                let session_clone = session_id.clone();
 
-        // Extract and record token usage from non-streaming response
-        let usage = TokenUsage::from_response_body(&anthropic_resp);
-        if !usage.is_empty() {
-            state.record_usage(idx, &client_id, &usage).await;
+                tokio::spawn(async move {
+                    let mut buffer = String::new();
+                    let mut raw_sse = String::new(); // accumulate for usage extraction
+                    let mut ctx = StreamContext::default();
+                    let mut sent_done = false;
+
+                    while let Ok(Some(chunk)) = resp.chunk().await {
+                        let chunk_str = String::from_utf8_lossy(&chunk);
+                        buffer.push_str(&chunk_str);
+                        raw_sse.push_str(&chunk_str);
+
+                        while let Some(pos) = buffer.find("\n\n") {
+                            let event = buffer[..pos].to_string();
+                            buffer = buffer[pos + 2..].to_string();
+
+                            if event.trim().is_empty() {
+                                continue;
+                            }
+
+                            if let Some(translated) = translate_sse_event(&event, &mut ctx) {
+                                if translated.contains("[DONE]") {
+                                    sent_done = true;
+                                }
+                                if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
+                                    return; // client disconnected
+                                }
+                            }
+                        }
+                    }
+
+                    // Process any remaining data in buffer
+                    if !buffer.trim().is_empty() {
+                        if let Some(translated) = translate_sse_event(&buffer, &mut ctx) {
+                            if translated.contains("[DONE]") {
+                                sent_done = true;
+                            }
+                            let _ = tx.send(Ok(bytes::Bytes::from(translated))).await;
+                        }
+                    }
+
+                    // Ensure [DONE] is always sent (fallback for abnormal stream termination)
+                    if !sent_done {
+                        let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
+                    }
+
+                    // Extract and record token usage from accumulated SSE data
+                    let usage = TokenUsage::from_sse_text(&raw_sse);
+                    if !usage.is_empty() {
+                        state_clone
+                            .record_usage(idx, &client_id_clone, &usage)
+                            .await;
+                    }
+                    state_clone.shadow_log(serde_json::json!({
+                        "ts": AppState::now_epoch(),
+                        "client": client_ip_str,
+                        "client_id": client_id_clone,
+                        "agent": agent_clone,
+                        "session": session_clone,
+                        "model": model_clone,
+                        "account": acct_name,
+                        "status": status.as_u16(),
+                        "stream": true,
+                        "openai_compat": true,
+                        "latency_ms": request_start.elapsed().as_millis() as u64,
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    }));
+                });
+
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .header("cache-control", "no-cache")
+                    .header("connection", "keep-alive")
+                    .header("x-budget-status", budget_status)
+                    .body(Body::from_stream(ReceiverStream::new(rx)))
+                    .unwrap_or_else(|_| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+                    });
+            }
+
+            // Non-streaming: buffer, translate, return
+            let resp_bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("failed to read upstream response: {e}");
+                    return (StatusCode::BAD_GATEWAY, "failed to read upstream response")
+                        .into_response();
+                }
+            };
+
+            let anthropic_resp: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header("x-budget-status", budget_status)
+                        .body(Body::from(resp_bytes))
+                        .unwrap_or_else(|_| {
+                            (StatusCode::INTERNAL_SERVER_ERROR, "response build error")
+                                .into_response()
+                        });
+                }
+            };
+
+            let openai_resp = translate_anthropic_to_openai(&anthropic_resp);
+
+            // Extract and record token usage from non-streaming response
+            let usage = TokenUsage::from_response_body(&anthropic_resp);
+            if !usage.is_empty() {
+                state.record_usage(idx, &client_id, &usage).await;
+            }
+            state.shadow_log(serde_json::json!({
+                "ts": AppState::now_epoch(),
+                "client": client_ip.to_string(),
+                "client_id": client_id,
+                "agent": agent_id,
+                "session": session_id,
+                "model": model,
+                "account": acct.name,
+                "status": status.as_u16(),
+                "stream": false,
+                "openai_compat": true,
+                "latency_ms": request_start.elapsed().as_millis() as u64,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": usage.cache_read_input_tokens,
+            }));
+
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("x-budget-status", budget_status)
+                .body(Body::from(
+                    serde_json::to_vec(&openai_resp).unwrap_or_default(),
+                ))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+                });
         }
-        state.shadow_log(serde_json::json!({
-            "ts": AppState::now_epoch(),
-            "client": client_ip.to_string(),
-            "client_id": client_id,
-            "agent": agent_id,
-            "session": session_id,
-            "model": model,
-            "account": acct.name,
-            "status": status.as_u16(),
-            "stream": false,
-            "openai_compat": true,
-            "latency_ms": request_start.elapsed().as_millis() as u64,
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-            "cache_read_input_tokens": usage.cache_read_input_tokens,
-        }));
-
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/json")
-            .header("x-budget-status", budget_status)
-            .body(Body::from(
-                serde_json::to_vec(&openai_resp).unwrap_or_default(),
-            ))
-            .unwrap_or_else(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-            });
+        if !saw_529 {
+            break;
+        }
     }
 
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all accounts").into_response()
