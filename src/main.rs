@@ -866,6 +866,15 @@ const REJECTED_UTIL_FLOOR: f64 = 1.0;
 /// 0.5 means the picked account must have at least 50% of the best's weight.
 const AFFINITY_OVERRIDE_RATIO: f64 = 0.5;
 
+/// Request-balance rebalancing: when the picked account's actual request share
+/// exceeds its weight-proportional share by more than this margin, override
+/// affinity to rebalance. Corrects hash-distribution skew with few clients.
+const REQUEST_BALANCE_THRESHOLD: f64 = 0.10;
+
+/// Minimum total requests across both candidates before balance correction
+/// activates. Avoids overriding on noisy small-sample data at startup.
+const REQUEST_BALANCE_MIN_SAMPLE: u64 = 20;
+
 /// Extract the model family from a model ID string.
 /// Used to look up model-specific rate-limit claims (e.g., "seven_day_sonnet").
 /// Returns "" for unrecognized models, which triggers worst-case routing.
@@ -1281,6 +1290,30 @@ impl AppState {
                     "pick: affinity override, weight ratio below threshold"
                 );
                 picked = other;
+            } else {
+                // Request-balance correction: affinity hashing with few clients
+                // can skew traffic far from the weight-proportional split. When
+                // the picked account's actual request share exceeds its expected
+                // share by REQUEST_BALANCE_THRESHOLD, send to the other account.
+                let picked_reqs = self.accounts[picked.idx].requests.load(Ordering::Relaxed);
+                let other_reqs = self.accounts[other.idx].requests.load(Ordering::Relaxed);
+                let total_reqs = picked_reqs + other_reqs;
+                if total_reqs >= REQUEST_BALANCE_MIN_SAMPLE {
+                    let actual_share = picked_reqs as f64 / total_reqs as f64;
+                    let expected_share = picked.weight / total_weight;
+                    if actual_share > expected_share + REQUEST_BALANCE_THRESHOLD {
+                        debug!(
+                            picked_account = self.accounts[picked.idx].name,
+                            other_account = self.accounts[other.idx].name,
+                            actual_share = format!("{:.1}%", actual_share * 100.0),
+                            expected_share = format!("{:.1}%", expected_share * 100.0),
+                            picked_reqs = picked_reqs,
+                            other_reqs = other_reqs,
+                            "pick: request-balance override, actual share exceeds weight share"
+                        );
+                        picked = other;
+                    }
+                }
             }
         }
 
@@ -6089,6 +6122,122 @@ mod tests {
             saw[0] && saw[1] && saw[2],
             "all 3 accounts should receive traffic when override is disabled (3 candidates)"
         );
+    }
+
+    #[tokio::test]
+    async fn request_balance_override_corrects_skew() {
+        // When affinity hash routes most clients to one account despite equal
+        // weights, the request-balance override kicks in after MIN_SAMPLE
+        // requests and redirects traffic to the underserved account.
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("jeff", "sk-ant-api-b"),
+        ]);
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.10);
+            info.reset_5h = Some(AppState::now_epoch() + 10000);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.10);
+            info.reset_5h = Some(AppState::now_epoch() + 10000);
+        }
+
+        // Simulate skewed history: jeff has 90% of past requests
+        state.accounts[1].requests.store(900, Ordering::Relaxed);
+        state.accounts[0].requests.store(100, Ordering::Relaxed);
+
+        // With equal weights (~0.9 each), expected share is ~50%.
+        // Jeff's actual share is 90%, which exceeds 50% + 10% threshold.
+        // All picks that hash to jeff should be overridden to primary.
+        let mut primary_count = 0u32;
+        let total = 200u32;
+        for i in 0..total {
+            let key = format!("balance-test-{}", i);
+            let idx = state
+                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            if idx == 0 {
+                primary_count += 1;
+            }
+        }
+
+        // With balance override active, primary should get the vast majority
+        // (both hash-to-primary AND overridden hash-to-jeff requests)
+        assert!(
+            primary_count > total * 80 / 100,
+            "expected >80% to primary with balance correction, got {}%",
+            primary_count * 100 / total
+        );
+    }
+
+    #[tokio::test]
+    async fn request_balance_no_override_when_balanced() {
+        // When request counts are already proportional to weights,
+        // the balance override should not fire — affinity is preserved.
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("jeff", "sk-ant-api-b"),
+        ]);
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.10);
+            info.reset_5h = Some(AppState::now_epoch() + 10000);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.10);
+            info.reset_5h = Some(AppState::now_epoch() + 10000);
+        }
+
+        // Equal weights, equal request counts — balanced
+        state.accounts[0].requests.store(500, Ordering::Relaxed);
+        state.accounts[1].requests.store(500, Ordering::Relaxed);
+
+        // Both accounts should see traffic (affinity preserved)
+        assert_affinity_distribution(
+            &state,
+            "balanced-reqs",
+            500,
+            None,
+            "balanced request counts should preserve affinity on both accounts",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn request_balance_skipped_below_min_sample() {
+        // Below REQUEST_BALANCE_MIN_SAMPLE, no override — even if skewed.
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("jeff", "sk-ant-api-b"),
+        ]);
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.10);
+            info.reset_5h = Some(AppState::now_epoch() + 10000);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.10);
+            info.reset_5h = Some(AppState::now_epoch() + 10000);
+        }
+
+        // Very few requests — below threshold
+        state.accounts[0].requests.store(1, Ordering::Relaxed);
+        state.accounts[1].requests.store(8, Ordering::Relaxed);
+
+        // Both accounts should see traffic (affinity preserved, no correction)
+        assert_affinity_distribution(
+            &state,
+            "low-sample",
+            500,
+            None,
+            "below min sample should preserve affinity on both accounts",
+        )
+        .await;
     }
 
     #[tokio::test]
