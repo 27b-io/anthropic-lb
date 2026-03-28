@@ -2199,6 +2199,9 @@ fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
         None => {
             body["system"] = serde_json::json!([cc_block]);
         }
+        Some(system) if system.is_null() => {
+            body["system"] = serde_json::json!([cc_block]);
+        }
         Some(system) => {
             if let Some(text) = system.as_str() {
                 if text == OAUTH_SYSTEM_PROMPT {
@@ -12877,6 +12880,20 @@ upstream = "https://api.anthropic.com"
         assert_eq!(system.len(), 1, "should not duplicate");
     }
 
+    #[test]
+    fn oauth_system_prompt_handles_null_system() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": null,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+        inject_oauth_system_prompt(&mut body);
+        let system = body.get("system").unwrap().as_array().unwrap();
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
+    }
+
     /// Integration test: verify OAuth accounts get the CC system prompt injected
     /// in requests sent through the OpenAI-compat endpoint.
     #[tokio::test]
@@ -12982,5 +12999,98 @@ upstream = "https://api.anthropic.com"
             .unwrap();
 
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+
+    /// Test that non-2xx upstream errors are translated to OpenAI error format.
+    #[tokio::test]
+    async fn openai_compat_translates_upstream_json_error() {
+        // Mock upstream returns 400 with Anthropic-format error
+        let mock_app = Router::new().fallback(any(|_req: Request<Body>| async {
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: must be positive"}}"#,
+                ))
+                .unwrap()
+        }));
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let (app, _state) = test_openai_app(&format!("http://{}", mock_addr), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"max_tokens":5}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["message"], "max_tokens: must be positive");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["param"].is_null());
+    }
+
+    /// Test that non-JSON upstream errors are wrapped in OpenAI error format.
+    #[tokio::test]
+    async fn openai_compat_translates_upstream_raw_error() {
+        // Mock upstream returns 422 with plain text (non-retryable, non-JSON)
+        let mock_app = Router::new().fallback(any(|_req: Request<Body>| async {
+            Response::builder()
+                .status(StatusCode::UNPROCESSABLE_ENTITY)
+                .header("content-type", "text/plain")
+                .body(Body::from("upstream timeout"))
+                .unwrap()
+        }));
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let (app, _state) = test_openai_app(&format!("http://{}", mock_addr), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"max_tokens":5}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["message"], "upstream timeout");
+        assert_eq!(body["error"]["type"], "api_error");
     }
 }
