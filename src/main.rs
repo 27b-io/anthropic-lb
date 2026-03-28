@@ -2402,7 +2402,8 @@ async fn proxy_handler(
         .to_string();
     let session_id = parts
         .headers
-        .get("x-session-id")
+        .get("x-claude-code-session-id")
+        .or_else(|| parts.headers.get("x-session-id"))
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-")
         .to_string();
@@ -4550,7 +4551,8 @@ async fn openai_chat_handler(
         .to_string();
     let session_id = parts
         .headers
-        .get("x-session-id")
+        .get("x-claude-code-session-id")
+        .or_else(|| parts.headers.get("x-session-id"))
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-")
         .to_string();
