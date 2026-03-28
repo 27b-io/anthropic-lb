@@ -4834,6 +4834,7 @@ async fn openai_chat_handler(
 
                 // Translate Anthropic error to OpenAI error format so clients
                 // (LiteLLM, etc.) can parse the actual error message.
+                let error_text = String::from_utf8_lossy(&error_body).to_string();
                 let openai_error =
                     if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&error_body) {
                         // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
