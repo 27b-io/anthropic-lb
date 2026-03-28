@@ -257,6 +257,10 @@ impl BurnRate {
 /// Default emergency brake threshold. When ALL accounts exceed this, non-operator traffic is blocked.
 const DEFAULT_EMERGENCY_THRESHOLD: f64 = 0.88;
 
+/// Claude Code system prompt required by the Anthropic API for OAuth tokens (sk-ant-oat*)
+/// to access sonnet/opus models. Must be the FIRST system block in the request.
+const OAUTH_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 /// Max bytes of 429 response body to include in debug logs.
 const MAX_429_BODY_LOG_BYTES: usize = 512;
 
@@ -612,6 +616,13 @@ impl AppState {
             }
             Err(e) => error!(error = %e, "failed to serialize state"),
         }
+    }
+
+    /// Returns true if any configured account uses an OAuth token.
+    fn has_oauth_accounts(&self) -> bool {
+        self.accounts
+            .iter()
+            .any(|a| a.token.starts_with("sk-ant-oat"))
     }
 
     /// Fire a minimal request (max_tokens=1) to refresh rate limit headers for an account.
@@ -2176,6 +2187,51 @@ impl AppState {
     }
 }
 
+// ── OAuth system prompt injection ──────────────────────────────────
+
+/// Inject the Claude Code system prompt as the first system block.
+///
+/// OAuth tokens (sk-ant-oat*) require this exact prompt as the first system
+/// block to access sonnet/opus models. Haiku works without it, but we inject
+/// unconditionally for OAuth accounts to keep things simple.
+///
+/// The prompt is prepended to any existing system content:
+/// - No system field → creates `"system": [{"type":"text","text":"..."}]`
+/// - String system → converts to array with CC prompt first, original second
+/// - Array system → prepends CC prompt block if not already present
+fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
+    let cc_block = serde_json::json!({"type": "text", "text": OAUTH_SYSTEM_PROMPT});
+
+    match body.get("system") {
+        None => {
+            body["system"] = serde_json::json!([cc_block]);
+        }
+        Some(system) => {
+            if let Some(text) = system.as_str() {
+                if text == OAUTH_SYSTEM_PROMPT {
+                    return; // already correct
+                }
+                // Convert string to array: CC prompt first, original second
+                body["system"] = serde_json::json!([
+                    cc_block,
+                    {"type": "text", "text": text}
+                ]);
+            } else if let Some(arr) = system.as_array() {
+                // Check if first block already has the CC prompt
+                if let Some(first) = arr.first() {
+                    if first.get("text").and_then(|t| t.as_str()) == Some(OAUTH_SYSTEM_PROMPT) {
+                        return; // already present
+                    }
+                }
+                // Prepend CC prompt block
+                let mut new_arr = vec![cc_block];
+                new_arr.extend(arr.iter().cloned());
+                body["system"] = serde_json::Value::Array(new_arr);
+            }
+        }
+    }
+}
+
 // ── Auto-cache injection ────────────────────────────────────────────
 
 struct CacheInjection {
@@ -2367,6 +2423,13 @@ async fn proxy_handler(
                 .and_then(|m| m.as_str())
                 .unwrap_or("")
                 .to_string();
+
+            // OAuth tokens require the Claude Code system prompt to access
+            // sonnet/opus models. Inject it before auto-cache (which may
+            // add cache_control to the system block).
+            if state.has_oauth_accounts() {
+                inject_oauth_system_prompt(&mut parsed);
+            }
 
             if state.auto_cache {
                 let inj = inject_cache_breakpoints(&mut parsed);
@@ -4528,6 +4591,12 @@ async fn openai_chat_handler(
 
     let mut anthropic_body = translate_openai_to_anthropic(&openai_body);
 
+    // OAuth tokens require the Claude Code system prompt to access
+    // sonnet/opus models. Inject before auto-cache.
+    if state.has_oauth_accounts() {
+        inject_oauth_system_prompt(&mut anthropic_body);
+    }
+
     if state.auto_cache {
         let inj = inject_cache_breakpoints(&mut anthropic_body);
         if inj.skipped {
@@ -4634,11 +4703,20 @@ async fn openai_chat_handler(
                 }
             }
 
+            let body_str = anthropic_body.to_string();
+            debug!(
+                account = acct.name,
+                model = %model,
+                body_len = body_str.len(),
+                body = %body_str,
+                "openai-compat: upstream request body"
+            );
+
             let upstream_req = state
                 .client
                 .request(reqwest::Method::POST, &url)
                 .headers(reqwest_headers(&headers))
-                .body(anthropic_body.to_string());
+                .body(body_str);
 
             let mut resp = match upstream_req.send().await {
                 Ok(r) => r,
@@ -4731,16 +4809,59 @@ async fn openai_chat_handler(
                 );
             }
 
-            // Non-2xx: return error as-is (not SSE even if streaming was requested)
+            // Non-2xx: log error detail, translate to OpenAI error format, return
             if !status.is_success() {
                 let error_body = resp.bytes().await.unwrap_or_default();
+                let error_text = String::from_utf8_lossy(&error_body);
+                warn!(
+                    account = acct.name,
+                    model = %model,
+                    status = status.as_u16(),
+                    error_body = %error_text,
+                    "openai-compat: upstream error"
+                );
+
+                // Translate Anthropic error to OpenAI error format so clients
+                // (LiteLLM, etc.) can parse the actual error message.
+                let openai_error =
+                    if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&error_body) {
+                        // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
+                        let msg = parsed
+                            .pointer("/error/message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown upstream error");
+                        let err_type = parsed
+                            .pointer("/error/type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("api_error");
+                        serde_json::json!({
+                            "error": {
+                                "message": msg,
+                                "type": err_type,
+                                "param": null,
+                                "code": null
+                            }
+                        })
+                    } else {
+                        serde_json::json!({
+                            "error": {
+                                "message": error_text.as_ref(),
+                                "type": "api_error",
+                                "param": null,
+                                "code": null
+                            }
+                        })
+                    };
+
                 return Response::builder()
                     .status(
                         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
                     )
                     .header("content-type", "application/json")
                     .header("x-budget-status", budget_status)
-                    .body(Body::from(error_body))
+                    .body(Body::from(
+                        serde_json::to_vec(&openai_error).unwrap_or_default(),
+                    ))
                     .unwrap_or_else(|_| {
                         (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                     });
@@ -12680,6 +12801,49 @@ upstream = "https://api.anthropic.com"
         assert!(
             !body.contains("anthropic_claim_utilization{account=\"acct-b\""),
             "acct-b should have no claim_utilization:\n{body}"
+        );
+    }
+
+    /// Reproduce the 400 error: send the exact same request as the probe via reqwest.
+    /// Run with: cargo test reqwest_vs_curl_opus -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn reqwest_vs_curl_opus() {
+        let token = std::env::var("TEST_OAUTH_TOKEN").expect("set TEST_OAUTH_TOKEN");
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+
+        // OAuth tokens require the Claude Code system prompt as the first
+        // system block to access sonnet/opus models.
+        let body = serde_json::json!({
+            "model": "claude-opus-4-6",
+            "max_tokens": 1,
+            "system": [{"type": "text", "text": OAUTH_SYSTEM_PROMPT}],
+            "messages": [{"role": "user", "content": "."}]
+        });
+
+        let resp = client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .header("authorization", format!("Bearer {token}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        println!("STATUS: {status}");
+        println!("BODY: {text}");
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "expected 200, body: {text}"
         );
     }
 }

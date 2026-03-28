@@ -55,6 +55,12 @@ Headroom-proportional weighted bucket hashing:
 - `sk-ant-api*` → `x-api-key` header
 - `passthrough` → forwards caller's auth headers untouched
 
+### OAuth System Prompt Requirement
+
+OAuth tokens (`sk-ant-oat*`) require the exact system prompt `"You are Claude Code, Anthropic's official CLI for Claude."` as the **first** system block to access sonnet/opus models. Without it, the API returns `400 invalid_request_error` with the unhelpful message `"Error"`. Haiku works without it.
+
+`inject_oauth_system_prompt()` handles this automatically for both handlers when OAuth accounts are configured. It prepends the prompt block, preserving any existing system content as subsequent blocks. Runs before auto-cache injection (which may add `cache_control` to the system block).
+
 ### Upstream Routing
 
 Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. Requests to `/upstream/{name}/*` are forwarded with `Authorization: Bearer` API key injection.
