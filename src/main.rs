@@ -2417,40 +2417,17 @@ async fn proxy_handler(
     };
 
     // Parse body once for model extraction and optional cache injection
-    let (body_bytes, model) =
-        if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+    // Parse the body to extract model and prepare for per-account processing
+    let (parsed_body, model) =
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             let model = parsed
                 .get("model")
                 .and_then(|m| m.as_str())
                 .unwrap_or("")
                 .to_string();
-
-            // OAuth tokens require the Claude Code system prompt to access
-            // sonnet/opus models. Inject it before auto-cache (which may
-            // add cache_control to the system block).
-            if state.has_oauth_accounts() {
-                inject_oauth_system_prompt(&mut parsed);
-            }
-
-            if state.auto_cache {
-                let inj = inject_cache_breakpoints(&mut parsed);
-                if inj.skipped {
-                    debug!("auto-cache: skipped, existing cache_control found");
-                } else if inj.tools || inj.system || inj.messages {
-                    debug!(
-                        tools = inj.tools,
-                        system = inj.system,
-                        messages = inj.messages,
-                        "auto-cache: injected breakpoints"
-                    );
-                }
-            }
-
-            // Re-serialize (only differs from original if cache was injected)
-            let bytes = serde_json::to_vec(&parsed).unwrap_or_else(|_| body_bytes.to_vec());
-            (bytes::Bytes::from(bytes), model)
+            (Some(parsed), model)
         } else {
-            (body_bytes, String::new())
+            (None, String::new())
         };
 
     // Pre-request gate: operator bypass, budget, utilization limit, emergency brake.
@@ -2498,6 +2475,36 @@ async fn proxy_handler(
             };
 
             let acct = &state.accounts[idx];
+
+            // Process body per-account: inject OAuth prompt if needed, then auto-cache
+            let body_bytes_for_request = if let Some(mut parsed) = parsed_body.clone() {
+                // OAuth tokens require the Claude Code system prompt to access
+                // sonnet/opus models. Inject it before auto-cache (which may
+                // add cache_control to the system block).
+                if acct.token.starts_with("sk-ant-oat") {
+                    inject_oauth_system_prompt(&mut parsed);
+                }
+
+                if state.auto_cache {
+                    let inj = inject_cache_breakpoints(&mut parsed);
+                    if inj.skipped {
+                        debug!("auto-cache: skipped, existing cache_control found");
+                    } else if inj.tools || inj.system || inj.messages {
+                        debug!(
+                            tools = inj.tools,
+                            system = inj.system,
+                            messages = inj.messages,
+                            "auto-cache: injected breakpoints"
+                        );
+                    }
+                }
+
+                // Re-serialize (may differ from original if OAuth prompt or cache was injected)
+                bytes::Bytes::from(serde_json::to_vec(&parsed).unwrap_or_else(|_| body_bytes.to_vec()))
+            } else {
+                body_bytes.clone()
+            };
+
             let url = format!(
                 "{}{}",
                 state.upstream,
@@ -2573,7 +2580,7 @@ async fn proxy_handler(
             // passthrough: caller's auth headers flow through untouched
 
             upstream_req = upstream_req.headers(headers);
-            upstream_req = upstream_req.body(body_bytes.clone());
+            upstream_req = upstream_req.body(body_bytes_for_request);
 
             let mut resp = match upstream_req.send().await {
                 Ok(r) => r,
@@ -4591,27 +4598,9 @@ async fn openai_chat_handler(
         return resp;
     }
 
-    let mut anthropic_body = translate_openai_to_anthropic(&openai_body);
-
-    // OAuth tokens require the Claude Code system prompt to access
-    // sonnet/opus models. Inject before auto-cache.
-    if state.has_oauth_accounts() {
-        inject_oauth_system_prompt(&mut anthropic_body);
-    }
-
-    if state.auto_cache {
-        let inj = inject_cache_breakpoints(&mut anthropic_body);
-        if inj.skipped {
-            debug!("auto-cache: skipped, existing cache_control found");
-        } else if inj.tools || inj.system || inj.messages {
-            debug!(
-                tools = inj.tools,
-                system = inj.system,
-                messages = inj.messages,
-                "auto-cache: injected breakpoints"
-            );
-        }
-    }
+    // Translate OpenAI format to Anthropic format (OAuth prompt and cache injection
+    // will be done per-account inside the retry loop)
+    let anthropic_body = translate_openai_to_anthropic(&openai_body);
 
     // Build affinity key for sticky routing — only use stickiness when there's
     // meaningful client identification beyond just the IP address
@@ -4650,6 +4639,30 @@ async fn openai_chat_handler(
             };
 
             let acct = &state.accounts[idx];
+
+            // Process body per-account: inject OAuth prompt if needed, then auto-cache
+            let mut anthropic_body_for_request = anthropic_body.clone();
+
+            // OAuth tokens require the Claude Code system prompt to access
+            // sonnet/opus models. Inject it before auto-cache.
+            if acct.token.starts_with("sk-ant-oat") {
+                inject_oauth_system_prompt(&mut anthropic_body_for_request);
+            }
+
+            if state.auto_cache {
+                let inj = inject_cache_breakpoints(&mut anthropic_body_for_request);
+                if inj.skipped {
+                    debug!("auto-cache: skipped, existing cache_control found");
+                } else if inj.tools || inj.system || inj.messages {
+                    debug!(
+                        tools = inj.tools,
+                        system = inj.system,
+                        messages = inj.messages,
+                        "auto-cache: injected breakpoints"
+                    );
+                }
+            }
+
             let url = format!("{}/v1/messages", state.upstream);
 
             let mut headers = parts.headers.clone();
@@ -4705,12 +4718,17 @@ async fn openai_chat_handler(
                 }
             }
 
-            let body_str = anthropic_body.to_string();
+            let body_str = anthropic_body_for_request.to_string();
+            let body_preview = if body_str.len() > 200 {
+                format!("{}...", &body_str[..200])
+            } else {
+                body_str.clone()
+            };
             debug!(
                 account = acct.name,
                 model = %model,
                 body_len = body_str.len(),
-                body = %body_str,
+                body_preview = %body_preview,
                 "openai-compat: upstream request body"
             );
 
@@ -12806,12 +12824,12 @@ upstream = "https://api.anthropic.com"
         );
     }
 
-    /// Reproduce the 400 error: send the exact same request as the probe via reqwest.
-    /// Run with: cargo test reqwest_vs_curl_opus -- --ignored --nocapture
+    /// Test that OAuth-style requests work with the mock upstream.
+    /// This test verifies the request format that would be sent to the real API,
+    /// but uses a local mock server instead of making live network calls.
     #[tokio::test]
-    #[ignore]
     async fn reqwest_vs_curl_opus() {
-        let token = std::env::var("TEST_OAUTH_TOKEN").expect("set TEST_OAUTH_TOKEN");
+        let (mock_url, _handle) = spawn_mock_upstream().await;
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -12827,12 +12845,12 @@ upstream = "https://api.anthropic.com"
         });
 
         let resp = client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(format!("{}/v1/messages", mock_url))
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
             .header("anthropic-dangerous-direct-browser-access", "true")
-            .header("authorization", format!("Bearer {token}"))
+            .header("authorization", "Bearer sk-ant-oat01-test")
             .json(&body)
             .send()
             .await
@@ -12840,12 +12858,15 @@ upstream = "https://api.anthropic.com"
 
         let status = resp.status();
         let text = resp.text().await.unwrap();
-        println!("STATUS: {status}");
-        println!("BODY: {text}");
         assert_eq!(
             status,
             reqwest::StatusCode::OK,
             "expected 200, body: {text}"
         );
+
+        // Verify the mock returned expected structure
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["type"], "message");
+        assert_eq!(parsed["id"], "msg_test");
     }
 }
