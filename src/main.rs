@@ -257,6 +257,10 @@ impl BurnRate {
 /// Default emergency brake threshold. When ALL accounts exceed this, non-operator traffic is blocked.
 const DEFAULT_EMERGENCY_THRESHOLD: f64 = 0.88;
 
+/// Claude Code system prompt required by the Anthropic API for OAuth tokens (sk-ant-oat*)
+/// to access sonnet/opus models. Must be the FIRST system block in the request.
+const OAUTH_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 /// Max bytes of 429 response body to include in debug logs.
 const MAX_429_BODY_LOG_BYTES: usize = 512;
 
@@ -2176,6 +2180,54 @@ impl AppState {
     }
 }
 
+// ── OAuth system prompt injection ──────────────────────────────────
+
+/// Inject the Claude Code system prompt as the first system block.
+///
+/// OAuth tokens (sk-ant-oat*) require this exact prompt as the first system
+/// block to access sonnet/opus models. Haiku works without it, but we inject
+/// unconditionally for OAuth accounts to keep things simple.
+///
+/// The prompt is prepended to any existing system content:
+/// - No system field → creates `"system": [{"type":"text","text":"..."}]`
+/// - String system → converts to array with CC prompt first, original second
+/// - Array system → prepends CC prompt block if not already present
+fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
+    let cc_block = serde_json::json!({"type": "text", "text": OAUTH_SYSTEM_PROMPT});
+
+    match body.get("system") {
+        None => {
+            body["system"] = serde_json::json!([cc_block]);
+        }
+        Some(system) if system.is_null() => {
+            body["system"] = serde_json::json!([cc_block]);
+        }
+        Some(system) => {
+            if let Some(text) = system.as_str() {
+                if text == OAUTH_SYSTEM_PROMPT {
+                    return; // already correct
+                }
+                // Convert string to array: CC prompt first, original second
+                body["system"] = serde_json::json!([
+                    cc_block,
+                    {"type": "text", "text": text}
+                ]);
+            } else if let Some(arr) = system.as_array() {
+                // Check if first block already has the CC prompt
+                if let Some(first) = arr.first() {
+                    if first.get("text").and_then(|t| t.as_str()) == Some(OAUTH_SYSTEM_PROMPT) {
+                        return; // already present
+                    }
+                }
+                // Prepend CC prompt block
+                let mut new_arr = vec![cc_block];
+                new_arr.extend(arr.iter().cloned());
+                body["system"] = serde_json::Value::Array(new_arr);
+            }
+        }
+    }
+}
+
 // ── Auto-cache injection ────────────────────────────────────────────
 
 struct CacheInjection {
@@ -2346,7 +2398,8 @@ async fn proxy_handler(
         .to_string();
     let session_id = parts
         .headers
-        .get("x-session-id")
+        .get("x-claude-code-session-id")
+        .or_else(|| parts.headers.get("x-session-id"))
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-")
         .to_string();
@@ -2360,7 +2413,7 @@ async fn proxy_handler(
     };
 
     // Parse body once for model extraction and optional cache injection
-    let (body_bytes, model) =
+    let (body_bytes, oauth_body_bytes, model) =
         if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             let model = parsed
                 .get("model")
@@ -2384,9 +2437,21 @@ async fn proxy_handler(
 
             // Re-serialize (only differs from original if cache was injected)
             let bytes = serde_json::to_vec(&parsed).unwrap_or_else(|_| body_bytes.to_vec());
-            (bytes::Bytes::from(bytes), model)
+
+            // Pre-compute OAuth variant with Claude Code system prompt prepended.
+            // OAuth tokens (sk-ant-oat*) require this to access sonnet/opus models.
+            let mut oauth_parsed = parsed;
+            inject_oauth_system_prompt(&mut oauth_parsed);
+            let oauth_bytes = serde_json::to_vec(&oauth_parsed).unwrap_or_else(|_| bytes.clone());
+
+            (
+                bytes::Bytes::from(bytes),
+                bytes::Bytes::from(oauth_bytes),
+                model,
+            )
         } else {
-            (body_bytes, String::new())
+            let clone = body_bytes.clone();
+            (body_bytes, clone, String::new())
         };
 
     // Pre-request gate: operator bypass, budget, utilization limit, emergency brake.
@@ -2509,7 +2574,13 @@ async fn proxy_handler(
             // passthrough: caller's auth headers flow through untouched
 
             upstream_req = upstream_req.headers(headers);
-            upstream_req = upstream_req.body(body_bytes.clone());
+            // Use OAuth variant (with CC system prompt) for OAuth tokens
+            let req_body = if acct.token.starts_with("sk-ant-oat") {
+                &oauth_body_bytes
+            } else {
+                &body_bytes
+            };
+            upstream_req = upstream_req.body(req_body.clone());
 
             let mut resp = match upstream_req.send().await {
                 Ok(r) => r,
@@ -4487,7 +4558,8 @@ async fn openai_chat_handler(
         .to_string();
     let session_id = parts
         .headers
-        .get("x-session-id")
+        .get("x-claude-code-session-id")
+        .or_else(|| parts.headers.get("x-session-id"))
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-")
         .to_string();
@@ -4541,6 +4613,11 @@ async fn openai_chat_handler(
             );
         }
     }
+
+    // Pre-compute OAuth variant with Claude Code system prompt.
+    // OAuth tokens (sk-ant-oat*) require this to access sonnet/opus models.
+    let mut oauth_anthropic_body = anthropic_body.clone();
+    inject_oauth_system_prompt(&mut oauth_anthropic_body);
 
     // Build affinity key for sticky routing — only use stickiness when there's
     // meaningful client identification beyond just the IP address
@@ -4634,11 +4711,25 @@ async fn openai_chat_handler(
                 }
             }
 
+            // Use OAuth variant (with CC system prompt) for OAuth tokens
+            let req_body = if acct.token.starts_with("sk-ant-oat") {
+                &oauth_anthropic_body
+            } else {
+                &anthropic_body
+            };
+            let body_str = req_body.to_string();
+            debug!(
+                account = acct.name,
+                model = %model,
+                body_len = body_str.len(),
+                "openai-compat: upstream request"
+            );
+
             let upstream_req = state
                 .client
                 .request(reqwest::Method::POST, &url)
                 .headers(reqwest_headers(&headers))
-                .body(anthropic_body.to_string());
+                .body(body_str);
 
             let mut resp = match upstream_req.send().await {
                 Ok(r) => r,
@@ -4731,16 +4822,66 @@ async fn openai_chat_handler(
                 );
             }
 
-            // Non-2xx: return error as-is (not SSE even if streaming was requested)
+            // Non-2xx: log error detail, translate to OpenAI error format, return
             if !status.is_success() {
                 let error_body = resp.bytes().await.unwrap_or_default();
+                let error_msg = serde_json::from_slice::<serde_json::Value>(&error_body)
+                    .ok()
+                    .and_then(|v| {
+                        v.pointer("/error/message")
+                            .and_then(|m| m.as_str())
+                            .map(String::from)
+                    });
+                warn!(
+                    account = acct.name,
+                    model = %model,
+                    status = status.as_u16(),
+                    error_message = ?error_msg,
+                    "openai-compat: upstream error"
+                );
+
+                // Translate Anthropic error to OpenAI error format so clients
+                // (LiteLLM, etc.) can parse the actual error message.
+                let openai_error =
+                    if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&error_body) {
+                        // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
+                        let msg = parsed
+                            .pointer("/error/message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown upstream error");
+                        let err_type = parsed
+                            .pointer("/error/type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("api_error");
+                        serde_json::json!({
+                            "error": {
+                                "message": msg,
+                                "type": err_type,
+                                "param": null,
+                                "code": null
+                            }
+                        })
+                    } else {
+                        let raw = String::from_utf8_lossy(&error_body);
+                        serde_json::json!({
+                            "error": {
+                                "message": raw.as_ref(),
+                                "type": "api_error",
+                                "param": null,
+                                "code": null
+                            }
+                        })
+                    };
+
                 return Response::builder()
                     .status(
                         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
                     )
                     .header("content-type", "application/json")
                     .header("x-budget-status", budget_status)
-                    .body(Body::from(error_body))
+                    .body(Body::from(
+                        serde_json::to_vec(&openai_error).unwrap_or_default(),
+                    ))
                     .unwrap_or_else(|_| {
                         (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                     });
@@ -12681,5 +12822,275 @@ upstream = "https://api.anthropic.com"
             !body.contains("anthropic_claim_utilization{account=\"acct-b\""),
             "acct-b should have no claim_utilization:\n{body}"
         );
+    }
+
+    #[test]
+    fn oauth_system_prompt_injects_when_missing() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+        inject_oauth_system_prompt(&mut body);
+        let system = body.get("system").unwrap().as_array().unwrap();
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn oauth_system_prompt_prepends_to_existing_string() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": "Be helpful.",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+        inject_oauth_system_prompt(&mut body);
+        let system = body.get("system").unwrap().as_array().unwrap();
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
+        assert_eq!(system[1]["text"].as_str().unwrap(), "Be helpful.");
+    }
+
+    #[test]
+    fn oauth_system_prompt_prepends_to_existing_array() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": [{"type": "text", "text": "Be helpful."}],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+        inject_oauth_system_prompt(&mut body);
+        let system = body.get("system").unwrap().as_array().unwrap();
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
+        assert_eq!(system[1]["text"].as_str().unwrap(), "Be helpful.");
+    }
+
+    #[test]
+    fn oauth_system_prompt_noop_when_already_present() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": [{"type": "text", "text": OAUTH_SYSTEM_PROMPT}],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+        inject_oauth_system_prompt(&mut body);
+        let system = body.get("system").unwrap().as_array().unwrap();
+        assert_eq!(system.len(), 1, "should not duplicate");
+    }
+
+    #[test]
+    fn oauth_system_prompt_handles_null_system() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": null,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+        inject_oauth_system_prompt(&mut body);
+        let system = body.get("system").unwrap().as_array().unwrap();
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
+    }
+
+    /// Integration test: verify OAuth accounts get the CC system prompt injected
+    /// in requests sent through the OpenAI-compat endpoint.
+    #[tokio::test]
+    async fn openai_compat_injects_oauth_system_prompt() {
+        // Mock upstream that captures and validates the request body
+        let mock_app = Router::new().fallback(any(|req: Request<Body>| async move {
+            let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+            // Verify the CC system prompt is the first system block
+            let system = body.get("system").expect("missing system field");
+            let arr = system.as_array().expect("system should be array");
+            assert_eq!(
+                arr[0]["text"].as_str().unwrap(),
+                OAUTH_SYSTEM_PROMPT,
+                "first system block must be CC prompt"
+            );
+
+            // Return valid Anthropic response
+            let mut resp = axum::Json(serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 1}
+            }))
+            .into_response();
+            resp.headers_mut().insert(
+                "anthropic-ratelimit-unified-representative-claim",
+                HeaderValue::from_static("five_hour"),
+            );
+            resp.headers_mut().insert(
+                "anthropic-ratelimit-unified-5h-utilization",
+                HeaderValue::from_static("0.10"),
+            );
+            resp
+        }));
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        // Build app with an OAuth account
+        let accounts = vec![make_account("oauth-acct", "sk-ant-oat01-test-token")];
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: format!("http://{}", mock_addr),
+            accounts,
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-oauth-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: false, // disable to keep body simple
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operators: vec![],
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+        });
+
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(openai_chat_handler),
+            )
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"max_tokens":5}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+
+    /// Test that non-2xx upstream errors are translated to OpenAI error format.
+    #[tokio::test]
+    async fn openai_compat_translates_upstream_json_error() {
+        // Mock upstream returns 400 with Anthropic-format error
+        let mock_app = Router::new().fallback(any(|_req: Request<Body>| async {
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: must be positive"}}"#,
+                ))
+                .unwrap()
+        }));
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let (app, _state) = test_openai_app(&format!("http://{}", mock_addr), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"max_tokens":5}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["message"], "max_tokens: must be positive");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["param"].is_null());
+    }
+
+    /// Test that non-JSON upstream errors are wrapped in OpenAI error format.
+    #[tokio::test]
+    async fn openai_compat_translates_upstream_raw_error() {
+        // Mock upstream returns 422 with plain text (non-retryable, non-JSON)
+        let mock_app = Router::new().fallback(any(|_req: Request<Body>| async {
+            Response::builder()
+                .status(StatusCode::UNPROCESSABLE_ENTITY)
+                .header("content-type", "text/plain")
+                .body(Body::from("upstream timeout"))
+                .unwrap()
+        }));
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let (app, _state) = test_openai_app(&format!("http://{}", mock_addr), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"max_tokens":5}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["message"], "upstream timeout");
+        assert_eq!(body["error"]["type"], "api_error");
     }
 }
