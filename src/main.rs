@@ -890,6 +890,15 @@ const REQUEST_BALANCE_THRESHOLD: f64 = 0.10;
 const REQUEST_BALANCE_MIN_SAMPLE: u64 = 20;
 
 /// Extract the model family from a model ID string.
+/// Extract version string from User-Agent header.
+/// "claude-cli/2.1.68 (external, cli)" → "2.1.68"
+/// "anthropic-sdk/1.0.0" → "1.0.0"
+/// Returns None for unrecognizable formats.
+fn extract_client_version(ua: &str) -> Option<&str> {
+    ua.split_once('/')
+        .map(|(_, rest)| rest.split_once(' ').map_or(rest, |(ver, _)| ver))
+}
+
 /// Used to look up model-specific rate-limit claims (e.g., "seven_day_sonnet").
 /// Returns "" for unrecognized models, which triggers worst-case routing.
 fn model_family(model: &str) -> &str {
@@ -2392,6 +2401,13 @@ async fn proxy_handler(
 
     // Extract client identification headers
     let client_id = state.resolve_client_id(&client_ip, &parts.headers);
+    let client_ver = parts
+        .headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_client_version)
+        .unwrap_or("-")
+        .to_string();
     let agent_id = parts
         .headers
         .get("x-agent-id")
@@ -2663,6 +2679,7 @@ async fn proxy_handler(
                 info!(
                     client = %client_ip,
                     client_id = %client_id,
+                    ver = %client_ver,
                     agent = %agent_id,
                     session = %session_id,
                     model = %model,
@@ -4576,6 +4593,13 @@ async fn openai_chat_handler(
 
     // Extract client identification headers
     let client_id = state.resolve_client_id(&client_ip, &parts.headers);
+    let client_ver = parts
+        .headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_client_version)
+        .unwrap_or("-")
+        .to_string();
     let agent_id = parts
         .headers
         .get("x-agent-id")
@@ -4832,6 +4856,7 @@ async fn openai_chat_handler(
                 info!(
                     client = %client_ip,
                     client_id = %client_id,
+                    ver = %client_ver,
                     agent = %agent_id,
                     session = %session_id,
                     model = %model,
@@ -9525,6 +9550,17 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(model_family("claude-haiku-4-5"), "haiku");
         assert_eq!(model_family("claude-3-5-sonnet"), "sonnet");
         assert_eq!(model_family("unknown-model"), "");
+    }
+
+    #[tokio::test]
+    async fn extract_client_version_parsing() {
+        assert_eq!(
+            extract_client_version("claude-cli/2.1.68 (external, cli)"),
+            Some("2.1.68")
+        );
+        assert_eq!(extract_client_version("anthropic-sdk/1.0.0"), Some("1.0.0"));
+        assert_eq!(extract_client_version("curl/8.5.0"), Some("8.5.0"));
+        assert_eq!(extract_client_version("no-version"), None);
     }
 
     #[tokio::test]
