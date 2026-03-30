@@ -696,14 +696,15 @@ impl AppState {
                 }
                 self.save_state().await;
                 let info = acct.rate_info.read().await;
-                let (eff_util, constraint) = effective_utilization(&info, Self::now_epoch(), model);
+                let (eff_util, constraint, adj_5h, adj_7d) =
+                    effective_utilization(&info, Self::now_epoch(), model);
                 info!(
                     account = acct.name,
                     status = status.as_u16(),
                     probe_model = model,
                     utilization = format_args!("{eff_util:.2}"),
-                    util_5h = ?info.utilization_5h,
-                    util_7d = ?info.utilization_7d,
+                    util_5h = ?adj_5h,
+                    util_7d = ?adj_7d,
                     constraint,
                     n_claims_7d = info.claims_7d.len(),
                     "probe complete"
@@ -897,8 +898,14 @@ const REQUEST_BALANCE_MIN_SAMPLE: u64 = 20;
 /// "anthropic-sdk/1.0.0" → "1.0.0"
 /// Returns None for unrecognizable formats.
 fn extract_client_version(ua: &str) -> Option<&str> {
-    ua.split_once('/')
-        .map(|(_, rest)| rest.split_once(' ').map_or(rest, |(ver, _)| ver))
+    let ver = ua
+        .split_once('/')
+        .map(|(_, rest)| rest.split_once(' ').map_or(rest, |(ver, _)| ver))?;
+    if ver.is_empty() {
+        None
+    } else {
+        Some(ver)
+    }
 }
 
 /// Used to look up model-specific rate-limit claims (e.g., "seven_day_sonnet").
@@ -1025,13 +1032,17 @@ fn time_adjusted_utilization(
 }
 
 /// Compute effective utilization for an account using the full fallback chain.
-/// Returns (utilization, source_label) for logging/routing.
+/// Returns (utilization, source_label, adj_5h, adj_7d) for logging/routing.
 ///
 /// Fallback chain:
 /// 1. Both windows adjusted → take max (most constrained wins)
 /// 2. Only one window → use it (the other is stale or absent)
 /// 3. Neither window → raw unified util, then legacy token ratio, then 0.5
-fn effective_utilization(info: &RateLimitInfo, now_epoch: u64, model: &str) -> (f64, &'static str) {
+fn effective_utilization(
+    info: &RateLimitInfo,
+    now_epoch: u64,
+    model: &str,
+) -> (f64, &'static str, Option<f64>, Option<f64>) {
     // 5h window — always flat (no per-model sub-budgets from API)
     let adj_5h = time_adjusted_utilization(
         info.utilization_5h,
@@ -1080,22 +1091,24 @@ fn effective_utilization(info: &RateLimitInfo, now_epoch: u64, model: &str) -> (
     };
 
     match (adj_5h, adj_7d) {
-        (Some(a), Some(b)) if a >= b => (a, "5h"),
-        (Some(_), Some(b)) => (b, "7d"),
-        (Some(a), None) => (a, "5h"),
-        (None, Some(b)) => (b, "7d"),
+        (Some(a), Some(b)) if a >= b => (a, "5h", adj_5h, adj_7d),
+        (Some(_), Some(b)) => (b, "7d", adj_5h, adj_7d),
+        (Some(a), None) => (a, "5h", adj_5h, adj_7d),
+        (None, Some(b)) => (b, "7d", adj_5h, adj_7d),
         (None, None) => {
             // Fallback: raw unified (no time adjustment), legacy tokens, or unknown
             if let Some(util) = info.utilization {
-                (util, "unified")
+                (util, "unified", None, None)
             } else if let Some(remaining) = info.remaining_tokens {
                 let limit = info.limit_tokens.unwrap_or(1_000_000);
                 (
                     (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0),
                     "legacy",
+                    None,
+                    None,
                 )
             } else {
-                (0.5, "unknown")
+                (0.5, "unknown", None, None)
             }
         }
     }
@@ -2089,7 +2102,7 @@ impl AppState {
             }
             any_compatible = true;
             let info = acct.rate_info.read().await;
-            let (util, _) = effective_utilization(&info, now_epoch, model);
+            let (util, _, _, _) = effective_utilization(&info, now_epoch, model);
             if util < limit {
                 all_above = false;
                 break;
@@ -2128,7 +2141,7 @@ impl AppState {
 
         for acct in &self.accounts {
             let info = acct.rate_info.read().await;
-            let (util, source) = effective_utilization(&info, now_epoch, "");
+            let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
             if source != "unknown" {
                 any_known = true;
             }
@@ -2678,7 +2691,7 @@ async fn proxy_handler(
             // Log with capacity info
             {
                 let info = acct.rate_info.read().await;
-                let (eff_util, constraint) =
+                let (eff_util, constraint, adj_5h, adj_7d) =
                     effective_utilization(&info, AppState::now_epoch(), &model);
                 info!(
                     req_id,
@@ -2691,8 +2704,8 @@ async fn proxy_handler(
                     account = acct.name,
                     status = status.as_u16(),
                     utilization = format_args!("{eff_util:.2}"),
-                    util_5h = ?info.utilization_5h,
-                    util_7d = ?info.utilization_7d,
+                    util_5h = ?adj_5h,
+                    util_7d = ?adj_7d,
                     constraint,
                     total = acct.requests.load(Ordering::Relaxed),
                     "proxied"
@@ -2717,7 +2730,8 @@ async fn proxy_handler(
             // Inject budget status header
             {
                 let info = acct.rate_info.read().await;
-                let (eff_util, _) = effective_utilization(&info, AppState::now_epoch(), &model);
+                let (eff_util, _, _, _) =
+                    effective_utilization(&info, AppState::now_epoch(), &model);
                 let status_val = compute_pressure_status(eff_util, &client_id, &state);
                 builder = builder.header("x-budget-status", status_val);
             }
@@ -3009,7 +3023,7 @@ async fn stats_handler(
         }
 
         // Projected throttle time
-        let (eff_util, _) = effective_utilization(&info, now_epoch, "");
+        let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
         let projected_throttle_at: serde_json::Value = if eff_util < 0.5 || br_1h < 0.01 {
             serde_json::Value::Null
         } else if let Some(headroom_reqs) = headroom {
@@ -3371,7 +3385,7 @@ async fn metrics_handler(
             .map(|d| d.as_secs() as f64)
             .unwrap_or(0.0);
 
-        let (eff_util, _) = effective_utilization(&info, now_epoch, "");
+        let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
         let projected_throttle_secs = if eff_util < 0.5 || br_1h < 0.01 {
             None
         } else {
@@ -4860,7 +4874,7 @@ async fn openai_chat_handler(
             // Compute budget pressure status for response header + log
             let budget_status = {
                 let info = acct.rate_info.read().await;
-                let (eff_util, constraint) =
+                let (eff_util, constraint, adj_5h, adj_7d) =
                     effective_utilization(&info, AppState::now_epoch(), &model);
                 info!(
                     req_id,
@@ -4873,8 +4887,8 @@ async fn openai_chat_handler(
                     account = acct.name,
                     status = status.as_u16(),
                     utilization = format_args!("{eff_util:.2}"),
-                    util_5h = ?info.utilization_5h,
-                    util_7d = ?info.utilization_7d,
+                    util_5h = ?adj_5h,
+                    util_7d = ?adj_7d,
                     constraint,
                     openai_compat = true,
                     stream = is_streaming,
@@ -5085,6 +5099,7 @@ async fn openai_chat_handler(
             if !usage.is_empty() {
                 state.record_usage(idx, &client_id, &usage).await;
                 info!(
+                    req_id,
                     client_id = %client_id,
                     model = %model,
                     account = acct.name,
@@ -9257,7 +9272,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch, "");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
         // 7d at 0.80 (no penalty). Max(0.60, 0.80) = 0.80
         assert_eq!(source, "7d");
         assert!((util - 0.80).abs() < 0.01, "expected ~0.80, got {util}");
@@ -9282,7 +9297,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch, "");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
         assert_eq!(source, "5h");
         assert!(
             (util - 0.60).abs() < 0.01,
@@ -9309,7 +9324,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch, "");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
         assert_eq!(source, "7d");
         // 0.50 is below CLAIM_PENALTY_THRESHOLD, so no penalty
         assert!(
@@ -9338,7 +9353,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             utilization: Some(0.65),
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch, "");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
         assert_eq!(source, "unified");
         assert!(
             (util - 0.65).abs() < 0.001,
@@ -9354,7 +9369,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             limit_tokens: Some(1_000_000),
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch, "");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
         assert_eq!(source, "legacy");
         assert!(
             (util - 0.70).abs() < 0.01,
@@ -9366,7 +9381,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn effective_util_fallback_unknown() {
         let now_epoch = AppState::now_epoch();
         let info = RateLimitInfo::default();
-        let (util, source) = effective_utilization(&info, now_epoch, "");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
         assert_eq!(source, "unknown");
         assert!(
             (util - 0.50).abs() < 0.001,
@@ -9403,8 +9418,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util_sonnet, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
-        let (util_opus, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        let (util_sonnet, _, _, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
+        let (util_opus, _, _, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
         // Sonnet 7d at 0.85 (max with 5h 0.30) = 0.85, Opus 7d at 0.10 (max with 5h 0.30) = 0.30
         assert!(
             (util_sonnet - 0.85).abs() < 0.01,
@@ -9438,9 +9453,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util_sonnet, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
-        let (util_opus, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
-        let (util_haiku, _) = effective_utilization(&info, now_epoch, "claude-haiku-4-5");
+        let (util_sonnet, _, _, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
+        let (util_opus, _, _, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        let (util_haiku, _, _, _) = effective_utilization(&info, now_epoch, "claude-haiku-4-5");
         // All should see the same general claim (0.50, no penalty)
         assert!(
             (util_sonnet - 0.50).abs() < 0.01,
@@ -9470,7 +9485,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util_opus, source) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        let (util_opus, source, _, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
         // Opus has no specific claim and no general fallback → only 5h at 0.20
         assert_eq!(source, "5h");
         assert!(
@@ -9478,7 +9493,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             "opus should only see 5h: got {util_opus}"
         );
 
-        let (util_sonnet, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
+        let (util_sonnet, _, _, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
         assert!(
             (util_sonnet - 0.95).abs() < 0.01,
             "sonnet should be 0.95: got {util_sonnet}"
@@ -9512,7 +9527,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util, _) = effective_utilization(&info, now_epoch, "");
+        let (util, _, _, _) = effective_utilization(&info, now_epoch, "");
         // Should pick sonnet's 0.95 (no penalty now)
         assert!(
             (util - 0.95).abs() < 0.01,
@@ -9548,7 +9563,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..Default::default()
         };
         // For sonnet model: sonnet claim is stale, no general fallback → only 5h
-        let (util_sonnet, source) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
+        let (util_sonnet, source, _, _) =
+            effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
         assert_eq!(source, "5h");
         assert!(
             (util_sonnet - 0.20).abs() < 0.01,
@@ -9556,7 +9572,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
 
         // For opus model: opus claim is fresh
-        let (util_opus, source) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        let (util_opus, source, _, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
         assert_eq!(source, "7d");
         assert!(
             (util_opus - 0.30).abs() < 0.01,
@@ -9582,6 +9598,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(extract_client_version("anthropic-sdk/1.0.0"), Some("1.0.0"));
         assert_eq!(extract_client_version("curl/8.5.0"), Some("8.5.0"));
         assert_eq!(extract_client_version("no-version"), None);
+        assert_eq!(extract_client_version("foo/"), None);
     }
 
     #[tokio::test]
@@ -9596,7 +9613,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             // claims_7d empty — migration/compat path
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
         assert_eq!(source, "7d");
         assert!((util - 0.60).abs() < 0.01, "should use flat 7d: got {util}");
     }
@@ -9829,7 +9846,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         // effective_utilization for both should be >= 0.88
         let info0 = state.accounts[0].rate_info.read().await;
-        let (util0, _) = effective_utilization(&info0, now, "");
+        let (util0, _, _, _) = effective_utilization(&info0, now, "");
         drop(info0);
         assert!(
             util0 >= DEFAULT_EMERGENCY_THRESHOLD,
@@ -11334,7 +11351,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..Default::default()
         };
 
-        let (util, source) = effective_utilization(&info, now, "");
+        let (util, source, _, _) = effective_utilization(&info, now, "");
         assert!(util > 0.60, "should use higher (5h) utilization");
         assert_eq!(source, "5h");
     }
@@ -11360,7 +11377,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..Default::default()
         };
 
-        let (util, _) = effective_utilization(&info, now, "");
+        let (util, _, _, _) = effective_utilization(&info, now, "");
         assert!(
             (util - 0.85).abs() < 0.01,
             "7d window should pass through at 0.85 without penalty: got {util}"
