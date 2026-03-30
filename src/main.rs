@@ -694,14 +694,15 @@ impl AppState {
                 }
                 self.save_state().await;
                 let info = acct.rate_info.read().await;
+                let (eff_util, constraint) = effective_utilization(&info, Self::now_epoch(), model);
                 info!(
                     account = acct.name,
                     status = status.as_u16(),
                     probe_model = model,
-                    utilization = ?info.utilization,
-                    util_7d = ?info.utilization_7d,
+                    utilization = format_args!("{eff_util:.2}"),
                     util_5h = ?info.utilization_5h,
-                    claim = ?info.representative_claim,
+                    util_7d = ?info.utilization_7d,
+                    constraint,
                     n_claims_7d = info.claims_7d.len(),
                     "probe complete"
                 );
@@ -1068,9 +1069,10 @@ fn effective_utilization(info: &RateLimitInfo, now_epoch: u64, model: &str) -> (
     };
 
     match (adj_5h, adj_7d) {
-        (Some(a), Some(b)) => (a.max(b), "time_adjusted"),
-        (Some(a), None) => (a, "time_adjusted_5h"),
-        (None, Some(b)) => (b, "time_adjusted_7d"),
+        (Some(a), Some(b)) if a >= b => (a, "5h"),
+        (Some(_), Some(b)) => (b, "7d"),
+        (Some(a), None) => (a, "5h"),
+        (None, Some(b)) => (b, "7d"),
         (None, None) => {
             // Fallback: raw unified (no time adjustment), legacy tokens, or unknown
             if let Some(util) = info.utilization {
@@ -2656,6 +2658,8 @@ async fn proxy_handler(
             // Log with capacity info
             {
                 let info = acct.rate_info.read().await;
+                let (eff_util, constraint) =
+                    effective_utilization(&info, AppState::now_epoch(), &model);
                 info!(
                     client = %client_ip,
                     client_id = %client_id,
@@ -2664,8 +2668,10 @@ async fn proxy_handler(
                     model = %model,
                     account = acct.name,
                     status = status.as_u16(),
-                    utilization = ?info.utilization,
-                    claim = ?info.representative_claim,
+                    utilization = format_args!("{eff_util:.2}"),
+                    util_5h = ?info.utilization_5h,
+                    util_7d = ?info.utilization_7d,
+                    constraint,
                     total = acct.requests.load(Ordering::Relaxed),
                     "proxied"
                 );
@@ -2728,6 +2734,16 @@ async fn proxy_handler(
                         state_clone
                             .record_usage(idx, &client_id_clone, &usage)
                             .await;
+                        info!(
+                            client_id = %client_id_clone,
+                            model = %model_clone,
+                            account = %acct_name,
+                            input = usage.input_tokens,
+                            output = usage.output_tokens,
+                            cached = usage.cache_read_input_tokens,
+                            cache_write = usage.cache_creation_input_tokens,
+                            "usage"
+                        );
                     }
                     state_clone.shadow_log(serde_json::json!({
                         "ts": AppState::now_epoch(),
@@ -2761,6 +2777,16 @@ async fn proxy_handler(
                     usage = TokenUsage::from_response_body(&parsed);
                     if !usage.is_empty() {
                         state.record_usage(idx, &client_id, &usage).await;
+                        info!(
+                            client_id = %client_id,
+                            model = %model,
+                            account = acct.name,
+                            input = usage.input_tokens,
+                            output = usage.output_tokens,
+                            cached = usage.cache_read_input_tokens,
+                            cache_write = usage.cache_creation_input_tokens,
+                            "usage"
+                        );
                     }
                 }
                 state.shadow_log(serde_json::json!({
@@ -4798,15 +4824,11 @@ async fn openai_chat_handler(
             // Persist state after clearing hard limit so the saved snapshot is clean
             state.save_state().await;
 
-            // Compute budget pressure status for response header
+            // Compute budget pressure status for response header + log
             let budget_status = {
                 let info = acct.rate_info.read().await;
-                let (eff_util, _) = effective_utilization(&info, AppState::now_epoch(), &model);
-                compute_pressure_status(eff_util, &client_id, &state)
-            };
-
-            {
-                let info = acct.rate_info.read().await;
+                let (eff_util, constraint) =
+                    effective_utilization(&info, AppState::now_epoch(), &model);
                 info!(
                     client = %client_ip,
                     client_id = %client_id,
@@ -4815,12 +4837,16 @@ async fn openai_chat_handler(
                     model = %model,
                     account = acct.name,
                     status = status.as_u16(),
-                    utilization = ?info.utilization,
+                    utilization = format_args!("{eff_util:.2}"),
+                    util_5h = ?info.utilization_5h,
+                    util_7d = ?info.utilization_7d,
+                    constraint,
                     openai_compat = true,
                     stream = is_streaming,
                     "proxied (openai-compat)"
                 );
-            }
+                compute_pressure_status(eff_util, &client_id, &state)
+            };
 
             // Non-2xx: log error detail, translate to OpenAI error format, return
             if !status.is_success() {
@@ -4949,6 +4975,16 @@ async fn openai_chat_handler(
                         state_clone
                             .record_usage(idx, &client_id_clone, &usage)
                             .await;
+                        info!(
+                            client_id = %client_id_clone,
+                            model = %model_clone,
+                            account = %acct_name,
+                            input = usage.input_tokens,
+                            output = usage.output_tokens,
+                            cached = usage.cache_read_input_tokens,
+                            cache_write = usage.cache_creation_input_tokens,
+                            "usage"
+                        );
                     }
                     state_clone.shadow_log(serde_json::json!({
                         "ts": AppState::now_epoch(),
@@ -5012,6 +5048,16 @@ async fn openai_chat_handler(
             let usage = TokenUsage::from_response_body(&anthropic_resp);
             if !usage.is_empty() {
                 state.record_usage(idx, &client_id, &usage).await;
+                info!(
+                    client_id = %client_id,
+                    model = %model,
+                    account = acct.name,
+                    input = usage.input_tokens,
+                    output = usage.output_tokens,
+                    cached = usage.cache_read_input_tokens,
+                    cache_write = usage.cache_creation_input_tokens,
+                    "usage"
+                );
             }
             state.shadow_log(serde_json::json!({
                 "ts": AppState::now_epoch(),
@@ -9167,7 +9213,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         };
         let (util, source) = effective_utilization(&info, now_epoch, "");
         // 7d at 0.80 (no penalty). Max(0.60, 0.80) = 0.80
-        assert_eq!(source, "time_adjusted");
+        assert_eq!(source, "7d");
         assert!((util - 0.80).abs() < 0.01, "expected ~0.80, got {util}");
     }
 
@@ -9191,7 +9237,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..Default::default()
         };
         let (util, source) = effective_utilization(&info, now_epoch, "");
-        assert_eq!(source, "time_adjusted_5h");
+        assert_eq!(source, "5h");
         assert!(
             (util - 0.60).abs() < 0.01,
             "should use 5h value: got {util}"
@@ -9218,7 +9264,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..Default::default()
         };
         let (util, source) = effective_utilization(&info, now_epoch, "");
-        assert_eq!(source, "time_adjusted_7d");
+        assert_eq!(source, "7d");
         // 0.50 is below CLAIM_PENALTY_THRESHOLD, so no penalty
         assert!(
             (util - 0.50).abs() < 0.01,
@@ -9380,7 +9426,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         };
         let (util_opus, source) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
         // Opus has no specific claim and no general fallback → only 5h at 0.20
-        assert_eq!(source, "time_adjusted_5h");
+        assert_eq!(source, "5h");
         assert!(
             (util_opus - 0.20).abs() < 0.01,
             "opus should only see 5h: got {util_opus}"
@@ -9457,7 +9503,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         };
         // For sonnet model: sonnet claim is stale, no general fallback → only 5h
         let (util_sonnet, source) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
-        assert_eq!(source, "time_adjusted_5h");
+        assert_eq!(source, "5h");
         assert!(
             (util_sonnet - 0.20).abs() < 0.01,
             "stale sonnet should be ignored: got {util_sonnet}"
@@ -9465,7 +9511,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         // For opus model: opus claim is fresh
         let (util_opus, source) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
-        assert_eq!(source, "time_adjusted");
+        assert_eq!(source, "7d");
         assert!(
             (util_opus - 0.30).abs() < 0.01,
             "fresh opus should be used: got {util_opus}"
@@ -9494,7 +9540,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..Default::default()
         };
         let (util, source) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
-        assert_eq!(source, "time_adjusted");
+        assert_eq!(source, "7d");
         assert!((util - 0.60).abs() < 0.01, "should use flat 7d: got {util}");
     }
 
@@ -11214,7 +11260,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         let (util, source) = effective_utilization(&info, now, "");
         assert!(util > 0.60, "should use higher (5h) utilization");
-        assert_eq!(source, "time_adjusted");
+        assert_eq!(source, "5h");
     }
 
     #[tokio::test]
