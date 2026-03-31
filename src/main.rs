@@ -408,6 +408,8 @@ struct AppState {
     cluster_info_cache: Mutex<Option<serde_json::Value>>,
     /// Monotonic request ID counter for log correlation.
     next_req_id: AtomicU64,
+    /// Random instance ID for cross-replica log disambiguation.
+    instance_id: u16,
 }
 
 impl Account {
@@ -2414,7 +2416,11 @@ async fn proxy_handler(
 
     let (parts, body) = req.into_parts();
 
-    let req_id = state.next_req_id.fetch_add(1, Ordering::Relaxed);
+    let req_id = format!(
+        "{:04x}:{}",
+        state.instance_id,
+        state.next_req_id.fetch_add(1, Ordering::Relaxed)
+    );
 
     // Extract client identification headers
     let client_id = state.resolve_client_id(&client_ip, &parts.headers);
@@ -4607,7 +4613,11 @@ async fn openai_chat_handler(
 
     let (parts, body) = req.into_parts();
 
-    let req_id = state.next_req_id.fetch_add(1, Ordering::Relaxed);
+    let req_id = format!(
+        "{:04x}:{}",
+        state.instance_id,
+        state.next_req_id.fetch_add(1, Ordering::Relaxed)
+    );
 
     // Extract client identification headers
     let client_id = state.resolve_client_id(&client_ip, &parts.headers);
@@ -5360,6 +5370,11 @@ async fn main() {
         redis,
         cluster_info_cache: Mutex::new(None),
         next_req_id: AtomicU64::new(0),
+        instance_id: {
+            use std::collections::hash_map::RandomState;
+            use std::hash::{BuildHasher, Hasher};
+            RandomState::new().build_hasher().finish() as u16
+        },
     });
 
     if state.auto_cache {
@@ -5541,6 +5556,7 @@ mod tests {
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         })
     }
 
@@ -5622,6 +5638,7 @@ mod tests {
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         (build_router(state.clone()), state)
@@ -5711,6 +5728,7 @@ mod tests {
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -7578,6 +7596,7 @@ mod tests {
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         let app = Router::new()
@@ -8136,6 +8155,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Try many affinity keys — all should route to healthy (idx 0)
@@ -8189,6 +8209,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Within budget
@@ -8692,6 +8713,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         {
             let mut info = state.accounts[0].rate_info.write().await;
@@ -9164,6 +9186,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Header overrides IP mapping (supports multiple clients per IP)
@@ -9227,6 +9250,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -9981,6 +10005,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.60, 0.50, now + 10000, now + 100000).await;
@@ -10025,6 +10050,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
@@ -10070,6 +10096,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -10117,6 +10144,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
         // Operator bypasses everything
@@ -10161,6 +10189,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // Request for "claude-opus" — no account serves it → should pass
         assert!(
@@ -10228,6 +10257,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
         assert!(state.is_emergency_brake_active().await);
@@ -10300,6 +10330,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.85, 0.70, now + 10000, now + 100000).await;
         assert!(
@@ -10337,6 +10368,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // "-" is not the operator
         assert!(!state.is_operator("-"));
@@ -10409,6 +10441,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // Operator always gets "healthy" regardless of utilization
         assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
@@ -10448,6 +10481,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // gastown has limit 0.85, 80% of that = 0.68
         // At 0.60, below 0.68 → no upgrade → "healthy"
@@ -10663,6 +10697,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // Set utilization above client's limit (0.80 > 0.50)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -10720,6 +10755,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // Set utilization below client's limit (0.50 < 0.90)
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -10774,6 +10810,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // All accounts above emergency threshold. 5h=0.96 > emergency threshold (0.88).
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -10836,6 +10873,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // All accounts above emergency threshold — 5h only (avoid claim penalty on 7d)
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -10895,6 +10933,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
 
@@ -10949,6 +10988,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
 
@@ -11054,6 +11094,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
@@ -11121,6 +11162,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         let status = compute_pressure_status(0.99, "operator-id", &state);
@@ -11168,6 +11210,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
@@ -11480,6 +11523,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         assert!(state.is_operator("special-operator"));
@@ -11522,6 +11566,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         assert!(state.is_operator("ray"));
         assert!(state.is_operator("openclaw"));
@@ -11578,6 +11623,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Budget check uses local path when redis is None
@@ -11706,6 +11752,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Recording 0 tokens should be a no-op
@@ -12040,6 +12087,7 @@ upstream = "https://api.anthropic.com"
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Set up some state to persist
@@ -12120,6 +12168,7 @@ upstream = "https://api.anthropic.com"
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Load state
@@ -12200,6 +12249,7 @@ upstream = "https://api.anthropic.com"
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Pre-populate with yesterday's usage (high usage that would exceed budget)
@@ -12250,6 +12300,7 @@ upstream = "https://api.anthropic.com"
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Pre-populate with yesterday's exhausted budget
@@ -12582,6 +12633,7 @@ upstream = "https://api.anthropic.com"
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Seed two operator clients and one regular client with token usage
@@ -12825,6 +12877,7 @@ upstream = "https://api.anthropic.com"
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         let app = build_router(state);
@@ -13114,6 +13167,7 @@ upstream = "https://api.anthropic.com"
             redis: None,
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         let app = Router::new()
