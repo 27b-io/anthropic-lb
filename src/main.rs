@@ -2110,6 +2110,7 @@ impl AppState {
         let mut nearest_reset: Option<u64> = None;
         let mut all_above = true;
         let mut any_compatible = false;
+        let mut any_known = false;
 
         for acct in &self.accounts {
             if !acct.serves_model(model) {
@@ -2117,29 +2118,30 @@ impl AppState {
             }
             any_compatible = true;
             let info = acct.rate_info.read().await;
-            let (util, _, _, _) = effective_utilization(&info, now_epoch, model);
+            let (util, source, _, _) = effective_utilization(&info, now_epoch, model);
+            if source == "unknown" {
+                continue; // fail-open: no data, skip this account
+            }
+            any_known = true;
             if util < limit {
                 all_above = false;
                 break;
             }
-            // Track nearest reset for Retry-After
-            if let Some(r) = info.reset_5h {
+            // Track nearest reset from the binding constraint only
+            let reset_epoch = match source {
+                "5h" => info.reset_5h,
+                "7d" => resolve_7d_claim(&info, model).and_then(|c| c.reset),
+                _ => info.reset_5h.or(info.reset_7d), // unified/legacy best-effort
+            };
+            if let Some(r) = reset_epoch {
                 if r > now_epoch {
                     let secs = r - now_epoch;
                     nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
                 }
             }
-            for c in info.claims_7d.values() {
-                if let Some(r) = c.reset {
-                    if r > now_epoch {
-                        let secs = r - now_epoch;
-                        nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
-                    }
-                }
-            }
         }
 
-        if all_above && any_compatible {
+        if all_above && any_compatible && any_known {
             let retry_after = nearest_reset.unwrap_or(300).clamp(60, 3600);
             Err(retry_after)
         } else {
@@ -10171,6 +10173,54 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .await
                 .is_ok(),
             "should not 429 when no account serves the requested model"
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_unknown_accounts_fail_open() {
+        // Accounts with no rate data (source="unknown") should not trigger the limit gate
+        let mut limits = HashMap::new();
+        limits.insert("testclient".to_string(), 0.30); // below the 0.5 unknown default
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![
+                make_account("a", "sk-ant-api-x"),
+                make_account("b", "sk-ant-api-y"),
+            ],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operators: vec![],
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
+        });
+        // Don't set any utilization — accounts remain "unknown" (0.5)
+        // With limit=0.30, unknown 0.5 would appear "above limit" without fail-open
+        assert!(
+            state
+                .check_utilization_limit("testclient", "")
+                .await
+                .is_ok(),
+            "should fail-open when all accounts have unknown utilization"
         );
     }
 
