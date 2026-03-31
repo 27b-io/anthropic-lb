@@ -2688,8 +2688,8 @@ async fn proxy_handler(
             // Persist state after clearing hard limit so the saved snapshot is clean
             state.save_state().await;
 
-            // Log with capacity info
-            {
+            // Log with capacity info + inject budget status header
+            let budget_status = {
                 let info = acct.rate_info.read().await;
                 let (eff_util, constraint, adj_5h, adj_7d) =
                     effective_utilization(&info, AppState::now_epoch(), &model);
@@ -2710,7 +2710,8 @@ async fn proxy_handler(
                     total = acct.requests.load(Ordering::Relaxed),
                     "proxied"
                 );
-            }
+                compute_pressure_status(eff_util, &client_id, &state)
+            };
 
             let latency_ms = request_start.elapsed().as_millis() as u64;
 
@@ -2728,13 +2729,7 @@ async fn proxy_handler(
             }
 
             // Inject budget status header
-            {
-                let info = acct.rate_info.read().await;
-                let (eff_util, _, _, _) =
-                    effective_utilization(&info, AppState::now_epoch(), &model);
-                let status_val = compute_pressure_status(eff_util, &client_id, &state);
-                builder = builder.header("x-budget-status", status_val);
-            }
+            builder = builder.header("x-budget-status", budget_status);
 
             // Detect streaming from content-type
             let is_streaming = resp_headers
