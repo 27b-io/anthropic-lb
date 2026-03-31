@@ -894,7 +894,6 @@ const REQUEST_BALANCE_THRESHOLD: f64 = 0.10;
 /// activates. Avoids overriding on noisy small-sample data at startup.
 const REQUEST_BALANCE_MIN_SAMPLE: u64 = 20;
 
-/// Extract the model family from a model ID string.
 /// Extract version string from User-Agent header.
 /// "claude-cli/2.1.68 (external, cli)" → "2.1.68"
 /// "anthropic-sdk/1.0.0" → "1.0.0"
@@ -1965,6 +1964,20 @@ impl TokenUsage {
     }
 }
 
+fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &TokenUsage) {
+    info!(
+        req_id,
+        client_id,
+        model,
+        account,
+        input = usage.input_tokens,
+        output = usage.output_tokens,
+        cached = usage.cache_read_input_tokens,
+        cache_write = usage.cache_creation_input_tokens,
+        "usage"
+    );
+}
+
 impl AppState {
     /// Record token usage for an account and client.
     async fn record_usage(&self, account_idx: usize, client_id: &str, usage: &TokenUsage) {
@@ -2771,17 +2784,7 @@ async fn proxy_handler(
                         state_clone
                             .record_usage(idx, &client_id_clone, &usage)
                             .await;
-                        info!(
-                            req_id,
-                            client_id = %client_id_clone,
-                            model = %model_clone,
-                            account = %acct_name,
-                            input = usage.input_tokens,
-                            output = usage.output_tokens,
-                            cached = usage.cache_read_input_tokens,
-                            cache_write = usage.cache_creation_input_tokens,
-                            "usage"
-                        );
+                        log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
                     }
                     state_clone.shadow_log(serde_json::json!({
                         "ts": AppState::now_epoch(),
@@ -2815,17 +2818,7 @@ async fn proxy_handler(
                     usage = TokenUsage::from_response_body(&parsed);
                     if !usage.is_empty() {
                         state.record_usage(idx, &client_id, &usage).await;
-                        info!(
-                            req_id,
-                            client_id = %client_id,
-                            model = %model,
-                            account = acct.name,
-                            input = usage.input_tokens,
-                            output = usage.output_tokens,
-                            cached = usage.cache_read_input_tokens,
-                            cache_write = usage.cache_creation_input_tokens,
-                            "usage"
-                        );
+                        log_usage(&req_id, &client_id, &model, &acct.name, &usage);
                     }
                 }
                 state.shadow_log(serde_json::json!({
@@ -5029,17 +5022,7 @@ async fn openai_chat_handler(
                         state_clone
                             .record_usage(idx, &client_id_clone, &usage)
                             .await;
-                        info!(
-                            req_id,
-                            client_id = %client_id_clone,
-                            model = %model_clone,
-                            account = %acct_name,
-                            input = usage.input_tokens,
-                            output = usage.output_tokens,
-                            cached = usage.cache_read_input_tokens,
-                            cache_write = usage.cache_creation_input_tokens,
-                            "usage"
-                        );
+                        log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
                     }
                     state_clone.shadow_log(serde_json::json!({
                         "ts": AppState::now_epoch(),
@@ -5103,17 +5086,7 @@ async fn openai_chat_handler(
             let usage = TokenUsage::from_response_body(&anthropic_resp);
             if !usage.is_empty() {
                 state.record_usage(idx, &client_id, &usage).await;
-                info!(
-                    req_id,
-                    client_id = %client_id,
-                    model = %model,
-                    account = acct.name,
-                    input = usage.input_tokens,
-                    output = usage.output_tokens,
-                    cached = usage.cache_read_input_tokens,
-                    cache_write = usage.cache_creation_input_tokens,
-                    "usage"
-                );
+                log_usage(&req_id, &client_id, &model, &acct.name, &usage);
             }
             state.shadow_log(serde_json::json!({
                 "ts": AppState::now_epoch(),
