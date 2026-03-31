@@ -2130,7 +2130,9 @@ impl AppState {
             // Track nearest reset from the binding constraint only
             let reset_epoch = match source {
                 "5h" => info.reset_5h,
-                "7d" => resolve_7d_claim(&info, model).and_then(|c| c.reset),
+                "7d" => resolve_7d_claim(&info, model)
+                    .and_then(|c| c.reset)
+                    .or(info.reset_7d),
                 _ => info.reset_5h.or(info.reset_7d), // unified/legacy best-effort
             };
             if let Some(r) = reset_epoch {
