@@ -886,17 +886,10 @@ const RETRY_529_BASE_DELAY: Duration = Duration::from_secs(1);
 
 /// Affinity override: if the affinity-picked account's weight is below this
 /// fraction of the best candidate's weight, discard affinity and pick the best.
-/// 0.5 means the picked account must have at least 50% of the best's weight.
-const AFFINITY_OVERRIDE_RATIO: f64 = 0.5;
-
-/// Request-balance rebalancing: when the picked account's actual request share
-/// exceeds its weight-proportional share by more than this margin, override
-/// affinity to rebalance. Corrects hash-distribution skew with few clients.
-const REQUEST_BALANCE_THRESHOLD: f64 = 0.10;
-
-/// Minimum total requests across both candidates before balance correction
-/// activates. Avoids overriding on noisy small-sample data at startup.
-const REQUEST_BALANCE_MIN_SAMPLE: u64 = 20;
+/// 0.25 means the picked account must have at least 25% of the best's weight.
+/// Set low to preserve session stickiness for prompt cache locality — different
+/// sessions provide the cross-account balancing factor.
+const AFFINITY_OVERRIDE_RATIO: f64 = 0.25;
 
 /// Extract version string from User-Agent header.
 /// "claude-cli/2.1.68 (external, cli)" → "2.1.68"
@@ -1287,77 +1280,51 @@ impl AppState {
             return None;
         }
 
-        // Compute position in [0, 10000) — either stable (affinity) or scattered (round-robin)
-        let position = if let Some(key) = affinity_key {
+        // Pick the account: affinity uses deterministic hash for session stickiness,
+        // non-affinity uses weighted bucket walk for proportional distribution.
+        let mut picked = if let Some(key) = affinity_key {
+            // Deterministic index from hash — stable as long as candidate set is unchanged.
+            // Different sessions hash to different accounts, providing cross-account balance.
+            // Sticky routing preserves prompt cache locality (5min/1hr TTL tiers).
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             key.hash(&mut hasher);
-            (hasher.finish() % 10000) as f64
+            let idx = hasher.finish() as usize % effective.len();
+            effective[idx]
         } else {
+            // No affinity: weighted bucket walk for proportional distribution.
             let counter = self.robin.fetch_add(1, Ordering::Relaxed) as u64;
-            (counter.wrapping_mul(11400714819323198485) % 10000) as f64
+            let position = (counter.wrapping_mul(11400714819323198485) % 10000) as f64;
+            let target = position / 10000.0 * total_weight;
+            let mut p = effective.last().unwrap();
+            let mut cumulative = 0.0;
+            for c in &effective {
+                cumulative += c.weight;
+                if target < cumulative {
+                    p = c;
+                    break;
+                }
+            }
+            p
         };
 
-        // Normalize position into [0, total_weight)
-        let target = position / 10000.0 * total_weight;
-
-        // Walk weighted buckets to find initial pick
-        let mut picked = effective.last().unwrap();
-        let mut cumulative = 0.0;
-        for c in &effective {
-            cumulative += c.weight;
-            if target < cumulative {
-                picked = c;
-                break;
-            }
-        }
-
-        // Affinity override: when exactly two candidates remain and the affinity-
-        // picked account's weight is far below the other's, discard affinity.
-        // Restricted to two candidates because with 3+ the proportional bucket
-        // system distributes load adequately — comparing every candidate against
-        // the single best would collapse all sticky traffic to one account.
-        // Weight encodes both 5h headroom AND 7d waste risk, so this catches
-        // disparities in either signal (see AFFINITY_OVERRIDE_RATIO).
-        if affinity_key.is_some() && effective.len() == 2 {
-            let other = if picked.idx == effective[0].idx {
-                &effective[1]
-            } else {
-                &effective[0]
-            };
-            if picked.weight < other.weight * AFFINITY_OVERRIDE_RATIO {
+        // Affinity override: if the picked account's weight is egregiously below
+        // the best candidate's, break stickiness. This preserves cache locality
+        // under normal conditions but sheds sessions from accounts under real pressure.
+        if affinity_key.is_some() {
+            let best = effective
+                .iter()
+                .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap())
+                .unwrap();
+            if best.idx != picked.idx && picked.weight < best.weight * AFFINITY_OVERRIDE_RATIO {
                 debug!(
                     picked_account = self.accounts[picked.idx].name,
                     picked_weight = format!("{:.3}", picked.weight),
-                    other_account = self.accounts[other.idx].name,
-                    other_weight = format!("{:.3}", other.weight),
-                    ratio = format!("{:.3}", picked.weight / other.weight),
-                    "pick: affinity override, weight ratio below threshold"
+                    best_account = self.accounts[best.idx].name,
+                    best_weight = format!("{:.3}", best.weight),
+                    ratio = format!("{:.3}", picked.weight / best.weight),
+                    "pick: affinity override, weight disparity exceeds threshold"
                 );
-                picked = other;
-            } else {
-                // Request-balance correction: affinity hashing with few clients
-                // can skew traffic far from the weight-proportional split. When
-                // the picked account's actual request share exceeds its expected
-                // share by REQUEST_BALANCE_THRESHOLD, send to the other account.
-                let picked_reqs = self.accounts[picked.idx].requests.load(Ordering::Relaxed);
-                let other_reqs = self.accounts[other.idx].requests.load(Ordering::Relaxed);
-                let total_reqs = picked_reqs + other_reqs;
-                if total_reqs >= REQUEST_BALANCE_MIN_SAMPLE {
-                    let actual_share = picked_reqs as f64 / total_reqs as f64;
-                    let expected_share = picked.weight / total_weight;
-                    if actual_share > expected_share + REQUEST_BALANCE_THRESHOLD {
-                        debug!(
-                            picked_account = self.accounts[picked.idx].name,
-                            other_account = self.accounts[other.idx].name,
-                            actual_share = format!("{:.1}%", actual_share * 100.0),
-                            expected_share = format!("{:.1}%", expected_share * 100.0),
-                            picked_reqs = picked_reqs,
-                            other_reqs = other_reqs,
-                            "pick: request-balance override, actual share exceeds weight share"
-                        );
-                        picked = other;
-                    }
-                }
+                picked = best;
             }
         }
 
@@ -6336,16 +6303,17 @@ mod tests {
 
     #[tokio::test]
     async fn affinity_override_massive_7d_disparity() {
-        // Scenario: production case — similar 5h, massive 7d gap
-        // Primary 5h=0.13, 7d=0.41 vs Jeff 5h=0.12, 7d=0.79
-        // Weight ratio well below 0.5 → ALL traffic to primary
+        // Scenario: egregious disparity — one account nearly spent, other fresh
+        // Primary 5h=0.10, 7d=0.10 vs Jeff 5h=0.10, 7d=0.95
+        // Primary's waste_risk is enormous, jeff's is near zero
+        // Weight ratio far below 0.25 → all traffic overridden to primary
         let state = test_state_with(vec![
             make_account("primary", "sk-ant-api-a"),
             make_account("jeff", "sk-ant-api-b"),
         ]);
         let now = AppState::now_epoch();
-        set_account_utilization(&state, 0, 0.13, 0.41, now + 10000, now + 300000).await;
-        set_account_utilization(&state, 1, 0.12, 0.79, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 1, 0.10, 0.95, now + 10000, now + 300000).await;
 
         assert_affinity_distribution(
             &state,
@@ -6439,126 +6407,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_balance_override_corrects_skew() {
-        // When affinity hash routes most clients to one account despite equal
-        // weights, the request-balance override kicks in after MIN_SAMPLE
-        // requests and redirects traffic to the underserved account.
-        let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("jeff", "sk-ant-api-b"),
-        ]);
-        {
-            let mut info = state.accounts[0].rate_info.write().await;
-            info.utilization_5h = Some(0.10);
-            info.reset_5h = Some(AppState::now_epoch() + 10000);
-        }
-        {
-            let mut info = state.accounts[1].rate_info.write().await;
-            info.utilization_5h = Some(0.10);
-            info.reset_5h = Some(AppState::now_epoch() + 10000);
-        }
-
-        // Simulate skewed history: jeff has 90% of past requests
-        state.accounts[1].requests.store(900, Ordering::Relaxed);
-        state.accounts[0].requests.store(100, Ordering::Relaxed);
-
-        // With equal weights (~0.9 each), expected share is ~50%.
-        // Jeff's actual share is 90%, which exceeds 50% + 10% threshold.
-        // All picks that hash to jeff should be overridden to primary.
-        let mut primary_count = 0u32;
-        let total = 200u32;
-        for i in 0..total {
-            let key = format!("balance-test-{}", i);
-            let idx = state
-                .pick_account(Some(&key), "claude-opus-4-6", &[])
-                .await
-                .unwrap();
-            if idx == 0 {
-                primary_count += 1;
-            }
-        }
-
-        // With balance override active, primary should get the vast majority
-        // (both hash-to-primary AND overridden hash-to-jeff requests)
-        assert!(
-            primary_count > total * 80 / 100,
-            "expected >80% to primary with balance correction, got {}%",
-            primary_count * 100 / total
-        );
-    }
-
-    #[tokio::test]
-    async fn request_balance_no_override_when_balanced() {
-        // When request counts are already proportional to weights,
-        // the balance override should not fire — affinity is preserved.
-        let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("jeff", "sk-ant-api-b"),
-        ]);
-        {
-            let mut info = state.accounts[0].rate_info.write().await;
-            info.utilization_5h = Some(0.10);
-            info.reset_5h = Some(AppState::now_epoch() + 10000);
-        }
-        {
-            let mut info = state.accounts[1].rate_info.write().await;
-            info.utilization_5h = Some(0.10);
-            info.reset_5h = Some(AppState::now_epoch() + 10000);
-        }
-
-        // Equal weights, equal request counts — balanced
-        state.accounts[0].requests.store(500, Ordering::Relaxed);
-        state.accounts[1].requests.store(500, Ordering::Relaxed);
-
-        // Both accounts should see traffic (affinity preserved)
-        assert_affinity_distribution(
-            &state,
-            "balanced-reqs",
-            500,
-            None,
-            "balanced request counts should preserve affinity on both accounts",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn request_balance_skipped_below_min_sample() {
-        // Below REQUEST_BALANCE_MIN_SAMPLE, no override — even if skewed.
-        let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("jeff", "sk-ant-api-b"),
-        ]);
-        {
-            let mut info = state.accounts[0].rate_info.write().await;
-            info.utilization_5h = Some(0.10);
-            info.reset_5h = Some(AppState::now_epoch() + 10000);
-        }
-        {
-            let mut info = state.accounts[1].rate_info.write().await;
-            info.utilization_5h = Some(0.10);
-            info.reset_5h = Some(AppState::now_epoch() + 10000);
-        }
-
-        // Very few requests — below threshold
-        state.accounts[0].requests.store(1, Ordering::Relaxed);
-        state.accounts[1].requests.store(8, Ordering::Relaxed);
-
-        // Both accounts should see traffic (affinity preserved, no correction)
-        assert_affinity_distribution(
-            &state,
-            "low-sample",
-            500,
-            None,
-            "below min sample should preserve affinity on both accounts",
-        )
-        .await;
-    }
-
-    #[tokio::test]
     async fn pick_unsticky_on_overload() {
-        // When a preferred account gets overloaded, most clients should migrate.
-        // Primary starts with 61.5% of bucket space (0.8/1.3), then shrinks to
-        // 1.96% (0.01/0.51). So ~97% of previously-primary clients should migrate.
+        // When a preferred account gets overloaded, sessions should migrate.
+        // Hash-based pick assigns ~50% of sessions to each account initially.
+        // After overload: primary weight=0.01, backup weight=0.5.
+        // Ratio 0.01/0.5 = 0.02 < 0.25 threshold → override fires for all
+        // sessions that hashed to primary.
         let state = test_state_with(vec![
             make_account("primary", "sk-ant-api-a"),
             make_account("backup", "sk-ant-api-b"),
@@ -6593,7 +6447,7 @@ mod tests {
             info.utilization = Some(0.99);
         }
 
-        // Most of these clients should migrate to backup
+        // All sessions that hashed to primary should migrate (egregious disparity)
         let mut migrated = 0usize;
         for key in &primary_keys {
             if state.pick_account(Some(key), "", &[]).await.unwrap() == 1 {
@@ -6603,11 +6457,192 @@ mod tests {
 
         let migration_pct = migrated as f64 / primary_keys.len() as f64;
         assert!(
-            migration_pct > 0.90,
-            "at least 90% of clients should migrate, got {:.1}% ({}/{})",
+            migration_pct > 0.95,
+            "at least 95% of clients should migrate, got {:.1}% ({}/{})",
             migration_pct * 100.0,
             migrated,
             primary_keys.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_sticky_near_equal_weights() {
+        // Game theory: two accounts with similar utilization must produce
+        // perfectly stable session routing. This is the prompt-cache scenario —
+        // bouncing between accounts wastes cache-creation tokens.
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("jeff", "sk-ant-api-b"),
+        ]);
+        let now = AppState::now_epoch();
+        set_account_utilization(&state, 0, 0.07, 0.73, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 1, 0.08, 0.71, now + 10000, now + 300000).await;
+
+        let session = "10.42.0.1:claude:first-steps:-:9e8efc8c-2891-4206-ae10-8bcd5fa7e1f0";
+        let first = state
+            .pick_account(Some(session), "claude-opus-4-6", &[])
+            .await
+            .unwrap();
+
+        // Same session, 100 consecutive requests: must ALWAYS pick the same account
+        for i in 0..100 {
+            let pick = state
+                .pick_account(Some(session), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            assert_eq!(
+                pick, first,
+                "request {} routed to account {} instead of {}, session is bouncing",
+                i, pick, first
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn affinity_stable_despite_utilization_drift() {
+        // Game theory: utilization changes slightly after each response,
+        // but sessions must remain stable. Simulates the real scenario where
+        // each request nudges the 5h utilization up by a tiny amount.
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("jeff", "sk-ant-api-b"),
+        ]);
+        let now = AppState::now_epoch();
+        set_account_utilization(&state, 0, 0.05, 0.70, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 1, 0.05, 0.68, now + 10000, now + 300000).await;
+
+        let session = "sticky-session-test";
+        let first = state
+            .pick_account(Some(session), "claude-opus-4-6", &[])
+            .await
+            .unwrap();
+
+        // Simulate 50 requests with drifting utilization
+        for i in 0..50 {
+            // Nudge 5h util slightly (simulates usage after each request)
+            let drift = 0.002 * (i as f64);
+            {
+                let mut info = state.accounts[0].rate_info.write().await;
+                info.utilization_5h = Some(0.05 + drift);
+            }
+            {
+                let mut info = state.accounts[1].rate_info.write().await;
+                info.utilization_5h = Some(0.05 + drift * 0.8);
+            }
+
+            let pick = state
+                .pick_account(Some(session), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            assert_eq!(
+                pick, first,
+                "request {} bounced to account {} after util drift, expected {}",
+                i, pick, first
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn affinity_different_sessions_distribute() {
+        // Game theory: different sessions should naturally distribute across
+        // accounts via hash, providing cross-account balance without per-session
+        // instability. This is the balancing mechanism.
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("jeff", "sk-ant-api-b"),
+        ]);
+        let now = AppState::now_epoch();
+        set_account_utilization(&state, 0, 0.10, 0.50, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 1, 0.10, 0.50, now + 10000, now + 300000).await;
+
+        let mut picks = [0u32; 2];
+        for i in 0..500 {
+            let session = format!("session-{}", i);
+            let idx = state
+                .pick_account(Some(&session), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            picks[idx] += 1;
+        }
+
+        // With equal weights, hash should distribute roughly 50/50 (±15%)
+        let primary_pct = picks[0] as f64 / 500.0;
+        assert!(
+            (0.35..=0.65).contains(&primary_pct),
+            "expected ~50/50 distribution, got primary={} jeff={} ({:.0}%)",
+            picks[0],
+            picks[1],
+            primary_pct * 100.0
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_breaks_on_egregious_disparity() {
+        // Game theory: when one account is under extreme pressure,
+        // cache locality cost is worth paying to avoid quota exhaustion.
+        let state = test_state_with(vec![
+            make_account("healthy", "sk-ant-api-a"),
+            make_account("dying", "sk-ant-api-b"),
+        ]);
+        let now = AppState::now_epoch();
+        // healthy: 5h=0.10, 7d=0.20 (lots of capacity)
+        // dying: 5h=0.10, 7d=0.98 (nearly exhausted)
+        set_account_utilization(&state, 0, 0.10, 0.20, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 1, 0.10, 0.98, now + 10000, now + 300000).await;
+
+        // ALL sessions should go to healthy (dying's weight is negligible)
+        let mut healthy_count = 0u32;
+        for i in 0..200 {
+            let session = format!("session-{}", i);
+            if state
+                .pick_account(Some(&session), "claude-opus-4-6", &[])
+                .await
+                .unwrap()
+                == 0
+            {
+                healthy_count += 1;
+            }
+        }
+        assert_eq!(
+            healthy_count, 200,
+            "all sessions should override to healthy account, got {}/200",
+            healthy_count
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_moderate_disparity_stays_sticky() {
+        // Game theory: moderate 7d difference (0.73 vs 0.41) should NOT
+        // break stickiness. The cache-creation cost outweighs the routing
+        // benefit at this disparity level.
+        let state = test_state_with(vec![
+            make_account("primary", "sk-ant-api-a"),
+            make_account("jeff", "sk-ant-api-b"),
+        ]);
+        let now = AppState::now_epoch();
+        set_account_utilization(&state, 0, 0.13, 0.41, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 1, 0.12, 0.79, now + 10000, now + 300000).await;
+
+        // Both accounts should retain their hashed sessions
+        let mut primary_picks = 0u32;
+        let mut jeff_picks = 0u32;
+        for i in 0..500 {
+            let session = format!("moderate-session-{}", i);
+            match state
+                .pick_account(Some(&session), "claude-opus-4-6", &[])
+                .await
+                .unwrap()
+            {
+                0 => primary_picks += 1,
+                _ => jeff_picks += 1,
+            }
+        }
+        // Both should get traffic (no one-sided override)
+        assert!(
+            primary_picks > 100 && jeff_picks > 100,
+            "moderate disparity should preserve stickiness on both: primary={}, jeff={}",
+            primary_picks,
+            jeff_picks
         );
     }
 
@@ -9807,6 +9842,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn pick_account_fallback_no_7d_data() {
         // No 7d claims → falls back to headroom-only weighting
+        // Uses non-affinity traffic to test weight-proportional distribution
         let acct_a = make_account("a", "sk-ant-api-a");
         let acct_b = make_account("b", "sk-ant-api-b");
         let state = test_state_with(vec![acct_a, acct_b]);
@@ -9829,12 +9865,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
 
         let mut picks = [0u32; 2];
-        for i in 0..200 {
-            let key = format!("client_{}", i);
-            if let Some(idx) = state
-                .pick_account(Some(&key), "claude-sonnet-4-6", &[])
-                .await
-            {
+        for _ in 0..200 {
+            if let Some(idx) = state.pick_account(None, "claude-sonnet-4-6", &[]).await {
                 picks[idx] += 1;
             }
         }
