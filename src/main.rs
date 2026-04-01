@@ -61,6 +61,8 @@ struct Config {
     /// Must be resolvable via client_names IP mapping (not spoofable via header).
     #[serde(default)]
     operators: Vec<String>,
+    /// Enable the emergency brake. Default: true.
+    emergency_brake: Option<bool>,
     /// Emergency brake threshold (0.0-1.0). When ALL accounts exceed this,
     /// non-operator traffic is blocked. Default: 0.88.
     emergency_threshold: Option<f64>,
@@ -395,6 +397,8 @@ struct AppState {
     client_utilization_limits: HashMap<String, f64>,
     /// Operator client IDs — never throttled by budgets, ceilings, or emergency brake.
     operators: Vec<String>,
+    /// Whether the emergency brake is enabled. Default: true.
+    emergency_brake: bool,
     /// Emergency brake threshold. Default: 0.88.
     emergency_threshold: f64,
     /// Per-client request tracking: client_id → (total_requests, rate_ewma)
@@ -406,6 +410,10 @@ struct AppState {
     redis: Option<redis::aio::ConnectionManager>,
     /// Cached cluster info from Redis, updated by background sync task.
     cluster_info_cache: Mutex<Option<serde_json::Value>>,
+    /// Monotonic request ID counter for log correlation.
+    next_req_id: AtomicU64,
+    /// Random instance ID for cross-replica log disambiguation.
+    instance_id: u16,
 }
 
 impl Account {
@@ -694,14 +702,16 @@ impl AppState {
                 }
                 self.save_state().await;
                 let info = acct.rate_info.read().await;
+                let (eff_util, constraint, adj_5h, adj_7d) =
+                    effective_utilization(&info, Self::now_epoch(), model);
                 info!(
                     account = acct.name,
                     status = status.as_u16(),
                     probe_model = model,
-                    utilization = ?info.utilization,
-                    util_7d = ?info.utilization_7d,
-                    util_5h = ?info.utilization_5h,
-                    claim = ?info.representative_claim,
+                    utilization = format_args!("{eff_util:.2}"),
+                    util_5h = ?adj_5h,
+                    util_7d = ?adj_7d,
+                    constraint,
                     n_claims_7d = info.claims_7d.len(),
                     "probe complete"
                 );
@@ -888,7 +898,21 @@ const REQUEST_BALANCE_THRESHOLD: f64 = 0.10;
 /// activates. Avoids overriding on noisy small-sample data at startup.
 const REQUEST_BALANCE_MIN_SAMPLE: u64 = 20;
 
-/// Extract the model family from a model ID string.
+/// Extract version string from User-Agent header.
+/// "claude-cli/2.1.68 (external, cli)" → "2.1.68"
+/// "anthropic-sdk/1.0.0" → "1.0.0"
+/// Returns None for unrecognizable formats.
+fn extract_client_version(ua: &str) -> Option<&str> {
+    let ver = ua
+        .split_once('/')
+        .map(|(_, rest)| rest.split_once(' ').map_or(rest, |(ver, _)| ver))?;
+    if ver.is_empty() {
+        None
+    } else {
+        Some(ver)
+    }
+}
+
 /// Used to look up model-specific rate-limit claims (e.g., "seven_day_sonnet").
 /// Returns "" for unrecognized models, which triggers worst-case routing.
 fn model_family(model: &str) -> &str {
@@ -1013,13 +1037,17 @@ fn time_adjusted_utilization(
 }
 
 /// Compute effective utilization for an account using the full fallback chain.
-/// Returns (utilization, source_label) for logging/routing.
+/// Returns (utilization, source_label, adj_5h, adj_7d) for logging/routing.
 ///
 /// Fallback chain:
 /// 1. Both windows adjusted → take max (most constrained wins)
 /// 2. Only one window → use it (the other is stale or absent)
 /// 3. Neither window → raw unified util, then legacy token ratio, then 0.5
-fn effective_utilization(info: &RateLimitInfo, now_epoch: u64, model: &str) -> (f64, &'static str) {
+fn effective_utilization(
+    info: &RateLimitInfo,
+    now_epoch: u64,
+    model: &str,
+) -> (f64, &'static str, Option<f64>, Option<f64>) {
     // 5h window — always flat (no per-model sub-budgets from API)
     let adj_5h = time_adjusted_utilization(
         info.utilization_5h,
@@ -1068,21 +1096,24 @@ fn effective_utilization(info: &RateLimitInfo, now_epoch: u64, model: &str) -> (
     };
 
     match (adj_5h, adj_7d) {
-        (Some(a), Some(b)) => (a.max(b), "time_adjusted"),
-        (Some(a), None) => (a, "time_adjusted_5h"),
-        (None, Some(b)) => (b, "time_adjusted_7d"),
+        (Some(a), Some(b)) if a >= b => (a, "5h", adj_5h, adj_7d),
+        (Some(_), Some(b)) => (b, "7d", adj_5h, adj_7d),
+        (Some(a), None) => (a, "5h", adj_5h, adj_7d),
+        (None, Some(b)) => (b, "7d", adj_5h, adj_7d),
         (None, None) => {
             // Fallback: raw unified (no time adjustment), legacy tokens, or unknown
             if let Some(util) = info.utilization {
-                (util, "unified")
+                (util, "unified", None, None)
             } else if let Some(remaining) = info.remaining_tokens {
                 let limit = info.limit_tokens.unwrap_or(1_000_000);
                 (
                     (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0),
                     "legacy",
+                    None,
+                    None,
                 )
             } else {
-                (0.5, "unknown")
+                (0.5, "unknown", None, None)
             }
         }
     }
@@ -1937,6 +1968,20 @@ impl TokenUsage {
     }
 }
 
+fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &TokenUsage) {
+    info!(
+        req_id,
+        client_id,
+        model,
+        account,
+        input = usage.input_tokens,
+        output = usage.output_tokens,
+        cached = usage.cache_read_input_tokens,
+        cache_write = usage.cache_creation_input_tokens,
+        "usage"
+    );
+}
+
 impl AppState {
     /// Record token usage for an account and client.
     async fn record_usage(&self, account_idx: usize, client_id: &str, usage: &TokenUsage) {
@@ -2069,6 +2114,7 @@ impl AppState {
         let mut nearest_reset: Option<u64> = None;
         let mut all_above = true;
         let mut any_compatible = false;
+        let mut any_known = false;
 
         for acct in &self.accounts {
             if !acct.serves_model(model) {
@@ -2076,29 +2122,33 @@ impl AppState {
             }
             any_compatible = true;
             let info = acct.rate_info.read().await;
-            let (util, _) = effective_utilization(&info, now_epoch, model);
+            let (util, source, _, _) = effective_utilization(&info, now_epoch, model);
+            if source == "unknown" {
+                all_above = false; // fail-open: unknown account may have capacity
+                break;
+            }
+            any_known = true;
             if util < limit {
                 all_above = false;
                 break;
             }
-            // Track nearest reset for Retry-After
-            if let Some(r) = info.reset_5h {
+            // Track nearest reset from the binding constraint only
+            let reset_epoch = match source {
+                "5h" => info.reset_5h,
+                "7d" => resolve_7d_claim(&info, model)
+                    .and_then(|c| c.reset)
+                    .or(info.reset_7d),
+                _ => info.reset_5h.or(info.reset_7d), // unified/legacy best-effort
+            };
+            if let Some(r) = reset_epoch {
                 if r > now_epoch {
                     let secs = r - now_epoch;
                     nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
                 }
             }
-            for c in info.claims_7d.values() {
-                if let Some(r) = c.reset {
-                    if r > now_epoch {
-                        let secs = r - now_epoch;
-                        nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
-                    }
-                }
-            }
         }
 
-        if all_above && any_compatible {
+        if all_above && any_compatible && any_known {
             let retry_after = nearest_reset.unwrap_or(300).clamp(60, 3600);
             Err(retry_after)
         } else {
@@ -2109,13 +2159,16 @@ impl AppState {
     /// Check if all accounts are above the emergency threshold.
     /// Fail-open: returns false if all accounts return (0.5, "unknown") — no data.
     async fn is_emergency_brake_active(&self) -> bool {
+        if !self.emergency_brake {
+            return false;
+        }
         let now_epoch = Self::now_epoch();
         let mut all_above = true;
         let mut any_known = false;
 
         for acct in &self.accounts {
             let info = acct.rate_info.read().await;
-            let (util, source) = effective_utilization(&info, now_epoch, "");
+            let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
             if source != "unknown" {
                 any_known = true;
             }
@@ -2388,8 +2441,21 @@ async fn proxy_handler(
 
     let (parts, body) = req.into_parts();
 
+    let req_id = format!(
+        "{:04x}:{}",
+        state.instance_id,
+        state.next_req_id.fetch_add(1, Ordering::Relaxed)
+    );
+
     // Extract client identification headers
     let client_id = state.resolve_client_id(&client_ip, &parts.headers);
+    let client_ver = parts
+        .headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_client_version)
+        .unwrap_or("-")
+        .to_string();
     let agent_id = parts
         .headers
         .get("x-agent-id")
@@ -2653,23 +2719,30 @@ async fn proxy_handler(
             // Persist state after clearing hard limit so the saved snapshot is clean
             state.save_state().await;
 
-            // Log with capacity info
-            {
+            // Log with capacity info + inject budget status header
+            let budget_status = {
                 let info = acct.rate_info.read().await;
+                let (eff_util, constraint, adj_5h, adj_7d) =
+                    effective_utilization(&info, AppState::now_epoch(), &model);
                 info!(
+                    req_id,
                     client = %client_ip,
                     client_id = %client_id,
+                    ver = %client_ver,
                     agent = %agent_id,
                     session = %session_id,
                     model = %model,
                     account = acct.name,
                     status = status.as_u16(),
-                    utilization = ?info.utilization,
-                    claim = ?info.representative_claim,
+                    utilization = format_args!("{eff_util:.2}"),
+                    util_5h = ?adj_5h,
+                    util_7d = ?adj_7d,
+                    constraint,
                     total = acct.requests.load(Ordering::Relaxed),
                     "proxied"
                 );
-            }
+                compute_pressure_status(eff_util, &client_id, &state)
+            };
 
             let latency_ms = request_start.elapsed().as_millis() as u64;
 
@@ -2687,12 +2760,7 @@ async fn proxy_handler(
             }
 
             // Inject budget status header
-            {
-                let info = acct.rate_info.read().await;
-                let (eff_util, _) = effective_utilization(&info, AppState::now_epoch(), &model);
-                let status_val = compute_pressure_status(eff_util, &client_id, &state);
-                builder = builder.header("x-budget-status", status_val);
-            }
+            builder = builder.header("x-budget-status", budget_status);
 
             // Detect streaming from content-type
             let is_streaming = resp_headers
@@ -2728,6 +2796,7 @@ async fn proxy_handler(
                         state_clone
                             .record_usage(idx, &client_id_clone, &usage)
                             .await;
+                        log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
                     }
                     state_clone.shadow_log(serde_json::json!({
                         "ts": AppState::now_epoch(),
@@ -2761,6 +2830,7 @@ async fn proxy_handler(
                     usage = TokenUsage::from_response_body(&parsed);
                     if !usage.is_empty() {
                         state.record_usage(idx, &client_id, &usage).await;
+                        log_usage(&req_id, &client_id, &model, &acct.name, &usage);
                     }
                 }
                 state.shadow_log(serde_json::json!({
@@ -2959,7 +3029,7 @@ async fn stats_handler(
         }
 
         // Projected throttle time
-        let (eff_util, _) = effective_utilization(&info, now_epoch, "");
+        let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
         let projected_throttle_at: serde_json::Value = if eff_util < 0.5 || br_1h < 0.01 {
             serde_json::Value::Null
         } else if let Some(headroom_reqs) = headroom {
@@ -3321,7 +3391,7 @@ async fn metrics_handler(
             .map(|d| d.as_secs() as f64)
             .unwrap_or(0.0);
 
-        let (eff_util, _) = effective_utilization(&info, now_epoch, "");
+        let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
         let projected_throttle_secs = if eff_util < 0.5 || br_1h < 0.01 {
             None
         } else {
@@ -4548,8 +4618,21 @@ async fn openai_chat_handler(
 
     let (parts, body) = req.into_parts();
 
+    let req_id = format!(
+        "{:04x}:{}",
+        state.instance_id,
+        state.next_req_id.fetch_add(1, Ordering::Relaxed)
+    );
+
     // Extract client identification headers
     let client_id = state.resolve_client_id(&client_ip, &parts.headers);
+    let client_ver = parts
+        .headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_client_version)
+        .unwrap_or("-")
+        .to_string();
     let agent_id = parts
         .headers
         .get("x-agent-id")
@@ -4798,29 +4881,31 @@ async fn openai_chat_handler(
             // Persist state after clearing hard limit so the saved snapshot is clean
             state.save_state().await;
 
-            // Compute budget pressure status for response header
+            // Compute budget pressure status for response header + log
             let budget_status = {
                 let info = acct.rate_info.read().await;
-                let (eff_util, _) = effective_utilization(&info, AppState::now_epoch(), &model);
-                compute_pressure_status(eff_util, &client_id, &state)
-            };
-
-            {
-                let info = acct.rate_info.read().await;
+                let (eff_util, constraint, adj_5h, adj_7d) =
+                    effective_utilization(&info, AppState::now_epoch(), &model);
                 info!(
+                    req_id,
                     client = %client_ip,
                     client_id = %client_id,
+                    ver = %client_ver,
                     agent = %agent_id,
                     session = %session_id,
                     model = %model,
                     account = acct.name,
                     status = status.as_u16(),
-                    utilization = ?info.utilization,
+                    utilization = format_args!("{eff_util:.2}"),
+                    util_5h = ?adj_5h,
+                    util_7d = ?adj_7d,
+                    constraint,
                     openai_compat = true,
                     stream = is_streaming,
                     "proxied (openai-compat)"
                 );
-            }
+                compute_pressure_status(eff_util, &client_id, &state)
+            };
 
             // Non-2xx: log error detail, translate to OpenAI error format, return
             if !status.is_success() {
@@ -4904,6 +4989,8 @@ async fn openai_chat_handler(
                     let mut ctx = StreamContext::default();
                     let mut sent_done = false;
 
+                    let mut client_gone = false;
+
                     while let Ok(Some(chunk)) = resp.chunk().await {
                         let chunk_str = String::from_utf8_lossy(&chunk);
                         buffer.push_str(&chunk_str);
@@ -4922,9 +5009,13 @@ async fn openai_chat_handler(
                                     sent_done = true;
                                 }
                                 if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
-                                    return; // client disconnected
+                                    client_gone = true;
+                                    break; // break inner loop
                                 }
                             }
+                        }
+                        if client_gone {
+                            break; // break outer loop — fall through to usage accounting
                         }
                     }
 
@@ -4949,6 +5040,7 @@ async fn openai_chat_handler(
                         state_clone
                             .record_usage(idx, &client_id_clone, &usage)
                             .await;
+                        log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
                     }
                     state_clone.shadow_log(serde_json::json!({
                         "ts": AppState::now_epoch(),
@@ -5012,6 +5104,7 @@ async fn openai_chat_handler(
             let usage = TokenUsage::from_response_body(&anthropic_resp);
             if !usage.is_empty() {
                 state.record_usage(idx, &client_id, &usage).await;
+                log_usage(&req_id, &client_id, &model, &acct.name, &usage);
             }
             state.shadow_log(serde_json::json!({
                 "ts": AppState::now_epoch(),
@@ -5260,6 +5353,7 @@ async fn main() {
         budget_usage: Mutex::new(HashMap::new()),
         client_utilization_limits: config.client_utilization_limits.clone(),
         operators: config.operators.clone(),
+        emergency_brake: config.emergency_brake.unwrap_or(true),
         emergency_threshold: config
             .emergency_threshold
             .unwrap_or(DEFAULT_EMERGENCY_THRESHOLD),
@@ -5267,6 +5361,12 @@ async fn main() {
         soft_limit: config.soft_limit.unwrap_or(0.90),
         redis,
         cluster_info_cache: Mutex::new(None),
+        next_req_id: AtomicU64::new(0),
+        instance_id: {
+            use std::collections::hash_map::RandomState;
+            use std::hash::{BuildHasher, Hasher};
+            RandomState::new().build_hasher().finish() as u16
+        },
     });
 
     if state.auto_cache {
@@ -5442,11 +5542,14 @@ mod tests {
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         })
     }
 
@@ -5522,11 +5625,14 @@ mod tests {
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         (build_router(state.clone()), state)
@@ -5610,11 +5716,14 @@ mod tests {
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -7476,11 +7585,14 @@ mod tests {
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         let app = Router::new()
@@ -8033,11 +8145,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 0.90,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Try many affinity keys — all should route to healthy (idx 0)
@@ -8085,11 +8200,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Within budget
@@ -8587,11 +8705,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 0.90, // Key: not 1.0 — throttled (0.98) will be excluded
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         {
             let mut info = state.accounts[0].rate_info.write().await;
@@ -9058,11 +9179,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Header overrides IP mapping (supports multiple clients per IP)
@@ -9120,11 +9244,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec!["ray".to_string()],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -9165,9 +9292,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch, "");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
         // 7d at 0.80 (no penalty). Max(0.60, 0.80) = 0.80
-        assert_eq!(source, "time_adjusted");
+        assert_eq!(source, "7d");
         assert!((util - 0.80).abs() < 0.01, "expected ~0.80, got {util}");
     }
 
@@ -9190,8 +9317,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch, "");
-        assert_eq!(source, "time_adjusted_5h");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
+        assert_eq!(source, "5h");
         assert!(
             (util - 0.60).abs() < 0.01,
             "should use 5h value: got {util}"
@@ -9217,8 +9344,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch, "");
-        assert_eq!(source, "time_adjusted_7d");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
+        assert_eq!(source, "7d");
         // 0.50 is below CLAIM_PENALTY_THRESHOLD, so no penalty
         assert!(
             (util - 0.50).abs() < 0.01,
@@ -9246,7 +9373,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             utilization: Some(0.65),
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch, "");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
         assert_eq!(source, "unified");
         assert!(
             (util - 0.65).abs() < 0.001,
@@ -9262,7 +9389,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             limit_tokens: Some(1_000_000),
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch, "");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
         assert_eq!(source, "legacy");
         assert!(
             (util - 0.70).abs() < 0.01,
@@ -9274,7 +9401,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn effective_util_fallback_unknown() {
         let now_epoch = AppState::now_epoch();
         let info = RateLimitInfo::default();
-        let (util, source) = effective_utilization(&info, now_epoch, "");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
         assert_eq!(source, "unknown");
         assert!(
             (util - 0.50).abs() < 0.001,
@@ -9311,8 +9438,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util_sonnet, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
-        let (util_opus, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        let (util_sonnet, _, _, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
+        let (util_opus, _, _, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
         // Sonnet 7d at 0.85 (max with 5h 0.30) = 0.85, Opus 7d at 0.10 (max with 5h 0.30) = 0.30
         assert!(
             (util_sonnet - 0.85).abs() < 0.01,
@@ -9346,9 +9473,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util_sonnet, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
-        let (util_opus, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
-        let (util_haiku, _) = effective_utilization(&info, now_epoch, "claude-haiku-4-5");
+        let (util_sonnet, _, _, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
+        let (util_opus, _, _, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        let (util_haiku, _, _, _) = effective_utilization(&info, now_epoch, "claude-haiku-4-5");
         // All should see the same general claim (0.50, no penalty)
         assert!(
             (util_sonnet - 0.50).abs() < 0.01,
@@ -9378,15 +9505,15 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util_opus, source) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        let (util_opus, source, _, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
         // Opus has no specific claim and no general fallback → only 5h at 0.20
-        assert_eq!(source, "time_adjusted_5h");
+        assert_eq!(source, "5h");
         assert!(
             (util_opus - 0.20).abs() < 0.01,
             "opus should only see 5h: got {util_opus}"
         );
 
-        let (util_sonnet, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
+        let (util_sonnet, _, _, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
         assert!(
             (util_sonnet - 0.95).abs() < 0.01,
             "sonnet should be 0.95: got {util_sonnet}"
@@ -9420,7 +9547,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             claims_7d,
             ..Default::default()
         };
-        let (util, _) = effective_utilization(&info, now_epoch, "");
+        let (util, _, _, _) = effective_utilization(&info, now_epoch, "");
         // Should pick sonnet's 0.95 (no penalty now)
         assert!(
             (util - 0.95).abs() < 0.01,
@@ -9456,16 +9583,17 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..Default::default()
         };
         // For sonnet model: sonnet claim is stale, no general fallback → only 5h
-        let (util_sonnet, source) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
-        assert_eq!(source, "time_adjusted_5h");
+        let (util_sonnet, source, _, _) =
+            effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
+        assert_eq!(source, "5h");
         assert!(
             (util_sonnet - 0.20).abs() < 0.01,
             "stale sonnet should be ignored: got {util_sonnet}"
         );
 
         // For opus model: opus claim is fresh
-        let (util_opus, source) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
-        assert_eq!(source, "time_adjusted");
+        let (util_opus, source, _, _) = effective_utilization(&info, now_epoch, "claude-opus-4-6");
+        assert_eq!(source, "7d");
         assert!(
             (util_opus - 0.30).abs() < 0.01,
             "fresh opus should be used: got {util_opus}"
@@ -9482,6 +9610,18 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
+    async fn extract_client_version_parsing() {
+        assert_eq!(
+            extract_client_version("claude-cli/2.1.68 (external, cli)"),
+            Some("2.1.68")
+        );
+        assert_eq!(extract_client_version("anthropic-sdk/1.0.0"), Some("1.0.0"));
+        assert_eq!(extract_client_version("curl/8.5.0"), Some("8.5.0"));
+        assert_eq!(extract_client_version("no-version"), None);
+        assert_eq!(extract_client_version("foo/"), None);
+    }
+
+    #[tokio::test]
     async fn flat_field_compat_fallback() {
         // When claims_7d is empty, should fall back to flat utilization_7d fields
         let now_epoch = AppState::now_epoch();
@@ -9493,8 +9633,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             // claims_7d empty — migration/compat path
             ..Default::default()
         };
-        let (util, source) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
-        assert_eq!(source, "time_adjusted");
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "claude-sonnet-4-6");
+        assert_eq!(source, "7d");
         assert!((util - 0.60).abs() < 0.01, "should use flat 7d: got {util}");
     }
 
@@ -9726,7 +9866,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         // effective_utilization for both should be >= 0.88
         let info0 = state.accounts[0].rate_info.read().await;
-        let (util0, _) = effective_utilization(&info0, now, "");
+        let (util0, _, _, _) = effective_utilization(&info0, now, "");
         drop(info0);
         assert!(
             util0 >= DEFAULT_EMERGENCY_THRESHOLD,
@@ -9860,11 +10000,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.60, 0.50, now + 10000, now + 100000).await;
@@ -9903,11 +10046,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
@@ -9947,11 +10093,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -9993,11 +10142,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
             operators: vec!["ray".to_string()],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
         // Operator bypasses everything
@@ -10036,11 +10188,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // Request for "claude-opus" — no account serves it → should pass
         assert!(
@@ -10049,6 +10204,109 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .await
                 .is_ok(),
             "should not 429 when no account serves the requested model"
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_unknown_accounts_fail_open() {
+        // Accounts with no rate data (source="unknown") should not trigger the limit gate
+        let mut limits = HashMap::new();
+        limits.insert("testclient".to_string(), 0.30); // below the 0.5 unknown default
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![
+                make_account("a", "sk-ant-api-x"),
+                make_account("b", "sk-ant-api-y"),
+            ],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operators: vec![],
+            emergency_brake: true,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
+        });
+        // Don't set any utilization — accounts remain "unknown" (0.5)
+        // With limit=0.30, unknown 0.5 would appear "above limit" without fail-open
+        assert!(
+            state
+                .check_utilization_limit("testclient", "")
+                .await
+                .is_ok(),
+            "should fail-open when all accounts have unknown utilization"
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_mixed_known_unknown_fails_open() {
+        // Known accounts above limit + one unknown account → should NOT 429
+        // The unknown account may have capacity; let pick_account route to it
+        let now = AppState::now_epoch();
+        let mut limits = HashMap::new();
+        limits.insert("testclient".to_string(), 0.50);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![
+                make_account("a", "sk-ant-api-x"),
+                make_account("b", "sk-ant-api-y"),
+                make_account("c", "sk-ant-api-z"),
+            ],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operators: vec![],
+            emergency_brake: true,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
+        });
+        // Two known accounts above limit, one unknown (no data set)
+        set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
+        // Account "c" has no rate data → unknown
+        assert!(
+            state
+                .check_utilization_limit("testclient", "")
+                .await
+                .is_ok(),
+            "should fail-open when unknown compatible account may have capacity"
         );
     }
 
@@ -10102,11 +10360,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
             operators: vec!["ray".to_string()],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
         assert!(state.is_emergency_brake_active().await);
@@ -10173,16 +10434,214 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: 0.80, // custom low threshold
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.85, 0.70, now + 10000, now + 100000).await;
         assert!(
             state.is_emergency_brake_active().await,
             "0.85 should exceed custom 0.80 threshold"
+        );
+    }
+
+    // ── Emergency brake: known/unknown interaction tests ──
+    // These tests document the quota-maximization design intent:
+    // Unknown accounts (no rate data) return (0.5, "unknown") from effective_utilization.
+    // The brake does NOT fire when unknown accounts exist because:
+    //   (a) 0.5 < 0.88 default threshold → all_above = false, OR
+    //   (b) even if threshold is low enough, any_known = false blocks activation.
+    // This is intentional: unknown accounts might have capacity, and activating
+    // the brake blocks ALL non-operator traffic — a blunt instrument that wastes quota.
+
+    #[tokio::test]
+    async fn emergency_mixed_known_above_plus_unknown_preserves_capacity() {
+        // Two known accounts above threshold + one unknown (no data).
+        // Unknown returns (0.5, "unknown") — its 0.5 < 0.88 breaks the all_above check.
+        // Brake stays inactive: the unknown account might have available quota.
+        let now = AppState::now_epoch();
+        let state = test_state_with(vec![
+            make_account("known-a", "sk-ant-api-a"),
+            make_account("known-b", "sk-ant-api-b"),
+            make_account("unknown-c", "sk-ant-api-c"), // no rate data set
+        ]);
+        set_account_utilization(&state, 0, 0.96, 0.92, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.95, 0.91, now + 10000, now + 100000).await;
+        // Account 2: no data → effective_utilization returns (0.5, "unknown")
+        assert!(
+            !state.is_emergency_brake_active().await,
+            "brake must not fire: unknown account at 0.5 < 0.88 threshold means potential capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_mixed_known_below_plus_unknown_inactive() {
+        // Some known above, some known below, plus an unknown. Brake inactive on multiple grounds.
+        let now = AppState::now_epoch();
+        let state = test_state_with(vec![
+            make_account("high", "sk-ant-api-a"),
+            make_account("low", "sk-ant-api-b"),
+            make_account("unknown", "sk-ant-api-c"),
+        ]);
+        set_account_utilization(&state, 0, 0.96, 0.92, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
+        // Account 2: no data
+        assert!(
+            !state.is_emergency_brake_active().await,
+            "brake must not fire: known account below threshold + unknown account"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_unknown_with_low_threshold_still_fails_open() {
+        // Edge case: threshold set to 0.4, below the unknown default of 0.5.
+        // Unknown's 0.5 >= 0.4 so all_above stays true, BUT any_known is false.
+        // The any_known guard prevents firing — fail-open even with aggressive threshold.
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("mystery", "sk-ant-api-x")],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operators: vec![],
+            emergency_brake: true,
+            emergency_threshold: 0.40, // below unknown's default 0.5
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
+        });
+        // No rate data set — account returns (0.5, "unknown")
+        // 0.5 >= 0.4 threshold → all_above is true
+        // But any_known is false → brake does NOT fire
+        assert!(
+            !state.is_emergency_brake_active().await,
+            "brake must fail-open: no known accounts even though unknown's 0.5 exceeds 0.40 threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_mixed_known_above_low_threshold_plus_unknown_fires() {
+        // Converse of above: threshold 0.4, one KNOWN account at 0.6, one unknown at default 0.5.
+        // Both 0.6 >= 0.4 and 0.5 >= 0.4 → all_above = true.
+        // Known account exists → any_known = true.
+        // Brake fires. This is correct because we have real data showing distress.
+        let now = AppState::now_epoch();
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![
+                make_account("known", "sk-ant-api-a"),
+                make_account("unknown", "sk-ant-api-b"),
+            ],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operators: vec![],
+            emergency_brake: true,
+            emergency_threshold: 0.40,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
+        });
+        set_account_utilization(&state, 0, 0.60, 0.55, now + 10000, now + 100000).await;
+        // Account 1: no data → (0.5, "unknown"), 0.5 >= 0.4 → all_above stays true
+        assert!(
+            state.is_emergency_brake_active().await,
+            "brake should fire: known account above 0.40 threshold + unknown's 0.5 also above"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_all_known_at_exact_threshold_fires() {
+        // Boundary: accounts at exactly the threshold. The check is `util < threshold`,
+        // so util == threshold means NOT below → all_above stays true → brake fires.
+        let now = AppState::now_epoch();
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-a"),
+            make_account("b", "sk-ant-api-b"),
+        ]);
+        set_account_utilization(&state, 0, 0.88, 0.88, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.88, 0.88, now + 10000, now + 100000).await;
+        assert!(
+            state.is_emergency_brake_active().await,
+            "at exactly threshold (0.88): util is NOT < threshold, so brake should fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_one_known_just_below_threshold_inactive() {
+        // Boundary: one account at threshold - epsilon. Just below → all_above = false.
+        let now = AppState::now_epoch();
+        let state = test_state_with(vec![
+            make_account("a", "sk-ant-api-a"),
+            make_account("b", "sk-ant-api-b"),
+        ]);
+        set_account_utilization(&state, 0, 0.96, 0.92, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.879, 0.85, now + 10000, now + 100000).await;
+        assert!(
+            !state.is_emergency_brake_active().await,
+            "0.879 < 0.88 threshold: brake should not fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_single_known_above_threshold_fires() {
+        // Single account fleet, known and above threshold → brake fires.
+        let now = AppState::now_epoch();
+        let state = test_state_with(vec![make_account("solo", "sk-ant-api-x")]);
+        set_account_utilization(&state, 0, 0.95, 0.92, now + 10000, now + 100000).await;
+        assert!(
+            state.is_emergency_brake_active().await,
+            "single known account above threshold: brake should fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_single_unknown_account_fails_open() {
+        // Single unknown account — both guards prevent activation:
+        // 0.5 < 0.88 → all_above = false, AND any_known = false.
+        let state = test_state_with(vec![make_account("solo", "sk-ant-api-x")]);
+        assert!(
+            !state.is_emergency_brake_active().await,
+            "single unknown account: must fail-open"
         );
     }
 
@@ -10209,11 +10668,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec!["ray".to_string()],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // "-" is not the operator
         assert!(!state.is_operator("-"));
@@ -10280,11 +10742,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec!["ray".to_string()],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // Operator always gets "healthy" regardless of utilization
         assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
@@ -10318,11 +10783,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // gastown has limit 0.85, 80% of that = 0.68
         // At 0.60, below 0.68 → no upgrade → "healthy"
@@ -10532,11 +11000,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // Set utilization above client's limit (0.80 > 0.50)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -10588,11 +11059,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // Set utilization below client's limit (0.50 < 0.90)
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -10641,11 +11115,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec!["ray".to_string()],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // All accounts above emergency threshold. 5h=0.96 > emergency threshold (0.88).
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -10702,11 +11179,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec!["ray".to_string()],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         // All accounts above emergency threshold — 5h only (avoid claim penalty on 7d)
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -10760,11 +11240,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
 
@@ -10813,11 +11296,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
 
@@ -10917,11 +11403,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
@@ -10983,11 +11472,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec!["operator-id".to_string()],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         let status = compute_pressure_status(0.99, "operator-id", &state);
@@ -11029,11 +11521,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
@@ -11212,9 +11707,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..Default::default()
         };
 
-        let (util, source) = effective_utilization(&info, now, "");
+        let (util, source, _, _) = effective_utilization(&info, now, "");
         assert!(util > 0.60, "should use higher (5h) utilization");
-        assert_eq!(source, "time_adjusted");
+        assert_eq!(source, "5h");
     }
 
     #[tokio::test]
@@ -11238,7 +11733,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..Default::default()
         };
 
-        let (util, _) = effective_utilization(&info, now, "");
+        let (util, _, _, _) = effective_utilization(&info, now, "");
         assert!(
             (util - 0.85).abs() < 0.01,
             "7d window should pass through at 0.85 without penalty: got {util}"
@@ -11340,11 +11835,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec!["special-operator".to_string()],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         assert!(state.is_operator("special-operator"));
@@ -11381,11 +11879,14 @@ data: {\"type\":\"message_stop\"}\n\n";
                 "openclaw".to_string(),
                 "claude".to_string(),
             ],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
         assert!(state.is_operator("ray"));
         assert!(state.is_operator("openclaw"));
@@ -11436,11 +11937,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Budget check uses local path when redis is None
@@ -11563,11 +12067,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Recording 0 tokens should be a no-op
@@ -11896,11 +12403,14 @@ upstream = "https://api.anthropic.com"
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Set up some state to persist
@@ -11975,11 +12485,14 @@ upstream = "https://api.anthropic.com"
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Load state
@@ -12054,11 +12567,14 @@ upstream = "https://api.anthropic.com"
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Pre-populate with yesterday's usage (high usage that would exceed budget)
@@ -12103,11 +12619,14 @@ upstream = "https://api.anthropic.com"
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Pre-populate with yesterday's exhausted budget
@@ -12434,11 +12953,14 @@ upstream = "https://api.anthropic.com"
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec!["op-alice".to_string(), "op-bob".to_string()],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         // Seed two operator clients and one regular client with token usage
@@ -12676,11 +13198,14 @@ upstream = "https://api.anthropic.com"
             budget_usage: Mutex::new(budget_usage_map),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(client_rates_map),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         let app = build_router(state);
@@ -12964,11 +13489,14 @@ upstream = "https://api.anthropic.com"
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
             operators: vec![],
+            emergency_brake: true,
             emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 1.0,
             redis: None,
             cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
         });
 
         let app = Router::new()
