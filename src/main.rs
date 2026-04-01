@@ -4989,6 +4989,8 @@ async fn openai_chat_handler(
                     let mut ctx = StreamContext::default();
                     let mut sent_done = false;
 
+                    let mut client_gone = false;
+
                     while let Ok(Some(chunk)) = resp.chunk().await {
                         let chunk_str = String::from_utf8_lossy(&chunk);
                         buffer.push_str(&chunk_str);
@@ -5007,9 +5009,13 @@ async fn openai_chat_handler(
                                     sent_done = true;
                                 }
                                 if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
-                                    return; // client disconnected
+                                    client_gone = true;
+                                    break; // break inner loop
                                 }
                             }
+                        }
+                        if client_gone {
+                            break; // break outer loop — fall through to usage accounting
                         }
                     }
 
