@@ -1316,13 +1316,13 @@ impl AppState {
                 .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap())
                 .unwrap();
             if best.idx != picked.idx && picked.weight < best.weight * AFFINITY_OVERRIDE_RATIO {
-                debug!(
+                warn!(
                     picked_account = self.accounts[picked.idx].name,
                     picked_weight = format!("{:.3}", picked.weight),
                     best_account = self.accounts[best.idx].name,
                     best_weight = format!("{:.3}", best.weight),
                     ratio = format!("{:.3}", picked.weight / best.weight),
-                    "pick: affinity override, weight disparity exceeds threshold"
+                    "pick: affinity override, breaking session stickiness"
                 );
                 picked = best;
             }
