@@ -1283,13 +1283,22 @@ impl AppState {
         // Pick the account: affinity uses deterministic hash for session stickiness,
         // non-affinity uses weighted bucket walk for proportional distribution.
         let mut picked = if let Some(key) = affinity_key {
-            // Deterministic index from hash — stable as long as candidate set is unchanged.
-            // Different sessions hash to different accounts, providing cross-account balance.
-            // Sticky routing preserves prompt cache locality (5min/1hr TTL tiers).
+            // Hash into the same weight-space as the non-affinity path so sticky sessions
+            // still respect headroom-proportional distribution. Different session keys spread
+            // across buckets proportionally; the same key always lands in the same bucket.
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             key.hash(&mut hasher);
-            let idx = hasher.finish() as usize % effective.len();
-            effective[idx]
+            let target = (hasher.finish() as f64 / u64::MAX as f64) * total_weight;
+            let mut p = effective.last().unwrap();
+            let mut cumulative = 0.0;
+            for c in &effective {
+                cumulative += c.weight;
+                if target < cumulative {
+                    p = c;
+                    break;
+                }
+            }
+            p
         } else {
             // No affinity: weighted bucket walk for proportional distribution.
             let counter = self.robin.fetch_add(1, Ordering::Relaxed) as u64;
@@ -9842,7 +9851,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn pick_account_fallback_no_7d_data() {
         // No 7d claims → falls back to headroom-only weighting
-        // Uses non-affinity traffic to test weight-proportional distribution
+        // Uses affinity (sticky) traffic to verify weight-proportional distribution
+        // across distinct session keys, exercising the affinity path.
         let acct_a = make_account("a", "sk-ant-api-a");
         let acct_b = make_account("b", "sk-ant-api-b");
         let state = test_state_with(vec![acct_a, acct_b]);
@@ -9864,12 +9874,29 @@ data: {\"type\":\"message_stop\"}\n\n";
             info.claims_7d.clear();
         }
 
+        // Each distinct session key deterministically hashes into the weight-space;
+        // 200 different keys should distribute ~70/30 matching A's higher headroom.
         let mut picks = [0u32; 2];
-        for _ in 0..200 {
-            if let Some(idx) = state.pick_account(None, "claude-sonnet-4-6", &[]).await {
+        for i in 0..200 {
+            let key = format!("session-{}", i);
+            if let Some(idx) = state
+                .pick_account(Some(&key), "claude-sonnet-4-6", &[])
+                .await
+            {
                 picks[idx] += 1;
             }
         }
+
+        // Verify the affinity path returns Some for a well-formed session key
+        let session = "10.42.0.1:client-test:agent-1:session-fallback";
+        assert!(
+            state
+                .pick_account(Some(session), "claude-sonnet-4-6", &[])
+                .await
+                .is_some(),
+            "affinity pick should return Some when accounts are available"
+        );
+
         // A headroom=0.70, B headroom=0.30. A should get ~70% of traffic
         assert!(
             picks[0] > picks[1],
