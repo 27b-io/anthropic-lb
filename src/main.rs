@@ -1317,9 +1317,11 @@ impl AppState {
         };
 
         // Affinity override: if the picked account's weight is egregiously below
-        // the best candidate's, break stickiness. This preserves cache locality
-        // under normal conditions but sheds sessions from accounts under real pressure.
-        if affinity_key.is_some() {
+        // the best candidate's, break stickiness. Only for small pools (< 3) where
+        // there's essentially one alternative; for 3+ candidates the weighted bucket
+        // walk already distributes proportionally and the override would collapse
+        // traffic onto a single "best" account instead of spreading it.
+        if affinity_key.is_some() && effective.len() < 3 {
             let best = effective
                 .iter()
                 .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap())
