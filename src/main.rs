@@ -2124,7 +2124,8 @@ impl AppState {
             let info = acct.rate_info.read().await;
             let (util, source, _, _) = effective_utilization(&info, now_epoch, model);
             if source == "unknown" {
-                continue; // fail-open: no data, skip this account
+                all_above = false; // fail-open: unknown account may have capacity
+                break;
             }
             any_known = true;
             if util < limit {
@@ -10246,6 +10247,60 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .await
                 .is_ok(),
             "should fail-open when all accounts have unknown utilization"
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_mixed_known_unknown_fails_open() {
+        // Known accounts above limit + one unknown account → should NOT 429
+        // The unknown account may have capacity; let pick_account route to it
+        let now = AppState::now_epoch();
+        let mut limits = HashMap::new();
+        limits.insert("testclient".to_string(), 0.50);
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![
+                make_account("a", "sk-ant-api-x"),
+                make_account("b", "sk-ant-api-y"),
+                make_account("c", "sk-ant-api-z"),
+            ],
+            robin: AtomicUsize::new(0),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: limits,
+            operators: vec![],
+            emergency_brake: true,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
+        });
+        // Two known accounts above limit, one unknown (no data set)
+        set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
+        set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
+        // Account "c" has no rate data → unknown
+        assert!(
+            state
+                .check_utilization_limit("testclient", "")
+                .await
+                .is_ok(),
+            "should fail-open when unknown compatible account may have capacity"
         );
     }
 
