@@ -11,7 +11,6 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
@@ -463,9 +462,22 @@ impl Account {
 struct RoutingCandidate {
     idx: usize,
     gate_5h: f64,
+    gate_7d: f64,
+    gate: f64,
     wr: f64,
     weight: f64,
     source: &'static str,
+}
+
+fn stable_affinity_hash(key: &str) -> u64 {
+    use std::hash::Hasher;
+
+    // Pinned SipHash keeps sticky routing stable across rebuilds and process
+    // restarts without depending on RandomState's per-process seeding.
+    #[allow(deprecated)]
+    let mut hasher = std::hash::SipHasher::new_with_keys(0, 0);
+    hasher.write(key.as_bytes());
+    hasher.finish()
 }
 
 /// Parsed IP allow entry — either a single IP or a CIDR range.
@@ -1216,8 +1228,10 @@ impl AppState {
                 })
             };
 
-            // 7d waste risk from model-specific claim
-            let (wr, source) = if let Some(claim) = resolve_7d_claim(&info, model) {
+            // 7d model-specific gate and waste risk. Keep raw 7d utilization in
+            // waste_risk, and use gate_7d only for pressure/status so we do not
+            // double-count the same 7d signal in both terms.
+            let (gate_7d, wr, source) = if let Some(claim) = resolve_7d_claim(&info, model) {
                 // Skip if this model's 7d claim is rejected AND we have fresh data.
                 // Stale rejections from expired hard limits are ignored — the account
                 // needs a chance to prove it's recovered.
@@ -1230,27 +1244,54 @@ impl AppState {
                     continue;
                 }
                 (
+                    if stale_after_hard_limit {
+                        0.5
+                    } else {
+                        time_adjusted_utilization(
+                            Some(0.0),
+                            claim.reset,
+                            claim.status.as_deref(),
+                            NEAR_RESET_7D_SECS,
+                            now_epoch,
+                        )
+                        .unwrap_or(0.0)
+                    },
                     waste_risk(claim.utilization, claim.reset, now_epoch),
                     "waste_risk",
                 )
             } else {
-                (0.0, "headroom_only")
+                (
+                    if stale_after_hard_limit {
+                        0.5
+                    } else {
+                        time_adjusted_utilization(
+                            Some(0.0),
+                            info.reset_7d,
+                            info.status_7d.as_deref(),
+                            NEAR_RESET_7D_SECS,
+                            now_epoch,
+                        )
+                        .unwrap_or(0.0)
+                    },
+                    0.0,
+                    "headroom_only",
+                )
             };
 
-            // Weight: waste_risk dampened by 5h headroom
-            let headroom_5h = (1.0 - gate_5h).max(0.01);
-            let weight = if wr > 0.0 {
-                wr * headroom_5h
-            } else {
-                headroom_5h
-            };
+            let gate = gate_5h.max(gate_7d);
+
+            // Weight: waste_risk dampened by the worst active gate.
+            let headroom = (1.0 - gate).max(0.01);
+            let weight = if wr > 0.0 { wr * headroom } else { headroom };
 
             // Zero weight for fully exhausted accounts
-            let weight = if gate_5h >= 1.0 { 0.0 } else { weight };
+            let weight = if gate >= 1.0 { 0.0 } else { weight };
 
             trace!(
                 account = acct.name,
                 gate_5h = format!("{:.4}", gate_5h),
+                gate_7d = format!("{:.4}", gate_7d),
+                gate = format!("{:.4}", gate),
                 waste_risk = format!("{:.4}", wr),
                 weight = format!("{:.4}", weight),
                 source = source,
@@ -1260,6 +1301,8 @@ impl AppState {
             candidates.push(RoutingCandidate {
                 idx: i,
                 gate_5h,
+                gate_7d,
+                gate,
                 wr,
                 weight,
                 source,
@@ -1288,9 +1331,7 @@ impl AppState {
         };
 
         if let Some(key) = affinity_key {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            key.hash(&mut hasher);
-            let target = (hasher.finish() as f64 / u64::MAX as f64) * total_weight;
+            let target = (stable_affinity_hash(key) as f64 / u64::MAX as f64) * total_weight;
             walk_buckets(target)
         } else {
             let counter = self.robin.fetch_add(1, Ordering::Relaxed) as u64;
@@ -1382,12 +1423,12 @@ impl AppState {
             return None;
         }
 
-        // Soft-limit gate: exclude accounts with 5h utilization above the ceiling.
-        let has_healthy = candidates.iter().any(|c| c.gate_5h < self.soft_limit);
+        // Soft-limit gate: exclude accounts whose effective gate exceeds the ceiling.
+        let has_healthy = candidates.iter().any(|c| c.gate < self.soft_limit);
         let effective: Vec<&RoutingCandidate> = if has_healthy {
             let excluded: Vec<&str> = candidates
                 .iter()
-                .filter(|c| c.gate_5h >= self.soft_limit)
+                .filter(|c| c.gate >= self.soft_limit)
                 .map(|c| self.accounts[c.idx].name.as_str())
                 .collect();
             if !excluded.is_empty() {
@@ -1395,7 +1436,7 @@ impl AppState {
             }
             candidates
                 .iter()
-                .filter(|c| c.gate_5h < self.soft_limit)
+                .filter(|c| c.gate < self.soft_limit)
                 .collect()
         } else {
             candidates.iter().collect()
@@ -1420,7 +1461,9 @@ impl AppState {
         debug!(
             strategy = self.routing_strategy.as_str(),
             account = self.accounts[picked.idx].name,
+            gate = format!("{:.3}", picked.gate),
             gate_5h = format!("{:.3}", picked.gate_5h),
+            gate_7d = format!("{:.3}", picked.gate_7d),
             waste_risk = format!("{:.3}", picked.wr),
             weight = format!("{:.3}", picked.weight),
             share = format!("{:.0}%", picked.weight / total_weight * 100.0),
@@ -6609,10 +6652,13 @@ mod tests {
         // After overload: primary weight=0.01, backup weight=0.5.
         // Ratio 0.01/0.5 = 0.02 < 0.25 threshold → override fires for all
         // sessions that hashed to primary.
-        let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("backup", "sk-ant-api-b"),
-        ]);
+        let state = test_state_with_strategy(
+            vec![
+                make_account("primary", "sk-ant-api-a"),
+                make_account("backup", "sk-ant-api-b"),
+            ],
+            RoutingStrategy::StickyWeightedV2,
+        );
 
         // Start with primary having lots of headroom
         {
@@ -9008,6 +9054,82 @@ data: {\"type\":\"message_stop\"}\n\n";
         // A is throttled → effective=0.98 → excluded by soft_limit=0.90
         // B gets all traffic
         assert_eq!(b_count, 100, "Throttled account A should be soft-excluded");
+    }
+
+    #[tokio::test]
+    async fn pick_model_specific_7d_throttled_claim_excludes() {
+        let now_epoch = AppState::now_epoch();
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![
+                make_account("acct-a", "sk-ant-api-test-aaa"),
+                make_account("acct-b", "sk-ant-api-test-bbb"),
+            ],
+            robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operators: vec![],
+            emergency_brake: true,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 0.90,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
+        });
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.20);
+            info.utilization = Some(0.20);
+            info.status_5h = Some("allowed".to_string());
+            info.reset_5h = Some(now_epoch + 7200);
+            info.claims_7d.insert(
+                "seven_day_opus".to_string(),
+                ClaimWindowData {
+                    utilization: 0.20,
+                    reset: Some(now_epoch + 86400),
+                    status: Some("throttled".to_string()),
+                },
+            );
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.40);
+            info.utilization = Some(0.40);
+            info.status_5h = Some("allowed".to_string());
+            info.reset_5h = Some(now_epoch + 7200);
+        }
+
+        let mut b_count = 0;
+        for i in 0..100 {
+            let key = format!("sticky-opus-{i}");
+            if let Some(idx) = state.pick_account(Some(&key), "claude-opus-4-6", &[]).await {
+                if idx == 1 {
+                    b_count += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            b_count, 100,
+            "model-specific throttled 7d claim should soft-exclude account A"
+        );
     }
 
     #[tokio::test]

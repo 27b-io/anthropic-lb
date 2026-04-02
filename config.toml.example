@@ -6,7 +6,7 @@ upstream = "https://api.anthropic.com"
 #   the older 0.5 affinity override threshold
 # - "sticky-weighted-v2": stronger session stickiness, only breaks on egregious
 #   weight disparities
-strategy = "dynamic-capacity"
+strategy = "dynamic-capacity-v1"
 rate_limit_cooldown_secs = 60
 probe_interval_secs = 300
 
