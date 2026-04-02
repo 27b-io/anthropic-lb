@@ -1,6 +1,11 @@
 # anthropic-lb configuration
 listen = "127.0.0.1:8082"
 upstream = "https://api.anthropic.com"
+# Routing strategy:
+# - "dynamic-capacity" / "dynamic-capacity-v1": legacy weighted routing with
+#   the older 0.5 affinity override threshold
+# - "sticky-weighted-v2": stronger session stickiness, only breaks on egregious
+#   weight disparities
 strategy = "dynamic-capacity"
 rate_limit_cooldown_secs = 60
 probe_interval_secs = 300

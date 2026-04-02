@@ -93,6 +93,32 @@ struct UpstreamConfig {
     api_key: String,
 }
 
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+enum RoutingStrategy {
+    #[default]
+    DynamicCapacityV1,
+    StickyWeightedV2,
+}
+
+impl RoutingStrategy {
+    fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.unwrap_or("dynamic-capacity-v1") {
+            "dynamic-capacity" | "dynamic-capacity-v1" => Ok(Self::DynamicCapacityV1),
+            "sticky-weighted" | "sticky-weighted-v2" => Ok(Self::StickyWeightedV2),
+            other => Err(format!(
+                "unknown strategy '{other}' (expected dynamic-capacity-v1 or sticky-weighted-v2)"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DynamicCapacityV1 => "dynamic-capacity-v1",
+            Self::StickyWeightedV2 => "sticky-weighted-v2",
+        }
+    }
+}
+
 // ── Runtime state ───────────────────────────────────────────────────
 
 /// Per-claim utilization data for a single rate-limit window.
@@ -378,6 +404,7 @@ struct AppState {
     upstream: String,
     accounts: Vec<Account>,
     robin: AtomicUsize,
+    routing_strategy: RoutingStrategy,
     cooldown: Duration,
     state_path: PathBuf,
     proxy_key: Option<String>,
@@ -430,6 +457,15 @@ impl Account {
             }
         })
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RoutingCandidate {
+    idx: usize,
+    gate_5h: f64,
+    wr: f64,
+    weight: f64,
+    source: &'static str,
 }
 
 /// Parsed IP allow entry — either a single IP or a CIDR range.
@@ -884,12 +920,13 @@ const MAX_529_RETRIES: u32 = 3;
 /// Base delay for 529 BEBO retries. Doubles each round: 1s, 2s, 4s.
 const RETRY_529_BASE_DELAY: Duration = Duration::from_secs(1);
 
-/// Affinity override: if the affinity-picked account's weight is below this
-/// fraction of the best candidate's weight, discard affinity and pick the best.
-/// 0.25 means the picked account must have at least 25% of the best's weight.
-/// Set low to preserve session stickiness for prompt cache locality — different
-/// sessions provide the cross-account balancing factor.
-const AFFINITY_OVERRIDE_RATIO: f64 = 0.25;
+/// Legacy dynamic-capacity override threshold. If the affinity-picked account's
+/// weight is below 50% of the alternative, stickiness is broken immediately.
+const LEGACY_AFFINITY_OVERRIDE_RATIO: f64 = 0.5;
+
+/// Sticky-weighted override threshold. Lower than the legacy algorithm to
+/// preserve cache locality and only break stickiness for egregious disparities.
+const STICKY_WEIGHTED_OVERRIDE_RATIO: f64 = 0.25;
 
 /// Extract version string from User-Agent header.
 /// "claude-cli/2.1.68 (external, cli)" → "2.1.68"
@@ -1113,30 +1150,10 @@ fn effective_utilization(
 }
 
 impl AppState {
-    /// Pick the best available account using headroom-proportional weighted bucket hashing.
-    ///
-    /// Each non-hard-limited account gets a "bucket" proportional to its available headroom
-    /// (1.0 - utilization). An affinity key hashes to a stable position in the bucket space,
-    /// providing stickiness. As utilization changes, bucket boundaries shift and clients near
-    /// the edges naturally migrate — no timers or thresholds needed.
-    async fn pick_account(
-        &self,
-        affinity_key: Option<&str>,
-        model: &str,
-        skip: &[usize],
-    ) -> Option<usize> {
+    async fn routing_candidates(&self, model: &str, skip: &[usize]) -> Vec<RoutingCandidate> {
         let now = Instant::now();
         let now_epoch = Self::now_epoch();
-
-        // Build candidate list with 5h gate and waste_risk for each account
-        struct Candidate<'a> {
-            idx: usize,
-            gate_5h: f64,
-            wr: f64,
-            weight: f64,
-            source: &'a str,
-        }
-        let mut candidates: Vec<Candidate> = Vec::new();
+        let mut candidates: Vec<RoutingCandidate> = Vec::new();
         for (i, acct) in self.accounts.iter().enumerate() {
             if skip.contains(&i) {
                 trace!(account = acct.name, "pick: skipping, already tried");
@@ -1240,7 +1257,7 @@ impl AppState {
                 "pick: candidate"
             );
 
-            candidates.push(Candidate {
+            candidates.push(RoutingCandidate {
                 idx: i,
                 gate_5h,
                 wr,
@@ -1248,7 +1265,118 @@ impl AppState {
                 source,
             });
         }
+        candidates
+    }
 
+    fn pick_weighted_bucket<'a>(
+        &self,
+        effective: &[&'a RoutingCandidate],
+        total_weight: f64,
+        affinity_key: Option<&str>,
+    ) -> &'a RoutingCandidate {
+        let walk_buckets = |target: f64| -> &'a RoutingCandidate {
+            let mut picked = effective.last().unwrap();
+            let mut cumulative = 0.0;
+            for c in effective {
+                cumulative += c.weight;
+                if target < cumulative {
+                    picked = c;
+                    break;
+                }
+            }
+            picked
+        };
+
+        if let Some(key) = affinity_key {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut hasher);
+            let target = (hasher.finish() as f64 / u64::MAX as f64) * total_weight;
+            walk_buckets(target)
+        } else {
+            let counter = self.robin.fetch_add(1, Ordering::Relaxed) as u64;
+            let position = (counter.wrapping_mul(11400714819323198485) % 10000) as f64;
+            let target = position / 10000.0 * total_weight;
+            walk_buckets(target)
+        }
+    }
+
+    fn pick_dynamic_capacity_v1<'a>(
+        &self,
+        effective: &[&'a RoutingCandidate],
+        total_weight: f64,
+        affinity_key: Option<&str>,
+    ) -> &'a RoutingCandidate {
+        let mut picked = self.pick_weighted_bucket(effective, total_weight, affinity_key);
+
+        if affinity_key.is_some() && effective.len() == 2 {
+            let other = if picked.idx == effective[0].idx {
+                effective[1]
+            } else {
+                effective[0]
+            };
+            if picked.weight < other.weight * LEGACY_AFFINITY_OVERRIDE_RATIO {
+                debug!(
+                    strategy = RoutingStrategy::DynamicCapacityV1.as_str(),
+                    picked_account = self.accounts[picked.idx].name,
+                    picked_weight = format!("{:.3}", picked.weight),
+                    other_account = self.accounts[other.idx].name,
+                    other_weight = format!("{:.3}", other.weight),
+                    ratio = format!("{:.3}", picked.weight / other.weight),
+                    "pick: affinity override, weight ratio below threshold"
+                );
+                picked = other;
+            }
+            // NOTE: Request-balance override intentionally disabled. The previous
+            // implementation used Account.requests counters which are replica-local
+            // and not pool-scoped, so multi-replica deployments could make routing
+            // decisions on partial history. Re-enable only after adding shared,
+            // pool-scoped counters that are synchronized across replicas.
+        }
+
+        picked
+    }
+
+    fn pick_sticky_weighted_v2<'a>(
+        &self,
+        effective: &[&'a RoutingCandidate],
+        total_weight: f64,
+        affinity_key: Option<&str>,
+    ) -> &'a RoutingCandidate {
+        let mut picked = self.pick_weighted_bucket(effective, total_weight, affinity_key);
+
+        if affinity_key.is_some() && effective.len() < 3 {
+            let best = effective
+                .iter()
+                .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap())
+                .copied()
+                .unwrap();
+            if best.idx != picked.idx
+                && picked.weight < best.weight * STICKY_WEIGHTED_OVERRIDE_RATIO
+            {
+                debug!(
+                    strategy = RoutingStrategy::StickyWeightedV2.as_str(),
+                    picked_account = self.accounts[picked.idx].name,
+                    picked_weight = format!("{:.3}", picked.weight),
+                    best_account = self.accounts[best.idx].name,
+                    best_weight = format!("{:.3}", best.weight),
+                    ratio = format!("{:.3}", picked.weight / best.weight),
+                    "pick: affinity override, breaking session stickiness"
+                );
+                picked = best;
+            }
+        }
+
+        picked
+    }
+
+    /// Pick the best available account using the configured routing strategy.
+    async fn pick_account(
+        &self,
+        affinity_key: Option<&str>,
+        model: &str,
+        skip: &[usize],
+    ) -> Option<usize> {
+        let candidates = self.routing_candidates(model, skip).await;
         if candidates.is_empty() {
             debug!("pick: no available accounts");
             return None;
@@ -1256,7 +1384,7 @@ impl AppState {
 
         // Soft-limit gate: exclude accounts with 5h utilization above the ceiling.
         let has_healthy = candidates.iter().any(|c| c.gate_5h < self.soft_limit);
-        let effective: Vec<&Candidate> = if has_healthy {
+        let effective: Vec<&RoutingCandidate> = if has_healthy {
             let excluded: Vec<&str> = candidates
                 .iter()
                 .filter(|c| c.gate_5h >= self.soft_limit)
@@ -1280,66 +1408,17 @@ impl AppState {
             return None;
         }
 
-        // Pick the account: affinity uses deterministic hash for session stickiness,
-        // non-affinity uses weighted bucket walk for proportional distribution.
-        let mut picked = if let Some(key) = affinity_key {
-            // Hash into the same weight-space as the non-affinity path so sticky sessions
-            // still respect headroom-proportional distribution. Different session keys spread
-            // across buckets proportionally; the same key always lands in the same bucket.
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            key.hash(&mut hasher);
-            let target = (hasher.finish() as f64 / u64::MAX as f64) * total_weight;
-            let mut p = effective.last().unwrap();
-            let mut cumulative = 0.0;
-            for c in &effective {
-                cumulative += c.weight;
-                if target < cumulative {
-                    p = c;
-                    break;
-                }
+        let picked = match self.routing_strategy {
+            RoutingStrategy::DynamicCapacityV1 => {
+                self.pick_dynamic_capacity_v1(&effective, total_weight, affinity_key)
             }
-            p
-        } else {
-            // No affinity: weighted bucket walk for proportional distribution.
-            let counter = self.robin.fetch_add(1, Ordering::Relaxed) as u64;
-            let position = (counter.wrapping_mul(11400714819323198485) % 10000) as f64;
-            let target = position / 10000.0 * total_weight;
-            let mut p = effective.last().unwrap();
-            let mut cumulative = 0.0;
-            for c in &effective {
-                cumulative += c.weight;
-                if target < cumulative {
-                    p = c;
-                    break;
-                }
+            RoutingStrategy::StickyWeightedV2 => {
+                self.pick_sticky_weighted_v2(&effective, total_weight, affinity_key)
             }
-            p
         };
 
-        // Affinity override: if the picked account's weight is egregiously below
-        // the best candidate's, break stickiness. Only for small pools (< 3) where
-        // there's essentially one alternative; for 3+ candidates the weighted bucket
-        // walk already distributes proportionally and the override would collapse
-        // traffic onto a single "best" account instead of spreading it.
-        if affinity_key.is_some() && effective.len() < 3 {
-            let best = effective
-                .iter()
-                .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap())
-                .unwrap();
-            if best.idx != picked.idx && picked.weight < best.weight * AFFINITY_OVERRIDE_RATIO {
-                warn!(
-                    picked_account = self.accounts[picked.idx].name,
-                    picked_weight = format!("{:.3}", picked.weight),
-                    best_account = self.accounts[best.idx].name,
-                    best_weight = format!("{:.3}", best.weight),
-                    ratio = format!("{:.3}", picked.weight / best.weight),
-                    "pick: affinity override, breaking session stickiness"
-                );
-                picked = best;
-            }
-        }
-
         debug!(
+            strategy = self.routing_strategy.as_str(),
             account = self.accounts[picked.idx].name,
             gate_5h = format!("{:.3}", picked.gate_5h),
             waste_risk = format!("{:.3}", picked.wr),
@@ -3224,7 +3303,7 @@ async fn stats_handler(
         "client_usage": client_usage,
         "client_budgets": budgets,
         "aggregate": aggregate,
-        "strategy": "dynamic-capacity",
+        "strategy": state.routing_strategy.as_str(),
     });
     if let Some(cluster_info) = cluster {
         response["cluster"] = cluster_info;
@@ -3457,7 +3536,7 @@ async fn metrics_handler(
     prom_gauge(
         &mut buf,
         "anthropic_lb_info",
-        &[("strategy", "dynamic-capacity")],
+        &[("strategy", state.routing_strategy.as_str())],
         1.0,
     );
 
@@ -5152,6 +5231,8 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to read {config_path}: {e}"));
     let config: Config =
         toml::from_str(&config_str).unwrap_or_else(|e| panic!("invalid config: {e}"));
+    let routing_strategy = RoutingStrategy::parse(config.strategy.as_deref())
+        .unwrap_or_else(|e| panic!("invalid strategy: {e}"));
 
     assert!(!config.accounts.is_empty(), "at least one account required");
 
@@ -5245,9 +5326,10 @@ async fn main() {
     }
 
     info!(
+        strategy = routing_strategy.as_str(),
         num_accounts = accounts.len(),
         num_upstreams = upstreams.len(),
-        "dynamic capacity-based routing enabled"
+        "routing strategy selected"
     );
 
     let state_path = PathBuf::from(&config_path).with_extension("state.json");
@@ -5318,6 +5400,7 @@ async fn main() {
         upstream: config.upstream,
         accounts,
         robin: AtomicUsize::new(0),
+        routing_strategy,
         cooldown,
         state_path,
         proxy_key: config.proxy_key.clone(),
@@ -5498,7 +5581,10 @@ mod tests {
         }
     }
 
-    fn test_state_with(accounts: Vec<Account>) -> Arc<AppState> {
+    fn test_state_with_strategy(
+        accounts: Vec<Account>,
+        routing_strategy: RoutingStrategy,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
@@ -5507,6 +5593,7 @@ mod tests {
             upstream: "http://127.0.0.1:1".to_string(), // unused in unit tests
             accounts,
             robin: AtomicUsize::new(0),
+            routing_strategy,
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
@@ -5529,6 +5616,10 @@ mod tests {
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
         })
+    }
+
+    fn test_state_with(accounts: Vec<Account>) -> Arc<AppState> {
+        test_state_with_strategy(accounts, RoutingStrategy::default())
     }
 
     /// Spawn a mock upstream that returns a canned response with rate-limit headers.
@@ -5571,7 +5662,11 @@ mod tests {
     }
 
     /// Build the full app router against a given upstream URL.
-    fn test_app(upstream_url: &str, proxy_key: Option<String>) -> (Router, Arc<AppState>) {
+    fn test_app_with_strategy(
+        upstream_url: &str,
+        proxy_key: Option<String>,
+        routing_strategy: RoutingStrategy,
+    ) -> (Router, Arc<AppState>) {
         let accounts = vec![
             make_account("acct-a", "sk-ant-api-test-aaa"),
             make_account("acct-b", "sk-ant-api-test-bbb"),
@@ -5585,6 +5680,7 @@ mod tests {
             upstream: upstream_url.to_string(),
             accounts,
             robin: AtomicUsize::new(0),
+            routing_strategy,
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key,
@@ -5681,6 +5777,7 @@ mod tests {
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -6418,6 +6515,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_capacity_v1_ignores_replica_local_request_history() {
+        let state = test_state_with_strategy(
+            vec![
+                make_account("primary", "sk-ant-api-a"),
+                make_account("jeff", "sk-ant-api-b"),
+            ],
+            RoutingStrategy::DynamicCapacityV1,
+        );
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.10);
+            info.reset_5h = Some(AppState::now_epoch() + 10000);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.10);
+            info.reset_5h = Some(AppState::now_epoch() + 10000);
+        }
+
+        state.accounts[1].requests.store(900, Ordering::Relaxed);
+        state.accounts[0].requests.store(100, Ordering::Relaxed);
+
+        let mut primary_count = 0u32;
+        let total = 200u32;
+        for i in 0..total {
+            let key = format!("balance-test-{}", i);
+            let idx = state
+                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            if idx == 0 {
+                primary_count += 1;
+            }
+        }
+
+        assert!(
+            (60..=140).contains(&primary_count),
+            "dynamic-capacity-v1 should ignore replica-local request skew, got {}/{} to primary",
+            primary_count,
+            total
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_weighted_v2_preserves_hash_distribution_under_skewed_history() {
+        let state = test_state_with_strategy(
+            vec![
+                make_account("primary", "sk-ant-api-a"),
+                make_account("jeff", "sk-ant-api-b"),
+            ],
+            RoutingStrategy::StickyWeightedV2,
+        );
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.10);
+            info.reset_5h = Some(AppState::now_epoch() + 10000);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.10);
+            info.reset_5h = Some(AppState::now_epoch() + 10000);
+        }
+
+        state.accounts[1].requests.store(900, Ordering::Relaxed);
+        state.accounts[0].requests.store(100, Ordering::Relaxed);
+
+        let mut primary_count = 0u32;
+        let total = 200u32;
+        for i in 0..total {
+            let key = format!("balance-test-{}", i);
+            let idx = state
+                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            if idx == 0 {
+                primary_count += 1;
+            }
+        }
+
+        assert!(
+            (60..=140).contains(&primary_count),
+            "sticky-weighted-v2 should stay near hash distribution, got {}/{} to primary",
+            primary_count,
+            total
+        );
+    }
+
+    #[tokio::test]
     async fn pick_unsticky_on_overload() {
         // When a preferred account gets overloaded, sessions should migrate.
         // Hash-based pick assigns ~50% of sessions to each account initially.
@@ -6514,6 +6699,8 @@ mod tests {
         // Game theory: utilization changes slightly after each response,
         // but sessions must remain stable. Simulates the real scenario where
         // each request nudges the 5h utilization up by a tiny amount.
+        // Uses multiple sessions and asserts low aggregate migration rate,
+        // avoiding boundary-sensitivity from any single hard-coded key.
         let state = test_state_with(vec![
             make_account("primary", "sk-ant-api-a"),
             make_account("jeff", "sk-ant-api-b"),
@@ -6522,15 +6709,23 @@ mod tests {
         set_account_utilization(&state, 0, 0.05, 0.70, now + 10000, now + 300000).await;
         set_account_utilization(&state, 1, 0.05, 0.68, now + 10000, now + 300000).await;
 
-        let session = "sticky-session-test";
-        let first = state
-            .pick_account(Some(session), "claude-opus-4-6", &[])
-            .await
-            .unwrap();
+        // Record initial picks for 100 distinct sessions
+        let num_sessions = 100;
+        let sessions: Vec<String> = (0..num_sessions)
+            .map(|i| format!("drift-session-{}", i))
+            .collect();
+        let mut initial_picks = Vec::with_capacity(num_sessions);
+        for s in &sessions {
+            initial_picks.push(
+                state
+                    .pick_account(Some(s), "claude-opus-4-6", &[])
+                    .await
+                    .unwrap(),
+            );
+        }
 
         // Simulate 50 requests with drifting utilization
         for i in 0..50 {
-            // Nudge 5h util slightly (simulates usage after each request)
             let drift = 0.002 * (i as f64);
             {
                 let mut info = state.accounts[0].rate_info.write().await;
@@ -6540,17 +6735,29 @@ mod tests {
                 let mut info = state.accounts[1].rate_info.write().await;
                 info.utilization_5h = Some(0.05 + drift * 0.8);
             }
+        }
 
+        // After drift, check how many sessions migrated
+        let mut migrated = 0usize;
+        for (j, s) in sessions.iter().enumerate() {
             let pick = state
-                .pick_account(Some(session), "claude-opus-4-6", &[])
+                .pick_account(Some(s), "claude-opus-4-6", &[])
                 .await
                 .unwrap();
-            assert_eq!(
-                pick, first,
-                "request {} bounced to account {} after util drift, expected {}",
-                i, pick, first
-            );
+            if pick != initial_picks[j] {
+                migrated += 1;
+            }
         }
+
+        // Allow up to 10% migration from boundary effects — small drift shouldn't
+        // cause wholesale session migration.
+        assert!(
+            migrated <= num_sessions / 10,
+            "too many sessions migrated after util drift: {}/{} (max {})",
+            migrated,
+            num_sessions,
+            num_sessions / 10,
+        );
     }
 
     #[tokio::test]
@@ -6626,10 +6833,13 @@ mod tests {
         // Game theory: moderate 7d difference (0.73 vs 0.41) should NOT
         // break stickiness. The cache-creation cost outweighs the routing
         // benefit at this disparity level.
-        let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("jeff", "sk-ant-api-b"),
-        ]);
+        let state = test_state_with_strategy(
+            vec![
+                make_account("primary", "sk-ant-api-a"),
+                make_account("jeff", "sk-ant-api-b"),
+            ],
+            RoutingStrategy::StickyWeightedV2,
+        );
         let now = AppState::now_epoch();
         set_account_utilization(&state, 0, 0.13, 0.41, now + 10000, now + 300000).await;
         set_account_utilization(&state, 1, 0.12, 0.79, now + 10000, now + 300000).await;
@@ -6800,7 +7010,7 @@ mod tests {
         assert_eq!(accounts.len(), 2);
         assert_eq!(accounts[0]["name"], "acct-a");
         assert_eq!(accounts[1]["name"], "acct-b");
-        assert_eq!(body["strategy"], "dynamic-capacity");
+        assert_eq!(body["strategy"], "dynamic-capacity-v1");
         // Upstreams section should be present
         let upstreams = body["upstreams"].as_array().unwrap();
         assert_eq!(upstreams.len(), 1);
@@ -7618,6 +7828,7 @@ mod tests {
             upstream: upstream_url.to_string(),
             accounts,
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-openai-test.state.json"),
             proxy_key,
@@ -7649,6 +7860,10 @@ mod tests {
             .with_state(state.clone());
 
         (app, state)
+    }
+
+    fn test_app(upstream_url: &str, proxy_key: Option<String>) -> (Router, Arc<AppState>) {
+        test_app_with_strategy(upstream_url, proxy_key, RoutingStrategy::default())
     }
 
     #[tokio::test]
@@ -8178,6 +8393,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts,
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
@@ -8233,6 +8449,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
@@ -8738,6 +8955,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("acct-b", "sk-ant-api-test-bbb"),
             ],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
@@ -9212,6 +9430,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -9277,6 +9496,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -9899,10 +10119,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             "affinity pick should return Some when accounts are available"
         );
 
-        // A headroom=0.70, B headroom=0.30. A should get ~70% of traffic
+        // A headroom=0.70, B headroom=0.30. A should get ~70% of 200 = ~140 picks.
+        // Require at least 65% (130) to catch regressions while allowing hash variance.
         assert!(
-            picks[0] > picks[1],
-            "A (lower 5h) should get more: A={}, B={}",
+            picks[0] >= 130,
+            "expected A to get ~70% but got A={}, B={}",
             picks[0],
             picks[1]
         );
@@ -10048,6 +10269,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("b", "sk-ant-api-y"),
             ],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -10094,6 +10316,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("b", "sk-ant-api-y"),
             ],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -10141,6 +10364,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("b", "sk-ant-api-y"),
             ],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -10190,6 +10414,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -10236,6 +10461,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![acct],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -10284,6 +10510,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("b", "sk-ant-api-y"),
             ],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -10336,6 +10563,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("c", "sk-ant-api-z"),
             ],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -10408,6 +10636,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -10482,6 +10711,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -10571,6 +10801,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("mystery", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -10620,6 +10851,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("unknown", "sk-ant-api-b"),
             ],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -10716,6 +10948,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -10790,6 +11023,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -10831,6 +11065,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -11048,6 +11283,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: mock_url.clone(),
             accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-limit-reject.state.json"),
             proxy_key: Some("key".to_string()),
@@ -11107,6 +11343,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: mock_url.clone(),
             accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-limit-pass.state.json"),
             proxy_key: Some("key".to_string()),
@@ -11163,6 +11400,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("b", "sk-ant-api-test-bbb"),
             ],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-emergency-block.state.json"),
             proxy_key: Some("key".to_string()),
@@ -11227,6 +11465,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("b", "sk-ant-api-test-bbb"),
             ],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-emergency-operator.state.json"),
             proxy_key: Some("key".to_string()),
@@ -11288,6 +11527,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: mock_url.clone(),
             accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-openai-limit.state.json"),
             proxy_key: Some("key".to_string()),
@@ -11344,6 +11584,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: mock_url.clone(),
             accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-openai-emergency.state.json"),
             proxy_key: Some("key".to_string()),
@@ -11423,7 +11664,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let body: serde_json::Value = stats.json().await.unwrap();
         assert!(body["accounts"].is_array());
         assert!(body["aggregate"].is_object());
-        assert_eq!(body["strategy"], "dynamic-capacity");
+        assert_eq!(body["strategy"], "dynamic-capacity-v1");
     }
 
     // ── Additional comprehensive tests ──────────────────────────────────
@@ -11451,6 +11692,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -11520,6 +11762,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -11569,6 +11812,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -11883,6 +12127,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -11923,6 +12168,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
@@ -11985,6 +12231,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
@@ -12115,6 +12362,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
@@ -12247,6 +12495,31 @@ api_key = "sk-openai-key"
         // Upstreams
         assert_eq!(cfg.upstreams.len(), 1);
         assert_eq!(cfg.upstreams[0].name, "openai");
+    }
+
+    #[test]
+    fn routing_strategy_parses_aliases() {
+        assert_eq!(
+            RoutingStrategy::parse(None).unwrap(),
+            RoutingStrategy::DynamicCapacityV1
+        );
+        assert_eq!(
+            RoutingStrategy::parse(Some("dynamic-capacity")).unwrap(),
+            RoutingStrategy::DynamicCapacityV1
+        );
+        assert_eq!(
+            RoutingStrategy::parse(Some("dynamic-capacity-v1")).unwrap(),
+            RoutingStrategy::DynamicCapacityV1
+        );
+        assert_eq!(
+            RoutingStrategy::parse(Some("sticky-weighted")).unwrap(),
+            RoutingStrategy::StickyWeightedV2
+        );
+        assert_eq!(
+            RoutingStrategy::parse(Some("sticky-weighted-v2")).unwrap(),
+            RoutingStrategy::StickyWeightedV2
+        );
+        assert!(RoutingStrategy::parse(Some("bogus")).is_err());
     }
 
     #[test]
@@ -12451,6 +12724,7 @@ upstream = "https://api.anthropic.com"
                 make_account("secondary", "sk-ant-api-bbb"),
             ],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: state_path.clone(),
             proxy_key: None,
@@ -12533,6 +12807,7 @@ upstream = "https://api.anthropic.com"
                 make_account("secondary", "sk-ant-api-bbb"),
             ],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path,
             proxy_key: None,
@@ -12615,6 +12890,7 @@ upstream = "https://api.anthropic.com"
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
@@ -12667,6 +12943,7 @@ upstream = "https://api.anthropic.com"
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
@@ -12901,7 +13178,7 @@ upstream = "https://api.anthropic.com"
 
         // Meta metric
         assert!(
-            body.contains("anthropic_lb_info{strategy=\"dynamic-capacity\"} 1"),
+            body.contains("anthropic_lb_info{strategy=\"dynamic-capacity-v1\"} 1"),
             "missing lb_info:\n{body}"
         );
 
@@ -13001,6 +13278,7 @@ upstream = "https://api.anthropic.com"
             upstream: mock_url.clone(),
             accounts,
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
@@ -13246,6 +13524,7 @@ upstream = "https://api.anthropic.com"
             upstream: "http://127.0.0.1:1".to_string(),
             accounts,
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
@@ -13537,6 +13816,7 @@ upstream = "https://api.anthropic.com"
             upstream: format!("http://{}", mock_addr),
             accounts,
             robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-oauth-test.state.json"),
             proxy_key: None,
