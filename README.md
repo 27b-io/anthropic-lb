@@ -157,11 +157,15 @@ token = "sk-ant-api03-..."
 | `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
 | `client_utilization_limits` | `{name: f64}` | `{}` | Per-client utilization ceiling (0.0–1.0) |
 | `operators` | `Vec<String>` | `[]` | Client IDs that bypass all enforcement |
+| `strategy` | `String` | `dynamic-capacity-v1` | Routing strategy (see note below) |
 | `emergency_threshold` | `f64` | `0.88` | Utilization threshold for emergency brake |
 | `redis_url` | `String?` | `None` | Redis/Valkey URL for distributed state |
 | `accounts[].name` | `String` | — | Display name for the account |
 | `accounts[].token` | `String` | — | API key or `"passthrough"` |
 | `accounts[].models` | `[String]` | `[]` | Model allowlist (empty = all) |
+
+> [!NOTE]
+> **Strategy normalization**: Both `"dynamic-capacity"` and `"dynamic-capacity-v1"` are accepted in config, but the runtime normalizes to `"dynamic-capacity-v1"` in logs and `/_stats` output. Similarly, `"sticky-weighted"` normalizes to `"sticky-weighted-v2"`.
 
 ### Token Types
 
@@ -325,7 +329,7 @@ All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
       "alice": { "limit": 5000000, "used": 1915000 }
     }
   },
-  "strategy": "dynamic-capacity"
+  "strategy": "dynamic-capacity-v1"
 }
 ```
 
