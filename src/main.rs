@@ -5242,13 +5242,21 @@ async fn openai_chat_handler(
                             if translated.contains("[DONE]") {
                                 sent_done = true;
                             }
-                            let _ = tx.send(Ok(bytes::Bytes::from(translated))).await;
+                            if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
+                                client_gone = true;
+                            }
                         }
                     }
 
                     // Ensure [DONE] is always sent (fallback for abnormal stream termination)
-                    if !sent_done {
-                        let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
+                    if !sent_done
+                        && !client_gone
+                        && tx
+                            .send(Ok(bytes::Bytes::from("data: [DONE]\n\n")))
+                            .await
+                            .is_err()
+                    {
+                        client_gone = true;
                     }
 
                     // Extract and record token usage from accumulated SSE data
