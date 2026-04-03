@@ -5214,8 +5214,8 @@ async fn openai_chat_handler(
                 let session_clone = session_id.clone();
 
                 tokio::spawn(async move {
-                    let mut buffer = String::new();
-                    let mut raw_sse = String::new(); // accumulate for usage extraction
+                    let mut buffer: Vec<u8> = Vec::new();
+                    let mut raw_sse: Vec<u8> = Vec::new();
                     let mut ctx = StreamContext::default();
                     let mut sent_done = false;
 
@@ -5225,13 +5225,13 @@ async fn openai_chat_handler(
                     loop {
                         match resp.chunk().await {
                             Ok(Some(chunk)) => {
-                                let chunk_str = String::from_utf8_lossy(&chunk);
-                                buffer.push_str(&chunk_str);
-                                raw_sse.push_str(&chunk_str);
+                                buffer.extend_from_slice(&chunk);
+                                raw_sse.extend_from_slice(&chunk);
 
-                                while let Some(pos) = buffer.find("\n\n") {
-                                    let event = buffer[..pos].to_string();
-                                    buffer = buffer[pos + 2..].to_string();
+                                while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
+                                    let event =
+                                        String::from_utf8_lossy(&buffer[..pos]).into_owned();
+                                    buffer.drain(..pos + 2);
 
                                     if event.trim().is_empty() {
                                         continue;
@@ -5239,7 +5239,7 @@ async fn openai_chat_handler(
 
                                     if let Some(translated) = translate_sse_event(&event, &mut ctx)
                                     {
-                                        if translated.contains("[DONE]") {
+                                        if translated.trim() == "data: [DONE]" {
                                             sent_done = true;
                                         }
                                         if tx
@@ -5266,13 +5266,16 @@ async fn openai_chat_handler(
                     }
 
                     // Process any remaining data in buffer (skip if upstream errored)
-                    if !upstream_error && !buffer.trim().is_empty() {
-                        if let Some(translated) = translate_sse_event(&buffer, &mut ctx) {
-                            if translated.contains("[DONE]") {
-                                sent_done = true;
-                            }
-                            if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
-                                client_gone = true;
+                    if !upstream_error && !buffer.is_empty() {
+                        let remaining = String::from_utf8_lossy(&buffer).into_owned();
+                        if !remaining.trim().is_empty() {
+                            if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
+                                if translated.trim() == "data: [DONE]" {
+                                    sent_done = true;
+                                }
+                                if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
+                                    client_gone = true;
+                                }
                             }
                         }
                     }
@@ -5290,7 +5293,8 @@ async fn openai_chat_handler(
                     }
 
                     // Extract and record token usage from accumulated SSE data
-                    let usage = TokenUsage::from_sse_text(&raw_sse);
+                    let text = String::from_utf8_lossy(&raw_sse);
+                    let usage = TokenUsage::from_sse_text(&text);
                     let elapsed_ms = request_start.elapsed().as_millis() as u64;
                     if !usage.is_empty() {
                         state_clone
