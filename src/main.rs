@@ -2950,20 +2950,39 @@ async fn proxy_handler(
 
                 tokio::spawn(async move {
                     let mut sse_buf = Vec::new();
+                    let mut client_disconnected = false;
                     while let Ok(Some(chunk)) = resp.chunk().await {
                         sse_buf.extend_from_slice(&chunk);
                         if tx.send(Ok(chunk)).await.is_err() {
-                            break; // client disconnected
+                            client_disconnected = true;
+                            break;
                         }
                     }
                     // Parse accumulated SSE data for usage
                     let text = String::from_utf8_lossy(&sse_buf);
                     let usage = TokenUsage::from_sse_text(&text);
+                    let elapsed_ms = request_start.elapsed().as_millis() as u64;
                     if !usage.is_empty() {
                         state_clone
                             .record_usage(idx, &client_id_clone, &usage)
                             .await;
                         log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
+                    } else {
+                        let reason = if client_disconnected {
+                            "client_disconnect"
+                        } else {
+                            "no_usage_event"
+                        };
+                        info!(
+                            req_id,
+                            client_id = %client_id_clone,
+                            model = %model_clone,
+                            account = acct_name,
+                            reason,
+                            elapsed_ms,
+                            sse_bytes = sse_buf.len(),
+                            "stream_end_no_usage"
+                        );
                     }
                     state_clone.shadow_log(serde_json::json!({
                         "ts": AppState::now_epoch(),
@@ -2975,11 +2994,12 @@ async fn proxy_handler(
                         "account": acct_name,
                         "status": status.as_u16(),
                         "stream": true,
-                        "latency_ms": request_start.elapsed().as_millis() as u64,
+                        "latency_ms": elapsed_ms,
                         "input_tokens": usage.input_tokens,
                         "output_tokens": usage.output_tokens,
                         "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                         "cache_read_input_tokens": usage.cache_read_input_tokens,
+                        "client_disconnected": client_disconnected,
                     }));
                 });
 
@@ -5233,11 +5253,28 @@ async fn openai_chat_handler(
 
                     // Extract and record token usage from accumulated SSE data
                     let usage = TokenUsage::from_sse_text(&raw_sse);
+                    let elapsed_ms = request_start.elapsed().as_millis() as u64;
                     if !usage.is_empty() {
                         state_clone
                             .record_usage(idx, &client_id_clone, &usage)
                             .await;
                         log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
+                    } else {
+                        let reason = if client_gone {
+                            "client_disconnect"
+                        } else {
+                            "no_usage_event"
+                        };
+                        info!(
+                            req_id,
+                            client_id = %client_id_clone,
+                            model = %model_clone,
+                            account = acct_name,
+                            reason,
+                            elapsed_ms,
+                            sse_bytes = raw_sse.len(),
+                            "stream_end_no_usage"
+                        );
                     }
                     state_clone.shadow_log(serde_json::json!({
                         "ts": AppState::now_epoch(),
@@ -5250,11 +5287,12 @@ async fn openai_chat_handler(
                         "status": status.as_u16(),
                         "stream": true,
                         "openai_compat": true,
-                        "latency_ms": request_start.elapsed().as_millis() as u64,
+                        "latency_ms": elapsed_ms,
                         "input_tokens": usage.input_tokens,
                         "output_tokens": usage.output_tokens,
                         "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                         "cache_read_input_tokens": usage.cache_read_input_tokens,
+                        "client_disconnected": client_gone,
                     }));
                 });
 
