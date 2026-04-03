@@ -2950,20 +2950,52 @@ async fn proxy_handler(
 
                 tokio::spawn(async move {
                     let mut sse_buf = Vec::new();
-                    while let Ok(Some(chunk)) = resp.chunk().await {
-                        sse_buf.extend_from_slice(&chunk);
-                        if tx.send(Ok(chunk)).await.is_err() {
-                            break; // client disconnected
+                    let mut client_disconnected = false;
+                    let mut upstream_error = false;
+                    loop {
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                sse_buf.extend_from_slice(&chunk);
+                                if tx.send(Ok(chunk)).await.is_err() {
+                                    client_disconnected = true;
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                upstream_error = true;
+                                warn!(req_id, error = %e, "upstream SSE read failed");
+                                break;
+                            }
                         }
                     }
                     // Parse accumulated SSE data for usage
                     let text = String::from_utf8_lossy(&sse_buf);
                     let usage = TokenUsage::from_sse_text(&text);
+                    let elapsed_ms = request_start.elapsed().as_millis() as u64;
                     if !usage.is_empty() {
                         state_clone
                             .record_usage(idx, &client_id_clone, &usage)
                             .await;
                         log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
+                    } else {
+                        let reason = if upstream_error {
+                            "upstream_error"
+                        } else if client_disconnected {
+                            "client_disconnect"
+                        } else {
+                            "no_usage_event"
+                        };
+                        info!(
+                            req_id,
+                            client_id = %client_id_clone,
+                            model = %model_clone,
+                            account = acct_name,
+                            reason,
+                            elapsed_ms,
+                            sse_bytes = sse_buf.len(),
+                            "stream_end_no_usage"
+                        );
                     }
                     state_clone.shadow_log(serde_json::json!({
                         "ts": AppState::now_epoch(),
@@ -2975,11 +3007,12 @@ async fn proxy_handler(
                         "account": acct_name,
                         "status": status.as_u16(),
                         "stream": true,
-                        "latency_ms": request_start.elapsed().as_millis() as u64,
+                        "latency_ms": elapsed_ms,
                         "input_tokens": usage.input_tokens,
                         "output_tokens": usage.output_tokens,
                         "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                         "cache_read_input_tokens": usage.cache_read_input_tokens,
+                        "client_disconnected": client_disconnected,
                     }));
                 });
 
@@ -5181,63 +5214,111 @@ async fn openai_chat_handler(
                 let session_clone = session_id.clone();
 
                 tokio::spawn(async move {
-                    let mut buffer = String::new();
-                    let mut raw_sse = String::new(); // accumulate for usage extraction
+                    let mut buffer: Vec<u8> = Vec::new();
+                    let mut raw_sse: Vec<u8> = Vec::new();
                     let mut ctx = StreamContext::default();
                     let mut sent_done = false;
 
                     let mut client_gone = false;
+                    let mut upstream_error = false;
 
-                    while let Ok(Some(chunk)) = resp.chunk().await {
-                        let chunk_str = String::from_utf8_lossy(&chunk);
-                        buffer.push_str(&chunk_str);
-                        raw_sse.push_str(&chunk_str);
+                    loop {
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                buffer.extend_from_slice(&chunk);
+                                raw_sse.extend_from_slice(&chunk);
 
-                        while let Some(pos) = buffer.find("\n\n") {
-                            let event = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
+                                while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
+                                    let event =
+                                        String::from_utf8_lossy(&buffer[..pos]).into_owned();
+                                    buffer.drain(..pos + 2);
 
-                            if event.trim().is_empty() {
-                                continue;
+                                    if event.trim().is_empty() {
+                                        continue;
+                                    }
+
+                                    if let Some(translated) = translate_sse_event(&event, &mut ctx)
+                                    {
+                                        if translated.trim() == "data: [DONE]" {
+                                            sent_done = true;
+                                        }
+                                        if tx
+                                            .send(Ok(bytes::Bytes::from(translated)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            client_gone = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if client_gone {
+                                    break;
+                                }
                             }
+                            Ok(None) => break,
+                            Err(e) => {
+                                upstream_error = true;
+                                warn!(req_id, error = %e, "upstream SSE read failed");
+                                break;
+                            }
+                        }
+                    }
 
-                            if let Some(translated) = translate_sse_event(&event, &mut ctx) {
-                                if translated.contains("[DONE]") {
+                    // Process any remaining data in buffer (skip if upstream errored)
+                    if !upstream_error && !buffer.is_empty() {
+                        let remaining = String::from_utf8_lossy(&buffer).into_owned();
+                        if !remaining.trim().is_empty() {
+                            if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
+                                if translated.trim() == "data: [DONE]" {
                                     sent_done = true;
                                 }
                                 if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
                                     client_gone = true;
-                                    break; // break inner loop
                                 }
                             }
                         }
-                        if client_gone {
-                            break; // break outer loop — fall through to usage accounting
-                        }
                     }
 
-                    // Process any remaining data in buffer
-                    if !buffer.trim().is_empty() {
-                        if let Some(translated) = translate_sse_event(&buffer, &mut ctx) {
-                            if translated.contains("[DONE]") {
-                                sent_done = true;
-                            }
-                            let _ = tx.send(Ok(bytes::Bytes::from(translated))).await;
-                        }
-                    }
-
-                    // Ensure [DONE] is always sent (fallback for abnormal stream termination)
-                    if !sent_done {
-                        let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
+                    // Ensure [DONE] is always sent (skip on upstream error — would fake clean completion)
+                    if !sent_done
+                        && !client_gone
+                        && !upstream_error
+                        && tx
+                            .send(Ok(bytes::Bytes::from("data: [DONE]\n\n")))
+                            .await
+                            .is_err()
+                    {
+                        client_gone = true;
                     }
 
                     // Extract and record token usage from accumulated SSE data
-                    let usage = TokenUsage::from_sse_text(&raw_sse);
+                    let text = String::from_utf8_lossy(&raw_sse);
+                    let usage = TokenUsage::from_sse_text(&text);
+                    let elapsed_ms = request_start.elapsed().as_millis() as u64;
                     if !usage.is_empty() {
                         state_clone
                             .record_usage(idx, &client_id_clone, &usage)
                             .await;
                         log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
+                    } else {
+                        let reason = if upstream_error {
+                            "upstream_error"
+                        } else if client_gone {
+                            "client_disconnect"
+                        } else {
+                            "no_usage_event"
+                        };
+                        info!(
+                            req_id,
+                            client_id = %client_id_clone,
+                            model = %model_clone,
+                            account = acct_name,
+                            reason,
+                            elapsed_ms,
+                            sse_bytes = raw_sse.len(),
+                            "stream_end_no_usage"
+                        );
                     }
                     state_clone.shadow_log(serde_json::json!({
                         "ts": AppState::now_epoch(),
@@ -5250,11 +5331,12 @@ async fn openai_chat_handler(
                         "status": status.as_u16(),
                         "stream": true,
                         "openai_compat": true,
-                        "latency_ms": request_start.elapsed().as_millis() as u64,
+                        "latency_ms": elapsed_ms,
                         "input_tokens": usage.input_tokens,
                         "output_tokens": usage.output_tokens,
                         "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                         "cache_read_input_tokens": usage.cache_read_input_tokens,
+                        "client_disconnected": client_gone,
                     }));
                 });
 
