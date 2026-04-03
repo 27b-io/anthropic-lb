@@ -14380,4 +14380,21 @@ upstream = "https://api.anthropic.com"
         assert_eq!(body["error"]["message"], "upstream timeout");
         assert_eq!(body["error"]["type"], "api_error");
     }
+
+    #[test]
+    fn reqwest_headers_preserves_multi_value() {
+        let mut src = axum::http::HeaderMap::new();
+        src.append("x-custom", axum::http::HeaderValue::from_static("first"));
+        src.append("x-custom", axum::http::HeaderValue::from_static("second"));
+
+        let out = reqwest_headers(&src);
+        let values: Vec<&str> = out
+            .get_all("x-custom")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(values.len(), 2, "multi-value header should have 2 entries");
+        assert!(values.contains(&"first"));
+        assert!(values.contains(&"second"));
+    }
 }
