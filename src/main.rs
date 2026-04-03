@@ -57,7 +57,8 @@ struct Config {
     #[serde(default)]
     client_utilization_limits: HashMap<String, f64>,
     /// Client IDs that bypass all budget/ceiling/emergency checks.
-    /// Must be resolvable via client_names IP mapping (not spoofable via header).
+    /// NOTE: operator identity is trust-based (all users are trusted). The x-client-id
+    /// header is not verified against client_names IP mapping.
     #[serde(default)]
     operators: Vec<String>,
     /// Enable the emergency brake. Default: true.
@@ -125,9 +126,16 @@ impl RoutingStrategy {
 /// alongside general windows ("seven_day"). Each gets its own entry.
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct ClaimWindowData {
-    utilization: f64,
+    /// None = no utilization data received yet (reset/status-only placeholder).
+    /// Consumers must treat None as "unknown", not "healthy at 0%".
+    utilization: Option<f64>,
     reset: Option<u64>,
     status: Option<String>,
+    /// Epoch seconds when this entry was last updated. Used to age out entries
+    /// that never received a reset timestamp (aligns runtime eviction with
+    /// load_state behavior which drops reset-less entries).
+    #[serde(default)]
+    last_seen: u64,
 }
 
 /// Subset of RateLimitInfo for cross-replica sync via Redis.
@@ -414,7 +422,9 @@ struct AppState {
     /// Per-client token usage: client_id → [input, output, cache_creation, cache_read]
     client_usage: Mutex<HashMap<String, [u64; 4]>>,
     /// Shadow log sender (fire-and-forget JSONL appends). None = disabled.
-    shadow_log_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    shadow_log_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// Count of shadow log entries dropped due to channel backpressure.
+    shadow_log_dropped: AtomicU64,
     /// Per-client daily token budgets: client_id → max tokens per day.
     client_budgets: HashMap<String, u64>,
     /// Budget tracking: client_id → (epoch_day, tokens_used). Resets on new day.
@@ -815,9 +825,10 @@ impl AppState {
                     info.claims_7d.insert(
                         key,
                         ClaimWindowData {
-                            utilization: util_7d,
+                            utilization: Some(util_7d),
                             reset: pa.reset_7d,
                             status: pa.status_7d.clone(),
+                            ..Default::default()
                         },
                     );
                 }
@@ -835,7 +846,7 @@ impl AppState {
                     info.utilization_7d = info
                         .claims_7d
                         .values()
-                        .map(|c| c.utilization)
+                        .filter_map(|c| c.utilization)
                         .reduce(f64::max);
                     info.reset_7d = info.claims_7d.values().filter_map(|c| c.reset).min();
                     info.status_7d = info
@@ -851,15 +862,18 @@ impl AppState {
                 }
 
                 // Invalidate stale 5h data
-                let stale_5h = info.reset_5h.is_none_or(|r| r <= now_epoch);
-                if stale_5h {
+                if info.reset_5h.is_none_or(|r| r <= now_epoch) {
                     info.utilization_5h = None;
                     info.reset_5h = None;
                     info.status_5h = None;
                 }
-                if stale_5h && info.claims_7d.is_empty() {
-                    info.utilization = None;
+
+                // Recompute unified utilization from surviving windows
+                let mut max_util: Option<f64> = info.utilization_5h;
+                if let Some(u7) = info.utilization_7d {
+                    max_util = Some(max_util.map_or(u7, |cur| cur.max(u7)));
                 }
+                info.utilization = max_util;
 
                 info.remaining_requests = pa.remaining_requests;
                 info.remaining_tokens = pa.remaining_tokens;
@@ -993,7 +1007,11 @@ const WASTE_RISK_MIN_REMAINING: u64 = 60;
 /// Compute waste risk: how much quota will be wasted if we don't route here.
 /// Higher = more urgency to use this account's remaining 7d budget.
 /// Returns 0.0 when reset data is unavailable or stale.
-fn waste_risk(util: f64, reset_epoch: Option<u64>, now_epoch: u64) -> f64 {
+fn waste_risk(util: Option<f64>, reset_epoch: Option<u64>, now_epoch: u64) -> f64 {
+    let util = match util {
+        Some(u) => u,
+        None => return 0.0, // No utilization data — can't compute waste risk
+    };
     let reset = match reset_epoch {
         Some(r) if r > now_epoch + WASTE_RISK_MIN_REMAINING => r,
         _ => return 0.0,
@@ -1104,7 +1122,7 @@ fn effective_utilization(
         if !model.is_empty() {
             resolve_7d_claim(info, model).and_then(|c| {
                 time_adjusted_utilization(
-                    Some(c.utilization),
+                    c.utilization,
                     c.reset,
                     c.status.as_deref(),
                     NEAR_RESET_7D_SECS,
@@ -1117,7 +1135,7 @@ fn effective_utilization(
                 .values()
                 .filter_map(|c| {
                     time_adjusted_utilization(
-                        Some(c.utilization),
+                        c.utilization,
                         c.reset,
                         c.status.as_deref(),
                         NEAR_RESET_7D_SECS,
@@ -1517,6 +1535,7 @@ impl AppState {
 
         // Capture 5h utilization (flat — no per-model sub-budgets observed for 5h).
         // Track whether we got utilization for sticky status fix (Bug #1).
+        let now_epoch = Self::now_epoch();
         let got_5h_util = if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-utilization")
         {
             if let Ok(s) = v.to_str() {
@@ -1535,7 +1554,8 @@ impl AppState {
             if let Ok(s) = v.to_str() {
                 if let Ok(util) = s.parse::<f64>() {
                     let entry = info.claims_7d.entry(claim_key_7d.to_string()).or_default();
-                    entry.utilization = util.clamp(0.0, 1.0);
+                    entry.utilization = Some(util.clamp(0.0, 1.0));
+                    entry.last_seen = now_epoch;
                     true
                 } else {
                     false
@@ -1549,7 +1569,6 @@ impl AppState {
 
         // Capture per-window reset timestamps (epoch seconds).
         // Sanity-capped: 5h window can't reset >5h out, 7d can't reset >7d out (Bug #6).
-        let now_epoch = Self::now_epoch();
         if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-reset") {
             if let Ok(s) = v.to_str() {
                 if let Ok(epoch) = s.parse::<u64>() {
@@ -1559,13 +1578,16 @@ impl AppState {
                 }
             }
         }
-        // 7d reset → store in claims_7d[claim_key]
+        // 7d reset → only update existing claims_7d entries. Creating a placeholder
+        // with utilization=None would shadow real fallback entries in resolve_7d_claim
+        // (model-specific key takes priority over "seven_day" via or_else).
         if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-reset") {
             if let Ok(s) = v.to_str() {
                 if let Ok(epoch) = s.parse::<u64>() {
                     if epoch <= now_epoch + 604800 {
                         if let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
                             entry.reset = Some(epoch);
+                            entry.last_seen = now_epoch;
                         }
                     }
                 }
@@ -1583,11 +1605,12 @@ impl AppState {
         } else if got_5h_util {
             info.status_5h = None;
         }
-        // 7d status → store in claims_7d[claim_key]
+        // 7d status → only update existing claims_7d entries (same shadowing concern).
         if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-status") {
             if let Ok(s) = v.to_str() {
                 if let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
                     entry.status = Some(s.to_string());
+                    entry.last_seen = now_epoch;
                 }
             }
         } else if got_7d_util {
@@ -1597,15 +1620,30 @@ impl AppState {
             }
         }
 
+        // Evict stale claims: expired resets (reset <= now) or reset-less entries
+        // not seen in >24h. This aligns with load_state() which drops all reset-less
+        // entries on boot — the 24h grace period covers the normal case where
+        // utilization arrives before reset in the same response cycle.
+        const CLAIMS_STALE_SECS: u64 = 86400;
+        info.claims_7d.retain(|_, c| {
+            if let Some(r) = c.reset {
+                r > now_epoch
+            } else {
+                // No reset — keep only if recently seen
+                c.last_seen > 0 && now_epoch.saturating_sub(c.last_seen) < CLAIMS_STALE_SECS
+            }
+        });
+
         // Derive flat convenience fields from claims_7d (backward compat for logs/stats).
         // utilization_7d = max utilization, reset_7d = min reset, status_7d = worst status.
+        // When claims_7d is empty (all evicted or never populated), clear the flat fields
+        // so effective_utilization() doesn't fall back to stale derived values.
         if !info.claims_7d.is_empty() {
-            info.utilization_7d = Some(
-                info.claims_7d
-                    .values()
-                    .map(|c| c.utilization)
-                    .fold(0.0_f64, f64::max),
-            );
+            info.utilization_7d = info
+                .claims_7d
+                .values()
+                .filter_map(|c| c.utilization)
+                .reduce(f64::max);
             info.reset_7d = info.claims_7d.values().filter_map(|c| c.reset).min();
             info.status_7d = info
                 .claims_7d
@@ -1617,16 +1655,25 @@ impl AppState {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .map(|s| s.to_string());
+        } else {
+            info.utilization_7d = None;
+            info.reset_7d = None;
+            info.status_7d = None;
         }
 
         // Derive unified utilization = max across all windows (5h + all 7d claims).
-        let mut max_util: Option<f64> = info.utilization_5h;
+        // Recompute unconditionally so stale unified values don't survive eviction.
+        // Include 5h if reset is absent (no staleness info) or in the future;
+        // exclude only when reset is present AND expired (stale data).
+        let mut max_util: Option<f64> = info
+            .utilization_5h
+            .filter(|_| info.reset_5h.is_none_or(|r| r > now_epoch));
         for cd in info.claims_7d.values() {
-            max_util = Some(max_util.map_or(cd.utilization, |cur| cur.max(cd.utilization)));
+            if let Some(u) = cd.utilization {
+                max_util = Some(max_util.map_or(u, |cur| cur.max(u)));
+            }
         }
-        if max_util.is_some() {
-            info.utilization = max_util;
-        }
+        info.utilization = max_util;
 
         // Legacy headers (still try them)
         let mut got_legacy = false;
@@ -2100,7 +2147,10 @@ impl AppState {
 
         // Per-client tracking
         if client_id != "-" {
-            let total = usage.input_tokens + usage.output_tokens;
+            let total = usage.input_tokens
+                + usage.output_tokens
+                + usage.cache_creation_input_tokens
+                + usage.cache_read_input_tokens;
             if let Ok(mut map) = self.client_usage.lock() {
                 let entry = map.entry(client_id.to_string()).or_insert([0; 4]);
                 entry[0] += usage.input_tokens;
@@ -2117,7 +2167,16 @@ impl AppState {
     fn shadow_log(&self, entry: serde_json::Value) {
         if let Some(ref tx) = self.shadow_log_tx {
             if let Ok(line) = serde_json::to_string(&entry) {
-                let _ = tx.send(line);
+                if tx.try_send(line).is_err() {
+                    let dropped = self.shadow_log_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                    // Rate-limit warning: log at powers of 2 to avoid log spam
+                    if dropped.is_power_of_two() {
+                        warn!(
+                            total_dropped = dropped,
+                            "shadow log channel full, entries being dropped"
+                        );
+                    }
+                }
             }
         }
     }
@@ -3459,7 +3518,7 @@ async fn metrics_handler(
         hard_limited_secs: f64,
         projected_throttle_secs: Option<f64>,
         token_usage: [u64; 4],
-        claims: Vec<(String, f64, f64)>,
+        claims: Vec<(String, Option<f64>, f64)>,
     }
 
     let mut snaps: Vec<AcctSnap> = Vec::with_capacity(state.accounts.len());
@@ -3504,7 +3563,7 @@ async fn metrics_handler(
             })
         };
 
-        let claims: Vec<(String, f64, f64)> = info
+        let claims: Vec<(String, Option<f64>, f64)> = info
             .claims_7d
             .iter()
             .map(|(k, d)| {
@@ -3835,12 +3894,14 @@ async fn metrics_handler(
     );
     for s in &snaps {
         for (claim_key, util, _) in &s.claims {
-            prom_gauge(
-                &mut buf,
-                "anthropic_claim_utilization",
-                &[("account", &s.name), ("claim", claim_key)],
-                *util,
-            );
+            if let Some(u) = util {
+                prom_gauge(
+                    &mut buf,
+                    "anthropic_claim_utilization",
+                    &[("account", &s.name), ("claim", claim_key)],
+                    *u,
+                );
+            }
         }
     }
     prom_header(
@@ -4160,6 +4221,21 @@ async fn metrics_handler(
             }
         }
     }
+
+    // Shadow log dropped entries counter (always exported for baseline visibility)
+    let dropped = state.shadow_log_dropped.load(Ordering::Relaxed);
+    prom_header(
+        &mut buf,
+        "anthropic_shadow_log_dropped_total",
+        "counter",
+        "Shadow log entries dropped due to channel backpressure",
+    );
+    prom_gauge(
+        &mut buf,
+        "anthropic_shadow_log_dropped_total",
+        &[],
+        dropped as f64,
+    );
 
     (
         StatusCode::OK,
@@ -4707,10 +4783,23 @@ async fn openai_chat_handler(
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
 
-    // Proxy auth
+    // Proxy auth: accept if either x-api-key or Authorization: Bearer matches
     if let Some(ref key) = state.proxy_key {
-        let provided = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-        if provided != Some(key.as_str()) {
+        let from_header = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
+        let from_bearer = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| {
+                // RFC 7235: auth scheme is case-insensitive
+                if v.len() >= 7 && v[..7].eq_ignore_ascii_case("bearer ") {
+                    Some(&v[7..])
+                } else {
+                    None
+                }
+            });
+        let authorized = from_header == Some(key.as_str()) || from_bearer == Some(key.as_str());
+        if !authorized {
             warn!(client = %client_ip, "rejected: invalid or missing proxy key");
             return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
@@ -5249,7 +5338,7 @@ fn reqwest_headers(headers: &axum::http::HeaderMap) -> reqwest::header::HeaderMa
     for (k, v) in headers.iter() {
         if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_str().as_bytes()) {
             if let Ok(val) = reqwest::header::HeaderValue::from_bytes(v.as_bytes()) {
-                out.insert(name, val);
+                out.append(name, val);
             }
         }
     }
@@ -5379,7 +5468,7 @@ async fn main() {
 
     // Set up shadow log writer if configured
     let shadow_log_tx = if let Some(ref path) = config.shadow_log {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(10_000);
         let log_path = PathBuf::from(path);
         info!(path = %log_path.display(), "shadow log enabled");
         tokio::spawn(async move {
@@ -5453,6 +5542,7 @@ async fn main() {
         auto_cache: config.auto_cache.unwrap_or(true),
         client_usage: Mutex::new(HashMap::new()),
         shadow_log_tx,
+        shadow_log_dropped: AtomicU64::new(0),
         client_budgets: config.client_budgets.clone(),
         budget_usage: Mutex::new(HashMap::new()),
         client_utilization_limits: config.client_utilization_limits.clone(),
@@ -5646,6 +5736,7 @@ mod tests {
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -5701,6 +5792,17 @@ mod tests {
             "anthropic-ratelimit-unified-5h-utilization",
             HeaderValue::from_static("0.25"),
         );
+        // Valid reset 1h in the future so unified derivation includes 5h
+        let reset_epoch = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600)
+            .to_string();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            HeaderValue::from_str(&reset_epoch).unwrap(),
+        );
         resp
     }
 
@@ -5738,6 +5840,7 @@ mod tests {
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -5830,6 +5933,7 @@ mod tests {
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -5995,9 +6099,10 @@ mod tests {
             info.claims_7d.insert(
                 "seven_day_sonnet".to_string(),
                 ClaimWindowData {
-                    utilization: 1.0,
+                    utilization: Some(1.0),
                     reset: Some(now_epoch + 100000),
                     status: Some("rejected".to_string()),
+                    ..Default::default()
                 },
             );
         }
@@ -6032,9 +6137,10 @@ mod tests {
             info.claims_7d.insert(
                 "seven_day_sonnet".to_string(),
                 ClaimWindowData {
-                    utilization: 1.0,
+                    utilization: Some(1.0),
                     reset: Some(now_epoch + 100000),
                     status: Some("rejected".to_string()),
+                    ..Default::default()
                 },
             );
         }
@@ -6324,9 +6430,10 @@ mod tests {
             info.claims_7d.insert(
                 "seven_day".to_string(),
                 ClaimWindowData {
-                    utilization: 0.30,
+                    utilization: Some(0.30),
                     reset: Some(now_epoch + 300000),
                     status: None,
+                    ..Default::default()
                 },
             );
         }
@@ -6337,9 +6444,10 @@ mod tests {
             info.claims_7d.insert(
                 "seven_day".to_string(),
                 ClaimWindowData {
-                    utilization: 0.85,
+                    utilization: Some(0.85),
                     reset: Some(now_epoch + 300000),
                     status: None,
+                    ..Default::default()
                 },
             );
         }
@@ -7884,6 +7992,7 @@ mod tests {
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -8069,6 +8178,115 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn openai_chat_accepts_bearer_capitalized() {
+        let mock_app = Router::new().fallback(any(mock_anthropic_handler));
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let mock_url = format!("http://{}", mock_addr);
+        let (app, _state) = test_openai_app(&mock_url, Some("secret-key".to_string()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret-key")
+            .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn openai_chat_accepts_bearer_lowercase() {
+        let mock_app = Router::new().fallback(any(mock_anthropic_handler));
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let mock_url = format!("http://{}", mock_addr);
+        let (app, _state) = test_openai_app(&mock_url, Some("secret-key".to_string()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .header("authorization", "bearer secret-key")
+            .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn openai_chat_wrong_apikey_valid_bearer() {
+        let mock_app = Router::new().fallback(any(mock_anthropic_handler));
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let mock_url = format!("http://{}", mock_addr);
+        let (app, _state) = test_openai_app(&mock_url, Some("secret-key".to_string()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "wrong-key")
+            .header("authorization", "Bearer secret-key")
+            .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
     }
 
     // ── Unit: auto-cache injection ─────────────────────────────────
@@ -8449,6 +8667,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -8505,6 +8724,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: budgets,
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -9011,6 +9231,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -9080,6 +9301,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -9102,9 +9324,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             info.claims_7d.insert(
                 "seven_day_opus".to_string(),
                 ClaimWindowData {
-                    utilization: 0.20,
+                    utilization: Some(0.20),
                     reset: Some(now_epoch + 86400),
                     status: Some("throttled".to_string()),
+                    ..Default::default()
                 },
             );
         }
@@ -9390,7 +9613,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn waste_risk_normal() {
         let now = 1_000_000u64;
         let reset = now + 302400; // 3.5 days remaining (half of 7d)
-        let wr = waste_risk(0.40, Some(reset), now);
+        let wr = waste_risk(Some(0.40), Some(reset), now);
         // unused=0.60, remaining_fraction=302400/604800=0.5, wr=0.60/0.5=1.2
         assert!((wr - 1.2).abs() < 0.01, "expected ~1.2, got {wr}");
     }
@@ -9398,27 +9621,27 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn waste_risk_stale_reset() {
         let now = 1_000_000u64;
-        let wr = waste_risk(0.40, Some(now - 100), now);
+        let wr = waste_risk(Some(0.40), Some(now - 100), now);
         assert_eq!(wr, 0.0, "stale reset should return 0");
     }
 
     #[test]
     fn waste_risk_no_reset() {
-        let wr = waste_risk(0.40, None, 1_000_000);
+        let wr = waste_risk(Some(0.40), None, 1_000_000);
         assert_eq!(wr, 0.0, "no reset should return 0");
     }
 
     #[test]
     fn waste_risk_under_60s_remaining() {
         let now = 1_000_000u64;
-        let wr = waste_risk(0.40, Some(now + 30), now);
+        let wr = waste_risk(Some(0.40), Some(now + 30), now);
         assert_eq!(wr, 0.0, "<60s remaining should return 0");
     }
 
     #[test]
     fn waste_risk_fully_utilized() {
         let now = 1_000_000u64;
-        let wr = waste_risk(1.0, Some(now + 302400), now);
+        let wr = waste_risk(Some(1.0), Some(now + 302400), now);
         assert_eq!(wr, 0.0, "fully utilized should return 0");
     }
 
@@ -9426,7 +9649,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn waste_risk_near_reset_urgency() {
         let now = 1_000_000u64;
         // 2 hours remaining, 50% unused — very urgent
-        let wr = waste_risk(0.50, Some(now + 7200), now);
+        let wr = waste_risk(Some(0.50), Some(now + 7200), now);
         // unused=0.50, remaining_fraction=7200/604800=0.0119, wr=0.50/0.0119=42→clamped to 10
         assert_eq!(wr, 10.0, "near-reset high-unused should clamp to 10");
     }
@@ -9435,7 +9658,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn waste_risk_clamped() {
         let now = 1_000_000u64;
         // 1 hour remaining, 90% unused
-        let wr = waste_risk(0.10, Some(now + 3600), now);
+        let wr = waste_risk(Some(0.10), Some(now + 3600), now);
         // unused=0.90, remaining_fraction=3600/604800≈0.00595, wr≈151→clamped to 10
         assert_eq!(wr, 10.0, "should clamp to 10.0");
     }
@@ -9444,16 +9667,16 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn waste_risk_boundary_at_60s() {
         let now = 1_000_000u64;
         // Exactly 60s remaining — guard is > 60, so should return 0
-        assert_eq!(waste_risk(0.40, Some(now + 60), now), 0.0);
+        assert_eq!(waste_risk(Some(0.40), Some(now + 60), now), 0.0);
         // 61s remaining — just above boundary, should return non-zero
-        assert!(waste_risk(0.40, Some(now + 61), now) > 0.0);
+        assert!(waste_risk(Some(0.40), Some(now + 61), now) > 0.0);
     }
 
     #[test]
     fn waste_risk_util_above_one() {
         let now = 1_000_000u64;
         // API can return util > 1.0; unused should clamp to 0
-        let wr = waste_risk(1.05, Some(now + 302400), now);
+        let wr = waste_risk(Some(1.05), Some(now + 302400), now);
         assert_eq!(wr, 0.0, "util > 1.0 should produce zero waste risk");
     }
 
@@ -9465,17 +9688,19 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims.insert(
             "seven_day_sonnet".to_string(),
             ClaimWindowData {
-                utilization: 0.80,
+                utilization: Some(0.80),
                 reset: Some(1000000),
                 status: None,
+                ..Default::default()
             },
         );
         claims.insert(
             "seven_day".to_string(),
             ClaimWindowData {
-                utilization: 0.50,
+                utilization: Some(0.50),
                 reset: Some(1000000),
                 status: None,
+                ..Default::default()
             },
         );
         let info = RateLimitInfo {
@@ -9484,7 +9709,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         };
         let claim = resolve_7d_claim(&info, "claude-sonnet-4-6").unwrap();
         assert!(
-            (claim.utilization - 0.80).abs() < 0.001,
+            (claim.utilization.unwrap() - 0.80).abs() < 0.001,
             "should pick model-specific claim"
         );
     }
@@ -9495,9 +9720,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims.insert(
             "seven_day".to_string(),
             ClaimWindowData {
-                utilization: 0.50,
+                utilization: Some(0.50),
                 reset: Some(1000000),
                 status: None,
+                ..Default::default()
             },
         );
         let info = RateLimitInfo {
@@ -9506,7 +9732,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         };
         let claim = resolve_7d_claim(&info, "claude-sonnet-4-6").unwrap();
         assert!(
-            (claim.utilization - 0.50).abs() < 0.001,
+            (claim.utilization.unwrap() - 0.50).abs() < 0.001,
             "should fall back to general"
         );
     }
@@ -9523,9 +9749,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims.insert(
             "seven_day".to_string(),
             ClaimWindowData {
-                utilization: 0.50,
+                utilization: Some(0.50),
                 reset: Some(1000000),
                 status: None,
+                ..Default::default()
             },
         );
         let info = RateLimitInfo {
@@ -9562,6 +9789,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -9628,6 +9856,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -9669,9 +9898,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims_7d.insert(
             "seven_day".to_string(),
             ClaimWindowData {
-                utilization: 0.80,
+                utilization: Some(0.80),
                 reset: Some(now_epoch + 100000),
                 status: None,
+                ..Default::default()
             },
         );
         let info = RateLimitInfo {
@@ -9694,9 +9924,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims_7d.insert(
             "seven_day".to_string(),
             ClaimWindowData {
-                utilization: 0.90,
+                utilization: Some(0.90),
                 reset: Some(now_epoch - 1),
                 status: None,
+                ..Default::default()
             },
         );
         let info = RateLimitInfo {
@@ -9720,9 +9951,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims_7d.insert(
             "seven_day".to_string(),
             ClaimWindowData {
-                utilization: 0.50,
+                utilization: Some(0.50),
                 reset: Some(now_epoch + 100000),
                 status: None,
+                ..Default::default()
             },
         );
         let info = RateLimitInfo {
@@ -9749,9 +9981,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims_7d.insert(
             "seven_day".to_string(),
             ClaimWindowData {
-                utilization: 0.50,
+                utilization: Some(0.50),
                 reset: Some(now_epoch - 1),
                 status: None,
+                ..Default::default()
             },
         );
         let info = RateLimitInfo {
@@ -9807,17 +10040,19 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims_7d.insert(
             "seven_day_sonnet".to_string(),
             ClaimWindowData {
-                utilization: 0.85,
+                utilization: Some(0.85),
                 reset: Some(now_epoch + 100000),
                 status: None,
+                ..Default::default()
             },
         );
         claims_7d.insert(
             "seven_day_opus".to_string(),
             ClaimWindowData {
-                utilization: 0.10,
+                utilization: Some(0.10),
                 reset: Some(now_epoch + 100000),
                 status: None,
+                ..Default::default()
             },
         );
         let info = RateLimitInfo {
@@ -9850,9 +10085,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims_7d.insert(
             "seven_day".to_string(),
             ClaimWindowData {
-                utilization: 0.50,
+                utilization: Some(0.50),
                 reset: Some(now_epoch + 100000),
                 status: None,
+                ..Default::default()
             },
         );
         let info = RateLimitInfo {
@@ -9881,9 +10117,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims_7d.insert(
             "seven_day_sonnet".to_string(),
             ClaimWindowData {
-                utilization: 0.95,
+                utilization: Some(0.95),
                 reset: Some(now_epoch + 100000),
                 status: None,
+                ..Default::default()
             },
         );
         // No opus claim and no general claim
@@ -9916,17 +10153,19 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims_7d.insert(
             "seven_day_sonnet".to_string(),
             ClaimWindowData {
-                utilization: 0.95,
+                utilization: Some(0.95),
                 reset: Some(now_epoch + 100000),
                 status: None,
+                ..Default::default()
             },
         );
         claims_7d.insert(
             "seven_day_opus".to_string(),
             ClaimWindowData {
-                utilization: 0.10,
+                utilization: Some(0.10),
                 reset: Some(now_epoch + 100000),
                 status: None,
+                ..Default::default()
             },
         );
         let info = RateLimitInfo {
@@ -9951,17 +10190,19 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims_7d.insert(
             "seven_day_sonnet".to_string(),
             ClaimWindowData {
-                utilization: 0.95,
+                utilization: Some(0.95),
                 reset: Some(now_epoch - 1), // stale
                 status: None,
+                ..Default::default()
             },
         );
         claims_7d.insert(
             "seven_day_opus".to_string(),
             ClaimWindowData {
-                utilization: 0.30,
+                utilization: Some(0.30),
                 reset: Some(now_epoch + 100000), // fresh
                 status: None,
+                ..Default::default()
             },
         );
         let info = RateLimitInfo {
@@ -10098,9 +10339,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             info.claims_7d.insert(
                 "seven_day_sonnet".to_string(),
                 ClaimWindowData {
-                    utilization: 0.40,
+                    utilization: Some(0.40),
                     reset: Some(now + 86400),
                     status: None,
+                    ..Default::default()
                 },
             );
         }
@@ -10109,9 +10351,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             info.claims_7d.insert(
                 "seven_day_sonnet".to_string(),
                 ClaimWindowData {
-                    utilization: 0.40,
+                    utilization: Some(0.40),
                     reset: Some(now + 518400),
                     status: None,
+                    ..Default::default()
                 },
             );
         }
@@ -10150,9 +10393,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             info.claims_7d.insert(
                 "seven_day_sonnet".to_string(),
                 ClaimWindowData {
-                    utilization: 0.20,
+                    utilization: Some(0.20),
                     reset: Some(now + 129600),
                     status: None,
+                    ..Default::default()
                 },
             );
         }
@@ -10164,9 +10408,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             info.claims_7d.insert(
                 "seven_day_sonnet".to_string(),
                 ClaimWindowData {
-                    utilization: 0.50,
+                    utilization: Some(0.50),
                     reset: Some(now + 302400),
                     status: None,
+                    ..Default::default()
                 },
             );
         }
@@ -10293,9 +10538,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             info.claims_7d.insert(
                 "seven_day_sonnet".to_string(),
                 ClaimWindowData {
-                    utilization: 1.0,
+                    utilization: Some(1.0),
                     reset: Some(now + 100000),
                     status: Some("rejected".to_string()),
+                    ..Default::default()
                 },
             );
         }
@@ -10331,9 +10577,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         info.claims_7d.insert(
             "seven_day".to_string(),
             ClaimWindowData {
-                utilization: util_7d,
+                utilization: Some(util_7d),
                 reset: Some(reset_7d),
                 status: None,
+                ..Default::default()
             },
         );
     }
@@ -10356,16 +10603,17 @@ data: {\"type\":\"message_stop\"}\n\n";
         info.claims_7d.insert(
             key,
             ClaimWindowData {
-                utilization: util_7d,
+                utilization: Some(util_7d),
                 reset: Some(reset_7d),
                 status: None,
+                ..Default::default()
             },
         );
         // Re-derive flat fields
         info.utilization_7d = info
             .claims_7d
             .values()
-            .map(|c| c.utilization)
+            .filter_map(|c| c.utilization)
             .reduce(f64::max);
         info.reset_7d = info.claims_7d.values().filter_map(|c| c.reset).min();
         info.utilization = Some(
@@ -10401,6 +10649,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
@@ -10448,6 +10697,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
@@ -10496,6 +10746,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
@@ -10546,6 +10797,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
@@ -10593,6 +10845,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
@@ -10642,6 +10895,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
@@ -10695,6 +10949,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
@@ -10768,6 +11023,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
@@ -10843,6 +11099,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -10933,6 +11190,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -10983,6 +11241,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -11080,6 +11339,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -11155,6 +11415,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -11197,6 +11458,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
@@ -11415,6 +11677,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
@@ -11475,6 +11738,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
@@ -11532,6 +11796,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -11597,6 +11862,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -11659,6 +11925,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
@@ -11716,6 +11983,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -11824,6 +12092,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -11894,6 +12163,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -11944,6 +12214,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
@@ -12121,9 +12392,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims_7d.insert(
             "seven_day".to_string(),
             ClaimWindowData {
-                utilization: 0.60,
+                utilization: Some(0.60),
                 reset: Some(now + 100000),
                 status: Some("allowed".to_string()),
+                ..Default::default()
             },
         );
         let info = RateLimitInfo {
@@ -12147,9 +12419,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims_7d.insert(
             "seven_day".to_string(),
             ClaimWindowData {
-                utilization: 0.85,
+                utilization: Some(0.85),
                 reset: Some(now + 100000),
                 status: Some("allowed".to_string()),
+                ..Default::default()
             },
         );
         let info = RateLimitInfo {
@@ -12259,6 +12532,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -12300,6 +12574,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -12363,6 +12638,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: budgets,
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -12391,9 +12667,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         claims.insert(
             "claude-sonnet-4-6".to_string(),
             ClaimWindowData {
-                utilization: 0.42,
+                utilization: Some(0.42),
                 reset: Some(1700000000),
                 status: Some("active".to_string()),
+                ..Default::default()
             },
         );
 
@@ -12425,7 +12702,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(info.updated_at, deserialized.updated_at);
         assert_eq!(info.claims_7d.len(), deserialized.claims_7d.len());
         let claim = deserialized.claims_7d.get("claude-sonnet-4-6").unwrap();
-        assert_eq!(claim.utilization, 0.42);
+        assert_eq!(claim.utilization, Some(0.42));
         assert_eq!(claim.reset, Some(1700000000));
     }
 
@@ -12494,6 +12771,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: budgets,
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -12856,6 +13134,7 @@ upstream = "https://api.anthropic.com"
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -12892,9 +13171,10 @@ upstream = "https://api.anthropic.com"
             info.claims_7d.insert(
                 "seven_day".to_string(),
                 ClaimWindowData {
-                    utilization: 0.70,
+                    utilization: Some(0.70),
                     reset: Some(now_epoch + 604800),
                     status: Some("allowed".to_string()),
+                    ..Default::default()
                 },
             );
         }
@@ -12939,6 +13219,7 @@ upstream = "https://api.anthropic.com"
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -12966,7 +13247,8 @@ upstream = "https://api.anthropic.com"
 
         {
             let info = state2.accounts[0].rate_info.read().await;
-            assert_eq!(info.utilization, Some(0.65));
+            // Unified is recomputed as max(utilization_5h, utilization_7d)
+            assert_eq!(info.utilization, Some(0.70));
             assert_eq!(info.utilization_5h, Some(0.50));
             assert_eq!(info.remaining_requests, Some(100));
             assert_eq!(info.remaining_tokens, Some(50000));
@@ -12978,7 +13260,7 @@ upstream = "https://api.anthropic.com"
                 "claims_7d should survive round-trip"
             );
             let claim = info.claims_7d.get("seven_day").unwrap();
-            assert_eq!(claim.utilization, 0.70);
+            assert_eq!(claim.utilization, Some(0.70));
             // last_updated_epoch should be the per-account value, not saved_at or now()
             assert_eq!(
                 info.last_updated_epoch,
@@ -13022,6 +13304,7 @@ upstream = "https://api.anthropic.com"
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: budgets,
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -13075,6 +13358,7 @@ upstream = "https://api.anthropic.com"
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: budgets,
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -13410,6 +13694,7 @@ upstream = "https://api.anthropic.com"
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
@@ -13656,6 +13941,7 @@ upstream = "https://api.anthropic.com"
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets,
             budget_usage: Mutex::new(budget_usage_map),
             client_utilization_limits: HashMap::new(),
@@ -13768,9 +14054,10 @@ upstream = "https://api.anthropic.com"
             info.claims_7d.insert(
                 "claude-sonnet".to_string(),
                 ClaimWindowData {
-                    utilization: 0.65,
+                    utilization: Some(0.65),
                     reset: Some(reset_epoch),
                     status: None,
+                    ..Default::default()
                 },
             );
         }
@@ -13948,6 +14235,7 @@ upstream = "https://api.anthropic.com"
             auto_cache: false, // disable to keep body simple
             client_usage: Mutex::new(HashMap::new()),
             shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: HashMap::new(),
             budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: HashMap::new(),
