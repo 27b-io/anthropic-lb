@@ -5081,7 +5081,7 @@ async fn openai_chat_handler(
             // Compute budget pressure status for response header + log
             let budget_status = {
                 let info = acct.rate_info.read().await;
-                let (eff_util, constraint, adj_5h, adj_7d) =
+                let (eff_util, constraint, _adj_5h, _adj_7d) =
                     effective_utilization(&info, AppState::now_epoch(), &model);
                 info!(
                     req_id,
@@ -5094,8 +5094,8 @@ async fn openai_chat_handler(
                     account = acct.name,
                     status = status.as_u16(),
                     utilization = format_args!("{eff_util:.2}"),
-                    util_5h = adj_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-                    util_7d = adj_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+                    util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+                    util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
                     constraint,
                     openai_compat = true,
                     stream = is_streaming,
