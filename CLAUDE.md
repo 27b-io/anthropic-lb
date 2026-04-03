@@ -79,13 +79,36 @@ Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. R
 | `client_names` | map? | {} | IP→client name mapping |
 | `client_budgets` | map? | {} | client_id→daily token limit |
 | `client_utilization_limits` | map? | {} | client_id→utilization ceiling (0.0–1.0) |
-| `operators` | string[]? | [] | Client IDs that bypass all enforcement |
+| `operators` | string[]? | [] | Client IDs that bypass budget, utilization, and emergency brake enforcement (trust-based, not IP-verified; does not bypass IP allowlist) |
 | `emergency_brake` | bool? | true | Enable/disable the emergency brake |
 | `emergency_threshold` | f64? | 0.88 | All-accounts utilization threshold for emergency brake |
 | `redis_url` | string? | none | Redis/Valkey URL for distributed state (`redis://` or `rediss://`) |
 | `accounts[].name` | string | required | Account display name |
 | `accounts[].token` | string | required | API key, OAuth token, or `"passthrough"` |
 | `accounts[].models` | string[]? | [] (all) | Model allowlist (supports `*` suffix wildcards) |
+
+### Anthropic Rate Limit Windows (Unified Headers)
+
+The proxy reads utilization from `anthropic-ratelimit-unified-*` response headers. These govern subscription-based access (Claude Code, Pro, Max plans) and are separate from the per-minute token bucket limits documented at platform.claude.com.
+
+**Two windows:**
+- **5h window** — Fixed-duration window. Starts when usage begins, resets at a specific time (hard reset to zero). Dashboard shows "resets in X min." NOT a smooth sliding window — utilization does not gradually decay. It stays constant or increases within a window, then drops to zero at reset.
+- **7d window** — Weekly ceiling. Per-model sub-budgets ("claims") tracked separately (e.g., `seven_day_sonnet`, `seven_day_opus`). The `representative-claim` header indicates which window currently constrains the account.
+
+**Key headers parsed:**
+
+| Header | Meaning |
+|--------|---------|
+| `anthropic-ratelimit-unified-representative-claim` | Which window is the binding constraint (e.g., `five_hour`, `seven_day_sonnet`) |
+| `anthropic-ratelimit-unified-5h-utilization` | Raw 5h usage fraction (0.0–1.0) |
+| `anthropic-ratelimit-unified-5h-reset` | Epoch timestamp when 5h window resets to zero |
+| `anthropic-ratelimit-unified-7d-utilization` | Raw 7d usage fraction (0.0–1.0) |
+| `anthropic-ratelimit-unified-7d-reset` | Epoch timestamp when 7d window resets |
+| `anthropic-ratelimit-unified-5h-status` / `7d-status` | API pressure signal: `allowed`, `allowed_warning`, `throttled`, `rejected` |
+
+**Logged values:** `util_5h` and `util_7d` in request/probe logs show **raw API values** (`info.utilization_5h`, `info.utilization_7d`). The `utilization` field shows the effective (time-adjusted) value used for routing decisions.
+
+**Peak hour adjustments:** Anthropic dynamically reduces 5h token allowances during peak hours (05:00–11:00 PT weekdays). ~7% of users affected. Weekly caps unchanged.
 
 ## Testing Patterns
 
