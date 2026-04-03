@@ -2130,6 +2130,55 @@ impl TokenUsage {
     }
 }
 
+/// Inject account authentication headers. Handles API keys, OAuth tokens,
+/// and passthrough mode. For OAuth, merges required beta flags with any
+/// existing flags from the client.
+fn inject_account_auth(headers: &mut axum::http::HeaderMap, token: &str, passthrough: bool) {
+    if passthrough {
+        return;
+    }
+    headers.remove("authorization");
+    headers.remove("x-api-key");
+    if token.starts_with("sk-ant-api") {
+        headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
+    } else if token.starts_with("sk-ant-oat") {
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
+        );
+        headers.insert(
+            "anthropic-dangerous-direct-browser-access",
+            HeaderValue::from_static("true"),
+        );
+        // Merge required OAuth beta flags with any existing client flags
+        let existing_beta = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let mut flags: Vec<&str> = if existing_beta.is_empty() {
+            vec![]
+        } else {
+            existing_beta
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        for flag in OAUTH_BETA_FLAGS {
+            if !flags.contains(flag) {
+                flags.push(flag);
+            }
+        }
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_str(&flags.join(",")).unwrap(),
+        );
+    } else {
+        headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
+    }
+}
+
 fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &TokenUsage) {
     info!(
         req_id,
@@ -2762,56 +2811,7 @@ async fn proxy_handler(
             }
 
             // Auth: passthrough keeps caller's headers, otherwise inject account token
-            if !acct.passthrough {
-                headers.remove("authorization");
-                headers.remove("x-api-key");
-                // Detect token type by prefix
-                if acct.token.starts_with("sk-ant-api") {
-                    // Standard API key → x-api-key header
-                    headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
-                } else if acct.token.starts_with("sk-ant-oat") {
-                    // OAuth token → Authorization: Bearer
-                    headers.insert(
-                        "authorization",
-                        HeaderValue::from_str(&format!("Bearer {}", acct.token)).unwrap(),
-                    );
-                    // OAuth tokens require these headers — client won't send them
-                    // since it doesn't know the proxy uses OAuth behind the scenes
-                    headers.insert(
-                        "anthropic-dangerous-direct-browser-access",
-                        HeaderValue::from_static("true"),
-                    );
-                    // Ensure required OAuth beta flags are present.
-                    // Both are required: oauth-2025-04-20 for OAuth auth,
-                    // claude-code-20250219 for Claude Code API access quota routing.
-                    // Missing claude-code-20250219 causes 429 with unified-overage-disabled.
-                    let existing_beta = headers
-                        .get("anthropic-beta")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-                    let mut beta_flags: Vec<&str> = if existing_beta.is_empty() {
-                        vec![]
-                    } else {
-                        existing_beta
-                            .split(',')
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty())
-                            .collect()
-                    };
-                    for flag in OAUTH_BETA_FLAGS {
-                        if !beta_flags.contains(flag) {
-                            beta_flags.push(flag);
-                        }
-                    }
-                    let new_beta = beta_flags.join(",");
-                    headers.insert("anthropic-beta", HeaderValue::from_str(&new_beta).unwrap());
-                } else {
-                    // Unknown token type → try x-api-key
-                    headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
-                }
-            }
-            // passthrough: caller's auth headers flow through untouched
+            inject_account_auth(&mut headers, &acct.token, acct.passthrough);
 
             upstream_req = upstream_req.headers(headers);
             // Use OAuth variant (with CC system prompt) for OAuth tokens
@@ -4989,47 +4989,8 @@ async fn openai_chat_handler(
             headers.insert("content-type", HeaderValue::from_static("application/json"));
             headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
 
-            // Auth injection with claude-code beta header for OAuth
-            if !acct.passthrough {
-                if acct.token.starts_with("sk-ant-api") {
-                    headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
-                } else if acct.token.starts_with("sk-ant-oat") {
-                    headers.insert(
-                        "authorization",
-                        HeaderValue::from_str(&format!("Bearer {}", acct.token)).unwrap(),
-                    );
-                    headers.insert(
-                        "anthropic-dangerous-direct-browser-access",
-                        HeaderValue::from_static("true"),
-                    );
-                    // OAuth tokens need both beta flags for non-Claude-Code clients
-                    let existing_beta = headers
-                        .get("anthropic-beta")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-                    let mut betas: Vec<&str> = if existing_beta.is_empty() {
-                        vec![]
-                    } else {
-                        existing_beta
-                            .split(',')
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty())
-                            .collect()
-                    };
-                    for flag in OAUTH_BETA_FLAGS {
-                        if !betas.contains(flag) {
-                            betas.push(flag);
-                        }
-                    }
-                    headers.insert(
-                        "anthropic-beta",
-                        HeaderValue::from_str(&betas.join(",")).unwrap(),
-                    );
-                } else {
-                    headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
-                }
-            }
+            // Auth injection
+            inject_account_auth(&mut headers, &acct.token, acct.passthrough);
 
             // Use OAuth variant (with CC system prompt) for OAuth tokens
             let req_body = if acct.token.starts_with("sk-ant-oat") {
