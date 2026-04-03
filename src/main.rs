@@ -724,7 +724,7 @@ impl AppState {
             .post(&url)
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+            .header("anthropic-beta", OAUTH_BETA_FLAGS.join(","))
             .header("user-agent", "claude-cli/2.1.2 (external, cli)")
             .header("x-app", "cli")
             .header("anthropic-dangerous-direct-browser-access", "true")
@@ -953,6 +953,13 @@ const MAX_529_RETRIES: u32 = 3;
 
 /// Base delay for 529 BEBO retries. Doubles each round: 1s, 2s, 4s.
 const RETRY_529_BASE_DELAY: Duration = Duration::from_secs(1);
+
+/// Maximum request body size (25 MB).
+const MAX_REQUEST_BODY_BYTES: usize = 25 * 1024 * 1024;
+
+/// Required OAuth beta flags. Both needed: oauth-2025-04-20 for OAuth auth,
+/// claude-code-20250219 for Claude Code API access quota routing.
+const OAUTH_BETA_FLAGS: &[&str] = &["oauth-2025-04-20", "claude-code-20250219"];
 
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
 /// weight is below 50% of the alternative, stickiness is broken immediately.
@@ -2637,7 +2644,7 @@ async fn proxy_handler(
         .unwrap_or("-")
         .to_string();
 
-    let body_bytes = match axum::body::to_bytes(body, 25 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             error!("failed to read request body: {e}");
@@ -2792,7 +2799,7 @@ async fn proxy_handler(
                             .filter(|s| !s.is_empty())
                             .collect()
                     };
-                    for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
+                    for flag in OAUTH_BETA_FLAGS {
                         if !beta_flags.contains(flag) {
                             beta_flags.push(flag);
                         }
@@ -3099,7 +3106,7 @@ async fn upstream_handler(
     // Extract client identification headers
     let client_id = state.resolve_client_id(&client_ip, &parts.headers);
 
-    let body_bytes = match axum::body::to_bytes(body, 25 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             error!("failed to read request body: {e}");
@@ -4877,7 +4884,7 @@ async fn openai_chat_handler(
         .unwrap_or("-")
         .to_string();
 
-    let body_bytes = match axum::body::to_bytes(body, 25 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             error!("failed to read request body: {e}");
@@ -5010,7 +5017,7 @@ async fn openai_chat_handler(
                             .filter(|s| !s.is_empty())
                             .collect()
                     };
-                    for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
+                    for flag in OAUTH_BETA_FLAGS {
                         if !betas.contains(flag) {
                             betas.push(flag);
                         }
