@@ -87,6 +87,28 @@ Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. R
 | `accounts[].token` | string | required | API key, OAuth token, or `"passthrough"` |
 | `accounts[].models` | string[]? | [] (all) | Model allowlist (supports `*` suffix wildcards) |
 
+### Anthropic Rate Limit Windows (Unified Headers)
+
+The proxy reads utilization from `anthropic-ratelimit-unified-*` response headers. These govern subscription-based access (Claude Code, Pro, Max plans) and are separate from the per-minute token bucket limits documented at platform.claude.com.
+
+**Two windows:**
+- **5h window** — Fixed-duration window. Starts when usage begins, resets at a specific time (hard reset to zero). Dashboard shows "resets in X min." NOT a smooth sliding window — utilization does not gradually decay. It stays constant or increases within a window, then drops to zero at reset.
+- **7d window** — Weekly ceiling. Per-model sub-budgets ("claims") tracked separately (e.g., `seven_day_sonnet`, `seven_day_opus`). The `representative-claim` header indicates which window currently constrains the account.
+
+**Key headers parsed:**
+| Header | Meaning |
+|--------|---------|
+| `anthropic-ratelimit-unified-representative-claim` | Which window is the binding constraint (e.g., `five_hour`, `seven_day_sonnet`) |
+| `anthropic-ratelimit-unified-5h-utilization` | Raw 5h usage fraction (0.0–1.0) |
+| `anthropic-ratelimit-unified-5h-reset` | Epoch timestamp when 5h window resets to zero |
+| `anthropic-ratelimit-unified-7d-utilization` | Raw 7d usage fraction (0.0–1.0) |
+| `anthropic-ratelimit-unified-7d-reset` | Epoch timestamp when 7d window resets |
+| `anthropic-ratelimit-unified-5h-status` / `7d-status` | API pressure signal: `allowed`, `allowed_warning`, `throttled`, `rejected` |
+
+**Important: logged util values are time-adjusted, not raw.** The `util_5h` and `util_7d` in request logs are the output of `time_adjusted_utilization()`, which applies a near-reset discount (linear ramp down in the last hour of a 5h window). This is intentional for routing but makes logs misleading when comparing against the Anthropic dashboard. Raw values are stored in `info.utilization_5h` / `info.utilization_7d`.
+
+**Peak hour adjustments:** Anthropic dynamically reduces 5h token allowances during peak hours (05:00–11:00 PT weekdays). ~7% of users affected. Weekly caps unchanged.
+
 ## Testing Patterns
 
 Tests use a `spawn_mock_upstream()` helper that starts a real TCP listener returning canned Anthropic-style responses with rate-limit headers. Integration tests bind to `127.0.0.1:0` (random port) and make real HTTP requests through the full axum router with `ConnectInfo<SocketAddr>`.
