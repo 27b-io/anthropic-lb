@@ -2979,10 +2979,10 @@ async fn proxy_handler(
                             .await;
                         log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
                     } else {
-                        let reason = if client_disconnected {
-                            "client_disconnect"
-                        } else if upstream_error {
+                        let reason = if upstream_error {
                             "upstream_error"
+                        } else if client_disconnected {
+                            "client_disconnect"
                         } else {
                             "no_usage_event"
                         };
@@ -5265,8 +5265,8 @@ async fn openai_chat_handler(
                         }
                     }
 
-                    // Process any remaining data in buffer
-                    if !buffer.trim().is_empty() {
+                    // Process any remaining data in buffer (skip if upstream errored)
+                    if !upstream_error && !buffer.trim().is_empty() {
                         if let Some(translated) = translate_sse_event(&buffer, &mut ctx) {
                             if translated.contains("[DONE]") {
                                 sent_done = true;
@@ -5277,9 +5277,10 @@ async fn openai_chat_handler(
                         }
                     }
 
-                    // Ensure [DONE] is always sent (fallback for abnormal stream termination)
+                    // Ensure [DONE] is always sent (skip on upstream error — would fake clean completion)
                     if !sent_done
                         && !client_gone
+                        && !upstream_error
                         && tx
                             .send(Ok(bytes::Bytes::from("data: [DONE]\n\n")))
                             .await
@@ -5297,10 +5298,10 @@ async fn openai_chat_handler(
                             .await;
                         log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
                     } else {
-                        let reason = if client_gone {
-                            "client_disconnect"
-                        } else if upstream_error {
+                        let reason = if upstream_error {
                             "upstream_error"
+                        } else if client_gone {
+                            "client_disconnect"
                         } else {
                             "no_usage_event"
                         };
