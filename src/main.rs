@@ -2951,11 +2951,22 @@ async fn proxy_handler(
                 tokio::spawn(async move {
                     let mut sse_buf = Vec::new();
                     let mut client_disconnected = false;
-                    while let Ok(Some(chunk)) = resp.chunk().await {
-                        sse_buf.extend_from_slice(&chunk);
-                        if tx.send(Ok(chunk)).await.is_err() {
-                            client_disconnected = true;
-                            break;
+                    let mut upstream_error = false;
+                    loop {
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                sse_buf.extend_from_slice(&chunk);
+                                if tx.send(Ok(chunk)).await.is_err() {
+                                    client_disconnected = true;
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                upstream_error = true;
+                                warn!(req_id, error = %e, "upstream SSE read failed");
+                                break;
+                            }
                         }
                     }
                     // Parse accumulated SSE data for usage
@@ -2970,6 +2981,8 @@ async fn proxy_handler(
                     } else {
                         let reason = if client_disconnected {
                             "client_disconnect"
+                        } else if upstream_error {
+                            "upstream_error"
                         } else {
                             "no_usage_event"
                         };
@@ -5207,32 +5220,48 @@ async fn openai_chat_handler(
                     let mut sent_done = false;
 
                     let mut client_gone = false;
+                    let mut upstream_error = false;
 
-                    while let Ok(Some(chunk)) = resp.chunk().await {
-                        let chunk_str = String::from_utf8_lossy(&chunk);
-                        buffer.push_str(&chunk_str);
-                        raw_sse.push_str(&chunk_str);
+                    loop {
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                let chunk_str = String::from_utf8_lossy(&chunk);
+                                buffer.push_str(&chunk_str);
+                                raw_sse.push_str(&chunk_str);
 
-                        while let Some(pos) = buffer.find("\n\n") {
-                            let event = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
+                                while let Some(pos) = buffer.find("\n\n") {
+                                    let event = buffer[..pos].to_string();
+                                    buffer = buffer[pos + 2..].to_string();
 
-                            if event.trim().is_empty() {
-                                continue;
-                            }
+                                    if event.trim().is_empty() {
+                                        continue;
+                                    }
 
-                            if let Some(translated) = translate_sse_event(&event, &mut ctx) {
-                                if translated.contains("[DONE]") {
-                                    sent_done = true;
+                                    if let Some(translated) = translate_sse_event(&event, &mut ctx)
+                                    {
+                                        if translated.contains("[DONE]") {
+                                            sent_done = true;
+                                        }
+                                        if tx
+                                            .send(Ok(bytes::Bytes::from(translated)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            client_gone = true;
+                                            break;
+                                        }
+                                    }
                                 }
-                                if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
-                                    client_gone = true;
-                                    break; // break inner loop
+                                if client_gone {
+                                    break;
                                 }
                             }
-                        }
-                        if client_gone {
-                            break; // break outer loop — fall through to usage accounting
+                            Ok(None) => break,
+                            Err(e) => {
+                                upstream_error = true;
+                                warn!(req_id, error = %e, "upstream SSE read failed");
+                                break;
+                            }
                         }
                     }
 
@@ -5270,6 +5299,8 @@ async fn openai_chat_handler(
                     } else {
                         let reason = if client_gone {
                             "client_disconnect"
+                        } else if upstream_error {
+                            "upstream_error"
                         } else {
                             "no_usage_event"
                         };
