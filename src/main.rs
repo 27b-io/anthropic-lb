@@ -2179,6 +2179,51 @@ fn inject_account_auth(headers: &mut axum::http::HeaderMap, token: &str, passthr
     }
 }
 
+/// Client identity extracted from request headers.
+struct RequestContext {
+    client_id: String,
+    client_ver: String,
+    agent_id: String,
+    session_id: String,
+}
+
+impl RequestContext {
+    fn from_request(state: &AppState, client_ip: &IpAddr, headers: &axum::http::HeaderMap) -> Self {
+        Self {
+            client_id: state.resolve_client_id(client_ip, headers),
+            client_ver: headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .and_then(extract_client_version)
+                .unwrap_or("-")
+                .to_string(),
+            agent_id: headers
+                .get("x-agent-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string(),
+            session_id: headers
+                .get("x-claude-code-session-id")
+                .or_else(|| headers.get("x-session-id"))
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string(),
+        }
+    }
+
+    fn affinity_key(&self, client_ip: &IpAddr) -> Option<String> {
+        let has_identity = self.client_id != "-" || self.agent_id != "-" || self.session_id != "-";
+        if has_identity {
+            Some(format!(
+                "{}:{}:{}:{}",
+                client_ip, self.client_id, self.agent_id, self.session_id
+            ))
+        } else {
+            None
+        }
+    }
+}
+
 fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &TokenUsage) {
     info!(
         req_id,
@@ -2216,7 +2261,7 @@ impl AppState {
                 + usage.cache_creation_input_tokens
                 + usage.cache_read_input_tokens;
             if let Ok(mut map) = self.client_usage.lock() {
-                let entry = map.entry(client_id.to_string()).or_insert([0; 4]);
+                let entry = map.entry(client_id.to_owned()).or_insert([0; 4]);
                 entry[0] += usage.input_tokens;
                 entry[1] += usage.output_tokens;
                 entry[2] += usage.cache_creation_input_tokens;
@@ -2290,7 +2335,7 @@ impl AppState {
 
         // Always update local state (for stats + fallback)
         if let Ok(mut map) = self.budget_usage.lock() {
-            let entry = map.entry(client_id.to_string()).or_insert((today, 0));
+            let entry = map.entry(client_id.to_owned()).or_insert((today, 0));
             if entry.0 != today {
                 *entry = (today, 0); // reset on new day
             }
@@ -2671,27 +2716,15 @@ async fn proxy_handler(
     );
 
     // Extract client identification headers
-    let client_id = state.resolve_client_id(&client_ip, &parts.headers);
-    let client_ver = parts
-        .headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .and_then(extract_client_version)
-        .unwrap_or("-")
-        .to_string();
-    let agent_id = parts
-        .headers
-        .get("x-agent-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
-    let session_id = parts
-        .headers
-        .get("x-claude-code-session-id")
-        .or_else(|| parts.headers.get("x-session-id"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
+    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers);
+    let affinity_key = rctx.affinity_key(&client_ip);
+    let affinity = affinity_key.as_deref();
+    let RequestContext {
+        client_id,
+        client_ver,
+        agent_id,
+        session_id,
+    } = rctx;
 
     let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
@@ -2750,16 +2783,6 @@ async fn proxy_handler(
     if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
         return resp;
     }
-
-    // Build affinity key for sticky routing — only use stickiness when there's
-    // meaningful client identification beyond just the IP address
-    let affinity_key = format!("{}:{}:{}:{}", client_ip, client_id, agent_id, session_id);
-    let has_identity = client_id != "-" || agent_id != "-" || session_id != "-";
-    let affinity = if has_identity {
-        Some(affinity_key.as_str())
-    } else {
-        None
-    };
 
     let n = state.accounts.len();
     for retry_round in 0..=MAX_529_RETRIES {
@@ -4862,27 +4885,15 @@ async fn openai_chat_handler(
     );
 
     // Extract client identification headers
-    let client_id = state.resolve_client_id(&client_ip, &parts.headers);
-    let client_ver = parts
-        .headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .and_then(extract_client_version)
-        .unwrap_or("-")
-        .to_string();
-    let agent_id = parts
-        .headers
-        .get("x-agent-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
-    let session_id = parts
-        .headers
-        .get("x-claude-code-session-id")
-        .or_else(|| parts.headers.get("x-session-id"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
+    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers);
+    let affinity_key = rctx.affinity_key(&client_ip);
+    let affinity = affinity_key.as_deref();
+    let RequestContext {
+        client_id,
+        client_ver,
+        agent_id,
+        session_id,
+    } = rctx;
 
     let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
@@ -4938,16 +4949,6 @@ async fn openai_chat_handler(
     // OAuth tokens (sk-ant-oat*) require this to access sonnet/opus models.
     let mut oauth_anthropic_body = anthropic_body.clone();
     inject_oauth_system_prompt(&mut oauth_anthropic_body);
-
-    // Build affinity key for sticky routing — only use stickiness when there's
-    // meaningful client identification beyond just the IP address
-    let affinity_key = format!("{}:{}:{}:{}", client_ip, client_id, agent_id, session_id);
-    let has_identity = client_id != "-" || agent_id != "-" || session_id != "-";
-    let affinity = if has_identity {
-        Some(affinity_key.as_str())
-    } else {
-        None
-    };
 
     let n = state.accounts.len();
     for retry_round in 0..=MAX_529_RETRIES {
