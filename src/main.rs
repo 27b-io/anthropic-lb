@@ -5093,7 +5093,7 @@ async fn openai_chat_handler(
             let upstream_req = state
                 .client
                 .request(reqwest::Method::POST, &url)
-                .headers(reqwest_headers(&headers))
+                .headers(headers)
                 .body(body_str);
 
             let mut resp = match upstream_req.send().await {
@@ -5428,19 +5428,6 @@ async fn openai_chat_handler(
     }
 
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all accounts").into_response()
-}
-
-/// Convert axum HeaderMap to reqwest HeaderMap.
-fn reqwest_headers(headers: &axum::http::HeaderMap) -> reqwest::header::HeaderMap {
-    let mut out = reqwest::header::HeaderMap::new();
-    for (k, v) in headers.iter() {
-        if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_str().as_bytes()) {
-            if let Ok(val) = reqwest::header::HeaderValue::from_bytes(v.as_bytes()) {
-                out.append(name, val);
-            }
-        }
-    }
-    out
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -14469,22 +14456,5 @@ upstream = "https://api.anthropic.com"
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["error"]["message"], "upstream timeout");
         assert_eq!(body["error"]["type"], "api_error");
-    }
-
-    #[test]
-    fn reqwest_headers_preserves_multi_value() {
-        let mut src = axum::http::HeaderMap::new();
-        src.append("x-custom", axum::http::HeaderValue::from_static("first"));
-        src.append("x-custom", axum::http::HeaderValue::from_static("second"));
-
-        let out = reqwest_headers(&src);
-        let values: Vec<&str> = out
-            .get_all("x-custom")
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect();
-        assert_eq!(values.len(), 2, "multi-value header should have 2 entries");
-        assert!(values.contains(&"first"));
-        assert!(values.contains(&"second"));
     }
 }
