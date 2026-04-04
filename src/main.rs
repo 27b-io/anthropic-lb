@@ -2306,6 +2306,49 @@ async fn finalize_stream(
     state.shadow_log(log);
 }
 
+/// Finalize a non-streaming response: extract usage from JSON body, log, and shadow log.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_non_stream(
+    state: &AppState,
+    idx: usize,
+    req_id: &str,
+    client_id: &str,
+    model: &str,
+    acct_name: &str,
+    client_ip: &str,
+    agent: &str,
+    session: &str,
+    status_code: u16,
+    usage: &TokenUsage,
+    latency_ms: u64,
+    openai_compat: bool,
+) {
+    if !usage.is_empty() {
+        state.record_usage(idx, client_id, usage).await;
+        log_usage(req_id, client_id, model, acct_name, usage);
+    }
+    let mut log = serde_json::json!({
+        "ts": AppState::now_epoch(),
+        "client": client_ip,
+        "client_id": client_id,
+        "agent": agent,
+        "session": session,
+        "model": model,
+        "account": acct_name,
+        "status": status_code,
+        "stream": false,
+        "latency_ms": latency_ms,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens,
+    });
+    if openai_compat {
+        log["openai_compat"] = serde_json::json!(true);
+    }
+    state.shadow_log(log);
+}
+
 impl AppState {
     /// Record token usage for an account and client.
     async fn record_usage(&self, account_idx: usize, client_id: &str, usage: &TokenUsage) {
@@ -3102,27 +3145,23 @@ async fn proxy_handler(
                 let mut usage = TokenUsage::default();
                 if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
                     usage = TokenUsage::from_response_body(&parsed);
-                    if !usage.is_empty() {
-                        state.record_usage(idx, &client_id, &usage).await;
-                        log_usage(&req_id, &client_id, &model, &acct.name, &usage);
-                    }
                 }
-                state.shadow_log(serde_json::json!({
-                    "ts": AppState::now_epoch(),
-                    "client": client_ip.to_string(),
-                    "client_id": client_id,
-                    "agent": agent_id,
-                    "session": session_id,
-                    "model": model,
-                    "account": acct.name,
-                    "status": status.as_u16(),
-                    "stream": false,
-                    "latency_ms": latency_ms,
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                    "cache_read_input_tokens": usage.cache_read_input_tokens,
-                }));
+                finalize_non_stream(
+                    &state,
+                    idx,
+                    &req_id,
+                    &client_id,
+                    &model,
+                    &acct.name,
+                    &client_ip.to_string(),
+                    &agent_id,
+                    &session_id,
+                    status.as_u16(),
+                    &usage,
+                    latency_ms,
+                    false,
+                )
+                .await;
                 return builder.body(Body::from(body_bytes)).unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                 });
@@ -5355,27 +5394,22 @@ async fn openai_chat_handler(
 
             // Extract and record token usage from non-streaming response
             let usage = TokenUsage::from_response_body(&anthropic_resp);
-            if !usage.is_empty() {
-                state.record_usage(idx, &client_id, &usage).await;
-                log_usage(&req_id, &client_id, &model, &acct.name, &usage);
-            }
-            state.shadow_log(serde_json::json!({
-                "ts": AppState::now_epoch(),
-                "client": client_ip.to_string(),
-                "client_id": client_id,
-                "agent": agent_id,
-                "session": session_id,
-                "model": model,
-                "account": acct.name,
-                "status": status.as_u16(),
-                "stream": false,
-                "openai_compat": true,
-                "latency_ms": request_start.elapsed().as_millis() as u64,
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                "cache_read_input_tokens": usage.cache_read_input_tokens,
-            }));
+            finalize_non_stream(
+                &state,
+                idx,
+                &req_id,
+                &client_id,
+                &model,
+                &acct.name,
+                &client_ip.to_string(),
+                &agent_id,
+                &session_id,
+                status.as_u16(),
+                &usage,
+                request_start.elapsed().as_millis() as u64,
+                true,
+            )
+            .await;
 
             return Response::builder()
                 .status(StatusCode::OK)
