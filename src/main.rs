@@ -724,7 +724,7 @@ impl AppState {
             .post(&url)
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+            .header("anthropic-beta", OAUTH_BETA_FLAGS.join(","))
             .header("user-agent", "claude-cli/2.1.2 (external, cli)")
             .header("x-app", "cli")
             .header("anthropic-dangerous-direct-browser-access", "true")
@@ -953,6 +953,13 @@ const MAX_529_RETRIES: u32 = 3;
 
 /// Base delay for 529 BEBO retries. Doubles each round: 1s, 2s, 4s.
 const RETRY_529_BASE_DELAY: Duration = Duration::from_secs(1);
+
+/// Maximum request body size (25 MB).
+const MAX_REQUEST_BODY_BYTES: usize = 25 * 1024 * 1024;
+
+/// Required OAuth beta flags. Both needed: oauth-2025-04-20 for OAuth auth,
+/// claude-code-20250219 for Claude Code API access quota routing.
+const OAUTH_BETA_FLAGS: &[&str] = &["oauth-2025-04-20", "claude-code-20250219"];
 
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
 /// weight is below 50% of the alternative, stickiness is broken immediately.
@@ -2123,6 +2130,105 @@ impl TokenUsage {
     }
 }
 
+/// Inject account authentication headers. Handles API keys, OAuth tokens,
+/// and passthrough mode. For OAuth, merges required beta flags with any
+/// existing flags from the client.
+fn inject_account_auth(headers: &mut axum::http::HeaderMap, token: &str, passthrough: bool) {
+    if passthrough {
+        return;
+    }
+    headers.remove("authorization");
+    headers.remove("x-api-key");
+    if token.starts_with("sk-ant-api") {
+        headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
+    } else if token.starts_with("sk-ant-oat") {
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
+        );
+        headers.insert(
+            "anthropic-dangerous-direct-browser-access",
+            HeaderValue::from_static("true"),
+        );
+        // Merge required OAuth beta flags with any existing client flags
+        // Use get_all to handle multiple anthropic-beta headers
+        let mut flags: Vec<String> = headers
+            .get_all("anthropic-beta")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|s| s.split(','))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for flag in OAUTH_BETA_FLAGS {
+            if !flags.iter().any(|f| f == flag) {
+                flags.push(flag.to_string());
+            }
+        }
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_str(&flags.join(",")).unwrap(),
+        );
+    } else {
+        headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
+    }
+}
+
+/// Client identity extracted from request headers.
+struct RequestContext {
+    client_id: String,
+    client_ver: String,
+    agent_id: String,
+    session_id: String,
+}
+
+impl RequestContext {
+    fn from_request(state: &AppState, client_ip: &IpAddr, headers: &axum::http::HeaderMap) -> Self {
+        Self {
+            client_id: state.resolve_client_id(client_ip, headers),
+            client_ver: headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .and_then(extract_client_version)
+                .unwrap_or("-")
+                .to_string(),
+            agent_id: headers
+                .get("x-agent-id")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("-")
+                .to_string(),
+            session_id: headers
+                .get("x-claude-code-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    headers
+                        .get("x-session-id")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or("-")
+                .to_string(),
+        }
+    }
+
+    fn affinity_key(&self, client_ip: &IpAddr) -> Option<String> {
+        let has_identity = self.client_id != "-" || self.agent_id != "-" || self.session_id != "-";
+        if has_identity {
+            Some(format!(
+                "{}:{}:{}:{}",
+                client_ip, self.client_id, self.agent_id, self.session_id
+            ))
+        } else {
+            None
+        }
+    }
+}
+
 fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &TokenUsage) {
     info!(
         req_id,
@@ -2135,6 +2241,117 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
         cache_write = usage.cache_creation_input_tokens,
         "usage"
     );
+}
+
+/// Finalize a streaming response: extract usage, log, and shadow log.
+/// Shared by proxy_handler and openai_chat_handler.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_stream(
+    state: &AppState,
+    idx: usize,
+    req_id: &str,
+    client_id: &str,
+    model: &str,
+    acct_name: &str,
+    client_ip: &str,
+    agent: &str,
+    session: &str,
+    status_code: u16,
+    sse_buf: &[u8],
+    request_start: std::time::Instant,
+    client_disconnected: bool,
+    upstream_error: bool,
+    openai_compat: bool,
+) {
+    let text = String::from_utf8_lossy(sse_buf);
+    let usage = TokenUsage::from_sse_text(&text);
+    let elapsed_ms = request_start.elapsed().as_millis() as u64;
+    if !usage.is_empty() {
+        state.record_usage(idx, client_id, &usage).await;
+        log_usage(req_id, client_id, model, acct_name, &usage);
+    } else {
+        let reason = if upstream_error {
+            "upstream_error"
+        } else if client_disconnected {
+            "client_disconnect"
+        } else {
+            "no_usage_event"
+        };
+        info!(
+            req_id,
+            client_id,
+            model,
+            account = acct_name,
+            reason,
+            elapsed_ms,
+            sse_bytes = sse_buf.len(),
+            "stream_end_no_usage"
+        );
+    }
+    let mut log = serde_json::json!({
+        "ts": AppState::now_epoch(),
+        "client": client_ip,
+        "client_id": client_id,
+        "agent": agent,
+        "session": session,
+        "model": model,
+        "account": acct_name,
+        "status": status_code,
+        "stream": true,
+        "latency_ms": elapsed_ms,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens,
+        "client_disconnected": client_disconnected,
+    });
+    if openai_compat {
+        log["openai_compat"] = serde_json::json!(true);
+    }
+    state.shadow_log(log);
+}
+
+/// Finalize a non-streaming response: extract usage from JSON body, log, and shadow log.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_non_stream(
+    state: &AppState,
+    idx: usize,
+    req_id: &str,
+    client_id: &str,
+    model: &str,
+    acct_name: &str,
+    client_ip: &str,
+    agent: &str,
+    session: &str,
+    status_code: u16,
+    usage: &TokenUsage,
+    latency_ms: u64,
+    openai_compat: bool,
+) {
+    if !usage.is_empty() {
+        state.record_usage(idx, client_id, usage).await;
+        log_usage(req_id, client_id, model, acct_name, usage);
+    }
+    let mut log = serde_json::json!({
+        "ts": AppState::now_epoch(),
+        "client": client_ip,
+        "client_id": client_id,
+        "agent": agent,
+        "session": session,
+        "model": model,
+        "account": acct_name,
+        "status": status_code,
+        "stream": false,
+        "latency_ms": latency_ms,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens,
+    });
+    if openai_compat {
+        log["openai_compat"] = serde_json::json!(true);
+    }
+    state.shadow_log(log);
 }
 
 impl AppState {
@@ -2160,7 +2377,7 @@ impl AppState {
                 + usage.cache_creation_input_tokens
                 + usage.cache_read_input_tokens;
             if let Ok(mut map) = self.client_usage.lock() {
-                let entry = map.entry(client_id.to_string()).or_insert([0; 4]);
+                let entry = map.entry(client_id.to_owned()).or_insert([0; 4]);
                 entry[0] += usage.input_tokens;
                 entry[1] += usage.output_tokens;
                 entry[2] += usage.cache_creation_input_tokens;
@@ -2168,6 +2385,21 @@ impl AppState {
             }
             // Budget accounting
             self.record_budget_usage(client_id, total).await;
+        }
+    }
+
+    /// Update burn rate for an account and per-client request tracking.
+    fn update_burn_rate(&self, acct: &Account, client_id: &str) {
+        let now = Instant::now();
+        if let Ok(mut br) = acct.burn_rate.lock() {
+            br.update(now);
+        }
+        if let Ok(mut rates) = self.client_request_rates.lock() {
+            let entry = rates
+                .entry(client_id.to_owned())
+                .or_insert_with(|| (0, Ewma::new(TAU_1H)));
+            entry.0 += 1;
+            entry.1.update(now);
         }
     }
 
@@ -2234,7 +2466,7 @@ impl AppState {
 
         // Always update local state (for stats + fallback)
         if let Ok(mut map) = self.budget_usage.lock() {
-            let entry = map.entry(client_id.to_string()).or_insert((today, 0));
+            let entry = map.entry(client_id.to_owned()).or_insert((today, 0));
             if entry.0 != today {
                 *entry = (today, 0); // reset on new day
             }
@@ -2615,29 +2847,17 @@ async fn proxy_handler(
     );
 
     // Extract client identification headers
-    let client_id = state.resolve_client_id(&client_ip, &parts.headers);
-    let client_ver = parts
-        .headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .and_then(extract_client_version)
-        .unwrap_or("-")
-        .to_string();
-    let agent_id = parts
-        .headers
-        .get("x-agent-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
-    let session_id = parts
-        .headers
-        .get("x-claude-code-session-id")
-        .or_else(|| parts.headers.get("x-session-id"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
+    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers);
+    let affinity_key = rctx.affinity_key(&client_ip);
+    let affinity = affinity_key.as_deref();
+    let RequestContext {
+        client_id,
+        client_ver,
+        agent_id,
+        session_id,
+    } = rctx;
 
-    let body_bytes = match axum::body::to_bytes(body, 25 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             error!("failed to read request body: {e}");
@@ -2695,16 +2915,6 @@ async fn proxy_handler(
         return resp;
     }
 
-    // Build affinity key for sticky routing — only use stickiness when there's
-    // meaningful client identification beyond just the IP address
-    let affinity_key = format!("{}:{}:{}:{}", client_ip, client_id, agent_id, session_id);
-    let has_identity = client_id != "-" || agent_id != "-" || session_id != "-";
-    let affinity = if has_identity {
-        Some(affinity_key.as_str())
-    } else {
-        None
-    };
-
     let n = state.accounts.len();
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
@@ -2755,56 +2965,7 @@ async fn proxy_handler(
             }
 
             // Auth: passthrough keeps caller's headers, otherwise inject account token
-            if !acct.passthrough {
-                headers.remove("authorization");
-                headers.remove("x-api-key");
-                // Detect token type by prefix
-                if acct.token.starts_with("sk-ant-api") {
-                    // Standard API key → x-api-key header
-                    headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
-                } else if acct.token.starts_with("sk-ant-oat") {
-                    // OAuth token → Authorization: Bearer
-                    headers.insert(
-                        "authorization",
-                        HeaderValue::from_str(&format!("Bearer {}", acct.token)).unwrap(),
-                    );
-                    // OAuth tokens require these headers — client won't send them
-                    // since it doesn't know the proxy uses OAuth behind the scenes
-                    headers.insert(
-                        "anthropic-dangerous-direct-browser-access",
-                        HeaderValue::from_static("true"),
-                    );
-                    // Ensure required OAuth beta flags are present.
-                    // Both are required: oauth-2025-04-20 for OAuth auth,
-                    // claude-code-20250219 for Claude Code API access quota routing.
-                    // Missing claude-code-20250219 causes 429 with unified-overage-disabled.
-                    let existing_beta = headers
-                        .get("anthropic-beta")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-                    let mut beta_flags: Vec<&str> = if existing_beta.is_empty() {
-                        vec![]
-                    } else {
-                        existing_beta
-                            .split(',')
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty())
-                            .collect()
-                    };
-                    for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
-                        if !beta_flags.contains(flag) {
-                            beta_flags.push(flag);
-                        }
-                    }
-                    let new_beta = beta_flags.join(",");
-                    headers.insert("anthropic-beta", HeaderValue::from_str(&new_beta).unwrap());
-                } else {
-                    // Unknown token type → try x-api-key
-                    headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
-                }
-            }
-            // passthrough: caller's auth headers flow through untouched
+            inject_account_auth(&mut headers, &acct.token, acct.passthrough);
 
             upstream_req = upstream_req.headers(headers);
             // Use OAuth variant (with CC system prompt) for OAuth tokens
@@ -2830,20 +2991,7 @@ async fn proxy_handler(
             state.update_rate_info(idx, resp.headers()).await;
 
             // Update burn rate (after rate-limit headers are parsed)
-            {
-                let now = Instant::now();
-                if let Ok(mut br) = acct.burn_rate.lock() {
-                    br.update(now);
-                }
-                // Per-client request tracking
-                if let Ok(mut rates) = state.client_request_rates.lock() {
-                    let entry = rates
-                        .entry(client_id.clone())
-                        .or_insert_with(|| (0, Ewma::new(TAU_1H)));
-                    entry.0 += 1;
-                    entry.1.update(now);
-                }
-            }
+            state.update_burn_rate(acct, &client_id);
 
             // 429 → mark hard-limited and try next account
             if status == StatusCode::TOO_MANY_REQUESTS {
@@ -2970,50 +3118,24 @@ async fn proxy_handler(
                         }
                     }
                     // Parse accumulated SSE data for usage
-                    let text = String::from_utf8_lossy(&sse_buf);
-                    let usage = TokenUsage::from_sse_text(&text);
-                    let elapsed_ms = request_start.elapsed().as_millis() as u64;
-                    if !usage.is_empty() {
-                        state_clone
-                            .record_usage(idx, &client_id_clone, &usage)
-                            .await;
-                        log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
-                    } else {
-                        let reason = if upstream_error {
-                            "upstream_error"
-                        } else if client_disconnected {
-                            "client_disconnect"
-                        } else {
-                            "no_usage_event"
-                        };
-                        info!(
-                            req_id,
-                            client_id = %client_id_clone,
-                            model = %model_clone,
-                            account = acct_name,
-                            reason,
-                            elapsed_ms,
-                            sse_bytes = sse_buf.len(),
-                            "stream_end_no_usage"
-                        );
-                    }
-                    state_clone.shadow_log(serde_json::json!({
-                        "ts": AppState::now_epoch(),
-                        "client": client_ip_str,
-                        "client_id": client_id_clone,
-                        "agent": agent_clone,
-                        "session": session_clone,
-                        "model": model_clone,
-                        "account": acct_name,
-                        "status": status.as_u16(),
-                        "stream": true,
-                        "latency_ms": elapsed_ms,
-                        "input_tokens": usage.input_tokens,
-                        "output_tokens": usage.output_tokens,
-                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                        "cache_read_input_tokens": usage.cache_read_input_tokens,
-                        "client_disconnected": client_disconnected,
-                    }));
+                    finalize_stream(
+                        &state_clone,
+                        idx,
+                        &req_id,
+                        &client_id_clone,
+                        &model_clone,
+                        &acct_name,
+                        &client_ip_str,
+                        &agent_clone,
+                        &session_clone,
+                        status.as_u16(),
+                        &sse_buf,
+                        request_start,
+                        client_disconnected,
+                        upstream_error,
+                        false,
+                    )
+                    .await;
                 });
 
                 let body_stream = ReceiverStream::new(rx);
@@ -3028,27 +3150,23 @@ async fn proxy_handler(
                 let mut usage = TokenUsage::default();
                 if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
                     usage = TokenUsage::from_response_body(&parsed);
-                    if !usage.is_empty() {
-                        state.record_usage(idx, &client_id, &usage).await;
-                        log_usage(&req_id, &client_id, &model, &acct.name, &usage);
-                    }
                 }
-                state.shadow_log(serde_json::json!({
-                    "ts": AppState::now_epoch(),
-                    "client": client_ip.to_string(),
-                    "client_id": client_id,
-                    "agent": agent_id,
-                    "session": session_id,
-                    "model": model,
-                    "account": acct.name,
-                    "status": status.as_u16(),
-                    "stream": false,
-                    "latency_ms": latency_ms,
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                    "cache_read_input_tokens": usage.cache_read_input_tokens,
-                }));
+                finalize_non_stream(
+                    &state,
+                    idx,
+                    &req_id,
+                    &client_id,
+                    &model,
+                    &acct.name,
+                    &client_ip.to_string(),
+                    &agent_id,
+                    &session_id,
+                    status.as_u16(),
+                    &usage,
+                    latency_ms,
+                    false,
+                )
+                .await;
                 return builder.body(Body::from(body_bytes)).unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                 });
@@ -3099,7 +3217,7 @@ async fn upstream_handler(
     // Extract client identification headers
     let client_id = state.resolve_client_id(&client_ip, &parts.headers);
 
-    let body_bytes = match axum::body::to_bytes(body, 25 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             error!("failed to read request body: {e}");
@@ -4855,29 +4973,17 @@ async fn openai_chat_handler(
     );
 
     // Extract client identification headers
-    let client_id = state.resolve_client_id(&client_ip, &parts.headers);
-    let client_ver = parts
-        .headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .and_then(extract_client_version)
-        .unwrap_or("-")
-        .to_string();
-    let agent_id = parts
-        .headers
-        .get("x-agent-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
-    let session_id = parts
-        .headers
-        .get("x-claude-code-session-id")
-        .or_else(|| parts.headers.get("x-session-id"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
+    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers);
+    let affinity_key = rctx.affinity_key(&client_ip);
+    let affinity = affinity_key.as_deref();
+    let RequestContext {
+        client_id,
+        client_ver,
+        agent_id,
+        session_id,
+    } = rctx;
 
-    let body_bytes = match axum::body::to_bytes(body, 25 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             error!("failed to read request body: {e}");
@@ -4932,16 +5038,6 @@ async fn openai_chat_handler(
     let mut oauth_anthropic_body = anthropic_body.clone();
     inject_oauth_system_prompt(&mut oauth_anthropic_body);
 
-    // Build affinity key for sticky routing — only use stickiness when there's
-    // meaningful client identification beyond just the IP address
-    let affinity_key = format!("{}:{}:{}:{}", client_ip, client_id, agent_id, session_id);
-    let has_identity = client_id != "-" || agent_id != "-" || session_id != "-";
-    let affinity = if has_identity {
-        Some(affinity_key.as_str())
-    } else {
-        None
-    };
-
     let n = state.accounts.len();
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
@@ -4973,8 +5069,10 @@ async fn openai_chat_handler(
 
             let mut headers = parts.headers.clone();
             headers.remove("host");
-            headers.remove("authorization");
-            headers.remove("x-api-key");
+            if !acct.passthrough {
+                headers.remove("authorization");
+                headers.remove("x-api-key");
+            }
             headers.remove("content-length"); // body size changes after translation
             headers.remove("accept-encoding"); // we need plaintext to translate the response
 
@@ -4982,47 +5080,8 @@ async fn openai_chat_handler(
             headers.insert("content-type", HeaderValue::from_static("application/json"));
             headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
 
-            // Auth injection with claude-code beta header for OAuth
-            if !acct.passthrough {
-                if acct.token.starts_with("sk-ant-api") {
-                    headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
-                } else if acct.token.starts_with("sk-ant-oat") {
-                    headers.insert(
-                        "authorization",
-                        HeaderValue::from_str(&format!("Bearer {}", acct.token)).unwrap(),
-                    );
-                    headers.insert(
-                        "anthropic-dangerous-direct-browser-access",
-                        HeaderValue::from_static("true"),
-                    );
-                    // OAuth tokens need both beta flags for non-Claude-Code clients
-                    let existing_beta = headers
-                        .get("anthropic-beta")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-                    let mut betas: Vec<&str> = if existing_beta.is_empty() {
-                        vec![]
-                    } else {
-                        existing_beta
-                            .split(',')
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty())
-                            .collect()
-                    };
-                    for flag in &["oauth-2025-04-20", "claude-code-20250219"] {
-                        if !betas.contains(flag) {
-                            betas.push(flag);
-                        }
-                    }
-                    headers.insert(
-                        "anthropic-beta",
-                        HeaderValue::from_str(&betas.join(",")).unwrap(),
-                    );
-                } else {
-                    headers.insert("x-api-key", HeaderValue::from_str(&acct.token).unwrap());
-                }
-            }
+            // Auth injection
+            inject_account_auth(&mut headers, &acct.token, acct.passthrough);
 
             // Use OAuth variant (with CC system prompt) for OAuth tokens
             let req_body = if acct.token.starts_with("sk-ant-oat") {
@@ -5041,7 +5100,7 @@ async fn openai_chat_handler(
             let upstream_req = state
                 .client
                 .request(reqwest::Method::POST, &url)
-                .headers(reqwest_headers(&headers))
+                .headers(headers)
                 .body(body_str);
 
             let mut resp = match upstream_req.send().await {
@@ -5057,19 +5116,7 @@ async fn openai_chat_handler(
             state.update_rate_info(idx, resp.headers()).await;
 
             // Update burn rate (after rate-limit headers are parsed)
-            {
-                let now = Instant::now();
-                if let Ok(mut br) = acct.burn_rate.lock() {
-                    br.update(now);
-                }
-                if let Ok(mut rates) = state.client_request_rates.lock() {
-                    let entry = rates
-                        .entry(client_id.clone())
-                        .or_insert_with(|| (0, Ewma::new(TAU_1H)));
-                    entry.0 += 1;
-                    entry.1.update(now);
-                }
-            }
+            state.update_burn_rate(acct, &client_id);
 
             if status == StatusCode::TOO_MANY_REQUESTS {
                 state.mark_hard_limited(idx, resp.headers()).await;
@@ -5293,51 +5340,24 @@ async fn openai_chat_handler(
                     }
 
                     // Extract and record token usage from accumulated SSE data
-                    let text = String::from_utf8_lossy(&raw_sse);
-                    let usage = TokenUsage::from_sse_text(&text);
-                    let elapsed_ms = request_start.elapsed().as_millis() as u64;
-                    if !usage.is_empty() {
-                        state_clone
-                            .record_usage(idx, &client_id_clone, &usage)
-                            .await;
-                        log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
-                    } else {
-                        let reason = if upstream_error {
-                            "upstream_error"
-                        } else if client_gone {
-                            "client_disconnect"
-                        } else {
-                            "no_usage_event"
-                        };
-                        info!(
-                            req_id,
-                            client_id = %client_id_clone,
-                            model = %model_clone,
-                            account = acct_name,
-                            reason,
-                            elapsed_ms,
-                            sse_bytes = raw_sse.len(),
-                            "stream_end_no_usage"
-                        );
-                    }
-                    state_clone.shadow_log(serde_json::json!({
-                        "ts": AppState::now_epoch(),
-                        "client": client_ip_str,
-                        "client_id": client_id_clone,
-                        "agent": agent_clone,
-                        "session": session_clone,
-                        "model": model_clone,
-                        "account": acct_name,
-                        "status": status.as_u16(),
-                        "stream": true,
-                        "openai_compat": true,
-                        "latency_ms": elapsed_ms,
-                        "input_tokens": usage.input_tokens,
-                        "output_tokens": usage.output_tokens,
-                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                        "cache_read_input_tokens": usage.cache_read_input_tokens,
-                        "client_disconnected": client_gone,
-                    }));
+                    finalize_stream(
+                        &state_clone,
+                        idx,
+                        &req_id,
+                        &client_id_clone,
+                        &model_clone,
+                        &acct_name,
+                        &client_ip_str,
+                        &agent_clone,
+                        &session_clone,
+                        status.as_u16(),
+                        &raw_sse,
+                        request_start,
+                        client_gone,
+                        upstream_error,
+                        true,
+                    )
+                    .await;
                 });
 
                 return Response::builder()
@@ -5381,27 +5401,22 @@ async fn openai_chat_handler(
 
             // Extract and record token usage from non-streaming response
             let usage = TokenUsage::from_response_body(&anthropic_resp);
-            if !usage.is_empty() {
-                state.record_usage(idx, &client_id, &usage).await;
-                log_usage(&req_id, &client_id, &model, &acct.name, &usage);
-            }
-            state.shadow_log(serde_json::json!({
-                "ts": AppState::now_epoch(),
-                "client": client_ip.to_string(),
-                "client_id": client_id,
-                "agent": agent_id,
-                "session": session_id,
-                "model": model,
-                "account": acct.name,
-                "status": status.as_u16(),
-                "stream": false,
-                "openai_compat": true,
-                "latency_ms": request_start.elapsed().as_millis() as u64,
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                "cache_read_input_tokens": usage.cache_read_input_tokens,
-            }));
+            finalize_non_stream(
+                &state,
+                idx,
+                &req_id,
+                &client_id,
+                &model,
+                &acct.name,
+                &client_ip.to_string(),
+                &agent_id,
+                &session_id,
+                status.as_u16(),
+                &usage,
+                request_start.elapsed().as_millis() as u64,
+                true,
+            )
+            .await;
 
             return Response::builder()
                 .status(StatusCode::OK)
@@ -5420,19 +5435,6 @@ async fn openai_chat_handler(
     }
 
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all accounts").into_response()
-}
-
-/// Convert axum HeaderMap to reqwest HeaderMap.
-fn reqwest_headers(headers: &axum::http::HeaderMap) -> reqwest::header::HeaderMap {
-    let mut out = reqwest::header::HeaderMap::new();
-    for (k, v) in headers.iter() {
-        if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_str().as_bytes()) {
-            if let Ok(val) = reqwest::header::HeaderValue::from_bytes(v.as_bytes()) {
-                out.append(name, val);
-            }
-        }
-    }
-    out
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -14464,19 +14466,78 @@ upstream = "https://api.anthropic.com"
     }
 
     #[test]
-    fn reqwest_headers_preserves_multi_value() {
-        let mut src = axum::http::HeaderMap::new();
-        src.append("x-custom", axum::http::HeaderValue::from_static("first"));
-        src.append("x-custom", axum::http::HeaderValue::from_static("second"));
+    fn inject_auth_api_key() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer old"));
+        inject_account_auth(&mut headers, "sk-ant-api-test123", false);
+        assert_eq!(headers.get("x-api-key").unwrap(), "sk-ant-api-test123");
+        assert!(headers.get("authorization").is_none());
+    }
 
-        let out = reqwest_headers(&src);
-        let values: Vec<&str> = out
-            .get_all("x-custom")
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect();
-        assert_eq!(values.len(), 2, "multi-value header should have 2 entries");
-        assert!(values.contains(&"first"));
-        assert!(values.contains(&"second"));
+    #[test]
+    fn inject_auth_oauth_token() {
+        let mut headers = axum::http::HeaderMap::new();
+        inject_account_auth(&mut headers, "sk-ant-oat-test123", false);
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer sk-ant-oat-test123"
+        );
+        assert_eq!(
+            headers
+                .get("anthropic-dangerous-direct-browser-access")
+                .unwrap(),
+            "true"
+        );
+        let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(beta.contains("oauth-2025-04-20"));
+        assert!(beta.contains("claude-code-20250219"));
+    }
+
+    #[test]
+    fn inject_auth_oauth_merges_multi_value_beta() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("anthropic-beta", HeaderValue::from_static("existing-flag"));
+        headers.append("anthropic-beta", HeaderValue::from_static("another-flag"));
+        inject_account_auth(&mut headers, "sk-ant-oat-test123", false);
+        let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(
+            beta.contains("existing-flag"),
+            "should preserve first header"
+        );
+        assert!(
+            beta.contains("another-flag"),
+            "should preserve second header"
+        );
+        assert!(beta.contains("oauth-2025-04-20"), "should add oauth flag");
+        assert!(beta.contains("claude-code-20250219"), "should add cc flag");
+    }
+
+    #[test]
+    fn inject_auth_passthrough_preserves_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer user-token"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static("user-key"));
+        inject_account_auth(&mut headers, "passthrough", true);
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer user-token");
+        assert_eq!(headers.get("x-api-key").unwrap(), "user-key");
+    }
+
+    #[test]
+    fn request_context_trims_whitespace_headers() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-agent-id", HeaderValue::from_static("  "));
+        headers.insert("x-session-id", HeaderValue::from_static(" \t "));
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let rctx = RequestContext::from_request(&state, &ip, &headers);
+        assert_eq!(rctx.agent_id, "-", "whitespace-only agent_id should be -");
+        assert_eq!(
+            rctx.session_id, "-",
+            "whitespace-only session_id should be -"
+        );
+        assert!(rctx.affinity_key(&ip).is_none(), "no meaningful identity");
     }
 }
