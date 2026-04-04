@@ -2272,6 +2272,21 @@ impl AppState {
         }
     }
 
+    /// Update burn rate for an account and per-client request tracking.
+    fn update_burn_rate(&self, acct: &Account, client_id: &str) {
+        let now = Instant::now();
+        if let Ok(mut br) = acct.burn_rate.lock() {
+            br.update(now);
+        }
+        if let Ok(mut rates) = self.client_request_rates.lock() {
+            let entry = rates
+                .entry(client_id.to_owned())
+                .or_insert_with(|| (0, Ewma::new(TAU_1H)));
+            entry.0 += 1;
+            entry.1.update(now);
+        }
+    }
+
     /// Write a shadow log entry (fire-and-forget).
     fn shadow_log(&self, entry: serde_json::Value) {
         if let Some(ref tx) = self.shadow_log_tx {
@@ -2860,20 +2875,7 @@ async fn proxy_handler(
             state.update_rate_info(idx, resp.headers()).await;
 
             // Update burn rate (after rate-limit headers are parsed)
-            {
-                let now = Instant::now();
-                if let Ok(mut br) = acct.burn_rate.lock() {
-                    br.update(now);
-                }
-                // Per-client request tracking
-                if let Ok(mut rates) = state.client_request_rates.lock() {
-                    let entry = rates
-                        .entry(client_id.clone())
-                        .or_insert_with(|| (0, Ewma::new(TAU_1H)));
-                    entry.0 += 1;
-                    entry.1.update(now);
-                }
-            }
+            state.update_burn_rate(acct, &client_id);
 
             // 429 → mark hard-limited and try next account
             if status == StatusCode::TOO_MANY_REQUESTS {
@@ -5026,19 +5028,7 @@ async fn openai_chat_handler(
             state.update_rate_info(idx, resp.headers()).await;
 
             // Update burn rate (after rate-limit headers are parsed)
-            {
-                let now = Instant::now();
-                if let Ok(mut br) = acct.burn_rate.lock() {
-                    br.update(now);
-                }
-                if let Ok(mut rates) = state.client_request_rates.lock() {
-                    let entry = rates
-                        .entry(client_id.clone())
-                        .or_insert_with(|| (0, Ewma::new(TAU_1H)));
-                    entry.0 += 1;
-                    entry.1.update(now);
-                }
-            }
+            state.update_burn_rate(acct, &client_id);
 
             if status == StatusCode::TOO_MANY_REQUESTS {
                 state.mark_hard_limited(idx, resp.headers()).await;
