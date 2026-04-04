@@ -2151,23 +2151,18 @@ fn inject_account_auth(headers: &mut axum::http::HeaderMap, token: &str, passthr
             HeaderValue::from_static("true"),
         );
         // Merge required OAuth beta flags with any existing client flags
-        let existing_beta = headers
-            .get("anthropic-beta")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let mut flags: Vec<&str> = if existing_beta.is_empty() {
-            vec![]
-        } else {
-            existing_beta
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect()
-        };
+        // Use get_all to handle multiple anthropic-beta headers
+        let mut flags: Vec<String> = headers
+            .get_all("anthropic-beta")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|s| s.split(','))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         for flag in OAUTH_BETA_FLAGS {
-            if !flags.contains(flag) {
-                flags.push(flag);
+            if !flags.iter().any(|f| f == flag) {
+                flags.push(flag.to_string());
             }
         }
         headers.insert(
@@ -2200,12 +2195,22 @@ impl RequestContext {
             agent_id: headers
                 .get("x-agent-id")
                 .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
                 .unwrap_or("-")
                 .to_string(),
             session_id: headers
                 .get("x-claude-code-session-id")
-                .or_else(|| headers.get("x-session-id"))
                 .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    headers
+                        .get("x-session-id")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                })
                 .unwrap_or("-")
                 .to_string(),
         }
@@ -5064,8 +5069,10 @@ async fn openai_chat_handler(
 
             let mut headers = parts.headers.clone();
             headers.remove("host");
-            headers.remove("authorization");
-            headers.remove("x-api-key");
+            if !acct.passthrough {
+                headers.remove("authorization");
+                headers.remove("x-api-key");
+            }
             headers.remove("content-length"); // body size changes after translation
             headers.remove("accept-encoding"); // we need plaintext to translate the response
 
@@ -14456,5 +14463,81 @@ upstream = "https://api.anthropic.com"
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["error"]["message"], "upstream timeout");
         assert_eq!(body["error"]["type"], "api_error");
+    }
+
+    #[test]
+    fn inject_auth_api_key() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer old"));
+        inject_account_auth(&mut headers, "sk-ant-api-test123", false);
+        assert_eq!(headers.get("x-api-key").unwrap(), "sk-ant-api-test123");
+        assert!(headers.get("authorization").is_none());
+    }
+
+    #[test]
+    fn inject_auth_oauth_token() {
+        let mut headers = axum::http::HeaderMap::new();
+        inject_account_auth(&mut headers, "sk-ant-oat-test123", false);
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer sk-ant-oat-test123"
+        );
+        assert_eq!(
+            headers
+                .get("anthropic-dangerous-direct-browser-access")
+                .unwrap(),
+            "true"
+        );
+        let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(beta.contains("oauth-2025-04-20"));
+        assert!(beta.contains("claude-code-20250219"));
+    }
+
+    #[test]
+    fn inject_auth_oauth_merges_multi_value_beta() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("anthropic-beta", HeaderValue::from_static("existing-flag"));
+        headers.append("anthropic-beta", HeaderValue::from_static("another-flag"));
+        inject_account_auth(&mut headers, "sk-ant-oat-test123", false);
+        let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(
+            beta.contains("existing-flag"),
+            "should preserve first header"
+        );
+        assert!(
+            beta.contains("another-flag"),
+            "should preserve second header"
+        );
+        assert!(beta.contains("oauth-2025-04-20"), "should add oauth flag");
+        assert!(beta.contains("claude-code-20250219"), "should add cc flag");
+    }
+
+    #[test]
+    fn inject_auth_passthrough_preserves_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer user-token"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static("user-key"));
+        inject_account_auth(&mut headers, "passthrough", true);
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer user-token");
+        assert_eq!(headers.get("x-api-key").unwrap(), "user-key");
+    }
+
+    #[test]
+    fn request_context_trims_whitespace_headers() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-agent-id", HeaderValue::from_static("  "));
+        headers.insert("x-session-id", HeaderValue::from_static(" \t "));
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let rctx = RequestContext::from_request(&state, &ip, &headers);
+        assert_eq!(rctx.agent_id, "-", "whitespace-only agent_id should be -");
+        assert_eq!(
+            rctx.session_id, "-",
+            "whitespace-only session_id should be -"
+        );
+        assert!(rctx.affinity_key(&ip).is_none(), "no meaningful identity");
     }
 }
