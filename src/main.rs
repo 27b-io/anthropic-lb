@@ -2238,6 +2238,74 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
     );
 }
 
+/// Finalize a streaming response: extract usage, log, and shadow log.
+/// Shared by proxy_handler and openai_chat_handler.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_stream(
+    state: &AppState,
+    idx: usize,
+    req_id: &str,
+    client_id: &str,
+    model: &str,
+    acct_name: &str,
+    client_ip: &str,
+    agent: &str,
+    session: &str,
+    status_code: u16,
+    sse_buf: &[u8],
+    request_start: std::time::Instant,
+    client_disconnected: bool,
+    upstream_error: bool,
+    openai_compat: bool,
+) {
+    let text = String::from_utf8_lossy(sse_buf);
+    let usage = TokenUsage::from_sse_text(&text);
+    let elapsed_ms = request_start.elapsed().as_millis() as u64;
+    if !usage.is_empty() {
+        state.record_usage(idx, client_id, &usage).await;
+        log_usage(req_id, client_id, model, acct_name, &usage);
+    } else {
+        let reason = if upstream_error {
+            "upstream_error"
+        } else if client_disconnected {
+            "client_disconnect"
+        } else {
+            "no_usage_event"
+        };
+        info!(
+            req_id,
+            client_id,
+            model,
+            account = acct_name,
+            reason,
+            elapsed_ms,
+            sse_bytes = sse_buf.len(),
+            "stream_end_no_usage"
+        );
+    }
+    let mut log = serde_json::json!({
+        "ts": AppState::now_epoch(),
+        "client": client_ip,
+        "client_id": client_id,
+        "agent": agent,
+        "session": session,
+        "model": model,
+        "account": acct_name,
+        "status": status_code,
+        "stream": true,
+        "latency_ms": elapsed_ms,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens,
+        "client_disconnected": client_disconnected,
+    });
+    if openai_compat {
+        log["openai_compat"] = serde_json::json!(true);
+    }
+    state.shadow_log(log);
+}
+
 impl AppState {
     /// Record token usage for an account and client.
     async fn record_usage(&self, account_idx: usize, client_id: &str, usage: &TokenUsage) {
@@ -3002,50 +3070,24 @@ async fn proxy_handler(
                         }
                     }
                     // Parse accumulated SSE data for usage
-                    let text = String::from_utf8_lossy(&sse_buf);
-                    let usage = TokenUsage::from_sse_text(&text);
-                    let elapsed_ms = request_start.elapsed().as_millis() as u64;
-                    if !usage.is_empty() {
-                        state_clone
-                            .record_usage(idx, &client_id_clone, &usage)
-                            .await;
-                        log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
-                    } else {
-                        let reason = if upstream_error {
-                            "upstream_error"
-                        } else if client_disconnected {
-                            "client_disconnect"
-                        } else {
-                            "no_usage_event"
-                        };
-                        info!(
-                            req_id,
-                            client_id = %client_id_clone,
-                            model = %model_clone,
-                            account = acct_name,
-                            reason,
-                            elapsed_ms,
-                            sse_bytes = sse_buf.len(),
-                            "stream_end_no_usage"
-                        );
-                    }
-                    state_clone.shadow_log(serde_json::json!({
-                        "ts": AppState::now_epoch(),
-                        "client": client_ip_str,
-                        "client_id": client_id_clone,
-                        "agent": agent_clone,
-                        "session": session_clone,
-                        "model": model_clone,
-                        "account": acct_name,
-                        "status": status.as_u16(),
-                        "stream": true,
-                        "latency_ms": elapsed_ms,
-                        "input_tokens": usage.input_tokens,
-                        "output_tokens": usage.output_tokens,
-                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                        "cache_read_input_tokens": usage.cache_read_input_tokens,
-                        "client_disconnected": client_disconnected,
-                    }));
+                    finalize_stream(
+                        &state_clone,
+                        idx,
+                        &req_id,
+                        &client_id_clone,
+                        &model_clone,
+                        &acct_name,
+                        &client_ip_str,
+                        &agent_clone,
+                        &session_clone,
+                        status.as_u16(),
+                        &sse_buf,
+                        request_start,
+                        client_disconnected,
+                        upstream_error,
+                        false,
+                    )
+                    .await;
                 });
 
                 let body_stream = ReceiverStream::new(rx);
@@ -5252,51 +5294,24 @@ async fn openai_chat_handler(
                     }
 
                     // Extract and record token usage from accumulated SSE data
-                    let text = String::from_utf8_lossy(&raw_sse);
-                    let usage = TokenUsage::from_sse_text(&text);
-                    let elapsed_ms = request_start.elapsed().as_millis() as u64;
-                    if !usage.is_empty() {
-                        state_clone
-                            .record_usage(idx, &client_id_clone, &usage)
-                            .await;
-                        log_usage(&req_id, &client_id_clone, &model_clone, &acct_name, &usage);
-                    } else {
-                        let reason = if upstream_error {
-                            "upstream_error"
-                        } else if client_gone {
-                            "client_disconnect"
-                        } else {
-                            "no_usage_event"
-                        };
-                        info!(
-                            req_id,
-                            client_id = %client_id_clone,
-                            model = %model_clone,
-                            account = acct_name,
-                            reason,
-                            elapsed_ms,
-                            sse_bytes = raw_sse.len(),
-                            "stream_end_no_usage"
-                        );
-                    }
-                    state_clone.shadow_log(serde_json::json!({
-                        "ts": AppState::now_epoch(),
-                        "client": client_ip_str,
-                        "client_id": client_id_clone,
-                        "agent": agent_clone,
-                        "session": session_clone,
-                        "model": model_clone,
-                        "account": acct_name,
-                        "status": status.as_u16(),
-                        "stream": true,
-                        "openai_compat": true,
-                        "latency_ms": elapsed_ms,
-                        "input_tokens": usage.input_tokens,
-                        "output_tokens": usage.output_tokens,
-                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                        "cache_read_input_tokens": usage.cache_read_input_tokens,
-                        "client_disconnected": client_gone,
-                    }));
+                    finalize_stream(
+                        &state_clone,
+                        idx,
+                        &req_id,
+                        &client_id_clone,
+                        &model_clone,
+                        &acct_name,
+                        &client_ip_str,
+                        &agent_clone,
+                        &session_clone,
+                        status.as_u16(),
+                        &raw_sse,
+                        request_start,
+                        client_gone,
+                        upstream_error,
+                        true,
+                    )
+                    .await;
                 });
 
                 return Response::builder()
