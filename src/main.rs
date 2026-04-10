@@ -1418,7 +1418,7 @@ impl AppState {
     ) -> &'a RoutingCandidate {
         let mut picked = self.pick_weighted_bucket(effective, total_weight, affinity_key);
 
-        if affinity_key.is_some() && effective.len() < 3 {
+        if affinity_key.is_some() {
             let best = effective
                 .iter()
                 .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap())
@@ -6724,15 +6724,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn affinity_override_skipped_with_three_candidates() {
-        // With 3+ candidates the override is disabled — proportional buckets
-        // handle distribution. Even with a large weight disparity, all three
-        // accounts should receive some traffic via affinity routing.
-        let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("steve", "sk-ant-api-b"),
-            make_account("jeff", "sk-ant-api-c"),
-        ]);
+    async fn affinity_override_preserves_stickiness_with_moderate_disparity() {
+        // With 3 candidates whose weights are moderately different (none below
+        // 0.25 ratio to the best), the override does NOT fire — all three
+        // accounts receive sticky traffic via proportional bucket hashing.
+        let state = test_state_with_strategy(
+            vec![
+                make_account("primary", "sk-ant-api-a"),
+                make_account("steve", "sk-ant-api-b"),
+                make_account("jeff", "sk-ant-api-c"),
+            ],
+            RoutingStrategy::StickyWeightedV2,
+        );
         let now = AppState::now_epoch();
         // primary is clearly best, steve middling, jeff worst
         set_account_utilization(&state, 0, 0.13, 0.41, now + 10000, now + 300000).await;
@@ -6753,8 +6756,67 @@ mod tests {
         }
         assert!(
             saw[0] && saw[1] && saw[2],
-            "all 3 accounts should receive traffic when override is disabled (3 candidates)"
+            "all 3 accounts should receive traffic with moderate disparity"
         );
+    }
+
+    #[tokio::test]
+    async fn affinity_override_fires_with_three_candidates_egregious_disparity() {
+        // When one account is near-exhausted (85% util) and others have plenty
+        // of headroom, sessions that hash into the exhausted account's tiny
+        // bucket should be overridden to the best account.
+        let state = test_state_with_strategy(
+            vec![
+                make_account("primary", "sk-ant-api-a"),
+                make_account("jeff", "sk-ant-api-b"),
+                make_account("insight", "sk-ant-api-c"),
+            ],
+            RoutingStrategy::StickyWeightedV2,
+        );
+        let now = AppState::now_epoch();
+        set_account_utilization(&state, 0, 0.09, 0.09, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 1, 0.20, 0.31, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 2, 0.85, 0.85, now + 10000, now + 300000).await;
+
+        // Find a key that would naturally hash into insight's bucket.
+        // Candidates/weights are static, so compute boundaries once.
+        let candidates = state.routing_candidates("claude-opus-4-6", &[]).await;
+        let total_weight: f64 = candidates.iter().map(|c| c.weight).sum();
+        let mut boundaries: Vec<(usize, f64)> = Vec::new();
+        let mut cumulative = 0.0;
+        for c in &candidates {
+            cumulative += c.weight;
+            boundaries.push((c.idx, cumulative));
+        }
+
+        let mut insight_key = None;
+        for i in 0..10000 {
+            let key = format!("find-insight-{}", i);
+            let target = (stable_affinity_hash(&key) as f64 / u64::MAX as f64) * total_weight;
+            for &(idx, boundary) in &boundaries {
+                if target < boundary {
+                    if idx == 2 {
+                        insight_key = Some(key);
+                    }
+                    break;
+                }
+            }
+            if insight_key.is_some() {
+                break;
+            }
+        }
+        let key = insight_key.expect("should find a key that hashes to insight's bucket");
+
+        // With the override, pick_account should redirect away from insight
+        let idx = state
+            .pick_account(Some(&key), "claude-opus-4-6", &[])
+            .await
+            .unwrap();
+        assert_ne!(
+            idx, 2,
+            "insight (85% util) should be overridden despite affinity hash landing there"
+        );
+        assert_eq!(idx, 0, "should override to primary (best headroom)");
     }
 
     #[tokio::test]
