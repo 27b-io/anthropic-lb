@@ -458,6 +458,8 @@ struct AppState {
     next_req_id: AtomicU64,
     /// Random instance ID for cross-replica log disambiguation.
     instance_id: u16,
+    /// Probe interval in seconds. Used for freshness check and distributed lock TTL.
+    probe_interval_secs: u64,
 }
 
 impl Account {
@@ -719,6 +721,54 @@ impl AppState {
             }
         }
 
+        // Local freshness check: skip if data was recently refreshed (e.g. by Redis sync)
+        let now_epoch = Self::now_epoch();
+        {
+            let info = acct.rate_info.read().await;
+            if let Some(epoch) = info.last_updated_epoch {
+                let age = now_epoch.saturating_sub(epoch);
+                if age < self.probe_interval_secs / 2 {
+                    trace!(
+                        account = acct.name,
+                        probe_model = model,
+                        age_secs = age,
+                        "probe skipped, data is fresh"
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Distributed probe lock: only one pod probes each account+model per interval
+        if let Some(redis) = &self.redis {
+            let mut conn = redis.clone();
+            let lock_key = format!("alb:probe:{}:{}", acct.name, model);
+            let lock_ttl = self.probe_interval_secs.saturating_sub(30).max(60);
+            let acquired: redis::RedisResult<bool> = redis::cmd("SET")
+                .arg(&lock_key)
+                .arg(1u8)
+                .arg("NX")
+                .arg("EX")
+                .arg(lock_ttl)
+                .query_async(&mut conn)
+                .await;
+            match acquired {
+                Ok(true) => {} // Lock acquired, proceed with probe
+                Ok(false) => {
+                    trace!(
+                        account = acct.name,
+                        probe_model = model,
+                        "probe skipped, another replica is probing"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    // Fail-open: if Redis is down, probe anyway
+                    trace!(account = acct.name, error = %e, "probe lock failed, probing anyway");
+                }
+            }
+        }
+
         let url = format!("{}/v1/messages", self.upstream);
         let body = serde_json::json!({
             "model": model,
@@ -778,8 +828,10 @@ impl AppState {
                 }
                 self.save_state().await;
                 let info = acct.rate_info.read().await;
+                let now_epoch = Self::now_epoch();
                 let (eff_util, constraint, _adj_5h, _adj_7d) =
-                    effective_utilization(&info, Self::now_epoch(), model);
+                    effective_utilization(&info, now_epoch, model);
+                let rw = compute_routing_weight(&info, model, now_epoch, false);
                 info!(
                     account = acct.name,
                     status = status.as_u16(),
@@ -797,6 +849,27 @@ impl AppState {
                         .unwrap_or("-"),
                     constraint,
                     n_claims_7d = info.claims_7d.len(),
+                    gate_5h = rw
+                        .as_ref()
+                        .map(|r| format!("{:.4}", r.gate_5h))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    gate_7d = rw
+                        .as_ref()
+                        .map(|r| format!("{:.4}", r.gate_7d))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    waste_risk = rw
+                        .as_ref()
+                        .map(|r| format!("{:.4}", r.wr))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    weight = rw
+                        .as_ref()
+                        .map(|r| format!("{:.4}", r.weight))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    weight_source = rw.as_ref().map(|r| r.source).unwrap_or("-"),
                     "probe complete"
                 );
             }
@@ -1212,12 +1285,109 @@ fn effective_utilization(
     }
 }
 
+/// Computed routing weight for a single account+model. Extracted so both
+/// `routing_candidates()` (real requests) and `probe_account()` (periodic probes)
+/// use identical logic. Returns `None` when the account's 7d claim is rejected
+/// (caller should skip it).
+struct RoutingWeight {
+    gate_5h: f64,
+    gate_7d: f64,
+    gate: f64,
+    wr: f64,
+    weight: f64,
+    source: &'static str,
+}
+
+fn compute_routing_weight(
+    info: &RateLimitInfo,
+    model: &str,
+    now_epoch: u64,
+    stale_after_hard_limit: bool,
+) -> Option<RoutingWeight> {
+    // 5h gate: time-adjusted 5h utilization with status floors
+    let gate_5h = if stale_after_hard_limit {
+        0.5
+    } else {
+        time_adjusted_utilization(
+            info.utilization_5h,
+            info.reset_5h,
+            info.status_5h.as_deref(),
+            NEAR_RESET_5H_SECS,
+            now_epoch,
+        )
+        .unwrap_or_else(|| {
+            // Fallback: raw unified, legacy, or unknown
+            if let Some(util) = info.utilization {
+                util
+            } else if let Some(remaining) = info.remaining_tokens {
+                let limit = info.limit_tokens.unwrap_or(1_000_000);
+                (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
+            } else {
+                0.5
+            }
+        })
+    };
+
+    // 7d model-specific gate and waste risk
+    let (gate_7d, wr, source) = if let Some(claim) = resolve_7d_claim(info, model) {
+        if claim.status.as_deref() == Some("rejected") && !stale_after_hard_limit {
+            return None; // caller should skip this account
+        }
+        (
+            if stale_after_hard_limit {
+                0.5
+            } else {
+                time_adjusted_utilization(
+                    Some(0.0),
+                    claim.reset,
+                    claim.status.as_deref(),
+                    NEAR_RESET_7D_SECS,
+                    now_epoch,
+                )
+                .unwrap_or(0.0)
+            },
+            waste_risk(claim.utilization, claim.reset, now_epoch),
+            "waste_risk",
+        )
+    } else {
+        (
+            if stale_after_hard_limit {
+                0.5
+            } else {
+                time_adjusted_utilization(
+                    Some(0.0),
+                    info.reset_7d,
+                    info.status_7d.as_deref(),
+                    NEAR_RESET_7D_SECS,
+                    now_epoch,
+                )
+                .unwrap_or(0.0)
+            },
+            0.0,
+            "headroom_only",
+        )
+    };
+
+    let gate = gate_5h.max(gate_7d);
+    let headroom = (1.0 - gate).max(0.01);
+    let weight = if wr > 0.0 { wr * headroom } else { headroom };
+    let weight = if gate >= 1.0 { 0.0 } else { weight };
+
+    Some(RoutingWeight {
+        gate_5h,
+        gate_7d,
+        gate,
+        wr,
+        weight,
+        source,
+    })
+}
+
 impl AppState {
     async fn routing_candidates(&self, model: &str, skip: &[usize]) -> Vec<RoutingCandidate> {
         let now = Instant::now();
         let now_epoch = Self::now_epoch();
-        let mut candidate_meta: Vec<(usize, &'static str)> = Vec::new();
-        let mut candidate_snaps: Vec<AcctMetricsSnap> = Vec::new();
+        let mut candidates: Vec<RoutingCandidate> = Vec::new();
         for (i, acct) in self.accounts.iter().enumerate() {
             if skip.contains(&i) {
                 trace!(account = acct.name, "pick: skipping, already tried");
@@ -1254,14 +1424,9 @@ impl AppState {
                 .hard_limited_until
                 .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
 
-            // 7d model-specific selection. Keep raw 7d utilization in waste_risk,
-            // and use gate_7d only for pressure/status so we do not double-count
-            // the same 7d signal in both terms.
-            let (claims, source) = if let Some(claim) = resolve_7d_claim(&info, model) {
-                // Skip if this model's 7d claim is rejected AND we have fresh data.
-                // Stale rejections from expired hard limits are ignored — the account
-                // needs a chance to prove it's recovered.
-                if claim.status.as_deref() == Some("rejected") && !stale_after_hard_limit {
+            let rw = match compute_routing_weight(&info, model, now_epoch, stale_after_hard_limit) {
+                Some(rw) => rw,
+                None => {
                     trace!(
                         account = acct.name,
                         model = model,
@@ -1269,70 +1434,27 @@ impl AppState {
                     );
                     continue;
                 }
-                (
-                    vec![ClaimMetricsSnap {
-                        key: "selected".to_string(),
-                        utilization: claim.utilization,
-                        waste_risk: waste_risk(claim.utilization, claim.reset, now_epoch),
-                        reset: claim.reset,
-                        status: claim.status.clone(),
-                    }],
-                    "waste_risk",
-                )
-            } else {
-                (Vec::new(), "headroom_only")
             };
 
-            candidate_snaps.push(AcctMetricsSnap {
-                name: acct.name.clone(),
-                passthrough: acct.passthrough,
-                has_applicable_7d: !claims.is_empty(),
-                utilization: info.utilization,
-                utilization_5h: info.utilization_5h,
-                utilization_7d: info.utilization_7d,
-                reset_5h: info.reset_5h,
-                reset_7d: info.reset_7d,
-                status_5h: info.status_5h.clone(),
-                status_7d: info.status_7d.clone(),
-                stale_after_hard_limit,
-                hard_limited_active: false,
-                burn_rate: (0.0, 0.0, 0.0),
-                headroom: None,
-                remaining_requests: info.remaining_requests,
-                remaining_tokens: info.remaining_tokens,
-                limit_requests: info.limit_requests,
-                limit_tokens: info.limit_tokens,
-                requests_total: 0,
-                hard_limited_secs: 0.0,
-                projected_throttle_secs: None,
-                token_usage: [0; 4],
-                claims,
-            });
-            candidate_meta.push((i, source));
-        }
-
-        let weight_snaps = compute_routing_weights(&candidate_snaps, now_epoch, self.soft_limit);
-        let mut candidates: Vec<RoutingCandidate> = Vec::with_capacity(weight_snaps.len());
-        for ((idx, source), snap) in candidate_meta.into_iter().zip(weight_snaps) {
             trace!(
-                account = snap.name,
-                gate_5h = format!("{:.4}", snap.gate_5h),
-                gate_7d = format!("{:.4}", snap.gate_7d),
-                gate = format!("{:.4}", snap.gate),
-                waste_risk = format!("{:.4}", snap.wr),
-                weight = format!("{:.4}", snap.weight),
-                source = source,
+                account = acct.name,
+                gate_5h = format!("{:.4}", rw.gate_5h),
+                gate_7d = format!("{:.4}", rw.gate_7d),
+                gate = format!("{:.4}", rw.gate),
+                waste_risk = format!("{:.4}", rw.wr),
+                weight = format!("{:.4}", rw.weight),
+                source = rw.source,
                 "pick: candidate"
             );
 
             candidates.push(RoutingCandidate {
-                idx,
-                gate_5h: snap.gate_5h,
-                gate_7d: snap.gate_7d,
-                gate: snap.gate,
-                wr: snap.wr,
-                weight: snap.weight,
-                source,
+                idx: i,
+                gate_5h: rw.gate_5h,
+                gate_7d: rw.gate_7d,
+                gate: rw.gate,
+                wr: rw.wr,
+                weight: rw.weight,
+                source: rw.source,
             });
         }
         candidates
@@ -6039,6 +6161,7 @@ async fn main() {
             use std::hash::{BuildHasher, Hasher};
             RandomState::new().build_hasher().finish() as u16
         },
+        probe_interval_secs: config.probe_interval_secs.unwrap_or(300),
     });
 
     if state.auto_cache {
@@ -6250,6 +6373,7 @@ mod tests {
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         })
     }
 
@@ -6289,6 +6413,7 @@ mod tests {
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         })
     }
 
@@ -6389,6 +6514,7 @@ mod tests {
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         (build_router(state.clone()), state)
@@ -6482,6 +6608,7 @@ mod tests {
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -8785,6 +8912,7 @@ mod tests {
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         let app = Router::new()
@@ -9460,6 +9588,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         // Try many affinity keys — all should route to healthy (idx 0)
@@ -9560,6 +9689,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         // Within budget
@@ -10067,6 +10197,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         {
             let mut info = state.accounts[0].rate_info.write().await;
@@ -10137,6 +10268,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         {
             let mut info = state.accounts[0].rate_info.write().await;
@@ -10503,6 +10635,138 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(wr, 0.0, "util > 1.0 should produce zero waste risk");
     }
 
+    // ── compute_routing_weight tests ──────────────────────────────
+
+    #[test]
+    fn routing_weight_basic_5h_only() {
+        // No 7d data → headroom_only, weight = headroom = 1 - gate_5h
+        let now = 1_000_000u64;
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.40),
+            reset_5h: Some(now + 18000), // 5h window
+            status_5h: Some("allowed".to_string()),
+            ..Default::default()
+        };
+        let rw = compute_routing_weight(&info, "claude-sonnet-4-6", now, false)
+            .expect("should produce weight");
+        assert!(rw.gate_5h > 0.0 && rw.gate_5h < 1.0);
+        assert_eq!(rw.source, "headroom_only");
+        assert!(rw.wr == 0.0);
+        assert!(rw.weight > 0.0);
+    }
+
+    #[test]
+    fn routing_weight_with_waste_risk() {
+        // 7d claim present → waste_risk sourced weight
+        let now = 1_000_000u64;
+        let mut claims = HashMap::new();
+        claims.insert(
+            "seven_day_sonnet".to_string(),
+            ClaimWindowData {
+                utilization: Some(0.40),
+                reset: Some(now + 302400), // 3.5 days
+                status: Some("allowed".to_string()),
+                last_seen: now,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.20),
+            reset_5h: Some(now + 18000),
+            status_5h: Some("allowed".to_string()),
+            claims_7d: claims,
+            ..Default::default()
+        };
+        let rw = compute_routing_weight(&info, "claude-sonnet-4-6", now, false)
+            .expect("should produce weight");
+        assert_eq!(rw.source, "waste_risk");
+        assert!(rw.wr > 0.0, "waste_risk should be positive");
+        // weight = wr * headroom (both positive)
+        assert!(rw.weight > 0.0);
+    }
+
+    #[test]
+    fn routing_weight_rejected_returns_none() {
+        // 7d claim rejected → None (account should be skipped)
+        let now = 1_000_000u64;
+        let mut claims = HashMap::new();
+        claims.insert(
+            "seven_day_sonnet".to_string(),
+            ClaimWindowData {
+                utilization: Some(1.0),
+                reset: Some(now + 302400),
+                status: Some("rejected".to_string()),
+                last_seen: now,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.20),
+            reset_5h: Some(now + 18000),
+            status_5h: Some("allowed".to_string()),
+            claims_7d: claims,
+            ..Default::default()
+        };
+        assert!(
+            compute_routing_weight(&info, "claude-sonnet-4-6", now, false).is_none(),
+            "rejected claim should return None"
+        );
+    }
+
+    #[test]
+    fn routing_weight_stale_uses_fallback() {
+        // stale_after_hard_limit = true → both gates fallback to 0.5
+        let now = 1_000_000u64;
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.95), // would be high, but stale
+            reset_5h: Some(now + 18000),
+            status_5h: Some("throttled".to_string()),
+            ..Default::default()
+        };
+        let rw = compute_routing_weight(&info, "claude-sonnet-4-6", now, true)
+            .expect("stale should still produce weight");
+        assert_eq!(rw.gate_5h, 0.5);
+        assert_eq!(rw.gate_7d, 0.5);
+        assert_eq!(rw.gate, 0.5);
+    }
+
+    #[test]
+    fn routing_weight_rejected_but_stale_still_returns_some() {
+        // Stale after hard limit + rejected claim → should NOT skip (give it a chance)
+        let now = 1_000_000u64;
+        let mut claims = HashMap::new();
+        claims.insert(
+            "seven_day_sonnet".to_string(),
+            ClaimWindowData {
+                utilization: Some(1.0),
+                reset: Some(now + 302400),
+                status: Some("rejected".to_string()),
+                last_seen: now,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.20),
+            reset_5h: Some(now + 18000),
+            status_5h: Some("allowed".to_string()),
+            claims_7d: claims,
+            ..Default::default()
+        };
+        assert!(
+            compute_routing_weight(&info, "claude-sonnet-4-6", now, true).is_some(),
+            "stale rejected should still return Some (give account a chance)"
+        );
+    }
+
+    #[test]
+    fn routing_weight_no_data_uses_defaults() {
+        // No utilization data at all → gate_5h=0.5 (unknown), headroom=0.5
+        let now = 1_000_000u64;
+        let info = RateLimitInfo::default();
+        let rw = compute_routing_weight(&info, "claude-sonnet-4-6", now, false)
+            .expect("should produce weight with defaults");
+        assert_eq!(rw.gate_5h, 0.5);
+        assert_eq!(rw.source, "headroom_only");
+        assert!(rw.weight > 0.0);
+    }
+
     // ── resolve_7d_claim tests ────────────────────────────────────
 
     #[test]
@@ -10625,6 +10889,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         // Header overrides IP mapping (supports multiple clients per IP)
@@ -10692,6 +10957,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -11485,6 +11751,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.60, 0.50, now + 10000, now + 100000).await;
@@ -11533,6 +11800,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
@@ -11582,6 +11850,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -11633,6 +11902,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
         // Operator bypasses everything
@@ -11681,6 +11951,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         // Request for "claude-opus" — no account serves it → should pass
         assert!(
@@ -11731,6 +12002,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         // Don't set any utilization — accounts remain "unknown" (0.5)
         // With limit=0.30, unknown 0.5 would appear "above limit" without fail-open
@@ -11785,6 +12057,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         // Two known accounts above limit, one unknown (no data set)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -11859,6 +12132,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
         assert!(state.is_emergency_brake_active().await);
@@ -11935,6 +12209,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         set_account_utilization(&state, 0, 0.85, 0.70, now + 10000, now + 100000).await;
         assert!(
@@ -12026,6 +12301,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         // No rate data set — account returns (0.5, "unknown")
         // 0.5 >= 0.4 threshold → all_above is true
@@ -12077,6 +12353,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         set_account_utilization(&state, 0, 0.60, 0.55, now + 10000, now + 100000).await;
         // Account 1: no data → (0.5, "unknown"), 0.5 >= 0.4 → all_above stays true
@@ -12175,6 +12452,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         // "-" is not the operator
         assert!(!state.is_operator("-"));
@@ -12251,6 +12529,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         // Operator always gets "healthy" regardless of utilization
         assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
@@ -12294,6 +12573,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         // gastown has limit 0.85, 80% of that = 0.68
         // At 0.60, below 0.68 → no upgrade → "healthy"
@@ -12513,6 +12793,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         // Set utilization above client's limit (0.80 > 0.50)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -12574,6 +12855,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         // Set utilization below client's limit (0.50 < 0.90)
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -12632,6 +12914,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         // All accounts above emergency threshold. 5h=0.96 > emergency threshold (0.88).
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -12698,6 +12981,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         // All accounts above emergency threshold — 5h only (avoid claim penalty on 7d)
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -12761,6 +13045,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
 
@@ -12819,6 +13104,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
 
@@ -12928,6 +13214,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
@@ -12999,6 +13286,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         let status = compute_pressure_status(0.99, "operator-id", &state);
@@ -13050,6 +13338,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
@@ -13368,6 +13657,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         assert!(state.is_operator("special-operator"));
@@ -13414,6 +13704,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
         assert!(state.is_operator("ray"));
         assert!(state.is_operator("openclaw"));
@@ -13474,6 +13765,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         // Budget check uses local path when redis is None
@@ -13607,6 +13899,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         // Recording 0 tokens should be a no-op
@@ -13970,6 +14263,7 @@ upstream = "https://api.anthropic.com"
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         // Set up some state to persist
@@ -14055,6 +14349,7 @@ upstream = "https://api.anthropic.com"
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         // Load state
@@ -14140,6 +14435,7 @@ upstream = "https://api.anthropic.com"
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         // Pre-populate with yesterday's usage (high usage that would exceed budget)
@@ -14194,6 +14490,7 @@ upstream = "https://api.anthropic.com"
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         // Pre-populate with yesterday's exhausted budget
@@ -14665,6 +14962,7 @@ upstream = "https://api.anthropic.com"
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         // Seed two operator clients and one regular client with token usage
@@ -14912,6 +15210,7 @@ upstream = "https://api.anthropic.com"
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         let app = build_router(state);
@@ -15649,6 +15948,7 @@ upstream = "https://api.anthropic.com"
             cluster_info_cache: Mutex::new(None),
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
+            probe_interval_secs: 300,
         });
 
         let app = Router::new()

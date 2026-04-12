@@ -16,6 +16,25 @@ cargo llvm-cov                       # Coverage report (requires cargo-llvm-cov)
 
 Run the proxy: `./target/release/anthropic-lb config.toml`
 
+## Deployment
+
+Production runs on the **mem** k8s cluster (`kubectl --context mem`), namespace `anthropic-lb`, managed by **Flux** from `27b-io/fleet-infra` repo.
+
+| What | Where |
+|------|-------|
+| Flux manifests | `~/code/27b.io/fleet-infra/apps/mem/anthropic-lb/` |
+| Config template | `externalsecret.yaml` (ExternalSecret → 1Password tokens + redis password) |
+| Image policy | Flux `imagepolicy` auto-updates digest from `ghcr.io/27b-io/anthropic-lb:main` |
+| Replicas | 2 (RollingUpdate, maxUnavailable=0) |
+| Config delivery | init container copies secret → `/data/config.toml` at pod start |
+
+**Config changes** require a pod restart after the ExternalSecret refreshes (secret is copied at init time, not watched):
+```bash
+kubectl --context mem -n anthropic-lb rollout restart deployment/anthropic-lb
+```
+
+Local dev instance also runs as systemd user unit: `systemctl --user restart anthropic-lb`
+
 ## Architecture
 
 Single-file Rust binary (`src/main.rs`, ~12000 lines) with inline tests. No library crate — everything lives in one file with section markers.
