@@ -156,12 +156,6 @@ struct RedisRateInfo {
     limit_requests: Option<u64>,
     limit_tokens: Option<u64>,
     updated_at: u64,
-    /// Precomputed routing weight (from refresh_metrics_weights on the probing pod).
-    /// Non-probing pods read this to set their gauge atomics without recomputing.
-    #[serde(default)]
-    routing_weight: Option<f64>,
-    #[serde(default)]
-    routing_share: Option<f64>,
 }
 
 #[derive(Default)]
@@ -727,18 +721,20 @@ impl AppState {
             }
         }
 
-        // Local freshness check: skip if data was recently refreshed (e.g. by Redis sync)
+        // Local freshness check: skip if this model's 7d claim was recently refreshed.
+        // Uses per-model claim.last_seen (not account-wide last_updated_epoch) so
+        // probing model A doesn't prevent probing model B in the same cycle.
         let now_epoch = Self::now_epoch();
         {
             let info = acct.rate_info.read().await;
-            if let Some(epoch) = info.last_updated_epoch {
-                let age = now_epoch.saturating_sub(epoch);
+            if let Some(claim) = resolve_7d_claim(&info, model) {
+                let age = now_epoch.saturating_sub(claim.last_seen);
                 if age < self.probe_interval_secs / 2 {
                     trace!(
                         account = acct.name,
                         probe_model = model,
                         age_secs = age,
-                        "probe skipped, data is fresh"
+                        "probe skipped, model claim is fresh"
                     );
                     return;
                 }
@@ -829,6 +825,18 @@ impl AppState {
                     // immediately so the dashboard reflects the account coming
                     // back online without waiting for the next probe cycle.
                     if recovered {
+                        // DEL Redis hard-limit key so other replicas don't re-apply it
+                        if let Some(redis) = &self.redis {
+                            let mut conn = redis.clone();
+                            let key = format!("alb:hard:{}", acct.name);
+                            tokio::spawn(async move {
+                                use redis::AsyncCommands;
+                                let result: redis::RedisResult<()> = conn.del(&key).await;
+                                if let Err(e) = result {
+                                    tracing::warn!(error = %e, "redis DEL failed for hard-limit clear");
+                                }
+                            });
+                        }
                         self.refresh_metrics_weights().await;
                     }
                 }
@@ -1643,6 +1651,30 @@ impl AppState {
         }
     }
 
+    /// Publish precomputed routing weights to Redis so non-probing pods
+    /// can set their gauge atomics without recomputing.
+    async fn publish_routing_weights(&self) {
+        let redis = match &self.redis {
+            Some(r) => r,
+            None => return,
+        };
+        use redis::AsyncCommands;
+        for acct in &self.accounts {
+            let w = f64::from_bits(acct.last_routing_weight.load(Ordering::Relaxed));
+            let s = f64::from_bits(acct.last_routing_share.load(Ordering::Relaxed));
+            let key = format!("alb:weight:{}", acct.name);
+            let val = format!("{w},{s}");
+            let mut conn = redis.clone();
+            let ttl = self.probe_interval_secs * 2;
+            tokio::spawn(async move {
+                let result: redis::RedisResult<()> = conn.set_ex(&key, val, ttl).await;
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "redis routing weight publish failed");
+                }
+            });
+        }
+    }
+
     fn pick_weighted_bucket<'a>(
         &self,
         effective: &[&'a RoutingCandidate],
@@ -2058,12 +2090,6 @@ impl AppState {
                 limit_requests: info.limit_requests,
                 limit_tokens: info.limit_tokens,
                 updated_at: Self::now_epoch(),
-                routing_weight: Some(f64::from_bits(
-                    acct.last_routing_weight.load(Ordering::Relaxed),
-                )),
-                routing_share: Some(f64::from_bits(
-                    acct.last_routing_share.load(Ordering::Relaxed),
-                )),
             };
             // Compute TTL from earliest reset timestamp
             let now_epoch = Self::now_epoch();
@@ -2268,17 +2294,6 @@ impl AppState {
                             info.limit_tokens = remote.limit_tokens;
                             info.last_updated = Some(now_instant);
                             info.last_updated_epoch = Some(remote.updated_at);
-                            // Apply precomputed routing weights from probing pod
-                            if let Some(w) = remote.routing_weight {
-                                self.accounts[i]
-                                    .last_routing_weight
-                                    .store(w.to_bits(), Ordering::Relaxed);
-                            }
-                            if let Some(s) = remote.routing_share {
-                                self.accounts[i]
-                                    .last_routing_share
-                                    .store(s.to_bits(), Ordering::Relaxed);
-                            }
                             trace!(
                                 account = self.accounts[i].name,
                                 remote_age,
@@ -2290,7 +2305,30 @@ impl AppState {
             }
         }
 
-        // 3. Refresh cluster info cache for /_stats endpoint
+        // 3. Sync precomputed routing weights (published by probing pod)
+        let weight_keys: Vec<String> = self
+            .accounts
+            .iter()
+            .map(|a| format!("alb:weight:{}", a.name))
+            .collect();
+        if let Ok(values) = conn.mget::<_, Vec<Option<String>>>(&weight_keys).await {
+            for (i, val) in values.iter().enumerate() {
+                if let Some(csv) = val {
+                    if let Some((w_str, s_str)) = csv.split_once(',') {
+                        if let (Ok(w), Ok(s)) = (w_str.parse::<f64>(), s_str.parse::<f64>()) {
+                            self.accounts[i]
+                                .last_routing_weight
+                                .store(w.to_bits(), Ordering::Relaxed);
+                            self.accounts[i]
+                                .last_routing_share
+                                .store(s.to_bits(), Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Refresh cluster info cache for /_stats endpoint
         let info = self.cluster_info().await;
         if let Ok(mut cache) = self.cluster_info_cache.lock() {
             *cache = info;
@@ -3372,6 +3410,14 @@ async fn proxy_handler(
             state.save_state().await;
 
             if recovered {
+                if let Some(redis) = &state.redis {
+                    let mut conn = redis.clone();
+                    let key = format!("alb:hard:{}", acct.name);
+                    tokio::spawn(async move {
+                        use redis::AsyncCommands;
+                        let _: redis::RedisResult<()> = conn.del(&key).await;
+                    });
+                }
                 state.refresh_metrics_weights().await;
             }
 
@@ -5699,6 +5745,14 @@ async fn openai_chat_handler(
             state.save_state().await;
 
             if recovered {
+                if let Some(redis) = &state.redis {
+                    let mut conn = redis.clone();
+                    let key = format!("alb:hard:{}", acct.name);
+                    tokio::spawn(async move {
+                        use redis::AsyncCommands;
+                        let _: redis::RedisResult<()> = conn.del(&key).await;
+                    });
+                }
                 state.refresh_metrics_weights().await;
             }
 
@@ -6268,6 +6322,7 @@ async fn main() {
                 // have refreshed rate-limit data. Keeps the gauges aligned
                 // with steady-state pool health, not per-request bias.
                 probe_state.refresh_metrics_weights().await;
+                probe_state.publish_routing_weights().await;
                 tokio::time::sleep(Duration::from_secs(probe_interval)).await;
             }
         });
@@ -13830,8 +13885,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             limit_requests: Some(200),
             limit_tokens: Some(100000),
             updated_at: 1700000000,
-            routing_weight: None,
-            routing_share: None,
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -13866,8 +13919,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             limit_requests: None,
             limit_tokens: None,
             updated_at: 0,
-            routing_weight: None,
-            routing_share: None,
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -14128,8 +14179,6 @@ upstream = "https://api.anthropic.com"
             limit_requests: Some(200),
             limit_tokens: Some(100000),
             updated_at: now_epoch - 10, // 10s ago — newer than local
-            routing_weight: None,
-            routing_share: None,
         };
 
         // Apply same merge logic as sync_from_redis
@@ -14184,8 +14233,6 @@ upstream = "https://api.anthropic.com"
             limit_requests: None,
             limit_tokens: None,
             updated_at: now_epoch - 120, // 120s ago — older than local
-            routing_weight: None,
-            routing_share: None,
         };
 
         // Apply same merge logic as sync_from_redis
@@ -14239,8 +14286,6 @@ upstream = "https://api.anthropic.com"
             limit_requests: None,
             limit_tokens: None,
             updated_at: now_epoch - 30,
-            routing_weight: None,
-            routing_share: None,
         };
 
         // When local has no epoch, local_age = u64::MAX, so remote always wins
