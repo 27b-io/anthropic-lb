@@ -397,6 +397,14 @@ struct Account {
     output_tokens: AtomicU64,
     cache_creation_tokens: AtomicU64,
     cache_read_tokens: AtomicU64,
+    /// Representative routing weight (f64 stored as u64 bits). Refreshed by
+    /// `refresh_metrics_weights()` once per probe cycle. Backs the
+    /// `anthropic_account_routing_weight` Prometheus gauge.
+    last_routing_weight: AtomicU64,
+    /// Representative routing share (weight/total, 0.0-1.0, f64 as bits).
+    /// Refreshed by `refresh_metrics_weights()` once per probe cycle. Backs
+    /// the `anthropic_account_routing_share` Prometheus gauge.
+    last_routing_share: AtomicU64,
 }
 
 struct Upstream {
@@ -748,15 +756,25 @@ impl AppState {
                 } else {
                     // Non-429: account is responsive, clear hard limit and burst counter
                     // so pick_account stops treating rate data as stale.
-                    let mut info = acct.rate_info.write().await;
-                    if info.hard_limited_until.is_some() {
-                        info.hard_limited_until = None;
-                        debug!(
-                            account = acct.name,
-                            "cleared hard limit after successful probe"
-                        );
+                    let recovered = {
+                        let mut info = acct.rate_info.write().await;
+                        let was_hard_limited = info.hard_limited_until.is_some();
+                        if was_hard_limited {
+                            info.hard_limited_until = None;
+                            debug!(
+                                account = acct.name,
+                                "cleared hard limit after successful probe"
+                            );
+                        }
+                        info.consecutive_burst_429s = 0;
+                        was_hard_limited
+                    };
+                    // Recovery is a sparse, high-impact event — refresh metrics
+                    // immediately so the dashboard reflects the account coming
+                    // back online without waiting for the next probe cycle.
+                    if recovered {
+                        self.refresh_metrics_weights().await;
                     }
-                    info.consecutive_burst_429s = 0;
                 }
                 self.save_state().await;
                 let info = acct.rate_info.read().await;
@@ -1320,6 +1338,168 @@ impl AppState {
         candidates
     }
 
+    /// Recompute and persist a representative routing weight per account for
+    /// metrics consumers. Called from the probe loop on the same cadence as
+    /// rate-limit data refreshes — never per-request, so the gauges reflect a
+    /// model-agnostic steady state instead of whichever model the last
+    /// inbound request happened to use.
+    ///
+    /// "Representative" means: 5h gate from the (model-agnostic) 5h window,
+    /// 7d gate from the convenience min-reset / max-utilization aggregates
+    /// already maintained on `RateLimitInfo`. This intentionally diverges from
+    /// `routing_candidates()` (which is model-specific) — pick decisions still
+    /// use the precise per-model claim.
+    ///
+    /// DIVERGENCE from `routing_candidates()`:
+    ///   1. Selects a representative `ClaimWindowData` model-agnostically
+    ///      (via `representative_claim` → `seven_day` general → highest
+    ///      waste_risk fallback) instead of the model-specific
+    ///      `resolve_7d_claim(model)` lookup. The chosen claim's util,
+    ///      reset, and status are read as a coherent triple — no
+    ///      Frankenstein from independently aggregated max/min.
+    ///   2. No "rejected claim → continue" branch; this is purely a metric
+    ///      snapshot, not a routing decision, so we still emit a gauge for
+    ///      such accounts (it ends up at zero via the `gate >= 1.0` clamp).
+    ///   3. Soft-limit handling matches `pick_account`'s graceful-degradation
+    ///      semantics: if at least one account is healthy, soft-limited
+    ///      accounts are zeroed; if NO account is healthy, all are kept so
+    ///      the dashboard reflects the still-routable degraded pool.
+    async fn refresh_metrics_weights(&self) {
+        let now_epoch = Self::now_epoch();
+        let now = Instant::now();
+
+        // Collect (gate, weight) per account. None = excluded entirely
+        // (passthrough or hard-limited — never weighted in any condition).
+        let mut entries: Vec<Option<(f64, f64)>> = vec![None; self.accounts.len()];
+
+        for (i, acct) in self.accounts.iter().enumerate() {
+            if acct.passthrough {
+                continue;
+            }
+
+            let info = acct.rate_info.read().await;
+
+            // Hard-limited accounts contribute zero (mirrors routing_candidates filter).
+            if let Some(until) = info.hard_limited_until {
+                if now < until {
+                    continue;
+                }
+            }
+
+            let stale_after_hard_limit = info
+                .hard_limited_until
+                .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
+
+            // 5h gate — same logic as routing_candidates
+            let gate_5h = if stale_after_hard_limit {
+                0.5
+            } else {
+                time_adjusted_utilization(
+                    info.utilization_5h,
+                    info.reset_5h,
+                    info.status_5h.as_deref(),
+                    NEAR_RESET_5H_SECS,
+                    now_epoch,
+                )
+                .unwrap_or_else(|| {
+                    if let Some(util) = info.utilization {
+                        util
+                    } else if let Some(remaining) = info.remaining_tokens {
+                        let limit = info.limit_tokens.unwrap_or(1_000_000);
+                        (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    }
+                })
+            };
+
+            // 7d gate + waste_risk from a SINGLE representative ClaimWindowData
+            // — utilization, reset and status are read as a coherent triple
+            // from one real claim, not Frankensteined from independently
+            // aggregated maxima/minima across claims.
+            //
+            // Selection precedence:
+            //   1. info.representative_claim if it points to a 7d entry
+            //      (this is the LB's own "binding constraint" signal)
+            //   2. The general "seven_day" claim if present
+            //   3. The model-specific claim with the highest waste_risk
+            //      (worst-case representative for the dashboard)
+            //   4. None → no 7d data, fall back to headroom-only
+            let representative: Option<&ClaimWindowData> = {
+                let rep_key = info.representative_claim.as_deref();
+                rep_key
+                    .filter(|k| k.starts_with("seven_day"))
+                    .and_then(|k| info.claims_7d.get(k))
+                    .or_else(|| info.claims_7d.get("seven_day"))
+                    .or_else(|| {
+                        info.claims_7d.values().max_by(|a, b| {
+                            let wr_a = waste_risk(a.utilization, a.reset, now_epoch);
+                            let wr_b = waste_risk(b.utilization, b.reset, now_epoch);
+                            wr_a.partial_cmp(&wr_b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                    })
+            };
+
+            let (gate_7d, wr) = if let Some(claim) = representative {
+                let g = if stale_after_hard_limit {
+                    0.5
+                } else {
+                    time_adjusted_utilization(
+                        Some(0.0),
+                        claim.reset,
+                        claim.status.as_deref(),
+                        NEAR_RESET_7D_SECS,
+                        now_epoch,
+                    )
+                    .unwrap_or(0.0)
+                };
+                let w = waste_risk(claim.utilization, claim.reset, now_epoch);
+                (g, w)
+            } else {
+                // No 7d claim at all — headroom-only
+                let g = if stale_after_hard_limit { 0.5 } else { 0.0 };
+                (g, 0.0)
+            };
+
+            let gate = gate_5h.max(gate_7d);
+            let headroom = (1.0 - gate).max(0.01);
+            let weight = if wr > 0.0 { wr * headroom } else { headroom };
+            let weight = if gate >= 1.0 { 0.0 } else { weight };
+
+            entries[i] = Some((gate, weight));
+        }
+
+        // Mirror pick_account's graceful-degradation: only filter soft-limited
+        // accounts when at least one healthy account exists in the pool.
+        // Otherwise the entire pool is degraded and we still want the dashboard
+        // to reflect the routable accounts (pick_account would route to them).
+        let has_healthy = entries
+            .iter()
+            .any(|e| matches!(e, Some((gate, _)) if *gate < self.soft_limit));
+
+        let mut weights = vec![0f64; self.accounts.len()];
+        for (i, entry) in entries.iter().enumerate() {
+            if let Some((gate, weight)) = entry {
+                if has_healthy && *gate >= self.soft_limit {
+                    continue; // soft-limited and there's a healthy alternative
+                }
+                weights[i] = *weight;
+            }
+        }
+
+        let total: f64 = weights.iter().sum();
+        for (i, acct) in self.accounts.iter().enumerate() {
+            let w = weights[i];
+            let share = if total > 0.0 { w / total } else { 0.0 };
+            // Weight and share are independent gauges, not a joint invariant —
+            // a torn read across the pair is harmless for dashboard consumers.
+            acct.last_routing_weight
+                .store(w.to_bits(), Ordering::Relaxed);
+            acct.last_routing_share
+                .store(share.to_bits(), Ordering::Relaxed);
+        }
+    }
+
     fn pick_weighted_bucket<'a>(
         &self,
         effective: &[&'a RoutingCandidate],
@@ -1850,6 +2030,15 @@ impl AppState {
                 }
             });
         }
+
+        // Drop the write lock explicitly so refresh_metrics_weights can take
+        // its read lock without contention.
+        drop(info);
+
+        // Hard-limit transitions are sparse, high-impact events. Refresh
+        // metric gauges immediately so the dashboard reflects the dropped
+        // account within seconds, not after the next probe cycle.
+        self.refresh_metrics_weights().await;
     }
 
     /// Sync shared state from Redis: hard limits + rate info.
@@ -3011,14 +3200,20 @@ async fn proxy_handler(
             }
 
             // Clear hard limit and burst counter — account just served a request successfully
-            {
+            let recovered = {
                 let mut info = acct.rate_info.write().await;
+                let was = info.hard_limited_until.is_some();
                 info.hard_limited_until = None;
                 info.consecutive_burst_429s = 0;
-            }
+                was
+            };
 
             // Persist state after clearing hard limit so the saved snapshot is clean
             state.save_state().await;
+
+            if recovered {
+                state.refresh_metrics_weights().await;
+            }
 
             // Log with capacity info + inject budget status header
             let budget_status = {
@@ -5332,14 +5527,20 @@ async fn openai_chat_handler(
             }
 
             // Clear hard limit and burst counter — account just served a request successfully
-            {
+            let recovered = {
                 let mut info = acct.rate_info.write().await;
+                let was = info.hard_limited_until.is_some();
                 info.hard_limited_until = None;
                 info.consecutive_burst_429s = 0;
-            }
+                was
+            };
 
             // Persist state after clearing hard limit so the saved snapshot is clean
             state.save_state().await;
+
+            if recovered {
+                state.refresh_metrics_weights().await;
+            }
 
             // Compute budget pressure status for response header + log
             let budget_status = {
@@ -5708,6 +5909,8 @@ async fn main() {
                 output_tokens: AtomicU64::new(0),
                 cache_creation_tokens: AtomicU64::new(0),
                 cache_read_tokens: AtomicU64::new(0),
+                last_routing_weight: AtomicU64::new(0),
+                last_routing_share: AtomicU64::new(0),
             }
         })
         .collect();
@@ -5845,6 +6048,9 @@ async fn main() {
     // Restore persisted state (cooldowns, utilization, request counts)
     state.load_state().await;
 
+    // Seed metric weights from restored state so gauges aren't zero on cold start.
+    state.refresh_metrics_weights().await;
+
     let app = Router::new()
         .route("/_stats", axum::routing::get(stats_handler))
         .route("/metrics", axum::routing::get(metrics_handler))
@@ -5908,8 +6114,26 @@ async fn main() {
                     // Small delay between accounts to avoid burst
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
+                // Recompute metric weights once per cycle, after all probes
+                // have refreshed rate-limit data. Keeps the gauges aligned
+                // with steady-state pool health, not per-request bias.
+                probe_state.refresh_metrics_weights().await;
                 probe_cycle = probe_cycle.wrapping_add(1);
                 tokio::time::sleep(Duration::from_secs(probe_interval)).await;
+            }
+        });
+    } else {
+        // Probes disabled — but `update_rate_info()` still refreshes data on
+        // every inbound request. Without this fallback ticker the routing
+        // weight gauges would freeze at startup values forever.
+        let metrics_state = state.clone();
+        tokio::spawn(async move {
+            const FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            info!("probes disabled — metrics weights refresh on a 60s timer");
+            loop {
+                metrics_state.refresh_metrics_weights().await;
+                tokio::time::sleep(FALLBACK_INTERVAL).await;
             }
         });
     }
@@ -5986,6 +6210,8 @@ mod tests {
             output_tokens: AtomicU64::new(0),
             cache_creation_tokens: AtomicU64::new(0),
             cache_read_tokens: AtomicU64::new(0),
+            last_routing_weight: AtomicU64::new(0),
+            last_routing_share: AtomicU64::new(0),
         }
     }
 
@@ -6029,6 +6255,41 @@ mod tests {
 
     fn test_state_with(accounts: Vec<Account>) -> Arc<AppState> {
         test_state_with_strategy(accounts, RoutingStrategy::default())
+    }
+
+    fn test_state_with_soft_limit(accounts: Vec<Account>, soft_limit: f64) -> Arc<AppState> {
+        Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts,
+            robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operators: vec![],
+            emergency_brake: true,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
+        })
     }
 
     /// Spawn a mock upstream that returns a canned response with rate-limit headers.
@@ -14795,6 +15056,183 @@ upstream = "https://api.anthropic.com"
         );
     }
 
+    /// Unit: refresh_metrics_weights() persists routing weights and shares to
+    /// atomics on each Account, with shares normalized to sum ≈ 1.0 and zeros
+    /// for rejected accounts and accounts above soft_limit.
+    #[tokio::test]
+    async fn refresh_metrics_weights_persists_atomics() {
+        let acct_a = make_account("a", "sk-ant-api-a");
+        let acct_b = make_account("b", "sk-ant-api-b");
+        let acct_c = make_account("c", "sk-ant-api-c");
+        let state = test_state_with(vec![acct_a, acct_b, acct_c]);
+
+        let now = AppState::now_epoch();
+
+        // a: 5h=0.20 (healthy), b: 5h=0.30 (healthy)
+        for (i, util) in [(0, 0.20), (1, 0.30)].iter() {
+            let mut info = state.accounts[*i].rate_info.write().await;
+            info.utilization_5h = Some(*util);
+            info.reset_5h = Some(now + 10000);
+            info.utilization = Some(*util);
+            info.claims_7d.clear();
+        }
+        // c: status=rejected → status_to_floor → gate=1.0 → weight=0
+        {
+            let mut info = state.accounts[2].rate_info.write().await;
+            info.utilization_5h = Some(0.10);
+            info.reset_5h = Some(now + 10000);
+            info.utilization = Some(0.10);
+            info.status_5h = Some("rejected".to_string());
+            info.claims_7d.clear();
+        }
+
+        state.refresh_metrics_weights().await;
+
+        let read_weight = |i: usize| {
+            f64::from_bits(
+                state.accounts[i]
+                    .last_routing_weight
+                    .load(Ordering::Relaxed),
+            )
+        };
+        let read_share =
+            |i: usize| f64::from_bits(state.accounts[i].last_routing_share.load(Ordering::Relaxed));
+
+        // a and b are healthy: positive weight + positive share
+        assert!(read_weight(0) > 0.0, "a should have non-zero weight");
+        assert!(read_weight(1) > 0.0, "b should have non-zero weight");
+        assert!(read_share(0) > 0.0, "a should have non-zero share");
+        assert!(read_share(1) > 0.0, "b should have non-zero share");
+
+        // c was rejected (gate=1.0) → must be zeroed
+        assert_eq!(read_weight(2), 0.0, "c (rejected) must have zero weight");
+        assert_eq!(read_share(2), 0.0, "c (rejected) must have zero share");
+
+        // Shares of healthy accounts sum to ≈ 1.0
+        let total_share = read_share(0) + read_share(1) + read_share(2);
+        assert!(
+            (total_share - 1.0).abs() < 1e-9,
+            "shares should sum to 1.0, got {total_share}"
+        );
+
+        // Lower-utilization account should win the larger share (a < b)
+        assert!(
+            read_share(0) > read_share(1),
+            "a (lower 5h util) should have larger share than b: a={}, b={}",
+            read_share(0),
+            read_share(1)
+        );
+    }
+
+    /// Regression: when SOME accounts are above soft_limit but at least one
+    /// is healthy, the soft-limited ones must be zeroed (mirrors pick_account
+    /// excluding them). When ALL accounts are above soft_limit, none are
+    /// zeroed — graceful degradation, the dashboard reflects what
+    /// pick_account would actually still route to.
+    #[tokio::test]
+    async fn refresh_metrics_weights_soft_limit_graceful_degradation() {
+        let now = AppState::now_epoch();
+
+        // Scenario 1: mixed pool. a=healthy(0.20), b=soft-limited(0.95).
+        // soft_limit=0.90 → b should be zeroed, a gets all weight.
+        {
+            let state = test_state_with_soft_limit(
+                vec![
+                    make_account("a", "sk-ant-api-a"),
+                    make_account("b", "sk-ant-api-b"),
+                ],
+                0.90,
+            );
+            for (i, util) in [(0, 0.20), (1, 0.95)].iter() {
+                let mut info = state.accounts[*i].rate_info.write().await;
+                info.utilization_5h = Some(*util);
+                info.reset_5h = Some(now + 10000);
+                info.utilization = Some(*util);
+                info.claims_7d.clear();
+            }
+
+            state.refresh_metrics_weights().await;
+
+            let w_a = f64::from_bits(
+                state.accounts[0]
+                    .last_routing_weight
+                    .load(Ordering::Relaxed),
+            );
+            let w_b = f64::from_bits(
+                state.accounts[1]
+                    .last_routing_weight
+                    .load(Ordering::Relaxed),
+            );
+            let s_a = f64::from_bits(state.accounts[0].last_routing_share.load(Ordering::Relaxed));
+            let s_b = f64::from_bits(state.accounts[1].last_routing_share.load(Ordering::Relaxed));
+
+            assert!(w_a > 0.0, "healthy a should have non-zero weight");
+            assert_eq!(
+                w_b, 0.0,
+                "soft-limited b should be zeroed when a is healthy"
+            );
+            assert!(
+                (s_a - 1.0).abs() < 1e-9,
+                "a should have 100% share, got {s_a}"
+            );
+            assert_eq!(s_b, 0.0, "b should have zero share");
+        }
+
+        // Scenario 2: ENTIRE pool above soft_limit. a=0.95, b=0.92.
+        // soft_limit=0.90 → both above. Without graceful degradation the
+        // dashboard would go blank — instead BOTH should keep non-zero shares
+        // matching what pick_account would still route to.
+        {
+            let state = test_state_with_soft_limit(
+                vec![
+                    make_account("a", "sk-ant-api-a"),
+                    make_account("b", "sk-ant-api-b"),
+                ],
+                0.90,
+            );
+            for (i, util) in [(0, 0.95), (1, 0.92)].iter() {
+                let mut info = state.accounts[*i].rate_info.write().await;
+                info.utilization_5h = Some(*util);
+                info.reset_5h = Some(now + 10000);
+                info.utilization = Some(*util);
+                info.claims_7d.clear();
+            }
+
+            state.refresh_metrics_weights().await;
+
+            let w_a = f64::from_bits(
+                state.accounts[0]
+                    .last_routing_weight
+                    .load(Ordering::Relaxed),
+            );
+            let w_b = f64::from_bits(
+                state.accounts[1]
+                    .last_routing_weight
+                    .load(Ordering::Relaxed),
+            );
+            let s_a = f64::from_bits(state.accounts[0].last_routing_share.load(Ordering::Relaxed));
+            let s_b = f64::from_bits(state.accounts[1].last_routing_share.load(Ordering::Relaxed));
+
+            assert!(
+                w_a > 0.0,
+                "degraded a should still have non-zero weight (graceful degradation)"
+            );
+            assert!(
+                w_b > 0.0,
+                "degraded b should still have non-zero weight (graceful degradation)"
+            );
+            assert!(
+                (s_a + s_b - 1.0).abs() < 1e-9,
+                "shares should sum to 1.0 in degraded pool"
+            );
+            // b has lower utilization → larger share
+            assert!(
+                s_b > s_a,
+                "b (lower util) should outweigh a in degraded pool: a={s_a}, b={s_b}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn metrics_routing_weight_and_share_present() {
         let (mock_url, _handle) = spawn_mock_upstream().await;
@@ -14853,6 +15291,90 @@ upstream = "https://api.anthropic.com"
         assert!(
             body.contains("# TYPE anthropic_account_routing_share gauge"),
             "missing routing_share TYPE header:\n{body}"
+        );
+    }
+
+    /// Integration: GET /metrics emits anthropic_account_routing_weight and
+    /// anthropic_account_routing_share for non-passthrough accounts only,
+    /// with the values populated by refresh_metrics_weights().
+    #[tokio::test]
+    async fn metrics_routing_weight_and_share() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, state) = test_app(&mock_url, None);
+
+        // Default test_app builds 2 non-passthrough accounts: acct-a, acct-b.
+        let now = AppState::now_epoch();
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.25);
+            info.reset_5h = Some(now + 10000);
+            info.utilization = Some(0.25);
+            info.claims_7d.clear();
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.50);
+            info.reset_5h = Some(now + 10000);
+            info.utilization = Some(0.50);
+            info.claims_7d.clear();
+        }
+        state.refresh_metrics_weights().await;
+
+        let addr = serve(app).await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap();
+        let body = resp.text().await.unwrap();
+
+        // Both metric families are emitted with the right HELP/TYPE headers
+        assert!(
+            body.contains("# HELP anthropic_account_routing_weight"),
+            "missing routing_weight HELP:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE anthropic_account_routing_weight gauge"),
+            "missing routing_weight TYPE:\n{body}"
+        );
+        assert!(
+            body.contains("# HELP anthropic_account_routing_share"),
+            "missing routing_share HELP:\n{body}"
+        );
+
+        // Both accounts get a routing_weight line labeled by name
+        assert!(
+            body.contains("anthropic_account_routing_weight{account=\"acct-a\"}"),
+            "missing acct-a routing_weight:\n{body}"
+        );
+        assert!(
+            body.contains("anthropic_account_routing_weight{account=\"acct-b\"}"),
+            "missing acct-b routing_weight:\n{body}"
+        );
+
+        // Shares for the two accounts must sum to ≈ 1.0 (parsed out of the body)
+        let parse_share = |account: &str| -> f64 {
+            let needle = format!("anthropic_account_routing_share{{account=\"{account}\"}} ");
+            let line = body
+                .lines()
+                .find(|l| l.starts_with(&needle))
+                .unwrap_or_else(|| panic!("no share line for {account}"));
+            line[needle.len()..]
+                .trim()
+                .parse::<f64>()
+                .expect("parseable share")
+        };
+        let total = parse_share("acct-a") + parse_share("acct-b");
+        assert!(
+            (total - 1.0).abs() < 1e-9,
+            "shares should sum to 1.0, got {total}\n{body}"
+        );
+
+        // acct-a (lower utilization) should get the larger share
+        assert!(
+            parse_share("acct-a") > parse_share("acct-b"),
+            "acct-a should outweigh acct-b\n{body}"
         );
     }
 
@@ -14927,6 +15449,54 @@ upstream = "https://api.anthropic.com"
                 key
             );
         }
+    }
+
+    /// Integration: passthrough accounts must NOT appear in routing_weight or
+    /// routing_share output (refresh_metrics_weights skips them).
+    #[tokio::test]
+    async fn metrics_routing_weight_omits_passthrough() {
+        let acct_a = make_account("a", "sk-ant-api-a");
+        let acct_pt = make_account("pt", "passthrough");
+        let state = test_state_with(vec![acct_a, acct_pt]);
+
+        let now = AppState::now_epoch();
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.25);
+            info.reset_5h = Some(now + 10000);
+            info.utilization = Some(0.25);
+            info.claims_7d.clear();
+        }
+        state.refresh_metrics_weights().await;
+
+        let app = Router::new()
+            .route("/metrics", axum::routing::get(metrics_handler))
+            .with_state(state.clone());
+        let addr = serve(app).await;
+        let client = Client::new();
+        let body = client
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        // a is present
+        assert!(
+            body.contains("anthropic_account_routing_weight{account=\"a\"}"),
+            "missing routing_weight for a:\n{body}"
+        );
+        // pt (passthrough) must be absent from BOTH families
+        assert!(
+            !body.contains("anthropic_account_routing_weight{account=\"pt\""),
+            "passthrough account must not appear in routing_weight:\n{body}"
+        );
+        assert!(
+            !body.contains("anthropic_account_routing_share{account=\"pt\""),
+            "passthrough account must not appear in routing_share:\n{body}"
+        );
     }
 
     #[test]
