@@ -4080,6 +4080,88 @@ async fn metrics_handler(
         }
     }
 
+    // ── Routing weights (derived from utilization + waste risk) ─────
+    //
+    // Mirrors the weight formula in routing_candidates() but uses the
+    // representative 7d claim per account (model-agnostic).  This gives
+    // a steady-state view of how the LB *would* distribute traffic.
+
+    prom_header(
+        &mut buf,
+        "anthropic_account_routing_weight",
+        "gauge",
+        "Per-account routing weight (headroom * waste_risk)",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_account_routing_share",
+        "gauge",
+        "Per-account share of total routing weight (0.0-1.0)",
+    );
+
+    {
+        struct WeightSnap {
+            name: String,
+            weight: f64,
+        }
+        let mut weight_snaps: Vec<WeightSnap> = Vec::with_capacity(snaps.len());
+
+        for s in &snaps {
+            if s.passthrough {
+                continue;
+            }
+
+            let gate_5h = s.utilization_5h.unwrap_or(0.5);
+
+            // Use the representative 7d claim's waste_risk (highest wr)
+            let (best_wr, best_claim_util) = s
+                .claims
+                .iter()
+                .filter(|(_, util, _)| util.is_some())
+                .fold((0.0f64, 0.0f64), |(wr_max, util_at_max), (_, util, wr)| {
+                    if *wr > wr_max {
+                        (*wr, util.unwrap_or(0.0))
+                    } else {
+                        (wr_max, util_at_max)
+                    }
+                });
+
+            let gate_7d = best_claim_util;
+            let gate = gate_5h.max(gate_7d);
+            let headroom = (1.0 - gate).max(0.01);
+            let weight = if best_wr > 0.0 {
+                best_wr * headroom
+            } else {
+                headroom
+            };
+            let weight = if gate >= 1.0 { 0.0 } else { weight };
+
+            weight_snaps.push(WeightSnap {
+                name: s.name.clone(),
+                weight,
+            });
+        }
+
+        let total_weight: f64 = weight_snaps.iter().map(|w| w.weight).sum();
+
+        for w in &weight_snaps {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_routing_weight",
+                &[("account", &w.name)],
+                w.weight,
+            );
+            if total_weight > 0.0 {
+                prom_gauge(
+                    &mut buf,
+                    "anthropic_account_routing_share",
+                    &[("account", &w.name)],
+                    w.weight / total_weight,
+                );
+            }
+        }
+    }
+
     // ── Aggregate metrics ──────────────────────────────────────────
 
     prom_header(
