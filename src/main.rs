@@ -4125,7 +4125,7 @@ fn append_routing_weight_metrics(
         buf,
         "anthropic_account_routing_weight",
         "gauge",
-        "Per-account routing weight (headroom * waste_risk)",
+        "Per-account routing weight (headroom * waste_risk, or plain headroom when no 7d claim)",
     );
     prom_header(
         buf,

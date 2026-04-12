@@ -2,7 +2,7 @@
 
 Usage-aware load balancing proxy for Claude Code
 
-### Anthropic Rate Limit Windows (Unified Headers)
+## Anthropic Rate Limit Windows (Unified Headers)
 
 The proxy reads utilization from `anthropic-ratelimit-unified-*` response headers. These govern subscription-based access (Claude Code, Pro, Max plans) and are separate from the per-minute token bucket limits documented at platform.claude.com.
 
