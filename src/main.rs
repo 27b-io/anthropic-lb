@@ -156,6 +156,12 @@ struct RedisRateInfo {
     limit_requests: Option<u64>,
     limit_tokens: Option<u64>,
     updated_at: u64,
+    /// Precomputed routing weight (from refresh_metrics_weights on the probing pod).
+    /// Non-probing pods read this to set their gauge atomics without recomputing.
+    #[serde(default)]
+    routing_weight: Option<f64>,
+    #[serde(default)]
+    routing_share: Option<f64>,
 }
 
 #[derive(Default)]
@@ -2052,6 +2058,12 @@ impl AppState {
                 limit_requests: info.limit_requests,
                 limit_tokens: info.limit_tokens,
                 updated_at: Self::now_epoch(),
+                routing_weight: Some(f64::from_bits(
+                    acct.last_routing_weight.load(Ordering::Relaxed),
+                )),
+                routing_share: Some(f64::from_bits(
+                    acct.last_routing_share.load(Ordering::Relaxed),
+                )),
             };
             // Compute TTL from earliest reset timestamp
             let now_epoch = Self::now_epoch();
@@ -2256,6 +2268,17 @@ impl AppState {
                             info.limit_tokens = remote.limit_tokens;
                             info.last_updated = Some(now_instant);
                             info.last_updated_epoch = Some(remote.updated_at);
+                            // Apply precomputed routing weights from probing pod
+                            if let Some(w) = remote.routing_weight {
+                                self.accounts[i]
+                                    .last_routing_weight
+                                    .store(w.to_bits(), Ordering::Relaxed);
+                            }
+                            if let Some(s) = remote.routing_share {
+                                self.accounts[i]
+                                    .last_routing_share
+                                    .store(s.to_bits(), Ordering::Relaxed);
+                            }
                             trace!(
                                 account = self.accounts[i].name,
                                 remote_age,
@@ -13819,6 +13842,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             limit_requests: Some(200),
             limit_tokens: Some(100000),
             updated_at: 1700000000,
+            routing_weight: None,
+            routing_share: None,
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -13853,6 +13878,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             limit_requests: None,
             limit_tokens: None,
             updated_at: 0,
+            routing_weight: None,
+            routing_share: None,
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -14113,6 +14140,8 @@ upstream = "https://api.anthropic.com"
             limit_requests: Some(200),
             limit_tokens: Some(100000),
             updated_at: now_epoch - 10, // 10s ago — newer than local
+            routing_weight: None,
+            routing_share: None,
         };
 
         // Apply same merge logic as sync_from_redis
@@ -14167,6 +14196,8 @@ upstream = "https://api.anthropic.com"
             limit_requests: None,
             limit_tokens: None,
             updated_at: now_epoch - 120, // 120s ago — older than local
+            routing_weight: None,
+            routing_share: None,
         };
 
         // Apply same merge logic as sync_from_redis
@@ -14220,6 +14251,8 @@ upstream = "https://api.anthropic.com"
             limit_requests: None,
             limit_tokens: None,
             updated_at: now_epoch - 30,
+            routing_weight: None,
+            routing_share: None,
         };
 
         // When local has no epoch, local_age = u64::MAX, so remote always wins
