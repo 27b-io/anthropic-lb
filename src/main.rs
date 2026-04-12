@@ -722,21 +722,26 @@ impl AppState {
         }
 
         // Local freshness check: skip if this model's 7d claim was recently refreshed.
-        // Uses per-model claim.last_seen (not account-wide last_updated_epoch) so
-        // probing model A doesn't prevent probing model B in the same cycle.
+        // Looks up only the model-specific claim key (e.g. "seven_day_opus"), NOT the
+        // general "seven_day" fallback, so probing one family doesn't block another.
         let now_epoch = Self::now_epoch();
         {
             let info = acct.rate_info.read().await;
-            if let Some(claim) = resolve_7d_claim(&info, model) {
-                let age = now_epoch.saturating_sub(claim.last_seen);
-                if age < self.probe_interval_secs / 2 {
-                    trace!(
-                        account = acct.name,
-                        probe_model = model,
-                        age_secs = age,
-                        "probe skipped, model claim is fresh"
-                    );
-                    return;
+            let family = model_family(model);
+            if !family.is_empty() {
+                let claim_key = format!("seven_day_{}", family);
+                if let Some(claim) = info.claims_7d.get(&claim_key) {
+                    let age = now_epoch.saturating_sub(claim.last_seen);
+                    if age < self.probe_interval_secs / 2 {
+                        trace!(
+                            account = acct.name,
+                            probe_model = model,
+                            claim_key,
+                            age_secs = age,
+                            "probe skipped, model claim is fresh"
+                        );
+                        return;
+                    }
                 }
             }
         }
