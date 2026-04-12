@@ -6253,33 +6253,21 @@ async fn main() {
                 interval_secs = probe_interval,
                 "starting utilization probes"
             );
-            let mut probe_cycle: usize = 0;
             loop {
                 for i in 0..n_accounts {
-                    // Rotate probe model per account per cycle
-                    let model_idx = (probe_cycle + i) % PROBE_MODELS.len();
-                    let model = PROBE_MODELS[model_idx];
-                    // Skip if account doesn't serve this model family
                     let acct = &probe_state.accounts[i];
-                    if !acct.serves_model(model) {
-                        // Try next model in rotation
-                        let alt_idx = (model_idx + 1) % PROBE_MODELS.len();
-                        let alt_model = PROBE_MODELS[alt_idx];
-                        if acct.serves_model(alt_model) {
-                            probe_state.probe_account(i, alt_model).await;
+                    // Probe all model families per account per cycle
+                    for model in PROBE_MODELS {
+                        if acct.serves_model(model) {
+                            probe_state.probe_account(i, model).await;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
                         }
-                        // else: account serves none of our probe models, skip
-                    } else {
-                        probe_state.probe_account(i, model).await;
                     }
-                    // Small delay between accounts to avoid burst
-                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 // Recompute metric weights once per cycle, after all probes
                 // have refreshed rate-limit data. Keeps the gauges aligned
                 // with steady-state pool health, not per-request bias.
                 probe_state.refresh_metrics_weights().await;
-                probe_cycle = probe_cycle.wrapping_add(1);
                 tokio::time::sleep(Duration::from_secs(probe_interval)).await;
             }
         });
