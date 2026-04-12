@@ -743,7 +743,7 @@ impl AppState {
         if let Some(redis) = &self.redis {
             let mut conn = redis.clone();
             let lock_key = format!("alb:probe:{}:{}", acct.name, model);
-            let lock_ttl = self.probe_interval_secs.saturating_sub(30).max(60);
+            let lock_ttl = self.probe_interval_secs.saturating_sub(10).max(1);
             let acquired: redis::RedisResult<bool> = redis::cmd("SET")
                 .arg(&lock_key)
                 .arg(1u8)
@@ -1547,18 +1547,32 @@ impl AppState {
             //   3. The model-specific claim with the highest waste_risk
             //      (worst-case representative for the dashboard)
             //   4. None → no 7d data, fall back to headroom-only
+            let claim_is_fresh = |c: &&ClaimWindowData| {
+                time_adjusted_utilization(
+                    Some(0.0),
+                    c.reset,
+                    c.status.as_deref(),
+                    NEAR_RESET_7D_SECS,
+                    now_epoch,
+                )
+                .is_some()
+            };
             let representative: Option<&ClaimWindowData> = {
                 let rep_key = info.representative_claim.as_deref();
                 rep_key
                     .filter(|k| k.starts_with("seven_day"))
                     .and_then(|k| info.claims_7d.get(k))
-                    .or_else(|| info.claims_7d.get("seven_day"))
+                    .filter(claim_is_fresh)
+                    .or_else(|| info.claims_7d.get("seven_day").filter(claim_is_fresh))
                     .or_else(|| {
-                        info.claims_7d.values().max_by(|a, b| {
-                            let wr_a = waste_risk(a.utilization, a.reset, now_epoch);
-                            let wr_b = waste_risk(b.utilization, b.reset, now_epoch);
-                            wr_a.partial_cmp(&wr_b).unwrap_or(std::cmp::Ordering::Equal)
-                        })
+                        info.claims_7d
+                            .values()
+                            .filter(claim_is_fresh)
+                            .max_by(|a, b| {
+                                let wr_a = waste_risk(a.utilization, a.reset, now_epoch);
+                                let wr_b = waste_risk(b.utilization, b.reset, now_epoch);
+                                wr_a.partial_cmp(&wr_b).unwrap_or(std::cmp::Ordering::Equal)
+                            })
                     })
             };
 
