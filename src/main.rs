@@ -750,7 +750,11 @@ impl AppState {
         if let Some(redis) = &self.redis {
             let mut conn = redis.clone();
             let lock_key = format!("alb:probe:{}:{}", acct.name, model);
-            let lock_ttl = self.probe_interval_secs.saturating_sub(10).max(1);
+            let lock_ttl = if self.probe_interval_secs > 10 {
+                self.probe_interval_secs - 10
+            } else {
+                self.probe_interval_secs
+            };
             let acquired: redis::RedisResult<bool> = redis::cmd("SET")
                 .arg(&lock_key)
                 .arg(1u8)
