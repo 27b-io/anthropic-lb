@@ -30,7 +30,7 @@ Production runs on the **mem** k8s cluster (`kubectl --context mem`), namespace 
 
 | What | Where |
 |------|-------|
-| Flux manifests | `~/code/27b.io/fleet-infra/apps/mem/anthropic-lb/` |
+| Flux manifests | `27b-io/fleet-infra` repo, `apps/mem/anthropic-lb/` |
 | Config template | `externalsecret.yaml` (ExternalSecret → 1Password tokens + redis password) |
 | Image policy | Flux `imagepolicy` auto-updates digest from `ghcr.io/27b-io/anthropic-lb:main` |
 | Replicas | 2 (RollingUpdate, maxUnavailable=0) |
