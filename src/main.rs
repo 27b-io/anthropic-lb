@@ -745,10 +745,10 @@ impl AppState {
             }
         }
 
-        // Distributed probe lock: only one pod probes each account per interval
+        // Distributed probe lock: one pod per account+model per interval
         if let Some(redis) = &self.redis {
             let mut conn = redis.clone();
-            let lock_key = format!("alb:probe:{}", acct.name);
+            let lock_key = format!("alb:probe:{}:{}", acct.name, model);
             let lock_ttl = self.probe_interval_secs.saturating_sub(10).max(1);
             let acquired: redis::RedisResult<bool> = redis::cmd("SET")
                 .arg(&lock_key)
