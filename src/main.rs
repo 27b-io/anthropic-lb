@@ -746,15 +746,13 @@ impl AppState {
             }
         }
 
-        // Distributed probe lock: one pod per account+model per interval
+        // Distributed probe lock: one pod per account+model per interval.
+        // TTL = full configured interval so the lock covers the entire
+        // dedup window (no early-rollover race).
         if let Some(redis) = &self.redis {
             let mut conn = redis.clone();
             let lock_key = format!("alb:probe:{}:{}", acct.name, model);
-            let lock_ttl = if self.probe_interval_secs > 10 {
-                self.probe_interval_secs - 10
-            } else {
-                self.probe_interval_secs
-            };
+            let lock_ttl = self.probe_interval_secs.max(1);
             let acquired: redis::RedisResult<bool> = redis::cmd("SET")
                 .arg(&lock_key)
                 .arg(1u8)
@@ -834,19 +832,7 @@ impl AppState {
                     // immediately so the dashboard reflects the account coming
                     // back online without waiting for the next probe cycle.
                     if recovered {
-                        // DEL Redis hard-limit key so other replicas don't re-apply it
-                        if let Some(redis) = &self.redis {
-                            let mut conn = redis.clone();
-                            let key = format!("alb:hard:{}", acct.name);
-                            tokio::spawn(async move {
-                                use redis::AsyncCommands;
-                                let result: redis::RedisResult<()> = conn.del(&key).await;
-                                if let Err(e) = result {
-                                    tracing::warn!(error = %e, "redis DEL failed for hard-limit clear");
-                                }
-                            });
-                        }
-                        self.refresh_metrics_weights().await;
+                        self.signal_hard_limit_recovery(acct).await;
                     }
                 }
                 self.save_state().await;
@@ -854,7 +840,13 @@ impl AppState {
                 let now_epoch = Self::now_epoch();
                 let (eff_util, constraint, _adj_5h, _adj_7d) =
                     effective_utilization(&info, now_epoch, model);
-                let rw = compute_routing_weight(&info, model, now_epoch, false);
+                // After a 429, the account is hard-limited — emit "-" instead of
+                // pre-429 routing weight values that no longer reflect reality.
+                let rw = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    None
+                } else {
+                    compute_routing_weight(&info, model, now_epoch, false)
+                };
                 info!(
                     account = acct.name,
                     status = status.as_u16(),
@@ -1684,6 +1676,32 @@ impl AppState {
         }
     }
 
+    /// Distributed hard-limit recovery: notifies other replicas that the local
+    /// hard limit has been cleared. Writes a `0` sentinel to `alb:hard:{account}`
+    /// (instead of DEL) so `sync_from_redis` can proactively clear other replicas'
+    /// stale `hard_limited_until` Instants — DEL alone leaves them stuck until
+    /// their own probe sees recovery. Also refreshes metric gauges and publishes
+    /// the updated routing weights so all replicas reflect the recovery within
+    /// the next sync tick.
+    async fn signal_hard_limit_recovery(&self, acct: &Account) {
+        if let Some(redis) = &self.redis {
+            let mut conn = redis.clone();
+            let key = format!("alb:hard:{}", acct.name);
+            // Sentinel: epoch=0 means "explicitly cleared". Short TTL because
+            // sync_from_redis runs every 5s; once every replica has observed
+            // the sentinel, the key can be removed.
+            tokio::spawn(async move {
+                use redis::AsyncCommands;
+                let result: redis::RedisResult<()> = conn.set_ex(&key, 0u64, 60u64).await;
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "redis sentinel write failed for hard-limit clear");
+                }
+            });
+        }
+        self.refresh_metrics_weights().await;
+        self.publish_routing_weights().await;
+    }
+
     fn pick_weighted_bucket<'a>(
         &self,
         effective: &[&'a RoutingCandidate],
@@ -2247,7 +2265,19 @@ impl AppState {
         if let Ok(values) = conn.mget::<_, Vec<Option<u64>>>(&hard_keys).await {
             for (i, val) in values.iter().enumerate() {
                 if let Some(until_epoch) = val {
-                    if *until_epoch > now_epoch {
+                    if *until_epoch == 0 {
+                        // Recovery sentinel: another replica cleared its hard limit.
+                        // Proactively clear ours so we stop excluding the account.
+                        let mut info = self.accounts[i].rate_info.write().await;
+                        if info.hard_limited_until.is_some() {
+                            info.hard_limited_until = None;
+                            info.consecutive_burst_429s = 0;
+                            trace!(
+                                account = self.accounts[i].name,
+                                "synced hard-limit clear sentinel from redis"
+                            );
+                        }
+                    } else if *until_epoch > now_epoch {
                         let remaining = Duration::from_secs(until_epoch - now_epoch);
                         let until_instant = now_instant + remaining;
                         let mut info = self.accounts[i].rate_info.write().await;
@@ -3419,15 +3449,7 @@ async fn proxy_handler(
             state.save_state().await;
 
             if recovered {
-                if let Some(redis) = &state.redis {
-                    let mut conn = redis.clone();
-                    let key = format!("alb:hard:{}", acct.name);
-                    tokio::spawn(async move {
-                        use redis::AsyncCommands;
-                        let _: redis::RedisResult<()> = conn.del(&key).await;
-                    });
-                }
-                state.refresh_metrics_weights().await;
+                state.signal_hard_limit_recovery(acct).await;
             }
 
             // Log with capacity info + inject budget status header
@@ -5754,15 +5776,7 @@ async fn openai_chat_handler(
             state.save_state().await;
 
             if recovered {
-                if let Some(redis) = &state.redis {
-                    let mut conn = redis.clone();
-                    let key = format!("alb:hard:{}", acct.name);
-                    tokio::spawn(async move {
-                        use redis::AsyncCommands;
-                        let _: redis::RedisResult<()> = conn.del(&key).await;
-                    });
-                }
-                state.refresh_metrics_weights().await;
+                state.signal_hard_limit_recovery(acct).await;
             }
 
             // Compute budget pressure status for response header + log
