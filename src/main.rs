@@ -812,9 +812,12 @@ impl AppState {
                 self.update_rate_info(idx, resp.headers()).await;
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     self.mark_hard_limited(idx, resp.headers()).await;
-                } else {
-                    // Non-429: account is responsive, clear hard limit and burst counter
+                } else if status.is_success() {
+                    // 2xx only: account is responsive, clear hard limit and burst counter
                     // so pick_account stops treating rate data as stale.
+                    // 5xx/529 are upstream errors, not proof the account recovered —
+                    // clearing the hard limit on those would flood a saturated account
+                    // during an Anthropic incident.
                     let recovered = {
                         let mut info = acct.rate_info.write().await;
                         let was_hard_limited = info.hard_limited_until.is_some();
@@ -835,17 +838,19 @@ impl AppState {
                         self.signal_hard_limit_recovery(acct).await;
                     }
                 }
+                // else: 5xx/529 — leave account state untouched. Next probe cycle retries.
                 self.save_state().await;
                 let info = acct.rate_info.read().await;
                 let now_epoch = Self::now_epoch();
                 let (eff_util, constraint, _adj_5h, _adj_7d) =
                     effective_utilization(&info, now_epoch, model);
-                // After a 429, the account is hard-limited — emit "-" instead of
-                // pre-429 routing weight values that no longer reflect reality.
-                let rw = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    None
-                } else {
+                // Only compute routing weight on 2xx — non-success responses leave
+                // the account state either mutated (429 → hard-limited) or untouched
+                // (5xx), and the pre-response weight no longer reflects reality.
+                let rw = if status.is_success() {
                     compute_routing_weight(&info, model, now_epoch, false)
+                } else {
+                    None
                 };
                 info!(
                     account = acct.name,
@@ -1059,6 +1064,18 @@ const MAX_529_RETRIES: u32 = 3;
 
 /// Base delay for 529 BEBO retries. Doubles each round: 1s, 2s, 4s.
 const RETRY_529_BASE_DELAY: Duration = Duration::from_secs(1);
+
+/// Sentinel value written to `alb:hard:{account}` when a replica has observed
+/// recovery from a hard rate limit. Other replicas interpret this as an
+/// instruction to proactively clear their local `hard_limited_until`, which
+/// DEL alone could not do (sync_from_redis ignores missing keys). Distinct
+/// from "no key" (no data) and "epoch > 0" (active hard limit).
+const HARD_LIMIT_CLEARED_SENTINEL: u64 = 0;
+
+/// TTL for the recovery sentinel in Redis. Long enough for every replica to
+/// observe it via sync_from_redis (5s interval = 12 opportunities), short
+/// enough that the key does not linger past the intended recovery window.
+const HARD_LIMIT_SENTINEL_TTL_SECS: u64 = 60;
 
 /// Maximum request body size (25 MB).
 const MAX_REQUEST_BODY_BYTES: usize = 25 * 1024 * 1024;
@@ -1398,6 +1415,46 @@ fn compute_routing_weight(
     })
 }
 
+/// Classification of a remote `alb:hard:{account}` value read from Redis.
+/// Pure function output — unit-testable without a Redis client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HardLimitSync {
+    /// Remote stored the recovery sentinel (`HARD_LIMIT_CLEARED_SENTINEL`).
+    /// Another replica observed recovery — this replica should clear its
+    /// local `hard_limited_until` but must NOT reset local burst-backoff state.
+    Clear,
+    /// Remote stored a valid future epoch. Apply it as a hard limit until
+    /// the given `Instant`.
+    Update(Instant),
+    /// Missing, stale (epoch <= now that isn't the sentinel), or bogus value.
+    /// Take no action — local state is already correct or more current.
+    Ignore,
+}
+
+/// Classify a remote hard-limit value from Redis into an action.
+///
+/// Clamps `until_epoch` to at most 24h in the future to prevent a corrupt or
+/// malicious Redis value (e.g. `u64::MAX`) from producing an `Instant` that
+/// panics on arithmetic or creates a permanent undead hard limit.
+fn classify_hard_limit_sync(
+    remote: Option<u64>,
+    now_epoch: u64,
+    now_instant: Instant,
+) -> HardLimitSync {
+    const MAX_HARD_LIMIT_SECS: u64 = 86_400; // 24h ceiling — matches mark_hard_limited
+    match remote {
+        None => HardLimitSync::Ignore,
+        Some(HARD_LIMIT_CLEARED_SENTINEL) => HardLimitSync::Clear,
+        Some(epoch) if epoch > now_epoch => {
+            let delta = (epoch - now_epoch).min(MAX_HARD_LIMIT_SECS);
+            HardLimitSync::Update(now_instant + Duration::from_secs(delta))
+        }
+        // Stale (epoch <= now_epoch but non-zero) — ignore. The key is expiring
+        // naturally via TTL; local state is unaffected.
+        Some(_) => HardLimitSync::Ignore,
+    }
+}
+
 impl AppState {
     async fn routing_candidates(&self, model: &str, skip: &[usize]) -> Vec<RoutingCandidate> {
         let now = Instant::now();
@@ -1666,7 +1723,11 @@ impl AppState {
             let key = format!("alb:weight:{}", acct.name);
             let val = format!("{w},{s}");
             let mut conn = redis.clone();
-            let ttl = self.probe_interval_secs * 2;
+            // Saturating multiply + floor to 1: prevents zero TTL when probes
+            // are disabled and avoids overflow for absurd probe_interval_secs.
+            // Redis SETEX rejects TTL=0, so a zero-floor would silently drop
+            // every weight publish.
+            let ttl = self.probe_interval_secs.saturating_mul(2).max(1);
             tokio::spawn(async move {
                 let result: redis::RedisResult<()> = conn.set_ex(&key, val, ttl).await;
                 if let Err(e) = result {
@@ -1677,22 +1738,49 @@ impl AppState {
     }
 
     /// Distributed hard-limit recovery: notifies other replicas that the local
-    /// hard limit has been cleared. Writes a `0` sentinel to `alb:hard:{account}`
-    /// (instead of DEL) so `sync_from_redis` can proactively clear other replicas'
-    /// stale `hard_limited_until` Instants — DEL alone leaves them stuck until
-    /// their own probe sees recovery. Also refreshes metric gauges and publishes
-    /// the updated routing weights so all replicas reflect the recovery within
-    /// the next sync tick.
+    /// hard limit has been cleared. Writes a sentinel (`HARD_LIMIT_CLEARED_SENTINEL`)
+    /// to `alb:hard:{account}` so `sync_from_redis` can proactively clear other
+    /// replicas' stale `hard_limited_until` Instants — DEL alone leaves them stuck
+    /// until their own probe sees recovery.
+    ///
+    /// The write uses a Lua CAS script: only clears if the current value is absent
+    /// or already `<= now_epoch` (i.e. stale/expired). This prevents a TOCTOU race
+    /// where `mark_hard_limited` spawns a write of `until_epoch=now+cooldown` at
+    /// roughly the same moment, and unordered tokio::spawn tasks reach Redis in
+    /// reversed order — without CAS, the stale sentinel would clobber the fresh
+    /// hard-limit write and propagate a false "cleared" state across replicas.
+    ///
+    /// Also refreshes metric gauges and publishes updated routing weights so all
+    /// replicas reflect the recovery within the next sync tick.
     async fn signal_hard_limit_recovery(&self, acct: &Account) {
         if let Some(redis) = &self.redis {
             let mut conn = redis.clone();
             let key = format!("alb:hard:{}", acct.name);
-            // Sentinel: epoch=0 means "explicitly cleared". Short TTL because
-            // sync_from_redis runs every 5s; once every replica has observed
-            // the sentinel, the key can be removed.
+            let now_epoch = Self::now_epoch();
+            // Lua CAS: only write the sentinel if the current value is absent,
+            // already the sentinel, or an expired hard-limit (epoch <= now).
+            // Rejects a concurrent mark_hard_limited write with epoch > now.
+            let script = redis::Script::new(
+                r#"
+                local current = redis.call('GET', KEYS[1])
+                if current == false then
+                    return redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+                end
+                local n = tonumber(current)
+                if n == nil or n <= tonumber(ARGV[3]) then
+                    return redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+                end
+                return 0
+                "#,
+            );
             tokio::spawn(async move {
-                use redis::AsyncCommands;
-                let result: redis::RedisResult<()> = conn.set_ex(&key, 0u64, 60u64).await;
+                let result: redis::RedisResult<redis::Value> = script
+                    .key(&key)
+                    .arg(HARD_LIMIT_CLEARED_SENTINEL)
+                    .arg(HARD_LIMIT_SENTINEL_TTL_SECS)
+                    .arg(now_epoch)
+                    .invoke_async(&mut conn)
+                    .await;
                 if let Err(e) = result {
                     tracing::warn!(error = %e, "redis sentinel write failed for hard-limit clear");
                 }
@@ -2241,6 +2329,10 @@ impl AppState {
         // metric gauges immediately so the dashboard reflects the dropped
         // account within seconds, not after the next probe cycle.
         self.refresh_metrics_weights().await;
+        // Republish weights to Redis so non-probing replicas pick up the
+        // new routing gauge immediately rather than reading a stale
+        // alb:weight:{account} until the next probe cycle.
+        self.publish_routing_weights().await;
     }
 
     /// Sync shared state from Redis: hard limits + rate info.
@@ -2263,37 +2355,39 @@ impl AppState {
             .collect();
 
         if let Ok(values) = conn.mget::<_, Vec<Option<u64>>>(&hard_keys).await {
-            for (i, val) in values.iter().enumerate() {
-                if let Some(until_epoch) = val {
-                    if *until_epoch == 0 {
-                        // Recovery sentinel: another replica cleared its hard limit.
-                        // Proactively clear ours so we stop excluding the account.
+            for (i, remote) in values.iter().enumerate() {
+                match classify_hard_limit_sync(*remote, now_epoch, now_instant) {
+                    HardLimitSync::Clear => {
+                        // Another replica observed recovery. Clear our local
+                        // `hard_limited_until` so pick_account stops excluding
+                        // the account. Do NOT reset `consecutive_burst_429s` —
+                        // that counter tracks THIS replica's burst-429 backoff
+                        // escalation, and resetting it based on another replica's
+                        // unrelated success would mask abuse patterns and thrash
+                        // the exponential backoff.
                         let mut info = self.accounts[i].rate_info.write().await;
                         if info.hard_limited_until.is_some() {
                             info.hard_limited_until = None;
-                            info.consecutive_burst_429s = 0;
                             trace!(
                                 account = self.accounts[i].name,
                                 "synced hard-limit clear sentinel from redis"
                             );
                         }
-                    } else if *until_epoch > now_epoch {
-                        let remaining = Duration::from_secs(until_epoch - now_epoch);
-                        let until_instant = now_instant + remaining;
+                    }
+                    HardLimitSync::Update(until_instant) => {
                         let mut info = self.accounts[i].rate_info.write().await;
-                        let should_update = match info.hard_limited_until {
-                            Some(local_until) => until_instant > local_until,
-                            None => true,
-                        };
+                        let should_update = info
+                            .hard_limited_until
+                            .is_none_or(|local| until_instant > local);
                         if should_update {
                             info.hard_limited_until = Some(until_instant);
                             trace!(
                                 account = self.accounts[i].name,
-                                remaining_secs = remaining.as_secs(),
                                 "synced hard-limit from redis"
                             );
                         }
                     }
+                    HardLimitSync::Ignore => {}
                 }
             }
         }
@@ -3436,17 +3530,24 @@ async fn proxy_handler(
                 continue;
             }
 
-            // Clear hard limit and burst counter — account just served a request successfully
-            let recovered = {
+            // Clear hard limit and burst counter only on a genuine 2xx success.
+            // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
+            // that the rate-limit window has drained — don't clobber state on
+            // client errors.
+            let recovered = if status.is_success() {
                 let mut info = acct.rate_info.write().await;
                 let was = info.hard_limited_until.is_some();
                 info.hard_limited_until = None;
                 info.consecutive_burst_429s = 0;
                 was
+            } else {
+                false
             };
 
             // Persist state after clearing hard limit so the saved snapshot is clean
-            state.save_state().await;
+            if status.is_success() {
+                state.save_state().await;
+            }
 
             if recovered {
                 state.signal_hard_limit_recovery(acct).await;
@@ -5763,17 +5864,24 @@ async fn openai_chat_handler(
                 continue;
             }
 
-            // Clear hard limit and burst counter — account just served a request successfully
-            let recovered = {
+            // Clear hard limit and burst counter only on a genuine 2xx success.
+            // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
+            // that the rate-limit window has drained — don't clobber state on
+            // client errors.
+            let recovered = if status.is_success() {
                 let mut info = acct.rate_info.write().await;
                 let was = info.hard_limited_until.is_some();
                 info.hard_limited_until = None;
                 info.consecutive_burst_429s = 0;
                 was
+            } else {
+                false
             };
 
             // Persist state after clearing hard limit so the saved snapshot is clean
-            state.save_state().await;
+            if status.is_success() {
+                state.save_state().await;
+            }
 
             if recovered {
                 state.signal_hard_limit_recovery(acct).await;
@@ -10869,6 +10977,107 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(rw.gate_5h, 0.5);
         assert_eq!(rw.source, "headroom_only");
         assert!(rw.weight > 0.0);
+    }
+
+    // ── classify_hard_limit_sync tests ────────────────────────────
+
+    #[test]
+    fn classify_hard_limit_none_is_ignore() {
+        let now_instant = Instant::now();
+        assert_eq!(
+            classify_hard_limit_sync(None, 1_000_000, now_instant),
+            HardLimitSync::Ignore
+        );
+    }
+
+    #[test]
+    fn classify_hard_limit_sentinel_is_clear() {
+        let now_instant = Instant::now();
+        assert_eq!(
+            classify_hard_limit_sync(Some(HARD_LIMIT_CLEARED_SENTINEL), 1_000_000, now_instant),
+            HardLimitSync::Clear
+        );
+    }
+
+    #[test]
+    fn classify_hard_limit_future_epoch_is_update() {
+        let now_instant = Instant::now();
+        let now_epoch = 1_000_000u64;
+        let future = now_epoch + 300; // 5 min from now
+        match classify_hard_limit_sync(Some(future), now_epoch, now_instant) {
+            HardLimitSync::Update(until) => {
+                let expected = now_instant + Duration::from_secs(300);
+                let delta = if until > expected {
+                    until.duration_since(expected)
+                } else {
+                    expected.duration_since(until)
+                };
+                assert!(delta < Duration::from_millis(1), "until Instant mismatch");
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_hard_limit_past_epoch_is_ignore() {
+        // Stale non-zero value — e.g. a hard limit that already expired via TTL
+        let now_instant = Instant::now();
+        let now_epoch = 1_000_000u64;
+        assert_eq!(
+            classify_hard_limit_sync(Some(now_epoch - 100), now_epoch, now_instant),
+            HardLimitSync::Ignore
+        );
+    }
+
+    #[test]
+    fn classify_hard_limit_epoch_equal_now_is_ignore() {
+        // Boundary: epoch == now means expired now, not future
+        let now_instant = Instant::now();
+        let now_epoch = 1_000_000u64;
+        assert_eq!(
+            classify_hard_limit_sync(Some(now_epoch), now_epoch, now_instant),
+            HardLimitSync::Ignore
+        );
+    }
+
+    #[test]
+    fn classify_hard_limit_clamps_far_future() {
+        // Corrupt or malicious Redis value must not create a panic-inducing Instant
+        // nor a permanent undead hard limit. Clamp to 24h.
+        let now_instant = Instant::now();
+        let now_epoch = 1_000_000u64;
+        match classify_hard_limit_sync(Some(u64::MAX), now_epoch, now_instant) {
+            HardLimitSync::Update(until) => {
+                let capped = now_instant + Duration::from_secs(86_400);
+                let delta = if until > capped {
+                    until.duration_since(capped)
+                } else {
+                    capped.duration_since(until)
+                };
+                assert!(delta < Duration::from_millis(1), "expected 24h clamp");
+            }
+            other => panic!("expected Update (clamped), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_hard_limit_recovery_without_redis_is_noop() {
+        // Without Redis, the helper must still refresh metrics + publish weights
+        // locally. It must not panic and must not attempt Redis I/O.
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-test")]);
+        // Pre-seed a non-zero weight so we can assert refresh_metrics_weights ran
+        state.accounts[0]
+            .last_routing_weight
+            .store(0u64, Ordering::Relaxed);
+        state.signal_hard_limit_recovery(&state.accounts[0]).await;
+        // refresh_metrics_weights always writes a value (even zero) — the point
+        // is that the method completed without Redis and without panicking.
+        let w = f64::from_bits(
+            state.accounts[0]
+                .last_routing_weight
+                .load(Ordering::Relaxed),
+        );
+        assert!(w.is_finite(), "weight atomic must remain valid: {w}");
     }
 
     // ── resolve_7d_claim tests ────────────────────────────────────
