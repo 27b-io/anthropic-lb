@@ -2354,9 +2354,10 @@ impl AppState {
             .map(|a| format!("alb:hard:{}", a.name))
             .collect();
 
-        if let Ok(values) = conn.mget::<_, Vec<Option<u64>>>(&hard_keys).await {
-            for (i, remote) in values.iter().enumerate() {
-                match classify_hard_limit_sync(*remote, now_epoch, now_instant) {
+        if let Ok(values) = conn.mget::<_, Vec<Option<String>>>(&hard_keys).await {
+            for (i, remote) in values.into_iter().enumerate() {
+                let remote = remote.and_then(|value| value.parse::<u64>().ok());
+                match classify_hard_limit_sync(remote, now_epoch, now_instant) {
                     HardLimitSync::Clear => {
                         // Another replica observed recovery. Clear our local
                         // `hard_limited_until` so pick_account stops excluding
@@ -3544,10 +3545,9 @@ async fn proxy_handler(
                 false
             };
 
-            // Persist state after clearing hard limit so the saved snapshot is clean
-            if status.is_success() {
-                state.save_state().await;
-            }
+            // Persist state after updating rate-limit state so completed 4xx
+            // responses and other terminal outcomes aren't dropped on restart.
+            state.save_state().await;
 
             if recovered {
                 state.signal_hard_limit_recovery(acct).await;
@@ -5878,10 +5878,9 @@ async fn openai_chat_handler(
                 false
             };
 
-            // Persist state after clearing hard limit so the saved snapshot is clean
-            if status.is_success() {
-                state.save_state().await;
-            }
+            // Persist state after updating rate-limit state so completed 4xx
+            // responses and other terminal outcomes aren't dropped on restart.
+            state.save_state().await;
 
             if recovered {
                 state.signal_hard_limit_recovery(acct).await;
@@ -6468,6 +6467,7 @@ async fn main() {
             info!("probes disabled — metrics weights refresh on a 60s timer");
             loop {
                 metrics_state.refresh_metrics_weights().await;
+                metrics_state.publish_routing_weights().await;
                 tokio::time::sleep(FALLBACK_INTERVAL).await;
             }
         });
@@ -6594,39 +6594,11 @@ mod tests {
     }
 
     fn test_state_with_soft_limit(accounts: Vec<Account>, soft_limit: f64) -> Arc<AppState> {
-        Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts,
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
-            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            upstreams: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-        })
+        let mut state = test_state_with(accounts);
+        Arc::get_mut(&mut state)
+            .expect("test fixture should be uniquely owned")
+            .soft_limit = soft_limit;
+        state
     }
 
     /// Spawn a mock upstream that returns a canned response with rate-limit headers.
