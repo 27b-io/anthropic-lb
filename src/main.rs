@@ -1267,7 +1267,7 @@ impl AppState {
 
             candidate_snaps.push(AcctMetricsSnap {
                 name: acct.name.clone(),
-                passthrough: false,
+                passthrough: acct.passthrough,
                 has_applicable_7d: !claims.is_empty(),
                 utilization: info.utilization,
                 utilization_5h: info.utilization_5h,
@@ -3684,7 +3684,7 @@ fn compute_routing_weights(
     let mut weight_snaps: Vec<WeightSnap> = Vec::with_capacity(snaps.len());
 
     for s in snaps {
-        if s.passthrough || s.hard_limited_active {
+        if s.hard_limited_active {
             continue;
         }
 
@@ -7559,6 +7559,98 @@ mod tests {
             String::from_utf8(captured).unwrap(),
             raw_body,
             "request body bytes should remain unchanged when auto-cache does not mutate payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_preserves_key_order_when_auto_cache_mutates() {
+        let seen_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let seen_body_clone = seen_body.clone();
+
+        let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+            let seen_body = seen_body_clone.clone();
+            async move {
+                let body_bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES)
+                    .await
+                    .unwrap();
+                *seen_body.lock().unwrap() = Some(body_bytes.to_vec());
+
+                let mut resp = axum::Json(serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "content": [{"type": "text", "text": "ok"}],
+                }))
+                .into_response();
+                let headers = resp.headers_mut();
+                headers.insert(
+                    "anthropic-ratelimit-unified-representative-claim",
+                    HeaderValue::from_static("five_hour"),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-utilization",
+                    HeaderValue::from_static("0.25"),
+                );
+                let reset_epoch = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600)
+                    .to_string();
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-reset",
+                    HeaderValue::from_str(&reset_epoch).unwrap(),
+                );
+                resp
+            }
+        }));
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let (app, _state) = test_app(
+            &format!("http://{}", mock_addr),
+            Some("secret-key".to_string()),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let input_body =
+            "{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}";
+        let expected_body = "{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"max_tokens\":1}";
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "secret-key")
+            .body(input_body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let captured = seen_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream should receive request body");
+        assert_eq!(
+            String::from_utf8(captured).unwrap(),
+            expected_body,
+            "mutated request body should preserve caller key order while adding cache markers"
         );
     }
 
@@ -13977,6 +14069,65 @@ upstream = "https://api.anthropic.com"
         );
     }
 
+    #[tokio::test]
+    async fn passthrough_accounts_participate_in_routing_candidates_and_metrics() {
+        let mut state = test_state_with(vec![
+            make_account("passthrough", "passthrough"),
+            make_account("api", "sk-ant-api-b"),
+        ]);
+        Arc::get_mut(&mut state).unwrap().soft_limit = 1.0;
+
+        let now_epoch = AppState::now_epoch();
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.20);
+            info.utilization_5h = Some(0.20);
+            info.reset_5h = Some(now_epoch + 10000);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(0.40);
+            info.utilization_5h = Some(0.40);
+            info.reset_5h = Some(now_epoch + 10000);
+        }
+
+        let candidates = state.routing_candidates("claude-sonnet-4-6", &[]).await;
+        assert_eq!(
+            candidates.len(),
+            2,
+            "passthrough account should remain routable"
+        );
+
+        let mut buf = String::new();
+        append_routing_weight_metrics(
+            &mut buf,
+            &[
+                AcctMetricsSnap {
+                    name: "passthrough".to_string(),
+                    passthrough: true,
+                    utilization: Some(0.20),
+                    utilization_5h: Some(0.20),
+                    reset_5h: Some(now_epoch + 10000),
+                    ..Default::default()
+                },
+                AcctMetricsSnap {
+                    name: "api".to_string(),
+                    utilization: Some(0.40),
+                    utilization_5h: Some(0.40),
+                    reset_5h: Some(now_epoch + 10000),
+                    ..Default::default()
+                },
+            ],
+            now_epoch,
+            state.soft_limit,
+        );
+
+        assert!(
+            buf.contains("anthropic_account_routing_weight{account=\"passthrough\"}"),
+            "passthrough account should appear in routing metrics:\n{buf}"
+        );
+    }
+
     // ── Integration: /metrics endpoint ───────────────────────────────
 
     #[tokio::test]
@@ -14707,58 +14858,27 @@ upstream = "https://api.anthropic.com"
 
     #[tokio::test]
     async fn routing_metrics_zero_share_for_soft_limited_account_matches_pick_account() {
-        let healthy = make_account("healthy", "sk-ant-api-a");
-        let soft_limited = make_account("soft-limited", "sk-ant-api-b");
-        let accounts = vec![healthy, soft_limited];
+        let mut state = test_state_with(vec![
+            make_account("healthy", "sk-ant-api-a"),
+            make_account("soft-limited", "sk-ant-api-b"),
+        ]);
+        Arc::get_mut(&mut state).unwrap().soft_limit = 0.90;
         let now_epoch = AppState::now_epoch();
 
         {
-            let mut info = accounts[0].rate_info.write().await;
+            let mut info = state.accounts[0].rate_info.write().await;
             info.utilization = Some(0.30);
             info.utilization_5h = Some(0.30);
             info.reset_5h = Some(now_epoch + 10000);
             info.status_5h = Some("allowed".to_string());
         }
         {
-            let mut info = accounts[1].rate_info.write().await;
+            let mut info = state.accounts[1].rate_info.write().await;
             info.utilization = Some(0.95);
             info.utilization_5h = Some(0.95);
             info.reset_5h = Some(now_epoch + 10000);
             info.status_5h = Some("allowed".to_string());
         }
-
-        let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts,
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
-            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            upstreams: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 0.90,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-        });
 
         let mut buf = String::new();
         append_routing_weight_metrics(
