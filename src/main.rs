@@ -3681,7 +3681,12 @@ struct AcctMetricsSnap {
     claims: Vec<ClaimMetricsSnap>,
 }
 
-fn append_routing_weight_metrics(buf: &mut String, snaps: &[AcctMetricsSnap], now_epoch: u64) {
+fn append_routing_weight_metrics(
+    buf: &mut String,
+    snaps: &[AcctMetricsSnap],
+    now_epoch: u64,
+    soft_limit: f64,
+) {
     use std::cmp::Ordering;
 
     // Model-agnostic routing view: keep the existing "best 7d claim" selection,
@@ -3701,6 +3706,7 @@ fn append_routing_weight_metrics(buf: &mut String, snaps: &[AcctMetricsSnap], no
 
     struct WeightSnap {
         name: String,
+        gate: f64,
         weight: f64,
     }
 
@@ -3781,8 +3787,20 @@ fn append_routing_weight_metrics(buf: &mut String, snaps: &[AcctMetricsSnap], no
 
         weight_snaps.push(WeightSnap {
             name: s.name.clone(),
+            gate,
             weight,
         });
+    }
+
+    // Match pick_account(): if any account is below soft_limit, accounts at/above
+    // the soft limit are excluded from selection and should contribute zero share.
+    let has_healthy = weight_snaps.iter().any(|w| w.gate < soft_limit);
+    if has_healthy {
+        for w in &mut weight_snaps {
+            if w.gate >= soft_limit {
+                w.weight = 0.0;
+            }
+        }
     }
 
     let total_weight: f64 = weight_snaps.iter().map(|w| w.weight).sum();
@@ -4238,7 +4256,7 @@ async fn metrics_handler(
         }
     }
 
-    append_routing_weight_metrics(&mut buf, &snaps, now_epoch);
+    append_routing_weight_metrics(&mut buf, &snaps, now_epoch, state.soft_limit);
 
     // ── Aggregate metrics ──────────────────────────────────────────
 
@@ -13767,6 +13785,7 @@ upstream = "https://api.anthropic.com"
                 ..Default::default()
             }],
             now_epoch,
+            1.0,
         );
 
         assert!(
@@ -13804,6 +13823,7 @@ upstream = "https://api.anthropic.com"
                 ..Default::default()
             }],
             now_epoch,
+            1.0,
         );
 
         assert!(
@@ -14545,6 +14565,110 @@ upstream = "https://api.anthropic.com"
             body.contains("# TYPE anthropic_account_routing_share gauge"),
             "missing routing_share TYPE header:\n{body}"
         );
+    }
+
+    #[tokio::test]
+    async fn routing_metrics_zero_share_for_soft_limited_account_matches_pick_account() {
+        let healthy = make_account("healthy", "sk-ant-api-a");
+        let soft_limited = make_account("soft-limited", "sk-ant-api-b");
+        let accounts = vec![healthy, soft_limited];
+        let now_epoch = AppState::now_epoch();
+
+        {
+            let mut info = accounts[0].rate_info.write().await;
+            info.utilization = Some(0.30);
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now_epoch + 10000);
+            info.status_5h = Some("allowed".to_string());
+        }
+        {
+            let mut info = accounts[1].rate_info.write().await;
+            info.utilization = Some(0.95);
+            info.utilization_5h = Some(0.95);
+            info.reset_5h = Some(now_epoch + 10000);
+            info.status_5h = Some("allowed".to_string());
+        }
+
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts,
+            robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operators: vec![],
+            emergency_brake: true,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 0.90,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
+        });
+
+        let mut buf = String::new();
+        append_routing_weight_metrics(
+            &mut buf,
+            &[
+                AcctMetricsSnap {
+                    name: "healthy".to_string(),
+                    utilization: Some(0.30),
+                    utilization_5h: Some(0.30),
+                    reset_5h: Some(now_epoch + 10000),
+                    status_5h: Some("allowed".to_string()),
+                    ..Default::default()
+                },
+                AcctMetricsSnap {
+                    name: "soft-limited".to_string(),
+                    utilization: Some(0.95),
+                    utilization_5h: Some(0.95),
+                    reset_5h: Some(now_epoch + 10000),
+                    status_5h: Some("allowed".to_string()),
+                    ..Default::default()
+                },
+            ],
+            now_epoch,
+            state.soft_limit,
+        );
+
+        assert!(
+            buf.contains("anthropic_account_routing_share{account=\"healthy\"} 1"),
+            "healthy account should receive full routing share:\n{buf}"
+        );
+        assert!(
+            buf.contains("anthropic_account_routing_share{account=\"soft-limited\"} 0"),
+            "soft-limited account should have zero routing share:\n{buf}"
+        );
+        assert!(
+            buf.contains("anthropic_account_routing_weight{account=\"soft-limited\"} 0"),
+            "soft-limited account should have zero routing weight:\n{buf}"
+        );
+
+        for i in 0..20 {
+            let key = format!("client-{i}");
+            let idx = state.pick_account(Some(&key), "any", &[]).await.unwrap();
+            assert_eq!(
+                idx, 0,
+                "client '{}' routed to soft-limited account despite exported zero share",
+                key
+            );
+        }
     }
 
     #[test]
