@@ -1198,7 +1198,8 @@ impl AppState {
     async fn routing_candidates(&self, model: &str, skip: &[usize]) -> Vec<RoutingCandidate> {
         let now = Instant::now();
         let now_epoch = Self::now_epoch();
-        let mut candidates: Vec<RoutingCandidate> = Vec::new();
+        let mut candidate_meta: Vec<(usize, &'static str)> = Vec::new();
+        let mut candidate_snaps: Vec<AcctMetricsSnap> = Vec::new();
         for (i, acct) in self.accounts.iter().enumerate() {
             if skip.contains(&i) {
                 trace!(account = acct.name, "pick: skipping, already tried");
@@ -1235,36 +1236,10 @@ impl AppState {
                 .hard_limited_until
                 .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
 
-            // 5h gate: time-adjusted 5h utilization with status floors
-            let gate_5h = if stale_after_hard_limit {
-                // Data is from the 429 era — treat as unknown to give the account
-                // a fair chance. The next successful request will refresh everything.
-                0.5
-            } else {
-                time_adjusted_utilization(
-                    info.utilization_5h,
-                    info.reset_5h,
-                    info.status_5h.as_deref(),
-                    NEAR_RESET_5H_SECS,
-                    now_epoch,
-                )
-                .unwrap_or_else(|| {
-                    // Fallback: raw unified, legacy, or unknown
-                    if let Some(util) = info.utilization {
-                        util
-                    } else if let Some(remaining) = info.remaining_tokens {
-                        let limit = info.limit_tokens.unwrap_or(1_000_000);
-                        (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
-                    } else {
-                        0.5
-                    }
-                })
-            };
-
-            // 7d model-specific gate and waste risk. Keep raw 7d utilization in
-            // waste_risk, and use gate_7d only for pressure/status so we do not
-            // double-count the same 7d signal in both terms.
-            let (gate_7d, wr, source) = if let Some(claim) = resolve_7d_claim(&info, model) {
+            // 7d model-specific selection. Keep raw 7d utilization in waste_risk,
+            // and use gate_7d only for pressure/status so we do not double-count
+            // the same 7d signal in both terms.
+            let (claims, source) = if let Some(claim) = resolve_7d_claim(&info, model) {
                 // Skip if this model's 7d claim is rejected AND we have fresh data.
                 // Stale rejections from expired hard limits are ignored — the account
                 // needs a chance to prove it's recovered.
@@ -1277,67 +1252,67 @@ impl AppState {
                     continue;
                 }
                 (
-                    if stale_after_hard_limit {
-                        0.5
-                    } else {
-                        time_adjusted_utilization(
-                            Some(0.0),
-                            claim.reset,
-                            claim.status.as_deref(),
-                            NEAR_RESET_7D_SECS,
-                            now_epoch,
-                        )
-                        .unwrap_or(0.0)
-                    },
-                    waste_risk(claim.utilization, claim.reset, now_epoch),
+                    vec![ClaimMetricsSnap {
+                        key: "selected".to_string(),
+                        utilization: claim.utilization,
+                        waste_risk: waste_risk(claim.utilization, claim.reset, now_epoch),
+                        reset: claim.reset,
+                        status: claim.status.clone(),
+                    }],
                     "waste_risk",
                 )
             } else {
-                (
-                    if stale_after_hard_limit {
-                        0.5
-                    } else {
-                        time_adjusted_utilization(
-                            Some(0.0),
-                            info.reset_7d,
-                            info.status_7d.as_deref(),
-                            NEAR_RESET_7D_SECS,
-                            now_epoch,
-                        )
-                        .unwrap_or(0.0)
-                    },
-                    0.0,
-                    "headroom_only",
-                )
+                (Vec::new(), "headroom_only")
             };
 
-            let gate = gate_5h.max(gate_7d);
+            candidate_snaps.push(AcctMetricsSnap {
+                name: acct.name.clone(),
+                passthrough: false,
+                utilization: info.utilization,
+                utilization_5h: info.utilization_5h,
+                utilization_7d: info.utilization_7d,
+                reset_5h: info.reset_5h,
+                reset_7d: info.reset_7d,
+                status_5h: info.status_5h.clone(),
+                status_7d: info.status_7d.clone(),
+                stale_after_hard_limit,
+                hard_limited_active: false,
+                burn_rate: (0.0, 0.0, 0.0),
+                headroom: None,
+                remaining_requests: info.remaining_requests,
+                remaining_tokens: info.remaining_tokens,
+                limit_requests: info.limit_requests,
+                limit_tokens: info.limit_tokens,
+                requests_total: 0,
+                hard_limited_secs: 0.0,
+                projected_throttle_secs: None,
+                token_usage: [0; 4],
+                claims,
+            });
+            candidate_meta.push((i, source));
+        }
 
-            // Weight: waste_risk dampened by the worst active gate.
-            let headroom = (1.0 - gate).max(0.01);
-            let weight = if wr > 0.0 { wr * headroom } else { headroom };
-
-            // Zero weight for fully exhausted accounts
-            let weight = if gate >= 1.0 { 0.0 } else { weight };
-
+        let weight_snaps = compute_routing_weights(&candidate_snaps, now_epoch, self.soft_limit);
+        let mut candidates: Vec<RoutingCandidate> = Vec::with_capacity(weight_snaps.len());
+        for ((idx, source), snap) in candidate_meta.into_iter().zip(weight_snaps) {
             trace!(
-                account = acct.name,
-                gate_5h = format!("{:.4}", gate_5h),
-                gate_7d = format!("{:.4}", gate_7d),
-                gate = format!("{:.4}", gate),
-                waste_risk = format!("{:.4}", wr),
-                weight = format!("{:.4}", weight),
+                account = snap.name,
+                gate_5h = format!("{:.4}", snap.gate_5h),
+                gate_7d = format!("{:.4}", snap.gate_7d),
+                gate = format!("{:.4}", snap.gate),
+                waste_risk = format!("{:.4}", snap.wr),
+                weight = format!("{:.4}", snap.weight),
                 source = source,
                 "pick: candidate"
             );
 
             candidates.push(RoutingCandidate {
-                idx: i,
-                gate_5h,
-                gate_7d,
-                gate,
-                wr,
-                weight,
+                idx,
+                gate_5h: snap.gate_5h,
+                gate_7d: snap.gate_7d,
+                gate: snap.gate,
+                wr: snap.wr,
+                weight: snap.weight,
                 source,
             });
         }
@@ -3681,34 +3656,22 @@ struct AcctMetricsSnap {
     claims: Vec<ClaimMetricsSnap>,
 }
 
-fn append_routing_weight_metrics(
-    buf: &mut String,
+#[derive(Clone, Debug)]
+struct WeightSnap {
+    name: String,
+    gate_5h: f64,
+    gate_7d: f64,
+    gate: f64,
+    wr: f64,
+    weight: f64,
+}
+
+fn compute_routing_weights(
     snaps: &[AcctMetricsSnap],
     now_epoch: u64,
     soft_limit: f64,
-) {
+) -> Vec<WeightSnap> {
     use std::cmp::Ordering;
-
-    // Model-agnostic routing view: keep the existing "best 7d claim" selection,
-    // but compute gates with the same time-adjusted logic as routing_candidates().
-    prom_header(
-        buf,
-        "anthropic_account_routing_weight",
-        "gauge",
-        "Per-account routing weight (headroom * waste_risk)",
-    );
-    prom_header(
-        buf,
-        "anthropic_account_routing_share",
-        "gauge",
-        "Per-account share of total routing weight (0.0-1.0)",
-    );
-
-    struct WeightSnap {
-        name: String,
-        gate: f64,
-        weight: f64,
-    }
 
     let mut weight_snaps: Vec<WeightSnap> = Vec::with_capacity(snaps.len());
 
@@ -3787,7 +3750,10 @@ fn append_routing_weight_metrics(
 
         weight_snaps.push(WeightSnap {
             name: s.name.clone(),
+            gate_5h,
+            gate_7d,
             gate,
+            wr,
             weight,
         });
     }
@@ -3803,6 +3769,31 @@ fn append_routing_weight_metrics(
         }
     }
 
+    weight_snaps
+}
+
+fn append_routing_weight_metrics(
+    buf: &mut String,
+    snaps: &[AcctMetricsSnap],
+    now_epoch: u64,
+    soft_limit: f64,
+) {
+    // Model-agnostic routing view: keep the existing "best 7d claim" selection,
+    // but compute gates with the same time-adjusted logic as routing_candidates().
+    prom_header(
+        buf,
+        "anthropic_account_routing_weight",
+        "gauge",
+        "Per-account routing weight (headroom * waste_risk)",
+    );
+    prom_header(
+        buf,
+        "anthropic_account_routing_share",
+        "gauge",
+        "Per-account share of total routing weight (0.0-1.0)",
+    );
+
+    let weight_snaps = compute_routing_weights(snaps, now_epoch, soft_limit);
     let total_weight: f64 = weight_snaps.iter().map(|w| w.weight).sum();
 
     for w in &weight_snaps {
