@@ -3646,6 +3646,165 @@ fn prom_header(buf: &mut String, name: &str, metric_type: &str, help: &str) {
     let _ = writeln!(buf, "# TYPE {name} {metric_type}");
 }
 
+#[derive(Default, Clone)]
+struct ClaimMetricsSnap {
+    key: String,
+    utilization: Option<f64>,
+    waste_risk: f64,
+    reset: Option<u64>,
+    status: Option<String>,
+}
+
+#[derive(Default, Clone)]
+struct AcctMetricsSnap {
+    name: String,
+    passthrough: bool,
+    utilization: Option<f64>,
+    utilization_5h: Option<f64>,
+    utilization_7d: Option<f64>,
+    reset_5h: Option<u64>,
+    reset_7d: Option<u64>,
+    status_5h: Option<String>,
+    status_7d: Option<String>,
+    stale_after_hard_limit: bool,
+    hard_limited_active: bool,
+    burn_rate: (f64, f64, f64),
+    headroom: Option<u64>,
+    remaining_requests: Option<u64>,
+    remaining_tokens: Option<u64>,
+    limit_requests: Option<u64>,
+    limit_tokens: Option<u64>,
+    requests_total: u64,
+    hard_limited_secs: f64,
+    projected_throttle_secs: Option<f64>,
+    token_usage: [u64; 4],
+    claims: Vec<ClaimMetricsSnap>,
+}
+
+fn append_routing_weight_metrics(buf: &mut String, snaps: &[AcctMetricsSnap], now_epoch: u64) {
+    use std::cmp::Ordering;
+
+    // Model-agnostic routing view: keep the existing "best 7d claim" selection,
+    // but compute gates with the same time-adjusted logic as routing_candidates().
+    prom_header(
+        buf,
+        "anthropic_account_routing_weight",
+        "gauge",
+        "Per-account routing weight (headroom * waste_risk)",
+    );
+    prom_header(
+        buf,
+        "anthropic_account_routing_share",
+        "gauge",
+        "Per-account share of total routing weight (0.0-1.0)",
+    );
+
+    struct WeightSnap {
+        name: String,
+        weight: f64,
+    }
+
+    let mut weight_snaps: Vec<WeightSnap> = Vec::with_capacity(snaps.len());
+
+    for s in snaps {
+        if s.passthrough || s.hard_limited_active {
+            continue;
+        }
+
+        let gate_5h = if s.stale_after_hard_limit {
+            0.5
+        } else {
+            time_adjusted_utilization(
+                s.utilization_5h,
+                s.reset_5h,
+                s.status_5h.as_deref(),
+                NEAR_RESET_5H_SECS,
+                now_epoch,
+            )
+            .unwrap_or_else(|| {
+                if let Some(util) = s.utilization {
+                    util
+                } else if let Some(remaining) = s.remaining_tokens {
+                    let limit = s.limit_tokens.unwrap_or(1_000_000);
+                    (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                }
+            })
+        };
+
+        let best_claim = s.claims.iter().max_by(|a, b| {
+            a.waste_risk
+                .partial_cmp(&b.waste_risk)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+
+        let (gate_7d, wr) = if let Some(claim) = best_claim {
+            (
+                if s.stale_after_hard_limit {
+                    0.5
+                } else {
+                    time_adjusted_utilization(
+                        Some(0.0),
+                        claim.reset,
+                        claim.status.as_deref(),
+                        NEAR_RESET_7D_SECS,
+                        now_epoch,
+                    )
+                    .unwrap_or(0.0)
+                },
+                claim.waste_risk,
+            )
+        } else {
+            (
+                if s.stale_after_hard_limit {
+                    0.5
+                } else {
+                    time_adjusted_utilization(
+                        Some(0.0),
+                        s.reset_7d,
+                        s.status_7d.as_deref(),
+                        NEAR_RESET_7D_SECS,
+                        now_epoch,
+                    )
+                    .unwrap_or(0.0)
+                },
+                0.0,
+            )
+        };
+
+        let gate = gate_5h.max(gate_7d);
+        let headroom = (1.0 - gate).max(0.01);
+        let weight = if wr > 0.0 { wr * headroom } else { headroom };
+        let weight = if gate >= 1.0 { 0.0 } else { weight };
+
+        weight_snaps.push(WeightSnap {
+            name: s.name.clone(),
+            weight,
+        });
+    }
+
+    let total_weight: f64 = weight_snaps.iter().map(|w| w.weight).sum();
+
+    for w in &weight_snaps {
+        prom_gauge(
+            buf,
+            "anthropic_account_routing_weight",
+            &[("account", &w.name)],
+            w.weight,
+        );
+        if total_weight > 0.0 {
+            prom_gauge(
+                buf,
+                "anthropic_account_routing_share",
+                &[("account", &w.name)],
+                w.weight / total_weight,
+            );
+        }
+    }
+}
+
 async fn metrics_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -3666,25 +3825,7 @@ async fn metrics_handler(
 
     // ── Phase 1: Gather data (async — acquires locks) ──────────────
 
-    struct AcctSnap {
-        name: String,
-        passthrough: bool,
-        utilization_5h: Option<f64>,
-        utilization_7d: Option<f64>,
-        burn_rate: (f64, f64, f64),
-        headroom: Option<u64>,
-        remaining_requests: Option<u64>,
-        remaining_tokens: Option<u64>,
-        limit_requests: Option<u64>,
-        limit_tokens: Option<u64>,
-        requests_total: u64,
-        hard_limited_secs: f64,
-        projected_throttle_secs: Option<f64>,
-        token_usage: [u64; 4],
-        claims: Vec<(String, Option<f64>, f64)>,
-    }
-
-    let mut snaps: Vec<AcctSnap> = Vec::with_capacity(state.accounts.len());
+    let mut snaps: Vec<AcctMetricsSnap> = Vec::with_capacity(state.accounts.len());
     let mut total_headroom: Option<u64> = Some(0);
 
     for acct in &state.accounts {
@@ -3712,6 +3853,12 @@ async fn metrics_handler(
             .and_then(|until| until.checked_duration_since(Instant::now()))
             .map(|d| d.as_secs() as f64)
             .unwrap_or(0.0);
+        let hard_limited_active = info
+            .hard_limited_until
+            .is_some_and(|until| Instant::now() < until);
+        let stale_after_hard_limit = info
+            .hard_limited_until
+            .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
 
         let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
         let projected_throttle_secs = if eff_util < 0.5 || br_1h < 0.01 {
@@ -3726,23 +3873,30 @@ async fn metrics_handler(
             })
         };
 
-        let claims: Vec<(String, Option<f64>, f64)> = info
+        let claims: Vec<ClaimMetricsSnap> = info
             .claims_7d
             .iter()
-            .map(|(k, d)| {
-                (
-                    k.clone(),
-                    d.utilization,
-                    waste_risk(d.utilization, d.reset, now_epoch),
-                )
+            .map(|(k, d)| ClaimMetricsSnap {
+                key: k.clone(),
+                utilization: d.utilization,
+                waste_risk: waste_risk(d.utilization, d.reset, now_epoch),
+                reset: d.reset,
+                status: d.status.clone(),
             })
             .collect();
 
-        snaps.push(AcctSnap {
+        snaps.push(AcctMetricsSnap {
             name: acct.name.clone(),
             passthrough: acct.passthrough,
+            utilization: info.utilization,
             utilization_5h: info.utilization_5h,
             utilization_7d: info.utilization_7d,
+            reset_5h: info.reset_5h,
+            reset_7d: info.reset_7d,
+            status_5h: info.status_5h.clone(),
+            status_7d: info.status_7d.clone(),
+            stale_after_hard_limit,
+            hard_limited_active,
             burn_rate: (br_5m, br_1h, br_6h),
             headroom,
             remaining_requests: info.remaining_requests,
@@ -4056,13 +4210,13 @@ async fn metrics_handler(
         "Per-claim utilization",
     );
     for s in &snaps {
-        for (claim_key, util, _) in &s.claims {
-            if let Some(u) = util {
+        for claim in &s.claims {
+            if let Some(u) = claim.utilization {
                 prom_gauge(
                     &mut buf,
                     "anthropic_claim_utilization",
-                    &[("account", &s.name), ("claim", claim_key)],
-                    *u,
+                    &[("account", &s.name), ("claim", &claim.key)],
+                    u,
                 );
             }
         }
@@ -4074,97 +4228,17 @@ async fn metrics_handler(
         "Per-claim waste risk score",
     );
     for s in &snaps {
-        for (claim_key, _, wr) in &s.claims {
+        for claim in &s.claims {
             prom_gauge(
                 &mut buf,
                 "anthropic_claim_waste_risk",
-                &[("account", &s.name), ("claim", claim_key)],
-                *wr,
+                &[("account", &s.name), ("claim", &claim.key)],
+                claim.waste_risk,
             );
         }
     }
 
-    // ── Routing weights (derived from utilization + waste risk) ─────
-    //
-    // Mirrors the weight formula in routing_candidates() but uses the
-    // representative 7d claim per account (model-agnostic).  This gives
-    // a steady-state view of how the LB *would* distribute traffic.
-
-    prom_header(
-        &mut buf,
-        "anthropic_account_routing_weight",
-        "gauge",
-        "Per-account routing weight (headroom * waste_risk)",
-    );
-    prom_header(
-        &mut buf,
-        "anthropic_account_routing_share",
-        "gauge",
-        "Per-account share of total routing weight (0.0-1.0)",
-    );
-
-    {
-        struct WeightSnap {
-            name: String,
-            weight: f64,
-        }
-        let mut weight_snaps: Vec<WeightSnap> = Vec::with_capacity(snaps.len());
-
-        for s in &snaps {
-            if s.passthrough {
-                continue;
-            }
-
-            let gate_5h = s.utilization_5h.unwrap_or(0.5);
-
-            // Use the representative 7d claim's waste_risk (highest wr)
-            let (best_wr, best_claim_util) = s
-                .claims
-                .iter()
-                .filter(|(_, util, _)| util.is_some())
-                .fold((0.0f64, 0.0f64), |(wr_max, util_at_max), (_, util, wr)| {
-                    if *wr > wr_max {
-                        (*wr, util.unwrap_or(0.0))
-                    } else {
-                        (wr_max, util_at_max)
-                    }
-                });
-
-            let gate_7d = best_claim_util;
-            let gate = gate_5h.max(gate_7d);
-            let headroom = (1.0 - gate).max(0.01);
-            let weight = if best_wr > 0.0 {
-                best_wr * headroom
-            } else {
-                headroom
-            };
-            let weight = if gate >= 1.0 { 0.0 } else { weight };
-
-            weight_snaps.push(WeightSnap {
-                name: s.name.clone(),
-                weight,
-            });
-        }
-
-        let total_weight: f64 = weight_snaps.iter().map(|w| w.weight).sum();
-
-        for w in &weight_snaps {
-            prom_gauge(
-                &mut buf,
-                "anthropic_account_routing_weight",
-                &[("account", &w.name)],
-                w.weight,
-            );
-            if total_weight > 0.0 {
-                prom_gauge(
-                    &mut buf,
-                    "anthropic_account_routing_share",
-                    &[("account", &w.name)],
-                    w.weight / total_weight,
-                );
-            }
-        }
-    }
+    append_routing_weight_metrics(&mut buf, &snaps, now_epoch);
 
     // ── Aggregate metrics ──────────────────────────────────────────
 
@@ -13671,6 +13745,80 @@ upstream = "https://api.anthropic.com"
         assert_eq!(buf, "m{name=\"has\\\"quotes\"} 1\n");
     }
 
+    #[test]
+    fn routing_metrics_present() {
+        let now_epoch = AppState::now_epoch();
+        let mut buf = String::new();
+        append_routing_weight_metrics(
+            &mut buf,
+            &[AcctMetricsSnap {
+                name: "acct-a".to_string(),
+                utilization: Some(0.20),
+                utilization_5h: Some(0.20),
+                reset_5h: Some(now_epoch + NEAR_RESET_5H_SECS as u64 + 600),
+                status_5h: Some("allowed".to_string()),
+                claims: vec![ClaimMetricsSnap {
+                    key: "seven_day".to_string(),
+                    utilization: Some(0.50),
+                    waste_risk: 0.50,
+                    reset: Some(now_epoch + TOTAL_7D_SECS as u64),
+                    status: Some("allowed".to_string()),
+                }],
+                ..Default::default()
+            }],
+            now_epoch,
+        );
+
+        assert!(
+            buf.lines()
+                .any(|line| line
+                    .starts_with("anthropic_account_routing_weight{account=\"acct-a\"} 0.4")),
+            "missing routing_weight line:\n{buf}"
+        );
+        assert!(
+            buf.lines()
+                .any(|line| line
+                    .starts_with("anthropic_account_routing_share{account=\"acct-a\"} 1")),
+            "missing routing_share line:\n{buf}"
+        );
+    }
+
+    #[test]
+    fn routing_metrics_zero_weight_for_rejected_claim() {
+        let now_epoch = AppState::now_epoch();
+        let mut buf = String::new();
+        append_routing_weight_metrics(
+            &mut buf,
+            &[AcctMetricsSnap {
+                name: "acct-a".to_string(),
+                utilization_5h: Some(0.20),
+                reset_5h: Some(now_epoch + NEAR_RESET_5H_SECS as u64 + 600),
+                status_5h: Some("allowed".to_string()),
+                claims: vec![ClaimMetricsSnap {
+                    key: "seven_day".to_string(),
+                    utilization: Some(0.50),
+                    waste_risk: 0.50,
+                    reset: Some(now_epoch + TOTAL_7D_SECS as u64),
+                    status: Some("rejected".to_string()),
+                }],
+                ..Default::default()
+            }],
+            now_epoch,
+        );
+
+        assert!(
+            buf.lines()
+                .any(|line| line
+                    .starts_with("anthropic_account_routing_weight{account=\"acct-a\"} 0")),
+            "rejected claim should zero routing_weight:\n{buf}"
+        );
+        assert!(
+            !buf.lines()
+                .any(|line| line.starts_with("anthropic_account_routing_share{account=\"acct-a\"}")),
+            "zero-total routing_share should be omitted:\n{buf}"
+        );
+    }
+
     // ── Integration: /metrics endpoint ───────────────────────────────
 
     #[tokio::test]
@@ -14335,6 +14483,67 @@ upstream = "https://api.anthropic.com"
         assert!(
             !body.contains("anthropic_claim_utilization{account=\"acct-b\""),
             "acct-b should have no claim_utilization:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_routing_weight_and_share_present() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, state) = test_app(&mock_url, None);
+
+        let now_epoch = AppState::now_epoch();
+
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.20);
+            info.utilization_5h = Some(0.20);
+            info.reset_5h = Some(now_epoch + NEAR_RESET_5H_SECS as u64 + 600);
+            info.status_5h = Some("allowed".to_string());
+            info.claims_7d.insert(
+                "seven_day".to_string(),
+                ClaimWindowData {
+                    utilization: Some(0.50),
+                    reset: Some(now_epoch + TOTAL_7D_SECS as u64),
+                    status: Some("allowed".to_string()),
+                    ..Default::default()
+                },
+            );
+            info.utilization_7d = Some(0.50);
+            info.reset_7d = Some(now_epoch + TOTAL_7D_SECS as u64);
+            info.status_7d = Some("allowed".to_string());
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(1.0);
+            info.utilization_5h = Some(1.0);
+            info.reset_5h = Some(now_epoch + NEAR_RESET_5H_SECS as u64 + 600);
+            info.status_5h = Some("allowed".to_string());
+        }
+
+        let addr = serve(app).await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap();
+        let body = resp.text().await.unwrap();
+
+        assert!(
+            body.contains("anthropic_account_routing_weight{account=\"acct-a\"} 0.4"),
+            "missing routing_weight:\n{body}"
+        );
+        assert!(
+            body.contains("anthropic_account_routing_share{account=\"acct-a\"} 1"),
+            "missing routing_share:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE anthropic_account_routing_weight gauge"),
+            "missing routing_weight TYPE header:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE anthropic_account_routing_share gauge"),
+            "missing routing_share TYPE header:\n{body}"
         );
     }
 
