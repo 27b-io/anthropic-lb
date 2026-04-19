@@ -1268,6 +1268,7 @@ impl AppState {
             candidate_snaps.push(AcctMetricsSnap {
                 name: acct.name.clone(),
                 passthrough: false,
+                has_applicable_7d: !claims.is_empty(),
                 utilization: info.utilization,
                 utilization_5h: info.utilization_5h,
                 utilization_7d: info.utilization_7d,
@@ -2848,12 +2849,14 @@ async fn proxy_handler(
                 .and_then(|m| m.as_str())
                 .unwrap_or("")
                 .to_string();
+            let mut mutated = false;
 
             if state.auto_cache {
                 let inj = inject_cache_breakpoints(&mut parsed);
                 if inj.skipped {
                     debug!("auto-cache: skipped, existing cache_control found");
                 } else if inj.tools || inj.system || inj.messages {
+                    mutated = true;
                     debug!(
                         tools = inj.tools,
                         system = inj.system,
@@ -2868,11 +2871,15 @@ async fn proxy_handler(
             // producing different bytes from what the client sent. Anthropic's prompt
             // caching matches on raw byte prefixes, so reordering silently breaks
             // cache hits (0 reads, full writes every turn).
-            let bytes = serde_json::to_vec(&parsed).unwrap_or_else(|_| body_bytes.to_vec());
+            let bytes = if mutated {
+                serde_json::to_vec(&parsed).unwrap_or_else(|_| body_bytes.to_vec())
+            } else {
+                body_bytes.to_vec()
+            };
 
             // Pre-compute OAuth variant with Claude Code system prompt prepended.
             // OAuth tokens (sk-ant-oat*) require this to access sonnet/opus models.
-            let mut oauth_parsed = parsed;
+            let mut oauth_parsed = parsed.clone();
             inject_oauth_system_prompt(&mut oauth_parsed);
             let oauth_bytes = serde_json::to_vec(&oauth_parsed).unwrap_or_else(|_| bytes.clone());
 
@@ -3634,6 +3641,7 @@ struct ClaimMetricsSnap {
 struct AcctMetricsSnap {
     name: String,
     passthrough: bool,
+    has_applicable_7d: bool,
     utilization: Option<f64>,
     utilization_5h: Option<f64>,
     utilization_7d: Option<f64>,
@@ -3725,7 +3733,7 @@ fn compute_routing_weights(
                 },
                 claim.waste_risk,
             )
-        } else {
+        } else if s.has_applicable_7d {
             (
                 if s.stale_after_hard_limit {
                     0.5
@@ -3741,6 +3749,8 @@ fn compute_routing_weights(
                 },
                 0.0,
             )
+        } else {
+            (if s.stale_after_hard_limit { 0.5 } else { 0.0 }, 0.0)
         };
 
         let gate = gate_5h.max(gate_7d);
@@ -3897,6 +3907,10 @@ async fn metrics_handler(
         snaps.push(AcctMetricsSnap {
             name: acct.name.clone(),
             passthrough: acct.passthrough,
+            has_applicable_7d: !claims.is_empty()
+                || info.utilization_7d.is_some()
+                || info.reset_7d.is_some()
+                || info.status_7d.is_some(),
             utilization: info.utilization,
             utilization_5h: info.utilization_5h,
             utilization_7d: info.utilization_7d,
@@ -7459,6 +7473,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_preserves_raw_body_bytes_when_auto_cache_skips() {
+        let seen_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let seen_body_clone = seen_body.clone();
+
+        let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+            let seen_body = seen_body_clone.clone();
+            async move {
+                let body_bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES)
+                    .await
+                    .unwrap();
+                *seen_body.lock().unwrap() = Some(body_bytes.to_vec());
+
+                let mut resp = axum::Json(serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "content": [{"type": "text", "text": "ok"}],
+                }))
+                .into_response();
+                let headers = resp.headers_mut();
+                headers.insert(
+                    "anthropic-ratelimit-unified-representative-claim",
+                    HeaderValue::from_static("five_hour"),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-utilization",
+                    HeaderValue::from_static("0.25"),
+                );
+                let reset_epoch = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600)
+                    .to_string();
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-reset",
+                    HeaderValue::from_str(&reset_epoch).unwrap(),
+                );
+                resp
+            }
+        }));
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let (app, _state) = test_app(
+            &format!("http://{}", mock_addr),
+            Some("secret-key".to_string()),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let raw_body = "{\n  \"model\" : \"test\",\n  \"messages\" : [{\"role\" : \"user\", \"content\" : [{\"type\":\"text\", \"text\":\"hi\", \"cache_control\":{\"type\":\"ephemeral\"}}]}],\n  \"max_tokens\" : 1\n}";
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "secret-key")
+            .body(raw_body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let captured = seen_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream should receive request body");
+        assert_eq!(
+            String::from_utf8(captured).unwrap(),
+            raw_body,
+            "request body bytes should remain unchanged when auto-cache does not mutate payload"
+        );
+    }
+
+    #[tokio::test]
     async fn stats_endpoint_returns_account_info() {
         let (mock_url, _handle) = spawn_mock_upstream().await;
         let (app, _state) = test_app(&mock_url, None);
@@ -9015,6 +9119,49 @@ data: {\"type\":\"message_stop\"}\n\n";
                 key
             );
         }
+    }
+
+    #[tokio::test]
+    async fn routing_candidates_ignore_unmatched_7d_state() {
+        let state = test_state_with(vec![make_account("acct-a", "sk-ant-api-a")]);
+        let now = AppState::now_epoch();
+
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.20);
+            info.utilization_5h = Some(0.20);
+            info.reset_5h = Some(now + 10000);
+            info.claims_7d.insert(
+                "seven_day_haiku".to_string(),
+                ClaimWindowData {
+                    utilization: Some(0.95),
+                    reset: Some(now + 100000),
+                    status: Some("throttled".to_string()),
+                    ..Default::default()
+                },
+            );
+            // Derived aggregate 7d fields reflect the unrelated claim, but routing
+            // for opus must ignore them when no applicable 7d claim exists.
+            info.utilization_7d = Some(0.95);
+            info.reset_7d = Some(now + 100000);
+            info.status_7d = Some("throttled".to_string());
+        }
+
+        let candidates = state.routing_candidates("claude-opus-4-6", &[]).await;
+        assert_eq!(candidates.len(), 1, "expected one routing candidate");
+
+        let candidate = &candidates[0];
+        assert_eq!(candidate.source, "headroom_only");
+        assert!(
+            (candidate.gate_7d - 0.0).abs() < f64::EPSILON,
+            "unmatched 7d state should not leak into gate_7d: {:?}",
+            candidate
+        );
+        assert!(
+            (candidate.weight - 0.8).abs() < 0.0001,
+            "weight should remain 5h headroom-only when no 7d claim applies: {:?}",
+            candidate
+        );
     }
 
     // ── Unit: per-client budget ────────────────────────────────────
