@@ -2888,7 +2888,11 @@ async fn proxy_handler(
                 }
             }
 
-            // Re-serialize (only differs from original if cache was injected)
+            // Re-serialize. The `preserve_order` feature on serde_json is critical:
+            // without it, serde uses BTreeMap which reorders JSON keys alphabetically,
+            // producing different bytes from what the client sent. Anthropic's prompt
+            // caching matches on raw byte prefixes, so reordering silently breaks
+            // cache hits (0 reads, full writes every turn).
             let bytes = serde_json::to_vec(&parsed).unwrap_or_else(|_| body_bytes.to_vec());
 
             // Pre-compute OAuth variant with Claude Code system prompt prepended.
