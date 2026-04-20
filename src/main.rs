@@ -1319,8 +1319,8 @@ fn effective_utilization(
 
 /// Computed routing weight for a single account+model. Extracted so both
 /// `routing_candidates()` (real requests) and `probe_account()` (periodic probes)
-/// use identical logic. Returns `None` when the account's 7d claim is rejected
-/// (caller should skip it).
+/// use identical logic. Returns `None` when the account's 7d claim is actively
+/// rejected (caller should skip it).
 struct RoutingWeight {
     gate_5h: f64,
     gate_7d: f64,
@@ -1362,7 +1362,9 @@ fn compute_routing_weight(
 
     // 7d model-specific gate and waste risk
     let (gate_7d, wr, source) = if let Some(claim) = resolve_7d_claim(info, model) {
-        if claim.status.as_deref() == Some("rejected") && !stale_after_hard_limit {
+        let rejected_claim_active = claim.status.as_deref() == Some("rejected")
+            && claim.reset.is_none_or(|reset| reset > now_epoch);
+        if rejected_claim_active && !stale_after_hard_limit {
             return None; // caller should skip this account
         }
         (
@@ -1383,18 +1385,7 @@ fn compute_routing_weight(
         )
     } else {
         (
-            if stale_after_hard_limit {
-                0.5
-            } else {
-                time_adjusted_utilization(
-                    Some(0.0),
-                    info.reset_7d,
-                    info.status_7d.as_deref(),
-                    NEAR_RESET_7D_SECS,
-                    now_epoch,
-                )
-                .unwrap_or(0.0)
-            },
+            if stale_after_hard_limit { 0.5 } else { 0.0 },
             0.0,
             "headroom_only",
         )
@@ -1709,6 +1700,18 @@ impl AppState {
         }
     }
 
+    fn routing_weight_publish_ttl(probe_interval_secs: u64) -> u64 {
+        const FALLBACK_PUBLISH_INTERVAL_SECS: u64 = 60;
+
+        let effective_interval = if probe_interval_secs == 0 {
+            FALLBACK_PUBLISH_INTERVAL_SECS
+        } else {
+            probe_interval_secs
+        };
+
+        effective_interval.saturating_mul(2).max(1)
+    }
+
     /// Publish precomputed routing weights to Redis so non-probing pods
     /// can set their gauge atomics without recomputing.
     async fn publish_routing_weights(&self) {
@@ -1723,11 +1726,7 @@ impl AppState {
             let key = format!("alb:weight:{}", acct.name);
             let val = format!("{w},{s}");
             let mut conn = redis.clone();
-            // Saturating multiply + floor to 1: prevents zero TTL when probes
-            // are disabled and avoids overflow for absurd probe_interval_secs.
-            // Redis SETEX rejects TTL=0, so a zero-floor would silently drop
-            // every weight publish.
-            let ttl = self.probe_interval_secs.saturating_mul(2).max(1);
+            let ttl = Self::routing_weight_publish_ttl(self.probe_interval_secs);
             tokio::spawn(async move {
                 let result: redis::RedisResult<()> = conn.set_ex(&key, val, ttl).await;
                 if let Err(e) = result {
@@ -4161,6 +4160,7 @@ fn prom_header(buf: &mut String, name: &str, metric_type: &str, help: &str) {
     let _ = writeln!(buf, "# TYPE {name} {metric_type}");
 }
 
+#[allow(dead_code)]
 #[derive(Default, Clone)]
 struct ClaimMetricsSnap {
     key: String,
@@ -4170,6 +4170,7 @@ struct ClaimMetricsSnap {
     status: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Default, Clone)]
 struct AcctMetricsSnap {
     name: String,
@@ -4197,132 +4198,12 @@ struct AcctMetricsSnap {
     claims: Vec<ClaimMetricsSnap>,
 }
 
-#[derive(Clone, Debug)]
-struct WeightSnap {
-    name: String,
-    gate_5h: f64,
-    gate_7d: f64,
-    gate: f64,
-    wr: f64,
-    weight: f64,
-}
-
-fn compute_routing_weights(
-    snaps: &[AcctMetricsSnap],
-    now_epoch: u64,
-    soft_limit: f64,
-) -> Vec<WeightSnap> {
-    use std::cmp::Ordering;
-
-    let mut weight_snaps: Vec<WeightSnap> = Vec::with_capacity(snaps.len());
-
-    for s in snaps {
-        if s.hard_limited_active {
-            continue;
-        }
-
-        let gate_5h = if s.stale_after_hard_limit {
-            0.5
-        } else {
-            time_adjusted_utilization(
-                s.utilization_5h,
-                s.reset_5h,
-                s.status_5h.as_deref(),
-                NEAR_RESET_5H_SECS,
-                now_epoch,
-            )
-            .unwrap_or_else(|| {
-                if let Some(util) = s.utilization {
-                    util
-                } else if let Some(remaining) = s.remaining_tokens {
-                    let limit = s.limit_tokens.unwrap_or(1_000_000);
-                    (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
-                } else {
-                    0.5
-                }
-            })
-        };
-
-        let best_claim = s.claims.iter().max_by(|a, b| {
-            a.waste_risk
-                .partial_cmp(&b.waste_risk)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.key.cmp(&b.key))
-        });
-
-        let (gate_7d, wr) = if let Some(claim) = best_claim {
-            (
-                if s.stale_after_hard_limit {
-                    0.5
-                } else {
-                    time_adjusted_utilization(
-                        Some(0.0),
-                        claim.reset,
-                        claim.status.as_deref(),
-                        NEAR_RESET_7D_SECS,
-                        now_epoch,
-                    )
-                    .unwrap_or(0.0)
-                },
-                claim.waste_risk,
-            )
-        } else if s.has_applicable_7d {
-            (
-                if s.stale_after_hard_limit {
-                    0.5
-                } else {
-                    time_adjusted_utilization(
-                        Some(0.0),
-                        s.reset_7d,
-                        s.status_7d.as_deref(),
-                        NEAR_RESET_7D_SECS,
-                        now_epoch,
-                    )
-                    .unwrap_or(0.0)
-                },
-                0.0,
-            )
-        } else {
-            (if s.stale_after_hard_limit { 0.5 } else { 0.0 }, 0.0)
-        };
-
-        let gate = gate_5h.max(gate_7d);
-        let headroom = (1.0 - gate).max(0.01);
-        let weight = if wr > 0.0 { wr * headroom } else { headroom };
-        let weight = if gate >= 1.0 { 0.0 } else { weight };
-
-        weight_snaps.push(WeightSnap {
-            name: s.name.clone(),
-            gate_5h,
-            gate_7d,
-            gate,
-            wr,
-            weight,
-        });
-    }
-
-    // Match pick_account(): if any account is below soft_limit, accounts at/above
-    // the soft limit are excluded from selection and should contribute zero share.
-    let has_healthy = weight_snaps.iter().any(|w| w.gate < soft_limit);
-    if has_healthy {
-        for w in &mut weight_snaps {
-            if w.gate >= soft_limit {
-                w.weight = 0.0;
-            }
-        }
-    }
-
-    weight_snaps
-}
-
+#[cfg(test)]
 fn append_routing_weight_metrics(
     buf: &mut String,
+    accounts: &[Account],
     snaps: &[AcctMetricsSnap],
-    now_epoch: u64,
-    soft_limit: f64,
 ) {
-    // Model-agnostic routing view: keep the existing "best 7d claim" selection,
-    // but compute gates with the same time-adjusted logic as routing_candidates().
     prom_header(
         buf,
         "anthropic_account_routing_weight",
@@ -4336,24 +4217,24 @@ fn append_routing_weight_metrics(
         "Per-account share of total routing weight (0.0-1.0)",
     );
 
-    let weight_snaps = compute_routing_weights(snaps, now_epoch, soft_limit);
-    let total_weight: f64 = weight_snaps.iter().map(|w| w.weight).sum();
-
-    for w in &weight_snaps {
+    for (acct, snap) in accounts.iter().zip(snaps.iter()) {
+        if snap.passthrough {
+            continue;
+        }
+        let weight = f64::from_bits(acct.last_routing_weight.load(Ordering::Relaxed));
+        let share = f64::from_bits(acct.last_routing_share.load(Ordering::Relaxed));
         prom_gauge(
             buf,
             "anthropic_account_routing_weight",
-            &[("account", &w.name)],
-            w.weight,
+            &[("account", &snap.name)],
+            weight,
         );
-        if total_weight > 0.0 {
-            prom_gauge(
-                buf,
-                "anthropic_account_routing_share",
-                &[("account", &w.name)],
-                w.weight / total_weight,
-            );
-        }
+        prom_gauge(
+            buf,
+            "anthropic_account_routing_share",
+            &[("account", &snap.name)],
+            share,
+        );
     }
 }
 
@@ -4794,7 +4675,40 @@ async fn metrics_handler(
         }
     }
 
-    append_routing_weight_metrics(&mut buf, &snaps, now_epoch, state.soft_limit);
+    // ── Routing weights (refreshed by refresh_metrics_weights per probe cycle) ─────
+
+    prom_header(
+        &mut buf,
+        "anthropic_account_routing_weight",
+        "gauge",
+        "Per-account routing weight (headroom * waste_risk, or plain headroom when no 7d claim)",
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_account_routing_share",
+        "gauge",
+        "Per-account share of total routing weight (0.0-1.0)",
+    );
+
+    for (acct, s) in state.accounts.iter().zip(snaps.iter()) {
+        if s.passthrough {
+            continue;
+        }
+        let weight = f64::from_bits(acct.last_routing_weight.load(Ordering::Relaxed));
+        let share = f64::from_bits(acct.last_routing_share.load(Ordering::Relaxed));
+        prom_gauge(
+            &mut buf,
+            "anthropic_account_routing_weight",
+            &[("account", &s.name)],
+            weight,
+        );
+        prom_gauge(
+            &mut buf,
+            "anthropic_account_routing_share",
+            &[("account", &s.name)],
+            share,
+        );
+    }
 
     // ── Aggregate metrics ──────────────────────────────────────────
 
@@ -7003,6 +6917,46 @@ mod tests {
             result,
             Some(1),
             "fresh rejected claim should still skip the account"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_ignores_expired_rejected_claim_without_hard_limit() {
+        let state = test_state_with(vec![
+            make_account("recovered", "sk-ant-api-a"),
+            make_account("available", "sk-ant-api-b"),
+        ]);
+        let now_epoch = AppState::now_epoch();
+
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.30);
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now_epoch + 10000);
+            info.claims_7d.insert(
+                "seven_day_sonnet".to_string(),
+                ClaimWindowData {
+                    utilization: Some(1.0),
+                    reset: Some(now_epoch.saturating_sub(1)),
+                    status: Some("rejected".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(0.80);
+            info.utilization_5h = Some(0.80);
+            info.reset_5h = Some(now_epoch + 10000);
+        }
+
+        let result = state
+            .pick_account(Some("test"), "claude-sonnet-4-6", &[])
+            .await;
+        assert_eq!(
+            result,
+            Some(0),
+            "expired rejected claim should not block account selection"
         );
     }
 
@@ -10896,6 +10850,32 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
+    fn routing_weight_expired_rejected_claim_returns_some() {
+        let now = 1_000_000u64;
+        let mut claims = HashMap::new();
+        claims.insert(
+            "seven_day_sonnet".to_string(),
+            ClaimWindowData {
+                utilization: Some(1.0),
+                reset: Some(now.saturating_sub(1)),
+                status: Some("rejected".to_string()),
+                last_seen: now,
+            },
+        );
+        let info = RateLimitInfo {
+            utilization_5h: Some(0.20),
+            reset_5h: Some(now + 18000),
+            status_5h: Some("allowed".to_string()),
+            claims_7d: claims,
+            ..Default::default()
+        };
+        assert!(
+            compute_routing_weight(&info, "claude-sonnet-4-6", now, false).is_some(),
+            "expired rejected claim should not return None"
+        );
+    }
+
+    #[test]
     fn routing_weight_stale_uses_fallback() {
         // stale_after_hard_limit = true → both gates fallback to 0.5
         let now = 1_000_000u64;
@@ -10937,6 +10917,16 @@ data: {\"type\":\"message_stop\"}\n\n";
             compute_routing_weight(&info, "claude-sonnet-4-6", now, true).is_some(),
             "stale rejected should still return Some (give account a chance)"
         );
+    }
+
+    #[test]
+    fn routing_weight_publish_ttl_uses_fallback_interval_when_probes_disabled() {
+        assert_eq!(AppState::routing_weight_publish_ttl(0), 120);
+    }
+
+    #[test]
+    fn routing_weight_publish_ttl_doubles_probe_interval() {
+        assert_eq!(AppState::routing_weight_publish_ttl(300), 600);
     }
 
     #[test]
@@ -14838,80 +14828,70 @@ upstream = "https://api.anthropic.com"
 
     #[test]
     fn routing_metrics_present() {
-        let now_epoch = AppState::now_epoch();
+        let acct = make_account("acct-a", "sk-ant-api-a");
+        acct.last_routing_weight
+            .store(0.4f64.to_bits(), Ordering::Relaxed);
+        acct.last_routing_share
+            .store(1.0f64.to_bits(), Ordering::Relaxed);
+
         let mut buf = String::new();
         append_routing_weight_metrics(
             &mut buf,
+            &[acct],
             &[AcctMetricsSnap {
                 name: "acct-a".to_string(),
-                utilization: Some(0.20),
-                utilization_5h: Some(0.20),
-                reset_5h: Some(now_epoch + NEAR_RESET_5H_SECS as u64 + 600),
-                status_5h: Some("allowed".to_string()),
-                claims: vec![ClaimMetricsSnap {
-                    key: "seven_day".to_string(),
-                    utilization: Some(0.50),
-                    waste_risk: 0.50,
-                    reset: Some(now_epoch + TOTAL_7D_SECS as u64),
-                    status: Some("allowed".to_string()),
-                }],
                 ..Default::default()
             }],
-            now_epoch,
-            1.0,
         );
 
         assert!(
             buf.lines()
                 .any(|line| line
                     .starts_with("anthropic_account_routing_weight{account=\"acct-a\"} 0.4")),
-            "missing routing_weight line:\n{buf}"
+            "missing routing_weight line:
+{buf}"
         );
         assert!(
             buf.lines()
                 .any(|line| line
                     .starts_with("anthropic_account_routing_share{account=\"acct-a\"} 1")),
-            "missing routing_share line:\n{buf}"
+            "missing routing_share line:
+{buf}"
         );
     }
-
     #[test]
     fn routing_metrics_zero_weight_for_rejected_claim() {
-        let now_epoch = AppState::now_epoch();
+        let acct = make_account("acct-a", "sk-ant-api-a");
+        acct.last_routing_weight
+            .store(0.0f64.to_bits(), Ordering::Relaxed);
+        acct.last_routing_share
+            .store(0.0f64.to_bits(), Ordering::Relaxed);
+
         let mut buf = String::new();
         append_routing_weight_metrics(
             &mut buf,
+            &[acct],
             &[AcctMetricsSnap {
                 name: "acct-a".to_string(),
-                utilization_5h: Some(0.20),
-                reset_5h: Some(now_epoch + NEAR_RESET_5H_SECS as u64 + 600),
-                status_5h: Some("allowed".to_string()),
-                claims: vec![ClaimMetricsSnap {
-                    key: "seven_day".to_string(),
-                    utilization: Some(0.50),
-                    waste_risk: 0.50,
-                    reset: Some(now_epoch + TOTAL_7D_SECS as u64),
-                    status: Some("rejected".to_string()),
-                }],
                 ..Default::default()
             }],
-            now_epoch,
-            1.0,
         );
 
         assert!(
             buf.lines()
                 .any(|line| line
                     .starts_with("anthropic_account_routing_weight{account=\"acct-a\"} 0")),
-            "rejected claim should zero routing_weight:\n{buf}"
+            "rejected claim should zero routing_weight:
+{buf}"
         );
         assert!(
-            !buf.lines()
-                .any(|line| line.starts_with("anthropic_account_routing_share{account=\"acct-a\"}")),
-            "zero-total routing_share should be omitted:\n{buf}"
+            buf.lines()
+                .any(|line| line
+                    .starts_with("anthropic_account_routing_share{account=\"acct-a\"} 0")),
+            "rejected claim should export zero routing_share:
+{buf}"
         );
     }
-
     #[tokio::test]
     async fn passthrough_accounts_participate_in_routing_candidates_and_metrics() {
         let mut state = test_state_with(vec![
@@ -14941,9 +14921,11 @@ upstream = "https://api.anthropic.com"
             "passthrough account should remain routable"
         );
 
+        state.refresh_metrics_weights().await;
         let mut buf = String::new();
         append_routing_weight_metrics(
             &mut buf,
+            &state.accounts,
             &[
                 AcctMetricsSnap {
                     name: "passthrough".to_string(),
@@ -14961,13 +14943,17 @@ upstream = "https://api.anthropic.com"
                     ..Default::default()
                 },
             ],
-            now_epoch,
-            state.soft_limit,
         );
 
         assert!(
-            buf.contains("anthropic_account_routing_weight{account=\"passthrough\"}"),
-            "passthrough account should appear in routing metrics:\n{buf}"
+            !buf.contains("anthropic_account_routing_weight{account=\"passthrough\"}"),
+            "passthrough account should be omitted from routing metrics:
+{buf}"
+        );
+        assert!(
+            buf.contains("anthropic_account_routing_weight{account=\"api\"}"),
+            "api account should remain in routing metrics:
+{buf}"
         );
     }
 
@@ -15850,6 +15836,7 @@ upstream = "https://api.anthropic.com"
             info.reset_5h = Some(now_epoch + NEAR_RESET_5H_SECS as u64 + 600);
             info.status_5h = Some("allowed".to_string());
         }
+        state.refresh_metrics_weights().await;
 
         let addr = serve(app).await;
         let client = Client::new();
@@ -15986,9 +15973,11 @@ upstream = "https://api.anthropic.com"
             info.status_5h = Some("allowed".to_string());
         }
 
+        state.refresh_metrics_weights().await;
         let mut buf = String::new();
         append_routing_weight_metrics(
             &mut buf,
+            &state.accounts,
             &[
                 AcctMetricsSnap {
                     name: "healthy".to_string(),
@@ -16007,21 +15996,22 @@ upstream = "https://api.anthropic.com"
                     ..Default::default()
                 },
             ],
-            now_epoch,
-            state.soft_limit,
         );
 
         assert!(
             buf.contains("anthropic_account_routing_share{account=\"healthy\"} 1"),
-            "healthy account should receive full routing share:\n{buf}"
+            "healthy account should receive full routing share:
+{buf}"
         );
         assert!(
             buf.contains("anthropic_account_routing_share{account=\"soft-limited\"} 0"),
-            "soft-limited account should have zero routing share:\n{buf}"
+            "soft-limited account should have zero routing share:
+{buf}"
         );
         assert!(
             buf.contains("anthropic_account_routing_weight{account=\"soft-limited\"} 0"),
-            "soft-limited account should have zero routing weight:\n{buf}"
+            "soft-limited account should have zero routing weight:
+{buf}"
         );
 
         for i in 0..20 {
