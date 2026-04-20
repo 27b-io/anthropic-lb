@@ -1198,7 +1198,8 @@ impl AppState {
     async fn routing_candidates(&self, model: &str, skip: &[usize]) -> Vec<RoutingCandidate> {
         let now = Instant::now();
         let now_epoch = Self::now_epoch();
-        let mut candidates: Vec<RoutingCandidate> = Vec::new();
+        let mut candidate_meta: Vec<(usize, &'static str)> = Vec::new();
+        let mut candidate_snaps: Vec<AcctMetricsSnap> = Vec::new();
         for (i, acct) in self.accounts.iter().enumerate() {
             if skip.contains(&i) {
                 trace!(account = acct.name, "pick: skipping, already tried");
@@ -1235,36 +1236,10 @@ impl AppState {
                 .hard_limited_until
                 .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
 
-            // 5h gate: time-adjusted 5h utilization with status floors
-            let gate_5h = if stale_after_hard_limit {
-                // Data is from the 429 era — treat as unknown to give the account
-                // a fair chance. The next successful request will refresh everything.
-                0.5
-            } else {
-                time_adjusted_utilization(
-                    info.utilization_5h,
-                    info.reset_5h,
-                    info.status_5h.as_deref(),
-                    NEAR_RESET_5H_SECS,
-                    now_epoch,
-                )
-                .unwrap_or_else(|| {
-                    // Fallback: raw unified, legacy, or unknown
-                    if let Some(util) = info.utilization {
-                        util
-                    } else if let Some(remaining) = info.remaining_tokens {
-                        let limit = info.limit_tokens.unwrap_or(1_000_000);
-                        (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
-                    } else {
-                        0.5
-                    }
-                })
-            };
-
-            // 7d model-specific gate and waste risk. Keep raw 7d utilization in
-            // waste_risk, and use gate_7d only for pressure/status so we do not
-            // double-count the same 7d signal in both terms.
-            let (gate_7d, wr, source) = if let Some(claim) = resolve_7d_claim(&info, model) {
+            // 7d model-specific selection. Keep raw 7d utilization in waste_risk,
+            // and use gate_7d only for pressure/status so we do not double-count
+            // the same 7d signal in both terms.
+            let (claims, source) = if let Some(claim) = resolve_7d_claim(&info, model) {
                 // Skip if this model's 7d claim is rejected AND we have fresh data.
                 // Stale rejections from expired hard limits are ignored — the account
                 // needs a chance to prove it's recovered.
@@ -1277,67 +1252,68 @@ impl AppState {
                     continue;
                 }
                 (
-                    if stale_after_hard_limit {
-                        0.5
-                    } else {
-                        time_adjusted_utilization(
-                            Some(0.0),
-                            claim.reset,
-                            claim.status.as_deref(),
-                            NEAR_RESET_7D_SECS,
-                            now_epoch,
-                        )
-                        .unwrap_or(0.0)
-                    },
-                    waste_risk(claim.utilization, claim.reset, now_epoch),
+                    vec![ClaimMetricsSnap {
+                        key: "selected".to_string(),
+                        utilization: claim.utilization,
+                        waste_risk: waste_risk(claim.utilization, claim.reset, now_epoch),
+                        reset: claim.reset,
+                        status: claim.status.clone(),
+                    }],
                     "waste_risk",
                 )
             } else {
-                (
-                    if stale_after_hard_limit {
-                        0.5
-                    } else {
-                        time_adjusted_utilization(
-                            Some(0.0),
-                            info.reset_7d,
-                            info.status_7d.as_deref(),
-                            NEAR_RESET_7D_SECS,
-                            now_epoch,
-                        )
-                        .unwrap_or(0.0)
-                    },
-                    0.0,
-                    "headroom_only",
-                )
+                (Vec::new(), "headroom_only")
             };
 
-            let gate = gate_5h.max(gate_7d);
+            candidate_snaps.push(AcctMetricsSnap {
+                name: acct.name.clone(),
+                passthrough: acct.passthrough,
+                has_applicable_7d: !claims.is_empty(),
+                utilization: info.utilization,
+                utilization_5h: info.utilization_5h,
+                utilization_7d: info.utilization_7d,
+                reset_5h: info.reset_5h,
+                reset_7d: info.reset_7d,
+                status_5h: info.status_5h.clone(),
+                status_7d: info.status_7d.clone(),
+                stale_after_hard_limit,
+                hard_limited_active: false,
+                burn_rate: (0.0, 0.0, 0.0),
+                headroom: None,
+                remaining_requests: info.remaining_requests,
+                remaining_tokens: info.remaining_tokens,
+                limit_requests: info.limit_requests,
+                limit_tokens: info.limit_tokens,
+                requests_total: 0,
+                hard_limited_secs: 0.0,
+                projected_throttle_secs: None,
+                token_usage: [0; 4],
+                claims,
+            });
+            candidate_meta.push((i, source));
+        }
 
-            // Weight: waste_risk dampened by the worst active gate.
-            let headroom = (1.0 - gate).max(0.01);
-            let weight = if wr > 0.0 { wr * headroom } else { headroom };
-
-            // Zero weight for fully exhausted accounts
-            let weight = if gate >= 1.0 { 0.0 } else { weight };
-
+        let weight_snaps = compute_routing_weights(&candidate_snaps, now_epoch, self.soft_limit);
+        let mut candidates: Vec<RoutingCandidate> = Vec::with_capacity(weight_snaps.len());
+        for ((idx, source), snap) in candidate_meta.into_iter().zip(weight_snaps) {
             trace!(
-                account = acct.name,
-                gate_5h = format!("{:.4}", gate_5h),
-                gate_7d = format!("{:.4}", gate_7d),
-                gate = format!("{:.4}", gate),
-                waste_risk = format!("{:.4}", wr),
-                weight = format!("{:.4}", weight),
+                account = snap.name,
+                gate_5h = format!("{:.4}", snap.gate_5h),
+                gate_7d = format!("{:.4}", snap.gate_7d),
+                gate = format!("{:.4}", snap.gate),
+                waste_risk = format!("{:.4}", snap.wr),
+                weight = format!("{:.4}", snap.weight),
                 source = source,
                 "pick: candidate"
             );
 
             candidates.push(RoutingCandidate {
-                idx: i,
-                gate_5h,
-                gate_7d,
-                gate,
-                wr,
-                weight,
+                idx,
+                gate_5h: snap.gate_5h,
+                gate_7d: snap.gate_7d,
+                gate: snap.gate,
+                wr: snap.wr,
+                weight: snap.weight,
                 source,
             });
         }
@@ -2873,12 +2849,14 @@ async fn proxy_handler(
                 .and_then(|m| m.as_str())
                 .unwrap_or("")
                 .to_string();
+            let mut mutated = false;
 
             if state.auto_cache {
                 let inj = inject_cache_breakpoints(&mut parsed);
                 if inj.skipped {
                     debug!("auto-cache: skipped, existing cache_control found");
                 } else if inj.tools || inj.system || inj.messages {
+                    mutated = true;
                     debug!(
                         tools = inj.tools,
                         system = inj.system,
@@ -2888,12 +2866,20 @@ async fn proxy_handler(
                 }
             }
 
-            // Re-serialize (only differs from original if cache was injected)
-            let bytes = serde_json::to_vec(&parsed).unwrap_or_else(|_| body_bytes.to_vec());
+            // Re-serialize. The `preserve_order` feature on serde_json is critical:
+            // without it, serde uses BTreeMap which reorders JSON keys alphabetically,
+            // producing different bytes from what the client sent. Anthropic's prompt
+            // caching matches on raw byte prefixes, so reordering silently breaks
+            // cache hits (0 reads, full writes every turn).
+            let bytes = if mutated {
+                serde_json::to_vec(&parsed).unwrap_or_else(|_| body_bytes.to_vec())
+            } else {
+                body_bytes.to_vec()
+            };
 
             // Pre-compute OAuth variant with Claude Code system prompt prepended.
             // OAuth tokens (sk-ant-oat*) require this to access sonnet/opus models.
-            let mut oauth_parsed = parsed;
+            let mut oauth_parsed = parsed.clone();
             inject_oauth_system_prompt(&mut oauth_parsed);
             let oauth_bytes = serde_json::to_vec(&oauth_parsed).unwrap_or_else(|_| bytes.clone());
 
@@ -3642,6 +3628,202 @@ fn prom_header(buf: &mut String, name: &str, metric_type: &str, help: &str) {
     let _ = writeln!(buf, "# TYPE {name} {metric_type}");
 }
 
+#[derive(Default, Clone)]
+struct ClaimMetricsSnap {
+    key: String,
+    utilization: Option<f64>,
+    waste_risk: f64,
+    reset: Option<u64>,
+    status: Option<String>,
+}
+
+#[derive(Default, Clone)]
+struct AcctMetricsSnap {
+    name: String,
+    passthrough: bool,
+    has_applicable_7d: bool,
+    utilization: Option<f64>,
+    utilization_5h: Option<f64>,
+    utilization_7d: Option<f64>,
+    reset_5h: Option<u64>,
+    reset_7d: Option<u64>,
+    status_5h: Option<String>,
+    status_7d: Option<String>,
+    stale_after_hard_limit: bool,
+    hard_limited_active: bool,
+    burn_rate: (f64, f64, f64),
+    headroom: Option<u64>,
+    remaining_requests: Option<u64>,
+    remaining_tokens: Option<u64>,
+    limit_requests: Option<u64>,
+    limit_tokens: Option<u64>,
+    requests_total: u64,
+    hard_limited_secs: f64,
+    projected_throttle_secs: Option<f64>,
+    token_usage: [u64; 4],
+    claims: Vec<ClaimMetricsSnap>,
+}
+
+#[derive(Clone, Debug)]
+struct WeightSnap {
+    name: String,
+    gate_5h: f64,
+    gate_7d: f64,
+    gate: f64,
+    wr: f64,
+    weight: f64,
+}
+
+fn compute_routing_weights(
+    snaps: &[AcctMetricsSnap],
+    now_epoch: u64,
+    soft_limit: f64,
+) -> Vec<WeightSnap> {
+    use std::cmp::Ordering;
+
+    let mut weight_snaps: Vec<WeightSnap> = Vec::with_capacity(snaps.len());
+
+    for s in snaps {
+        if s.hard_limited_active {
+            continue;
+        }
+
+        let gate_5h = if s.stale_after_hard_limit {
+            0.5
+        } else {
+            time_adjusted_utilization(
+                s.utilization_5h,
+                s.reset_5h,
+                s.status_5h.as_deref(),
+                NEAR_RESET_5H_SECS,
+                now_epoch,
+            )
+            .unwrap_or_else(|| {
+                if let Some(util) = s.utilization {
+                    util
+                } else if let Some(remaining) = s.remaining_tokens {
+                    let limit = s.limit_tokens.unwrap_or(1_000_000);
+                    (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                }
+            })
+        };
+
+        let best_claim = s.claims.iter().max_by(|a, b| {
+            a.waste_risk
+                .partial_cmp(&b.waste_risk)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+
+        let (gate_7d, wr) = if let Some(claim) = best_claim {
+            (
+                if s.stale_after_hard_limit {
+                    0.5
+                } else {
+                    time_adjusted_utilization(
+                        Some(0.0),
+                        claim.reset,
+                        claim.status.as_deref(),
+                        NEAR_RESET_7D_SECS,
+                        now_epoch,
+                    )
+                    .unwrap_or(0.0)
+                },
+                claim.waste_risk,
+            )
+        } else if s.has_applicable_7d {
+            (
+                if s.stale_after_hard_limit {
+                    0.5
+                } else {
+                    time_adjusted_utilization(
+                        Some(0.0),
+                        s.reset_7d,
+                        s.status_7d.as_deref(),
+                        NEAR_RESET_7D_SECS,
+                        now_epoch,
+                    )
+                    .unwrap_or(0.0)
+                },
+                0.0,
+            )
+        } else {
+            (if s.stale_after_hard_limit { 0.5 } else { 0.0 }, 0.0)
+        };
+
+        let gate = gate_5h.max(gate_7d);
+        let headroom = (1.0 - gate).max(0.01);
+        let weight = if wr > 0.0 { wr * headroom } else { headroom };
+        let weight = if gate >= 1.0 { 0.0 } else { weight };
+
+        weight_snaps.push(WeightSnap {
+            name: s.name.clone(),
+            gate_5h,
+            gate_7d,
+            gate,
+            wr,
+            weight,
+        });
+    }
+
+    // Match pick_account(): if any account is below soft_limit, accounts at/above
+    // the soft limit are excluded from selection and should contribute zero share.
+    let has_healthy = weight_snaps.iter().any(|w| w.gate < soft_limit);
+    if has_healthy {
+        for w in &mut weight_snaps {
+            if w.gate >= soft_limit {
+                w.weight = 0.0;
+            }
+        }
+    }
+
+    weight_snaps
+}
+
+fn append_routing_weight_metrics(
+    buf: &mut String,
+    snaps: &[AcctMetricsSnap],
+    now_epoch: u64,
+    soft_limit: f64,
+) {
+    // Model-agnostic routing view: keep the existing "best 7d claim" selection,
+    // but compute gates with the same time-adjusted logic as routing_candidates().
+    prom_header(
+        buf,
+        "anthropic_account_routing_weight",
+        "gauge",
+        "Per-account routing weight (headroom * waste_risk)",
+    );
+    prom_header(
+        buf,
+        "anthropic_account_routing_share",
+        "gauge",
+        "Per-account share of total routing weight (0.0-1.0)",
+    );
+
+    let weight_snaps = compute_routing_weights(snaps, now_epoch, soft_limit);
+    let total_weight: f64 = weight_snaps.iter().map(|w| w.weight).sum();
+
+    for w in &weight_snaps {
+        prom_gauge(
+            buf,
+            "anthropic_account_routing_weight",
+            &[("account", &w.name)],
+            w.weight,
+        );
+        if total_weight > 0.0 {
+            prom_gauge(
+                buf,
+                "anthropic_account_routing_share",
+                &[("account", &w.name)],
+                w.weight / total_weight,
+            );
+        }
+    }
+}
+
 async fn metrics_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -3662,25 +3844,7 @@ async fn metrics_handler(
 
     // ── Phase 1: Gather data (async — acquires locks) ──────────────
 
-    struct AcctSnap {
-        name: String,
-        passthrough: bool,
-        utilization_5h: Option<f64>,
-        utilization_7d: Option<f64>,
-        burn_rate: (f64, f64, f64),
-        headroom: Option<u64>,
-        remaining_requests: Option<u64>,
-        remaining_tokens: Option<u64>,
-        limit_requests: Option<u64>,
-        limit_tokens: Option<u64>,
-        requests_total: u64,
-        hard_limited_secs: f64,
-        projected_throttle_secs: Option<f64>,
-        token_usage: [u64; 4],
-        claims: Vec<(String, Option<f64>, f64)>,
-    }
-
-    let mut snaps: Vec<AcctSnap> = Vec::with_capacity(state.accounts.len());
+    let mut snaps: Vec<AcctMetricsSnap> = Vec::with_capacity(state.accounts.len());
     let mut total_headroom: Option<u64> = Some(0);
 
     for acct in &state.accounts {
@@ -3708,6 +3872,12 @@ async fn metrics_handler(
             .and_then(|until| until.checked_duration_since(Instant::now()))
             .map(|d| d.as_secs() as f64)
             .unwrap_or(0.0);
+        let hard_limited_active = info
+            .hard_limited_until
+            .is_some_and(|until| Instant::now() < until);
+        let stale_after_hard_limit = info
+            .hard_limited_until
+            .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
 
         let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
         let projected_throttle_secs = if eff_util < 0.5 || br_1h < 0.01 {
@@ -3722,23 +3892,34 @@ async fn metrics_handler(
             })
         };
 
-        let claims: Vec<(String, Option<f64>, f64)> = info
+        let claims: Vec<ClaimMetricsSnap> = info
             .claims_7d
             .iter()
-            .map(|(k, d)| {
-                (
-                    k.clone(),
-                    d.utilization,
-                    waste_risk(d.utilization, d.reset, now_epoch),
-                )
+            .map(|(k, d)| ClaimMetricsSnap {
+                key: k.clone(),
+                utilization: d.utilization,
+                waste_risk: waste_risk(d.utilization, d.reset, now_epoch),
+                reset: d.reset,
+                status: d.status.clone(),
             })
             .collect();
 
-        snaps.push(AcctSnap {
+        snaps.push(AcctMetricsSnap {
             name: acct.name.clone(),
             passthrough: acct.passthrough,
+            has_applicable_7d: !claims.is_empty()
+                || info.utilization_7d.is_some()
+                || info.reset_7d.is_some()
+                || info.status_7d.is_some(),
+            utilization: info.utilization,
             utilization_5h: info.utilization_5h,
             utilization_7d: info.utilization_7d,
+            reset_5h: info.reset_5h,
+            reset_7d: info.reset_7d,
+            status_5h: info.status_5h.clone(),
+            status_7d: info.status_7d.clone(),
+            stale_after_hard_limit,
+            hard_limited_active,
             burn_rate: (br_5m, br_1h, br_6h),
             headroom,
             remaining_requests: info.remaining_requests,
@@ -4052,13 +4233,13 @@ async fn metrics_handler(
         "Per-claim utilization",
     );
     for s in &snaps {
-        for (claim_key, util, _) in &s.claims {
-            if let Some(u) = util {
+        for claim in &s.claims {
+            if let Some(u) = claim.utilization {
                 prom_gauge(
                     &mut buf,
                     "anthropic_claim_utilization",
-                    &[("account", &s.name), ("claim", claim_key)],
-                    *u,
+                    &[("account", &s.name), ("claim", &claim.key)],
+                    u,
                 );
             }
         }
@@ -4070,15 +4251,17 @@ async fn metrics_handler(
         "Per-claim waste risk score",
     );
     for s in &snaps {
-        for (claim_key, _, wr) in &s.claims {
+        for claim in &s.claims {
             prom_gauge(
                 &mut buf,
                 "anthropic_claim_waste_risk",
-                &[("account", &s.name), ("claim", claim_key)],
-                *wr,
+                &[("account", &s.name), ("claim", &claim.key)],
+                claim.waste_risk,
             );
         }
     }
+
+    append_routing_weight_metrics(&mut buf, &snaps, now_epoch, state.soft_limit);
 
     // ── Aggregate metrics ──────────────────────────────────────────
 
@@ -7290,6 +7473,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_preserves_raw_body_bytes_when_auto_cache_skips() {
+        let seen_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let seen_body_clone = seen_body.clone();
+
+        let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+            let seen_body = seen_body_clone.clone();
+            async move {
+                let body_bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES)
+                    .await
+                    .unwrap();
+                *seen_body.lock().unwrap() = Some(body_bytes.to_vec());
+
+                let mut resp = axum::Json(serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "content": [{"type": "text", "text": "ok"}],
+                }))
+                .into_response();
+                let headers = resp.headers_mut();
+                headers.insert(
+                    "anthropic-ratelimit-unified-representative-claim",
+                    HeaderValue::from_static("five_hour"),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-utilization",
+                    HeaderValue::from_static("0.25"),
+                );
+                let reset_epoch = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600)
+                    .to_string();
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-reset",
+                    HeaderValue::from_str(&reset_epoch).unwrap(),
+                );
+                resp
+            }
+        }));
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let (app, _state) = test_app(
+            &format!("http://{}", mock_addr),
+            Some("secret-key".to_string()),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let raw_body = "{\n  \"model\" : \"test\",\n  \"messages\" : [{\"role\" : \"user\", \"content\" : [{\"type\":\"text\", \"text\":\"hi\", \"cache_control\":{\"type\":\"ephemeral\"}}]}],\n  \"max_tokens\" : 1\n}";
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "secret-key")
+            .body(raw_body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let captured = seen_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream should receive request body");
+        assert_eq!(
+            String::from_utf8(captured).unwrap(),
+            raw_body,
+            "request body bytes should remain unchanged when auto-cache does not mutate payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_preserves_key_order_when_auto_cache_mutates() {
+        let seen_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let seen_body_clone = seen_body.clone();
+
+        let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+            let seen_body = seen_body_clone.clone();
+            async move {
+                let body_bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES)
+                    .await
+                    .unwrap();
+                *seen_body.lock().unwrap() = Some(body_bytes.to_vec());
+
+                let mut resp = axum::Json(serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "content": [{"type": "text", "text": "ok"}],
+                }))
+                .into_response();
+                let headers = resp.headers_mut();
+                headers.insert(
+                    "anthropic-ratelimit-unified-representative-claim",
+                    HeaderValue::from_static("five_hour"),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-utilization",
+                    HeaderValue::from_static("0.25"),
+                );
+                let reset_epoch = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600)
+                    .to_string();
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-reset",
+                    HeaderValue::from_str(&reset_epoch).unwrap(),
+                );
+                resp
+            }
+        }));
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let (app, _state) = test_app(
+            &format!("http://{}", mock_addr),
+            Some("secret-key".to_string()),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let input_body =
+            "{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}";
+        let expected_body = "{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"max_tokens\":1}";
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "secret-key")
+            .body(input_body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let captured = seen_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream should receive request body");
+        assert_eq!(
+            String::from_utf8(captured).unwrap(),
+            expected_body,
+            "mutated request body should preserve caller key order while adding cache markers"
+        );
+    }
+
+    #[tokio::test]
     async fn stats_endpoint_returns_account_info() {
         let (mock_url, _handle) = spawn_mock_upstream().await;
         let (app, _state) = test_app(&mock_url, None);
@@ -8846,6 +9211,49 @@ data: {\"type\":\"message_stop\"}\n\n";
                 key
             );
         }
+    }
+
+    #[tokio::test]
+    async fn routing_candidates_ignore_unmatched_7d_state() {
+        let state = test_state_with(vec![make_account("acct-a", "sk-ant-api-a")]);
+        let now = AppState::now_epoch();
+
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.20);
+            info.utilization_5h = Some(0.20);
+            info.reset_5h = Some(now + 10000);
+            info.claims_7d.insert(
+                "seven_day_haiku".to_string(),
+                ClaimWindowData {
+                    utilization: Some(0.95),
+                    reset: Some(now + 100000),
+                    status: Some("throttled".to_string()),
+                    ..Default::default()
+                },
+            );
+            // Derived aggregate 7d fields reflect the unrelated claim, but routing
+            // for opus must ignore them when no applicable 7d claim exists.
+            info.utilization_7d = Some(0.95);
+            info.reset_7d = Some(now + 100000);
+            info.status_7d = Some("throttled".to_string());
+        }
+
+        let candidates = state.routing_candidates("claude-opus-4-6", &[]).await;
+        assert_eq!(candidates.len(), 1, "expected one routing candidate");
+
+        let candidate = &candidates[0];
+        assert_eq!(candidate.source, "headroom_only");
+        assert!(
+            (candidate.gate_7d - 0.0).abs() < f64::EPSILON,
+            "unmatched 7d state should not leak into gate_7d: {:?}",
+            candidate
+        );
+        assert!(
+            (candidate.weight - 0.8).abs() < 0.0001,
+            "weight should remain 5h headroom-only when no 7d claim applies: {:?}",
+            candidate
+        );
     }
 
     // ── Unit: per-client budget ────────────────────────────────────
@@ -13585,6 +13993,141 @@ upstream = "https://api.anthropic.com"
         assert_eq!(buf, "m{name=\"has\\\"quotes\"} 1\n");
     }
 
+    #[test]
+    fn routing_metrics_present() {
+        let now_epoch = AppState::now_epoch();
+        let mut buf = String::new();
+        append_routing_weight_metrics(
+            &mut buf,
+            &[AcctMetricsSnap {
+                name: "acct-a".to_string(),
+                utilization: Some(0.20),
+                utilization_5h: Some(0.20),
+                reset_5h: Some(now_epoch + NEAR_RESET_5H_SECS as u64 + 600),
+                status_5h: Some("allowed".to_string()),
+                claims: vec![ClaimMetricsSnap {
+                    key: "seven_day".to_string(),
+                    utilization: Some(0.50),
+                    waste_risk: 0.50,
+                    reset: Some(now_epoch + TOTAL_7D_SECS as u64),
+                    status: Some("allowed".to_string()),
+                }],
+                ..Default::default()
+            }],
+            now_epoch,
+            1.0,
+        );
+
+        assert!(
+            buf.lines()
+                .any(|line| line
+                    .starts_with("anthropic_account_routing_weight{account=\"acct-a\"} 0.4")),
+            "missing routing_weight line:\n{buf}"
+        );
+        assert!(
+            buf.lines()
+                .any(|line| line
+                    .starts_with("anthropic_account_routing_share{account=\"acct-a\"} 1")),
+            "missing routing_share line:\n{buf}"
+        );
+    }
+
+    #[test]
+    fn routing_metrics_zero_weight_for_rejected_claim() {
+        let now_epoch = AppState::now_epoch();
+        let mut buf = String::new();
+        append_routing_weight_metrics(
+            &mut buf,
+            &[AcctMetricsSnap {
+                name: "acct-a".to_string(),
+                utilization_5h: Some(0.20),
+                reset_5h: Some(now_epoch + NEAR_RESET_5H_SECS as u64 + 600),
+                status_5h: Some("allowed".to_string()),
+                claims: vec![ClaimMetricsSnap {
+                    key: "seven_day".to_string(),
+                    utilization: Some(0.50),
+                    waste_risk: 0.50,
+                    reset: Some(now_epoch + TOTAL_7D_SECS as u64),
+                    status: Some("rejected".to_string()),
+                }],
+                ..Default::default()
+            }],
+            now_epoch,
+            1.0,
+        );
+
+        assert!(
+            buf.lines()
+                .any(|line| line
+                    .starts_with("anthropic_account_routing_weight{account=\"acct-a\"} 0")),
+            "rejected claim should zero routing_weight:\n{buf}"
+        );
+        assert!(
+            !buf.lines()
+                .any(|line| line.starts_with("anthropic_account_routing_share{account=\"acct-a\"}")),
+            "zero-total routing_share should be omitted:\n{buf}"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_accounts_participate_in_routing_candidates_and_metrics() {
+        let mut state = test_state_with(vec![
+            make_account("passthrough", "passthrough"),
+            make_account("api", "sk-ant-api-b"),
+        ]);
+        Arc::get_mut(&mut state).unwrap().soft_limit = 1.0;
+
+        let now_epoch = AppState::now_epoch();
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.20);
+            info.utilization_5h = Some(0.20);
+            info.reset_5h = Some(now_epoch + 10000);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(0.40);
+            info.utilization_5h = Some(0.40);
+            info.reset_5h = Some(now_epoch + 10000);
+        }
+
+        let candidates = state.routing_candidates("claude-sonnet-4-6", &[]).await;
+        assert_eq!(
+            candidates.len(),
+            2,
+            "passthrough account should remain routable"
+        );
+
+        let mut buf = String::new();
+        append_routing_weight_metrics(
+            &mut buf,
+            &[
+                AcctMetricsSnap {
+                    name: "passthrough".to_string(),
+                    passthrough: true,
+                    utilization: Some(0.20),
+                    utilization_5h: Some(0.20),
+                    reset_5h: Some(now_epoch + 10000),
+                    ..Default::default()
+                },
+                AcctMetricsSnap {
+                    name: "api".to_string(),
+                    utilization: Some(0.40),
+                    utilization_5h: Some(0.40),
+                    reset_5h: Some(now_epoch + 10000),
+                    ..Default::default()
+                },
+            ],
+            now_epoch,
+            state.soft_limit,
+        );
+
+        assert!(
+            buf.contains("anthropic_account_routing_weight{account=\"passthrough\"}"),
+            "passthrough account should appear in routing metrics:\n{buf}"
+        );
+    }
+
     // ── Integration: /metrics endpoint ───────────────────────────────
 
     #[tokio::test]
@@ -14250,6 +14793,140 @@ upstream = "https://api.anthropic.com"
             !body.contains("anthropic_claim_utilization{account=\"acct-b\""),
             "acct-b should have no claim_utilization:\n{body}"
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_routing_weight_and_share_present() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, state) = test_app(&mock_url, None);
+
+        let now_epoch = AppState::now_epoch();
+
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.20);
+            info.utilization_5h = Some(0.20);
+            info.reset_5h = Some(now_epoch + NEAR_RESET_5H_SECS as u64 + 600);
+            info.status_5h = Some("allowed".to_string());
+            info.claims_7d.insert(
+                "seven_day".to_string(),
+                ClaimWindowData {
+                    utilization: Some(0.50),
+                    reset: Some(now_epoch + TOTAL_7D_SECS as u64),
+                    status: Some("allowed".to_string()),
+                    ..Default::default()
+                },
+            );
+            info.utilization_7d = Some(0.50);
+            info.reset_7d = Some(now_epoch + TOTAL_7D_SECS as u64);
+            info.status_7d = Some("allowed".to_string());
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(1.0);
+            info.utilization_5h = Some(1.0);
+            info.reset_5h = Some(now_epoch + NEAR_RESET_5H_SECS as u64 + 600);
+            info.status_5h = Some("allowed".to_string());
+        }
+
+        let addr = serve(app).await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap();
+        let body = resp.text().await.unwrap();
+
+        assert!(
+            body.contains("anthropic_account_routing_weight{account=\"acct-a\"} 0.4"),
+            "missing routing_weight:\n{body}"
+        );
+        assert!(
+            body.contains("anthropic_account_routing_share{account=\"acct-a\"} 1"),
+            "missing routing_share:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE anthropic_account_routing_weight gauge"),
+            "missing routing_weight TYPE header:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE anthropic_account_routing_share gauge"),
+            "missing routing_share TYPE header:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_metrics_zero_share_for_soft_limited_account_matches_pick_account() {
+        let mut state = test_state_with(vec![
+            make_account("healthy", "sk-ant-api-a"),
+            make_account("soft-limited", "sk-ant-api-b"),
+        ]);
+        Arc::get_mut(&mut state).unwrap().soft_limit = 0.90;
+        let now_epoch = AppState::now_epoch();
+
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization = Some(0.30);
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now_epoch + 10000);
+            info.status_5h = Some("allowed".to_string());
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization = Some(0.95);
+            info.utilization_5h = Some(0.95);
+            info.reset_5h = Some(now_epoch + 10000);
+            info.status_5h = Some("allowed".to_string());
+        }
+
+        let mut buf = String::new();
+        append_routing_weight_metrics(
+            &mut buf,
+            &[
+                AcctMetricsSnap {
+                    name: "healthy".to_string(),
+                    utilization: Some(0.30),
+                    utilization_5h: Some(0.30),
+                    reset_5h: Some(now_epoch + 10000),
+                    status_5h: Some("allowed".to_string()),
+                    ..Default::default()
+                },
+                AcctMetricsSnap {
+                    name: "soft-limited".to_string(),
+                    utilization: Some(0.95),
+                    utilization_5h: Some(0.95),
+                    reset_5h: Some(now_epoch + 10000),
+                    status_5h: Some("allowed".to_string()),
+                    ..Default::default()
+                },
+            ],
+            now_epoch,
+            state.soft_limit,
+        );
+
+        assert!(
+            buf.contains("anthropic_account_routing_share{account=\"healthy\"} 1"),
+            "healthy account should receive full routing share:\n{buf}"
+        );
+        assert!(
+            buf.contains("anthropic_account_routing_share{account=\"soft-limited\"} 0"),
+            "soft-limited account should have zero routing share:\n{buf}"
+        );
+        assert!(
+            buf.contains("anthropic_account_routing_weight{account=\"soft-limited\"} 0"),
+            "soft-limited account should have zero routing weight:\n{buf}"
+        );
+
+        for i in 0..20 {
+            let key = format!("client-{i}");
+            let idx = state.pick_account(Some(&key), "any", &[]).await.unwrap();
+            assert_eq!(
+                idx, 0,
+                "client '{}' routed to soft-limited account despite exported zero share",
+                key
+            );
+        }
     }
 
     #[test]
