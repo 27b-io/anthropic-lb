@@ -1,6 +1,14 @@
-# CLAUDE.md
+# AnthropicLB
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Usage-aware load balancing proxy for Claude Code
+
+## Anthropic Rate Limit Windows (Unified Headers)
+
+The proxy reads utilization from `anthropic-ratelimit-unified-*` response headers. These govern subscription-based access (Claude Code, Pro, Max plans) and are separate from the per-minute token bucket limits documented at platform.claude.com.
+
+**Two windows:**
+- **5h window** — Fixed-duration window. Starts when usage begins, resets at a specific time (hard reset to zero). Dashboard shows "resets in X min." NOT a smooth sliding window — utilization does not gradually decay. It stays constant or increases within a window, then drops to zero at reset.
+- **7d window** — Weekly ceiling. Per-model sub-budgets ("claims") tracked separately (e.g., `seven_day_sonnet`, `seven_day_opus`). The `representative-claim` header indicates which window currently constrains the account.
 
 ## Build & Development
 
@@ -15,6 +23,26 @@ cargo llvm-cov                       # Coverage report (requires cargo-llvm-cov)
 ```
 
 Run the proxy: `./target/release/anthropic-lb config.toml`
+
+## Deployment
+
+Production runs on the **mem** k8s cluster (`kubectl --context mem`), namespace `anthropic-lb`, managed by **Flux** from `27b-io/fleet-infra` repo.
+
+| What | Where |
+|------|-------|
+| Flux manifests | `27b-io/fleet-infra` repo, `apps/mem/anthropic-lb/` |
+| Config template | `externalsecret.yaml` (ExternalSecret → 1Password tokens + redis password) |
+| Image policy | Flux `imagepolicy` auto-updates digest from `ghcr.io/27b-io/anthropic-lb:main` |
+| Replicas | 2 (RollingUpdate, maxUnavailable=0) |
+| Config delivery | init container copies secret → `/data/config.toml` at pod start |
+
+**Config changes** require a pod restart after the ExternalSecret refreshes (secret is copied at init time, not watched):
+
+```bash
+kubectl --context mem -n anthropic-lb rollout restart deployment/anthropic-lb
+```
+
+Local dev instance also runs as systemd user unit: `systemctl --user restart anthropic-lb`
 
 ## Architecture
 
@@ -87,13 +115,6 @@ Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. R
 | `accounts[].token` | string | required | API key, OAuth token, or `"passthrough"` |
 | `accounts[].models` | string[]? | [] (all) | Model allowlist (supports `*` suffix wildcards) |
 
-### Anthropic Rate Limit Windows (Unified Headers)
-
-The proxy reads utilization from `anthropic-ratelimit-unified-*` response headers. These govern subscription-based access (Claude Code, Pro, Max plans) and are separate from the per-minute token bucket limits documented at platform.claude.com.
-
-**Two windows:**
-- **5h window** — Fixed-duration window. Starts when usage begins, resets at a specific time (hard reset to zero). Dashboard shows "resets in X min." NOT a smooth sliding window — utilization does not gradually decay. It stays constant or increases within a window, then drops to zero at reset.
-- **7d window** — Weekly ceiling. Per-model sub-budgets ("claims") tracked separately (e.g., `seven_day_sonnet`, `seven_day_opus`). The `representative-claim` header indicates which window currently constrains the account.
 
 **Key headers parsed:**
 
