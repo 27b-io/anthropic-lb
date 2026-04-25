@@ -3152,8 +3152,8 @@ fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
         }
         Some(system) => {
             if let Some(text) = system.as_str() {
-                if text == OAUTH_SYSTEM_PROMPT {
-                    return; // already correct
+                if text.starts_with(OAUTH_SYSTEM_PROMPT) {
+                    return; // already correct (exact match or prefix of larger block)
                 }
                 // Convert string to array: CC prompt first, original second
                 body["system"] = serde_json::json!([
@@ -3161,9 +3161,13 @@ fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
                     {"type": "text", "text": text}
                 ]);
             } else if let Some(arr) = system.as_array() {
-                // Check if first block already has the CC prompt
+                // Check if first block already has the CC prompt (exact or prefix)
                 if let Some(first) = arr.first() {
-                    if first.get("text").and_then(|t| t.as_str()) == Some(OAUTH_SYSTEM_PROMPT) {
+                    if first
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(|t| t.starts_with(OAUTH_SYSTEM_PROMPT))
+                    {
                         return; // already present
                     }
                 }
@@ -3402,19 +3406,19 @@ async fn proxy_handler(
             // Skip if the client already includes it — re-serializing through serde
             // changes byte representation and breaks Anthropic's prompt caching.
             let client_has_oauth_prompt = match parsed.get("system") {
-                Some(system) if system.is_string() => system.as_str() == Some(OAUTH_SYSTEM_PROMPT),
-                Some(system) if system.is_array() => {
-                    system
-                        .as_array()
-                        .and_then(|arr| arr.first())
-                        .and_then(|b| b.get("text"))
-                        .and_then(|t| t.as_str())
-                        == Some(OAUTH_SYSTEM_PROMPT)
-                }
+                Some(system) if system.is_string() => system
+                    .as_str()
+                    .is_some_and(|s| s.starts_with(OAUTH_SYSTEM_PROMPT)),
+                Some(system) if system.is_array() => system
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|b| b.get("text"))
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t.starts_with(OAUTH_SYSTEM_PROMPT)),
                 _ => false,
             };
             let oauth_bytes = if client_has_oauth_prompt {
-                bytes.clone()
+                body_bytes.to_vec()
             } else {
                 let mut oauth_parsed = parsed.clone();
                 inject_oauth_system_prompt(&mut oauth_parsed);
@@ -16145,6 +16149,38 @@ upstream = "https://api.anthropic.com"
         inject_oauth_system_prompt(&mut body);
         let system = body.get("system").unwrap().as_array().unwrap();
         assert_eq!(system.len(), 1, "should not duplicate");
+    }
+
+    #[test]
+    fn oauth_system_prompt_noop_when_prompt_is_prefix_string() {
+        // CC may send the identity prompt as prefix of a longer system string
+        let system_text = format!("{}\n\nYou are an interactive agent.", OAUTH_SYSTEM_PROMPT);
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": system_text,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+        inject_oauth_system_prompt(&mut body);
+        // Should remain a string, untouched
+        assert!(body["system"].is_string(), "should not convert to array");
+        assert_eq!(body["system"].as_str().unwrap(), system_text);
+    }
+
+    #[test]
+    fn oauth_system_prompt_noop_when_prompt_is_prefix_array() {
+        // CC may embed the identity prompt as prefix of first block text
+        let block_text = format!("{}\n\nYou are an interactive agent.", OAUTH_SYSTEM_PROMPT);
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": [{"type": "text", "text": block_text}],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+        inject_oauth_system_prompt(&mut body);
+        let system = body.get("system").unwrap().as_array().unwrap();
+        assert_eq!(system.len(), 1, "should not prepend duplicate");
+        assert_eq!(system[0]["text"].as_str().unwrap(), block_text);
     }
 
     #[test]
