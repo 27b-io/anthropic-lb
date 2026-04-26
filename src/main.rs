@@ -3130,6 +3130,23 @@ impl AppState {
 
 // ── OAuth system prompt injection ──────────────────────────────────
 
+/// Check whether the request body already contains the OAuth system prompt
+/// as a prefix of the first system block (string or array form).
+fn has_oauth_system_prompt(body: &serde_json::Value) -> bool {
+    match body.get("system") {
+        Some(system) if system.is_string() => system
+            .as_str()
+            .is_some_and(|s| s.starts_with(OAUTH_SYSTEM_PROMPT)),
+        Some(system) if system.is_array() => system
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.starts_with(OAUTH_SYSTEM_PROMPT)),
+        _ => false,
+    }
+}
+
 /// Inject the Claude Code system prompt as the first system block.
 ///
 /// OAuth tokens (sk-ant-oat*) require this exact prompt as the first system
@@ -3141,36 +3158,24 @@ impl AppState {
 /// - String system → converts to array with CC prompt first, original second
 /// - Array system → prepends CC prompt block if not already present
 fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
+    if has_oauth_system_prompt(body) {
+        return;
+    }
+
     let cc_block = serde_json::json!({"type": "text", "text": OAUTH_SYSTEM_PROMPT});
 
     match body.get("system") {
-        None => {
-            body["system"] = serde_json::json!([cc_block]);
-        }
-        Some(system) if system.is_null() => {
+        None | Some(&serde_json::Value::Null) => {
             body["system"] = serde_json::json!([cc_block]);
         }
         Some(system) => {
             if let Some(text) = system.as_str() {
-                if text.starts_with(OAUTH_SYSTEM_PROMPT) {
-                    return; // already correct (exact match or prefix of larger block)
-                }
                 // Convert string to array: CC prompt first, original second
                 body["system"] = serde_json::json!([
                     cc_block,
                     {"type": "text", "text": text}
                 ]);
             } else if let Some(arr) = system.as_array() {
-                // Check if first block already has the CC prompt (exact or prefix)
-                if let Some(first) = arr.first() {
-                    if first
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .is_some_and(|t| t.starts_with(OAUTH_SYSTEM_PROMPT))
-                    {
-                        return; // already present
-                    }
-                }
                 // Prepend CC prompt block
                 let mut new_arr = vec![cc_block];
                 new_arr.extend(arr.iter().cloned());
@@ -3405,19 +3410,7 @@ async fn proxy_handler(
             // OAuth tokens (sk-ant-oat*) require this to access sonnet/opus models.
             // Skip if the client already includes it — re-serializing through serde
             // changes byte representation and breaks Anthropic's prompt caching.
-            let client_has_oauth_prompt = match parsed.get("system") {
-                Some(system) if system.is_string() => system
-                    .as_str()
-                    .is_some_and(|s| s.starts_with(OAUTH_SYSTEM_PROMPT)),
-                Some(system) if system.is_array() => system
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|b| b.get("text"))
-                    .and_then(|t| t.as_str())
-                    .is_some_and(|t| t.starts_with(OAUTH_SYSTEM_PROMPT)),
-                _ => false,
-            };
-            let oauth_bytes = if client_has_oauth_prompt {
+            let oauth_bytes = if has_oauth_system_prompt(&parsed) {
                 body_bytes.to_vec()
             } else {
                 let mut oauth_parsed = parsed.clone();
