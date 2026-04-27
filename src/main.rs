@@ -3130,6 +3130,23 @@ impl AppState {
 
 // ── OAuth system prompt injection ──────────────────────────────────
 
+/// Check whether the request body already contains the OAuth system prompt
+/// as a prefix of the first system block (string or array form).
+fn has_oauth_system_prompt(body: &serde_json::Value) -> bool {
+    match body.get("system") {
+        Some(system) if system.is_string() => system
+            .as_str()
+            .is_some_and(|s| s.starts_with(OAUTH_SYSTEM_PROMPT)),
+        Some(system) if system.is_array() => system
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.starts_with(OAUTH_SYSTEM_PROMPT)),
+        _ => false,
+    }
+}
+
 /// Inject the Claude Code system prompt as the first system block.
 ///
 /// OAuth tokens (sk-ant-oat*) require this exact prompt as the first system
@@ -3141,32 +3158,24 @@ impl AppState {
 /// - String system → converts to array with CC prompt first, original second
 /// - Array system → prepends CC prompt block if not already present
 fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
+    if has_oauth_system_prompt(body) {
+        return;
+    }
+
     let cc_block = serde_json::json!({"type": "text", "text": OAUTH_SYSTEM_PROMPT});
 
     match body.get("system") {
-        None => {
-            body["system"] = serde_json::json!([cc_block]);
-        }
-        Some(system) if system.is_null() => {
+        None | Some(&serde_json::Value::Null) => {
             body["system"] = serde_json::json!([cc_block]);
         }
         Some(system) => {
             if let Some(text) = system.as_str() {
-                if text == OAUTH_SYSTEM_PROMPT {
-                    return; // already correct
-                }
                 // Convert string to array: CC prompt first, original second
                 body["system"] = serde_json::json!([
                     cc_block,
                     {"type": "text", "text": text}
                 ]);
             } else if let Some(arr) = system.as_array() {
-                // Check if first block already has the CC prompt
-                if let Some(first) = arr.first() {
-                    if first.get("text").and_then(|t| t.as_str()) == Some(OAUTH_SYSTEM_PROMPT) {
-                        return; // already present
-                    }
-                }
                 // Prepend CC prompt block
                 let mut new_arr = vec![cc_block];
                 new_arr.extend(arr.iter().cloned());
@@ -3399,9 +3408,16 @@ async fn proxy_handler(
 
             // Pre-compute OAuth variant with Claude Code system prompt prepended.
             // OAuth tokens (sk-ant-oat*) require this to access sonnet/opus models.
-            let mut oauth_parsed = parsed.clone();
-            inject_oauth_system_prompt(&mut oauth_parsed);
-            let oauth_bytes = serde_json::to_vec(&oauth_parsed).unwrap_or_else(|_| bytes.clone());
+            // Skip injection when the client already includes the prompt — the
+            // normal `bytes` payload (which preserves auto-cache mutations) is
+            // already correct for OAuth accounts too.
+            let oauth_bytes = if has_oauth_system_prompt(&parsed) {
+                bytes.clone()
+            } else {
+                let mut oauth_parsed = parsed.clone();
+                inject_oauth_system_prompt(&mut oauth_parsed);
+                serde_json::to_vec(&oauth_parsed).unwrap_or_else(|_| bytes.clone())
+            };
 
             (
                 bytes::Bytes::from(bytes),
@@ -8177,6 +8193,142 @@ mod tests {
             String::from_utf8(captured).unwrap(),
             expected_body,
             "mutated request body should preserve caller key order while adding cache markers"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_oauth_account_preserves_auto_cache_with_system_prompt() {
+        // Regression test: when an OAuth account is selected and auto_cache
+        // injects breakpoints, oauth_bytes must contain BOTH the OAuth system
+        // prompt AND the cache_control markers. Before the fix, the fast-path
+        // used raw body_bytes (dropping cache mutations).
+        let seen_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let seen_body_clone = seen_body.clone();
+
+        let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+            let seen_body = seen_body_clone.clone();
+            async move {
+                let body_bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES)
+                    .await
+                    .unwrap();
+                *seen_body.lock().unwrap() = Some(body_bytes.to_vec());
+
+                let mut resp = axum::Json(serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "content": [{"type": "text", "text": "ok"}],
+                }))
+                .into_response();
+                let headers = resp.headers_mut();
+                headers.insert(
+                    "anthropic-ratelimit-unified-representative-claim",
+                    HeaderValue::from_static("five_hour"),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-utilization",
+                    HeaderValue::from_static("0.10"),
+                );
+                let reset_epoch = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600)
+                    .to_string();
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-reset",
+                    HeaderValue::from_str(&reset_epoch).unwrap(),
+                );
+                resp
+            }
+        }));
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        // Single OAuth account — forces all requests through the oauth_body_bytes path
+        let accounts = vec![make_account("oauth-acct", "sk-ant-oat01-test-token")];
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: format!("http://{}", mock_addr),
+            accounts,
+            robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-oauth-cache-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: true, // KEY: auto-cache enabled
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operators: vec![],
+            emergency_brake: true,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
+            probe_interval_secs: 300,
+        });
+
+        let app = build_router(state);
+        let addr = serve(app).await;
+
+        // Body with NO cache_control and NO system field — auto-cache will inject
+        // breakpoints, and inject_oauth_system_prompt will add the CC prompt.
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"max_tokens":5}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let captured = seen_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream should receive request body");
+        let body: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+
+        // 1. OAuth system prompt must be injected as first system block
+        let system = body
+            .get("system")
+            .expect("system field must be present (injected by OAuth path)");
+        let arr = system.as_array().expect("system should be array");
+        assert_eq!(
+            arr[0]["text"].as_str().unwrap(),
+            OAUTH_SYSTEM_PROMPT,
+            "first system block must be CC prompt"
+        );
+
+        // 2. Auto-cache breakpoints must be present (not dropped by fast-path)
+        let messages = body["messages"].as_array().unwrap();
+        let last_user = messages
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "user")
+            .expect("should have user message");
+        let content = last_user["content"].as_array().unwrap();
+        assert!(
+            content.last().unwrap().get("cache_control").is_some(),
+            "auto-cache breakpoint on last user message must survive OAuth path"
         );
     }
 
@@ -16127,6 +16279,38 @@ upstream = "https://api.anthropic.com"
         inject_oauth_system_prompt(&mut body);
         let system = body.get("system").unwrap().as_array().unwrap();
         assert_eq!(system.len(), 1, "should not duplicate");
+    }
+
+    #[test]
+    fn oauth_system_prompt_noop_when_prompt_is_prefix_string() {
+        // CC may send the identity prompt as prefix of a longer system string
+        let system_text = format!("{}\n\nYou are an interactive agent.", OAUTH_SYSTEM_PROMPT);
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": system_text,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+        inject_oauth_system_prompt(&mut body);
+        // Should remain a string, untouched
+        assert!(body["system"].is_string(), "should not convert to array");
+        assert_eq!(body["system"].as_str().unwrap(), system_text);
+    }
+
+    #[test]
+    fn oauth_system_prompt_noop_when_prompt_is_prefix_array() {
+        // CC may embed the identity prompt as prefix of first block text
+        let block_text = format!("{}\n\nYou are an interactive agent.", OAUTH_SYSTEM_PROMPT);
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": [{"type": "text", "text": block_text}],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+        inject_oauth_system_prompt(&mut body);
+        let system = body.get("system").unwrap().as_array().unwrap();
+        assert_eq!(system.len(), 1, "should not prepend duplicate");
+        assert_eq!(system[0]["text"].as_str().unwrap(), block_text);
     }
 
     #[test]
