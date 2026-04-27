@@ -4438,6 +4438,42 @@ async fn metrics_handler(
         }
     }
 
+    // Account reset countdowns
+    prom_header(
+        &mut buf,
+        "anthropic_account_reset_seconds",
+        "gauge",
+        "Seconds until rate-limit window resets",
+    );
+    for s in &snaps {
+        if let Some(r) = s.reset_5h {
+            let secs = if r > now_epoch {
+                (r - now_epoch) as f64
+            } else {
+                0.0
+            };
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_reset_seconds",
+                &[("account", &s.name), ("window", "5h")],
+                secs,
+            );
+        }
+        if let Some(r) = s.reset_7d {
+            let secs = if r > now_epoch {
+                (r - now_epoch) as f64
+            } else {
+                0.0
+            };
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_reset_seconds",
+                &[("account", &s.name), ("window", "7d")],
+                secs,
+            );
+        }
+    }
+
     // Account burn rate
     prom_header(
         &mut buf,
@@ -4652,6 +4688,30 @@ async fn metrics_handler(
             "anthropic_account_passthrough",
             &[("account", &s.name)],
             if s.passthrough { 1.0 } else { 0.0 },
+        );
+    }
+
+    // Account-level waste risk (max across 7d claims).
+    // Note: refresh_metrics_weights uses a 3-tier claim selection
+    // (representative → seven_day → max) for routing_weight/share.
+    // This metric intentionally shows the max to surface the worst-case
+    // claim regardless of which one the router currently selects.
+    prom_header(
+        &mut buf,
+        "anthropic_account_waste_risk",
+        "gauge",
+        "Max waste risk across 7d claims (worst-case urgency signal)",
+    );
+    for s in &snaps {
+        if s.passthrough || s.claims.is_empty() {
+            continue;
+        }
+        let wr = s.claims.iter().map(|c| c.waste_risk).fold(0.0f64, f64::max);
+        prom_gauge(
+            &mut buf,
+            "anthropic_account_waste_risk",
+            &[("account", &s.name)],
+            wr,
         );
     }
 
@@ -15775,6 +15835,101 @@ upstream = "https://api.anthropic.com"
         assert!(
             !body.contains("anthropic_claim_utilization{account=\"acct-b\""),
             "acct-b should have no claim_utilization:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_reset_seconds_and_account_waste_risk() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, state) = test_app(&mock_url, None);
+
+        let now_epoch = AppState::now_epoch();
+        let reset_5h = now_epoch + 7200; // 2 hours
+        let reset_7d = now_epoch + 302400; // 3.5 days
+
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.reset_5h = Some(reset_5h);
+            info.reset_7d = Some(reset_7d);
+            info.claims_7d.insert(
+                "claude-sonnet".to_string(),
+                ClaimWindowData {
+                    utilization: Some(0.30),
+                    reset: Some(reset_7d),
+                    status: None,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let addr = serve(app).await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap();
+        let body = resp.text().await.unwrap();
+
+        // R6.1: reset_seconds for 5h window — should be close to 7200
+        assert!(
+            body.contains("# TYPE anthropic_account_reset_seconds gauge"),
+            "missing reset_seconds type line:\n{body}"
+        );
+        // Parse the actual value and check within ±5s tolerance
+        let line_5h = body
+            .lines()
+            .find(|l| {
+                l.contains("anthropic_account_reset_seconds")
+                    && l.contains("acct-a")
+                    && l.contains("5h")
+            })
+            .expect("missing reset_seconds 5h for acct-a");
+        let val_5h: f64 = line_5h.split_whitespace().last().unwrap().parse().unwrap();
+        assert!(
+            (val_5h - 7200.0).abs() < 5.0,
+            "reset_seconds 5h should be ~7200, got {val_5h}"
+        );
+
+        // R6.2: reset_seconds for 7d window — should be close to 302400
+        let line_7d = body
+            .lines()
+            .find(|l| {
+                l.contains("anthropic_account_reset_seconds")
+                    && l.contains("acct-a")
+                    && l.contains("7d")
+            })
+            .expect("missing reset_seconds 7d for acct-a");
+        let val_7d: f64 = line_7d.split_whitespace().last().unwrap().parse().unwrap();
+        assert!(
+            (val_7d - 302400.0).abs() < 5.0,
+            "reset_seconds 7d should be ~302400, got {val_7d}"
+        );
+
+        // R6.3: account_waste_risk — max claim waste_risk for acct-a
+        // waste_risk(0.30, reset_7d, now_epoch):
+        //   remaining_fraction = 302400 / 604800 = 0.5
+        //   unused = 1.0 - 0.30 = 0.70
+        //   waste_risk = 0.70 / 0.5 = 1.4
+        assert!(
+            body.contains("# TYPE anthropic_account_waste_risk gauge"),
+            "missing account_waste_risk type line:\n{body}"
+        );
+        assert!(
+            body.contains("anthropic_account_waste_risk{account=\"acct-a\"} 1.4"),
+            "missing account_waste_risk for acct-a:\n{body}"
+        );
+
+        // R6.4: acct-b has no claims → no account_waste_risk
+        assert!(
+            !body.contains("anthropic_account_waste_risk{account=\"acct-b\""),
+            "acct-b should have no account_waste_risk:\n{body}"
+        );
+
+        // R6.5: acct-b has no reset data → no reset_seconds
+        assert!(
+            !body.contains("anthropic_account_reset_seconds{account=\"acct-b\""),
+            "acct-b should have no reset_seconds:\n{body}"
         );
     }
 
