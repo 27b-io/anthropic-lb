@@ -3408,10 +3408,11 @@ async fn proxy_handler(
 
             // Pre-compute OAuth variant with Claude Code system prompt prepended.
             // OAuth tokens (sk-ant-oat*) require this to access sonnet/opus models.
-            // Skip if the client already includes it — re-serializing through serde
-            // changes byte representation and breaks Anthropic's prompt caching.
+            // Skip injection when the client already includes the prompt — the
+            // normal `bytes` payload (which preserves auto-cache mutations) is
+            // already correct for OAuth accounts too.
             let oauth_bytes = if has_oauth_system_prompt(&parsed) {
-                body_bytes.to_vec()
+                bytes.clone()
             } else {
                 let mut oauth_parsed = parsed.clone();
                 inject_oauth_system_prompt(&mut oauth_parsed);
