@@ -4446,30 +4446,20 @@ async fn metrics_handler(
         "Seconds until rate-limit window resets",
     );
     for s in &snaps {
-        if let Some(r) = s.reset_5h {
-            let secs = if r > now_epoch {
-                (r - now_epoch) as f64
-            } else {
-                0.0
-            };
+        if let Some(r) = s.reset_5h.filter(|&r| r > now_epoch) {
             prom_gauge(
                 &mut buf,
                 "anthropic_account_reset_seconds",
                 &[("account", &s.name), ("window", "5h")],
-                secs,
+                (r - now_epoch) as f64,
             );
         }
-        if let Some(r) = s.reset_7d {
-            let secs = if r > now_epoch {
-                (r - now_epoch) as f64
-            } else {
-                0.0
-            };
+        if let Some(r) = s.reset_7d.filter(|&r| r > now_epoch) {
             prom_gauge(
                 &mut buf,
                 "anthropic_account_reset_seconds",
                 &[("account", &s.name), ("window", "7d")],
-                secs,
+                (r - now_epoch) as f64,
             );
         }
     }
