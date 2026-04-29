@@ -405,6 +405,9 @@ struct Account {
     /// Refreshed by `refresh_metrics_weights()` once per probe cycle. Backs
     /// the `anthropic_account_routing_share` Prometheus gauge.
     last_routing_share: AtomicU64,
+    /// Effective routing gate (f64 as bits): max(gate_5h, gate_7d) after
+    /// time-adjustment and status floors. Refreshed by `refresh_metrics_weights()`.
+    last_effective_gate: AtomicU64,
 }
 
 struct Upstream {
@@ -1178,6 +1181,19 @@ fn status_to_floor(status: Option<&str>) -> f64 {
     }
 }
 
+/// Map a rate-limit status string to a Prometheus ordinal gauge value.
+/// 0=allowed, 1=allowed_warning, 2=throttled, 3=rejected.
+/// Unknown statuses map to 1 (warning-level) for visibility.
+fn status_to_ordinal(status: Option<&str>) -> f64 {
+    match status {
+        Some("rejected") => 3.0,
+        Some("throttled") => 2.0,
+        Some("allowed_warning") => 1.0,
+        Some("allowed") | None => 0.0,
+        Some(_) => 1.0, // unknown → warning
+    }
+}
+
 /// Compute time-adjusted utilization for a single rate-limit window.
 ///
 /// In the near-reset zone (final `near_reset_secs` of the block), raw utilization is
@@ -1691,12 +1707,15 @@ impl AppState {
         for (i, acct) in self.accounts.iter().enumerate() {
             let w = weights[i];
             let share = if total > 0.0 { w / total } else { 0.0 };
-            // Weight and share are independent gauges, not a joint invariant —
-            // a torn read across the pair is harmless for dashboard consumers.
+            let gate = entries[i].map(|(g, _)| g).unwrap_or(0.0);
+            // Weight, share and gate are independent gauges, not a joint invariant —
+            // a torn read across them is harmless for dashboard consumers.
             acct.last_routing_weight
                 .store(w.to_bits(), Ordering::Relaxed);
             acct.last_routing_share
                 .store(share.to_bits(), Ordering::Relaxed);
+            acct.last_effective_gate
+                .store(gate.to_bits(), Ordering::Relaxed);
         }
     }
 
@@ -4212,6 +4231,7 @@ struct AcctMetricsSnap {
     projected_throttle_secs: Option<f64>,
     token_usage: [u64; 4],
     claims: Vec<ClaimMetricsSnap>,
+    last_updated_epoch: Option<u64>,
 }
 
 #[cfg(test)]
@@ -4232,6 +4252,12 @@ fn append_routing_weight_metrics(
         "gauge",
         "Per-account share of total routing weight (0.0-1.0)",
     );
+    prom_header(
+        buf,
+        "anthropic_account_effective_gate",
+        "gauge",
+        "Effective routing gate: max(time_adjusted_5h, time_adjusted_7d) with status floors",
+    );
 
     for (acct, snap) in accounts.iter().zip(snaps.iter()) {
         if snap.passthrough {
@@ -4239,6 +4265,7 @@ fn append_routing_weight_metrics(
         }
         let weight = f64::from_bits(acct.last_routing_weight.load(Ordering::Relaxed));
         let share = f64::from_bits(acct.last_routing_share.load(Ordering::Relaxed));
+        let gate = f64::from_bits(acct.last_effective_gate.load(Ordering::Relaxed));
         prom_gauge(
             buf,
             "anthropic_account_routing_weight",
@@ -4250,6 +4277,12 @@ fn append_routing_weight_metrics(
             "anthropic_account_routing_share",
             &[("account", &snap.name)],
             share,
+        );
+        prom_gauge(
+            buf,
+            "anthropic_account_effective_gate",
+            &[("account", &snap.name)],
+            gate,
         );
     }
 }
@@ -4366,6 +4399,7 @@ async fn metrics_handler(
                 acct.cache_read_tokens.load(Ordering::Relaxed),
             ],
             claims,
+            last_updated_epoch: info.last_updated_epoch,
         });
     }
 
@@ -4434,6 +4468,33 @@ async fn metrics_handler(
                 "anthropic_account_utilization",
                 &[("account", &s.name), ("window", "7d")],
                 u,
+            );
+        }
+    }
+
+    // Rate-limit status (ordinal: 0=allowed, 1=allowed_warning, 2=throttled, 3=rejected)
+    prom_header(
+        &mut buf,
+        "anthropic_account_rate_limit_status",
+        "gauge",
+        "Rate-limit status ordinal (0=allowed, 1=warning, 2=throttled, 3=rejected)",
+    );
+    for s in &snaps {
+        if s.passthrough {
+            continue;
+        }
+        prom_gauge(
+            &mut buf,
+            "anthropic_account_rate_limit_status",
+            &[("account", &s.name), ("window", "5h")],
+            status_to_ordinal(s.status_5h.as_deref()),
+        );
+        if s.has_applicable_7d {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_rate_limit_status",
+                &[("account", &s.name), ("window", "7d")],
+                status_to_ordinal(s.status_7d.as_deref()),
             );
         }
     }
@@ -4705,6 +4766,32 @@ async fn metrics_handler(
         );
     }
 
+    // Probe data age (seconds since last rate-limit header update)
+    prom_header(
+        &mut buf,
+        "anthropic_account_data_age_seconds",
+        "gauge",
+        "Seconds since last rate-limit data update from upstream",
+    );
+    for s in &snaps {
+        if s.passthrough {
+            continue;
+        }
+        if let Some(epoch) = s.last_updated_epoch {
+            let age = if now_epoch > epoch {
+                (now_epoch - epoch) as f64
+            } else {
+                0.0
+            };
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_data_age_seconds",
+                &[("account", &s.name)],
+                age,
+            );
+        }
+    }
+
     // Claim metrics
     prom_header(
         &mut buf,
@@ -4755,6 +4842,12 @@ async fn metrics_handler(
         "gauge",
         "Per-account share of total routing weight (0.0-1.0)",
     );
+    prom_header(
+        &mut buf,
+        "anthropic_account_effective_gate",
+        "gauge",
+        "Effective routing gate: max(time_adjusted_5h, time_adjusted_7d) with status floors",
+    );
 
     for (acct, s) in state.accounts.iter().zip(snaps.iter()) {
         if s.passthrough {
@@ -4762,6 +4855,7 @@ async fn metrics_handler(
         }
         let weight = f64::from_bits(acct.last_routing_weight.load(Ordering::Relaxed));
         let share = f64::from_bits(acct.last_routing_share.load(Ordering::Relaxed));
+        let gate = f64::from_bits(acct.last_effective_gate.load(Ordering::Relaxed));
         prom_gauge(
             &mut buf,
             "anthropic_account_routing_weight",
@@ -4773,6 +4867,12 @@ async fn metrics_handler(
             "anthropic_account_routing_share",
             &[("account", &s.name)],
             share,
+        );
+        prom_gauge(
+            &mut buf,
+            "anthropic_account_effective_gate",
+            &[("account", &s.name)],
+            gate,
         );
     }
 
@@ -6235,6 +6335,7 @@ async fn main() {
                 cache_read_tokens: AtomicU64::new(0),
                 last_routing_weight: AtomicU64::new(0),
                 last_routing_share: AtomicU64::new(0),
+                last_effective_gate: AtomicU64::new(0),
             }
         })
         .collect();
@@ -6527,6 +6628,7 @@ mod tests {
             cache_read_tokens: AtomicU64::new(0),
             last_routing_weight: AtomicU64::new(0),
             last_routing_share: AtomicU64::new(0),
+            last_effective_gate: AtomicU64::new(0),
         }
     }
 
@@ -15920,6 +16022,109 @@ upstream = "https://api.anthropic.com"
         assert!(
             !body.contains("anthropic_account_reset_seconds{account=\"acct-b\""),
             "acct-b should have no reset_seconds:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_status_gate_and_data_age() {
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, state) = test_app(&mock_url, None);
+
+        let now_epoch = AppState::now_epoch();
+        let data_age_secs = 120u64;
+
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.60);
+            info.reset_5h = Some(now_epoch + 7200);
+            info.status_5h = Some("allowed_warning".to_string());
+            info.utilization_7d = Some(0.40);
+            info.reset_7d = Some(now_epoch + 302400);
+            info.status_7d = Some("throttled".to_string());
+            info.last_updated_epoch = Some(now_epoch - data_age_secs);
+            info.claims_7d.insert(
+                "seven_day".to_string(),
+                ClaimWindowData {
+                    utilization: Some(0.40),
+                    reset: Some(now_epoch + 302400),
+                    status: Some("throttled".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Populate the effective gate atomic
+        state.refresh_metrics_weights().await;
+
+        let addr = serve(app).await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap();
+        let body = resp.text().await.unwrap();
+
+        // #49: rate_limit_status — allowed_warning=1 for 5h, throttled=2 for 7d
+        assert!(
+            body.contains(
+                "anthropic_account_rate_limit_status{account=\"acct-a\",window=\"5h\"} 1"
+            ),
+            "missing status 5h=1 (allowed_warning):\n{body}"
+        );
+        assert!(
+            body.contains(
+                "anthropic_account_rate_limit_status{account=\"acct-a\",window=\"7d\"} 2"
+            ),
+            "missing status 7d=2 (throttled):\n{body}"
+        );
+        // acct-b has no status data → should still emit 0 (allowed/None)
+        assert!(
+            body.contains(
+                "anthropic_account_rate_limit_status{account=\"acct-b\",window=\"5h\"} 0"
+            ),
+            "acct-b 5h should be 0 (allowed):\n{body}"
+        );
+
+        // #50: effective_gate — should be > 0 for acct-a (has utilization data)
+        assert!(
+            body.contains("# TYPE anthropic_account_effective_gate gauge"),
+            "missing effective_gate TYPE:\n{body}"
+        );
+        let gate_line = body
+            .lines()
+            .find(|l| l.contains("anthropic_account_effective_gate") && l.contains("acct-a"))
+            .expect("missing effective_gate for acct-a");
+        let gate_val: f64 = gate_line
+            .split_whitespace()
+            .last()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            gate_val > 0.0,
+            "effective_gate for acct-a should be > 0, got {gate_val}"
+        );
+
+        // #51: data_age_seconds — should be ~120s for acct-a
+        assert!(
+            body.contains("# TYPE anthropic_account_data_age_seconds gauge"),
+            "missing data_age_seconds TYPE:\n{body}"
+        );
+        let age_line = body
+            .lines()
+            .find(|l| l.contains("anthropic_account_data_age_seconds") && l.contains("acct-a"))
+            .expect("missing data_age_seconds for acct-a");
+        let age_val: f64 = age_line.split_whitespace().last().unwrap().parse().unwrap();
+        assert!(
+            (age_val - data_age_secs as f64).abs() < 5.0,
+            "data_age_seconds should be ~{data_age_secs}, got {age_val}"
+        );
+
+        // acct-b has no last_updated_epoch → no data_age line
+        assert!(
+            !body.contains("anthropic_account_data_age_seconds{account=\"acct-b\""),
+            "acct-b should have no data_age_seconds:\n{body}"
         );
     }
 
