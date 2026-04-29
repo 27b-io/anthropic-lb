@@ -1190,7 +1190,13 @@ fn status_to_ordinal(status: Option<&str>) -> f64 {
         Some("throttled") => 2.0,
         Some("allowed_warning") => 1.0,
         Some("allowed") | None => 0.0,
-        Some(_) => 1.0, // unknown → warning
+        Some(unknown) => {
+            warn!(
+                status = unknown,
+                "unknown rate-limit status in ordinal mapping"
+            );
+            1.0
+        }
     }
 }
 
@@ -1707,7 +1713,9 @@ impl AppState {
         for (i, acct) in self.accounts.iter().enumerate() {
             let w = weights[i];
             let share = if total > 0.0 { w / total } else { 0.0 };
-            let gate = entries[i].map(|(g, _)| g).unwrap_or(0.0);
+            // Excluded accounts (passthrough, hard-limited) report gate=1.0
+            // (fully gated) since they receive zero traffic.
+            let gate = entries[i].map(|(g, _)| g).unwrap_or(1.0);
             // Weight, share and gate are independent gauges, not a joint invariant —
             // a torn read across them is harmless for dashboard consumers.
             acct.last_routing_weight
@@ -13944,6 +13952,17 @@ data: {\"type\":\"message_stop\"}\n\n";
             floor, WARNING_UTIL_FLOOR,
             "unknown status should map to warning floor"
         );
+    }
+
+    #[test]
+    fn status_to_ordinal_mapping() {
+        assert_eq!(status_to_ordinal(Some("rejected")), 3.0);
+        assert_eq!(status_to_ordinal(Some("throttled")), 2.0);
+        assert_eq!(status_to_ordinal(Some("allowed_warning")), 1.0);
+        assert_eq!(status_to_ordinal(Some("allowed")), 0.0);
+        assert_eq!(status_to_ordinal(None), 0.0);
+        // Unknown statuses map to 1.0 (warning-level)
+        assert_eq!(status_to_ordinal(Some("new_unknown_status")), 1.0);
     }
 
     #[test]
