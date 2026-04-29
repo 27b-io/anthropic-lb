@@ -1750,8 +1750,9 @@ impl AppState {
         for acct in &self.accounts {
             let w = f64::from_bits(acct.last_routing_weight.load(Ordering::Relaxed));
             let s = f64::from_bits(acct.last_routing_share.load(Ordering::Relaxed));
+            let g = f64::from_bits(acct.last_effective_gate.load(Ordering::Relaxed));
             let key = format!("alb:weight:{}", acct.name);
-            let val = format!("{w},{s}");
+            let val = format!("{w},{s},{g}");
             let mut conn = redis.clone();
             let ttl = Self::routing_weight_publish_ttl(self.probe_interval_secs);
             tokio::spawn(async move {
@@ -2474,7 +2475,8 @@ impl AppState {
         if let Ok(values) = conn.mget::<_, Vec<Option<String>>>(&weight_keys).await {
             for (i, val) in values.iter().enumerate() {
                 if let Some(csv) = val {
-                    if let Some((w_str, s_str)) = csv.split_once(',') {
+                    let mut parts = csv.splitn(3, ',');
+                    if let (Some(w_str), Some(s_str)) = (parts.next(), parts.next()) {
                         if let (Ok(w), Ok(s)) = (w_str.parse::<f64>(), s_str.parse::<f64>()) {
                             self.accounts[i]
                                 .last_routing_weight
@@ -2482,6 +2484,12 @@ impl AppState {
                             self.accounts[i]
                                 .last_routing_share
                                 .store(s.to_bits(), Ordering::Relaxed);
+                            // Gate is optional (backward compat with older publishers)
+                            if let Some(Ok(g)) = parts.next().map(|g| g.parse::<f64>()) {
+                                self.accounts[i]
+                                    .last_effective_gate
+                                    .store(g.to_bits(), Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -4497,14 +4505,12 @@ async fn metrics_handler(
             &[("account", &s.name), ("window", "5h")],
             status_to_ordinal(s.status_5h.as_deref()),
         );
-        if s.has_applicable_7d {
-            prom_gauge(
-                &mut buf,
-                "anthropic_account_rate_limit_status",
-                &[("account", &s.name), ("window", "7d")],
-                status_to_ordinal(s.status_7d.as_deref()),
-            );
-        }
+        prom_gauge(
+            &mut buf,
+            "anthropic_account_rate_limit_status",
+            &[("account", &s.name), ("window", "7d")],
+            status_to_ordinal(s.status_7d.as_deref()),
+        );
     }
 
     // Account reset countdowns
