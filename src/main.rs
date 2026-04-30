@@ -2808,7 +2808,9 @@ async fn finalize_stream(
         } else {
             "no_usage_event"
         };
-        info!(
+        let head_len = sse_buf.len().min(500);
+        let sse_head = String::from_utf8_lossy(&sse_buf[..head_len]);
+        warn!(
             req_id,
             client_id,
             model,
@@ -2816,6 +2818,7 @@ async fn finalize_stream(
             reason,
             elapsed_ms,
             sse_bytes = sse_buf.len(),
+            %sse_head,
             "stream_end_no_usage"
         );
     }
