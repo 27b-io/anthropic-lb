@@ -2808,8 +2808,12 @@ async fn finalize_stream(
         } else {
             "no_usage_event"
         };
-        let head_len = sse_buf.len().min(500);
-        let sse_head = String::from_utf8_lossy(&sse_buf[..head_len]);
+        // Log structural metadata only — SSE payloads contain user content.
+        let sse_text = String::from_utf8_lossy(sse_buf);
+        let sse_event_types: Vec<&str> = sse_text
+            .lines()
+            .filter_map(|l| l.strip_prefix("event: "))
+            .collect();
         warn!(
             req_id,
             client_id,
@@ -2818,7 +2822,7 @@ async fn finalize_stream(
             reason,
             elapsed_ms,
             sse_bytes = sse_buf.len(),
-            %sse_head,
+            sse_events = ?sse_event_types,
             "stream_end_no_usage"
         );
     }
