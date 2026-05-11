@@ -2808,7 +2808,19 @@ async fn finalize_stream(
         } else {
             "no_usage_event"
         };
-        info!(
+        // Log structural metadata only — SSE payloads contain user content.
+        let sse_text = String::from_utf8_lossy(sse_buf);
+        let sse_event_types: Vec<&str> = sse_text
+            .lines()
+            .filter_map(|l| {
+                l.strip_prefix("event: ")
+                    .or_else(|| l.strip_prefix("event:"))
+            })
+            .collect();
+        let total_events = sse_event_types.len();
+        let truncated = total_events > 5;
+        let preview: Vec<&str> = sse_event_types.into_iter().take(5).collect();
+        warn!(
             req_id,
             client_id,
             model,
@@ -2816,6 +2828,9 @@ async fn finalize_stream(
             reason,
             elapsed_ms,
             sse_bytes = sse_buf.len(),
+            sse_event_count = total_events,
+            sse_events = ?preview,
+            truncated,
             "stream_end_no_usage"
         );
     }
