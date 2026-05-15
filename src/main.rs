@@ -3530,6 +3530,7 @@ async fn proxy_handler(
             let mut headers = parts.headers.clone();
             headers.remove("host");
             headers.remove("content-length"); // body size may change after cache injection
+            headers.remove("accept-encoding"); // need plaintext SSE to extract token usage
 
             // Default anthropic-version if client didn't set it
             if !headers.contains_key("anthropic-version") {
