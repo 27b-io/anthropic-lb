@@ -1,5 +1,10 @@
 /target
 config.toml
-config.state.json
+config-debug.toml
+*.state.json
+debug.log
+shadow.jsonl
 .vscode/
 .spec-workflow/
+.claude/
+AGENTS.md
