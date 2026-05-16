@@ -1,0 +1,15 @@
+# Debug proxy config — for investigating cache/auth behavior
+# Usage: cp config-debug.toml.example config-debug.toml && edit token
+# Run:   cargo build && ./target/debug/anthropic-lb config-debug.toml
+# Tail:  tail -f debug.log
+listen = "127.0.0.1:8083"
+upstream = "https://api.anthropic.com"
+auto_cache = true
+debug_log = "debug.log"
+
+# Single account for clean signal
+# Copy this file to config-debug.toml and set your token below.
+# config-debug.toml is gitignored and will not be committed.
+[[accounts]]
+name = "debug"
+token = "YOUR_TOKEN_HERE"

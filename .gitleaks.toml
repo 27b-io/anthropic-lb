@@ -1,0 +1,23 @@
+# Gitleaks configuration — custom rules for Anthropic tokens
+# https://github.com/gitleaks/gitleaks
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key (sk-ant-api*)"
+regex = '''sk-ant-api\w{2,}-[\w-]{20,}'''
+keywords = ["sk-ant-api"]
+
+[[rules]]
+id = "anthropic-oauth-token"
+description = "Anthropic OAuth token (sk-ant-oat*)"
+regex = '''sk-ant-oat\w{2,}-[\w-]{20,}'''
+keywords = ["sk-ant-oat"]
+
+[allowlist]
+paths = [
+  '''\.lock$''',
+  '''target/''',
+]

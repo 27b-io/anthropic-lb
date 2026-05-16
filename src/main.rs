@@ -73,6 +73,9 @@ struct Config {
     /// Redis/Valkey URL for distributed state. When set, budget enforcement and hard-limit
     /// propagation use Redis for cross-replica coordination. None = local-only (single instance).
     redis_url: Option<String>,
+    /// Path for debug log file. When set, writes debug-level logs to this file while
+    /// keeping info-level on stderr. For investigating cache/auth behavior.
+    debug_log: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -299,13 +302,11 @@ const OAUTH_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI
 /// Max bytes of 429 response body to include in debug logs.
 const MAX_429_BODY_LOG_BYTES: usize = 512;
 
-/// Headers redacted from 429 debug logs.
-const REDACTED_HEADERS: &[&str] = &[
-    "authorization",
-    "cookie",
-    "x-api-key",
-    "proxy-authorization",
-];
+/// Substrings that mark a header as sensitive — any header whose name contains
+/// one of these is redacted from debug logs. Safer than a denylist: new
+/// sensitive headers (e.g. `x-auth-foo`, `session-token`) are caught by default.
+const SENSITIVE_HEADER_SUBSTRINGS: &[&str] =
+    &["auth", "cookie", "token", "key", "secret", "session"];
 
 /// Format 429 response headers and body for a single debug log line.
 /// Redacts sensitive headers, truncates body to MAX_429_BODY_LOG_BYTES.
@@ -315,7 +316,7 @@ async fn log_429_details(account_name: &str, resp: reqwest::Response) {
         .iter()
         .map(|(k, v)| {
             let name = k.as_str();
-            if REDACTED_HEADERS.contains(&name) {
+            if is_sensitive_header(name) {
                 format!("{}=<redacted>", name)
             } else {
                 format!("{}={}", name, v.to_str().unwrap_or("<binary>"))
@@ -3189,10 +3190,14 @@ fn has_oauth_system_prompt(body: &serde_json::Value) -> bool {
             .is_some_and(|s| s.starts_with(OAUTH_SYSTEM_PROMPT)),
         Some(system) if system.is_array() => system
             .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|b| b.get("text"))
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| t.starts_with(OAUTH_SYSTEM_PROMPT)),
+            .map(|arr| {
+                arr.iter().any(|b| {
+                    b.get("text")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(|t| t.starts_with(OAUTH_SYSTEM_PROMPT))
+                })
+            })
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -3368,6 +3373,92 @@ fn has_existing_cache_control(body: &serde_json::Value) -> bool {
     false
 }
 
+/// Whether a header name looks sensitive (substring match).
+fn is_sensitive_header(name: &str) -> bool {
+    SENSITIVE_HEADER_SUBSTRINGS
+        .iter()
+        .any(|sub| name.contains(sub))
+}
+
+/// Return the header value for debug logging, redacting sensitive headers.
+fn debug_header_value<'a>(name: &axum::http::HeaderName, value: &'a HeaderValue) -> &'a str {
+    if is_sensitive_header(name.as_str()) {
+        "<redacted>"
+    } else {
+        value.to_str().unwrap_or("<binary>")
+    }
+}
+
+/// Debug: dump all cache_control objects found in the request body.
+fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
+    let mut count = 0u32;
+
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        for (i, tool) in tools.iter().enumerate() {
+            if let Some(cc) = tool.get("cache_control") {
+                debug!(req_id, location = format_args!("tools[{i}]"), cache_control = %cc, "body cache_control");
+                count += 1;
+            }
+        }
+    }
+    if let Some(system) = body.get("system") {
+        if let Some(cc) = system.get("cache_control") {
+            debug!(req_id, location = "system", cache_control = %cc, "body cache_control");
+            count += 1;
+        }
+        if let Some(arr) = system.as_array() {
+            for (i, block) in arr.iter().enumerate() {
+                if let Some(cc) = block.get("cache_control") {
+                    debug!(req_id, location = format_args!("system[{i}]"), cache_control = %cc, "body cache_control");
+                    count += 1;
+                }
+            }
+        }
+    }
+    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+        for (i, msg) in messages.iter().enumerate() {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("-");
+            if let Some(cc) = msg.get("cache_control") {
+                debug!(req_id, location = format_args!("messages[{i}]"), role, cache_control = %cc, "body cache_control");
+                count += 1;
+            }
+            if let Some(content) = msg.get("content") {
+                if let Some(arr) = content.as_array() {
+                    for (j, block) in arr.iter().enumerate() {
+                        if let Some(cc) = block.get("cache_control") {
+                            debug!(
+                                req_id,
+                                location = format_args!("messages[{i}].content[{j}]"),
+                                role,
+                                cache_control = %cc,
+                                "body cache_control"
+                            );
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let msg_count = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let tool_count = body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    debug!(
+        req_id,
+        cache_control_count = count,
+        messages = msg_count,
+        tools = tool_count,
+        "body summary"
+    );
+}
+
 // ── Handler ─────────────────────────────────────────────────────────
 
 async fn proxy_handler(
@@ -3412,6 +3503,14 @@ async fn proxy_handler(
         session_id,
     } = rctx;
 
+    // Debug: dump all inbound request headers
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        debug!(req_id, client_id = %client_id, ver = %client_ver, ">>> inbound request");
+        for (k, v) in parts.headers.iter() {
+            debug!(req_id, header = %k, value = debug_header_value(k, v), ">>> req header");
+        }
+    }
+
     let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
@@ -3429,6 +3528,11 @@ async fn proxy_handler(
                 .unwrap_or("")
                 .to_string();
             let mut mutated = false;
+
+            // Debug: dump cache_control structures found in request body
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug_dump_cache_control(&parsed, &req_id);
+            }
 
             if state.auto_cache {
                 let inj = inject_cache_breakpoints(&mut parsed);
@@ -3540,6 +3644,34 @@ async fn proxy_handler(
             // Auth: passthrough keeps caller's headers, otherwise inject account token
             inject_account_auth(&mut headers, &acct.token, acct.passthrough);
 
+            // Debug: log outbound auth method and key headers
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let auth_method = if acct.passthrough {
+                    "passthrough"
+                } else if acct.token.starts_with("sk-ant-oat") {
+                    "oauth"
+                } else {
+                    "api-key"
+                };
+                debug!(
+                    req_id,
+                    account = acct.name,
+                    auth_method,
+                    body_bytes = if acct.token.starts_with("sk-ant-oat") {
+                        oauth_body_bytes.len()
+                    } else {
+                        body_bytes.len()
+                    },
+                    has_anthropic_beta = headers
+                        .get("anthropic-beta")
+                        .map(|v| v.to_str().unwrap_or("-")),
+                    has_anthropic_version = headers
+                        .get("anthropic-version")
+                        .map(|v| v.to_str().unwrap_or("-")),
+                    "<<< outbound to upstream"
+                );
+            }
+
             upstream_req = upstream_req.headers(headers);
             // Use OAuth variant (with CC system prompt) for OAuth tokens
             let req_body = if acct.token.starts_with("sk-ant-oat") {
@@ -3559,6 +3691,19 @@ async fn proxy_handler(
 
             let status = resp.status();
             acct.requests.fetch_add(1, Ordering::Relaxed);
+
+            // Debug: dump all response headers
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(
+                    req_id,
+                    status = status.as_u16(),
+                    account = acct.name,
+                    "<<< upstream response"
+                );
+                for (k, v) in resp.headers().iter() {
+                    debug!(req_id, header = %k, value = debug_header_value(k, v), "<<< resp header");
+                }
+            }
 
             // Always update rate limit info and persist
             state.update_rate_info(idx, resp.headers()).await;
@@ -6279,13 +6424,7 @@ async fn openai_chat_handler(
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "anthropic_lb=info".into()),
-        )
-        .init();
-
+    // Parse config first so debug_log path is available for tracing setup
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "config.toml".to_string());
@@ -6293,6 +6432,34 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to read {config_path}: {e}"));
     let config: Config =
         toml::from_str(&config_str).unwrap_or_else(|e| panic!("invalid config: {e}"));
+
+    // Set up tracing: stderr (info+) always, plus optional debug log file
+    {
+        use tracing_subscriber::prelude::*;
+        let stderr_layer = tracing_subscriber::fmt::layer().with_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "anthropic_lb=info".into()),
+        );
+        if let Some(ref debug_path) = config.debug_log {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(debug_path)
+                .unwrap_or_else(|e| panic!("failed to open debug log {debug_path}: {e}"));
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_filter(tracing_subscriber::EnvFilter::new("anthropic_lb=debug"));
+            tracing_subscriber::registry()
+                .with(stderr_layer)
+                .with(file_layer)
+                .init();
+            eprintln!("debug logging to {debug_path}");
+        } else {
+            tracing_subscriber::registry().with(stderr_layer).init();
+        }
+    }
+
     let routing_strategy = RoutingStrategy::parse(config.strategy.as_deref())
         .unwrap_or_else(|e| panic!("invalid strategy: {e}"));
 
@@ -16716,6 +16883,187 @@ upstream = "https://api.anthropic.com"
         let system = body.get("system").unwrap().as_array().unwrap();
         assert_eq!(system.len(), 1);
         assert_eq!(system[0]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
+    }
+
+    /// Regression: CC 142+ prepends a billing header as system[0], pushing the
+    /// CC identity prompt to system[1+]. has_oauth_system_prompt must scan all
+    /// blocks, not just the first — otherwise inject_oauth_system_prompt
+    /// re-serializes the body, breaking Anthropic's byte-prefix cache matching.
+    #[test]
+    fn oauth_system_prompt_detected_in_later_block() {
+        // system[0] is a non-prompt block (billing header), system[1] has the CC prompt
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.109"},
+                {"type": "text", "text": OAUTH_SYSTEM_PROMPT}
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+
+        // Must detect prompt at system[1] — no re-injection
+        assert!(
+            has_oauth_system_prompt(&body),
+            "should detect CC prompt in system[1]"
+        );
+        inject_oauth_system_prompt(&mut body);
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(
+            system.len(),
+            2,
+            "should not prepend — prompt already present"
+        );
+        assert_eq!(
+            system[1]["text"].as_str().unwrap(),
+            OAUTH_SYSTEM_PROMPT,
+            "CC prompt should remain at system[1]"
+        );
+    }
+
+    /// Regression: full proxy roundtrip with OAuth account where the CC prompt
+    /// is at system[1+]. Verifies the proxy does not re-serialize the body
+    /// (which would break upstream prompt cache matching).
+    #[tokio::test]
+    async fn oauth_system_prompt_no_reserialize_when_in_later_block() {
+        use std::sync::Arc as StdArc;
+
+        // Mock upstream that captures the raw request body
+        let captured_body: StdArc<tokio::sync::Mutex<Vec<u8>>> =
+            StdArc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = captured_body.clone();
+        let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+            let captured = captured.clone();
+            async move {
+                let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                *captured.lock().await = body_bytes.to_vec();
+
+                let mut resp = axum::Json(serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "model": "claude-sonnet-4-6",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 10, "output_tokens": 1}
+                }))
+                .into_response();
+                resp.headers_mut().insert(
+                    "anthropic-ratelimit-unified-representative-claim",
+                    HeaderValue::from_static("five_hour"),
+                );
+                resp.headers_mut().insert(
+                    "anthropic-ratelimit-unified-5h-utilization",
+                    HeaderValue::from_static("0.10"),
+                );
+                let reset = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600)
+                    .to_string();
+                resp.headers_mut().insert(
+                    "anthropic-ratelimit-unified-5h-reset",
+                    HeaderValue::from_str(&reset).unwrap(),
+                );
+                resp
+            }
+        }));
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        // Build app with an OAuth account, auto_cache off for clean signal
+        let accounts = vec![make_account("oauth-acct", "sk-ant-oat01-test-token")];
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: format!("http://{}", mock_addr),
+            accounts,
+            robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-oauth-regression.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![],
+            client_names: HashMap::new(),
+            auto_cache: false,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operators: vec![],
+            emergency_brake: true,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
+            probe_interval_secs: 300,
+        });
+
+        let app = build_router(state);
+        let addr = serve(app).await;
+
+        // Request body: CC prompt at system[1], billing header at system[0]
+        let request_body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.109"},
+                {"type": "text", "text": OAUTH_SYSTEM_PROMPT}
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+        let request_bytes = serde_json::to_vec(&request_body).unwrap();
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .body(request_bytes.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // The proxy should have forwarded the original body byte-for-byte (no re-serialization).
+        // Serde roundtrip can reorder keys or change whitespace — only raw byte comparison
+        // catches the cache-breaking re-serialization bug this test guards against.
+        let forwarded = captured_body.lock().await;
+        assert_eq!(
+            forwarded.as_slice(),
+            request_bytes.as_slice(),
+            "forwarded body must be byte-identical to request (re-serialization breaks upstream cache)"
+        );
+        let forwarded_body: serde_json::Value = serde_json::from_slice(&forwarded).unwrap();
+        let system = forwarded_body["system"].as_array().unwrap();
+        assert_eq!(
+            system.len(),
+            2,
+            "proxy must not prepend another CC prompt — it was already at system[1]"
+        );
+        assert_eq!(
+            system[0]["text"].as_str().unwrap(),
+            "x-anthropic-billing-header: cc_version=2.1.109",
+            "system[0] should be the billing header, untouched"
+        );
+        assert_eq!(
+            system[1]["text"].as_str().unwrap(),
+            OAUTH_SYSTEM_PROMPT,
+            "system[1] should be the CC prompt, untouched"
+        );
     }
 
     /// Integration test: verify OAuth accounts get the CC system prompt injected
