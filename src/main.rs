@@ -73,6 +73,9 @@ struct Config {
     /// Redis/Valkey URL for distributed state. When set, budget enforcement and hard-limit
     /// propagation use Redis for cross-replica coordination. None = local-only (single instance).
     redis_url: Option<String>,
+    /// Path for debug log file. When set, writes debug-level logs to this file while
+    /// keeping info-level on stderr. For investigating cache/auth behavior.
+    debug_log: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -3189,10 +3192,14 @@ fn has_oauth_system_prompt(body: &serde_json::Value) -> bool {
             .is_some_and(|s| s.starts_with(OAUTH_SYSTEM_PROMPT)),
         Some(system) if system.is_array() => system
             .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|b| b.get("text"))
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| t.starts_with(OAUTH_SYSTEM_PROMPT)),
+            .map(|arr| {
+                arr.iter().any(|b| {
+                    b.get("text")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(|t| t.starts_with(OAUTH_SYSTEM_PROMPT))
+                })
+            })
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -3368,6 +3375,72 @@ fn has_existing_cache_control(body: &serde_json::Value) -> bool {
     false
 }
 
+/// Debug: dump all cache_control objects found in the request body.
+fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
+    let mut count = 0u32;
+
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        for (i, tool) in tools.iter().enumerate() {
+            if let Some(cc) = tool.get("cache_control") {
+                debug!(req_id, location = format_args!("tools[{i}]"), cache_control = %cc, "body cache_control");
+                count += 1;
+            }
+        }
+    }
+    if let Some(system) = body.get("system") {
+        if let Some(cc) = system.get("cache_control") {
+            debug!(req_id, location = "system", cache_control = %cc, "body cache_control");
+            count += 1;
+        }
+        if let Some(arr) = system.as_array() {
+            for (i, block) in arr.iter().enumerate() {
+                if let Some(cc) = block.get("cache_control") {
+                    debug!(req_id, location = format_args!("system[{i}]"), cache_control = %cc, "body cache_control");
+                    count += 1;
+                }
+            }
+        }
+    }
+    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+        for (i, msg) in messages.iter().enumerate() {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("-");
+            if let Some(content) = msg.get("content") {
+                if let Some(arr) = content.as_array() {
+                    for (j, block) in arr.iter().enumerate() {
+                        if let Some(cc) = block.get("cache_control") {
+                            debug!(
+                                req_id,
+                                location = format_args!("messages[{i}].content[{j}]"),
+                                role,
+                                cache_control = %cc,
+                                "body cache_control"
+                            );
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let msg_count = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let tool_count = body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    debug!(
+        req_id,
+        cache_control_count = count,
+        messages = msg_count,
+        tools = tool_count,
+        "body summary"
+    );
+}
+
 // ── Handler ─────────────────────────────────────────────────────────
 
 async fn proxy_handler(
@@ -3412,6 +3485,14 @@ async fn proxy_handler(
         session_id,
     } = rctx;
 
+    // Debug: dump all inbound request headers
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        debug!(req_id, client_id = %client_id, ver = %client_ver, ">>> inbound request");
+        for (k, v) in parts.headers.iter() {
+            debug!(req_id, header = %k, value = %v.to_str().unwrap_or("<binary>"), ">>> req header");
+        }
+    }
+
     let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
@@ -3429,6 +3510,11 @@ async fn proxy_handler(
                 .unwrap_or("")
                 .to_string();
             let mut mutated = false;
+
+            // Debug: dump cache_control structures found in request body
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug_dump_cache_control(&parsed, &req_id);
+            }
 
             if state.auto_cache {
                 let inj = inject_cache_breakpoints(&mut parsed);
@@ -3540,6 +3626,34 @@ async fn proxy_handler(
             // Auth: passthrough keeps caller's headers, otherwise inject account token
             inject_account_auth(&mut headers, &acct.token, acct.passthrough);
 
+            // Debug: log outbound auth method and key headers
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let auth_method = if acct.passthrough {
+                    "passthrough"
+                } else if acct.token.starts_with("sk-ant-oat") {
+                    "oauth"
+                } else {
+                    "api-key"
+                };
+                debug!(
+                    req_id,
+                    account = acct.name,
+                    auth_method,
+                    body_bytes = if acct.token.starts_with("sk-ant-oat") {
+                        oauth_body_bytes.len()
+                    } else {
+                        body_bytes.len()
+                    },
+                    has_anthropic_beta = headers
+                        .get("anthropic-beta")
+                        .map(|v| v.to_str().unwrap_or("-")),
+                    has_anthropic_version = headers
+                        .get("anthropic-version")
+                        .map(|v| v.to_str().unwrap_or("-")),
+                    "<<< outbound to upstream"
+                );
+            }
+
             upstream_req = upstream_req.headers(headers);
             // Use OAuth variant (with CC system prompt) for OAuth tokens
             let req_body = if acct.token.starts_with("sk-ant-oat") {
@@ -3559,6 +3673,19 @@ async fn proxy_handler(
 
             let status = resp.status();
             acct.requests.fetch_add(1, Ordering::Relaxed);
+
+            // Debug: dump all response headers
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(
+                    req_id,
+                    status = status.as_u16(),
+                    account = acct.name,
+                    "<<< upstream response"
+                );
+                for (k, v) in resp.headers().iter() {
+                    debug!(req_id, header = %k, value = %v.to_str().unwrap_or("<binary>"), "<<< resp header");
+                }
+            }
 
             // Always update rate limit info and persist
             state.update_rate_info(idx, resp.headers()).await;
@@ -6279,13 +6406,7 @@ async fn openai_chat_handler(
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "anthropic_lb=info".into()),
-        )
-        .init();
-
+    // Parse config first so debug_log path is available for tracing setup
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "config.toml".to_string());
@@ -6293,6 +6414,34 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to read {config_path}: {e}"));
     let config: Config =
         toml::from_str(&config_str).unwrap_or_else(|e| panic!("invalid config: {e}"));
+
+    // Set up tracing: stderr (info+) always, plus optional debug log file
+    {
+        use tracing_subscriber::prelude::*;
+        let stderr_layer = tracing_subscriber::fmt::layer().with_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "anthropic_lb=info".into()),
+        );
+        if let Some(ref debug_path) = config.debug_log {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(debug_path)
+                .unwrap_or_else(|e| panic!("failed to open debug log {debug_path}: {e}"));
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_filter(tracing_subscriber::EnvFilter::new("anthropic_lb=debug"));
+            tracing_subscriber::registry()
+                .with(stderr_layer)
+                .with(file_layer)
+                .init();
+            eprintln!("debug logging to {debug_path}");
+        } else {
+            tracing_subscriber::registry().with(stderr_layer).init();
+        }
+    }
+
     let routing_strategy = RoutingStrategy::parse(config.strategy.as_deref())
         .unwrap_or_else(|e| panic!("invalid strategy: {e}"));
 
