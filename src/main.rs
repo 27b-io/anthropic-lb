@@ -3418,6 +3418,10 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
     if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
         for (i, msg) in messages.iter().enumerate() {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("-");
+            if let Some(cc) = msg.get("cache_control") {
+                debug!(req_id, location = format_args!("messages[{i}]"), role, cache_control = %cc, "body cache_control");
+                count += 1;
+            }
             if let Some(content) = msg.get("content") {
                 if let Some(arr) = content.as_array() {
                     for (j, block) in arr.iter().enumerate() {
