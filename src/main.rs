@@ -302,14 +302,11 @@ const OAUTH_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI
 /// Max bytes of 429 response body to include in debug logs.
 const MAX_429_BODY_LOG_BYTES: usize = 512;
 
-/// Headers redacted from debug logs (429 dumps, request/response header traces).
-const REDACTED_HEADERS: &[&str] = &[
-    "authorization",
-    "cookie",
-    "set-cookie",
-    "x-api-key",
-    "proxy-authorization",
-];
+/// Substrings that mark a header as sensitive — any header whose name contains
+/// one of these is redacted from debug logs. Safer than a denylist: new
+/// sensitive headers (e.g. `x-auth-foo`, `session-token`) are caught by default.
+const SENSITIVE_HEADER_SUBSTRINGS: &[&str] =
+    &["auth", "cookie", "token", "key", "secret", "session"];
 
 /// Format 429 response headers and body for a single debug log line.
 /// Redacts sensitive headers, truncates body to MAX_429_BODY_LOG_BYTES.
@@ -319,7 +316,7 @@ async fn log_429_details(account_name: &str, resp: reqwest::Response) {
         .iter()
         .map(|(k, v)| {
             let name = k.as_str();
-            if REDACTED_HEADERS.contains(&name) {
+            if is_sensitive_header(name) {
                 format!("{}=<redacted>", name)
             } else {
                 format!("{}={}", name, v.to_str().unwrap_or("<binary>"))
@@ -3376,9 +3373,16 @@ fn has_existing_cache_control(body: &serde_json::Value) -> bool {
     false
 }
 
+/// Whether a header name looks sensitive (substring match).
+fn is_sensitive_header(name: &str) -> bool {
+    SENSITIVE_HEADER_SUBSTRINGS
+        .iter()
+        .any(|sub| name.contains(sub))
+}
+
 /// Return the header value for debug logging, redacting sensitive headers.
 fn debug_header_value<'a>(name: &axum::http::HeaderName, value: &'a HeaderValue) -> &'a str {
-    if REDACTED_HEADERS.contains(&name.as_str()) {
+    if is_sensitive_header(name.as_str()) {
         "<redacted>"
     } else {
         value.to_str().unwrap_or("<binary>")
@@ -17030,8 +17034,15 @@ upstream = "https://api.anthropic.com"
             .unwrap();
         assert_eq!(resp.status(), 200);
 
-        // The proxy should have forwarded the original body unchanged (no re-serialization)
+        // The proxy should have forwarded the original body byte-for-byte (no re-serialization).
+        // Serde roundtrip can reorder keys or change whitespace — only raw byte comparison
+        // catches the cache-breaking re-serialization bug this test guards against.
         let forwarded = captured_body.lock().await;
+        assert_eq!(
+            forwarded.as_slice(),
+            request_bytes.as_slice(),
+            "forwarded body must be byte-identical to request (re-serialization breaks upstream cache)"
+        );
         let forwarded_body: serde_json::Value = serde_json::from_slice(&forwarded).unwrap();
         let system = forwarded_body["system"].as_array().unwrap();
         assert_eq!(

@@ -20,6 +20,4 @@ keywords = ["sk-ant-oat"]
 paths = [
   '''\.lock$''',
   '''target/''',
-  '''config\.toml$''',
-  '''\.state\.json$''',
 ]
