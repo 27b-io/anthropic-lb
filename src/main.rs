@@ -76,6 +76,9 @@ struct Config {
     /// Path for debug log file. When set, writes debug-level logs to this file while
     /// keeping info-level on stderr. For investigating cache/auth behavior.
     debug_log: Option<String>,
+    /// Name of an [[upstreams]] entry to use as fallback when all accounts are exhausted.
+    /// The upstream receives OpenAI-format requests; Anthropic↔OpenAI translation is automatic.
+    fallback_upstream: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -87,6 +90,10 @@ struct AccountConfig {
     /// Supports exact names ("claude-sonnet-4-6") and prefixes ("claude-opus-*").
     #[serde(default)]
     models: Vec<String>,
+    /// Priority tier (0 = highest). Lower tiers are tried first; higher tiers
+    /// only receive traffic when all lower tiers are exhausted. Default: 0.
+    #[serde(default)]
+    priority: u32,
 }
 
 #[derive(Deserialize, Clone)]
@@ -389,6 +396,8 @@ struct Account {
     passthrough: bool,
     /// Model allowlist — empty means all models allowed.
     models: Vec<String>,
+    /// Priority tier (0 = highest). Lower tiers are tried first.
+    priority: u32,
     requests: AtomicU64,
     rate_info: RwLock<RateLimitInfo>,
     /// Per-account burn rate tracker (requests per minute EWMA)
@@ -464,6 +473,9 @@ struct AppState {
     instance_id: u16,
     /// Probe interval in seconds. Used for freshness check and distributed lock TTL.
     probe_interval_secs: u64,
+    /// Index into `upstreams` for the fallback when all accounts are exhausted.
+    /// The upstream receives OpenAI-format requests; format translation is automatic.
+    fallback_upstream: Option<usize>,
 }
 
 impl Account {
@@ -485,6 +497,7 @@ impl Account {
 #[derive(Clone, Copy, Debug)]
 struct RoutingCandidate {
     idx: usize,
+    priority: u32,
     gate_5h: f64,
     gate_7d: f64,
     gate: f64,
@@ -1535,6 +1548,7 @@ impl AppState {
 
             candidates.push(RoutingCandidate {
                 idx: i,
+                priority: acct.priority,
                 gate_5h: rw.gate_5h,
                 gate_7d: rw.gate_7d,
                 gate: rw.gate,
@@ -1917,6 +1931,41 @@ impl AppState {
         picked
     }
 
+    /// Select from a pre-filtered candidate slice using the configured routing strategy.
+    fn pick_from_candidates(
+        &self,
+        effective: &[&RoutingCandidate],
+        total_weight: f64,
+        affinity_key: Option<&str>,
+        tier: u32,
+    ) -> usize {
+        let picked = match self.routing_strategy {
+            RoutingStrategy::DynamicCapacityV1 => {
+                self.pick_dynamic_capacity_v1(effective, total_weight, affinity_key)
+            }
+            RoutingStrategy::StickyWeightedV2 => {
+                self.pick_sticky_weighted_v2(effective, total_weight, affinity_key)
+            }
+        };
+
+        debug!(
+            strategy = self.routing_strategy.as_str(),
+            account = self.accounts[picked.idx].name,
+            tier = tier,
+            gate = format!("{:.3}", picked.gate),
+            gate_5h = format!("{:.3}", picked.gate_5h),
+            gate_7d = format!("{:.3}", picked.gate_7d),
+            waste_risk = format!("{:.3}", picked.wr),
+            weight = format!("{:.3}", picked.weight),
+            share = format!("{:.0}%", picked.weight / total_weight * 100.0),
+            source = picked.source,
+            candidates = effective.len(),
+            affinity = affinity_key.unwrap_or("-"),
+            "pick: selected"
+        );
+        picked.idx
+    }
+
     /// Pick the best available account using the configured routing strategy.
     async fn pick_account(
         &self,
@@ -1930,56 +1979,75 @@ impl AppState {
             return None;
         }
 
-        // Soft-limit gate: exclude accounts whose effective gate exceeds the ceiling.
-        let has_healthy = candidates.iter().any(|c| c.gate < self.soft_limit);
-        let effective: Vec<&RoutingCandidate> = if has_healthy {
-            let excluded: Vec<&str> = candidates
+        // Collect unique priority tiers, sorted ascending (0 = highest priority).
+        let mut tiers: Vec<u32> = candidates.iter().map(|c| c.priority).collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+
+        // Try each tier in order with soft-limit filtering. A tier is skipped when
+        // it has no healthy (below soft_limit) candidates — prefer a lower-priority
+        // tier with headroom over a soft-limited higher-priority tier.
+        for tier in &tiers {
+            let tier_candidates: Vec<&RoutingCandidate> =
+                candidates.iter().filter(|c| c.priority == *tier).collect();
+
+            let has_healthy = tier_candidates.iter().any(|c| c.gate < self.soft_limit);
+            if !has_healthy {
+                debug!(tier = tier, "pick: tier all soft-limited, trying next");
+                continue;
+            }
+
+            let excluded: Vec<&str> = tier_candidates
                 .iter()
                 .filter(|c| c.gate >= self.soft_limit)
                 .map(|c| self.accounts[c.idx].name.as_str())
                 .collect();
             if !excluded.is_empty() {
-                debug!(soft_limit = self.soft_limit, excluded = ?excluded, "pick: soft-limited accounts excluded");
+                debug!(soft_limit = self.soft_limit, tier = tier, excluded = ?excluded, "pick: soft-limited accounts excluded");
             }
-            candidates
+            let effective: Vec<&RoutingCandidate> = tier_candidates
                 .iter()
                 .filter(|c| c.gate < self.soft_limit)
-                .collect()
-        } else {
-            candidates.iter().collect()
-        };
+                .copied()
+                .collect();
 
-        // Total weight. If zero (all exhausted), return None.
-        let total_weight: f64 = effective.iter().map(|c| c.weight).sum();
-        if total_weight <= 0.0 {
-            debug!("pick: all candidates exhausted (zero weight)");
-            return None;
+            let total_weight: f64 = effective.iter().map(|c| c.weight).sum();
+            if total_weight <= 0.0 {
+                debug!(
+                    tier = tier,
+                    "pick: tier exhausted (zero weight), trying next"
+                );
+                continue;
+            }
+
+            return Some(self.pick_from_candidates(&effective, total_weight, affinity_key, *tier));
         }
 
-        let picked = match self.routing_strategy {
-            RoutingStrategy::DynamicCapacityV1 => {
-                self.pick_dynamic_capacity_v1(&effective, total_weight, affinity_key)
-            }
-            RoutingStrategy::StickyWeightedV2 => {
-                self.pick_sticky_weighted_v2(&effective, total_weight, affinity_key)
-            }
-        };
+        // Graceful degradation: all tiers soft-limited. Try each tier again
+        // without soft-limit filtering — use whatever capacity exists.
+        for tier in &tiers {
+            let tier_candidates: Vec<&RoutingCandidate> =
+                candidates.iter().filter(|c| c.priority == *tier).collect();
 
-        debug!(
-            strategy = self.routing_strategy.as_str(),
-            account = self.accounts[picked.idx].name,
-            gate = format!("{:.3}", picked.gate),
-            gate_5h = format!("{:.3}", picked.gate_5h),
-            gate_7d = format!("{:.3}", picked.gate_7d),
-            waste_risk = format!("{:.3}", picked.wr),
-            weight = format!("{:.3}", picked.weight),
-            share = format!("{:.0}%", picked.weight / total_weight * 100.0),
-            source = picked.source,
-            candidates = effective.len(),
-            affinity = affinity_key.unwrap_or("-"),
-            "pick: selected"
-        );
-        Some(picked.idx)
+            let total_weight: f64 = tier_candidates.iter().map(|c| c.weight).sum();
+            if total_weight <= 0.0 {
+                continue;
+            }
+
+            debug!(
+                tier = tier,
+                "pick: graceful degradation — using soft-limited tier"
+            );
+            return Some(self.pick_from_candidates(
+                &tier_candidates,
+                total_weight,
+                affinity_key,
+                *tier,
+            ));
+        }
+
+        debug!("pick: all tiers exhausted");
+        None
     }
 
     /// Update rate limit info from response headers.
@@ -3608,7 +3676,19 @@ async fn proxy_handler(
             let idx = match state.pick_account(affinity, &model, &skip).await {
                 Some(i) => i,
                 None => {
-                    warn!("all accounts rate-limited");
+                    warn!("all accounts rate-limited, trying fallback upstream");
+                    if let Some(resp) = try_fallback_upstream(
+                        &state,
+                        &body_bytes,
+                        &req_id,
+                        &client_id,
+                        &model,
+                        true,
+                    )
+                    .await
+                    {
+                        return resp;
+                    }
                     return (
                         StatusCode::TOO_MANY_REQUESTS,
                         "all upstream accounts rate-limited",
@@ -3908,7 +3988,266 @@ async fn proxy_handler(
         }
     }
 
+    // Last resort: try fallback upstream before returning 429
+    if let Some(resp) =
+        try_fallback_upstream(&state, &body_bytes, &req_id, &client_id, &model, true).await
+    {
+        return resp;
+    }
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all accounts").into_response()
+}
+
+// ── Fallback upstream handler ────────────────────────────────────────
+
+/// Forward a request to the fallback upstream (OpenAI-compatible) when all
+/// accounts are exhausted. For Anthropic-format callers (proxy_handler),
+/// translates the request to OpenAI format and the response back.
+/// For OpenAI-format callers (openai_chat_handler), forwards directly.
+async fn try_fallback_upstream(
+    state: &AppState,
+    body_bytes: &[u8],
+    req_id: &str,
+    client_id: &str,
+    model: &str,
+    translate: bool, // true = Anthropic↔OpenAI translation needed
+) -> Option<Response> {
+    let upstream_idx = state.fallback_upstream?;
+    let upstream = &state.upstreams[upstream_idx];
+
+    info!(
+        req_id,
+        client_id,
+        model,
+        upstream = upstream.name,
+        translate,
+        "fallback: routing to upstream"
+    );
+
+    upstream.requests.fetch_add(1, Ordering::Relaxed);
+
+    // Parse once to extract streaming flag before potential translation
+    let parsed: serde_json::Value = serde_json::from_slice(body_bytes).ok()?;
+    let is_streaming = parsed
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+
+    // Build request body
+    let request_body = if translate {
+        let openai_body = translate_anthropic_request_to_openai(&parsed);
+        serde_json::to_vec(&openai_body).ok()?
+    } else {
+        body_bytes.to_vec()
+    };
+
+    let url = format!("{}/v1/chat/completions", upstream.base_url);
+
+    let mut resp = match state
+        .client
+        .post(&url)
+        .header("authorization", format!("Bearer {}", upstream.api_key))
+        .header("content-type", "application/json")
+        .body(request_body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!(
+                req_id,
+                upstream = upstream.name,
+                error = %e,
+                "fallback: upstream request failed"
+            );
+            return None;
+        }
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let err_body = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "upstream error".to_string());
+        warn!(
+            req_id,
+            upstream = upstream.name,
+            status = status.as_u16(),
+            body = %err_body,
+            "fallback: upstream returned error"
+        );
+        if translate {
+            // Return error in Anthropic format
+            return Some(
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": err_body,
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap_or_else(|_| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
+                    }),
+            );
+        }
+        return Some(
+            Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(err_body))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
+                }),
+        );
+    }
+
+    // Streaming response
+    if is_streaming {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+        let req_id = req_id.to_string();
+        let upstream_name = upstream.name.clone();
+        let translate_response = translate;
+
+        tokio::spawn(async move {
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut ctx = ReverseStreamContext::default();
+            let mut client_gone = false;
+
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if translate_response {
+                            buffer.extend_from_slice(&chunk);
+                            // Parse SSE events delimited by \n\n
+                            while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
+                                let event = String::from_utf8_lossy(&buffer[..pos]).into_owned();
+                                buffer.drain(..pos + 2);
+
+                                // Extract data line
+                                for line in event.lines() {
+                                    if let Some(data) = line.strip_prefix("data: ") {
+                                        let events =
+                                            translate_openai_sse_to_anthropic(data, &mut ctx);
+                                        for ev in events {
+                                            if tx.send(Ok(bytes::Bytes::from(ev))).await.is_err() {
+                                                client_gone = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if client_gone {
+                                    break;
+                                }
+                            }
+                        } else {
+                            // OpenAI format — forward directly
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                client_gone = true;
+                            }
+                        }
+                        if client_gone {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!(req_id, error = %e, "fallback: upstream SSE read failed");
+                        break;
+                    }
+                }
+            }
+
+            // Flush remaining buffer
+            if translate_response && !buffer.is_empty() && !client_gone {
+                let remaining = String::from_utf8_lossy(&buffer).into_owned();
+                for line in remaining.lines() {
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        let events = translate_openai_sse_to_anthropic(data, &mut ctx);
+                        for ev in events {
+                            if tx.send(Ok(bytes::Bytes::from(ev))).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if client_gone {
+                debug!(req_id, "fallback: client disconnected during stream");
+            }
+            info!(
+                req_id,
+                upstream = upstream_name,
+                "fallback: stream complete"
+            );
+        });
+
+        return Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .header("cache-control", "no-cache")
+                .header("connection", "keep-alive")
+                .body(Body::from_stream(
+                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                ))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "fallback stream error").into_response()
+                }),
+        );
+    }
+
+    // Non-streaming response
+    let resp_body = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!(req_id, error = %e, "fallback: failed to read response body");
+            return None;
+        }
+    };
+
+    if translate {
+        let openai_resp: serde_json::Value =
+            serde_json::from_slice(&resp_body).unwrap_or(serde_json::json!({}));
+        let anthropic_resp = translate_openai_response_to_anthropic(&openai_resp);
+        info!(
+            req_id,
+            upstream = upstream.name,
+            "fallback: translated response"
+        );
+        Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(anthropic_resp.to_string()))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
+                }),
+        )
+    } else {
+        info!(
+            req_id,
+            upstream = upstream.name,
+            "fallback: forwarded response"
+        );
+        Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(resp_body))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
+                }),
+        )
+    }
 }
 
 // ── Upstream passthrough handler ─────────────────────────────────────
@@ -4112,6 +4451,7 @@ async fn stats_handler(
         out.push(serde_json::json!({
             "name": acct.name,
             "passthrough": acct.passthrough,
+            "priority": acct.priority,
             "requests_total": acct.requests.load(Ordering::Relaxed),
             "utilization": info.utilization,
             "utilization_7d": info.utilization_7d,
@@ -5899,6 +6239,560 @@ fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
     }
 }
 
+// ── Reverse translation: Anthropic → OpenAI (for upstream fallback) ──
+
+/// Map OpenAI finish_reason back to Anthropic stop_reason.
+fn reverse_map_stop_reason(reason: &str) -> &'static str {
+    match reason {
+        "stop" => "end_turn",
+        "length" => "max_tokens",
+        "tool_calls" => "tool_use",
+        _ => "end_turn",
+    }
+}
+
+/// Translate an Anthropic Messages API request body to OpenAI Chat Completions format.
+/// Reverse of `translate_openai_to_anthropic`.
+fn translate_anthropic_request_to_openai(body: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+
+    if let Some(model) = body.get("model") {
+        out.insert("model".to_string(), model.clone());
+    }
+
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+
+    // System prompt → system role message(s)
+    if let Some(system) = body.get("system") {
+        if let Some(s) = system.as_str() {
+            if !s.is_empty() {
+                messages.push(serde_json::json!({"role": "system", "content": s}));
+            }
+        } else if let Some(arr) = system.as_array() {
+            // Array of system blocks → concatenate text
+            let text: String = arr
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if !text.is_empty() {
+                messages.push(serde_json::json!({"role": "system", "content": text}));
+            }
+        }
+    }
+
+    // Messages
+    if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+        for msg in msgs {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            let content = msg.get("content");
+
+            if role == "assistant" {
+                // Check for tool_use blocks in content array
+                if let Some(blocks) = content.and_then(|c| c.as_array()) {
+                    let has_tool_use = blocks
+                        .iter()
+                        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+
+                    if has_tool_use {
+                        // Extract text blocks as content, tool_use blocks as tool_calls
+                        let text: String = blocks
+                            .iter()
+                            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("");
+
+                        let tool_calls: Vec<serde_json::Value> = blocks
+                            .iter()
+                            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                            .map(|b| {
+                                let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                let input =
+                                    b.get("input").cloned().unwrap_or(serde_json::json!({}));
+                                serde_json::json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": input.to_string(),
+                                    }
+                                })
+                            })
+                            .collect();
+
+                        let mut m = serde_json::json!({"role": "assistant"});
+                        if text.is_empty() {
+                            m["content"] = serde_json::Value::Null;
+                        } else {
+                            m["content"] = serde_json::Value::String(text);
+                        }
+                        m["tool_calls"] = serde_json::Value::Array(tool_calls);
+                        messages.push(m);
+                        continue;
+                    }
+                }
+                // Plain assistant message
+                let text = content
+                    .and_then(|c| {
+                        c.as_str().map(|s| s.to_string()).or_else(|| {
+                            c.as_array().map(|arr| {
+                                arr.iter()
+                                    .filter(|b| {
+                                        b.get("type").and_then(|t| t.as_str()) == Some("text")
+                                    })
+                                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("")
+                            })
+                        })
+                    })
+                    .unwrap_or_default();
+                messages.push(serde_json::json!({"role": "assistant", "content": text}));
+            } else if role == "user" {
+                // Check for tool_result blocks
+                if let Some(blocks) = content.and_then(|c| c.as_array()) {
+                    let tool_results: Vec<&serde_json::Value> = blocks
+                        .iter()
+                        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                        .collect();
+
+                    if !tool_results.is_empty() {
+                        // Each tool_result → separate OpenAI tool message
+                        for tr in &tool_results {
+                            let tool_call_id =
+                                tr.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+                            let content_val = tr.get("content");
+                            let content_str = content_val
+                                .and_then(|c| c.as_str())
+                                .map(|s| s.to_string())
+                                .or_else(|| {
+                                    content_val?.as_array().map(|parts| {
+                                        parts
+                                            .iter()
+                                            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                                            .collect::<Vec<_>>()
+                                            .join("")
+                                    })
+                                })
+                                .unwrap_or_default();
+                            messages.push(serde_json::json!({
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": content_str,
+                            }));
+                        }
+
+                        // Also emit any non-tool_result text blocks as a user message
+                        let text_blocks: Vec<&str> = blocks
+                            .iter()
+                            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .collect();
+                        if !text_blocks.is_empty() {
+                            messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": text_blocks.join(""),
+                            }));
+                        }
+                        continue;
+                    }
+                }
+                // Plain user message — pass through content as-is
+                if let Some(c) = content {
+                    if let Some(s) = c.as_str() {
+                        messages.push(serde_json::json!({"role": "user", "content": s}));
+                    } else if let Some(arr) = c.as_array() {
+                        let text: String = arr
+                            .iter()
+                            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        messages.push(serde_json::json!({"role": "user", "content": text}));
+                    }
+                }
+            }
+        }
+    }
+
+    out.insert("messages".to_string(), serde_json::Value::Array(messages));
+
+    // max_tokens → max_tokens
+    if let Some(mt) = body.get("max_tokens") {
+        out.insert("max_tokens".to_string(), mt.clone());
+    }
+
+    // Passthrough params
+    for key in &["temperature", "top_p", "stream"] {
+        if let Some(v) = body.get(*key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+
+    // stop_sequences → stop
+    if let Some(ss) = body.get("stop_sequences") {
+        out.insert("stop".to_string(), ss.clone());
+    }
+
+    // tools: Anthropic → OpenAI function format
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        let openai_tools: Vec<serde_json::Value> = tools
+            .iter()
+            .filter_map(|tool| {
+                let name = tool.get("name")?.as_str()?;
+                let mut func = serde_json::json!({"name": name});
+                if let Some(desc) = tool.get("description") {
+                    func["description"] = desc.clone();
+                }
+                if let Some(schema) = tool.get("input_schema") {
+                    func["parameters"] = schema.clone();
+                }
+                Some(serde_json::json!({"type": "function", "function": func}))
+            })
+            .collect();
+        if !openai_tools.is_empty() {
+            out.insert("tools".to_string(), serde_json::Value::Array(openai_tools));
+        }
+    }
+
+    // tool_choice translation
+    if let Some(tc) = body.get("tool_choice") {
+        let tc_type = tc.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let openai_tc = match tc_type {
+            "auto" => Some(serde_json::json!("auto")),
+            "any" => Some(serde_json::json!("required")),
+            "tool" => tc
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(|name| serde_json::json!({"type": "function", "function": {"name": name}})),
+            _ => None,
+        };
+        if let Some(otc) = openai_tc {
+            out.insert("tool_choice".to_string(), otc);
+        }
+    }
+
+    serde_json::Value::Object(out)
+}
+
+/// Translate an OpenAI Chat Completions response to Anthropic Messages API format.
+/// Reverse of `translate_anthropic_to_openai`.
+fn translate_openai_response_to_anthropic(body: &serde_json::Value) -> serde_json::Value {
+    let id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("chatcmpl-unknown")
+        .strip_prefix("chatcmpl-")
+        .unwrap_or("msg_unknown");
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let choice = body
+        .pointer("/choices/0")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let message = choice
+        .get("message")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+
+    let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+
+    // Text content
+    if let Some(text) = message.get("content").and_then(|c| c.as_str()) {
+        if !text.is_empty() {
+            content_blocks.push(serde_json::json!({"type": "text", "text": text}));
+        }
+    }
+
+    // Tool calls → tool_use blocks
+    if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
+        for tc in tool_calls {
+            let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = tc
+                .pointer("/function/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let args_str = tc
+                .pointer("/function/arguments")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
+            let input: serde_json::Value =
+                serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+            content_blocks.push(serde_json::json!({
+                "type": "tool_use",
+                "id": tc_id,
+                "name": name,
+                "input": input,
+            }));
+        }
+    }
+
+    if content_blocks.is_empty() {
+        content_blocks.push(serde_json::json!({"type": "text", "text": ""}));
+    }
+
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("stop");
+
+    let input_tokens = body
+        .pointer("/usage/prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output_tokens = body
+        .pointer("/usage/completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    serde_json::json!({
+        "id": format!("msg_{}", id),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content_blocks,
+        "stop_reason": reverse_map_stop_reason(finish_reason),
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        },
+    })
+}
+
+/// State tracker for OpenAI SSE → Anthropic SSE translation.
+struct ReverseStreamContext {
+    id: String,
+    model: String,
+    message_started: bool,
+    block_index: i64,
+    in_text_block: bool,
+    in_tool_use: bool,
+}
+
+impl Default for ReverseStreamContext {
+    fn default() -> Self {
+        Self {
+            id: format!("msg_{}", AppState::now_epoch()),
+            model: String::new(),
+            message_started: false,
+            block_index: -1,
+            in_text_block: false,
+            in_tool_use: false,
+        }
+    }
+}
+
+/// Format an Anthropic SSE event.
+fn make_anthropic_event(event_type: &str, data: &serde_json::Value) -> String {
+    format!("event: {}\ndata: {}\n\n", event_type, data)
+}
+
+/// Translate an OpenAI SSE chunk to Anthropic SSE events.
+/// Returns Vec because one OpenAI chunk may produce multiple Anthropic events.
+/// `raw` is the raw SSE data line (after stripping "data: " prefix).
+fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed == "[DONE]" {
+        // Only emit message_stop if we started a message
+        if ctx.message_started {
+            return vec![make_anthropic_event(
+                "message_stop",
+                &serde_json::json!({"type": "message_stop"}),
+            )];
+        }
+        return vec![];
+    }
+
+    let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let mut events: Vec<String> = Vec::new();
+
+    // Capture model from first chunk
+    if let Some(model) = parsed.get("model").and_then(|v| v.as_str()) {
+        if ctx.model.is_empty() {
+            ctx.model = model.to_string();
+        }
+    }
+    if let Some(id) = parsed.get("id").and_then(|v| v.as_str()) {
+        if let Some(stripped) = id.strip_prefix("chatcmpl-") {
+            ctx.id = format!("msg_{}", stripped);
+        }
+    }
+
+    let delta = match parsed.pointer("/choices/0/delta") {
+        Some(d) => d,
+        None => return vec![],
+    };
+    let finish_reason = parsed
+        .pointer("/choices/0/finish_reason")
+        .and_then(|v| v.as_str());
+
+    // Emit message_start on first meaningful chunk
+    if !ctx.message_started && (delta.get("role").is_some() || delta.get("content").is_some()) {
+        ctx.message_started = true;
+        events.push(make_anthropic_event(
+            "message_start",
+            &serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": ctx.id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": ctx.model,
+                    "content": [],
+                    "stop_reason": null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+            }),
+        ));
+    }
+
+    // Text content delta
+    if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+        if !text.is_empty() {
+            if !ctx.in_text_block {
+                // Close tool block if open
+                if ctx.in_tool_use {
+                    events.push(make_anthropic_event(
+                        "content_block_stop",
+                        &serde_json::json!({"type": "content_block_stop", "index": ctx.block_index}),
+                    ));
+                    ctx.in_tool_use = false;
+                }
+                ctx.block_index += 1;
+                ctx.in_text_block = true;
+                events.push(make_anthropic_event(
+                    "content_block_start",
+                    &serde_json::json!({
+                        "type": "content_block_start",
+                        "index": ctx.block_index,
+                        "content_block": {"type": "text", "text": ""}
+                    }),
+                ));
+            }
+            events.push(make_anthropic_event(
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": ctx.block_index,
+                    "delta": {"type": "text_delta", "text": text}
+                }),
+            ));
+        }
+    }
+
+    // Tool calls
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+        for tc in tool_calls {
+            let has_name = tc
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .is_some();
+            let args = tc
+                .pointer("/function/arguments")
+                .and_then(|a| a.as_str())
+                .unwrap_or("");
+
+            if has_name {
+                // New tool call — close previous block if any
+                if ctx.in_text_block {
+                    events.push(make_anthropic_event(
+                        "content_block_stop",
+                        &serde_json::json!({"type": "content_block_stop", "index": ctx.block_index}),
+                    ));
+                    ctx.in_text_block = false;
+                }
+                if ctx.in_tool_use {
+                    events.push(make_anthropic_event(
+                        "content_block_stop",
+                        &serde_json::json!({"type": "content_block_stop", "index": ctx.block_index}),
+                    ));
+                }
+
+                if !ctx.message_started {
+                    ctx.message_started = true;
+                    events.push(make_anthropic_event(
+                        "message_start",
+                        &serde_json::json!({
+                            "type": "message_start",
+                            "message": {
+                                "id": ctx.id,
+                                "type": "message",
+                                "role": "assistant",
+                                "model": ctx.model,
+                                "content": [],
+                                "stop_reason": null,
+                                "usage": {"input_tokens": 0, "output_tokens": 0}
+                            }
+                        }),
+                    ));
+                }
+
+                ctx.block_index += 1;
+                ctx.in_tool_use = true;
+                let name = tc.pointer("/function/name").unwrap().as_str().unwrap();
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                events.push(make_anthropic_event(
+                    "content_block_start",
+                    &serde_json::json!({
+                        "type": "content_block_start",
+                        "index": ctx.block_index,
+                        "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+                    }),
+                ));
+            }
+
+            // Tool arguments delta
+            if !args.is_empty() && ctx.in_tool_use {
+                events.push(make_anthropic_event(
+                    "content_block_delta",
+                    &serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": ctx.block_index,
+                        "delta": {"type": "input_json_delta", "partial_json": args}
+                    }),
+                ));
+            }
+        }
+    }
+
+    // Finish reason → close blocks + message_delta + message_stop
+    if let Some(reason) = finish_reason {
+        if ctx.in_text_block || ctx.in_tool_use {
+            events.push(make_anthropic_event(
+                "content_block_stop",
+                &serde_json::json!({"type": "content_block_stop", "index": ctx.block_index}),
+            ));
+            ctx.in_text_block = false;
+            ctx.in_tool_use = false;
+        }
+        events.push(make_anthropic_event(
+            "message_delta",
+            &serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": reverse_map_stop_reason(reason)},
+                "usage": {"output_tokens": 0}
+            }),
+        ));
+        events.push(make_anthropic_event(
+            "message_stop",
+            &serde_json::json!({"type": "message_stop"}),
+        ));
+        ctx.message_started = false; // prevent duplicate from [DONE]
+    }
+
+    events
+}
+
 async fn openai_chat_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -6026,7 +6920,19 @@ async fn openai_chat_handler(
             let idx = match state.pick_account(affinity, &model, &skip).await {
                 Some(i) => i,
                 None => {
-                    warn!("all accounts rate-limited");
+                    warn!("all accounts rate-limited, trying fallback upstream");
+                    if let Some(resp) = try_fallback_upstream(
+                        &state,
+                        &body_bytes,
+                        &req_id,
+                        &client_id,
+                        &model,
+                        false,
+                    )
+                    .await
+                    {
+                        return resp;
+                    }
                     return (
                         StatusCode::TOO_MANY_REQUESTS,
                         "all upstream accounts rate-limited",
@@ -6417,6 +7323,12 @@ async fn openai_chat_handler(
         }
     }
 
+    // Last resort: try fallback upstream before returning 429
+    if let Some(resp) =
+        try_fallback_upstream(&state, &body_bytes, &req_id, &client_id, &model, false).await
+    {
+        return resp;
+    }
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all accounts").into_response()
 }
 
@@ -6513,8 +7425,8 @@ async fn main() {
         .into_iter()
         .map(|a| {
             let passthrough = a.token == "passthrough";
-            if !a.models.is_empty() {
-                info!(name = a.name, passthrough, models = ?a.models, "loaded account");
+            if !a.models.is_empty() || a.priority > 0 {
+                info!(name = a.name, passthrough, priority = a.priority, models = ?a.models, "loaded account");
             } else {
                 info!(name = a.name, passthrough, "loaded account");
             }
@@ -6522,6 +7434,7 @@ async fn main() {
                 name: a.name,
                 passthrough,
                 models: a.models,
+                priority: a.priority,
                 token: a.token,
                 requests: AtomicU64::new(0),
                 rate_info: RwLock::new(RateLimitInfo::default()),
@@ -6624,6 +7537,27 @@ async fn main() {
         None
     };
 
+    // Resolve fallback_upstream name to index
+    let fallback_upstream_idx = config.fallback_upstream.as_ref().map(|name| {
+        upstreams
+            .iter()
+            .position(|u| u.name == *name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "fallback_upstream '{}' not found in [[upstreams]] — available: {:?}",
+                    name,
+                    upstreams.iter().map(|u| &u.name).collect::<Vec<_>>()
+                )
+            })
+    });
+    if let Some(idx) = fallback_upstream_idx {
+        info!(
+            upstream = upstreams[idx].name,
+            base_url = upstreams[idx].base_url,
+            "fallback upstream configured"
+        );
+    }
+
     let state = Arc::new(AppState {
         client: Client::builder()
             .timeout(Duration::from_secs(600))
@@ -6662,6 +7596,7 @@ async fn main() {
             RandomState::new().build_hasher().finish() as u16
         },
         probe_interval_secs: config.probe_interval_secs.unwrap_or(300),
+        fallback_upstream: fallback_upstream_idx,
     });
 
     if state.auto_cache {
@@ -6816,6 +7751,7 @@ mod tests {
             token: token.to_string(),
             passthrough: token == "passthrough",
             models: vec![],
+            priority: 0,
             requests: AtomicU64::new(0),
             rate_info: RwLock::new(RateLimitInfo::default()),
             burn_rate: Mutex::new(BurnRate::new()),
@@ -6865,6 +7801,7 @@ mod tests {
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         })
     }
 
@@ -6978,6 +7915,7 @@ mod tests {
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         (build_router(state.clone()), state)
@@ -7072,6 +8010,7 @@ mod tests {
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -8631,6 +9570,7 @@ mod tests {
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         let app = build_router(state);
@@ -9455,6 +10395,332 @@ mod tests {
         );
     }
 
+    // ── Reverse translation: Anthropic → OpenAI ──────────────────────
+
+    #[test]
+    fn reverse_map_stop_reasons() {
+        assert_eq!(reverse_map_stop_reason("stop"), "end_turn");
+        assert_eq!(reverse_map_stop_reason("length"), "max_tokens");
+        assert_eq!(reverse_map_stop_reason("tool_calls"), "tool_use");
+        assert_eq!(reverse_map_stop_reason("unknown"), "end_turn");
+    }
+
+    #[test]
+    fn translate_anthropic_request_basic() {
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there!"},
+                {"role": "user", "content": "How are you?"}
+            ],
+            "max_tokens": 1024,
+            "temperature": 0.7,
+            "stream": true
+        });
+
+        let result = translate_anthropic_request_to_openai(&body);
+        assert_eq!(result["model"], "claude-sonnet-4-6");
+        assert_eq!(result["max_tokens"], 1024);
+        assert_eq!(result["temperature"], 0.7);
+        assert_eq!(result["stream"], true);
+
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "You are helpful.");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "Hello");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "Hi there!");
+    }
+
+    #[test]
+    fn translate_anthropic_request_tool_use() {
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Let me search for that."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_123",
+                            "name": "search",
+                            "input": {"query": "test"}
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_123",
+                            "content": "Search result"
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 1024
+        });
+
+        let result = translate_anthropic_request_to_openai(&body);
+        let msgs = result["messages"].as_array().unwrap();
+
+        // Assistant with tool_calls
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["content"], "Let me search for that.");
+        let tc = &msgs[0]["tool_calls"][0];
+        assert_eq!(tc["id"], "toolu_123");
+        assert_eq!(tc["function"]["name"], "search");
+
+        // Tool result
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "toolu_123");
+        assert_eq!(msgs[1]["content"], "Search result");
+    }
+
+    #[test]
+    fn translate_anthropic_request_tools() {
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 1024,
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Get weather info",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}}
+                    }
+                }
+            ],
+            "tool_choice": {"type": "auto"}
+        });
+
+        let result = translate_anthropic_request_to_openai(&body);
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "get_weather");
+        assert_eq!(result["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn translate_anthropic_request_tool_result_array_content() {
+        // tool_result with array content (structured response) should not be silently dropped
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_456",
+                            "content": [
+                                {"type": "text", "text": "Result line 1"},
+                                {"type": "text", "text": "Result line 2"}
+                            ]
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 1024
+        });
+
+        let result = translate_anthropic_request_to_openai(&body);
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "tool");
+        assert_eq!(msgs[0]["content"], "Result line 1Result line 2");
+    }
+
+    #[test]
+    fn reverse_sse_no_duplicate_message_stop() {
+        let mut ctx = ReverseStreamContext::default();
+
+        // Start message
+        translate_openai_sse_to_anthropic(
+            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}",
+            &mut ctx,
+        );
+        // Text
+        translate_openai_sse_to_anthropic(
+            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}",
+            &mut ctx,
+        );
+        // Finish — emits message_stop
+        let finish_events = translate_openai_sse_to_anthropic(
+            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+            &mut ctx,
+        );
+        let stop_count = finish_events
+            .iter()
+            .filter(|e| e.contains("message_stop"))
+            .count();
+        assert_eq!(
+            stop_count, 1,
+            "finish_reason should emit exactly one message_stop"
+        );
+
+        // [DONE] — should NOT emit another message_stop
+        let done_events = translate_openai_sse_to_anthropic("[DONE]", &mut ctx);
+        assert!(
+            done_events.is_empty(),
+            "DONE after finish_reason should emit nothing (message_stop already sent)"
+        );
+    }
+
+    #[test]
+    fn translate_anthropic_request_stop_sequences() {
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 1024,
+            "stop_sequences": ["END", "STOP"]
+        });
+
+        let result = translate_anthropic_request_to_openai(&body);
+        assert_eq!(result["stop"], serde_json::json!(["END", "STOP"]));
+    }
+
+    #[test]
+    fn translate_openai_response_basic() {
+        let body = serde_json::json!({
+            "id": "chatcmpl-abc123",
+            "object": "chat.completion",
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            }
+        });
+
+        let result = translate_openai_response_to_anthropic(&body);
+        assert_eq!(result["id"], "msg_abc123");
+        assert_eq!(result["type"], "message");
+        assert_eq!(result["model"], "gpt-4");
+        assert_eq!(result["stop_reason"], "end_turn");
+        assert_eq!(result["content"][0]["type"], "text");
+        assert_eq!(result["content"][0]["text"], "Hello!");
+        assert_eq!(result["usage"]["input_tokens"], 10);
+        assert_eq!(result["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn translate_openai_response_tool_calls() {
+        let body = serde_json::json!({
+            "id": "chatcmpl-xyz",
+            "model": "gpt-4",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "search",
+                            "arguments": "{\"query\":\"test\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+
+        let result = translate_openai_response_to_anthropic(&body);
+        assert_eq!(result["stop_reason"], "tool_use");
+        let blocks = result["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["id"], "call_123");
+        assert_eq!(blocks[0]["name"], "search");
+        assert_eq!(blocks[0]["input"]["query"], "test");
+    }
+
+    #[test]
+    fn reverse_sse_basic_text() {
+        let mut ctx = ReverseStreamContext::default();
+
+        // First chunk with role
+        let events = translate_openai_sse_to_anthropic(
+            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}",
+            &mut ctx,
+        );
+        assert!(ctx.message_started);
+        assert!(events.iter().any(|e| e.contains("message_start")));
+
+        // Text delta
+        let events = translate_openai_sse_to_anthropic(
+            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}",
+            &mut ctx,
+        );
+        assert!(events.iter().any(|e| e.contains("text_delta")));
+        assert!(events.iter().any(|e| e.contains("Hello")));
+
+        // Finish
+        let events = translate_openai_sse_to_anthropic(
+            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+            &mut ctx,
+        );
+        assert!(events.iter().any(|e| e.contains("message_delta")));
+        assert!(events.iter().any(|e| e.contains("end_turn")));
+        assert!(events.iter().any(|e| e.contains("message_stop")));
+    }
+
+    #[test]
+    fn reverse_sse_tool_use() {
+        let mut ctx = ReverseStreamContext::default();
+
+        // Tool call start
+        let events = translate_openai_sse_to_anthropic(
+            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}",
+            &mut ctx,
+        );
+        assert!(ctx.message_started);
+        assert!(ctx.in_tool_use);
+        assert!(events.iter().any(|e| e.contains("content_block_start")));
+        assert!(events.iter().any(|e| e.contains("tool_use")));
+        assert!(events.iter().any(|e| e.contains("search")));
+
+        // Tool arguments delta
+        let events = translate_openai_sse_to_anthropic(
+            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\"\"}}]},\"finish_reason\":null}]}",
+            &mut ctx,
+        );
+        assert!(events.iter().any(|e| e.contains("input_json_delta")));
+
+        // Finish
+        let events = translate_openai_sse_to_anthropic(
+            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+            &mut ctx,
+        );
+        assert!(events.iter().any(|e| e.contains("content_block_stop")));
+        assert!(events.iter().any(|e| e.contains("tool_use")));
+    }
+
+    #[test]
+    fn reverse_sse_done_sentinel() {
+        let mut ctx = ReverseStreamContext {
+            message_started: true,
+            ..ReverseStreamContext::default()
+        };
+        let events = translate_openai_sse_to_anthropic("[DONE]", &mut ctx);
+        assert!(events.iter().any(|e| e.contains("message_stop")));
+    }
+
     // ── Integration: OpenAI-compat handler ──────────────────────────
 
     /// Mock that returns Anthropic /v1/messages format (non-streaming)
@@ -9552,6 +10818,7 @@ mod tests {
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         let app = Router::new()
@@ -10228,6 +11495,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         // Try many affinity keys — all should route to healthy (idx 0)
@@ -10329,6 +11597,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         // Within budget
@@ -10837,6 +12106,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         {
             let mut info = state.accounts[0].rate_info.write().await;
@@ -10908,6 +12178,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         {
             let mut info = state.accounts[0].rate_info.write().await;
@@ -11666,6 +12937,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         // Header overrides IP mapping (supports multiple clients per IP)
@@ -11734,6 +13006,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -12528,6 +13801,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.60, 0.50, now + 10000, now + 100000).await;
@@ -12577,6 +13851,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
@@ -12627,6 +13902,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -12679,6 +13955,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
         // Operator bypasses everything
@@ -12728,6 +14005,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         // Request for "claude-opus" — no account serves it → should pass
         assert!(
@@ -12779,6 +14057,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         // Don't set any utilization — accounts remain "unknown" (0.5)
         // With limit=0.30, unknown 0.5 would appear "above limit" without fail-open
@@ -12834,6 +14113,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         // Two known accounts above limit, one unknown (no data set)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -12909,6 +14189,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
         assert!(state.is_emergency_brake_active().await);
@@ -12986,6 +14267,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         set_account_utilization(&state, 0, 0.85, 0.70, now + 10000, now + 100000).await;
         assert!(
@@ -13078,6 +14360,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         // No rate data set — account returns (0.5, "unknown")
         // 0.5 >= 0.4 threshold → all_above is true
@@ -13130,6 +14413,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         set_account_utilization(&state, 0, 0.60, 0.55, now + 10000, now + 100000).await;
         // Account 1: no data → (0.5, "unknown"), 0.5 >= 0.4 → all_above stays true
@@ -13229,6 +14513,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         // "-" is not the operator
         assert!(!state.is_operator("-"));
@@ -13306,6 +14591,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         // Operator always gets "healthy" regardless of utilization
         assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
@@ -13350,6 +14636,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         // gastown has limit 0.85, 80% of that = 0.68
         // At 0.60, below 0.68 → no upgrade → "healthy"
@@ -13570,6 +14857,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         // Set utilization above client's limit (0.80 > 0.50)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -13632,6 +14920,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         // Set utilization below client's limit (0.50 < 0.90)
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -13691,6 +14980,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         // All accounts above emergency threshold. 5h=0.96 > emergency threshold (0.88).
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -13758,6 +15048,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         // All accounts above emergency threshold — 5h only (avoid claim penalty on 7d)
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -13822,6 +15113,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
 
@@ -13881,6 +15173,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
 
@@ -13991,6 +15284,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
@@ -14063,6 +15357,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         let status = compute_pressure_status(0.99, "operator-id", &state);
@@ -14115,6 +15410,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
@@ -14414,6 +15710,171 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
+    // ── Priority tier tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn pick_account_respects_priority_tiers() {
+        // Tier 0 accounts with headroom should get ALL traffic — tier 1 gets nothing.
+        let mut primary = make_account("primary", "sk-ant-api-a");
+        primary.priority = 0;
+        let mut fallback = make_account("fallback", "sk-ant-api-b");
+        fallback.priority = 1;
+        let state = test_state_with(vec![primary, fallback]);
+
+        let now = AppState::now_epoch();
+        for acct in &state.accounts {
+            let mut info = acct.rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now + 10000);
+        }
+
+        for _ in 0..100 {
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            assert_eq!(idx, 0, "all traffic should go to tier 0 when healthy");
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_account_falls_through_to_lower_priority() {
+        // Tier 0 hard-limited → tier 1 should receive traffic.
+        let mut primary = make_account("primary", "sk-ant-api-a");
+        primary.priority = 0;
+        let mut fallback = make_account("fallback", "sk-ant-api-b");
+        fallback.priority = 1;
+        let state = test_state_with(vec![primary, fallback]);
+
+        // Hard-limit tier 0
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+        }
+
+        let now = AppState::now_epoch();
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now + 10000);
+        }
+
+        for _ in 0..100 {
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            assert_eq!(
+                idx, 1,
+                "tier 1 should get traffic when tier 0 is hard-limited"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_account_priority_default_zero() {
+        // Accounts without explicit priority should behave as tier 0.
+        let a = make_account("a", "sk-ant-api-a");
+        let b = make_account("b", "sk-ant-api-b");
+        assert_eq!(a.priority, 0);
+        assert_eq!(b.priority, 0);
+
+        let state = test_state_with(vec![a, b]);
+        let now = AppState::now_epoch();
+        for acct in &state.accounts {
+            let mut info = acct.rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now + 10000);
+        }
+
+        // Both should receive traffic (same tier)
+        let mut counts = [0u32; 2];
+        for _ in 0..1000 {
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            counts[idx] += 1;
+        }
+        assert!(counts[0] > 0, "account a should get traffic");
+        assert!(counts[1] > 0, "account b should get traffic");
+    }
+
+    #[tokio::test]
+    async fn pick_account_priority_soft_limit_per_tier() {
+        // Tier 0 accounts all above soft_limit → should fall through to tier 1.
+        let mut primary_a = make_account("primary_a", "sk-ant-api-a");
+        primary_a.priority = 0;
+        let mut primary_b = make_account("primary_b", "sk-ant-api-b");
+        primary_b.priority = 0;
+        let mut fallback = make_account("fallback", "sk-ant-api-c");
+        fallback.priority = 1;
+        let state = test_state_with_soft_limit(vec![primary_a, primary_b, fallback], 0.90);
+
+        let now = AppState::now_epoch();
+        // Tier 0: above soft limit
+        for i in 0..2 {
+            let mut info = state.accounts[i].rate_info.write().await;
+            info.utilization_5h = Some(0.95);
+            info.reset_5h = Some(now + 10000);
+        }
+        // Tier 1: healthy
+        {
+            let mut info = state.accounts[2].rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now + 10000);
+        }
+
+        for _ in 0..100 {
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            assert_eq!(
+                idx, 2,
+                "tier 1 should get traffic when tier 0 is all soft-limited"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_account_multiple_tiers_cascade() {
+        // Three tiers: 0, 1, 2. Tier 0 and 1 exhausted → tier 2 gets traffic.
+        let mut t0 = make_account("t0", "sk-ant-api-a");
+        t0.priority = 0;
+        let mut t1 = make_account("t1", "sk-ant-api-b");
+        t1.priority = 1;
+        let mut t2 = make_account("t2", "sk-ant-api-c");
+        t2.priority = 2;
+        let state = test_state_with(vec![t0, t1, t2]);
+
+        // Hard-limit tiers 0 and 1
+        for i in 0..2 {
+            let mut info = state.accounts[i].rate_info.write().await;
+            info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+        }
+
+        let now = AppState::now_epoch();
+        {
+            let mut info = state.accounts[2].rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now + 10000);
+        }
+
+        for _ in 0..100 {
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            assert_eq!(
+                idx, 2,
+                "tier 2 should get traffic when tiers 0 and 1 are exhausted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_account_all_tiers_exhausted_returns_none() {
+        // All tiers hard-limited → None.
+        let mut t0 = make_account("t0", "sk-ant-api-a");
+        t0.priority = 0;
+        let mut t1 = make_account("t1", "sk-ant-api-b");
+        t1.priority = 1;
+        let state = test_state_with(vec![t0, t1]);
+
+        for acct in &state.accounts {
+            let mut info = acct.rate_info.write().await;
+            info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+        }
+
+        assert!(state.pick_account(None, "", &[]).await.is_none());
+    }
+
     #[test]
     fn is_operator_checks_configured_operator() {
         let state = Arc::new(AppState {
@@ -14445,6 +15906,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         assert!(state.is_operator("special-operator"));
@@ -14492,6 +15954,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
         assert!(state.is_operator("ray"));
         assert!(state.is_operator("openclaw"));
@@ -14553,6 +16016,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         // Budget check uses local path when redis is None
@@ -14687,6 +16151,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         // Recording 0 tokens should be a no-op
@@ -15051,6 +16516,7 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         // Set up some state to persist
@@ -15137,6 +16603,7 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         // Load state
@@ -15223,6 +16690,7 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         // Pre-populate with yesterday's usage (high usage that would exceed budget)
@@ -15278,6 +16746,7 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         // Pre-populate with yesterday's exhausted budget
@@ -15746,6 +17215,7 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         // Seed two operator clients and one regular client with token usage
@@ -15994,6 +17464,7 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         let app = build_router(state);
@@ -17011,6 +18482,7 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         let app = build_router(state);
@@ -17147,6 +18619,7 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
+            fallback_upstream: None,
         });
 
         let app = Router::new()
@@ -17346,5 +18819,290 @@ upstream = "https://api.anthropic.com"
             "whitespace-only session_id should be -"
         );
         assert!(rctx.affinity_key(&ip).is_none(), "no meaningful identity");
+    }
+
+    // ── Integration: fallback upstream ──────────────────────────────
+
+    /// Mock OpenAI-compatible upstream that returns chat completion responses.
+    async fn mock_openai_upstream_handler(req: Request<Body>) -> Response {
+        // Verify Bearer auth
+        let auth = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !auth.starts_with("Bearer ") {
+            return (StatusCode::UNAUTHORIZED, "missing bearer auth").into_response();
+        }
+
+        let body_bytes = axum::body::to_bytes(req.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        let is_streaming = body
+            .get("stream")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false);
+
+        if is_streaming {
+            let sse = [
+                "data: {\"id\":\"chatcmpl-fb1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl-fb1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Fallback\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl-fb1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\" works\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl-fb1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ];
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(sse.join("")))
+                .unwrap();
+        }
+
+        axum::Json(serde_json::json!({
+            "id": "chatcmpl-fallback",
+            "object": "chat.completion",
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Fallback response"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 3,
+                "total_tokens": 13
+            }
+        }))
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn proxy_handler_falls_back_to_upstream() {
+        // Start mock OpenAI upstream
+        let mock_app = Router::new().fallback(any(mock_openai_upstream_handler));
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+        let mock_url = format!("http://{}", mock_addr);
+
+        // Build state with all accounts hard-limited and a fallback upstream
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(), // unused — accounts are hard-limited
+            accounts: vec![make_account("acct-a", "sk-ant-api-a")],
+            robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-fallback-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![Upstream {
+                name: "litellm".to_string(),
+                base_url: mock_url,
+                api_key: "sk-test-key".to_string(),
+                requests: AtomicU64::new(0),
+            }],
+            client_names: HashMap::new(),
+            auto_cache: false,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operators: vec![],
+            emergency_brake: true,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
+            probe_interval_secs: 300,
+            fallback_upstream: Some(0), // index into upstreams
+        });
+
+        // Hard-limit the only account
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+        }
+
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+
+        // Non-streaming request (Anthropic format) → should get Anthropic-format response via fallback
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 1024
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["content"][0]["type"], "text");
+        assert_eq!(body["content"][0]["text"], "Fallback response");
+        assert_eq!(body["stop_reason"], "end_turn");
+
+        // Verify upstream got the request
+        assert_eq!(state.upstreams[0].requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_handler_fallback_streaming() {
+        // Start mock OpenAI upstream
+        let mock_app = Router::new().fallback(any(mock_openai_upstream_handler));
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+        let mock_url = format!("http://{}", mock_addr);
+
+        let state = Arc::new(AppState {
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            accounts: vec![make_account("acct-a", "sk-ant-api-a")],
+            robin: AtomicUsize::new(0),
+            routing_strategy: RoutingStrategy::default(),
+            cooldown: Duration::from_secs(60),
+            state_path: PathBuf::from("/tmp/anthropic-lb-fallback-stream-test.state.json"),
+            proxy_key: None,
+            allowed_ips: vec![],
+            upstreams: vec![Upstream {
+                name: "litellm".to_string(),
+                base_url: mock_url,
+                api_key: "sk-test-key".to_string(),
+                requests: AtomicU64::new(0),
+            }],
+            client_names: HashMap::new(),
+            auto_cache: false,
+            client_usage: Mutex::new(HashMap::new()),
+            shadow_log_tx: None,
+            shadow_log_dropped: AtomicU64::new(0),
+            client_budgets: HashMap::new(),
+            budget_usage: Mutex::new(HashMap::new()),
+            client_utilization_limits: HashMap::new(),
+            operators: vec![],
+            emergency_brake: true,
+            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
+            client_request_rates: Mutex::new(HashMap::new()),
+            soft_limit: 1.0,
+            redis: None,
+            cluster_info_cache: Mutex::new(None),
+            next_req_id: AtomicU64::new(0),
+            instance_id: 0,
+            probe_interval_secs: 300,
+            fallback_upstream: Some(0),
+        });
+
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+        }
+
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+
+        // Streaming request
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 1024,
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+
+        let body = resp.text().await.unwrap();
+        // Should contain Anthropic SSE events (translated from OpenAI)
+        assert!(
+            body.contains("message_start"),
+            "should have message_start event"
+        );
+        assert!(body.contains("text_delta"), "should have text_delta events");
+        assert!(body.contains("Fallback"), "should contain 'Fallback' text");
+        assert!(
+            body.contains("message_stop"),
+            "should have message_stop event"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_handler_no_fallback_returns_429() {
+        // Without fallback_upstream, exhausted accounts should return 429
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-a")]);
+
+        // Hard-limit the account
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+        }
+
+        assert!(state.fallback_upstream.is_none());
+        let result = state.pick_account(None, "", &[]).await;
+        assert!(
+            result.is_none(),
+            "should return None when account is hard-limited"
+        );
     }
 }

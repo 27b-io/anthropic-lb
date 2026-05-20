@@ -93,6 +93,14 @@ OAuth tokens (`sk-ant-oat*`) require the exact system prompt `"You are Claude Co
 
 Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. Requests to `/upstream/{name}/*` are forwarded with `Authorization: Bearer` API key injection.
 
+### Priority Tiers
+
+Accounts have a `priority` field (u32, default 0). Lower number = higher priority. `pick_account` tries tier 0 first; only falls to tier 1+ when tier 0 has no viable candidates (hard-limited, soft-limited, or 7d-rejected). Graceful degradation: if ALL tiers are soft-limited, the lowest tier with remaining capacity is used.
+
+### Fallback Upstream
+
+When `fallback_upstream` names an `[[upstreams]]` entry and all accounts are exhausted, the proxy forwards to that upstream with automatic Anthropic↔OpenAI format translation (for `proxy_handler`) or direct passthrough (for `openai_chat_handler`). Streaming is supported in both paths.
+
 ### Config Fields
 
 | Field | Type | Default | Description |
@@ -111,9 +119,11 @@ Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. R
 | `emergency_brake` | bool? | true | Enable/disable the emergency brake |
 | `emergency_threshold` | f64? | 0.88 | All-accounts utilization threshold for emergency brake |
 | `redis_url` | string? | none | Redis/Valkey URL for distributed state (`redis://` or `rediss://`) |
+| `fallback_upstream` | string? | none | Name of an `[[upstreams]]` entry to use when all accounts are exhausted |
 | `accounts[].name` | string | required | Account display name |
 | `accounts[].token` | string | required | API key, OAuth token, or `"passthrough"` |
 | `accounts[].models` | string[]? | [] (all) | Model allowlist (supports `*` suffix wildcards) |
+| `accounts[].priority` | u32? | 0 | Priority tier (0 = highest). Lower tiers tried first |
 
 
 **Key headers parsed:**
