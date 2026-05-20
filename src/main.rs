@@ -79,6 +79,10 @@ struct Config {
     /// Name of an [[upstreams]] entry to use as fallback when all accounts are exhausted.
     /// The upstream receives OpenAI-format requests; Anthropic↔OpenAI translation is automatic.
     fallback_upstream: Option<String>,
+    /// Priority penalty added to an account's effective priority tier while it is
+    /// serving via Anthropic overage (paid extra usage). Keeps free subscription
+    /// capacity preferred over paid overage. Default: 10.
+    overage_penalty: Option<u32>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -101,6 +105,11 @@ struct UpstreamConfig {
     name: String,
     base_url: String,
     api_key: String,
+    /// Priority tier (0 = highest) used when this upstream is the `fallback_upstream`
+    /// and participates in unified endpoint routing. Set high (e.g. 100) so the
+    /// upstream is tried only after all account tiers are exhausted. Default: 0.
+    #[serde(default)]
+    priority: u32,
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
@@ -165,6 +174,14 @@ struct RedisRateInfo {
     remaining_tokens: Option<u64>,
     limit_requests: Option<u64>,
     limit_tokens: Option<u64>,
+    #[serde(default)]
+    overage_in_use: bool,
+    #[serde(default)]
+    overage_status: Option<String>,
+    #[serde(default)]
+    overage_utilization: Option<f64>,
+    #[serde(default)]
+    overage_reset: Option<u64>,
     updated_at: u64,
 }
 
@@ -196,6 +213,17 @@ struct RateLimitInfo {
     /// Derived convenience: worst status across all claims_7d entries.
     status_7d: Option<String>,
     hard_limited_until: Option<Instant>,
+    /// Overage (paid extra usage) is actively serving requests for this account.
+    /// Account-level signal — overage covers whichever subscription window is exhausted.
+    /// Always overwritten per response: header absent/false → false.
+    overage_in_use: bool,
+    /// Overage window status ("allowed", "allowed_warning", "rejected"). Feeds the
+    /// routing gate via `status_to_floor` when overage is in use.
+    overage_status: Option<String>,
+    /// Overage budget consumed (0.0 = fresh, 1.0 = overage exhausted).
+    overage_utilization: Option<f64>,
+    /// Epoch seconds when the overage window resets.
+    overage_reset: Option<u64>,
     /// Counts consecutive burst 429s (no retry-after) for exponential backoff.
     /// Reset to 0 on any successful response.
     consecutive_burst_429s: u32,
@@ -424,6 +452,8 @@ struct Upstream {
     name: String,
     base_url: String,
     api_key: String,
+    /// Priority tier when this upstream participates in unified routing as the fallback.
+    priority: u32,
     requests: AtomicU64,
 }
 
@@ -476,6 +506,9 @@ struct AppState {
     /// Index into `upstreams` for the fallback when all accounts are exhausted.
     /// The upstream receives OpenAI-format requests; format translation is automatic.
     fallback_upstream: Option<usize>,
+    /// Priority penalty added to an account's effective priority while it serves
+    /// via overage. Default: 10.
+    overage_penalty: u32,
 }
 
 impl Account {
@@ -494,9 +527,30 @@ impl Account {
     }
 }
 
+/// A routable endpoint: an Anthropic account or the fallback OpenAI-compatible upstream.
+/// Accounts and the fallback upstream share one priority space so routing order is
+/// decided entirely by tier numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Endpoint {
+    Account(usize),
+    Upstream(usize),
+}
+
+impl Endpoint {
+    /// The account index, or None if this is an upstream.
+    #[cfg(test)]
+    fn account(self) -> Option<usize> {
+        match self {
+            Endpoint::Account(i) => Some(i),
+            Endpoint::Upstream(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RoutingCandidate {
-    idx: usize,
+    endpoint: Endpoint,
+    /// Effective priority tier — includes the overage penalty when applicable.
     priority: u32,
     gate_5h: f64,
     gate_7d: f64,
@@ -588,6 +642,14 @@ struct PersistedAccount {
     remaining_tokens: Option<u64>,
     limit_requests: Option<u64>,
     limit_tokens: Option<u64>,
+    #[serde(default)]
+    overage_in_use: bool,
+    #[serde(default)]
+    overage_status: Option<String>,
+    #[serde(default)]
+    overage_utilization: Option<f64>,
+    #[serde(default)]
+    overage_reset: Option<u64>,
     /// Absolute unix timestamp (secs) when hard limit expires
     hard_limited_until_epoch: Option<u64>,
     /// Wall-clock epoch when this account's rate info was last updated.
@@ -689,6 +751,10 @@ impl AppState {
                 remaining_tokens: info.remaining_tokens,
                 limit_requests: info.limit_requests,
                 limit_tokens: info.limit_tokens,
+                overage_in_use: info.overage_in_use,
+                overage_status: info.overage_status.clone(),
+                overage_utilization: info.overage_utilization,
+                overage_reset: info.overage_reset,
                 hard_limited_until_epoch: hard_until_epoch,
                 last_updated_epoch: info.last_updated_epoch,
             });
@@ -946,6 +1012,10 @@ impl AppState {
                 info.representative_claim = pa.representative_claim.clone();
                 info.reset_5h = pa.reset_5h;
                 info.status_5h = pa.status_5h.clone();
+                info.overage_in_use = pa.overage_in_use;
+                info.overage_status = pa.overage_status.clone();
+                info.overage_utilization = pa.overage_utilization;
+                info.overage_reset = pa.overage_reset;
 
                 // Load claims_7d: either from persisted map or migrate from flat fields
                 if !pa.claims_7d.is_empty() {
@@ -1062,6 +1132,9 @@ impl AppState {
 const NEAR_RESET_5H_SECS: f64 = 3600.0;
 /// Last ~3.5% of 7d block. Conservative — overshoot has multi-day consequence.
 const NEAR_RESET_7D_SECS: f64 = 21600.0;
+/// Overage window near-reset threshold. Overage utilization is the real signal;
+/// the time discount only matters in the final hour before the window resets.
+const NEAR_RESET_OVERAGE_SECS: f64 = 3600.0;
 /// Minimum discount factor — prevents utilization from collapsing to zero near reset.
 const TIME_FRACTION_FLOOR: f64 = 0.05;
 /// Above soft_limit (0.90) so throttled accounts are excluded from routing unless
@@ -1364,6 +1437,8 @@ struct RoutingWeight {
     wr: f64,
     weight: f64,
     source: &'static str,
+    /// Account is serving via paid overage — caller demotes its priority tier.
+    overage_active: bool,
 }
 
 fn compute_routing_weight(
@@ -1372,6 +1447,10 @@ fn compute_routing_weight(
     now_epoch: u64,
     stale_after_hard_limit: bool,
 ) -> Option<RoutingWeight> {
+    // Overage active: the account's exhausted subscription window is being covered
+    // by paid overage. The subscription gates are moot — the overage window governs.
+    let overage_active = info.overage_in_use && !stale_after_hard_limit;
+
     // 5h gate: time-adjusted 5h utilization with status floors
     let gate_5h = if stale_after_hard_limit {
         0.5
@@ -1397,10 +1476,12 @@ fn compute_routing_weight(
     };
 
     // 7d model-specific gate and waste risk
-    let (gate_7d, wr, source) = if let Some(claim) = resolve_7d_claim(info, model) {
+    let (gate_7d, wr_7d, source_7d) = if let Some(claim) = resolve_7d_claim(info, model) {
         let rejected_claim_active = claim.status.as_deref() == Some("rejected")
             && claim.reset.is_none_or(|reset| reset > now_epoch);
-        if rejected_claim_active && !stale_after_hard_limit {
+        // A rejected 7d claim normally skips the account — but not while overage is
+        // covering it (overage serves requests despite the rejected subscription claim).
+        if rejected_claim_active && !stale_after_hard_limit && !overage_active {
             return None; // caller should skip this account
         }
         (
@@ -1427,7 +1508,22 @@ fn compute_routing_weight(
         )
     };
 
-    let gate = gate_5h.max(gate_7d);
+    // Effective gate: when overage is in use, the overage window governs — the
+    // exhausted 5h/7d gates are superseded. waste_risk is moot for an overage account.
+    let (gate, wr, source) = if overage_active {
+        let gate_overage = time_adjusted_utilization(
+            info.overage_utilization,
+            info.overage_reset,
+            info.overage_status.as_deref(),
+            NEAR_RESET_OVERAGE_SECS,
+            now_epoch,
+        )
+        .unwrap_or(0.0);
+        (gate_overage, 0.0, "overage")
+    } else {
+        (gate_5h.max(gate_7d), wr_7d, source_7d)
+    };
+
     let headroom = (1.0 - gate).max(0.01);
     let weight = if wr > 0.0 { wr * headroom } else { headroom };
     let weight = if gate >= 1.0 { 0.0 } else { weight };
@@ -1439,6 +1535,7 @@ fn compute_routing_weight(
         wr,
         weight,
         source,
+        overage_active,
     })
 }
 
@@ -1483,12 +1580,20 @@ fn classify_hard_limit_sync(
 }
 
 impl AppState {
-    async fn routing_candidates(&self, model: &str, skip: &[usize]) -> Vec<RoutingCandidate> {
+    /// Display name for an endpoint (account or upstream), for logging.
+    fn endpoint_name(&self, ep: Endpoint) -> &str {
+        match ep {
+            Endpoint::Account(i) => &self.accounts[i].name,
+            Endpoint::Upstream(i) => &self.upstreams[i].name,
+        }
+    }
+
+    async fn routing_candidates(&self, model: &str, skip: &[Endpoint]) -> Vec<RoutingCandidate> {
         let now = Instant::now();
         let now_epoch = Self::now_epoch();
         let mut candidates: Vec<RoutingCandidate> = Vec::new();
         for (i, acct) in self.accounts.iter().enumerate() {
-            if skip.contains(&i) {
+            if skip.contains(&Endpoint::Account(i)) {
                 trace!(account = acct.name, "pick: skipping, already tried");
                 continue;
             }
@@ -1535,6 +1640,14 @@ impl AppState {
                 }
             };
 
+            // Effective priority: an account serving via paid overage is demoted by
+            // `overage_penalty` so free subscription capacity is always preferred.
+            let effective_priority = if rw.overage_active {
+                acct.priority.saturating_add(self.overage_penalty)
+            } else {
+                acct.priority
+            };
+
             trace!(
                 account = acct.name,
                 gate_5h = format!("{:.4}", rw.gate_5h),
@@ -1543,12 +1656,14 @@ impl AppState {
                 waste_risk = format!("{:.4}", rw.wr),
                 weight = format!("{:.4}", rw.weight),
                 source = rw.source,
+                priority = effective_priority,
+                overage = rw.overage_active,
                 "pick: candidate"
             );
 
             candidates.push(RoutingCandidate {
-                idx: i,
-                priority: acct.priority,
+                endpoint: Endpoint::Account(i),
+                priority: effective_priority,
                 gate_5h: rw.gate_5h,
                 gate_7d: rw.gate_7d,
                 gate: rw.gate,
@@ -1556,6 +1671,29 @@ impl AppState {
                 weight: rw.weight,
                 source: rw.source,
             });
+        }
+
+        // The fallback upstream is a first-class routing candidate at its configured
+        // priority. It has no rate-limit data: gate 0 (always "healthy"), weight 1.
+        if let Some(u_idx) = self.fallback_upstream {
+            if !skip.contains(&Endpoint::Upstream(u_idx)) {
+                let upstream = &self.upstreams[u_idx];
+                trace!(
+                    upstream = upstream.name,
+                    priority = upstream.priority,
+                    "pick: candidate (upstream)"
+                );
+                candidates.push(RoutingCandidate {
+                    endpoint: Endpoint::Upstream(u_idx),
+                    priority: upstream.priority,
+                    gate_5h: 0.0,
+                    gate_7d: 0.0,
+                    gate: 0.0,
+                    wr: 0.0,
+                    weight: 1.0,
+                    source: "upstream",
+                });
+            }
         }
         candidates
     }
@@ -1871,7 +2009,7 @@ impl AppState {
         let mut picked = self.pick_weighted_bucket(effective, total_weight, affinity_key);
 
         if affinity_key.is_some() && effective.len() == 2 {
-            let other = if picked.idx == effective[0].idx {
+            let other = if picked.endpoint == effective[0].endpoint {
                 effective[1]
             } else {
                 effective[0]
@@ -1879,9 +2017,9 @@ impl AppState {
             if picked.weight < other.weight * LEGACY_AFFINITY_OVERRIDE_RATIO {
                 debug!(
                     strategy = RoutingStrategy::DynamicCapacityV1.as_str(),
-                    picked_account = self.accounts[picked.idx].name,
+                    picked_account = self.endpoint_name(picked.endpoint),
                     picked_weight = format!("{:.3}", picked.weight),
-                    other_account = self.accounts[other.idx].name,
+                    other_account = self.endpoint_name(other.endpoint),
                     other_weight = format!("{:.3}", other.weight),
                     ratio = format!("{:.3}", picked.weight / other.weight),
                     "pick: affinity override, weight ratio below threshold"
@@ -1912,14 +2050,14 @@ impl AppState {
                 .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap())
                 .copied()
                 .unwrap();
-            if best.idx != picked.idx
+            if best.endpoint != picked.endpoint
                 && picked.weight < best.weight * STICKY_WEIGHTED_OVERRIDE_RATIO
             {
                 debug!(
                     strategy = RoutingStrategy::StickyWeightedV2.as_str(),
-                    picked_account = self.accounts[picked.idx].name,
+                    picked_account = self.endpoint_name(picked.endpoint),
                     picked_weight = format!("{:.3}", picked.weight),
-                    best_account = self.accounts[best.idx].name,
+                    best_account = self.endpoint_name(best.endpoint),
                     best_weight = format!("{:.3}", best.weight),
                     ratio = format!("{:.3}", picked.weight / best.weight),
                     "pick: affinity override, breaking session stickiness"
@@ -1938,7 +2076,7 @@ impl AppState {
         total_weight: f64,
         affinity_key: Option<&str>,
         tier: u32,
-    ) -> usize {
+    ) -> Endpoint {
         let picked = match self.routing_strategy {
             RoutingStrategy::DynamicCapacityV1 => {
                 self.pick_dynamic_capacity_v1(effective, total_weight, affinity_key)
@@ -1950,7 +2088,7 @@ impl AppState {
 
         debug!(
             strategy = self.routing_strategy.as_str(),
-            account = self.accounts[picked.idx].name,
+            account = self.endpoint_name(picked.endpoint),
             tier = tier,
             gate = format!("{:.3}", picked.gate),
             gate_5h = format!("{:.3}", picked.gate_5h),
@@ -1963,53 +2101,51 @@ impl AppState {
             affinity = affinity_key.unwrap_or("-"),
             "pick: selected"
         );
-        picked.idx
+        picked.endpoint
     }
 
-    /// Pick the best available account using the configured routing strategy.
-    async fn pick_account(
+    /// Pick the best available endpoint (account or fallback upstream).
+    ///
+    /// Tiers are tried strictly in ascending priority order. Within a tier:
+    /// healthy candidates (`gate < soft_limit`) are preferred; if none are healthy
+    /// the tier degrades to its soft-limited candidates. Only when a tier has zero
+    /// total weight (genuinely exhausted) does routing move to the next tier — so
+    /// `soft_limit` is intra-tier load-shedding and never causes a tier jump. This
+    /// guarantees free capacity is fully drained before any paid (overage/upstream)
+    /// tier is touched.
+    async fn pick_endpoint(
         &self,
         affinity_key: Option<&str>,
         model: &str,
-        skip: &[usize],
-    ) -> Option<usize> {
+        skip: &[Endpoint],
+    ) -> Option<Endpoint> {
         let candidates = self.routing_candidates(model, skip).await;
         if candidates.is_empty() {
-            debug!("pick: no available accounts");
+            debug!("pick: no available endpoints");
             return None;
         }
 
-        // Collect unique priority tiers, sorted ascending (0 = highest priority).
+        // Unique priority tiers, ascending (0 = highest priority).
         let mut tiers: Vec<u32> = candidates.iter().map(|c| c.priority).collect();
         tiers.sort_unstable();
         tiers.dedup();
 
-        // Try each tier in order with soft-limit filtering. A tier is skipped when
-        // it has no healthy (below soft_limit) candidates — prefer a lower-priority
-        // tier with headroom over a soft-limited higher-priority tier.
         for tier in &tiers {
             let tier_candidates: Vec<&RoutingCandidate> =
                 candidates.iter().filter(|c| c.priority == *tier).collect();
 
-            let has_healthy = tier_candidates.iter().any(|c| c.gate < self.soft_limit);
-            if !has_healthy {
-                debug!(tier = tier, "pick: tier all soft-limited, trying next");
-                continue;
-            }
-
-            let excluded: Vec<&str> = tier_candidates
-                .iter()
-                .filter(|c| c.gate >= self.soft_limit)
-                .map(|c| self.accounts[c.idx].name.as_str())
-                .collect();
-            if !excluded.is_empty() {
-                debug!(soft_limit = self.soft_limit, tier = tier, excluded = ?excluded, "pick: soft-limited accounts excluded");
-            }
-            let effective: Vec<&RoutingCandidate> = tier_candidates
+            // Prefer healthy candidates; fall back to soft-limited ones within the tier.
+            let healthy: Vec<&RoutingCandidate> = tier_candidates
                 .iter()
                 .filter(|c| c.gate < self.soft_limit)
                 .copied()
                 .collect();
+
+            let (effective, degraded): (Vec<&RoutingCandidate>, bool) = if !healthy.is_empty() {
+                (healthy, false)
+            } else {
+                (tier_candidates.clone(), true)
+            };
 
             let total_weight: f64 = effective.iter().map(|c| c.weight).sum();
             if total_weight <= 0.0 {
@@ -2020,34 +2156,31 @@ impl AppState {
                 continue;
             }
 
-            return Some(self.pick_from_candidates(&effective, total_weight, affinity_key, *tier));
-        }
-
-        // Graceful degradation: all tiers soft-limited. Try each tier again
-        // without soft-limit filtering — use whatever capacity exists.
-        for tier in &tiers {
-            let tier_candidates: Vec<&RoutingCandidate> =
-                candidates.iter().filter(|c| c.priority == *tier).collect();
-
-            let total_weight: f64 = tier_candidates.iter().map(|c| c.weight).sum();
-            if total_weight <= 0.0 {
-                continue;
+            if degraded {
+                debug!(
+                    tier = tier,
+                    "pick: tier all soft-limited — degrading within tier"
+                );
             }
-
-            debug!(
-                tier = tier,
-                "pick: graceful degradation — using soft-limited tier"
-            );
-            return Some(self.pick_from_candidates(
-                &tier_candidates,
-                total_weight,
-                affinity_key,
-                *tier,
-            ));
+            return Some(self.pick_from_candidates(&effective, total_weight, affinity_key, *tier));
         }
 
         debug!("pick: all tiers exhausted");
         None
+    }
+
+    /// Test-only convenience: `pick_endpoint` restricted to account results.
+    #[cfg(test)]
+    async fn pick_account(
+        &self,
+        affinity_key: Option<&str>,
+        model: &str,
+        skip: &[usize],
+    ) -> Option<usize> {
+        let skip: Vec<Endpoint> = skip.iter().map(|&i| Endpoint::Account(i)).collect();
+        self.pick_endpoint(affinity_key, model, &skip)
+            .await
+            .and_then(|ep| ep.account())
     }
 
     /// Update rate limit info from response headers.
@@ -2177,6 +2310,36 @@ impl AppState {
             }
         }
 
+        // Overage (paid extra usage) — account-level, covers whichever subscription
+        // window is exhausted. `overage-in-use` is always overwritten: header absent
+        // or "false" → false (so demotion auto-clears when the window refills).
+        info.overage_in_use = headers
+            .get("anthropic-ratelimit-unified-overage-in-use")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if info.overage_in_use {
+            info.overage_status = headers
+                .get("anthropic-ratelimit-unified-overage-status")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            info.overage_utilization = headers
+                .get("anthropic-ratelimit-unified-overage-utilization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|v| v.clamp(0.0, 1.0));
+            info.overage_reset = headers
+                .get("anthropic-ratelimit-unified-overage-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|&epoch| epoch <= now_epoch + 2_678_400); // ≤31d sanity cap
+        } else {
+            // Not in overage — clear stale overage data so routing doesn't read it.
+            info.overage_status = None;
+            info.overage_utilization = None;
+            info.overage_reset = None;
+        }
+
         // Evict stale claims: expired resets (reset <= now) or reset-less entries
         // not seen in >24h. This aligns with load_state() which drops all reset-less
         // entries on boot — the 24h grace period covers the normal case where
@@ -2300,6 +2463,10 @@ impl AppState {
                 remaining_tokens: info.remaining_tokens,
                 limit_requests: info.limit_requests,
                 limit_tokens: info.limit_tokens,
+                overage_in_use: info.overage_in_use,
+                overage_status: info.overage_status.clone(),
+                overage_utilization: info.overage_utilization,
+                overage_reset: info.overage_reset,
                 updated_at: Self::now_epoch(),
             };
             // Compute TTL from earliest reset timestamp
@@ -2522,6 +2689,10 @@ impl AppState {
                             info.remaining_tokens = remote.remaining_tokens;
                             info.limit_requests = remote.limit_requests;
                             info.limit_tokens = remote.limit_tokens;
+                            info.overage_in_use = remote.overage_in_use;
+                            info.overage_status = remote.overage_status;
+                            info.overage_utilization = remote.overage_utilization;
+                            info.overage_reset = remote.overage_reset;
                             info.last_updated = Some(now_instant);
                             info.last_updated_epoch = Some(remote.updated_at);
                             trace!(
@@ -3670,28 +3841,37 @@ async fn proxy_handler(
             );
             tokio::time::sleep(delay).await;
         }
-        let mut skip: Vec<usize> = Vec::new();
+        let mut skip: Vec<Endpoint> = Vec::new();
         let mut saw_529 = false;
-        for _attempt in 0..n {
-            let idx = match state.pick_account(affinity, &model, &skip).await {
-                Some(i) => i,
-                None => {
-                    warn!("all accounts rate-limited, trying fallback upstream");
-                    if let Some(resp) = try_fallback_upstream(
+        // n accounts + 1 fallback upstream is the candidate ceiling.
+        for _attempt in 0..(n + 1) {
+            let idx = match state.pick_endpoint(affinity, &model, &skip).await {
+                Some(Endpoint::Account(i)) => i,
+                Some(Endpoint::Upstream(u)) => {
+                    // All account tiers exhausted — route through the fallback upstream.
+                    match try_fallback_upstream(
                         &state,
                         &body_bytes,
                         &req_id,
                         &client_id,
                         &model,
+                        u,
                         true,
                     )
                     .await
                     {
-                        return resp;
+                        Some(resp) => return resp,
+                        None => {
+                            skip.push(Endpoint::Upstream(u));
+                            continue;
+                        }
                     }
+                }
+                None => {
+                    warn!("all endpoints exhausted");
                     return (
                         StatusCode::TOO_MANY_REQUESTS,
-                        "all upstream accounts rate-limited",
+                        "all upstream endpoints exhausted",
                     )
                         .into_response();
                 }
@@ -3797,7 +3977,7 @@ async fn proxy_handler(
                 log_429_details(&acct.name, resp).await;
                 state.save_state().await;
                 info!(account = acct.name, "got 429, rotating to next account");
-                skip.push(idx);
+                skip.push(Endpoint::Account(idx));
                 continue;
             }
 
@@ -3806,7 +3986,7 @@ async fn proxy_handler(
                 state.save_state().await;
                 warn!(account = acct.name, "got 529, rotating to next account");
                 saw_529 = true;
-                skip.push(idx);
+                skip.push(Endpoint::Account(idx));
                 continue;
             }
 
@@ -3818,7 +3998,7 @@ async fn proxy_handler(
                     status = status.as_u16(),
                     "got server error, rotating to next account"
                 );
-                skip.push(idx);
+                skip.push(Endpoint::Account(idx));
                 continue;
             }
 
@@ -3863,6 +4043,7 @@ async fn proxy_handler(
                     util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
                     util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
                     constraint,
+                    overage = info.overage_in_use,
                     total = acct.requests.load(Ordering::Relaxed),
                     "proxied"
                 );
@@ -3988,13 +4169,7 @@ async fn proxy_handler(
         }
     }
 
-    // Last resort: try fallback upstream before returning 429
-    if let Some(resp) =
-        try_fallback_upstream(&state, &body_bytes, &req_id, &client_id, &model, true).await
-    {
-        return resp;
-    }
-    (StatusCode::TOO_MANY_REQUESTS, "exhausted all accounts").into_response()
+    (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
 }
 
 // ── Fallback upstream handler ────────────────────────────────────────
@@ -4009,9 +4184,9 @@ async fn try_fallback_upstream(
     req_id: &str,
     client_id: &str,
     model: &str,
+    upstream_idx: usize,
     translate: bool, // true = Anthropic↔OpenAI translation needed
 ) -> Option<Response> {
-    let upstream_idx = state.fallback_upstream?;
     let upstream = &state.upstreams[upstream_idx];
 
     info!(
@@ -4461,6 +4636,10 @@ async fn stats_handler(
             "reset_7d": info.reset_7d,
             "status_5h": info.status_5h,
             "status_7d": info.status_7d,
+            "overage_in_use": info.overage_in_use,
+            "overage_status": info.overage_status,
+            "overage_utilization": info.overage_utilization,
+            "overage_reset": info.overage_reset,
             "claims_7d": info.claims_7d.iter().map(|(k, v)| {
                 (k.clone(), serde_json::json!({
                     "utilization": v.utilization,
@@ -4749,6 +4928,8 @@ struct AcctMetricsSnap {
     token_usage: [u64; 4],
     claims: Vec<ClaimMetricsSnap>,
     last_updated_epoch: Option<u64>,
+    overage_in_use: bool,
+    overage_utilization: Option<f64>,
 }
 
 #[cfg(test)]
@@ -4917,6 +5098,8 @@ async fn metrics_handler(
             ],
             claims,
             last_updated_epoch: info.last_updated_epoch,
+            overage_in_use: info.overage_in_use,
+            overage_utilization: info.overage_utilization,
         });
     }
 
@@ -4986,6 +5169,18 @@ async fn metrics_handler(
                 &[("account", &s.name), ("window", "7d")],
                 u,
             );
+        }
+        // Overage window — emitted only while overage is actively serving, so the
+        // metric's presence itself signals an account on paid extra usage.
+        if s.overage_in_use {
+            if let Some(u) = s.overage_utilization {
+                prom_gauge(
+                    &mut buf,
+                    "anthropic_account_utilization",
+                    &[("account", &s.name), ("window", "overage")],
+                    u,
+                );
+            }
         }
     }
 
@@ -6910,28 +7105,38 @@ async fn openai_chat_handler(
             );
             tokio::time::sleep(delay).await;
         }
-        let mut skip: Vec<usize> = Vec::new();
+        let mut skip: Vec<Endpoint> = Vec::new();
         let mut saw_529 = false;
-        for _attempt in 0..n {
-            let idx = match state.pick_account(affinity, &model, &skip).await {
-                Some(i) => i,
-                None => {
-                    warn!("all accounts rate-limited, trying fallback upstream");
-                    if let Some(resp) = try_fallback_upstream(
+        // n accounts + 1 fallback upstream is the candidate ceiling.
+        for _attempt in 0..(n + 1) {
+            let idx = match state.pick_endpoint(affinity, &model, &skip).await {
+                Some(Endpoint::Account(i)) => i,
+                Some(Endpoint::Upstream(u)) => {
+                    // All account tiers exhausted — the upstream is OpenAI-native,
+                    // so forward the original request body without translation.
+                    match try_fallback_upstream(
                         &state,
                         &body_bytes,
                         &req_id,
                         &client_id,
                         &model,
+                        u,
                         false,
                     )
                     .await
                     {
-                        return resp;
+                        Some(resp) => return resp,
+                        None => {
+                            skip.push(Endpoint::Upstream(u));
+                            continue;
+                        }
                     }
+                }
+                None => {
+                    warn!("all endpoints exhausted");
                     return (
                         StatusCode::TOO_MANY_REQUESTS,
-                        "all upstream accounts rate-limited",
+                        "all upstream endpoints exhausted",
                     )
                         .into_response();
                 }
@@ -6996,7 +7201,7 @@ async fn openai_chat_handler(
                 log_429_details(&acct.name, resp).await;
                 state.save_state().await;
                 info!(account = acct.name, "got 429, rotating to next account");
-                skip.push(idx);
+                skip.push(Endpoint::Account(idx));
                 continue;
             }
 
@@ -7005,7 +7210,7 @@ async fn openai_chat_handler(
                 state.save_state().await;
                 warn!(account = acct.name, "got 529, rotating to next account");
                 saw_529 = true;
-                skip.push(idx);
+                skip.push(Endpoint::Account(idx));
                 continue;
             }
 
@@ -7017,7 +7222,7 @@ async fn openai_chat_handler(
                     status = status.as_u16(),
                     "got server error, rotating to next account"
                 );
-                skip.push(idx);
+                skip.push(Endpoint::Account(idx));
                 continue;
             }
 
@@ -7319,13 +7524,7 @@ async fn openai_chat_handler(
         }
     }
 
-    // Last resort: try fallback upstream before returning 429
-    if let Some(resp) =
-        try_fallback_upstream(&state, &body_bytes, &req_id, &client_id, &model, false).await
-    {
-        return resp;
-    }
-    (StatusCode::TOO_MANY_REQUESTS, "exhausted all accounts").into_response()
+    (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -7455,6 +7654,7 @@ async fn main() {
                 name: u.name.clone(),
                 base_url: u.base_url.clone(),
                 api_key: u.api_key.clone(),
+                priority: u.priority,
                 requests: AtomicU64::new(0),
             }
         })
@@ -7550,8 +7750,22 @@ async fn main() {
         info!(
             upstream = upstreams[idx].name,
             base_url = upstreams[idx].base_url,
+            priority = upstreams[idx].priority,
             "fallback upstream configured"
         );
+        // Guardrail: the fallback upstream is a paid endpoint. If its priority is
+        // not strictly above every account's, it shares (or beats) the free tier
+        // and leaks paid traffic. Warn loudly — it should be set high (e.g. 100).
+        let max_acct_priority = accounts.iter().map(|a| a.priority).max().unwrap_or(0);
+        if upstreams[idx].priority <= max_acct_priority {
+            warn!(
+                upstream = upstreams[idx].name,
+                upstream_priority = upstreams[idx].priority,
+                max_account_priority = max_acct_priority,
+                "fallback upstream priority is not above account priorities — it will \
+                 compete with (or preempt) free accounts; set a higher priority"
+            );
+        }
     }
 
     let state = Arc::new(AppState {
@@ -7593,6 +7807,7 @@ async fn main() {
         },
         probe_interval_secs: config.probe_interval_secs.unwrap_or(300),
         fallback_upstream: fallback_upstream_idx,
+        overage_penalty: config.overage_penalty.unwrap_or(10),
     });
 
     if state.auto_cache {
@@ -7798,6 +8013,7 @@ mod tests {
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         })
     }
 
@@ -7810,6 +8026,21 @@ mod tests {
         Arc::get_mut(&mut state)
             .expect("test fixture should be uniquely owned")
             .soft_limit = soft_limit;
+        state
+    }
+
+    /// Test state with a single fallback upstream registered at `upstream_priority`.
+    fn test_state_with_fallback(accounts: Vec<Account>, upstream_priority: u32) -> Arc<AppState> {
+        let mut state = test_state_with(accounts);
+        let st = Arc::get_mut(&mut state).expect("test fixture should be uniquely owned");
+        st.upstreams.push(Upstream {
+            name: "fallback".to_string(),
+            base_url: "http://127.0.0.1:1".to_string(),
+            api_key: "test".to_string(),
+            priority: upstream_priority,
+            requests: AtomicU64::new(0),
+        });
+        st.fallback_upstream = Some(0);
         state
     }
 
@@ -7891,6 +8122,7 @@ mod tests {
                 name: "mock".to_string(),
                 base_url: upstream_url.to_string(),
                 api_key: "test-key".to_string(),
+                priority: 0,
                 requests: AtomicU64::new(0),
             }],
             client_names: HashMap::new(),
@@ -7912,6 +8144,7 @@ mod tests {
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         (build_router(state.clone()), state)
@@ -8007,6 +8240,7 @@ mod tests {
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -8795,7 +9029,7 @@ mod tests {
         let mut cumulative = 0.0;
         for c in &candidates {
             cumulative += c.weight;
-            boundaries.push((c.idx, cumulative));
+            boundaries.push((c.endpoint.account().unwrap(), cumulative));
         }
 
         let mut insight_key = None;
@@ -9567,6 +9801,7 @@ mod tests {
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         let app = build_router(state);
@@ -10815,6 +11050,7 @@ mod tests {
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         let app = Router::new()
@@ -11492,6 +11728,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         // Try many affinity keys — all should route to healthy (idx 0)
@@ -11594,6 +11831,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         // Within budget
@@ -12103,6 +12341,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         {
             let mut info = state.accounts[0].rate_info.write().await;
@@ -12175,6 +12414,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         {
             let mut info = state.accounts[0].rate_info.write().await;
@@ -12934,6 +13174,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         // Header overrides IP mapping (supports multiple clients per IP)
@@ -13003,6 +13244,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -13798,6 +14040,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.60, 0.50, now + 10000, now + 100000).await;
@@ -13848,6 +14091,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
@@ -13899,6 +14143,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -13952,6 +14197,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
         // Operator bypasses everything
@@ -14002,6 +14248,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         // Request for "claude-opus" — no account serves it → should pass
         assert!(
@@ -14054,6 +14301,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         // Don't set any utilization — accounts remain "unknown" (0.5)
         // With limit=0.30, unknown 0.5 would appear "above limit" without fail-open
@@ -14110,6 +14358,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         // Two known accounts above limit, one unknown (no data set)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -14186,6 +14435,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
         assert!(state.is_emergency_brake_active().await);
@@ -14264,6 +14514,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.85, 0.70, now + 10000, now + 100000).await;
         assert!(
@@ -14357,6 +14608,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         // No rate data set — account returns (0.5, "unknown")
         // 0.5 >= 0.4 threshold → all_above is true
@@ -14410,6 +14662,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.60, 0.55, now + 10000, now + 100000).await;
         // Account 1: no data → (0.5, "unknown"), 0.5 >= 0.4 → all_above stays true
@@ -14510,6 +14763,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         // "-" is not the operator
         assert!(!state.is_operator("-"));
@@ -14588,6 +14842,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         // Operator always gets "healthy" regardless of utilization
         assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
@@ -14633,6 +14888,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         // gastown has limit 0.85, 80% of that = 0.68
         // At 0.60, below 0.68 → no upgrade → "healthy"
@@ -14854,6 +15110,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         // Set utilization above client's limit (0.80 > 0.50)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -14917,6 +15174,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         // Set utilization below client's limit (0.50 < 0.90)
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -14977,6 +15235,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         // All accounts above emergency threshold. 5h=0.96 > emergency threshold (0.88).
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -15045,6 +15304,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         // All accounts above emergency threshold — 5h only (avoid claim penalty on 7d)
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -15110,6 +15370,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
 
@@ -15170,6 +15431,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
 
@@ -15281,6 +15543,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
@@ -15354,6 +15617,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         let status = compute_pressure_status(0.99, "operator-id", &state);
@@ -15407,6 +15671,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
@@ -15788,8 +16053,10 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn pick_account_priority_soft_limit_per_tier() {
-        // Tier 0 accounts all above soft_limit → should fall through to tier 1.
+    async fn pick_account_priority_soft_limit_stays_in_tier() {
+        // Tier 0 accounts above soft_limit but still alive (weight > 0) → tier 0 is
+        // degraded-used, NOT skipped. soft_limit is intra-tier load-shedding; it must
+        // never cause a jump to a lower-priority (paid) tier while free capacity remains.
         let mut primary_a = make_account("primary_a", "sk-ant-api-a");
         primary_a.priority = 0;
         let mut primary_b = make_account("primary_b", "sk-ant-api-b");
@@ -15799,13 +16066,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         let state = test_state_with_soft_limit(vec![primary_a, primary_b, fallback], 0.90);
 
         let now = AppState::now_epoch();
-        // Tier 0: above soft limit
+        // Tier 0: above soft limit (0.95) but still has headroom — weight > 0.
         for i in 0..2 {
             let mut info = state.accounts[i].rate_info.write().await;
             info.utilization_5h = Some(0.95);
             info.reset_5h = Some(now + 10000);
         }
-        // Tier 1: healthy
+        // Tier 1: healthy.
         {
             let mut info = state.accounts[2].rate_info.write().await;
             info.utilization_5h = Some(0.30);
@@ -15814,10 +16081,42 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         for _ in 0..100 {
             let idx = state.pick_account(None, "", &[]).await.unwrap();
-            assert_eq!(
-                idx, 2,
-                "tier 1 should get traffic when tier 0 is all soft-limited"
+            assert!(
+                idx == 0 || idx == 1,
+                "tier 0 must be drained (degraded) before tier 1 is touched"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_account_priority_zero_weight_tier_falls_through() {
+        // Tier 0 accounts at zero weight (util 1.0 → gate 1.0) → genuinely exhausted →
+        // routing falls through to tier 1.
+        let mut primary_a = make_account("primary_a", "sk-ant-api-a");
+        primary_a.priority = 0;
+        let mut primary_b = make_account("primary_b", "sk-ant-api-b");
+        primary_b.priority = 0;
+        let mut fallback = make_account("fallback", "sk-ant-api-c");
+        fallback.priority = 1;
+        let state = test_state_with_soft_limit(vec![primary_a, primary_b, fallback], 0.90);
+
+        let now = AppState::now_epoch();
+        // Tier 0: fully exhausted — util 1.0 → gate 1.0 → weight 0.
+        for i in 0..2 {
+            let mut info = state.accounts[i].rate_info.write().await;
+            info.utilization_5h = Some(1.0);
+            info.reset_5h = Some(now + 10000);
+        }
+        // Tier 1: healthy.
+        {
+            let mut info = state.accounts[2].rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now + 10000);
+        }
+
+        for _ in 0..100 {
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            assert_eq!(idx, 2, "tier 1 used once tier 0 is genuinely zero-weight");
         }
     }
 
@@ -15871,6 +16170,199 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(state.pick_account(None, "", &[]).await.is_none());
     }
 
+    // ── Overage tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn update_rate_info_parses_overage_headers() {
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-a")]);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-overage-in-use",
+            "true".parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-overage-status",
+            "allowed".parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-overage-utilization",
+            "0.25".parse().unwrap(),
+        );
+        let reset = AppState::now_epoch() + 100000;
+        headers.insert(
+            "anthropic-ratelimit-unified-overage-reset",
+            reset.to_string().parse().unwrap(),
+        );
+        state.update_rate_info(0, &headers).await;
+
+        let info = state.accounts[0].rate_info.read().await;
+        assert!(info.overage_in_use);
+        assert_eq!(info.overage_status.as_deref(), Some("allowed"));
+        assert_eq!(info.overage_utilization, Some(0.25));
+        assert_eq!(info.overage_reset, Some(reset));
+    }
+
+    #[tokio::test]
+    async fn update_rate_info_overage_absent_resets_to_false() {
+        // Corner 1: an account previously in overage whose next response omits the
+        // overage-in-use header must drop back to overage_in_use=false.
+        let state = test_state_with(vec![make_account("a", "sk-ant-api-a")]);
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.overage_in_use = true;
+            info.overage_status = Some("allowed".to_string());
+            info.overage_utilization = Some(0.5);
+        }
+        // Fresh response with no overage headers at all.
+        let headers = reqwest::header::HeaderMap::new();
+        state.update_rate_info(0, &headers).await;
+
+        let info = state.accounts[0].rate_info.read().await;
+        assert!(!info.overage_in_use, "overage_in_use must reset to false");
+        assert_eq!(info.overage_status, None);
+        assert_eq!(info.overage_utilization, None);
+    }
+
+    #[test]
+    fn routing_weight_overage_active_keeps_account_routable() {
+        // 5h subscription window rejected/exhausted, but overage is covering it →
+        // the account must have non-zero weight, not be dropped.
+        let now = AppState::now_epoch();
+        let mut info = RateLimitInfo {
+            utilization_5h: Some(1.0),
+            reset_5h: Some(now + 3000),
+            status_5h: Some("rejected".to_string()),
+            ..Default::default()
+        };
+        info.overage_in_use = true;
+        info.overage_status = Some("allowed".to_string());
+        info.overage_utilization = Some(0.0);
+        info.overage_reset = Some(now + 100000);
+
+        let rw = compute_routing_weight(&info, "claude-sonnet-4-6", now, false)
+            .expect("overage account must not be skipped");
+        assert!(rw.overage_active, "overage_active flag must be set");
+        assert!(
+            rw.weight > 0.0,
+            "overage account with fresh overage budget must have non-zero weight, got {}",
+            rw.weight
+        );
+        assert_eq!(rw.source, "overage");
+    }
+
+    #[test]
+    fn routing_weight_overage_exhausted_zero_weight() {
+        // Overage in use but overage budget itself exhausted (utilization 1.0) → weight 0.
+        let now = AppState::now_epoch();
+        let mut info = RateLimitInfo {
+            utilization_5h: Some(1.0),
+            reset_5h: Some(now + 3000),
+            status_5h: Some("rejected".to_string()),
+            ..Default::default()
+        };
+        info.overage_in_use = true;
+        info.overage_status = Some("allowed".to_string());
+        info.overage_utilization = Some(1.0);
+        info.overage_reset = Some(now + 100000);
+
+        let rw = compute_routing_weight(&info, "claude-sonnet-4-6", now, false)
+            .expect("still a candidate");
+        assert_eq!(rw.weight, 0.0, "exhausted overage → zero weight");
+    }
+
+    #[tokio::test]
+    async fn pick_account_overage_demoted_below_free() {
+        // Free account (eff. priority 0) must drain before an overage account
+        // (eff. priority 0 + overage_penalty 10) receives any traffic.
+        let free = make_account("free", "sk-ant-api-a");
+        let overage = make_account("overage", "sk-ant-api-b");
+        let state = test_state_with(vec![free, overage]);
+
+        let now = AppState::now_epoch();
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now + 10000);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(1.0);
+            info.reset_5h = Some(now + 3000);
+            info.status_5h = Some("rejected".to_string());
+            info.overage_in_use = true;
+            info.overage_status = Some("allowed".to_string());
+            info.overage_utilization = Some(0.0);
+            info.overage_reset = Some(now + 100000);
+        }
+
+        for _ in 0..100 {
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            assert_eq!(idx, 0, "free account preferred over overage account");
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_account_overage_used_when_free_exhausted() {
+        // Free account at zero weight → the overage account (demoted) is used.
+        let free = make_account("free", "sk-ant-api-a");
+        let overage = make_account("overage", "sk-ant-api-b");
+        let state = test_state_with(vec![free, overage]);
+
+        let now = AppState::now_epoch();
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(1.0); // zero weight
+            info.reset_5h = Some(now + 10000);
+        }
+        {
+            let mut info = state.accounts[1].rate_info.write().await;
+            info.utilization_5h = Some(1.0);
+            info.reset_5h = Some(now + 3000);
+            info.status_5h = Some("rejected".to_string());
+            info.overage_in_use = true;
+            info.overage_status = Some("allowed".to_string());
+            info.overage_utilization = Some(0.0);
+            info.overage_reset = Some(now + 100000);
+        }
+
+        for _ in 0..100 {
+            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            assert_eq!(idx, 1, "overage account used once free tier is exhausted");
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_endpoint_upstream_is_last_resort() {
+        // The fallback upstream (priority 100) is a unified routing candidate: a
+        // healthy account beats it; it is selected only once accounts are exhausted.
+        let state = test_state_with_fallback(vec![make_account("a", "sk-ant-api-a")], 100);
+        let now = AppState::now_epoch();
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now + 10000);
+        }
+
+        for _ in 0..50 {
+            assert_eq!(
+                state.pick_endpoint(None, "", &[]).await,
+                Some(Endpoint::Account(0)),
+                "healthy account beats the priority-100 upstream"
+            );
+        }
+
+        // Hard-limit the account → the upstream is the only remaining candidate.
+        {
+            let mut info = state.accounts[0].rate_info.write().await;
+            info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+        }
+        assert_eq!(
+            state.pick_endpoint(None, "", &[]).await,
+            Some(Endpoint::Upstream(0)),
+            "upstream selected once the account tier is exhausted"
+        );
+    }
+
     #[test]
     fn is_operator_checks_configured_operator() {
         let state = Arc::new(AppState {
@@ -15903,6 +16395,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         assert!(state.is_operator("special-operator"));
@@ -15951,6 +16444,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
         assert!(state.is_operator("ray"));
         assert!(state.is_operator("openclaw"));
@@ -16013,6 +16507,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         // Budget check uses local path when redis is None
@@ -16050,6 +16545,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             remaining_tokens: Some(50000),
             limit_requests: Some(200),
             limit_tokens: Some(100000),
+            overage_in_use: false,
+            overage_status: None,
+            overage_utilization: None,
+            overage_reset: None,
             updated_at: 1700000000,
         };
 
@@ -16084,6 +16583,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             remaining_tokens: None,
             limit_requests: None,
             limit_tokens: None,
+            overage_in_use: false,
+            overage_status: None,
+            overage_utilization: None,
+            overage_reset: None,
             updated_at: 0,
         };
 
@@ -16148,6 +16651,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         // Recording 0 tokens should be a no-op
@@ -16345,6 +16849,10 @@ upstream = "https://api.anthropic.com"
             remaining_tokens: Some(25000),
             limit_requests: Some(200),
             limit_tokens: Some(100000),
+            overage_in_use: false,
+            overage_status: None,
+            overage_utilization: None,
+            overage_reset: None,
             updated_at: now_epoch - 10, // 10s ago — newer than local
         };
 
@@ -16399,6 +16907,10 @@ upstream = "https://api.anthropic.com"
             remaining_tokens: None,
             limit_requests: None,
             limit_tokens: None,
+            overage_in_use: false,
+            overage_status: None,
+            overage_utilization: None,
+            overage_reset: None,
             updated_at: now_epoch - 120, // 120s ago — older than local
         };
 
@@ -16452,6 +16964,10 @@ upstream = "https://api.anthropic.com"
             remaining_tokens: None,
             limit_requests: None,
             limit_tokens: None,
+            overage_in_use: false,
+            overage_status: None,
+            overage_utilization: None,
+            overage_reset: None,
             updated_at: now_epoch - 30,
         };
 
@@ -16513,6 +17029,7 @@ upstream = "https://api.anthropic.com"
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         // Set up some state to persist
@@ -16600,6 +17117,7 @@ upstream = "https://api.anthropic.com"
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         // Load state
@@ -16687,6 +17205,7 @@ upstream = "https://api.anthropic.com"
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         // Pre-populate with yesterday's usage (high usage that would exceed budget)
@@ -16743,6 +17262,7 @@ upstream = "https://api.anthropic.com"
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         // Pre-populate with yesterday's exhausted budget
@@ -17212,6 +17732,7 @@ upstream = "https://api.anthropic.com"
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         // Seed two operator clients and one regular client with token usage
@@ -17461,6 +17982,7 @@ upstream = "https://api.anthropic.com"
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         let app = build_router(state);
@@ -18479,6 +19001,7 @@ upstream = "https://api.anthropic.com"
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         let app = build_router(state);
@@ -18616,6 +19139,7 @@ upstream = "https://api.anthropic.com"
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: None,
+            overage_penalty: 10,
         });
 
         let app = Router::new()
@@ -18906,6 +19430,7 @@ upstream = "https://api.anthropic.com"
                 name: "litellm".to_string(),
                 base_url: mock_url,
                 api_key: "sk-test-key".to_string(),
+                priority: 0,
                 requests: AtomicU64::new(0),
             }],
             client_names: HashMap::new(),
@@ -18927,6 +19452,7 @@ upstream = "https://api.anthropic.com"
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: Some(0), // index into upstreams
+            overage_penalty: 10,
         });
 
         // Hard-limit the only account
@@ -19004,6 +19530,7 @@ upstream = "https://api.anthropic.com"
                 name: "litellm".to_string(),
                 base_url: mock_url,
                 api_key: "sk-test-key".to_string(),
+                priority: 0,
                 requests: AtomicU64::new(0),
             }],
             client_names: HashMap::new(),
@@ -19025,6 +19552,7 @@ upstream = "https://api.anthropic.com"
             instance_id: 0,
             probe_interval_secs: 300,
             fallback_upstream: Some(0),
+            overage_penalty: 10,
         });
 
         {

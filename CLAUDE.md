@@ -93,13 +93,17 @@ OAuth tokens (`sk-ant-oat*`) require the exact system prompt `"You are Claude Co
 
 Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. Requests to `/upstream/{name}/*` are forwarded with `Authorization: Bearer` API key injection.
 
-### Priority Tiers
+### Unified Endpoint Priority
 
-Accounts have a `priority` field (u32, default 0). Lower number = higher priority. `pick_account` tries tier 0 first; only falls to tier 1+ when tier 0 has no viable candidates (hard-limited, soft-limited, or 7d-rejected). Graceful degradation: if ALL tiers are soft-limited, the lowest tier with remaining capacity is used.
+Accounts **and** the `fallback_upstream` share one priority space. Both `[[accounts]]` and `[[upstreams]]` have a `priority` field (u32, default 0; lower = preferred). `pick_endpoint` partitions all candidates by priority and tries tiers in ascending order.
 
-### Fallback Upstream
+Within a tier: healthy candidates (`gate < soft_limit`) are preferred; if none are healthy the tier degrades to its soft-limited candidates. Routing only advances to the next tier when the current tier has **zero total weight** (genuinely exhausted). So `soft_limit` is intra-tier load-shedding — it never causes a tier jump. Free capacity is fully drained before any paid (overage or upstream) tier is touched.
 
-When `fallback_upstream` names an `[[upstreams]]` entry and all accounts are exhausted, the proxy forwards to that upstream with automatic Anthropic↔OpenAI format translation (for `proxy_handler`) or direct passthrough (for `openai_chat_handler`). Streaming is supported in both paths.
+The `fallback_upstream` is a first-class routing candidate at its configured `priority`. Set it high (e.g. 100) so it is tried only after all account tiers; a startup `warn!` fires if its priority is not above every account's. When the upstream endpoint is selected, the request is forwarded with automatic Anthropic↔OpenAI translation (`proxy_handler`) or direct passthrough (`openai_chat_handler`); streaming is supported on both paths.
+
+### Overage Awareness
+
+When an account serves via Anthropic **overage** (paid extra usage — `anthropic-ratelimit-unified-overage-in-use: true`), its exhausted 5h/7d subscription windows are superseded: the routing gate is computed from the overage window instead, so the account stays routable. Its effective priority is demoted by `overage_penalty` (default 10) so free subscription capacity is always preferred. When the overage window itself fills (`overage-utilization` → 1.0) the account's weight drops to 0 and routing moves on. The demotion auto-clears when the subscription window refills (`overage-in-use` goes absent → `false`).
 
 ### Config Fields
 
@@ -119,11 +123,13 @@ When `fallback_upstream` names an `[[upstreams]]` entry and all accounts are exh
 | `emergency_brake` | bool? | true | Enable/disable the emergency brake |
 | `emergency_threshold` | f64? | 0.88 | All-accounts utilization threshold for emergency brake |
 | `redis_url` | string? | none | Redis/Valkey URL for distributed state (`redis://` or `rediss://`) |
-| `fallback_upstream` | string? | none | Name of an `[[upstreams]]` entry to use when all accounts are exhausted |
+| `fallback_upstream` | string? | none | Name of an `[[upstreams]]` entry to route to as a priority tier |
+| `overage_penalty` | u32? | 10 | Priority penalty added to an account while it serves via overage |
 | `accounts[].name` | string | required | Account display name |
 | `accounts[].token` | string | required | API key, OAuth token, or `"passthrough"` |
 | `accounts[].models` | string[]? | [] (all) | Model allowlist (supports `*` suffix wildcards) |
 | `accounts[].priority` | u32? | 0 | Priority tier (0 = highest). Lower tiers tried first |
+| `upstreams[].priority` | u32? | 0 | Priority tier when this upstream is the `fallback_upstream` (set high) |
 
 
 **Key headers parsed:**
@@ -136,6 +142,10 @@ When `fallback_upstream` names an `[[upstreams]]` entry and all accounts are exh
 | `anthropic-ratelimit-unified-7d-utilization` | Raw 7d usage fraction (0.0–1.0) |
 | `anthropic-ratelimit-unified-7d-reset` | Epoch timestamp when 7d window resets |
 | `anthropic-ratelimit-unified-5h-status` / `7d-status` | API pressure signal: `allowed`, `allowed_warning`, `throttled`, `rejected` |
+| `anthropic-ratelimit-unified-overage-in-use` | Account is currently serving via paid overage (always overwritten; absent → `false`) |
+| `anthropic-ratelimit-unified-overage-status` | Overage window status — feeds the routing gate floor while overage is in use |
+| `anthropic-ratelimit-unified-overage-utilization` | Overage budget consumed (0.0–1.0) |
+| `anthropic-ratelimit-unified-overage-reset` | Epoch timestamp when the overage window resets |
 
 **Logged values:** `util_5h` and `util_7d` in request/probe logs show **raw API values** (`info.utilization_5h`, `info.utilization_7d`). The `utilization` field shows the effective (time-adjusted) value used for routing decisions.
 
