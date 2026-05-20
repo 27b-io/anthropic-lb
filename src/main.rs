@@ -6693,16 +6693,13 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
     // Tool calls
     if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
         for tc in tool_calls {
-            let has_name = tc
-                .pointer("/function/name")
-                .and_then(|n| n.as_str())
-                .is_some();
+            let tool_name = tc.pointer("/function/name").and_then(|n| n.as_str());
             let args = tc
                 .pointer("/function/arguments")
                 .and_then(|a| a.as_str())
                 .unwrap_or("");
 
-            if has_name {
+            if let Some(name) = tool_name {
                 // New tool call — close previous block if any
                 if ctx.in_text_block {
                     events.push(make_anthropic_event(
@@ -6739,7 +6736,6 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
 
                 ctx.block_index += 1;
                 ctx.in_tool_use = true;
-                let name = tc.pointer("/function/name").unwrap().as_str().unwrap();
                 let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 events.push(make_anthropic_event(
                     "content_block_start",
