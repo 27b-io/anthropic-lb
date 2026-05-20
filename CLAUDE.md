@@ -97,7 +97,7 @@ Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. R
 
 Accounts **and** the `fallback_upstream` share one priority space. Both `[[accounts]]` and `[[upstreams]]` have a `priority` field (u32, default 0; lower = preferred). `pick_endpoint` partitions all candidates by priority and tries tiers in ascending order.
 
-Within a tier: healthy candidates (`gate < soft_limit`) are preferred; if none are healthy the tier degrades to its soft-limited candidates. Routing only advances to the next tier when the current tier has **zero total weight** (genuinely exhausted). So `soft_limit` is intra-tier load-shedding — it never causes a tier jump. Free capacity is fully drained before any paid (overage or upstream) tier is touched.
+Within a tier: healthy candidates (`gate < soft_limit`) are preferred; if none are healthy, the tier degrades to its soft-limited candidates. Routing only advances to the next tier when the current tier has **zero total weight** (genuinely exhausted). So `soft_limit` is intra-tier load-shedding — it never causes a tier jump. Free capacity is fully drained before any paid (overage or upstream) tier is touched.
 
 The `fallback_upstream` is a first-class routing candidate at its configured `priority`. Set it high (e.g. 100) so it is tried only after all account tiers; a startup `warn!` fires if its priority is not above every account's. When the upstream endpoint is selected, the request is forwarded with automatic Anthropic↔OpenAI translation (`proxy_handler`) or direct passthrough (`openai_chat_handler`); streaming is supported on both paths.
 
