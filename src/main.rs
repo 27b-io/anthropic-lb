@@ -1670,15 +1670,12 @@ fn classify_hard_limit_sync(
 }
 
 impl AppState {
-    /// Display name for an endpoint (account or upstream), for logging.
+    /// Display name for an endpoint (account, upstream, or unified pool), for logging.
     fn endpoint_name(&self, ep: EndpointIdx) -> &str {
         match ep {
             EndpointIdx::Account(i) => &self.accounts[i].name,
             EndpointIdx::Upstream(i) => &self.upstreams[i].name,
-            // Phase 2: AppState.endpoints not yet wired. Filled in Task 7.
-            EndpointIdx::Unified(_) => {
-                unreachable!("EndpointIdx::Unified constructed before AppState.endpoints exists")
-            }
+            EndpointIdx::Unified(i) => &self.endpoints[i].name,
         }
     }
 
@@ -4051,7 +4048,7 @@ async fn proxy_handler(
                     }
                 }
                 Some(EndpointIdx::Unified(_)) => unreachable!(
-                    "EndpointIdx::Unified constructed before routing_candidates wires it"
+                    "Phase 2b: handler dispatch for EndpointIdx::Unified is not yet wired; the startup guard in main() rejects [[endpoints]] configs until this branch lands."
                 ),
                 None => {
                     warn!("all endpoints exhausted");
@@ -7319,7 +7316,7 @@ async fn openai_chat_handler(
                     }
                 }
                 Some(EndpointIdx::Unified(_)) => unreachable!(
-                    "EndpointIdx::Unified constructed before routing_candidates wires it"
+                    "Phase 2b: handler dispatch for EndpointIdx::Unified is not yet wired; the startup guard in main() rejects [[endpoints]] configs until this branch lands."
                 ),
                 None => {
                     warn!("all endpoints exhausted");
@@ -7833,6 +7830,18 @@ async fn main() {
         .unwrap_or_else(|e| panic!("config parse error: {e}"));
     if let Err(msg) = validate_endpoints(&config.endpoints) {
         panic!("{msg}");
+    }
+
+    // TRANSIENT GUARD (Phase 2a → Phase 2b): routing_candidates produces
+    // EndpointIdx::Unified(i) candidates for any populated [[endpoints]],
+    // but handler dispatch for that variant is not wired until Phase 2b.
+    // Selecting a Unified candidate would panic via `unreachable!()`. Refuse
+    // to start until dispatch lands. This block is deleted by Phase 2b.
+    if !config.endpoints.is_empty() {
+        panic!(
+            "config: [[endpoints]] is declared ({} entries) but handler dispatch is not yet wired (Phase 2b incoming). Use [[accounts]] / [[upstreams]] for now.",
+            config.endpoints.len()
+        );
     }
 
     // Set up tracing: stderr (info+) always, plus optional debug log file
