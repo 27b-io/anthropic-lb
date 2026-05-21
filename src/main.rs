@@ -1008,7 +1008,7 @@ impl AppState {
                     // immediately so the dashboard reflects the account coming
                     // back online without waiting for the next probe cycle.
                     if recovered {
-                        self.signal_hard_limit_recovery(acct).await;
+                        self.signal_hard_limit_recovery(&acct.name).await;
                     }
                 }
                 // else: 5xx/529 — leave account state untouched. Next probe cycle retries.
@@ -1068,6 +1068,184 @@ impl AppState {
             }
             Err(e) => {
                 warn!(account = acct.name, error = %e, "probe failed");
+            }
+        }
+    }
+
+    /// Probe a unified-pool endpoint by index to refresh rate-limit headers.
+    /// Skips `Protocol::OpenAI` endpoints — they expose no Anthropic rate-limit
+    /// headers, so a probe would only burn a request. One of the three named
+    /// `match protocol` sites. Mirrors `probe_account`; Phase 4 collapses the
+    /// two once the legacy Account pool is retired.
+    async fn probe_endpoint_unified(&self, idx: usize, model: &str) {
+        let ep = &self.endpoints[idx];
+        if ep.protocol == Protocol::OpenAI {
+            debug!(endpoint = ep.name, "skipping probe for openai endpoint");
+            return;
+        }
+        if ep.passthrough {
+            debug!(
+                endpoint = ep.name,
+                "skipping probe for passthrough endpoint"
+            );
+            return;
+        }
+
+        // Check if hard-limited — don't waste a request
+        {
+            let info = ep.rate_info.read().await;
+            if let Some(until) = info.hard_limited_until {
+                if Instant::now() < until {
+                    debug!(
+                        endpoint = ep.name,
+                        "skipping probe, endpoint is hard-limited"
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Local freshness check: skip if this model's 7d claim was recently
+        // refreshed. Looks up only the model-specific claim key so probing one
+        // family doesn't block another.
+        let now_epoch = Self::now_epoch();
+        {
+            let info = ep.rate_info.read().await;
+            let family = model_family(model);
+            if !family.is_empty() {
+                let claim_key = format!("seven_day_{}", family);
+                if let Some(claim) = info.claims_7d.get(&claim_key) {
+                    let age = now_epoch.saturating_sub(claim.last_seen);
+                    if age < self.probe_interval_secs / 2 {
+                        trace!(
+                            endpoint = ep.name,
+                            probe_model = model,
+                            claim_key,
+                            age_secs = age,
+                            "probe skipped, model claim is fresh"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Distributed probe lock: one pod per endpoint+model per interval.
+        if let Some(redis) = &self.redis {
+            let mut conn = redis.clone();
+            let lock_key = format!("alb:probe:{}:{}", ep.name, model);
+            let lock_ttl = self.probe_interval_secs.max(1);
+            let acquired: redis::RedisResult<bool> = redis::cmd("SET")
+                .arg(&lock_key)
+                .arg(1u8)
+                .arg("NX")
+                .arg("EX")
+                .arg(lock_ttl)
+                .query_async(&mut conn)
+                .await;
+            match acquired {
+                Ok(true) => {} // Lock acquired, proceed with probe
+                Ok(false) => {
+                    trace!(
+                        endpoint = ep.name,
+                        probe_model = model,
+                        "probe skipped, another replica is probing"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    // Fail-open: if Redis is down, probe anyway
+                    trace!(endpoint = ep.name, error = %e, "probe lock failed, probing anyway");
+                }
+            }
+        }
+
+        // The unified Endpoint carries its own base URL (the Account pool used
+        // the global self.upstream).
+        let url = format!("{}/v1/messages", ep.base_url);
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 1,
+            "system": [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}],
+            "messages": [{"role": "user", "content": "."}]
+        });
+
+        let mut req = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", OAUTH_BETA_FLAGS.join(","))
+            .header("user-agent", "claude-cli/2.1.2 (external, cli)")
+            .header("x-app", "cli")
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .json(&body);
+
+        // Inject auth
+        if ep.token.starts_with("sk-ant-api") {
+            req = req.header("x-api-key", &ep.token);
+        } else if ep.token.starts_with("sk-ant-oat") {
+            req = req.header("authorization", format!("Bearer {}", ep.token));
+        } else {
+            req = req.header("x-api-key", &ep.token);
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                self.update_rate_info_for(&ep.rate_info, &ep.name, resp.headers())
+                    .await;
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    self.mark_hard_limited_for(&ep.rate_info, &ep.name, resp.headers())
+                        .await;
+                } else if status.is_success() {
+                    // 2xx only: endpoint is responsive — clear hard limit and
+                    // burst counter. 5xx/529 are upstream errors, not recovery.
+                    let recovered = {
+                        let mut info = ep.rate_info.write().await;
+                        let was_hard_limited = info.hard_limited_until.is_some();
+                        if was_hard_limited {
+                            info.hard_limited_until = None;
+                            debug!(
+                                endpoint = ep.name,
+                                "cleared hard limit after successful probe"
+                            );
+                        }
+                        info.consecutive_burst_429s = 0;
+                        was_hard_limited
+                    };
+                    if recovered {
+                        self.signal_hard_limit_recovery(&ep.name).await;
+                    }
+                }
+                // else: 5xx/529 — leave endpoint state untouched.
+                self.save_state().await;
+                let info = ep.rate_info.read().await;
+                let now_epoch = Self::now_epoch();
+                let (eff_util, constraint, _adj_5h, _adj_7d) =
+                    effective_utilization(&info, now_epoch, model);
+                info!(
+                    endpoint = ep.name,
+                    status = status.as_u16(),
+                    probe_model = model,
+                    utilization = format_args!("{eff_util:.2}"),
+                    util_5h = info
+                        .utilization_5h
+                        .map(|v| format!("{v:.2}"))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    util_7d = info
+                        .utilization_7d
+                        .map(|v| format!("{v:.2}"))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    constraint,
+                    n_claims_7d = info.claims_7d.len(),
+                    "probe complete"
+                );
+            }
+            Err(e) => {
+                warn!(endpoint = ep.name, error = %e, "probe failed");
             }
         }
     }
@@ -2112,10 +2290,13 @@ impl AppState {
     ///
     /// Also refreshes metric gauges and publishes updated routing weights so all
     /// replicas reflect the recovery within the next sync tick.
-    async fn signal_hard_limit_recovery(&self, acct: &Account) {
+    /// Broadcast a hard-limit recovery for an endpoint by name. Pool-agnostic:
+    /// the Redis sentinel key is derived from the name alone, so this serves
+    /// both the legacy Account pool and the unified Endpoint pool.
+    async fn signal_hard_limit_recovery(&self, endpoint_name: &str) {
         if let Some(redis) = &self.redis {
             let mut conn = redis.clone();
-            let key = format!("alb:hard:{}", acct.name);
+            let key = format!("alb:hard:{}", endpoint_name);
             let now_epoch = Self::now_epoch();
             // Lua CAS: only write the sentinel if the current value is absent,
             // already the sentinel, or an expired hard-limit (epoch <= now).
@@ -2366,7 +2547,20 @@ impl AppState {
     /// Update rate limit info from response headers.
     async fn update_rate_info(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
         let acct = &self.accounts[idx];
-        let mut info = acct.rate_info.write().await;
+        self.update_rate_info_for(&acct.rate_info, &acct.name, headers)
+            .await;
+    }
+
+    /// Pool-agnostic core of `update_rate_info`: parses rate-limit headers into
+    /// the supplied `RateLimitInfo` lock. Shared by the legacy Account pool and
+    /// the unified Endpoint pool (`probe_endpoint_unified`).
+    async fn update_rate_info_for(
+        &self,
+        rate_info: &RwLock<RateLimitInfo>,
+        endpoint_name: &str,
+        headers: &reqwest::header::HeaderMap,
+    ) {
+        let mut info = rate_info.write().await;
 
         // Debug: log all ratelimit headers
         for (name, value) in headers.iter() {
@@ -2374,7 +2568,7 @@ impl AppState {
             if name_str.contains("ratelimit") || name_str.contains("retry") {
                 if let Ok(v) = value.to_str() {
                     tracing::trace!(
-                        account = acct.name,
+                        account = endpoint_name,
                         header = name_str,
                         value = v,
                         "rate-limit header"
@@ -2612,7 +2806,7 @@ impl AppState {
         }
 
         trace!(
-            account = acct.name,
+            account = endpoint_name,
             utilization = ?info.utilization,
             util_7d = ?info.utilization_7d,
             util_5h = ?info.utilization_5h,
@@ -2661,7 +2855,7 @@ impl AppState {
                 .unwrap_or(3600); // default 1h if no reset known
 
             let mut conn = redis.clone();
-            let key = format!("alb:rate:{}", acct.name);
+            let key = format!("alb:rate:{}", endpoint_name);
             tokio::spawn(async move {
                 if let Ok(json) = serde_json::to_string(&rate_data) {
                     use redis::AsyncCommands;
@@ -2677,7 +2871,20 @@ impl AppState {
     /// Mark an account as hard rate-limited (got a 429).
     async fn mark_hard_limited(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
         let acct = &self.accounts[idx];
-        let mut info = acct.rate_info.write().await;
+        self.mark_hard_limited_for(&acct.rate_info, &acct.name, headers)
+            .await;
+    }
+
+    /// Pool-agnostic core of `mark_hard_limited`: applies a 429 cooldown to the
+    /// supplied `RateLimitInfo` lock. Shared by the legacy Account pool and the
+    /// unified Endpoint pool (`probe_endpoint_unified`).
+    async fn mark_hard_limited_for(
+        &self,
+        rate_info: &RwLock<RateLimitInfo>,
+        endpoint_name: &str,
+        headers: &reqwest::header::HeaderMap,
+    ) {
+        let mut info = rate_info.write().await;
 
         let raw_retry_after = headers
             .get("retry-after")
@@ -2739,7 +2946,7 @@ impl AppState {
         info.last_updated_epoch = Some(Self::now_epoch());
 
         warn!(
-            account = acct.name,
+            account = endpoint_name,
             cooldown_secs = cooldown.as_secs(),
             retry_after_raw = ?raw_retry_after,
             burst = is_burst_limit,
@@ -2750,7 +2957,7 @@ impl AppState {
         // Propagate to Redis for cross-replica awareness
         if let Some(redis) = &self.redis {
             let mut conn = redis.clone();
-            let key = format!("alb:hard:{}", acct.name);
+            let key = format!("alb:hard:{}", endpoint_name);
             let until_epoch = Self::now_epoch()
                 + cooldown.as_secs()
                 + if cooldown.subsec_nanos() > 0 { 1 } else { 0 };
@@ -4225,7 +4432,7 @@ async fn proxy_handler(
             state.save_state().await;
 
             if recovered {
-                state.signal_hard_limit_recovery(acct).await;
+                state.signal_hard_limit_recovery(&acct.name).await;
             }
 
             // Log with capacity info + inject budget status header
@@ -7452,7 +7659,7 @@ async fn openai_chat_handler(
             state.save_state().await;
 
             if recovered {
-                state.signal_hard_limit_recovery(acct).await;
+                state.signal_hard_limit_recovery(&acct.name).await;
             }
 
             // Compute budget pressure status for response header + log
@@ -8266,6 +8473,36 @@ async fn main() {
                 metrics_state.refresh_metrics_weights().await;
                 metrics_state.publish_routing_weights().await;
                 tokio::time::sleep(FALLBACK_INTERVAL).await;
+            }
+        });
+    }
+
+    // Probe loop for the unified endpoint pool. Mirrors the account probe loop;
+    // probe_endpoint_unified internally skips OpenAI endpoints. Metrics weight
+    // refresh stays on the account loop — the unified pool's metrics migration
+    // is a later task.
+    let n_endpoints = state.endpoints.len();
+    if probe_interval > 0 && n_endpoints > 0 {
+        let probe_state = state.clone();
+        tokio::spawn(async move {
+            const PROBE_MODELS: &[&str] =
+                &["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6"];
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            info!(
+                interval_secs = probe_interval,
+                "starting unified endpoint utilization probes"
+            );
+            loop {
+                for i in 0..n_endpoints {
+                    let ep = &probe_state.endpoints[i];
+                    for model in PROBE_MODELS {
+                        if ep.serves_model(model) {
+                            probe_state.probe_endpoint_unified(i, model).await;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(probe_interval)).await;
             }
         });
     }
@@ -13611,7 +13848,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         state.accounts[0]
             .last_routing_weight
             .store(0u64, Ordering::Relaxed);
-        state.signal_hard_limit_recovery(&state.accounts[0]).await;
+        state
+            .signal_hard_limit_recovery(&state.accounts[0].name)
+            .await;
         // refresh_metrics_weights always writes a value (even zero) — the point
         // is that the method completed without Redis and without panicking.
         let w = f64::from_bits(
@@ -14511,6 +14750,47 @@ data: {\"type\":\"message_stop\"}\n\n";
             state.is_emergency_brake_active().await,
             "brake must fire: anthropic is above threshold; openai must not vote"
         );
+    }
+
+    #[tokio::test]
+    async fn probe_endpoint_unified_skips_openai() {
+        // The mock upstream injects `5h-utilization: 0.25` headers. If the probe
+        // ran, `rate_info.utilization_5h` would become Some(0.25). The OpenAI
+        // skip means the endpoint is never contacted and rate_info stays None.
+        let (mock_url, _h) = spawn_mock_upstream().await;
+        let ep = Endpoint {
+            name: "openai".to_string(),
+            protocol: Protocol::OpenAI,
+            base_url: mock_url,
+            token: "sk-ant-api-test".to_string(),
+            passthrough: false,
+            models: vec![],
+            priority: 100,
+            requests: AtomicU64::new(0),
+            rate_info: RwLock::new(RateLimitInfo::default()),
+            burn_rate: Mutex::new(BurnRate::new()),
+            input_tokens: AtomicU64::new(0),
+            output_tokens: AtomicU64::new(0),
+            cache_creation_tokens: AtomicU64::new(0),
+            cache_read_tokens: AtomicU64::new(0),
+            last_routing_weight: AtomicU64::new(0),
+            last_routing_share: AtomicU64::new(0),
+            last_effective_gate: AtomicU64::new(0),
+        };
+        let mut state = test_state_with(vec![]);
+        Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+        state.probe_endpoint_unified(0, "claude-haiku-4-5").await;
+
+        // rate_info must be untouched: the OpenAI endpoint was skipped, no HTTP
+        // call was made. A naive "probe all endpoints" version would have hit
+        // the mock and set utilization_5h to Some(0.25).
+        let info = state.endpoints[0].rate_info.read().await;
+        assert!(
+            info.utilization_5h.is_none(),
+            "probe must short-circuit for OpenAI endpoints — rate_info must stay untouched"
+        );
+        assert_eq!(state.endpoints[0].requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
