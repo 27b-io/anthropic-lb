@@ -493,6 +493,58 @@ struct Upstream {
     requests: AtomicU64,
 }
 
+/// Unified routing endpoint. Replaces the separate `Account` and `Upstream`
+/// runtime structs (which remain temporarily during the migration). After
+/// Phase 4 cleanup, only this struct survives.
+///
+/// Rate-limit/utilization fields are populated only for `Protocol::Anthropic`.
+/// `Protocol::OpenAI` endpoints carry a stub `RateLimitInfo` (all fields None);
+/// three code sites branch on `protocol` to handle this correctly:
+///   1. `routing_candidates()` — short-circuits to a fixed RoutingCandidate.
+///   2. `is_emergency_brake_active()` — iterates only Anthropic endpoints.
+///   3. probe loop — skips OpenAI endpoints.
+#[allow(dead_code)]
+struct Endpoint {
+    name: String,
+    protocol: Protocol,
+    /// Resolved at startup: api.anthropic.com for Anthropic default, else the
+    /// explicit base_url. No trailing slash.
+    base_url: String,
+    token: String,
+    /// True iff token == "passthrough". Only meaningful for Protocol::Anthropic.
+    passthrough: bool,
+    models: Vec<String>,
+    priority: u32,
+    requests: AtomicU64,
+    rate_info: RwLock<RateLimitInfo>,
+    burn_rate: Mutex<BurnRate>,
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+    cache_creation_tokens: AtomicU64,
+    cache_read_tokens: AtomicU64,
+    last_routing_weight: AtomicU64,
+    last_routing_share: AtomicU64,
+    last_effective_gate: AtomicU64,
+}
+
+#[allow(dead_code)]
+impl Endpoint {
+    /// Check if this endpoint can serve the given model. Empty allowlist = all.
+    /// Identical to the historical `Account::serves_model` predicate.
+    fn serves_model(&self, model: &str) -> bool {
+        if self.models.is_empty() || model.is_empty() {
+            return true;
+        }
+        self.models.iter().any(|pattern| {
+            if let Some(prefix) = pattern.strip_suffix('*') {
+                model.starts_with(prefix)
+            } else {
+                model == pattern
+            }
+        })
+    }
+}
+
 struct AppState {
     client: Client,
     upstream: String,
@@ -563,29 +615,31 @@ impl Account {
     }
 }
 
-/// A routable endpoint: an Anthropic account or the fallback OpenAI-compatible upstream.
-/// Accounts and the fallback upstream share one priority space so routing order is
-/// decided entirely by tier numbers.
+/// Index into one of the runtime endpoint pools. After Phase 4 cleanup this
+/// collapses to a bare `usize`. Kept as an enum during the migration so
+/// `Account`/`Upstream` consumers and the new `Endpoint` consumer can coexist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Endpoint {
+enum EndpointIdx {
     Account(usize),
     Upstream(usize),
+    /// Index into AppState.endpoints (new unified pool).
+    #[allow(dead_code)] // constructed by routing_candidates in Task 8
+    Unified(usize),
 }
 
-impl Endpoint {
-    /// The account index, or None if this is an upstream.
+impl EndpointIdx {
     #[cfg(test)]
     fn account(self) -> Option<usize> {
         match self {
-            Endpoint::Account(i) => Some(i),
-            Endpoint::Upstream(_) => None,
+            EndpointIdx::Account(i) => Some(i),
+            _ => None,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct RoutingCandidate {
-    endpoint: Endpoint,
+    endpoint: EndpointIdx,
     /// Effective priority tier — includes the overage penalty when applicable.
     priority: u32,
     gate_5h: f64,
@@ -1617,19 +1671,23 @@ fn classify_hard_limit_sync(
 
 impl AppState {
     /// Display name for an endpoint (account or upstream), for logging.
-    fn endpoint_name(&self, ep: Endpoint) -> &str {
+    fn endpoint_name(&self, ep: EndpointIdx) -> &str {
         match ep {
-            Endpoint::Account(i) => &self.accounts[i].name,
-            Endpoint::Upstream(i) => &self.upstreams[i].name,
+            EndpointIdx::Account(i) => &self.accounts[i].name,
+            EndpointIdx::Upstream(i) => &self.upstreams[i].name,
+            // Phase 2: AppState.endpoints not yet wired. Filled in Task 7.
+            EndpointIdx::Unified(_) => {
+                unreachable!("EndpointIdx::Unified constructed before AppState.endpoints exists")
+            }
         }
     }
 
-    async fn routing_candidates(&self, model: &str, skip: &[Endpoint]) -> Vec<RoutingCandidate> {
+    async fn routing_candidates(&self, model: &str, skip: &[EndpointIdx]) -> Vec<RoutingCandidate> {
         let now = Instant::now();
         let now_epoch = Self::now_epoch();
         let mut candidates: Vec<RoutingCandidate> = Vec::new();
         for (i, acct) in self.accounts.iter().enumerate() {
-            if skip.contains(&Endpoint::Account(i)) {
+            if skip.contains(&EndpointIdx::Account(i)) {
                 trace!(account = acct.name, "pick: skipping, already tried");
                 continue;
             }
@@ -1698,7 +1756,7 @@ impl AppState {
             );
 
             candidates.push(RoutingCandidate {
-                endpoint: Endpoint::Account(i),
+                endpoint: EndpointIdx::Account(i),
                 priority: effective_priority,
                 gate_5h: rw.gate_5h,
                 gate_7d: rw.gate_7d,
@@ -1712,7 +1770,7 @@ impl AppState {
         // The fallback upstream is a first-class routing candidate at its configured
         // priority. It has no rate-limit data: gate 0 (always "healthy"), weight 1.
         if let Some(u_idx) = self.fallback_upstream {
-            if !skip.contains(&Endpoint::Upstream(u_idx)) {
+            if !skip.contains(&EndpointIdx::Upstream(u_idx)) {
                 let upstream = &self.upstreams[u_idx];
                 trace!(
                     upstream = upstream.name,
@@ -1720,7 +1778,7 @@ impl AppState {
                     "pick: candidate (upstream)"
                 );
                 candidates.push(RoutingCandidate {
-                    endpoint: Endpoint::Upstream(u_idx),
+                    endpoint: EndpointIdx::Upstream(u_idx),
                     priority: upstream.priority,
                     gate_5h: 0.0,
                     gate_7d: 0.0,
@@ -2112,7 +2170,7 @@ impl AppState {
         total_weight: f64,
         affinity_key: Option<&str>,
         tier: u32,
-    ) -> Endpoint {
+    ) -> EndpointIdx {
         let picked = match self.routing_strategy {
             RoutingStrategy::DynamicCapacityV1 => {
                 self.pick_dynamic_capacity_v1(effective, total_weight, affinity_key)
@@ -2153,8 +2211,8 @@ impl AppState {
         &self,
         affinity_key: Option<&str>,
         model: &str,
-        skip: &[Endpoint],
-    ) -> Option<Endpoint> {
+        skip: &[EndpointIdx],
+    ) -> Option<EndpointIdx> {
         let candidates = self.routing_candidates(model, skip).await;
         if candidates.is_empty() {
             debug!("pick: no available endpoints");
@@ -2213,7 +2271,7 @@ impl AppState {
         model: &str,
         skip: &[usize],
     ) -> Option<usize> {
-        let skip: Vec<Endpoint> = skip.iter().map(|&i| Endpoint::Account(i)).collect();
+        let skip: Vec<EndpointIdx> = skip.iter().map(|&i| EndpointIdx::Account(i)).collect();
         self.pick_endpoint(affinity_key, model, &skip)
             .await
             .and_then(|ep| ep.account())
@@ -3877,13 +3935,13 @@ async fn proxy_handler(
             );
             tokio::time::sleep(delay).await;
         }
-        let mut skip: Vec<Endpoint> = Vec::new();
+        let mut skip: Vec<EndpointIdx> = Vec::new();
         let mut saw_529 = false;
         // n accounts + 1 fallback upstream is the candidate ceiling.
         for _attempt in 0..(n + 1) {
             let idx = match state.pick_endpoint(affinity, &model, &skip).await {
-                Some(Endpoint::Account(i)) => i,
-                Some(Endpoint::Upstream(u)) => {
+                Some(EndpointIdx::Account(i)) => i,
+                Some(EndpointIdx::Upstream(u)) => {
                     // All account tiers exhausted — route through the fallback upstream.
                     match try_fallback_upstream(
                         &state,
@@ -3898,11 +3956,14 @@ async fn proxy_handler(
                     {
                         Some(resp) => return resp,
                         None => {
-                            skip.push(Endpoint::Upstream(u));
+                            skip.push(EndpointIdx::Upstream(u));
                             continue;
                         }
                     }
                 }
+                Some(EndpointIdx::Unified(_)) => unreachable!(
+                    "EndpointIdx::Unified constructed before routing_candidates wires it"
+                ),
                 None => {
                     warn!("all endpoints exhausted");
                     return (
@@ -4013,7 +4074,7 @@ async fn proxy_handler(
                 log_429_details(&acct.name, resp).await;
                 state.save_state().await;
                 info!(account = acct.name, "got 429, rotating to next account");
-                skip.push(Endpoint::Account(idx));
+                skip.push(EndpointIdx::Account(idx));
                 continue;
             }
 
@@ -4022,7 +4083,7 @@ async fn proxy_handler(
                 state.save_state().await;
                 warn!(account = acct.name, "got 529, rotating to next account");
                 saw_529 = true;
-                skip.push(Endpoint::Account(idx));
+                skip.push(EndpointIdx::Account(idx));
                 continue;
             }
 
@@ -4034,7 +4095,7 @@ async fn proxy_handler(
                     status = status.as_u16(),
                     "got server error, rotating to next account"
                 );
-                skip.push(Endpoint::Account(idx));
+                skip.push(EndpointIdx::Account(idx));
                 continue;
             }
 
@@ -7141,13 +7202,13 @@ async fn openai_chat_handler(
             );
             tokio::time::sleep(delay).await;
         }
-        let mut skip: Vec<Endpoint> = Vec::new();
+        let mut skip: Vec<EndpointIdx> = Vec::new();
         let mut saw_529 = false;
         // n accounts + 1 fallback upstream is the candidate ceiling.
         for _attempt in 0..(n + 1) {
             let idx = match state.pick_endpoint(affinity, &model, &skip).await {
-                Some(Endpoint::Account(i)) => i,
-                Some(Endpoint::Upstream(u)) => {
+                Some(EndpointIdx::Account(i)) => i,
+                Some(EndpointIdx::Upstream(u)) => {
                     // All account tiers exhausted — the upstream is OpenAI-native,
                     // so forward the original request body without translation.
                     match try_fallback_upstream(
@@ -7163,11 +7224,14 @@ async fn openai_chat_handler(
                     {
                         Some(resp) => return resp,
                         None => {
-                            skip.push(Endpoint::Upstream(u));
+                            skip.push(EndpointIdx::Upstream(u));
                             continue;
                         }
                     }
                 }
+                Some(EndpointIdx::Unified(_)) => unreachable!(
+                    "EndpointIdx::Unified constructed before routing_candidates wires it"
+                ),
                 None => {
                     warn!("all endpoints exhausted");
                     return (
@@ -7237,7 +7301,7 @@ async fn openai_chat_handler(
                 log_429_details(&acct.name, resp).await;
                 state.save_state().await;
                 info!(account = acct.name, "got 429, rotating to next account");
-                skip.push(Endpoint::Account(idx));
+                skip.push(EndpointIdx::Account(idx));
                 continue;
             }
 
@@ -7246,7 +7310,7 @@ async fn openai_chat_handler(
                 state.save_state().await;
                 warn!(account = acct.name, "got 529, rotating to next account");
                 saw_529 = true;
-                skip.push(Endpoint::Account(idx));
+                skip.push(EndpointIdx::Account(idx));
                 continue;
             }
 
@@ -7258,7 +7322,7 @@ async fn openai_chat_handler(
                     status = status.as_u16(),
                     "got server error, rotating to next account"
                 );
-                skip.push(Endpoint::Account(idx));
+                skip.push(EndpointIdx::Account(idx));
                 continue;
             }
 
@@ -16678,7 +16742,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         for _ in 0..50 {
             assert_eq!(
                 state.pick_endpoint(None, "", &[]).await,
-                Some(Endpoint::Account(0)),
+                Some(EndpointIdx::Account(0)),
                 "healthy account beats the priority-100 upstream"
             );
         }
@@ -16690,7 +16754,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
         assert_eq!(
             state.pick_endpoint(None, "", &[]).await,
-            Some(Endpoint::Upstream(0)),
+            Some(EndpointIdx::Upstream(0)),
             "upstream selected once the account tier is exhausted"
         );
     }
