@@ -42,8 +42,6 @@ struct Config {
     /// OpenAI-compatible, distinguished by `protocol`. Replaces [[accounts]]
     /// + [[upstreams]] + fallback_upstream.
     #[serde(default)]
-    #[allow(dead_code)]
-    // Wired into routing in later phases of the unified-endpoints refactor.
     endpoints: Vec<EndpointConfig>,
     accounts: Vec<AccountConfig>,
     /// OpenAI-compatible upstream routes. Requests to /upstream/<name>/... are forwarded.
@@ -120,7 +118,6 @@ struct UpstreamConfig {
 }
 
 #[derive(Deserialize, Clone)]
-#[allow(dead_code)] // Wired into routing in later phases of the unified-endpoints refactor.
 struct EndpointConfig {
     name: String,
     /// Wire format. Default: anthropic (sends to api.anthropic.com via x-api-key).
@@ -503,7 +500,7 @@ struct Upstream {
 ///   1. `routing_candidates()` — short-circuits to a fixed RoutingCandidate.
 ///   2. `is_emergency_brake_active()` — iterates only Anthropic endpoints.
 ///   3. probe loop — skips OpenAI endpoints.
-#[allow(dead_code)]
+#[allow(dead_code)] // fields read by routing in Task 8 (next commit)
 struct Endpoint {
     name: String,
     protocol: Protocol,
@@ -527,7 +524,7 @@ struct Endpoint {
     last_effective_gate: AtomicU64,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // method used by routing_candidates in Task 8 (next commit)
 impl Endpoint {
     /// Check if this endpoint can serve the given model. Empty allowlist = all.
     /// Identical to the historical `Account::serves_model` predicate.
@@ -549,6 +546,11 @@ struct AppState {
     client: Client,
     upstream: String,
     accounts: Vec<Account>,
+    /// Unified endpoints. After Phase 4, this replaces `accounts` and `upstreams`.
+    /// During migration, both sets are populated so consumers can be migrated
+    /// one at a time.
+    #[allow(dead_code)] // read by routing_candidates in Task 8 (next commit)
+    endpoints: Vec<Endpoint>,
     robin: AtomicUsize,
     routing_strategy: RoutingStrategy,
     cooldown: Duration,
@@ -7866,6 +7868,53 @@ async fn main() {
         })
         .collect();
 
+    // Build the unified endpoint vector from the new [[endpoints]] config.
+    // During the migration, the old accounts/upstreams Vecs remain alongside.
+    let endpoints: Vec<Endpoint> = config
+        .endpoints
+        .iter()
+        .map(|ec| {
+            let passthrough = ec.token == "passthrough";
+            let base_url = match ec.protocol {
+                Protocol::Anthropic => ec
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
+                Protocol::OpenAI => ec.base_url.clone().expect(
+                    "validate_endpoints should have rejected an openai endpoint without base_url",
+                ),
+            };
+            info!(
+                name = ec.name,
+                protocol = ?ec.protocol,
+                base_url = base_url.as_str(),
+                priority = ec.priority,
+                passthrough,
+                models = ?ec.models,
+                "loaded endpoint"
+            );
+            Endpoint {
+                name: ec.name.clone(),
+                protocol: ec.protocol,
+                base_url: base_url.trim_end_matches('/').to_string(),
+                token: ec.token.clone(),
+                passthrough,
+                models: ec.models.clone(),
+                priority: ec.priority,
+                requests: AtomicU64::new(0),
+                rate_info: RwLock::new(RateLimitInfo::default()),
+                burn_rate: Mutex::new(BurnRate::new()),
+                input_tokens: AtomicU64::new(0),
+                output_tokens: AtomicU64::new(0),
+                cache_creation_tokens: AtomicU64::new(0),
+                cache_read_tokens: AtomicU64::new(0),
+                last_routing_weight: AtomicU64::new(0),
+                last_routing_share: AtomicU64::new(0),
+                last_effective_gate: AtomicU64::new(0),
+            }
+        })
+        .collect();
+
     if config.proxy_key.is_some() {
         info!("proxy authentication enabled (x-api-key)");
     } else {
@@ -7981,6 +8030,7 @@ async fn main() {
             .expect("failed to build HTTP client"),
         upstream: config.upstream,
         accounts,
+        endpoints,
         robin: AtomicUsize::new(0),
         routing_strategy,
         cooldown,
@@ -8383,6 +8433,7 @@ token = "sk-ant-test"
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(), // unused in unit tests
             accounts,
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy,
             cooldown: Duration::from_secs(60),
@@ -8508,6 +8559,7 @@ token = "sk-ant-test"
                 .unwrap(),
             upstream: upstream_url.to_string(),
             accounts,
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy,
             cooldown: Duration::from_secs(60),
@@ -8610,6 +8662,7 @@ token = "sk-ant-test"
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -10171,6 +10224,7 @@ token = "sk-ant-test"
                 .unwrap(),
             upstream: format!("http://{}", mock_addr),
             accounts,
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -11420,6 +11474,7 @@ token = "sk-ant-test"
                 .unwrap(),
             upstream: upstream_url.to_string(),
             accounts,
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -12098,6 +12153,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts,
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -12201,6 +12257,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -12711,6 +12768,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("acct-a", "sk-ant-api-test-aaa"),
                 make_account("acct-b", "sk-ant-api-test-bbb"),
             ],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -12784,6 +12842,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("acct-a", "sk-ant-api-test-aaa"),
                 make_account("acct-b", "sk-ant-api-test-bbb"),
             ],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -13544,6 +13603,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -13614,6 +13674,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -14410,6 +14471,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("a", "sk-ant-api-x"),
                 make_account("b", "sk-ant-api-y"),
             ],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -14461,6 +14523,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("a", "sk-ant-api-x"),
                 make_account("b", "sk-ant-api-y"),
             ],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -14513,6 +14576,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("a", "sk-ant-api-x"),
                 make_account("b", "sk-ant-api-y"),
             ],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -14567,6 +14631,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -14618,6 +14683,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![acct],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -14671,6 +14737,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("a", "sk-ant-api-x"),
                 make_account("b", "sk-ant-api-y"),
             ],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -14728,6 +14795,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("b", "sk-ant-api-y"),
                 make_account("c", "sk-ant-api-z"),
             ],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -14805,6 +14873,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -14884,6 +14953,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -14978,6 +15048,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("mystery", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -15032,6 +15103,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("known", "sk-ant-api-a"),
                 make_account("unknown", "sk-ant-api-b"),
             ],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -15133,6 +15205,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -15212,6 +15285,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -15258,6 +15332,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -15480,6 +15555,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: mock_url.clone(),
             accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -15544,6 +15620,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: mock_url.clone(),
             accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -15605,6 +15682,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("a", "sk-ant-api-test-aaa"),
                 make_account("b", "sk-ant-api-test-bbb"),
             ],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -15674,6 +15752,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 make_account("a", "sk-ant-api-test-aaa"),
                 make_account("b", "sk-ant-api-test-bbb"),
             ],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -15740,6 +15819,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: mock_url.clone(),
             accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -15801,6 +15881,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: mock_url.clone(),
             accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -15913,6 +15994,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client: Client::new(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -15987,6 +16069,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client: Client::new(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -16041,6 +16124,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client: Client::new(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -16765,6 +16849,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client: Client::new(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -16810,6 +16895,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             client: Client::new(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -16877,6 +16963,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -17021,6 +17108,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -17399,6 +17487,7 @@ upstream = "https://api.anthropic.com"
                 make_account("primary", "sk-ant-api-aaa"),
                 make_account("secondary", "sk-ant-api-bbb"),
             ],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -17487,6 +17576,7 @@ upstream = "https://api.anthropic.com"
                 make_account("primary", "sk-ant-api-aaa"),
                 make_account("secondary", "sk-ant-api-bbb"),
             ],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -17575,6 +17665,7 @@ upstream = "https://api.anthropic.com"
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -17632,6 +17723,7 @@ upstream = "https://api.anthropic.com"
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -18102,6 +18194,7 @@ upstream = "https://api.anthropic.com"
                 .unwrap(),
             upstream: mock_url.clone(),
             accounts,
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -18352,6 +18445,7 @@ upstream = "https://api.anthropic.com"
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts,
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -19371,6 +19465,7 @@ upstream = "https://api.anthropic.com"
                 .unwrap(),
             upstream: format!("http://{}", mock_addr),
             accounts,
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -19509,6 +19604,7 @@ upstream = "https://api.anthropic.com"
                 .unwrap(),
             upstream: format!("http://{}", mock_addr),
             accounts,
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -19816,6 +19912,7 @@ upstream = "https://api.anthropic.com"
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(), // unused — accounts are hard-limited
             accounts: vec![make_account("acct-a", "sk-ant-api-a")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
@@ -19916,6 +20013,7 @@ upstream = "https://api.anthropic.com"
                 .unwrap(),
             upstream: "http://127.0.0.1:1".to_string(),
             accounts: vec![make_account("acct-a", "sk-ant-api-a")],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
