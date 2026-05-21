@@ -7565,6 +7565,66 @@ async fn openai_chat_handler(
 
 // ── Main ────────────────────────────────────────────────────────────
 
+/// Validate endpoint configuration. Returns the first hard error encountered.
+/// Soft warnings (non-canonical anthropic host, priority collision with an
+/// openai endpoint) are emitted as `warn!` and do not return an error.
+fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
+    for ep in endpoints {
+        if let Some(url) = ep.base_url.as_deref() {
+            if !url.starts_with("https://") {
+                return Err(format!(
+                    "endpoint '{}': base_url must start with https:// (got '{}')",
+                    ep.name, url
+                ));
+            }
+        }
+        match ep.protocol {
+            Protocol::OpenAI => {
+                if ep.base_url.is_none() {
+                    return Err(format!(
+                        "endpoint '{}': base_url is required for protocol = openai",
+                        ep.name
+                    ));
+                }
+            }
+            Protocol::Anthropic => {
+                if let Some(url) = ep.base_url.as_deref() {
+                    if !url.starts_with("https://api.anthropic.com") {
+                        warn!(
+                            endpoint = ep.name,
+                            base_url = url,
+                            "anthropic endpoint base_url is non-canonical — verify this is intentional"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Priority-collision warning: an OpenAI endpoint sharing the lowest tier
+    // with any Anthropic endpoint recreates the bug §Problem cites.
+    let lowest = endpoints.iter().map(|e| e.priority).min().unwrap_or(0);
+    let openai_at_lowest: Vec<&str> = endpoints
+        .iter()
+        .filter(|e| e.protocol == Protocol::OpenAI && e.priority == lowest)
+        .map(|e| e.name.as_str())
+        .collect();
+    let anthropic_at_lowest: Vec<&str> = endpoints
+        .iter()
+        .filter(|e| e.protocol == Protocol::Anthropic && e.priority == lowest)
+        .map(|e| e.name.as_str())
+        .collect();
+    if !openai_at_lowest.is_empty() && !anthropic_at_lowest.is_empty() {
+        warn!(
+            priority = lowest,
+            openai = ?openai_at_lowest,
+            anthropic = ?anthropic_at_lowest,
+            "openai endpoint(s) share the lowest priority tier with anthropic endpoint(s) — paid OpenAI capacity will compete with free Anthropic capacity"
+        );
+    }
+    Ok(())
+}
+
 /// Reject removed config keys with explicit errors. Run after the raw TOML
 /// has been parsed to a `toml::Value`, before strongly-typed deserialization.
 ///
@@ -7612,6 +7672,9 @@ async fn main() {
     let config: Config = raw_value
         .try_into()
         .unwrap_or_else(|e| panic!("config parse error: {e}"));
+    if let Err(msg) = validate_endpoints(&config.endpoints) {
+        panic!("{msg}");
+    }
 
     // Set up tracing: stderr (info+) always, plus optional debug log file
     {
@@ -8149,6 +8212,72 @@ token = "sk-ant-test"
 "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         assert!(reject_legacy_config_keys(&value).is_ok());
+    }
+
+    #[test]
+    fn validate_endpoints_warns_on_non_anthropic_host() {
+        let endpoints = vec![EndpointConfig {
+            name: "primary".to_string(),
+            protocol: Protocol::Anthropic,
+            base_url: Some("https://staging.anthropic.example".to_string()),
+            token: "sk-ant".to_string(),
+            models: vec![],
+            priority: 0,
+        }];
+        assert!(validate_endpoints(&endpoints).is_ok());
+    }
+
+    #[test]
+    fn validate_endpoints_rejects_http_base_url() {
+        let endpoints = vec![EndpointConfig {
+            name: "primary".to_string(),
+            protocol: Protocol::Anthropic,
+            base_url: Some("http://insecure.example".to_string()),
+            token: "sk-ant".to_string(),
+            models: vec![],
+            priority: 0,
+        }];
+        let err = validate_endpoints(&endpoints).unwrap_err();
+        assert!(err.contains("https"), "error must mention https: {err}");
+        assert!(err.contains("primary"));
+    }
+
+    #[test]
+    fn validate_endpoints_requires_base_url_for_openai() {
+        let endpoints = vec![EndpointConfig {
+            name: "gateway".to_string(),
+            protocol: Protocol::OpenAI,
+            base_url: None,
+            token: "sk-test".to_string(),
+            models: vec![],
+            priority: 100,
+        }];
+        let err = validate_endpoints(&endpoints).unwrap_err();
+        assert!(err.contains("base_url"));
+        assert!(err.contains("gateway"));
+    }
+
+    #[test]
+    fn validate_endpoints_accepts_well_formed_mix() {
+        let endpoints = vec![
+            EndpointConfig {
+                name: "primary".to_string(),
+                protocol: Protocol::Anthropic,
+                base_url: None,
+                token: "sk-ant".to_string(),
+                models: vec![],
+                priority: 0,
+            },
+            EndpointConfig {
+                name: "gateway".to_string(),
+                protocol: Protocol::OpenAI,
+                base_url: Some("https://gateway.example".to_string()),
+                token: "sk-test".to_string(),
+                models: vec![],
+                priority: 100,
+            },
+        ];
+        assert!(validate_endpoints(&endpoints).is_ok());
     }
 
     // ── Helpers ──────────────────────────────────────────────────────
