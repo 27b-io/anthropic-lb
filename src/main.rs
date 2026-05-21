@@ -3543,6 +3543,27 @@ impl AppState {
             }
         }
 
+        // Unified endpoints — ONLY Protocol::Anthropic. OpenAI endpoints carry a
+        // stub RateLimitInfo (all None) which effective_utilization() resolves to
+        // (0.5, "unknown"); including them would force all_above = false and the
+        // brake could never fire. One of the three named `match protocol` sites.
+        if all_above {
+            for ep in &self.endpoints {
+                if ep.protocol != Protocol::Anthropic {
+                    continue;
+                }
+                let info = ep.rate_info.read().await;
+                let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
+                if source != "unknown" {
+                    any_known = true;
+                }
+                if util < self.emergency_threshold {
+                    all_above = false;
+                    break;
+                }
+            }
+        }
+
         // Fail-open: if no account has real data, don't activate
         all_above && any_known
     }
@@ -14449,6 +14470,46 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(
             util0 >= DEFAULT_EMERGENCY_THRESHOLD,
             "util should be >= threshold: {util0}"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_brake_fires_when_only_anthropic_above_threshold_with_openai_present() {
+        // 1 anthropic account at utilization 0.95, 1 openai endpoint with stub rate info.
+        // A naive "iterate all endpoints" version sees the openai stub at (0.5, "unknown")
+        // and forces all_above = false → brake never fires. The correct "skip OpenAI"
+        // version excludes it and the brake fires.
+        let acct = make_account("anthropic", "sk-ant");
+        {
+            let mut info = acct.rate_info.write().await;
+            info.utilization = Some(0.95);
+            info.utilization_5h = Some(0.95);
+        }
+        let mut state = test_state_with(vec![acct]);
+        let st = Arc::get_mut(&mut state).expect("uniquely owned");
+        st.endpoints.push(Endpoint {
+            name: "openai".to_string(),
+            protocol: Protocol::OpenAI,
+            base_url: "https://gateway.example".to_string(),
+            token: "sk".to_string(),
+            passthrough: false,
+            models: vec![],
+            priority: 100,
+            requests: AtomicU64::new(0),
+            rate_info: RwLock::new(RateLimitInfo::default()),
+            burn_rate: Mutex::new(BurnRate::new()),
+            input_tokens: AtomicU64::new(0),
+            output_tokens: AtomicU64::new(0),
+            cache_creation_tokens: AtomicU64::new(0),
+            cache_read_tokens: AtomicU64::new(0),
+            last_routing_weight: AtomicU64::new(0),
+            last_routing_share: AtomicU64::new(0),
+            last_effective_gate: AtomicU64::new(0),
+        });
+        st.emergency_threshold = 0.88;
+        assert!(
+            state.is_emergency_brake_active().await,
+            "brake must fire: anthropic is above threshold; openai must not vote"
         );
     }
 
