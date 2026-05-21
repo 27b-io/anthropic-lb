@@ -3572,8 +3572,6 @@ enum UsageTarget {
     /// Index into AppState.accounts (legacy pool).
     Account(usize),
     /// Index into AppState.endpoints (unified pool).
-    #[allow(dead_code)]
-    // wired up in Task 9 (forward_anthropic for Unified Anthropic endpoint)
     Unified(usize),
 }
 
@@ -3628,9 +3626,9 @@ impl AppState {
     }
 
     /// Update burn rate for an account and per-client request tracking.
-    fn update_burn_rate(&self, acct: &Account, client_id: &str) {
+    fn update_burn_rate(&self, burn_rate: &Mutex<BurnRate>, client_id: &str) {
         let now = Instant::now();
-        if let Ok(mut br) = acct.burn_rate.lock() {
+        if let Ok(mut br) = burn_rate.lock() {
             br.update(now);
         }
         if let Ok(mut rates) = self.client_request_rates.lock() {
@@ -4174,6 +4172,352 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 
 // ── Handler ─────────────────────────────────────────────────────────
 
+/// Outcome of a single forward attempt to an Anthropic-protocol endpoint.
+/// The retry loop in `proxy_handler` interprets the outcome:
+///   - `Done(resp)`: final response — return it to the caller.
+///   - `Retry { saw_529, push_skip }`: try the next candidate. If
+///     `push_skip` is true the caller appends the failed endpoint index to
+///     its `skip` list; if `saw_529` is true the loop will BEBO-retry once
+///     this round exhausts.
+enum ForwardOutcome {
+    Done(Response),
+    Retry { saw_529: bool, push_skip: bool },
+}
+
+/// Forward one Anthropic-protocol request to a single endpoint. Pool-agnostic:
+/// reusable for both `AppState.accounts` (legacy) and `AppState.endpoints`
+/// (unified) by passing the endpoint's identity, auth, and shared state in
+/// explicitly. Behavior is byte-for-byte equivalent to the prior inline block
+/// in `proxy_handler` — only the `EndpointIdx::X(i)` value used for `skip` is
+/// chosen by the caller, since this helper does not know which pool it's
+/// serving.
+#[allow(clippy::too_many_arguments)]
+async fn forward_anthropic(
+    state: &Arc<AppState>,
+    parts: &axum::http::request::Parts,
+    body_bytes: &bytes::Bytes,
+    oauth_body_bytes: &bytes::Bytes,
+    base_url: &str,
+    token: &str,
+    passthrough: bool,
+    endpoint_name: &str,
+    usage_target: UsageTarget,
+    requests_counter: &AtomicU64,
+    rate_info: &RwLock<RateLimitInfo>,
+    burn_rate: &Mutex<BurnRate>,
+    req_id: &str,
+    client_id: &str,
+    client_ver: &str,
+    client_ip: &std::net::IpAddr,
+    agent_id: &str,
+    session_id: &str,
+    model: &str,
+    request_start: std::time::Instant,
+) -> ForwardOutcome {
+    let url = format!(
+        "{}{}",
+        base_url,
+        parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/")
+    );
+
+    let mut upstream_req = state.client.request(parts.method.clone(), &url);
+
+    // Forward headers
+    let mut headers = parts.headers.clone();
+    headers.remove("host");
+    headers.remove("content-length"); // body size may change after cache injection
+    headers.remove("accept-encoding"); // need plaintext SSE to extract token usage
+
+    // Default anthropic-version if client didn't set it
+    if !headers.contains_key("anthropic-version") {
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    }
+
+    // Auth: passthrough keeps caller's headers, otherwise inject account token
+    inject_account_auth(&mut headers, token, passthrough);
+
+    // Debug: log outbound auth method and key headers
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let auth_method = if passthrough {
+            "passthrough"
+        } else if token.starts_with("sk-ant-oat") {
+            "oauth"
+        } else {
+            "api-key"
+        };
+        debug!(
+            req_id,
+            account = endpoint_name,
+            auth_method,
+            body_bytes = if token.starts_with("sk-ant-oat") {
+                oauth_body_bytes.len()
+            } else {
+                body_bytes.len()
+            },
+            has_anthropic_beta = headers
+                .get("anthropic-beta")
+                .map(|v| v.to_str().unwrap_or("-")),
+            has_anthropic_version = headers
+                .get("anthropic-version")
+                .map(|v| v.to_str().unwrap_or("-")),
+            "<<< outbound to upstream"
+        );
+    }
+
+    upstream_req = upstream_req.headers(headers);
+    // Use OAuth variant (with CC system prompt) for OAuth tokens
+    let req_body = if token.starts_with("sk-ant-oat") {
+        oauth_body_bytes
+    } else {
+        body_bytes
+    };
+    upstream_req = upstream_req.body(req_body.clone());
+
+    let mut resp = match upstream_req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(account = endpoint_name, "upstream request failed: {e}");
+            // Preserve original behavior: transport errors retry without
+            // adding the endpoint to the skip list.
+            return ForwardOutcome::Retry {
+                saw_529: false,
+                push_skip: false,
+            };
+        }
+    };
+
+    let status = resp.status();
+    requests_counter.fetch_add(1, Ordering::Relaxed);
+
+    // Debug: dump all response headers
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        debug!(
+            req_id,
+            status = status.as_u16(),
+            account = endpoint_name,
+            "<<< upstream response"
+        );
+        for (k, v) in resp.headers().iter() {
+            debug!(req_id, header = %k, value = debug_header_value(k, v), "<<< resp header");
+        }
+    }
+
+    // Always update rate limit info and persist
+    state
+        .update_rate_info_for(rate_info, endpoint_name, resp.headers())
+        .await;
+
+    // Update burn rate (after rate-limit headers are parsed)
+    state.update_burn_rate(burn_rate, client_id);
+
+    // 429 → mark hard-limited and try next account
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        state
+            .mark_hard_limited_for(rate_info, endpoint_name, resp.headers())
+            .await;
+        log_429_details(endpoint_name, resp).await;
+        state.save_state().await;
+        info!(account = endpoint_name, "got 429, rotating to next account");
+        return ForwardOutcome::Retry {
+            saw_529: false,
+            push_skip: true,
+        };
+    }
+
+    // 529 → overloaded, try next account; flag for BEBO retry if all exhausted
+    if status.as_u16() == 529 {
+        state.save_state().await;
+        warn!(account = endpoint_name, "got 529, rotating to next account");
+        return ForwardOutcome::Retry {
+            saw_529: true,
+            push_skip: true,
+        };
+    }
+
+    // Other 5xx → transient, try next account (no BEBO retry)
+    if status.is_server_error() {
+        state.save_state().await;
+        warn!(
+            account = endpoint_name,
+            status = status.as_u16(),
+            "got server error, rotating to next account"
+        );
+        return ForwardOutcome::Retry {
+            saw_529: false,
+            push_skip: true,
+        };
+    }
+
+    // Clear hard limit and burst counter only on a genuine 2xx success.
+    // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
+    // that the rate-limit window has drained — don't clobber state on
+    // client errors.
+    let recovered = if status.is_success() {
+        let mut info = rate_info.write().await;
+        let was = info.hard_limited_until.is_some();
+        info.hard_limited_until = None;
+        info.consecutive_burst_429s = 0;
+        was
+    } else {
+        false
+    };
+
+    // Persist state after updating rate-limit state so completed 4xx
+    // responses and other terminal outcomes aren't dropped on restart.
+    state.save_state().await;
+
+    if recovered {
+        state.signal_hard_limit_recovery(endpoint_name).await;
+    }
+
+    // Log with capacity info + inject budget status header
+    let budget_status = {
+        let info = rate_info.read().await;
+        let (eff_util, constraint, _adj_5h, _adj_7d) =
+            effective_utilization(&info, AppState::now_epoch(), model);
+        info!(
+            req_id,
+            client = %client_ip,
+            client_id = %client_id,
+            ver = %client_ver,
+            agent = %agent_id,
+            session = %session_id,
+            model = %model,
+            account = endpoint_name,
+            status = status.as_u16(),
+            utilization = format_args!("{eff_util:.2}"),
+            util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+            util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+            constraint,
+            overage = info.overage_in_use,
+            total = requests_counter.load(Ordering::Relaxed),
+            "proxied"
+        );
+        compute_pressure_status(eff_util, client_id, state)
+    };
+
+    let latency_ms = request_start.elapsed().as_millis() as u64;
+
+    // Stream response through, extracting token usage
+    let resp_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let resp_headers = resp.headers().clone();
+
+    let mut builder = Response::builder().status(resp_status);
+    for (k, v) in resp_headers.iter() {
+        if k == "transfer-encoding" {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+
+    // Inject budget status header
+    builder = builder.header("x-budget-status", budget_status);
+
+    // Detect streaming from content-type
+    let is_streaming = resp_headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false);
+
+    if is_streaming {
+        // Streaming: tee the byte stream to accumulate SSE text for usage extraction
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+        let state_clone = state.clone();
+        let client_id_clone = client_id.to_owned();
+        let acct_name = endpoint_name.to_owned();
+        let model_clone = model.to_owned();
+        let client_ip_str = client_ip.to_string();
+        let agent_clone = agent_id.to_owned();
+        let session_clone = session_id.to_owned();
+        let req_id_clone = req_id.to_owned();
+        let status_code = status.as_u16();
+
+        tokio::spawn(async move {
+            let mut sse_buf = Vec::new();
+            let mut client_disconnected = false;
+            let mut upstream_error = false;
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        sse_buf.extend_from_slice(&chunk);
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            client_disconnected = true;
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        upstream_error = true;
+                        warn!(req_id = req_id_clone, error = %e, "upstream SSE read failed");
+                        break;
+                    }
+                }
+            }
+            // Parse accumulated SSE data for usage
+            finalize_stream(
+                &state_clone,
+                usage_target,
+                &req_id_clone,
+                &client_id_clone,
+                &model_clone,
+                &acct_name,
+                &client_ip_str,
+                &agent_clone,
+                &session_clone,
+                status_code,
+                &sse_buf,
+                request_start,
+                client_disconnected,
+                upstream_error,
+                false,
+            )
+            .await;
+        });
+
+        let body_stream = ReceiverStream::new(rx);
+        let response = builder
+            .body(Body::from_stream(body_stream))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+            });
+        ForwardOutcome::Done(response)
+    } else {
+        // Non-streaming: buffer, extract usage, forward
+        let resp_body_bytes = resp.bytes().await.unwrap_or_default();
+        let mut usage = TokenUsage::default();
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&resp_body_bytes) {
+            usage = TokenUsage::from_response_body(&parsed);
+        }
+        finalize_non_stream(
+            state,
+            usage_target,
+            req_id,
+            client_id,
+            model,
+            endpoint_name,
+            &client_ip.to_string(),
+            agent_id,
+            session_id,
+            status.as_u16(),
+            &usage,
+            latency_ms,
+            false,
+        )
+        .await;
+        let response = builder
+            .body(Body::from(resp_body_bytes))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+            });
+        ForwardOutcome::Done(response)
+    }
+}
+
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -4319,325 +4663,132 @@ async fn proxy_handler(
         let mut saw_529 = false;
         // n accounts + 1 fallback upstream is the candidate ceiling.
         for _attempt in 0..(n + 1) {
-            let idx = match state.pick_endpoint(affinity, &model, &skip).await {
-                Some(EndpointIdx::Account(i)) => i,
-                Some(EndpointIdx::Upstream(u)) => {
-                    // All account tiers exhausted — route through the fallback upstream.
-                    match try_fallback_upstream(
-                        &state,
-                        &body_bytes,
-                        &req_id,
-                        &client_id,
-                        &model,
-                        u,
-                        true,
-                    )
-                    .await
-                    {
-                        Some(resp) => return resp,
-                        None => {
-                            skip.push(EndpointIdx::Upstream(u));
-                            continue;
+            // Pick the next candidate. Each branch resolves the call to
+            // `forward_anthropic` (Anthropic-protocol endpoints — accounts or
+            // unified Anthropic) or `try_fallback_upstream*` (OpenAI-protocol).
+            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) =
+                match state.pick_endpoint(affinity, &model, &skip).await {
+                    Some(EndpointIdx::Account(i)) => {
+                        let acct = &state.accounts[i];
+                        let out = forward_anthropic(
+                            &state,
+                            &parts,
+                            &body_bytes,
+                            &oauth_body_bytes,
+                            &state.upstream,
+                            &acct.token,
+                            acct.passthrough,
+                            &acct.name,
+                            UsageTarget::Account(i),
+                            &acct.requests,
+                            &acct.rate_info,
+                            &acct.burn_rate,
+                            &req_id,
+                            &client_id,
+                            &client_ver,
+                            &client_ip,
+                            &agent_id,
+                            &session_id,
+                            &model,
+                            request_start,
+                        )
+                        .await;
+                        (out, EndpointIdx::Account(i))
+                    }
+                    Some(EndpointIdx::Upstream(u)) => {
+                        // All account tiers exhausted — route through the fallback upstream.
+                        match try_fallback_upstream(
+                            &state,
+                            &body_bytes,
+                            &req_id,
+                            &client_id,
+                            &model,
+                            u,
+                            true,
+                        )
+                        .await
+                        {
+                            Some(resp) => return resp,
+                            None => {
+                                skip.push(EndpointIdx::Upstream(u));
+                                continue;
+                            }
                         }
                     }
-                }
-                Some(EndpointIdx::Unified(_)) => unreachable!(
-                    "Phase 2b: handler dispatch for EndpointIdx::Unified is not yet wired; the startup guard in main() rejects [[endpoints]] configs until this branch lands."
-                ),
-                None => {
-                    warn!("all endpoints exhausted");
-                    return (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "all upstream endpoints exhausted",
-                    )
-                        .into_response();
-                }
-            };
-
-            let acct = &state.accounts[idx];
-            let url = format!(
-                "{}{}",
-                state.upstream,
-                parts
-                    .uri
-                    .path_and_query()
-                    .map(|pq| pq.as_str())
-                    .unwrap_or("/")
-            );
-
-            let mut upstream_req = state.client.request(parts.method.clone(), &url);
-
-            // Forward headers
-            let mut headers = parts.headers.clone();
-            headers.remove("host");
-            headers.remove("content-length"); // body size may change after cache injection
-            headers.remove("accept-encoding"); // need plaintext SSE to extract token usage
-
-            // Default anthropic-version if client didn't set it
-            if !headers.contains_key("anthropic-version") {
-                headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-            }
-
-            // Auth: passthrough keeps caller's headers, otherwise inject account token
-            inject_account_auth(&mut headers, &acct.token, acct.passthrough);
-
-            // Debug: log outbound auth method and key headers
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                let auth_method = if acct.passthrough {
-                    "passthrough"
-                } else if acct.token.starts_with("sk-ant-oat") {
-                    "oauth"
-                } else {
-                    "api-key"
-                };
-                debug!(
-                    req_id,
-                    account = acct.name,
-                    auth_method,
-                    body_bytes = if acct.token.starts_with("sk-ant-oat") {
-                        oauth_body_bytes.len()
-                    } else {
-                        body_bytes.len()
-                    },
-                    has_anthropic_beta = headers
-                        .get("anthropic-beta")
-                        .map(|v| v.to_str().unwrap_or("-")),
-                    has_anthropic_version = headers
-                        .get("anthropic-version")
-                        .map(|v| v.to_str().unwrap_or("-")),
-                    "<<< outbound to upstream"
-                );
-            }
-
-            upstream_req = upstream_req.headers(headers);
-            // Use OAuth variant (with CC system prompt) for OAuth tokens
-            let req_body = if acct.token.starts_with("sk-ant-oat") {
-                &oauth_body_bytes
-            } else {
-                &body_bytes
-            };
-            upstream_req = upstream_req.body(req_body.clone());
-
-            let mut resp = match upstream_req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    error!(account = acct.name, "upstream request failed: {e}");
-                    continue;
-                }
-            };
-
-            let status = resp.status();
-            acct.requests.fetch_add(1, Ordering::Relaxed);
-
-            // Debug: dump all response headers
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(
-                    req_id,
-                    status = status.as_u16(),
-                    account = acct.name,
-                    "<<< upstream response"
-                );
-                for (k, v) in resp.headers().iter() {
-                    debug!(req_id, header = %k, value = debug_header_value(k, v), "<<< resp header");
-                }
-            }
-
-            // Always update rate limit info and persist
-            state.update_rate_info(idx, resp.headers()).await;
-
-            // Update burn rate (after rate-limit headers are parsed)
-            state.update_burn_rate(acct, &client_id);
-
-            // 429 → mark hard-limited and try next account
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                state.mark_hard_limited(idx, resp.headers()).await;
-                log_429_details(&acct.name, resp).await;
-                state.save_state().await;
-                info!(account = acct.name, "got 429, rotating to next account");
-                skip.push(EndpointIdx::Account(idx));
-                continue;
-            }
-
-            // 529 → overloaded, try next account; flag for BEBO retry if all exhausted
-            if status.as_u16() == 529 {
-                state.save_state().await;
-                warn!(account = acct.name, "got 529, rotating to next account");
-                saw_529 = true;
-                skip.push(EndpointIdx::Account(idx));
-                continue;
-            }
-
-            // Other 5xx → transient, try next account (no BEBO retry)
-            if status.is_server_error() {
-                state.save_state().await;
-                warn!(
-                    account = acct.name,
-                    status = status.as_u16(),
-                    "got server error, rotating to next account"
-                );
-                skip.push(EndpointIdx::Account(idx));
-                continue;
-            }
-
-            // Clear hard limit and burst counter only on a genuine 2xx success.
-            // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
-            // that the rate-limit window has drained — don't clobber state on
-            // client errors.
-            let recovered = if status.is_success() {
-                let mut info = acct.rate_info.write().await;
-                let was = info.hard_limited_until.is_some();
-                info.hard_limited_until = None;
-                info.consecutive_burst_429s = 0;
-                was
-            } else {
-                false
-            };
-
-            // Persist state after updating rate-limit state so completed 4xx
-            // responses and other terminal outcomes aren't dropped on restart.
-            state.save_state().await;
-
-            if recovered {
-                state.signal_hard_limit_recovery(&acct.name).await;
-            }
-
-            // Log with capacity info + inject budget status header
-            let budget_status = {
-                let info = acct.rate_info.read().await;
-                let (eff_util, constraint, _adj_5h, _adj_7d) =
-                    effective_utilization(&info, AppState::now_epoch(), &model);
-                info!(
-                    req_id,
-                    client = %client_ip,
-                    client_id = %client_id,
-                    ver = %client_ver,
-                    agent = %agent_id,
-                    session = %session_id,
-                    model = %model,
-                    account = acct.name,
-                    status = status.as_u16(),
-                    utilization = format_args!("{eff_util:.2}"),
-                    util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-                    util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-                    constraint,
-                    overage = info.overage_in_use,
-                    total = acct.requests.load(Ordering::Relaxed),
-                    "proxied"
-                );
-                compute_pressure_status(eff_util, &client_id, &state)
-            };
-
-            let latency_ms = request_start.elapsed().as_millis() as u64;
-
-            // Stream response through, extracting token usage
-            let resp_status =
-                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let resp_headers = resp.headers().clone();
-
-            let mut builder = Response::builder().status(resp_status);
-            for (k, v) in resp_headers.iter() {
-                if k == "transfer-encoding" {
-                    continue;
-                }
-                builder = builder.header(k, v);
-            }
-
-            // Inject budget status header
-            builder = builder.header("x-budget-status", budget_status);
-
-            // Detect streaming from content-type
-            let is_streaming = resp_headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .map(|ct| ct.contains("text/event-stream"))
-                .unwrap_or(false);
-
-            if is_streaming {
-                // Streaming: tee the byte stream to accumulate SSE text for usage extraction
-                let (tx, rx) =
-                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
-                let state_clone = state.clone();
-                let client_id_clone = client_id.clone();
-                let acct_name = acct.name.clone();
-                let model_clone = model.clone();
-                let client_ip_str = client_ip.to_string();
-                let agent_clone = agent_id.clone();
-                let session_clone = session_id.clone();
-
-                tokio::spawn(async move {
-                    let mut sse_buf = Vec::new();
-                    let mut client_disconnected = false;
-                    let mut upstream_error = false;
-                    loop {
-                        match resp.chunk().await {
-                            Ok(Some(chunk)) => {
-                                sse_buf.extend_from_slice(&chunk);
-                                if tx.send(Ok(chunk)).await.is_err() {
-                                    client_disconnected = true;
-                                    break;
+                    Some(EndpointIdx::Unified(i)) => {
+                        let ep = &state.endpoints[i];
+                        match ep.protocol {
+                            Protocol::Anthropic => {
+                                let out = forward_anthropic(
+                                    &state,
+                                    &parts,
+                                    &body_bytes,
+                                    &oauth_body_bytes,
+                                    &ep.base_url,
+                                    &ep.token,
+                                    ep.passthrough,
+                                    &ep.name,
+                                    UsageTarget::Unified(i),
+                                    &ep.requests,
+                                    &ep.rate_info,
+                                    &ep.burn_rate,
+                                    &req_id,
+                                    &client_id,
+                                    &client_ver,
+                                    &client_ip,
+                                    &agent_id,
+                                    &session_id,
+                                    &model,
+                                    request_start,
+                                )
+                                .await;
+                                (out, EndpointIdx::Unified(i))
+                            }
+                            Protocol::OpenAI => {
+                                match try_fallback_upstream_unified(
+                                    &state,
+                                    &body_bytes,
+                                    &req_id,
+                                    &client_id,
+                                    &model,
+                                    i,
+                                    true,
+                                )
+                                .await
+                                {
+                                    Some(resp) => return resp,
+                                    None => {
+                                        skip.push(EndpointIdx::Unified(i));
+                                        continue;
+                                    }
                                 }
                             }
-                            Ok(None) => break,
-                            Err(e) => {
-                                upstream_error = true;
-                                warn!(req_id, error = %e, "upstream SSE read failed");
-                                break;
-                            }
                         }
                     }
-                    // Parse accumulated SSE data for usage
-                    finalize_stream(
-                        &state_clone,
-                        UsageTarget::Account(idx),
-                        &req_id,
-                        &client_id_clone,
-                        &model_clone,
-                        &acct_name,
-                        &client_ip_str,
-                        &agent_clone,
-                        &session_clone,
-                        status.as_u16(),
-                        &sse_buf,
-                        request_start,
-                        client_disconnected,
-                        upstream_error,
-                        false,
-                    )
-                    .await;
-                });
+                    None => {
+                        warn!("all endpoints exhausted");
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "all upstream endpoints exhausted",
+                        )
+                            .into_response();
+                    }
+                };
 
-                let body_stream = ReceiverStream::new(rx);
-                return builder
-                    .body(Body::from_stream(body_stream))
-                    .unwrap_or_else(|_| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                    });
-            } else {
-                // Non-streaming: buffer, extract usage, forward
-                let body_bytes = resp.bytes().await.unwrap_or_default();
-                let mut usage = TokenUsage::default();
-                if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                    usage = TokenUsage::from_response_body(&parsed);
+            match outcome {
+                ForwardOutcome::Done(resp) => return resp,
+                ForwardOutcome::Retry {
+                    saw_529: this_529,
+                    push_skip,
+                } => {
+                    if this_529 {
+                        saw_529 = true;
+                    }
+                    if push_skip {
+                        skip.push(picked_idx);
+                    }
+                    continue;
                 }
-                finalize_non_stream(
-                    &state,
-                    UsageTarget::Account(idx),
-                    &req_id,
-                    &client_id,
-                    &model,
-                    &acct.name,
-                    &client_ip.to_string(),
-                    &agent_id,
-                    &session_id,
-                    status.as_u16(),
-                    &usage,
-                    latency_ms,
-                    false,
-                )
-                .await;
-                return builder.body(Body::from(body_bytes)).unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                });
             }
         }
         // If no 529s in this round, don't retry (e.g. all were 429s or errors)
@@ -4904,17 +5055,15 @@ async fn try_fallback_upstream(
 
 /// Forward a request to a `Protocol::OpenAI` endpoint in the unified pool.
 ///
-/// Used by `proxy_handler`'s `EndpointIdx::Unified` arm (Task 9). Marked
-/// `#[allow(dead_code)]` until that arm lands in the same series.
-/// Mirrors `try_fallback_upstream` but reads from `state.endpoints` and —
-/// critically — returns `None` on upstream 429/5xx so the retry loop advances
-/// to the next candidate. Other 4xx (e.g. 400, 401) are still returned to the
-/// caller as a final response — retry won't help on client-side errors.
+/// Used by `proxy_handler`'s `EndpointIdx::Unified` arm. Mirrors
+/// `try_fallback_upstream` but reads from `state.endpoints` and — critically —
+/// returns `None` on upstream 429/5xx so the retry loop advances to the next
+/// candidate. Other 4xx (e.g. 400, 401) are still returned to the caller as a
+/// final response — retry won't help on client-side errors.
 ///
 /// Like the original `try_fallback_upstream`, this only increments the
 /// endpoint's request counter; it does not call `record_usage` (OpenAI-compat
 /// responses don't carry the same usage signal we extract for Anthropic).
-#[allow(dead_code)] // wired in Task 9 (proxy_handler EndpointIdx::Unified dispatch)
 async fn try_fallback_upstream_unified(
     state: &AppState,
     body_bytes: &[u8],
@@ -7942,7 +8091,7 @@ async fn openai_chat_handler(
             state.update_rate_info(idx, resp.headers()).await;
 
             // Update burn rate (after rate-limit headers are parsed)
-            state.update_burn_rate(acct, &client_id);
+            state.update_burn_rate(&acct.burn_rate, &client_id);
 
             if status == StatusCode::TOO_MANY_REQUESTS {
                 state.mark_hard_limited(idx, resp.headers()).await;
