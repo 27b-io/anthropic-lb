@@ -7589,7 +7589,13 @@ fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
             }
             Protocol::Anthropic => {
                 if let Some(url) = ep.base_url.as_deref() {
-                    if !url.starts_with("https://api.anthropic.com") {
+                    // Parse the URL and compare hosts exactly. A naive
+                    // `starts_with("https://api.anthropic.com")` would accept
+                    // `https://api.anthropic.com.evil.example` as canonical.
+                    let host = reqwest::Url::parse(url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(str::to_string));
+                    if host.as_deref() != Some("api.anthropic.com") {
                         warn!(
                             endpoint = ep.name,
                             base_url = url,
