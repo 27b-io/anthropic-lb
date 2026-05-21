@@ -3444,7 +3444,7 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
 #[allow(clippy::too_many_arguments)]
 async fn finalize_stream(
     state: &AppState,
-    idx: usize,
+    target: UsageTarget,
     req_id: &str,
     client_id: &str,
     model: &str,
@@ -3463,7 +3463,7 @@ async fn finalize_stream(
     let usage = TokenUsage::from_sse_text(&text);
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
     if !usage.is_empty() {
-        state.record_usage(idx, client_id, &usage).await;
+        state.record_usage(target, client_id, &usage).await;
         log_usage(req_id, client_id, model, acct_name, &usage);
     } else {
         let reason = if upstream_error {
@@ -3526,7 +3526,7 @@ async fn finalize_stream(
 #[allow(clippy::too_many_arguments)]
 async fn finalize_non_stream(
     state: &AppState,
-    idx: usize,
+    target: UsageTarget,
     req_id: &str,
     client_id: &str,
     model: &str,
@@ -3540,7 +3540,7 @@ async fn finalize_non_stream(
     openai_compat: bool,
 ) {
     if !usage.is_empty() {
-        state.record_usage(idx, client_id, usage).await;
+        state.record_usage(target, client_id, usage).await;
         log_usage(req_id, client_id, model, acct_name, usage);
     }
     let mut log = serde_json::json!({
@@ -3565,21 +3565,49 @@ async fn finalize_non_stream(
     state.shadow_log(log);
 }
 
+/// Which runtime pool a usage record applies to. During the strangler
+/// migration both pools coexist; after Phase 4 only Unified remains.
+#[derive(Clone, Copy, Debug)]
+enum UsageTarget {
+    /// Index into AppState.accounts (legacy pool).
+    Account(usize),
+    /// Index into AppState.endpoints (unified pool).
+    #[allow(dead_code)]
+    // wired up in Task 9 (forward_anthropic for Unified Anthropic endpoint)
+    Unified(usize),
+}
+
 impl AppState {
-    /// Record token usage for an account and client.
-    async fn record_usage(&self, account_idx: usize, client_id: &str, usage: &TokenUsage) {
+    /// Record token usage for an endpoint and client.
+    async fn record_usage(&self, target: UsageTarget, client_id: &str, usage: &TokenUsage) {
         if usage.is_empty() {
             return;
         }
-        let acct = &self.accounts[account_idx];
-        acct.input_tokens
-            .fetch_add(usage.input_tokens, Ordering::Relaxed);
-        acct.output_tokens
-            .fetch_add(usage.output_tokens, Ordering::Relaxed);
-        acct.cache_creation_tokens
-            .fetch_add(usage.cache_creation_input_tokens, Ordering::Relaxed);
-        acct.cache_read_tokens
-            .fetch_add(usage.cache_read_input_tokens, Ordering::Relaxed);
+        // Resolve the four token-counter atomics from whichever pool.
+        let (input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) = match target {
+            UsageTarget::Account(i) => {
+                let a = &self.accounts[i];
+                (
+                    &a.input_tokens,
+                    &a.output_tokens,
+                    &a.cache_creation_tokens,
+                    &a.cache_read_tokens,
+                )
+            }
+            UsageTarget::Unified(i) => {
+                let e = &self.endpoints[i];
+                (
+                    &e.input_tokens,
+                    &e.output_tokens,
+                    &e.cache_creation_tokens,
+                    &e.cache_read_tokens,
+                )
+            }
+        };
+        input_tokens.fetch_add(usage.input_tokens, Ordering::Relaxed);
+        output_tokens.fetch_add(usage.output_tokens, Ordering::Relaxed);
+        cache_creation_tokens.fetch_add(usage.cache_creation_input_tokens, Ordering::Relaxed);
+        cache_read_tokens.fetch_add(usage.cache_read_input_tokens, Ordering::Relaxed);
 
         // Per-client tracking
         if client_id != "-" {
@@ -4560,7 +4588,7 @@ async fn proxy_handler(
                     // Parse accumulated SSE data for usage
                     finalize_stream(
                         &state_clone,
-                        idx,
+                        UsageTarget::Account(idx),
                         &req_id,
                         &client_id_clone,
                         &model_clone,
@@ -4593,7 +4621,7 @@ async fn proxy_handler(
                 }
                 finalize_non_stream(
                     &state,
-                    idx,
+                    UsageTarget::Account(idx),
                     &req_id,
                     &client_id,
                     &model,
@@ -7884,7 +7912,7 @@ async fn openai_chat_handler(
                     // Extract and record token usage from accumulated SSE data
                     finalize_stream(
                         &state_clone,
-                        idx,
+                        UsageTarget::Account(idx),
                         &req_id,
                         &client_id_clone,
                         &model_clone,
@@ -7945,7 +7973,7 @@ async fn openai_chat_handler(
             let usage = TokenUsage::from_response_body(&anthropic_resp);
             finalize_non_stream(
                 &state,
-                idx,
+                UsageTarget::Account(idx),
                 &req_id,
                 &client_id,
                 &model,
@@ -12427,7 +12455,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             cache_creation_input_tokens: 20,
             cache_read_input_tokens: 30,
         };
-        state.record_usage(0, "test-client", &usage).await;
+        state
+            .record_usage(UsageTarget::Account(0), "test-client", &usage)
+            .await;
 
         assert_eq!(state.accounts[0].input_tokens.load(Ordering::Relaxed), 100);
         assert_eq!(state.accounts[0].output_tokens.load(Ordering::Relaxed), 50);
@@ -12456,7 +12486,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         };
-        state.record_usage(0, "-", &usage).await;
+        state
+            .record_usage(UsageTarget::Account(0), "-", &usage)
+            .await;
 
         // Account gets updated
         assert_eq!(state.accounts[0].input_tokens.load(Ordering::Relaxed), 100);
