@@ -7565,6 +7565,38 @@ async fn openai_chat_handler(
 
 // ── Main ────────────────────────────────────────────────────────────
 
+/// Reject removed config keys with explicit errors. Run after the raw TOML
+/// has been parsed to a `toml::Value`, before strongly-typed deserialization.
+///
+/// `serde` silently drops unknown keys by default; this gives the operator
+/// a clear migration message instead of a silent misconfiguration.
+#[allow(dead_code)] // Wired into main() in Task 4 of the unified-endpoints refactor.
+fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
+    let table = match value.as_table() {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    if table.contains_key("accounts") {
+        return Err(
+            "config: [[accounts]] is no longer supported — use [[endpoints]] (see CLAUDE.md)"
+                .to_string(),
+        );
+    }
+    if table.contains_key("upstreams") {
+        return Err(
+            "config: [[upstreams]] is no longer supported — use [[endpoints]] with protocol = \"openai\" (see CLAUDE.md)"
+                .to_string(),
+        );
+    }
+    if table.contains_key("fallback_upstream") {
+        return Err(
+            "config: fallback_upstream is no longer supported — set a high priority on the OpenAI endpoint instead (see CLAUDE.md)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     // Parse config first so debug_log path is available for tracing setup
@@ -8046,6 +8078,72 @@ models = ["claude-opus-*"]
         assert_eq!(ep.base_url.as_deref(), Some("https://gateway.example.com"));
         assert_eq!(ep.priority, 100);
         assert_eq!(ep.models, vec!["claude-opus-*".to_string()]);
+    }
+
+    #[test]
+    fn config_rejects_legacy_accounts_block() {
+        let toml_str = r#"
+listen = "0.0.0.0:8080"
+upstream = "https://api.anthropic.com"
+
+[[accounts]]
+name = "primary"
+token = "sk-ant-test"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = reject_legacy_config_keys(&value).unwrap_err();
+        assert!(
+            err.contains("accounts"),
+            "error must name 'accounts': {err}"
+        );
+        assert!(
+            err.contains("endpoints"),
+            "error must mention replacement: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_legacy_upstreams_block() {
+        let toml_str = r#"
+listen = "0.0.0.0:8080"
+upstream = "https://api.anthropic.com"
+
+[[upstreams]]
+name = "fallback"
+base_url = "https://example.com"
+api_key = "key"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = reject_legacy_config_keys(&value).unwrap_err();
+        assert!(err.contains("upstreams"));
+        assert!(err.contains("endpoints"));
+    }
+
+    #[test]
+    fn config_rejects_fallback_upstream_key() {
+        let toml_str = r#"
+listen = "0.0.0.0:8080"
+upstream = "https://api.anthropic.com"
+fallback_upstream = "anything"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = reject_legacy_config_keys(&value).unwrap_err();
+        assert!(err.contains("fallback_upstream"));
+        assert!(err.contains("priority"));
+    }
+
+    #[test]
+    fn config_accepts_endpoints_only_schema() {
+        let toml_str = r#"
+listen = "0.0.0.0:8080"
+upstream = "https://api.anthropic.com"
+
+[[endpoints]]
+name = "primary"
+token = "sk-ant-test"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        assert!(reject_legacy_config_keys(&value).is_ok());
     }
 
     // ── Helpers ──────────────────────────────────────────────────────
