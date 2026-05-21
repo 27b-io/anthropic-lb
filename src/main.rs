@@ -500,7 +500,7 @@ struct Upstream {
 ///   1. `routing_candidates()` — short-circuits to a fixed RoutingCandidate.
 ///   2. `is_emergency_brake_active()` — iterates only Anthropic endpoints.
 ///   3. probe loop — skips OpenAI endpoints.
-#[allow(dead_code)] // fields read by routing in Task 8 (next commit)
+#[allow(dead_code)] // probe loop, emergency-brake reads in later phases
 struct Endpoint {
     name: String,
     protocol: Protocol,
@@ -524,7 +524,6 @@ struct Endpoint {
     last_effective_gate: AtomicU64,
 }
 
-#[allow(dead_code)] // method used by routing_candidates in Task 8 (next commit)
 impl Endpoint {
     /// Check if this endpoint can serve the given model. Empty allowlist = all.
     /// Identical to the historical `Account::serves_model` predicate.
@@ -549,7 +548,6 @@ struct AppState {
     /// Unified endpoints. After Phase 4, this replaces `accounts` and `upstreams`.
     /// During migration, both sets are populated so consumers can be migrated
     /// one at a time.
-    #[allow(dead_code)] // read by routing_candidates in Task 8 (next commit)
     endpoints: Vec<Endpoint>,
     robin: AtomicUsize,
     routing_strategy: RoutingStrategy,
@@ -1789,6 +1787,95 @@ impl AppState {
                     weight: 1.0,
                     source: "upstream",
                 });
+            }
+        }
+
+        // Unified endpoints. During the migration, both the old `accounts`+`upstreams`
+        // pools and the new `endpoints` pool are enumerated. The deployed config will
+        // populate only one side at a time — both populated is a configuration error
+        // caught elsewhere.
+        for (i, ep) in self.endpoints.iter().enumerate() {
+            if skip.contains(&EndpointIdx::Unified(i)) {
+                continue;
+            }
+            if !ep.serves_model(model) {
+                continue;
+            }
+            match ep.protocol {
+                Protocol::OpenAI => {
+                    // OpenAI endpoints carry no rate-limit data — push a fixed candidate
+                    // at the configured priority. This is one of the three named
+                    // `match protocol` sites (see Endpoint struct docs).
+                    trace!(
+                        endpoint = ep.name,
+                        priority = ep.priority,
+                        "pick: candidate (openai, fixed)"
+                    );
+                    candidates.push(RoutingCandidate {
+                        endpoint: EndpointIdx::Unified(i),
+                        priority: ep.priority,
+                        gate_5h: 0.0,
+                        gate_7d: 0.0,
+                        gate: 0.0,
+                        wr: 0.0,
+                        weight: 1.0,
+                        source: "openai",
+                    });
+                }
+                Protocol::Anthropic => {
+                    let info = ep.rate_info.read().await;
+                    if let Some(until) = info.hard_limited_until {
+                        if now < until {
+                            trace!(
+                                endpoint = ep.name,
+                                hard_limited_secs = until.duration_since(now).as_secs(),
+                                "pick: skipping hard-limited endpoint"
+                            );
+                            continue;
+                        }
+                    }
+                    let stale_after_hard_limit = info
+                        .hard_limited_until
+                        .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
+                    let rw = match compute_routing_weight(
+                        &info,
+                        model,
+                        now_epoch,
+                        stale_after_hard_limit,
+                    ) {
+                        Some(rw) => rw,
+                        None => {
+                            trace!(
+                                endpoint = ep.name,
+                                model = model,
+                                "pick: skipping, 7d claim rejected"
+                            );
+                            continue;
+                        }
+                    };
+                    let effective_priority = if rw.overage_active {
+                        ep.priority.saturating_add(self.overage_penalty)
+                    } else {
+                        ep.priority
+                    };
+                    trace!(
+                        endpoint = ep.name,
+                        gate = format!("{:.4}", rw.gate),
+                        weight = format!("{:.4}", rw.weight),
+                        priority = effective_priority,
+                        "pick: candidate (anthropic)"
+                    );
+                    candidates.push(RoutingCandidate {
+                        endpoint: EndpointIdx::Unified(i),
+                        priority: effective_priority,
+                        gate_5h: rw.gate_5h,
+                        gate_7d: rw.gate_7d,
+                        gate: rw.gate,
+                        wr: rw.wr,
+                        weight: rw.weight,
+                        source: rw.source,
+                    });
+                }
             }
         }
         candidates
