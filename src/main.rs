@@ -867,6 +867,33 @@ impl AppState {
         }
     }
 
+    /// True if `model`'s 7d claim was refreshed recently enough to skip a probe.
+    ///
+    /// Pure freshness check shared by `probe_account` and `probe_endpoint_unified`.
+    /// Looks up only the model-specific claim key (e.g. `seven_day_opus`), NOT the
+    /// general `seven_day` fallback, so probing one family doesn't suppress another.
+    /// An empty `model_family` (unrecognized model) never counts as fresh.
+    /// "Recent" means the claim's age is under half the probe interval.
+    fn claim_recently_probed(
+        info: &RateLimitInfo,
+        model: &str,
+        probe_interval_secs: u64,
+        now_epoch: u64,
+    ) -> bool {
+        let family = model_family(model);
+        if family.is_empty() {
+            return false;
+        }
+        let claim_key = format!("seven_day_{}", family);
+        match info.claims_7d.get(&claim_key) {
+            Some(claim) => {
+                let age = now_epoch.saturating_sub(claim.last_seen);
+                age < probe_interval_secs / 2
+            }
+            None => false,
+        }
+    }
+
     /// Fire a minimal request (max_tokens=1) to refresh rate limit headers for an account.
     /// The `model` parameter controls which model is probed, rotating across families
     /// so that per-model 7d utilization claims get populated for each family.
@@ -895,27 +922,16 @@ impl AppState {
         }
 
         // Local freshness check: skip if this model's 7d claim was recently refreshed.
-        // Looks up only the model-specific claim key (e.g. "seven_day_opus"), NOT the
-        // general "seven_day" fallback, so probing one family doesn't block another.
         let now_epoch = Self::now_epoch();
         {
             let info = acct.rate_info.read().await;
-            let family = model_family(model);
-            if !family.is_empty() {
-                let claim_key = format!("seven_day_{}", family);
-                if let Some(claim) = info.claims_7d.get(&claim_key) {
-                    let age = now_epoch.saturating_sub(claim.last_seen);
-                    if age < self.probe_interval_secs / 2 {
-                        trace!(
-                            account = acct.name,
-                            probe_model = model,
-                            claim_key,
-                            age_secs = age,
-                            "probe skipped, model claim is fresh"
-                        );
-                        return;
-                    }
-                }
+            if Self::claim_recently_probed(&info, model, self.probe_interval_secs, now_epoch) {
+                trace!(
+                    account = acct.name,
+                    probe_model = model,
+                    "probe skipped, model claim is fresh"
+                );
+                return;
             }
         }
 
@@ -1105,31 +1121,21 @@ impl AppState {
             }
         }
 
-        // Local freshness check: skip if this model's 7d claim was recently
-        // refreshed. Looks up only the model-specific claim key so probing one
-        // family doesn't block another.
+        // Local freshness check: skip if this model's 7d claim was recently refreshed.
         let now_epoch = Self::now_epoch();
         {
             let info = ep.rate_info.read().await;
-            let family = model_family(model);
-            if !family.is_empty() {
-                let claim_key = format!("seven_day_{}", family);
-                if let Some(claim) = info.claims_7d.get(&claim_key) {
-                    let age = now_epoch.saturating_sub(claim.last_seen);
-                    if age < self.probe_interval_secs / 2 {
-                        trace!(
-                            endpoint = ep.name,
-                            probe_model = model,
-                            claim_key,
-                            age_secs = age,
-                            "probe skipped, model claim is fresh"
-                        );
-                        return;
-                    }
-                }
+            if Self::claim_recently_probed(&info, model, self.probe_interval_secs, now_epoch) {
+                trace!(
+                    endpoint = ep.name,
+                    probe_model = model,
+                    "probe skipped, model claim is fresh"
+                );
+                return;
             }
         }
 
+        // Phase 4: this Redis probe-lock block is duplicated from probe_account; the two probe functions collapse in Phase 4.
         // Distributed probe lock: one pod per endpoint+model per interval.
         if let Some(redis) = &self.redis {
             let mut conn = redis.clone();
@@ -1170,25 +1176,28 @@ impl AppState {
             "messages": [{"role": "user", "content": "."}]
         });
 
-        let mut req = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", OAUTH_BETA_FLAGS.join(","))
-            .header("user-agent", "claude-cli/2.1.2 (external, cli)")
-            .header("x-app", "cli")
-            .header("anthropic-dangerous-direct-browser-access", "true")
-            .json(&body);
+        // Build headers in a HeaderMap so auth injection can reuse the shared
+        // `inject_account_auth` (token-prefix dispatch + OAuth beta-flag merge)
+        // instead of a hand-rolled copy.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_str(&OAUTH_BETA_FLAGS.join(",")).unwrap(),
+        );
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("claude-cli/2.1.2 (external, cli)"),
+        );
+        headers.insert("x-app", HeaderValue::from_static("cli"));
+        headers.insert(
+            "anthropic-dangerous-direct-browser-access",
+            HeaderValue::from_static("true"),
+        );
+        inject_account_auth(&mut headers, &ep.token, ep.passthrough);
 
-        // Inject auth
-        if ep.token.starts_with("sk-ant-api") {
-            req = req.header("x-api-key", &ep.token);
-        } else if ep.token.starts_with("sk-ant-oat") {
-            req = req.header("authorization", format!("Bearer {}", ep.token));
-        } else {
-            req = req.header("x-api-key", &ep.token);
-        }
+        let req = self.client.post(&url).headers(headers).json(&body);
 
         match req.send().await {
             Ok(resp) => {
@@ -1224,6 +1233,14 @@ impl AppState {
                 let now_epoch = Self::now_epoch();
                 let (eff_util, constraint, _adj_5h, _adj_7d) =
                     effective_utilization(&info, now_epoch, model);
+                // Only compute routing weight on 2xx — non-success responses leave
+                // the endpoint state either mutated (429 → hard-limited) or untouched
+                // (5xx), and the pre-response weight no longer reflects reality.
+                let rw = if status.is_success() {
+                    compute_routing_weight(&info, model, now_epoch, false)
+                } else {
+                    None
+                };
                 info!(
                     endpoint = ep.name,
                     status = status.as_u16(),
@@ -1241,6 +1258,27 @@ impl AppState {
                         .unwrap_or("-"),
                     constraint,
                     n_claims_7d = info.claims_7d.len(),
+                    gate_5h = rw
+                        .as_ref()
+                        .map(|r| format!("{:.4}", r.gate_5h))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    gate_7d = rw
+                        .as_ref()
+                        .map(|r| format!("{:.4}", r.gate_7d))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    waste_risk = rw
+                        .as_ref()
+                        .map(|r| format!("{:.4}", r.wr))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    weight = rw
+                        .as_ref()
+                        .map(|r| format!("{:.4}", r.weight))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    weight_source = rw.as_ref().map(|r| r.source).unwrap_or("-"),
                     "probe complete"
                 );
             }
