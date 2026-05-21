@@ -7570,7 +7570,6 @@ async fn openai_chat_handler(
 ///
 /// `serde` silently drops unknown keys by default; this gives the operator
 /// a clear migration message instead of a silent misconfiguration.
-#[allow(dead_code)] // Wired into main() in Task 4 of the unified-endpoints refactor.
 fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
     let table = match value.as_table() {
         Some(t) => t,
@@ -7605,8 +7604,14 @@ async fn main() {
         .unwrap_or_else(|| "config.toml".to_string());
     let config_str = std::fs::read_to_string(&config_path)
         .unwrap_or_else(|e| panic!("failed to read {config_path}: {e}"));
-    let config: Config =
-        toml::from_str(&config_str).unwrap_or_else(|e| panic!("invalid config: {e}"));
+    let raw_value: toml::Value =
+        toml::from_str(&config_str).unwrap_or_else(|e| panic!("config parse error: {e}"));
+    if let Err(msg) = reject_legacy_config_keys(&raw_value) {
+        panic!("{msg}");
+    }
+    let config: Config = raw_value
+        .try_into()
+        .unwrap_or_else(|e| panic!("config parse error: {e}"));
 
     // Set up tracing: stderr (info+) always, plus optional debug log file
     {
