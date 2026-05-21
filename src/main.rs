@@ -38,6 +38,13 @@ struct Config {
     proxy_key: Option<String>,
     /// Source IP allowlist. Supports individual IPs and CIDR ranges. None/empty = allow all.
     allowed_ips: Option<Vec<String>>,
+    /// Unified routing endpoints. Each entry is either Anthropic-native or
+    /// OpenAI-compatible, distinguished by `protocol`. Replaces [[accounts]]
+    /// + [[upstreams]] + fallback_upstream.
+    #[serde(default)]
+    #[allow(dead_code)]
+    // Wired into routing in later phases of the unified-endpoints refactor.
+    endpoints: Vec<EndpointConfig>,
     accounts: Vec<AccountConfig>,
     /// OpenAI-compatible upstream routes. Requests to /upstream/<name>/... are forwarded.
     #[serde(default)]
@@ -112,14 +119,29 @@ struct UpstreamConfig {
     priority: u32,
 }
 
+#[derive(Deserialize, Clone)]
+#[allow(dead_code)] // Wired into routing in later phases of the unified-endpoints refactor.
+struct EndpointConfig {
+    name: String,
+    /// Wire format. Default: anthropic (sends to api.anthropic.com via x-api-key).
+    #[serde(default)]
+    protocol: Protocol,
+    /// Override base URL. For protocol = anthropic, defaults to https://api.anthropic.com.
+    /// For protocol = openai, this field is required (validated at startup).
+    base_url: Option<String>,
+    /// Auth credential. "passthrough" (anthropic only) forwards caller's auth headers.
+    token: String,
+    /// Model allowlist (supports "*" suffix wildcards). Empty = all models.
+    #[serde(default)]
+    models: Vec<String>,
+    /// Priority tier (0 = highest). Lower tiers tried first.
+    #[serde(default)]
+    priority: u32,
+}
+
 /// Wire format on config / state: "anthropic" | "openai".
-///
-/// `#[allow(dead_code)]` is transient: removed when Task 2 of the
-/// unified-endpoints plan adds `EndpointConfig` which references this enum
-/// from non-test code.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
-#[allow(dead_code)]
 enum Protocol {
     #[default]
     Anthropic,
@@ -7980,6 +8002,50 @@ mod tests {
     fn protocol_default_is_anthropic() {
         assert_eq!(Protocol::default(), Protocol::Anthropic);
         assert_ne!(Protocol::default(), Protocol::OpenAI);
+    }
+
+    #[test]
+    fn endpoint_config_parses_minimal_anthropic_block() {
+        let toml_str = r#"
+listen = "0.0.0.0:8080"
+upstream = "https://api.anthropic.com"
+accounts = []
+
+[[endpoints]]
+name = "primary"
+token = "sk-ant-test"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.endpoints.len(), 1);
+        assert_eq!(cfg.endpoints[0].name, "primary");
+        assert_eq!(cfg.endpoints[0].protocol, Protocol::Anthropic);
+        assert_eq!(cfg.endpoints[0].base_url, None);
+        assert_eq!(cfg.endpoints[0].token, "sk-ant-test");
+        assert!(cfg.endpoints[0].models.is_empty());
+        assert_eq!(cfg.endpoints[0].priority, 0);
+    }
+
+    #[test]
+    fn endpoint_config_parses_openai_with_base_url() {
+        let toml_str = r#"
+listen = "0.0.0.0:8080"
+upstream = "https://api.anthropic.com"
+accounts = []
+
+[[endpoints]]
+name = "gateway"
+protocol = "openai"
+base_url = "https://gateway.example.com"
+token = "sk-test"
+priority = 100
+models = ["claude-opus-*"]
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let ep = &cfg.endpoints[0];
+        assert_eq!(ep.protocol, Protocol::OpenAI);
+        assert_eq!(ep.base_url.as_deref(), Some("https://gateway.example.com"));
+        assert_eq!(ep.priority, 100);
+        assert_eq!(ep.models, vec!["claude-opus-*".to_string()]);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────
