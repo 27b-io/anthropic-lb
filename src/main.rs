@@ -4902,6 +4902,274 @@ async fn try_fallback_upstream(
     }
 }
 
+/// Forward a request to a `Protocol::OpenAI` endpoint in the unified pool.
+///
+/// Used by `proxy_handler`'s `EndpointIdx::Unified` arm (Task 9). Marked
+/// `#[allow(dead_code)]` until that arm lands in the same series.
+/// Mirrors `try_fallback_upstream` but reads from `state.endpoints` and —
+/// critically — returns `None` on upstream 429/5xx so the retry loop advances
+/// to the next candidate. Other 4xx (e.g. 400, 401) are still returned to the
+/// caller as a final response — retry won't help on client-side errors.
+///
+/// Like the original `try_fallback_upstream`, this only increments the
+/// endpoint's request counter; it does not call `record_usage` (OpenAI-compat
+/// responses don't carry the same usage signal we extract for Anthropic).
+#[allow(dead_code)] // wired in Task 9 (proxy_handler EndpointIdx::Unified dispatch)
+async fn try_fallback_upstream_unified(
+    state: &AppState,
+    body_bytes: &[u8],
+    req_id: &str,
+    client_id: &str,
+    model: &str,
+    endpoint_idx: usize,
+    translate: bool, // true = Anthropic↔OpenAI translation needed
+) -> Option<Response> {
+    let ep = &state.endpoints[endpoint_idx];
+
+    info!(
+        req_id,
+        client_id,
+        model,
+        upstream = ep.name,
+        translate,
+        "fallback: routing to unified OpenAI endpoint"
+    );
+
+    ep.requests.fetch_add(1, Ordering::Relaxed);
+
+    // Parse once to extract streaming flag before potential translation
+    let parsed: serde_json::Value = serde_json::from_slice(body_bytes).ok()?;
+    let is_streaming = parsed
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+
+    // Build request body
+    let request_body = if translate {
+        let openai_body = translate_anthropic_request_to_openai(&parsed);
+        serde_json::to_vec(&openai_body).ok()?
+    } else {
+        body_bytes.to_vec()
+    };
+
+    let url = format!("{}/v1/chat/completions", ep.base_url);
+
+    let mut resp = match state
+        .client
+        .post(&url)
+        .header("authorization", format!("Bearer {}", ep.token))
+        .header("content-type", "application/json")
+        .body(request_body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!(
+                req_id,
+                upstream = ep.name,
+                error = %e,
+                "fallback: unified OpenAI endpoint request failed"
+            );
+            return None;
+        }
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let err_body = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "upstream error".to_string());
+        // Retry-eligible: 429 or 5xx → return None so the retry loop advances
+        // to the next candidate. This is the only behavioral difference from
+        // `try_fallback_upstream`.
+        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            warn!(
+                req_id,
+                upstream = ep.name,
+                status = status.as_u16(),
+                body = %err_body,
+                "fallback: unified endpoint returned retry-eligible error, advancing"
+            );
+            return None;
+        }
+        warn!(
+            req_id,
+            upstream = ep.name,
+            status = status.as_u16(),
+            body = %err_body,
+            "fallback: unified endpoint returned error"
+        );
+        if translate {
+            // Return error in Anthropic format
+            return Some(
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": err_body,
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap_or_else(|_| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
+                    }),
+            );
+        }
+        return Some(
+            Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(err_body))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
+                }),
+        );
+    }
+
+    // Streaming response
+    if is_streaming {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+        let req_id = req_id.to_string();
+        let upstream_name = ep.name.clone();
+        let translate_response = translate;
+
+        tokio::spawn(async move {
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut ctx = ReverseStreamContext::default();
+            let mut client_gone = false;
+
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if translate_response {
+                            buffer.extend_from_slice(&chunk);
+                            while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
+                                let event = String::from_utf8_lossy(&buffer[..pos]).into_owned();
+                                buffer.drain(..pos + 2);
+
+                                for line in event.lines() {
+                                    if let Some(data) = line.strip_prefix("data: ") {
+                                        let events =
+                                            translate_openai_sse_to_anthropic(data, &mut ctx);
+                                        for ev in events {
+                                            if tx.send(Ok(bytes::Bytes::from(ev))).await.is_err() {
+                                                client_gone = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if client_gone {
+                                    break;
+                                }
+                            }
+                        } else if tx.send(Ok(chunk)).await.is_err() {
+                            client_gone = true;
+                        }
+                        if client_gone {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!(req_id, error = %e, "fallback: unified endpoint SSE read failed");
+                        break;
+                    }
+                }
+            }
+
+            // Flush remaining buffer
+            if translate_response && !buffer.is_empty() && !client_gone {
+                let remaining = String::from_utf8_lossy(&buffer).into_owned();
+                for line in remaining.lines() {
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        let events = translate_openai_sse_to_anthropic(data, &mut ctx);
+                        for ev in events {
+                            if tx.send(Ok(bytes::Bytes::from(ev))).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if client_gone {
+                debug!(req_id, "fallback: client disconnected during stream");
+            }
+            info!(
+                req_id,
+                upstream = upstream_name,
+                "fallback: unified endpoint stream complete"
+            );
+        });
+
+        return Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .header("cache-control", "no-cache")
+                .header("connection", "keep-alive")
+                .body(Body::from_stream(
+                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                ))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "fallback stream error").into_response()
+                }),
+        );
+    }
+
+    // Non-streaming response
+    let resp_body = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!(req_id, error = %e, "fallback: failed to read unified endpoint response body");
+            return None;
+        }
+    };
+
+    if translate {
+        let openai_resp: serde_json::Value =
+            serde_json::from_slice(&resp_body).unwrap_or(serde_json::json!({}));
+        let anthropic_resp = translate_openai_response_to_anthropic(&openai_resp);
+        info!(
+            req_id,
+            upstream = ep.name,
+            "fallback: unified endpoint translated response"
+        );
+        Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(anthropic_resp.to_string()))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
+                }),
+        )
+    } else {
+        info!(
+            req_id,
+            upstream = ep.name,
+            "fallback: unified endpoint forwarded response"
+        );
+        Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(resp_body))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
+                }),
+        )
+    }
+}
+
 // ── Upstream passthrough handler ─────────────────────────────────────
 
 async fn upstream_handler(
