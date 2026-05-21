@@ -112,6 +112,20 @@ struct UpstreamConfig {
     priority: u32,
 }
 
+/// Wire format on config / state: "anthropic" | "openai".
+///
+/// `#[allow(dead_code)]` is transient: removed when Task 2 of the
+/// unified-endpoints plan adds `EndpointConfig` which references this enum
+/// from non-test code.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum Protocol {
+    #[default]
+    Anthropic,
+    OpenAI,
+}
+
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 enum RoutingStrategy {
     #[default]
@@ -7953,6 +7967,20 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_deserializes_lowercase_strings() {
+        let p: Protocol = serde_json::from_str(r#""anthropic""#).unwrap();
+        assert_eq!(p, Protocol::Anthropic);
+        let p: Protocol = serde_json::from_str(r#""openai""#).unwrap();
+        assert_eq!(p, Protocol::OpenAI);
+    }
+
+    #[test]
+    fn protocol_default_is_anthropic() {
+        assert_eq!(Protocol::default(), Protocol::Anthropic);
+        assert_ne!(Protocol::default(), Protocol::OpenAI);
+    }
 
     // ── Helpers ──────────────────────────────────────────────────────
 
