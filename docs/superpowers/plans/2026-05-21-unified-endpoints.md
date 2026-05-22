@@ -1174,170 +1174,121 @@ git commit -m "feat: add try_fallback_upstream_unified with 429/5xx-as-retryable
 
 ---
 
-### Task 11: Migrate `openai_chat_handler` candidate filter and dispatch
+### Task 11: Add a unified-endpoint dispatch arm to `openai_chat_handler`
+
+> **Revised 2026-05-22.** An earlier version of this task filtered
+> `openai_chat_handler` to OpenAI endpoints only, on the false belief that the
+> handler reached only upstreams today. It does not — `openai_chat_handler`
+> already translates OpenAI→Anthropic and routes to Anthropic accounts. That
+> behavior is preserved. This task ADDS a `Unified` dispatch arm; it does not
+> filter anything out.
 
 **Files:**
-- Modify: `src/main.rs` `openai_chat_handler` (~line 6987)
+- Modify: `src/main.rs` `openai_chat_handler` (locate via `grep -n "async fn openai_chat_handler"`).
 
-- [ ] **Step 1: Add candidate filtering — Protocol::OpenAI only**
+**Context.** `openai_chat_handler` has a retry loop with a `match state.pick_endpoint(...)` dispatch. Today it has three arms:
+- `EndpointIdx::Account(i)` — translates the request to Anthropic, forwards to `state.upstream`, translates the response back to OpenAI. This is a large inline block.
+- `EndpointIdx::Upstream(u)` — calls `try_fallback_upstream(.., translate=false)` (forwards the original OpenAI body directly).
+- `EndpointIdx::Unified(_) => unreachable!(...)` — the placeholder added in Phase 2a.
 
-In `openai_chat_handler`, the dispatch loop currently picks from any endpoint via `state.pick_endpoint`. The spec requires this handler to target only `Protocol::OpenAI` endpoints. The cleanest path: add a `pick_endpoint_filtered(filter: Option<Protocol>)` method on `AppState`, or filter the result of `routing_candidates` before calling into the picker.
+You will replace the `unreachable!()` with a real arm that branches on `state.endpoints[i].protocol`:
+- `Protocol::OpenAI` → forward direct, no translation (same as the `Upstream` arm).
+- `Protocol::Anthropic` → translate + forward + translate-back (same as the `Account` arm).
 
-Choose the second — less surface area. Replace the current pick call with:
+- [ ] **Step 1: Factor the openai-compat Anthropic forward path**
+
+The `EndpointIdx::Account(i)` arm contains a large inline block: build the Anthropic-translated request, forward to the Anthropic API, handle 429/529/5xx, parse rate-limit headers, `record_usage`, and translate the response (streaming + non-streaming) back to OpenAI.
+
+Factor this block into a helper — call it `forward_openai_compat_anthropic` — parameterised the same way `forward_anthropic` was in Task 9: it takes `base_url`, `token`, `passthrough`, `endpoint_name`, `usage_target: UsageTarget`, `requests_counter: &AtomicU64`, `rate_info: &RwLock<RateLimitInfo>`, `burn_rate: &Mutex<BurnRate>`, plus the pre-translated `anthropic_body` / `oauth_anthropic_body`, the request context (`req_id`, `client_id`, etc.), and whatever else the inline block reads. Return a `ForwardOutcome` (the enum from Task 9) so the retry loop owns `skip`/`saw_529`/retry exactly as it does for `forward_anthropic`.
+
+This mirrors Task 9 precisely. If `forward_anthropic` and `forward_openai_compat_anthropic` end up sharing significant structure, that is acceptable — do NOT try to merge them; Phase 4 collapses pool-specific code. Copy-and-adapt is fine here.
+
+- [ ] **Step 2: Replace the dispatch match**
 
 ```rust
-let idx = {
-    let all_candidates = state.routing_candidates(&model, &skip).await;
-    // Filter: only Protocol::OpenAI endpoints from the unified pool.
-    // (Legacy `accounts` -> EndpointIdx::Account candidates remain — drop them
-    // until Phase 4 deletes the old pool entirely.)
-    let openai_only: Vec<RoutingCandidate> = all_candidates
-        .into_iter()
-        .filter(|c| match c.endpoint {
-            EndpointIdx::Unified(i) => {
-                matches!(state.endpoints[i].protocol, Protocol::OpenAI)
-            }
-            EndpointIdx::Upstream(_) => true,  // legacy upstream — also openai
-            EndpointIdx::Account(_) => false,
-        })
-        .collect();
-    state.pick_from_candidates_or_none(openai_only, affinity).await
+let picked = match state.pick_endpoint(affinity, &model, &skip).await {
+    Some(e) => e,
+    None => {
+        warn!("all endpoints exhausted");
+        return (StatusCode::TOO_MANY_REQUESTS, "all upstream endpoints exhausted")
+            .into_response();
+    }
 };
-```
-
-To avoid duplicating tier logic, **first extract** `pick_endpoint`'s tier-and-pick body into a private helper, then call it from both `pick_endpoint` and the new filtered path.
-
-Refactor `pick_endpoint` (~line 2116) to:
-
-```rust
-async fn pick_endpoint(
-    &self,
-    affinity_key: Option<&str>,
-    model: &str,
-    skip: &[EndpointIdx],
-) -> Option<EndpointIdx> {
-    let candidates = self.routing_candidates(model, skip).await;
-    self.pick_from_tiered_candidates(candidates, affinity_key)
-}
-
-/// Apply priority-tier partitioning and intra-tier soft-limit handling
-/// to an already-filtered candidate set. Returns the chosen index, or
-/// None if every tier has zero weight.
-fn pick_from_tiered_candidates(
-    &self,
-    candidates: Vec<RoutingCandidate>,
-    affinity_key: Option<&str>,
-) -> Option<EndpointIdx> {
-    if candidates.is_empty() {
-        debug!("pick: no available endpoints");
-        return None;
-    }
-    let mut tiers: Vec<u32> = candidates.iter().map(|c| c.priority).collect();
-    tiers.sort_unstable();
-    tiers.dedup();
-    for tier in &tiers {
-        let tier_candidates: Vec<&RoutingCandidate> =
-            candidates.iter().filter(|c| c.priority == *tier).collect();
-        let healthy: Vec<&RoutingCandidate> = tier_candidates
-            .iter()
-            .filter(|c| c.gate < self.soft_limit)
-            .copied()
-            .collect();
-        let (effective, degraded): (Vec<&RoutingCandidate>, bool) = if !healthy.is_empty() {
-            (healthy, false)
-        } else {
-            (tier_candidates.clone(), true)
-        };
-        let total_weight: f64 = effective.iter().map(|c| c.weight).sum();
-        if total_weight <= 0.0 {
-            debug!(tier = tier, "pick: tier exhausted (zero weight), trying next");
-            continue;
-        }
-        if degraded {
-            debug!(tier = tier, "pick: tier all soft-limited — degrading within tier");
-        }
-        return Some(self.pick_from_candidates(&effective, total_weight, affinity_key, *tier));
-    }
-    debug!("pick: all tiers exhausted");
-    None
-}
-```
-
-Then `openai_chat_handler` can do:
-
-```rust
-let candidates = state.routing_candidates(&model, &skip).await;
-let openai_only: Vec<RoutingCandidate> = candidates
-    .into_iter()
-    .filter(|c| match c.endpoint {
-        EndpointIdx::Unified(i) => matches!(state.endpoints[i].protocol, Protocol::OpenAI),
-        EndpointIdx::Upstream(_) => true,
-        EndpointIdx::Account(_) => false,
-    })
-    .collect();
-let idx = state.pick_from_tiered_candidates(openai_only, affinity);
-```
-
-- [ ] **Step 2: Dispatch on protocol after pick**
-
-After the picker call, branch:
-
-```rust
-let idx_resolved = match idx {
-    Some(EndpointIdx::Unified(i)) => i,
-    Some(EndpointIdx::Upstream(u)) => {
-        // legacy upstream path — try_fallback_upstream
-        match try_fallback_upstream(
-            &state, &body_bytes, &req_id, &client_id, &model, u, false,
-        )
-        .await
-        {
-            Some(resp) => return resp,
-            None => {
-                skip.push(EndpointIdx::Upstream(u));
+match picked {
+    EndpointIdx::Account(i) => {
+        let acct = &state.accounts[i];
+        match forward_openai_compat_anthropic(
+            &state, &parts, &anthropic_body, &oauth_anthropic_body,
+            &state.upstream, &acct.token, acct.passthrough, &acct.name,
+            UsageTarget::Account(i), &acct.requests, &acct.rate_info, &acct.burn_rate,
+            &req_id, &client_id, /* ...remaining ctx args... */ &model,
+        ).await {
+            ForwardOutcome::Done(resp) => return resp,
+            ForwardOutcome::Retry { saw_529: s, push_skip } => {
+                if s { saw_529 = true; }
+                if push_skip { skip.push(EndpointIdx::Account(i)); }
                 continue;
             }
         }
     }
-    Some(EndpointIdx::Account(_)) => unreachable!("filtered out above"),
-    None => {
-        warn!("all openai endpoints exhausted");
-        return (StatusCode::TOO_MANY_REQUESTS, "no openai endpoint available").into_response();
+    EndpointIdx::Upstream(u) => {
+        match try_fallback_upstream(&state, &body_bytes, &req_id, &client_id, &model, u, false).await {
+            Some(resp) => return resp,
+            None => { skip.push(EndpointIdx::Upstream(u)); continue; }
+        }
     }
-};
-// Unified OpenAI endpoint — forward direct, no translation
-match try_fallback_upstream_unified(
-    &state, &body_bytes, &req_id, &client_id, &model, idx_resolved, false,
-).await {
-    Some(resp) => return resp,
-    None => {
-        skip.push(EndpointIdx::Unified(idx_resolved));
-        continue;
+    EndpointIdx::Unified(i) => {
+        let ep = &state.endpoints[i];
+        match ep.protocol {
+            Protocol::Anthropic => {
+                match forward_openai_compat_anthropic(
+                    &state, &parts, &anthropic_body, &oauth_anthropic_body,
+                    &ep.base_url, &ep.token, ep.passthrough, &ep.name,
+                    UsageTarget::Unified(i), &ep.requests, &ep.rate_info, &ep.burn_rate,
+                    &req_id, &client_id, /* ...remaining ctx args... */ &model,
+                ).await {
+                    ForwardOutcome::Done(resp) => return resp,
+                    ForwardOutcome::Retry { saw_529: s, push_skip } => {
+                        if s { saw_529 = true; }
+                        if push_skip { skip.push(EndpointIdx::Unified(i)); }
+                        continue;
+                    }
+                }
+            }
+            Protocol::OpenAI => {
+                match try_fallback_upstream_unified(
+                    &state, &body_bytes, &req_id, &client_id, &model, i, false,
+                ).await {
+                    Some(resp) => return resp,
+                    None => { skip.push(EndpointIdx::Unified(i)); continue; }
+                }
+            }
+        }
     }
 }
 ```
 
-- [ ] **Step 3: Move eager translation inside the protocol branch**
+The exact parameter lists must match whatever `forward_openai_compat_anthropic` ends up needing — adapt. The point: Account and Unified-Anthropic both call the helper; Upstream and Unified-OpenAI both forward direct.
 
-The current `openai_chat_handler` runs `translate_openai_request_to_anthropic` before the retry loop (~line 7076). The spec says translation must happen *after* `pick_endpoint`, and only for Anthropic targets. Since the candidate filter above excludes Anthropic candidates, the translation call can be **deleted entirely** from this handler — the only remaining targets are OpenAI endpoints that need no translation.
+- [ ] **Step 3: Keep the eager translation**
 
-Remove the eager `translate_openai_request_to_anthropic` block. The body forwarded downstream is the original OpenAI-format body.
+`openai_chat_handler` translates `openai_body` → `anthropic_body` (and the OAuth variant) before the retry loop. **Keep that** — both the Account arm and the new Unified-Anthropic arm consume `anthropic_body`. (The earlier plan said to delete it; that was tied to the now-reverted "OpenAI-only" filtering. The OpenAI-protocol arms simply ignore `anthropic_body` and forward `body_bytes` — a small unused-translation cost on the all-OpenAI-endpoints path, acceptable and unchanged from today's behavior where the translation also always runs.)
 
 - [ ] **Step 4: Verify compile and tests**
 
 ```bash
 cargo build 2>&1 | tail -5
-cargo test --lib openai_chat 2>&1 | tail -10
-cargo test --lib 2>&1 | tail -3
+cargo test --bin anthropic-lb 2>&1 | tail -8
+RUSTFLAGS="-Dwarnings" cargo clippy --all-targets 2>&1 | tail -3
 ```
 
-Expected: clean build. Existing OpenAI-chat tests use `[[upstreams]]` (legacy) and should still pass via the `EndpointIdx::Upstream` arm. Tests targeting the unified pool come in Phase 3.
+Expected: clean build, all existing tests pass (the ~10 `test_openai_app` tests route through the `Account` arm, which still calls the same logic — now via `forward_openai_compat_anthropic`).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/main.rs
-git commit -m "refactor: openai_chat_handler filters to OpenAI endpoints, dispatch by index"
+git commit -m "refactor: factor openai-compat Anthropic forward; openai_chat_handler dispatches unified endpoints"
 ```
 
 ---
@@ -2108,54 +2059,91 @@ git commit -m "test: try_fallback_upstream_unified returns None on 429/5xx for r
 
 ---
 
-### Task 22: New test — `openai_chat_handler` routes only to OpenAI endpoints
+### Task 22: New test — `openai_chat_handler` routes to a unified Anthropic endpoint
+
+> **Revised 2026-05-22.** Was "openai_chat_handler routes only to OpenAI
+> endpoints" — reversed along with Task 11. This test now proves the OPPOSITE:
+> an OpenAI-format request is correctly served by a unified `Protocol::Anthropic`
+> endpoint via the OpenAI→Anthropic→OpenAI round-trip translation.
 
 **Files:**
 - Modify: `src/main.rs` `mod tests`
 
 - [ ] **Step 1: Write the test**
 
+Use a mock upstream that returns a canned Anthropic `messages` response. Build an `AppState` whose `endpoints` pool contains one `Protocol::Anthropic` endpoint pointed at the mock (and empty `accounts`/`upstreams`). POST an OpenAI-format `/v1/chat/completions` request; assert a 200 whose body is OpenAI-shaped (`choices[0].message.content` present), proving the request was translated to Anthropic, forwarded to the unified endpoint, and the response translated back.
+
 ```rust
 #[tokio::test]
-async fn openai_chat_handler_skips_anthropic_only_pool() {
-    // Pool: only Anthropic endpoints in the unified pool. An OpenAI-format
-    // request must NOT route to them (no reverse-translation path per spec).
-    // Expect: 429 "all openai endpoints exhausted".
-    let acct = make_account("anthropic", "sk-ant");
-    let state = test_state_with(vec![acct]);  // legacy accounts also Anthropic
-    // No endpoints added. openai_chat_handler must return 429.
+async fn openai_chat_handler_routes_to_unified_anthropic_endpoint() {
+    // Mock Anthropic upstream: returns a minimal messages response.
+    let mock = Router::new().fallback(any(|| async {
+        axum::Json(serde_json::json!({
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "model": "claude-opus-4-7",
+            "content": [{"type": "text", "text": "hi back"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        })).into_response()
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap(); });
+
+    let mut state = test_state_with(vec![]); // no legacy accounts
+    Arc::get_mut(&mut state).unwrap().endpoints.push(Endpoint {
+        name: "unified-anthropic".to_string(),
+        protocol: Protocol::Anthropic,
+        base_url: format!("http://{}", mock_addr),
+        token: "sk-ant-api-test".to_string(),
+        passthrough: false,
+        models: vec![],
+        priority: 0,
+        requests: AtomicU64::new(0),
+        rate_info: RwLock::new(RateLimitInfo::default()),
+        burn_rate: Mutex::new(BurnRate::new()),
+        input_tokens: AtomicU64::new(0),
+        output_tokens: AtomicU64::new(0),
+        cache_creation_tokens: AtomicU64::new(0),
+        cache_read_tokens: AtomicU64::new(0),
+        last_routing_weight: AtomicU64::new(0),
+        last_routing_share: AtomicU64::new(0),
+        last_effective_gate: AtomicU64::new(0),
+    });
     let app = Router::new()
         .route("/v1/chat/completions", axum::routing::post(openai_chat_handler))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-    let client = reqwest::Client::new();
-    let resp = client
+
+    let resp = reqwest::Client::new()
         .post(format!("http://{}/v1/chat/completions", addr))
         .json(&serde_json::json!({
             "model": "claude-opus-4-7",
             "messages": [{"role": "user", "content": "hi"}],
         }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 429,
-        "openai_chat_handler must NOT route an OpenAI-format request to an Anthropic endpoint");
+        .send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["choices"][0]["message"]["content"].is_string(),
+        "response must be OpenAI-shaped after round-trip translation");
 }
 ```
 
-- [ ] **Step 2: Run — expect pass (Task 11 implements this filter)**
+Adapt the `Endpoint { .. }` field list and the mock response shape to whatever the actual structs require. If the codebase has a `make_endpoint` test helper by this point (added in Phase 4 Task 25 — may not exist yet), use it; otherwise hand-construct.
+
+- [ ] **Step 2: Run — expect pass (Task 11 wired this path)**
 
 ```bash
-cargo test openai_chat_handler_skips_anthropic_only 2>&1 | tail -10
+cargo test --bin anthropic-lb openai_chat_handler_routes_to_unified_anthropic 2>&1 | tail -10
 ```
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add src/main.rs
-git commit -m "test: openai_chat_handler does not route to Anthropic endpoints"
+git commit -m "test: openai_chat_handler routes to a unified Anthropic endpoint with translation"
 ```
 
 ---

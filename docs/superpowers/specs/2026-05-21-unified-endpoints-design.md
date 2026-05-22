@@ -46,13 +46,17 @@ runtime type, and `Option<usize>` index.
 - Supporting wire formats beyond Anthropic-native and OpenAI chat-completions.
   The design leaves room for more (`protocol` is an enum) but only two variants
   ship now.
-- **Routing OpenAI-format requests to Anthropic accounts** (an OpenAI→Anthropic
-  reverse-translation path). `openai_chat_handler` keeps targeting only
-  `Protocol::OpenAI` endpoints, exactly as it reaches only upstreams today. The
-  reverse path is a distinct feature with its own budget/usage-tracking
-  requirements; it is not bundled into this refactor.
 - A config deprecation period. This is a hard break (see Migration).
 - Keeping the `/upstream/{name}/*` passthrough route. It is unused and removed.
+
+> **Correction (2026-05-22):** An earlier revision of this spec listed
+> "routing OpenAI-format requests to Anthropic accounts" as a non-goal, on the
+> belief that `openai_chat_handler` reached only upstreams. That belief was
+> wrong — `openai_chat_handler` has always translated OpenAI→Anthropic, routed
+> to Anthropic accounts, and translated the response back. That behavior is
+> existing, tested, and **preserved**: in the unified model `openai_chat_handler`
+> dispatches to both `Protocol::OpenAI` endpoints (direct) and
+> `Protocol::Anthropic` endpoints (translated), symmetric with `proxy_handler`.
 
 ## Design
 
@@ -174,36 +178,35 @@ same intra-tier soft-limit degradation. The only difference: candidates come
 from a single `state.endpoints` pool, and `routing_candidates()` no longer has
 the `if let Some(u_idx) = self.fallback_upstream` block.
 
-**Candidate sets differ per handler.** `proxy_handler` (Anthropic-format input)
-can target any endpoint — Anthropic directly, OpenAI via translation.
-`openai_chat_handler` (OpenAI-format input) targets **only** `Protocol::OpenAI`
-endpoints; its `routing_candidates()` call filters out Anthropic endpoints. This
-matches today's behavior exactly (`openai_chat_handler` only ever reached
-upstreams) and avoids adding an OpenAI→Anthropic reverse-translation path, which
-is a separate feature out of scope here (see Non-goals).
+**Both handlers can target any endpoint.** Each of the two inbound wire
+formats can be served by each of the two endpoint protocols — four dispatch
+cells, all of which exist in the code today. The refactor changes how the
+endpoint is *selected* (one unified pool), not what happens after.
 
-After an endpoint is picked, `proxy_handler` dispatches on `endpoint.protocol`:
+After an endpoint is picked, the handler dispatches on `endpoint.protocol`:
 
-| Handler                  | Endpoint protocol | Action |
-|--------------------------|-------------------|--------|
-| `proxy_handler`          | Anthropic         | forward to `base_url`, parse rate-limit headers, track utilization, `record_usage` |
-| `proxy_handler`          | OpenAI            | translate Anthropic→OpenAI, forward, translate response back |
-| `openai_chat_handler`    | OpenAI            | forward direct, no translation |
+| Handler               | Endpoint protocol | Action |
+|-----------------------|-------------------|--------|
+| `proxy_handler`       | Anthropic         | forward to `base_url`, parse rate-limit headers, track utilization, `record_usage` |
+| `proxy_handler`       | OpenAI            | translate Anthropic→OpenAI request, forward, translate response back |
+| `openai_chat_handler` | Anthropic         | translate OpenAI→Anthropic request, forward, parse rate-limit headers, `record_usage`, translate response back |
+| `openai_chat_handler` | OpenAI            | forward direct, no translation |
 
-All three cells exist in the code today; this refactor only changes how the
-endpoint is *selected*, not what happens after. Translation must be deferred
-until **after** `pick_endpoint` and branched on `endpoint.protocol` —
-`openai_chat_handler` currently translates eagerly before the retry loop; that
-translation moves inside the protocol branch.
+All four cells exist in the code today (`openai_chat_handler` already routes to
+both Anthropic accounts and OpenAI upstreams). The refactor preserves every
+cell; it only swaps the two legacy pools (`accounts`, `upstreams`) for the one
+unified `endpoints` pool feeding `pick_endpoint`.
 
-`try_fallback_upstream` is renamed `forward_translated()`. **Critical change to
-its contract:** it currently returns the upstream's error response directly
-(`Some(resp) => return resp`), so an OpenAI endpoint's 429/5xx is sent straight
-to the caller instead of being retried. `forward_translated()` must instead
-return `None` on upstream 429/5xx so the shared retry loop adds the endpoint to
-`skip` and tries the next one — matching Anthropic-endpoint failure semantics.
-The `requests` counter increment, `skip` push, and retry remain owned by the
-shared loop, not the helper.
+A new `try_fallback_upstream_unified()` serves OpenAI-protocol endpoints from
+the unified pool, alongside the legacy `try_fallback_upstream()` (deleted in
+Phase 4). **Critical contract difference:** `try_fallback_upstream()` returns
+the upstream's error response directly (`Some(resp) => return resp`), so an
+OpenAI endpoint's 429/5xx is sent straight to the caller instead of being
+retried. `try_fallback_upstream_unified()` returns `None` on upstream 429/5xx
+so the shared retry loop adds the endpoint to `skip` and tries the next one —
+matching Anthropic-endpoint failure semantics. Non-429 4xx errors are still
+returned to the caller (retry would not help). The `skip` push and retry are
+owned by the shared loop, not the helper.
 
 The `/upstream/{name}/*` route and `upstream_handler` are deleted.
 
@@ -302,10 +305,10 @@ New tests:
 - OpenAI-protocol endpoint participates in priority-tier routing
 - Model allowlist on an OpenAI endpoint (e.g. opus-only) filters correctly
 - `proxy_handler` → OpenAI endpoint performs Anthropic→OpenAI translation
-- `openai_chat_handler` routes only to OpenAI endpoints; an Anthropic-only
-  endpoint pool yields no candidate (no reverse-translation path)
-- `forward_translated()` returns `None` on an upstream 429/5xx so the retry
-  loop advances to the next endpoint
+- `openai_chat_handler` → unified `Protocol::Anthropic` endpoint performs the
+  OpenAI→Anthropic request + response round-trip translation
+- `try_fallback_upstream_unified()` returns `None` on an upstream 429/5xx so the
+  retry loop advances to the next endpoint
 - Emergency brake still fires when all Anthropic endpoints are above threshold
   even with an OpenAI endpoint present in the pool
 - Config parse is rejected for `[[accounts]]`, `[[upstreams]]`, and
