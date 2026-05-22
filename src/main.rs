@@ -3077,7 +3077,7 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
 #[allow(clippy::too_many_arguments)]
 async fn finalize_stream(
     state: &AppState,
-    endpoint_idx: usize,
+    ep: &Endpoint,
     req_id: &str,
     client_id: &str,
     model: &str,
@@ -3096,7 +3096,7 @@ async fn finalize_stream(
     let usage = TokenUsage::from_sse_text(&text);
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
     if !usage.is_empty() {
-        state.record_usage(endpoint_idx, client_id, &usage).await;
+        state.record_usage(ep, client_id, &usage).await;
         log_usage(req_id, client_id, model, acct_name, &usage);
     } else {
         let reason = if upstream_error {
@@ -3159,7 +3159,7 @@ async fn finalize_stream(
 #[allow(clippy::too_many_arguments)]
 async fn finalize_non_stream(
     state: &AppState,
-    endpoint_idx: usize,
+    ep: &Endpoint,
     req_id: &str,
     client_id: &str,
     model: &str,
@@ -3173,7 +3173,7 @@ async fn finalize_non_stream(
     openai_compat: bool,
 ) {
     if !usage.is_empty() {
-        state.record_usage(endpoint_idx, client_id, usage).await;
+        state.record_usage(ep, client_id, usage).await;
         log_usage(req_id, client_id, model, acct_name, usage);
     }
     let mut log = serde_json::json!({
@@ -3199,12 +3199,24 @@ async fn finalize_non_stream(
 }
 
 impl AppState {
+    /// Recover the index of an endpoint borrowed from `self.endpoints`.
+    ///
+    /// `pick_endpoint` hands callers an `&Endpoint`; a detached streaming task
+    /// (which owns only a cloned `Arc<AppState>`) cannot carry that borrow
+    /// across the `tokio::spawn` boundary, so it re-derives the endpoint by
+    /// index. `Vec` storage is contiguous, so the index is the pointer offset.
+    /// Caller contract: `ep` must point into `self.endpoints`.
+    fn endpoint_index(&self, ep: &Endpoint) -> usize {
+        let base = self.endpoints.as_ptr() as usize;
+        let here = ep as *const Endpoint as usize;
+        (here - base) / std::mem::size_of::<Endpoint>()
+    }
+
     /// Record token usage for an endpoint and client.
-    async fn record_usage(&self, endpoint_idx: usize, client_id: &str, usage: &TokenUsage) {
+    async fn record_usage(&self, ep: &Endpoint, client_id: &str, usage: &TokenUsage) {
         if usage.is_empty() {
             return;
         }
-        let ep = &self.endpoints[endpoint_idx];
         ep.input_tokens
             .fetch_add(usage.input_tokens, Ordering::Relaxed);
         ep.output_tokens
@@ -3848,7 +3860,6 @@ async fn forward_anthropic(
     body_bytes: &bytes::Bytes,
     oauth_body_bytes: &bytes::Bytes,
     ep: &Endpoint,
-    endpoint_idx: usize,
     req_id: &str,
     client_id: &str,
     client_ver: &str,
@@ -4045,6 +4056,9 @@ async fn forward_anthropic(
         // Streaming: tee the byte stream to accumulate SSE text for usage extraction
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
         let state_clone = state.clone();
+        // The detached task can't carry the `ep` borrow across the spawn
+        // boundary; capture the index and re-borrow from the owned `Arc`.
+        let endpoint_idx = state.endpoint_index(ep);
         let client_id_clone = client_id.to_owned();
         let acct_name = endpoint_name.to_owned();
         let model_clone = model.to_owned();
@@ -4078,7 +4092,7 @@ async fn forward_anthropic(
             // Parse accumulated SSE data for usage
             finalize_stream(
                 &state_clone,
-                endpoint_idx,
+                &state_clone.endpoints[endpoint_idx],
                 &req_id_clone,
                 &client_id_clone,
                 &model_clone,
@@ -4112,7 +4126,7 @@ async fn forward_anthropic(
         }
         finalize_non_stream(
             state,
-            endpoint_idx,
+            ep,
             req_id,
             client_id,
             model,
@@ -4295,7 +4309,6 @@ async fn proxy_handler(
                                     &body_bytes,
                                     &oauth_body_bytes,
                                     ep,
-                                    i,
                                     &req_id,
                                     &client_id,
                                     &client_ver,
@@ -7157,7 +7170,6 @@ async fn forward_openai_compat_anthropic(
     state: &Arc<AppState>,
     parts: &axum::http::request::Parts,
     ep: &Endpoint,
-    endpoint_idx: usize,
     anthropic_body: &serde_json::Value,
     oauth_anthropic_body: &serde_json::Value,
     req_id: &str,
@@ -7356,6 +7368,9 @@ async fn forward_openai_compat_anthropic(
     if is_streaming {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
         let state_clone = state.clone();
+        // The detached task can't carry the `ep` borrow across the spawn
+        // boundary; capture the index and re-borrow from the owned `Arc`.
+        let endpoint_idx = state.endpoint_index(ep);
         let client_id_clone = client_id.to_owned();
         let acct_name = endpoint_name.to_owned();
         let model_clone = model.to_owned();
@@ -7441,7 +7456,7 @@ async fn forward_openai_compat_anthropic(
             // Extract and record token usage from accumulated SSE data
             finalize_stream(
                 &state_clone,
-                endpoint_idx,
+                &state_clone.endpoints[endpoint_idx],
                 &req_id_clone,
                 &client_id_clone,
                 &model_clone,
@@ -7504,7 +7519,7 @@ async fn forward_openai_compat_anthropic(
     let usage = TokenUsage::from_response_body(&anthropic_resp);
     finalize_non_stream(
         state,
-        endpoint_idx,
+        ep,
         req_id,
         client_id,
         model,
@@ -7670,7 +7685,6 @@ async fn openai_chat_handler(
                                     &state,
                                     &parts,
                                     ep,
-                                    i,
                                     &anthropic_body,
                                     &oauth_anthropic_body,
                                     &req_id,
@@ -12043,7 +12057,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             cache_creation_input_tokens: 20,
             cache_read_input_tokens: 30,
         };
-        state.record_usage(0, "test-client", &usage).await;
+        state
+            .record_usage(&state.endpoints[0], "test-client", &usage)
+            .await;
 
         assert_eq!(state.endpoints[0].input_tokens.load(Ordering::Relaxed), 100);
         assert_eq!(state.endpoints[0].output_tokens.load(Ordering::Relaxed), 50);
@@ -12072,7 +12088,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         };
-        state.record_usage(0, "-", &usage).await;
+        state.record_usage(&state.endpoints[0], "-", &usage).await;
 
         // Account gets updated
         assert_eq!(state.endpoints[0].input_tokens.load(Ordering::Relaxed), 100);
