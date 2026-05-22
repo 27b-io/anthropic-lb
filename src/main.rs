@@ -8697,14 +8697,15 @@ async fn main() {
         panic!("{msg}");
     }
 
-    // TRANSIENT GUARD (Phase 2a → Phase 2b): routing_candidates produces
-    // EndpointIdx::Unified(i) candidates for any populated [[endpoints]],
-    // but handler dispatch for that variant is not wired until Phase 2b.
-    // Selecting a Unified candidate would panic via `unreachable!()`. Refuse
-    // to start until dispatch lands. This block is deleted by Phase 2b.
+    // TRANSIENT GUARD (removed at the end of Phase 2c): handler dispatch for
+    // EndpointIdx::Unified is now wired in both handlers, but the unified pool
+    // is not yet covered by persistence (save/load_state), metrics, or Redis
+    // sync. Refuse to start with a populated [[endpoints]] config until those
+    // land, so the schema goes straight from "rejected" to "fully working"
+    // with no half-migrated window. This block is deleted by Phase 2c.
     if !config.endpoints.is_empty() {
         panic!(
-            "config: [[endpoints]] is declared ({} entries) but handler dispatch is not yet wired (Phase 2b incoming). Use [[accounts]] / [[upstreams]] for now.",
+            "config: [[endpoints]] is declared ({} entries) but the unified-pool migration is incomplete (persistence/metrics pending, Phase 2c). Use [[accounts]] / [[upstreams]] for now.",
             config.endpoints.len()
         );
     }
