@@ -5475,122 +5475,6 @@ async fn try_fallback_upstream_unified(
     }
 }
 
-// ── Upstream passthrough handler ─────────────────────────────────────
-
-async fn upstream_handler(
-    State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
-    axum::extract::Path((upstream_name, _rest)): axum::extract::Path<(String, String)>,
-    req: Request<Body>,
-) -> Response {
-    let client_ip = client_addr.ip();
-
-    if !state.is_ip_allowed(&client_ip) {
-        warn!(client = %client_ip, "rejected: IP not in allowlist");
-        return (StatusCode::FORBIDDEN, "forbidden").into_response();
-    }
-
-    if let Some(ref key) = state.proxy_key {
-        let provided = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-        if provided != Some(key.as_str()) {
-            warn!(client = %client_ip, "rejected: invalid or missing proxy key");
-            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
-    }
-
-    let upstream = match state.upstreams.iter().find(|u| u.name == upstream_name) {
-        Some(u) => u,
-        None => {
-            warn!(client = %client_ip, upstream = %upstream_name, "unknown upstream");
-            return (StatusCode::NOT_FOUND, "unknown upstream").into_response();
-        }
-    };
-
-    let (parts, body) = req.into_parts();
-
-    // Extract client identification headers
-    let client_id = state.resolve_client_id(&client_ip, &parts.headers);
-
-    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(e) => {
-            error!("failed to read request body: {e}");
-            return (StatusCode::BAD_REQUEST, "bad request body").into_response();
-        }
-    };
-
-    // Extract model from request body for logging
-    let model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-        .ok()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str().map(String::from)))
-        .unwrap_or_default();
-
-    // Build upstream URL: strip /upstream/<name> prefix, forward the rest
-    let path = parts.uri.path();
-    let prefix = format!("/upstream/{}", upstream_name);
-    let remainder = path.strip_prefix(&prefix).unwrap_or("/");
-    let remainder = if remainder.is_empty() { "/" } else { remainder };
-    let query = parts
-        .uri
-        .query()
-        .map(|q| format!("?{}", q))
-        .unwrap_or_default();
-    let url = format!("{}{}{}", upstream.base_url, remainder, query);
-
-    let mut headers = parts.headers.clone();
-    headers.remove("host");
-    headers.remove("authorization");
-    headers.remove("x-api-key");
-    // Inject upstream API key as Bearer token (OpenAI-compatible)
-    headers.insert(
-        "authorization",
-        HeaderValue::from_str(&format!("Bearer {}", upstream.api_key)).unwrap(),
-    );
-
-    let upstream_req = state
-        .client
-        .request(parts.method.clone(), &url)
-        .headers(headers)
-        .body(body_bytes);
-
-    let resp = match upstream_req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            error!(upstream = upstream.name, error = %e, "upstream request failed");
-            return (StatusCode::BAD_GATEWAY, "upstream request failed").into_response();
-        }
-    };
-
-    let status = resp.status();
-    upstream.requests.fetch_add(1, Ordering::Relaxed);
-
-    info!(
-        client = %client_ip,
-        client_id = %client_id,
-        model = %model,
-        upstream = upstream.name,
-        status = status.as_u16(),
-        total = upstream.requests.load(Ordering::Relaxed),
-        "proxied (upstream)"
-    );
-
-    let resp_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let resp_headers = resp.headers().clone();
-
-    let mut builder = Response::builder().status(resp_status);
-    for (k, v) in resp_headers.iter() {
-        if k == "transfer-encoding" {
-            continue;
-        }
-        builder = builder.header(k, v);
-    }
-    builder
-        .body(Body::from_stream(resp.bytes_stream()))
-        .unwrap_or_else(|_| {
-            (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-        })
-}
-
 // ── Stats endpoint ──────────────────────────────────────────────────
 
 /// Build one `/stats` JSON entry from the shared (name, priority, rate_info,
@@ -9295,7 +9179,6 @@ async fn main() {
             "/v1/chat/completions",
             axum::routing::post(openai_chat_handler),
         )
-        .route("/upstream/{name}/{*rest}", any(upstream_handler))
         .fallback(any(proxy_handler))
         .with_state(state.clone());
 
@@ -9878,7 +9761,6 @@ token = "sk-ant-test"
                 "/v1/chat/completions",
                 axum::routing::post(openai_chat_handler),
             )
-            .route("/upstream/{name}/{*rest}", any(upstream_handler))
             .fallback(any(proxy_handler))
             .with_state(state)
     }
@@ -11643,65 +11525,6 @@ token = "sk-ant-test"
         assert_eq!(endpoints[0]["priority"], 5);
         assert_eq!(endpoints[1]["name"], "ep-openai");
         assert_eq!(endpoints[1]["protocol"], "openai");
-    }
-
-    #[tokio::test]
-    async fn upstream_handler_forwards_to_named_upstream() {
-        let (mock_url, _handle) = spawn_mock_upstream().await;
-        let (app, _state) = test_app(&mock_url, None);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
-        });
-
-        let client = Client::new();
-        let resp = client
-            .post(format!("http://{}/upstream/mock/v1/chat/completions", addr))
-            .header("content-type", "application/json")
-            .body(r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#)
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn upstream_handler_rejects_unknown_upstream() {
-        let (mock_url, _handle) = spawn_mock_upstream().await;
-        let (app, _state) = test_app(&mock_url, None);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
-        });
-
-        let client = Client::new();
-        let resp = client
-            .post(format!(
-                "http://{}/upstream/nonexistent/v1/chat/completions",
-                addr
-            ))
-            .header("content-type", "application/json")
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
     }
 
     // ── Unit: OpenAI request translation ────────────────────────────
