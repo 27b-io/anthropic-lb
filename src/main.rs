@@ -696,8 +696,8 @@ impl AppState {
         let mut endpoints = Vec::new();
         let now = Instant::now();
 
-        // Build a PersistedEndpoint from the shared (name, requests, rate_info)
-        // fields common to both Account and Endpoint.
+        // Build a PersistedEndpoint from an endpoint's (name, requests,
+        // rate_info) fields.
         async fn persist_one(
             name: &str,
             requests: &AtomicU64,
@@ -869,8 +869,7 @@ impl AppState {
             }
         }
 
-        // The unified Endpoint carries its own base URL (the Account pool used
-        // the global self.upstream).
+        // Each endpoint carries its own base URL.
         let url = format!("{}/v1/messages", ep.base_url);
         let body = serde_json::json!({
             "model": model,
@@ -1791,8 +1790,7 @@ impl AppState {
 
 /// Per-entry representative `(gate, weight)` for metrics gauges, model-agnostic.
 /// Returns `None` for hard-limited members (they contribute zero in any state).
-/// Shared by both the legacy account pool and the unified endpoint pool — only
-/// reads `RateLimitInfo`, so it is pool-agnostic.
+/// Computed purely from a `RateLimitInfo`.
 fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Option<(f64, f64)> {
     // Hard-limited members contribute zero (mirrors routing_candidates filter).
     if let Some(until) = info.hard_limited_until {
@@ -1965,9 +1963,8 @@ impl AppState {
     ///
     /// Also refreshes metric gauges and publishes updated routing weights so all
     /// replicas reflect the recovery within the next sync tick.
-    /// Broadcast a hard-limit recovery for an endpoint by name. Pool-agnostic:
-    /// the Redis sentinel key is derived from the name alone, so this serves
-    /// both the legacy Account pool and the unified Endpoint pool.
+    /// Broadcast a hard-limit recovery for an endpoint by name. The Redis
+    /// sentinel key is derived from the name alone.
     async fn signal_hard_limit_recovery(&self, endpoint_name: &str) {
         if let Some(redis) = &self.redis {
             let mut conn = redis.clone();
@@ -4647,10 +4644,9 @@ async fn try_fallback_upstream(
 
 // ── Stats endpoint ──────────────────────────────────────────────────
 
-/// Build one `/stats` JSON entry from the shared (name, priority, rate_info,
-/// burn_rate, counters) field set common to both `Account` and the unified
-/// `Endpoint`. When `protocol` is `Some`, a `"protocol"` field is added — the
-/// only shape difference between an account entry and an endpoint entry.
+/// Build one `/stats` JSON entry from an endpoint's (name, priority,
+/// rate_info, burn_rate, counters) fields. When `protocol` is `Some`, a
+/// `"protocol"` field is added to the entry.
 #[allow(clippy::too_many_arguments)]
 async fn build_stats_entry(
     name: &str,
@@ -5131,10 +5127,9 @@ fn append_routing_weight_metrics(
     }
 }
 
-/// Build an `EndpointMetricsSnap` from the shared (name, rate_info, burn_rate,
-/// counters, gauge atomics) field set common to both `Account` and the unified
-/// `Endpoint`. Pool-agnostic: callers pass field references, so one
-/// implementation serves both the legacy account pool and the endpoint pool.
+/// Build an `EndpointMetricsSnap` from an endpoint's (name, rate_info,
+/// burn_rate, counters, gauge atomics) fields. Callers pass field references
+/// rather than an `&Endpoint`.
 #[allow(clippy::too_many_arguments)]
 async fn build_metrics_snap(
     name: &str,
@@ -5751,7 +5746,7 @@ async fn metrics_handler(
         "Effective routing gate: max(time_adjusted_5h, time_adjusted_7d) with status floors",
     );
 
-    // Snap-carried gauges (captured at snap time) — covers both pools.
+    // Snap-carried gauges (captured at snap time).
     for s in &snaps {
         if s.passthrough {
             continue;
@@ -16955,8 +16950,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(state.cluster_info_cache.lock().unwrap().is_none());
     }
 
-    /// sync_from_redis / publish_routing_weights build the unified SyncTarget
-    /// list over BOTH pools. With an endpoints-only config (and a mix of
+    /// sync_from_redis / publish_routing_weights build the SyncTarget list over
+    /// the endpoint pool. With an endpoints-only config (and a mix of
     /// Anthropic + OpenAI protocols) neither path may panic.
     #[tokio::test]
     async fn sync_and_publish_handle_endpoint_pool_without_redis() {
