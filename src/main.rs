@@ -13549,6 +13549,35 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
+    // ── Unit: unified endpoint participation in routing ────────────
+
+    #[tokio::test]
+    async fn openai_endpoint_participates_at_configured_priority() {
+        let acct = make_account("anthropic", "sk-ant-api-a");
+        {
+            let mut info = acct.rate_info.write().await;
+            info.utilization = Some(0.0); // healthy
+        }
+        let mut state = test_state_with(vec![acct]);
+        let st = Arc::get_mut(&mut state).unwrap();
+        let mut ep = make_endpoint("openai", Protocol::OpenAI);
+        ep.priority = 100;
+        st.endpoints.push(ep);
+
+        let candidates = state.routing_candidates("claude-opus-4-7", &[]).await;
+        let openai_candidate = candidates
+            .iter()
+            .find(|c| matches!(c.endpoint, EndpointIdx::Unified(_)));
+        assert!(
+            openai_candidate.is_some(),
+            "openai endpoint must be a candidate"
+        );
+        let c = openai_candidate.unwrap();
+        assert_eq!(c.priority, 100);
+        assert_eq!(c.weight, 1.0);
+        assert_eq!(c.gate, 0.0);
+    }
+
     // ── Unit: per-client budget ────────────────────────────────────
 
     #[tokio::test]
