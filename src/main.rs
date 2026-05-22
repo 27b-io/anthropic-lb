@@ -21713,4 +21713,64 @@ upstream = "https://api.anthropic.com"
         .await;
         assert!(result.is_none(), "500 must return None for retry");
     }
+    // ── Unified endpoint: cross-protocol handler routing ───────────
+
+    #[tokio::test]
+    async fn openai_chat_handler_routes_to_unified_anthropic_endpoint() {
+        // Mock Anthropic upstream: returns a minimal messages response.
+        let mock = Router::new().fallback(any(|| async {
+            axum::Json(serde_json::json!({
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "model": "claude-opus-4-7",
+                "content": [{"type": "text", "text": "hi back"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 2}
+            }))
+            .into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock).await.unwrap();
+        });
+
+        let mut state = test_state_with(vec![]); // no legacy accounts
+        let mut ep = make_endpoint("unified-anthropic", Protocol::Anthropic);
+        ep.base_url = format!("http://{}", mock_addr);
+        ep.token = "sk-ant-api-test".to_string();
+        Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(openai_chat_handler),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .json(&serde_json::json!({
+                "model": "claude-opus-4-7",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["choices"][0]["message"]["content"].is_string(),
+            "response must be OpenAI-shaped after round-trip translation"
+        );
+    }
 }
