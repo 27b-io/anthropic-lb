@@ -8423,145 +8423,135 @@ async fn openai_chat_handler(
         let mut saw_529 = false;
         // n accounts + 1 fallback upstream is the candidate ceiling.
         for _attempt in 0..(n + 1) {
-            let picked = match state.pick_endpoint(affinity, &model, &skip).await {
-                Some(e) => e,
-                None => {
-                    warn!("all endpoints exhausted");
-                    return (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "all upstream endpoints exhausted",
-                    )
-                        .into_response();
-                }
-            };
-            match picked {
-                EndpointIdx::Account(i) => {
-                    let acct = &state.accounts[i];
-                    match forward_openai_compat_anthropic(
-                        &state,
-                        &parts,
-                        &state.upstream,
-                        &acct.token,
-                        acct.passthrough,
-                        &acct.name,
-                        UsageTarget::Account(i),
-                        &acct.requests,
-                        &acct.rate_info,
-                        &acct.burn_rate,
-                        &anthropic_body,
-                        &oauth_anthropic_body,
-                        &req_id,
-                        &client_id,
-                        &client_ver,
-                        &client_ip,
-                        &agent_id,
-                        &session_id,
-                        &model,
-                        is_streaming,
-                        request_start,
-                    )
-                    .await
-                    {
-                        ForwardOutcome::Done(resp) => return resp,
-                        ForwardOutcome::Retry {
-                            saw_529: this_529,
-                            push_skip,
-                        } => {
-                            if this_529 {
-                                saw_529 = true;
+            // Pick the next candidate. Anthropic-protocol branches (accounts or
+            // unified Anthropic) resolve to a `(ForwardOutcome, EndpointIdx)`
+            // pair; OpenAI-protocol branches (`try_fallback_upstream*`) handle
+            // their `Option<Response>` inline by `return`/`continue`-ing.
+            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) =
+                match state.pick_endpoint(affinity, &model, &skip).await {
+                    Some(EndpointIdx::Account(i)) => {
+                        let acct = &state.accounts[i];
+                        let out = forward_openai_compat_anthropic(
+                            &state,
+                            &parts,
+                            &state.upstream,
+                            &acct.token,
+                            acct.passthrough,
+                            &acct.name,
+                            UsageTarget::Account(i),
+                            &acct.requests,
+                            &acct.rate_info,
+                            &acct.burn_rate,
+                            &anthropic_body,
+                            &oauth_anthropic_body,
+                            &req_id,
+                            &client_id,
+                            &client_ver,
+                            &client_ip,
+                            &agent_id,
+                            &session_id,
+                            &model,
+                            is_streaming,
+                            request_start,
+                        )
+                        .await;
+                        (out, EndpointIdx::Account(i))
+                    }
+                    Some(EndpointIdx::Upstream(u)) => {
+                        // All account tiers exhausted — the upstream is OpenAI-native,
+                        // so forward the original request body without translation.
+                        match try_fallback_upstream(
+                            &state,
+                            &body_bytes,
+                            &req_id,
+                            &client_id,
+                            &model,
+                            u,
+                            false,
+                        )
+                        .await
+                        {
+                            Some(resp) => return resp,
+                            None => {
+                                skip.push(EndpointIdx::Upstream(u));
+                                continue;
                             }
-                            if push_skip {
-                                skip.push(EndpointIdx::Account(i));
-                            }
-                            continue;
                         }
                     }
-                }
-                EndpointIdx::Upstream(u) => {
-                    // All account tiers exhausted — the upstream is OpenAI-native,
-                    // so forward the original request body without translation.
-                    match try_fallback_upstream(
-                        &state,
-                        &body_bytes,
-                        &req_id,
-                        &client_id,
-                        &model,
-                        u,
-                        false,
-                    )
-                    .await
-                    {
-                        Some(resp) => return resp,
-                        None => {
-                            skip.push(EndpointIdx::Upstream(u));
-                            continue;
-                        }
-                    }
-                }
-                EndpointIdx::Unified(i) => {
-                    let ep = &state.endpoints[i];
-                    match ep.protocol {
-                        Protocol::Anthropic => {
-                            match forward_openai_compat_anthropic(
-                                &state,
-                                &parts,
-                                &ep.base_url,
-                                &ep.token,
-                                ep.passthrough,
-                                &ep.name,
-                                UsageTarget::Unified(i),
-                                &ep.requests,
-                                &ep.rate_info,
-                                &ep.burn_rate,
-                                &anthropic_body,
-                                &oauth_anthropic_body,
-                                &req_id,
-                                &client_id,
-                                &client_ver,
-                                &client_ip,
-                                &agent_id,
-                                &session_id,
-                                &model,
-                                is_streaming,
-                                request_start,
-                            )
-                            .await
-                            {
-                                ForwardOutcome::Done(resp) => return resp,
-                                ForwardOutcome::Retry {
-                                    saw_529: this_529,
-                                    push_skip,
-                                } => {
-                                    if this_529 {
-                                        saw_529 = true;
-                                    }
-                                    if push_skip {
+                    Some(EndpointIdx::Unified(i)) => {
+                        let ep = &state.endpoints[i];
+                        match ep.protocol {
+                            Protocol::Anthropic => {
+                                let out = forward_openai_compat_anthropic(
+                                    &state,
+                                    &parts,
+                                    &ep.base_url,
+                                    &ep.token,
+                                    ep.passthrough,
+                                    &ep.name,
+                                    UsageTarget::Unified(i),
+                                    &ep.requests,
+                                    &ep.rate_info,
+                                    &ep.burn_rate,
+                                    &anthropic_body,
+                                    &oauth_anthropic_body,
+                                    &req_id,
+                                    &client_id,
+                                    &client_ver,
+                                    &client_ip,
+                                    &agent_id,
+                                    &session_id,
+                                    &model,
+                                    is_streaming,
+                                    request_start,
+                                )
+                                .await;
+                                (out, EndpointIdx::Unified(i))
+                            }
+                            Protocol::OpenAI => {
+                                match try_fallback_upstream_unified(
+                                    &state,
+                                    &body_bytes,
+                                    &req_id,
+                                    &client_id,
+                                    &model,
+                                    i,
+                                    false,
+                                )
+                                .await
+                                {
+                                    Some(resp) => return resp,
+                                    None => {
                                         skip.push(EndpointIdx::Unified(i));
+                                        continue;
                                     }
-                                    continue;
-                                }
-                            }
-                        }
-                        Protocol::OpenAI => {
-                            match try_fallback_upstream_unified(
-                                &state,
-                                &body_bytes,
-                                &req_id,
-                                &client_id,
-                                &model,
-                                i,
-                                false,
-                            )
-                            .await
-                            {
-                                Some(resp) => return resp,
-                                None => {
-                                    skip.push(EndpointIdx::Unified(i));
-                                    continue;
                                 }
                             }
                         }
                     }
+                    None => {
+                        warn!("all endpoints exhausted");
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "all upstream endpoints exhausted",
+                        )
+                            .into_response();
+                    }
+                };
+
+            match outcome {
+                ForwardOutcome::Done(resp) => return resp,
+                ForwardOutcome::Retry {
+                    saw_529: this_529,
+                    push_skip,
+                } => {
+                    if this_529 {
+                        saw_529 = true;
+                    }
+                    if push_skip {
+                        skip.push(picked_idx);
+                    }
+                    continue;
                 }
             }
         }
