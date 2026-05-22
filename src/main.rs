@@ -2380,20 +2380,41 @@ impl AppState {
             None => return,
         };
         use redis::AsyncCommands;
-        for acct in &self.accounts {
-            let w = f64::from_bits(acct.last_routing_weight.load(Ordering::Relaxed));
-            let s = f64::from_bits(acct.last_routing_share.load(Ordering::Relaxed));
-            let g = f64::from_bits(acct.last_effective_gate.load(Ordering::Relaxed));
-            let key = format!("alb:weight:{}", acct.name);
+        let ttl = Self::routing_weight_publish_ttl(self.probe_interval_secs);
+        let publish = |name: &str, weight: &AtomicU64, share: &AtomicU64, gate: &AtomicU64| {
+            let w = f64::from_bits(weight.load(Ordering::Relaxed));
+            let s = f64::from_bits(share.load(Ordering::Relaxed));
+            let g = f64::from_bits(gate.load(Ordering::Relaxed));
+            let key = format!("alb:weight:{}", name);
             let val = format!("{w},{s},{g}");
             let mut conn = redis.clone();
-            let ttl = Self::routing_weight_publish_ttl(self.probe_interval_secs);
             tokio::spawn(async move {
                 let result: redis::RedisResult<()> = conn.set_ex(&key, val, ttl).await;
                 if let Err(e) = result {
                     tracing::warn!(error = %e, "redis routing weight publish failed");
                 }
             });
+        };
+        for acct in &self.accounts {
+            publish(
+                &acct.name,
+                &acct.last_routing_weight,
+                &acct.last_routing_share,
+                &acct.last_effective_gate,
+            );
+        }
+        // Parallel pass over the unified endpoint pool. OpenAI endpoints are
+        // skipped — sync_from_redis only reads weights for Anthropic targets.
+        for ep in &self.endpoints {
+            if ep.protocol == Protocol::OpenAI {
+                continue;
+            }
+            publish(
+                &ep.name,
+                &ep.last_routing_weight,
+                &ep.last_routing_share,
+                &ep.last_effective_gate,
+            );
         }
     }
 
@@ -3119,11 +3140,43 @@ impl AppState {
         let now_epoch = Self::now_epoch();
         let now_instant = Instant::now();
 
-        // 1. Sync hard limits (MGET for all accounts in one round-trip)
-        let hard_keys: Vec<String> = self
-            .accounts
+        // Unified sync target list. Spans both the legacy account pool and the
+        // unified endpoint pool — in a real config exactly one is non-empty.
+        // OpenAI endpoints are skipped: they carry no Anthropic rate-limit data.
+        struct SyncTarget<'a> {
+            name: &'a str,
+            rate_info: &'a RwLock<RateLimitInfo>,
+            weight: &'a AtomicU64,
+            share: &'a AtomicU64,
+            gate: &'a AtomicU64,
+        }
+        let mut targets: Vec<SyncTarget<'_>> = Vec::new();
+        for a in &self.accounts {
+            targets.push(SyncTarget {
+                name: &a.name,
+                rate_info: &a.rate_info,
+                weight: &a.last_routing_weight,
+                share: &a.last_routing_share,
+                gate: &a.last_effective_gate,
+            });
+        }
+        for e in &self.endpoints {
+            if e.protocol == Protocol::OpenAI {
+                continue;
+            }
+            targets.push(SyncTarget {
+                name: &e.name,
+                rate_info: &e.rate_info,
+                weight: &e.last_routing_weight,
+                share: &e.last_routing_share,
+                gate: &e.last_effective_gate,
+            });
+        }
+
+        // 1. Sync hard limits (MGET for all targets in one round-trip)
+        let hard_keys: Vec<String> = targets
             .iter()
-            .map(|a| format!("alb:hard:{}", a.name))
+            .map(|t| format!("alb:hard:{}", t.name))
             .collect();
 
         if let Ok(values) = conn.mget::<_, Vec<Option<String>>>(&hard_keys).await {
@@ -3138,26 +3191,23 @@ impl AppState {
                         // escalation, and resetting it based on another replica's
                         // unrelated success would mask abuse patterns and thrash
                         // the exponential backoff.
-                        let mut info = self.accounts[i].rate_info.write().await;
+                        let mut info = targets[i].rate_info.write().await;
                         if info.hard_limited_until.is_some() {
                             info.hard_limited_until = None;
                             trace!(
-                                account = self.accounts[i].name,
+                                endpoint = targets[i].name,
                                 "synced hard-limit clear sentinel from redis"
                             );
                         }
                     }
                     HardLimitSync::Update(until_instant) => {
-                        let mut info = self.accounts[i].rate_info.write().await;
+                        let mut info = targets[i].rate_info.write().await;
                         let should_update = info
                             .hard_limited_until
                             .is_none_or(|local| until_instant > local);
                         if should_update {
                             info.hard_limited_until = Some(until_instant);
-                            trace!(
-                                account = self.accounts[i].name,
-                                "synced hard-limit from redis"
-                            );
+                            trace!(endpoint = targets[i].name, "synced hard-limit from redis");
                         }
                     }
                     HardLimitSync::Ignore => {}
@@ -3165,18 +3215,17 @@ impl AppState {
             }
         }
 
-        // 2. Sync rate info (MGET for all accounts in one round-trip)
-        let rate_keys: Vec<String> = self
-            .accounts
+        // 2. Sync rate info (MGET for all targets in one round-trip)
+        let rate_keys: Vec<String> = targets
             .iter()
-            .map(|a| format!("alb:rate:{}", a.name))
+            .map(|t| format!("alb:rate:{}", t.name))
             .collect();
 
         if let Ok(values) = conn.mget::<_, Vec<Option<String>>>(&rate_keys).await {
             for (i, val) in values.iter().enumerate() {
                 if let Some(json) = val {
                     if let Ok(remote) = serde_json::from_str::<RedisRateInfo>(json) {
-                        let mut info = self.accounts[i].rate_info.write().await;
+                        let mut info = targets[i].rate_info.write().await;
                         // "Most recent wins": only apply remote data if it's newer
                         // Both ages use wall-clock epoch to avoid mixed-clock-domain bugs
                         let local_age = info
@@ -3205,7 +3254,7 @@ impl AppState {
                             info.last_updated = Some(now_instant);
                             info.last_updated_epoch = Some(remote.updated_at);
                             trace!(
-                                account = self.accounts[i].name,
+                                endpoint = targets[i].name,
                                 remote_age,
                                 "synced rate info from redis"
                             );
@@ -3216,10 +3265,9 @@ impl AppState {
         }
 
         // 3. Sync precomputed routing weights (published by probing pod)
-        let weight_keys: Vec<String> = self
-            .accounts
+        let weight_keys: Vec<String> = targets
             .iter()
-            .map(|a| format!("alb:weight:{}", a.name))
+            .map(|t| format!("alb:weight:{}", t.name))
             .collect();
         if let Ok(values) = conn.mget::<_, Vec<Option<String>>>(&weight_keys).await {
             for (i, val) in values.iter().enumerate() {
@@ -3227,17 +3275,11 @@ impl AppState {
                     let mut parts = csv.splitn(3, ',');
                     if let (Some(w_str), Some(s_str)) = (parts.next(), parts.next()) {
                         if let (Ok(w), Ok(s)) = (w_str.parse::<f64>(), s_str.parse::<f64>()) {
-                            self.accounts[i]
-                                .last_routing_weight
-                                .store(w.to_bits(), Ordering::Relaxed);
-                            self.accounts[i]
-                                .last_routing_share
-                                .store(s.to_bits(), Ordering::Relaxed);
+                            targets[i].weight.store(w.to_bits(), Ordering::Relaxed);
+                            targets[i].share.store(s.to_bits(), Ordering::Relaxed);
                             // Gate is optional (backward compat with older publishers)
                             if let Some(Ok(g)) = parts.next().map(|g| g.parse::<f64>()) {
-                                self.accounts[i]
-                                    .last_effective_gate
-                                    .store(g.to_bits(), Ordering::Relaxed);
+                                targets[i].gate.store(g.to_bits(), Ordering::Relaxed);
                             }
                         }
                     }
@@ -18298,6 +18340,44 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Should not panic or error when redis is None
         state.sync_from_redis().await;
         // Cluster cache should remain None
+        assert!(state.cluster_info_cache.lock().unwrap().is_none());
+    }
+
+    /// sync_from_redis / publish_routing_weights build the unified SyncTarget
+    /// list over BOTH pools. With an endpoints-only config (and a mix of
+    /// Anthropic + OpenAI protocols) neither path may panic.
+    #[tokio::test]
+    async fn sync_and_publish_handle_endpoint_pool_without_redis() {
+        fn make_ep(name: &str, protocol: Protocol) -> Endpoint {
+            Endpoint {
+                name: name.to_string(),
+                protocol,
+                base_url: "https://api.anthropic.com".to_string(),
+                token: "sk-ant-api-test".to_string(),
+                passthrough: false,
+                models: vec![],
+                priority: 0,
+                requests: AtomicU64::new(0),
+                rate_info: RwLock::new(RateLimitInfo::default()),
+                burn_rate: Mutex::new(BurnRate::new()),
+                input_tokens: AtomicU64::new(0),
+                output_tokens: AtomicU64::new(0),
+                cache_creation_tokens: AtomicU64::new(0),
+                cache_read_tokens: AtomicU64::new(0),
+                last_routing_weight: AtomicU64::new(0),
+                last_routing_share: AtomicU64::new(0),
+                last_effective_gate: AtomicU64::new(0),
+            }
+        }
+        let mut state = test_state_with(vec![]);
+        {
+            let st = Arc::get_mut(&mut state).unwrap();
+            st.endpoints.push(make_ep("ep-a", Protocol::Anthropic));
+            st.endpoints.push(make_ep("ep-oai", Protocol::OpenAI));
+        }
+        // Both paths must be no-ops (redis is None) and must not panic.
+        state.sync_from_redis().await;
+        state.publish_routing_weights().await;
         assert!(state.cluster_info_cache.lock().unwrap().is_none());
     }
 
