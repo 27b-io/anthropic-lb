@@ -21773,4 +21773,76 @@ upstream = "https://api.anthropic.com"
             "response must be OpenAI-shaped after round-trip translation"
         );
     }
+    #[tokio::test]
+    async fn proxy_handler_translates_to_openai_endpoint() {
+        // Mock OpenAI upstream: capture the request body to assert it was
+        // translated to OpenAI shape, then return an OpenAI-format response.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(1);
+        let app = Router::new().fallback(any(move |req: Request<Body>| {
+            let tx = tx.clone();
+            async move {
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let _ = tx.send(v).await;
+                (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "id": "chatcmpl-x",
+                        "object": "chat.completion",
+                        "model": "claude-opus-4-7",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "hi back"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+                    })),
+                )
+                    .into_response()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = test_state_with(vec![]);
+        let mut ep = make_endpoint("openai-gw", Protocol::OpenAI);
+        ep.base_url = format!("http://{}", upstream_addr);
+        Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+        let proxy_app = Router::new().fallback(any(proxy_handler)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                proxy_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .json(&serde_json::json!({
+                "model": "claude-opus-4-7",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        let received = rx.recv().await.expect("upstream must receive a request");
+        assert!(
+            received.get("messages").is_some(),
+            "translated request must have OpenAI `messages` field"
+        );
+        assert_eq!(received["model"], "claude-opus-4-7");
+    }
 }
