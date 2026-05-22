@@ -1,6 +1,5 @@
 # anthropic-lb configuration
 listen = "127.0.0.1:8082"
-upstream = "https://api.anthropic.com"
 # Routing strategy:
 # - "dynamic-capacity" / "dynamic-capacity-v1": legacy weighted routing with
 #   the older 0.5 affinity override threshold
@@ -22,13 +21,13 @@ probe_interval_secs = 300
 # or the emergency brake. Identity resolved via x-client-id header or client_names IP map.
 # operators = ["ray", "openclaw", "claude"]
 
-# Per-client utilization limits: clients are 429'd when ALL model-compatible accounts
+# Per-client utilization limits: clients are 429'd when ALL model-compatible endpoints
 # exceed their configured limit. Values must be 0.0-1.0.
 # [client_utilization_limits]
 # gastown = 0.85
 # openclaw = 0.95
 
-# Emergency brake: when ALL accounts exceed this threshold, all non-operator traffic
+# Emergency brake: when ALL endpoints exceed this threshold, all non-operator traffic
 # is automatically blocked. Default: 0.88.
 # emergency_threshold = 0.88
 
@@ -38,13 +37,22 @@ probe_interval_secs = 300
 # redis_url = "redis://10.0.0.5:6379"
 
 # "passthrough" = forward caller's auth headers as-is (for OpenClaw managed tokens)
-# Any other value = inject as the account's own token
+# Any other value = inject as the endpoint's own token
 # OAuth tokens (sk-ant-oat*) are injected as Authorization: Bearer
 # Standard keys (sk-ant-api*) are injected as X-Api-Key
-[[accounts]]
+[[endpoints]]
 name = "primary"
 token = "sk-ant-oat01-YOUR_TOKEN_HERE"
 
-[[accounts]]
+[[endpoints]]
 name = "secondary"
 token = "sk-ant-oat01-YOUR_TOKEN_HERE"
+
+# OpenAI-compatible endpoint — set a high priority so it is tried only
+# after all Anthropic endpoints are exhausted.
+#[[endpoints]]
+#name = "portkey"
+#protocol = "openai"
+#base_url = "https://portkey.example.dev/v1"
+#token = "your-api-key"
+#priority = 100
