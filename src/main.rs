@@ -13578,6 +13578,20 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(c.gate, 0.0);
     }
 
+    #[tokio::test]
+    async fn openai_endpoint_with_opus_only_allowlist_excludes_sonnet() {
+        let mut state = test_state_with(vec![]);
+        let st = Arc::get_mut(&mut state).unwrap();
+        let mut ep = make_endpoint("opus-gw", Protocol::OpenAI);
+        ep.models = vec!["claude-opus-*".to_string()];
+        st.endpoints.push(ep);
+
+        let cs_opus = state.routing_candidates("claude-opus-4-7", &[]).await;
+        let cs_sonnet = state.routing_candidates("claude-sonnet-4-6", &[]).await;
+        assert_eq!(cs_opus.len(), 1, "opus must hit the opus-only endpoint");
+        assert_eq!(cs_sonnet.len(), 0, "sonnet must be filtered out");
+    }
+
     // ── Unit: per-client budget ────────────────────────────────────
 
     #[tokio::test]
