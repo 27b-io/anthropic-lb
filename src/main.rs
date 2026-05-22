@@ -7878,6 +7878,431 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
     events
 }
 
+/// Forward one OpenAI-compat request to a single Anthropic-protocol endpoint.
+/// The caller has already translated the OpenAI request into `anthropic_body`
+/// (plus the OAuth variant `oauth_anthropic_body`); this helper picks the right
+/// variant by token prefix, forwards to `base_url`, and translates the Anthropic
+/// response back to OpenAI format. Pool-agnostic: reusable for both
+/// `AppState.accounts` (legacy) and `AppState.endpoints` (unified) by passing
+/// the endpoint's identity, auth, and shared state in explicitly. Behavior is
+/// byte-for-byte equivalent to the prior inline Account block in
+/// `openai_chat_handler` — only the `EndpointIdx::X(i)` value used for `skip`
+/// is chosen by the caller, since this helper does not know which pool it's
+/// serving. Structurally similar to `forward_anthropic`, but intentionally
+/// kept separate: it speaks OpenAI on both edges (request body already
+/// translated, response translated back).
+#[allow(clippy::too_many_arguments)]
+async fn forward_openai_compat_anthropic(
+    state: &Arc<AppState>,
+    parts: &axum::http::request::Parts,
+    base_url: &str,
+    token: &str,
+    passthrough: bool,
+    endpoint_name: &str,
+    usage_target: UsageTarget,
+    requests_counter: &AtomicU64,
+    rate_info: &RwLock<RateLimitInfo>,
+    burn_rate: &Mutex<BurnRate>,
+    anthropic_body: &serde_json::Value,
+    oauth_anthropic_body: &serde_json::Value,
+    req_id: &str,
+    client_id: &str,
+    client_ver: &str,
+    client_ip: &std::net::IpAddr,
+    agent_id: &str,
+    session_id: &str,
+    model: &str,
+    is_streaming: bool,
+    request_start: std::time::Instant,
+) -> ForwardOutcome {
+    let url = format!("{base_url}/v1/messages");
+
+    let mut headers = parts.headers.clone();
+    headers.remove("host");
+    if !passthrough {
+        headers.remove("authorization");
+        headers.remove("x-api-key");
+    }
+    headers.remove("content-length"); // body size changes after translation
+    headers.remove("accept-encoding"); // we need plaintext to translate the response
+
+    // Inject required Anthropic headers
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+
+    // Auth injection
+    inject_account_auth(&mut headers, token, passthrough);
+
+    // Use OAuth variant (with CC system prompt) for OAuth tokens
+    let req_body = if token.starts_with("sk-ant-oat") {
+        oauth_anthropic_body
+    } else {
+        anthropic_body
+    };
+    let body_str = req_body.to_string();
+    debug!(
+        account = endpoint_name,
+        model = %model,
+        body_len = body_str.len(),
+        "openai-compat: upstream request"
+    );
+
+    let upstream_req = state
+        .client
+        .request(reqwest::Method::POST, &url)
+        .headers(headers)
+        .body(body_str);
+
+    let mut resp = match upstream_req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(account = endpoint_name, "upstream request failed: {e}");
+            // Preserve original behavior: transport errors retry without
+            // adding the endpoint to the skip list.
+            return ForwardOutcome::Retry {
+                saw_529: false,
+                push_skip: false,
+            };
+        }
+    };
+
+    let status = resp.status();
+    requests_counter.fetch_add(1, Ordering::Relaxed);
+    state
+        .update_rate_info_for(rate_info, endpoint_name, resp.headers())
+        .await;
+
+    // Update burn rate (after rate-limit headers are parsed)
+    state.update_burn_rate(burn_rate, client_id);
+
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        state
+            .mark_hard_limited_for(rate_info, endpoint_name, resp.headers())
+            .await;
+        log_429_details(endpoint_name, resp).await;
+        state.save_state().await;
+        info!(account = endpoint_name, "got 429, rotating to next account");
+        return ForwardOutcome::Retry {
+            saw_529: false,
+            push_skip: true,
+        };
+    }
+
+    // 529 → overloaded, try next account; flag for BEBO retry if all exhausted
+    if status.as_u16() == 529 {
+        state.save_state().await;
+        warn!(account = endpoint_name, "got 529, rotating to next account");
+        return ForwardOutcome::Retry {
+            saw_529: true,
+            push_skip: true,
+        };
+    }
+
+    // Other 5xx → transient, try next account (no BEBO retry)
+    if status.is_server_error() {
+        state.save_state().await;
+        warn!(
+            account = endpoint_name,
+            status = status.as_u16(),
+            "got server error, rotating to next account"
+        );
+        return ForwardOutcome::Retry {
+            saw_529: false,
+            push_skip: true,
+        };
+    }
+
+    // Clear hard limit and burst counter only on a genuine 2xx success.
+    // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
+    // that the rate-limit window has drained — don't clobber state on
+    // client errors.
+    let recovered = if status.is_success() {
+        let mut info = rate_info.write().await;
+        let was = info.hard_limited_until.is_some();
+        info.hard_limited_until = None;
+        info.consecutive_burst_429s = 0;
+        was
+    } else {
+        false
+    };
+
+    // Persist state after updating rate-limit state so completed 4xx
+    // responses and other terminal outcomes aren't dropped on restart.
+    state.save_state().await;
+
+    if recovered {
+        state.signal_hard_limit_recovery(endpoint_name).await;
+    }
+
+    // Compute budget pressure status for response header + log
+    let budget_status = {
+        let info = rate_info.read().await;
+        let (eff_util, constraint, _adj_5h, _adj_7d) =
+            effective_utilization(&info, AppState::now_epoch(), model);
+        info!(
+            req_id,
+            client = %client_ip,
+            client_id = %client_id,
+            ver = %client_ver,
+            agent = %agent_id,
+            session = %session_id,
+            model = %model,
+            account = endpoint_name,
+            status = status.as_u16(),
+            utilization = format_args!("{eff_util:.2}"),
+            util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+            util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+            constraint,
+            openai_compat = true,
+            stream = is_streaming,
+            "proxied (openai-compat)"
+        );
+        compute_pressure_status(eff_util, client_id, state)
+    };
+
+    // Non-2xx: log error detail, translate to OpenAI error format, return
+    if !status.is_success() {
+        let error_body = resp.bytes().await.unwrap_or_default();
+        let error_msg = serde_json::from_slice::<serde_json::Value>(&error_body)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/error/message")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+            });
+        warn!(
+            account = endpoint_name,
+            model = %model,
+            status = status.as_u16(),
+            error_message = ?error_msg,
+            "openai-compat: upstream error"
+        );
+
+        // Translate Anthropic error to OpenAI error format so clients
+        // (LiteLLM, etc.) can parse the actual error message.
+        let openai_error =
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&error_body) {
+                // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
+                let msg = parsed
+                    .pointer("/error/message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown upstream error");
+                let err_type = parsed
+                    .pointer("/error/type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("api_error");
+                serde_json::json!({
+                    "error": {
+                        "message": msg,
+                        "type": err_type,
+                        "param": null,
+                        "code": null
+                    }
+                })
+            } else {
+                let raw = String::from_utf8_lossy(&error_body);
+                serde_json::json!({
+                    "error": {
+                        "message": raw.as_ref(),
+                        "type": "api_error",
+                        "param": null,
+                        "code": null
+                    }
+                })
+            };
+
+        let response = Response::builder()
+            .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+            .header("content-type", "application/json")
+            .header("x-budget-status", budget_status)
+            .body(Body::from(
+                serde_json::to_vec(&openai_error).unwrap_or_default(),
+            ))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+            });
+        return ForwardOutcome::Done(response);
+    }
+
+    if is_streaming {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+        let state_clone = state.clone();
+        let client_id_clone = client_id.to_owned();
+        let acct_name = endpoint_name.to_owned();
+        let model_clone = model.to_owned();
+        let client_ip_str = client_ip.to_string();
+        let agent_clone = agent_id.to_owned();
+        let session_clone = session_id.to_owned();
+        let req_id_clone = req_id.to_owned();
+        let status_code = status.as_u16();
+
+        tokio::spawn(async move {
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut raw_sse: Vec<u8> = Vec::new();
+            let mut ctx = StreamContext::default();
+            let mut sent_done = false;
+
+            let mut client_gone = false;
+            let mut upstream_error = false;
+
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        buffer.extend_from_slice(&chunk);
+                        raw_sse.extend_from_slice(&chunk);
+
+                        while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
+                            let event = String::from_utf8_lossy(&buffer[..pos]).into_owned();
+                            buffer.drain(..pos + 2);
+
+                            if event.trim().is_empty() {
+                                continue;
+                            }
+
+                            if let Some(translated) = translate_sse_event(&event, &mut ctx) {
+                                if translated.trim() == "data: [DONE]" {
+                                    sent_done = true;
+                                }
+                                if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
+                                    client_gone = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if client_gone {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        upstream_error = true;
+                        warn!(req_id = req_id_clone, error = %e, "upstream SSE read failed");
+                        break;
+                    }
+                }
+            }
+
+            // Process any remaining data in buffer (skip if upstream errored)
+            if !upstream_error && !buffer.is_empty() {
+                let remaining = String::from_utf8_lossy(&buffer).into_owned();
+                if !remaining.trim().is_empty() {
+                    if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
+                        if translated.trim() == "data: [DONE]" {
+                            sent_done = true;
+                        }
+                        if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
+                            client_gone = true;
+                        }
+                    }
+                }
+            }
+
+            // Ensure [DONE] is always sent (skip on upstream error — would fake clean completion)
+            if !sent_done
+                && !client_gone
+                && !upstream_error
+                && tx
+                    .send(Ok(bytes::Bytes::from("data: [DONE]\n\n")))
+                    .await
+                    .is_err()
+            {
+                client_gone = true;
+            }
+
+            // Extract and record token usage from accumulated SSE data
+            finalize_stream(
+                &state_clone,
+                usage_target,
+                &req_id_clone,
+                &client_id_clone,
+                &model_clone,
+                &acct_name,
+                &client_ip_str,
+                &agent_clone,
+                &session_clone,
+                status_code,
+                &raw_sse,
+                request_start,
+                client_gone,
+                upstream_error,
+                true,
+            )
+            .await;
+        });
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("connection", "keep-alive")
+            .header("x-budget-status", budget_status)
+            .body(Body::from_stream(ReceiverStream::new(rx)))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+            });
+        return ForwardOutcome::Done(response);
+    }
+
+    // Non-streaming: buffer, translate, return
+    let resp_bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("failed to read upstream response: {e}");
+            return ForwardOutcome::Done(
+                (StatusCode::BAD_GATEWAY, "failed to read upstream response").into_response(),
+            );
+        }
+    };
+
+    let anthropic_resp: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("x-budget-status", budget_status)
+                .body(Body::from(resp_bytes))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+                });
+            return ForwardOutcome::Done(response);
+        }
+    };
+
+    let openai_resp = translate_anthropic_to_openai(&anthropic_resp);
+
+    // Extract and record token usage from non-streaming response
+    let usage = TokenUsage::from_response_body(&anthropic_resp);
+    finalize_non_stream(
+        state,
+        usage_target,
+        req_id,
+        client_id,
+        model,
+        endpoint_name,
+        &client_ip.to_string(),
+        agent_id,
+        session_id,
+        status.as_u16(),
+        &usage,
+        request_start.elapsed().as_millis() as u64,
+        true,
+    )
+    .await;
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .header("x-budget-status", budget_status)
+        .body(Body::from(
+            serde_json::to_vec(&openai_resp).unwrap_or_default(),
+        ))
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+        });
+    ForwardOutcome::Done(response)
+}
+
 async fn openai_chat_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -8003,9 +8428,61 @@ async fn openai_chat_handler(
         let mut saw_529 = false;
         // n accounts + 1 fallback upstream is the candidate ceiling.
         for _attempt in 0..(n + 1) {
-            let idx = match state.pick_endpoint(affinity, &model, &skip).await {
-                Some(EndpointIdx::Account(i)) => i,
-                Some(EndpointIdx::Upstream(u)) => {
+            let picked = match state.pick_endpoint(affinity, &model, &skip).await {
+                Some(e) => e,
+                None => {
+                    warn!("all endpoints exhausted");
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "all upstream endpoints exhausted",
+                    )
+                        .into_response();
+                }
+            };
+            match picked {
+                EndpointIdx::Account(i) => {
+                    let acct = &state.accounts[i];
+                    match forward_openai_compat_anthropic(
+                        &state,
+                        &parts,
+                        &state.upstream,
+                        &acct.token,
+                        acct.passthrough,
+                        &acct.name,
+                        UsageTarget::Account(i),
+                        &acct.requests,
+                        &acct.rate_info,
+                        &acct.burn_rate,
+                        &anthropic_body,
+                        &oauth_anthropic_body,
+                        &req_id,
+                        &client_id,
+                        &client_ver,
+                        &client_ip,
+                        &agent_id,
+                        &session_id,
+                        &model,
+                        is_streaming,
+                        request_start,
+                    )
+                    .await
+                    {
+                        ForwardOutcome::Done(resp) => return resp,
+                        ForwardOutcome::Retry {
+                            saw_529: this_529,
+                            push_skip,
+                        } => {
+                            if this_529 {
+                                saw_529 = true;
+                            }
+                            if push_skip {
+                                skip.push(EndpointIdx::Account(i));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                EndpointIdx::Upstream(u) => {
                     // All account tiers exhausted — the upstream is OpenAI-native,
                     // so forward the original request body without translation.
                     match try_fallback_upstream(
@@ -8026,395 +8503,72 @@ async fn openai_chat_handler(
                         }
                     }
                 }
-                Some(EndpointIdx::Unified(_)) => unreachable!(
-                    "Phase 2b: handler dispatch for EndpointIdx::Unified is not yet wired; the startup guard in main() rejects [[endpoints]] configs until this branch lands."
-                ),
-                None => {
-                    warn!("all endpoints exhausted");
-                    return (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "all upstream endpoints exhausted",
-                    )
-                        .into_response();
-                }
-            };
-
-            let acct = &state.accounts[idx];
-            let url = format!("{}/v1/messages", state.upstream);
-
-            let mut headers = parts.headers.clone();
-            headers.remove("host");
-            if !acct.passthrough {
-                headers.remove("authorization");
-                headers.remove("x-api-key");
-            }
-            headers.remove("content-length"); // body size changes after translation
-            headers.remove("accept-encoding"); // we need plaintext to translate the response
-
-            // Inject required Anthropic headers
-            headers.insert("content-type", HeaderValue::from_static("application/json"));
-            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-
-            // Auth injection
-            inject_account_auth(&mut headers, &acct.token, acct.passthrough);
-
-            // Use OAuth variant (with CC system prompt) for OAuth tokens
-            let req_body = if acct.token.starts_with("sk-ant-oat") {
-                &oauth_anthropic_body
-            } else {
-                &anthropic_body
-            };
-            let body_str = req_body.to_string();
-            debug!(
-                account = acct.name,
-                model = %model,
-                body_len = body_str.len(),
-                "openai-compat: upstream request"
-            );
-
-            let upstream_req = state
-                .client
-                .request(reqwest::Method::POST, &url)
-                .headers(headers)
-                .body(body_str);
-
-            let mut resp = match upstream_req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    error!(account = acct.name, "upstream request failed: {e}");
-                    continue;
-                }
-            };
-
-            let status = resp.status();
-            acct.requests.fetch_add(1, Ordering::Relaxed);
-            state.update_rate_info(idx, resp.headers()).await;
-
-            // Update burn rate (after rate-limit headers are parsed)
-            state.update_burn_rate(&acct.burn_rate, &client_id);
-
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                state.mark_hard_limited(idx, resp.headers()).await;
-                log_429_details(&acct.name, resp).await;
-                state.save_state().await;
-                info!(account = acct.name, "got 429, rotating to next account");
-                skip.push(EndpointIdx::Account(idx));
-                continue;
-            }
-
-            // 529 → overloaded, try next account; flag for BEBO retry if all exhausted
-            if status.as_u16() == 529 {
-                state.save_state().await;
-                warn!(account = acct.name, "got 529, rotating to next account");
-                saw_529 = true;
-                skip.push(EndpointIdx::Account(idx));
-                continue;
-            }
-
-            // Other 5xx → transient, try next account (no BEBO retry)
-            if status.is_server_error() {
-                state.save_state().await;
-                warn!(
-                    account = acct.name,
-                    status = status.as_u16(),
-                    "got server error, rotating to next account"
-                );
-                skip.push(EndpointIdx::Account(idx));
-                continue;
-            }
-
-            // Clear hard limit and burst counter only on a genuine 2xx success.
-            // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
-            // that the rate-limit window has drained — don't clobber state on
-            // client errors.
-            let recovered = if status.is_success() {
-                let mut info = acct.rate_info.write().await;
-                let was = info.hard_limited_until.is_some();
-                info.hard_limited_until = None;
-                info.consecutive_burst_429s = 0;
-                was
-            } else {
-                false
-            };
-
-            // Persist state after updating rate-limit state so completed 4xx
-            // responses and other terminal outcomes aren't dropped on restart.
-            state.save_state().await;
-
-            if recovered {
-                state.signal_hard_limit_recovery(&acct.name).await;
-            }
-
-            // Compute budget pressure status for response header + log
-            let budget_status = {
-                let info = acct.rate_info.read().await;
-                let (eff_util, constraint, _adj_5h, _adj_7d) =
-                    effective_utilization(&info, AppState::now_epoch(), &model);
-                info!(
-                    req_id,
-                    client = %client_ip,
-                    client_id = %client_id,
-                    ver = %client_ver,
-                    agent = %agent_id,
-                    session = %session_id,
-                    model = %model,
-                    account = acct.name,
-                    status = status.as_u16(),
-                    utilization = format_args!("{eff_util:.2}"),
-                    util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-                    util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-                    constraint,
-                    openai_compat = true,
-                    stream = is_streaming,
-                    "proxied (openai-compat)"
-                );
-                compute_pressure_status(eff_util, &client_id, &state)
-            };
-
-            // Non-2xx: log error detail, translate to OpenAI error format, return
-            if !status.is_success() {
-                let error_body = resp.bytes().await.unwrap_or_default();
-                let error_msg = serde_json::from_slice::<serde_json::Value>(&error_body)
-                    .ok()
-                    .and_then(|v| {
-                        v.pointer("/error/message")
-                            .and_then(|m| m.as_str())
-                            .map(String::from)
-                    });
-                warn!(
-                    account = acct.name,
-                    model = %model,
-                    status = status.as_u16(),
-                    error_message = ?error_msg,
-                    "openai-compat: upstream error"
-                );
-
-                // Translate Anthropic error to OpenAI error format so clients
-                // (LiteLLM, etc.) can parse the actual error message.
-                let openai_error =
-                    if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&error_body) {
-                        // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
-                        let msg = parsed
-                            .pointer("/error/message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown upstream error");
-                        let err_type = parsed
-                            .pointer("/error/type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("api_error");
-                        serde_json::json!({
-                            "error": {
-                                "message": msg,
-                                "type": err_type,
-                                "param": null,
-                                "code": null
-                            }
-                        })
-                    } else {
-                        let raw = String::from_utf8_lossy(&error_body);
-                        serde_json::json!({
-                            "error": {
-                                "message": raw.as_ref(),
-                                "type": "api_error",
-                                "param": null,
-                                "code": null
-                            }
-                        })
-                    };
-
-                return Response::builder()
-                    .status(
-                        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-                    )
-                    .header("content-type", "application/json")
-                    .header("x-budget-status", budget_status)
-                    .body(Body::from(
-                        serde_json::to_vec(&openai_error).unwrap_or_default(),
-                    ))
-                    .unwrap_or_else(|_| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                    });
-            }
-
-            if is_streaming {
-                let (tx, rx) =
-                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
-                let state_clone = state.clone();
-                let client_id_clone = client_id.clone();
-                let acct_name = acct.name.clone();
-                let model_clone = model.clone();
-                let client_ip_str = client_ip.to_string();
-                let agent_clone = agent_id.clone();
-                let session_clone = session_id.clone();
-
-                tokio::spawn(async move {
-                    let mut buffer: Vec<u8> = Vec::new();
-                    let mut raw_sse: Vec<u8> = Vec::new();
-                    let mut ctx = StreamContext::default();
-                    let mut sent_done = false;
-
-                    let mut client_gone = false;
-                    let mut upstream_error = false;
-
-                    loop {
-                        match resp.chunk().await {
-                            Ok(Some(chunk)) => {
-                                buffer.extend_from_slice(&chunk);
-                                raw_sse.extend_from_slice(&chunk);
-
-                                while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
-                                    let event =
-                                        String::from_utf8_lossy(&buffer[..pos]).into_owned();
-                                    buffer.drain(..pos + 2);
-
-                                    if event.trim().is_empty() {
-                                        continue;
-                                    }
-
-                                    if let Some(translated) = translate_sse_event(&event, &mut ctx)
-                                    {
-                                        if translated.trim() == "data: [DONE]" {
-                                            sent_done = true;
-                                        }
-                                        if tx
-                                            .send(Ok(bytes::Bytes::from(translated)))
-                                            .await
-                                            .is_err()
-                                        {
-                                            client_gone = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if client_gone {
-                                    break;
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                upstream_error = true;
-                                warn!(req_id, error = %e, "upstream SSE read failed");
-                                break;
-                            }
-                        }
-                    }
-
-                    // Process any remaining data in buffer (skip if upstream errored)
-                    if !upstream_error && !buffer.is_empty() {
-                        let remaining = String::from_utf8_lossy(&buffer).into_owned();
-                        if !remaining.trim().is_empty() {
-                            if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
-                                if translated.trim() == "data: [DONE]" {
-                                    sent_done = true;
-                                }
-                                if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
-                                    client_gone = true;
-                                }
-                            }
-                        }
-                    }
-
-                    // Ensure [DONE] is always sent (skip on upstream error — would fake clean completion)
-                    if !sent_done
-                        && !client_gone
-                        && !upstream_error
-                        && tx
-                            .send(Ok(bytes::Bytes::from("data: [DONE]\n\n")))
+                EndpointIdx::Unified(i) => {
+                    let ep = &state.endpoints[i];
+                    match ep.protocol {
+                        Protocol::Anthropic => {
+                            match forward_openai_compat_anthropic(
+                                &state,
+                                &parts,
+                                &ep.base_url,
+                                &ep.token,
+                                ep.passthrough,
+                                &ep.name,
+                                UsageTarget::Unified(i),
+                                &ep.requests,
+                                &ep.rate_info,
+                                &ep.burn_rate,
+                                &anthropic_body,
+                                &oauth_anthropic_body,
+                                &req_id,
+                                &client_id,
+                                &client_ver,
+                                &client_ip,
+                                &agent_id,
+                                &session_id,
+                                &model,
+                                is_streaming,
+                                request_start,
+                            )
                             .await
-                            .is_err()
-                    {
-                        client_gone = true;
+                            {
+                                ForwardOutcome::Done(resp) => return resp,
+                                ForwardOutcome::Retry {
+                                    saw_529: this_529,
+                                    push_skip,
+                                } => {
+                                    if this_529 {
+                                        saw_529 = true;
+                                    }
+                                    if push_skip {
+                                        skip.push(EndpointIdx::Unified(i));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        Protocol::OpenAI => {
+                            match try_fallback_upstream_unified(
+                                &state,
+                                &body_bytes,
+                                &req_id,
+                                &client_id,
+                                &model,
+                                i,
+                                false,
+                            )
+                            .await
+                            {
+                                Some(resp) => return resp,
+                                None => {
+                                    skip.push(EndpointIdx::Unified(i));
+                                    continue;
+                                }
+                            }
+                        }
                     }
-
-                    // Extract and record token usage from accumulated SSE data
-                    finalize_stream(
-                        &state_clone,
-                        UsageTarget::Account(idx),
-                        &req_id,
-                        &client_id_clone,
-                        &model_clone,
-                        &acct_name,
-                        &client_ip_str,
-                        &agent_clone,
-                        &session_clone,
-                        status.as_u16(),
-                        &raw_sse,
-                        request_start,
-                        client_gone,
-                        upstream_error,
-                        true,
-                    )
-                    .await;
-                });
-
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/event-stream")
-                    .header("cache-control", "no-cache")
-                    .header("connection", "keep-alive")
-                    .header("x-budget-status", budget_status)
-                    .body(Body::from_stream(ReceiverStream::new(rx)))
-                    .unwrap_or_else(|_| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                    });
+                }
             }
-
-            // Non-streaming: buffer, translate, return
-            let resp_bytes = match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    error!("failed to read upstream response: {e}");
-                    return (StatusCode::BAD_GATEWAY, "failed to read upstream response")
-                        .into_response();
-                }
-            };
-
-            let anthropic_resp: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
-                Ok(v) => v,
-                Err(_) => {
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .header("x-budget-status", budget_status)
-                        .body(Body::from(resp_bytes))
-                        .unwrap_or_else(|_| {
-                            (StatusCode::INTERNAL_SERVER_ERROR, "response build error")
-                                .into_response()
-                        });
-                }
-            };
-
-            let openai_resp = translate_anthropic_to_openai(&anthropic_resp);
-
-            // Extract and record token usage from non-streaming response
-            let usage = TokenUsage::from_response_body(&anthropic_resp);
-            finalize_non_stream(
-                &state,
-                UsageTarget::Account(idx),
-                &req_id,
-                &client_id,
-                &model,
-                &acct.name,
-                &client_ip.to_string(),
-                &agent_id,
-                &session_id,
-                status.as_u16(),
-                &usage,
-                request_start.elapsed().as_millis() as u64,
-                true,
-            )
-            .await;
-
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .header("x-budget-status", budget_status)
-                .body(Body::from(
-                    serde_json::to_vec(&openai_resp).unwrap_or_default(),
-                ))
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                });
         }
         if !saw_529 {
             break;
