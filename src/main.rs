@@ -5546,6 +5546,133 @@ async fn upstream_handler(
 
 // ── Stats endpoint ──────────────────────────────────────────────────
 
+/// Build one `/stats` JSON entry from the shared (name, priority, rate_info,
+/// burn_rate, counters) field set common to both `Account` and the unified
+/// `Endpoint`. When `protocol` is `Some`, a `"protocol"` field is added — the
+/// only shape difference between an account entry and an endpoint entry.
+#[allow(clippy::too_many_arguments)]
+async fn build_stats_entry(
+    name: &str,
+    passthrough: bool,
+    priority: u32,
+    protocol: Option<&str>,
+    rate_info: &RwLock<RateLimitInfo>,
+    burn_rate: &Mutex<BurnRate>,
+    requests: &AtomicU64,
+    token_counters: [&AtomicU64; 4],
+    now_epoch: u64,
+    total_headroom: &mut Option<u64>,
+) -> serde_json::Value {
+    let info = rate_info.read().await;
+    let hard_limited = match info.hard_limited_until {
+        Some(until) if Instant::now() < until => {
+            Some(until.duration_since(Instant::now()).as_secs())
+        }
+        _ => None,
+    };
+
+    // Burn rate from EWMA tracker
+    let (br_5m, br_1h, br_6h) = burn_rate
+        .lock()
+        .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
+        .unwrap_or((0.0, 0.0, 0.0));
+
+    // Headroom: prefer remaining_requests header, else (1-util)*limit, else null
+    let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
+        Some(rem)
+    } else if let (Some(util), Some(limit)) = (info.utilization, info.limit_requests) {
+        Some(((1.0 - util) * limit as f64).max(0.0) as u64)
+    } else {
+        None
+    };
+    match (total_headroom.as_mut(), headroom) {
+        (Some(total), Some(h)) => *total += h,
+        _ => *total_headroom = None,
+    }
+
+    // Projected throttle time
+    let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
+    let projected_throttle_at: serde_json::Value = if eff_util < 0.5 || br_1h < 0.01 {
+        serde_json::Value::Null
+    } else if let Some(headroom_reqs) = headroom {
+        if headroom_reqs == 0 {
+            // Already at limit — check if hard-limited and report cooldown expiry
+            if let Some(hl_secs) = hard_limited {
+                serde_json::Value::String(AppState::epoch_to_iso8601(now_epoch + hl_secs))
+            } else {
+                serde_json::Value::String(AppState::epoch_to_iso8601(now_epoch))
+            }
+        } else {
+            let minutes_remaining = headroom_reqs as f64 / br_1h;
+            let secs_remaining = (minutes_remaining * 60.0) as u64;
+            let projected_epoch = now_epoch + secs_remaining;
+            // If projection is beyond next reset, account will recover → null
+            let mut next_reset = info.reset_5h.unwrap_or(u64::MAX);
+            for c in info.claims_7d.values() {
+                if let Some(r) = c.reset {
+                    next_reset = next_reset.min(r);
+                }
+            }
+            if projected_epoch > next_reset && next_reset != u64::MAX {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(AppState::epoch_to_iso8601(projected_epoch))
+            }
+        }
+    } else {
+        serde_json::Value::Null
+    };
+
+    let mut entry = serde_json::json!({
+        "name": name,
+        "passthrough": passthrough,
+        "priority": priority,
+        "requests_total": requests.load(Ordering::Relaxed),
+        "utilization": info.utilization,
+        "utilization_7d": info.utilization_7d,
+        "utilization_5h": info.utilization_5h,
+        "representative_claim": info.representative_claim,
+        "reset_5h": info.reset_5h,
+        "reset_7d": info.reset_7d,
+        "status_5h": info.status_5h,
+        "status_7d": info.status_7d,
+        "overage_in_use": info.overage_in_use,
+        "overage_status": info.overage_status,
+        "overage_utilization": info.overage_utilization,
+        "overage_reset": info.overage_reset,
+        "claims_7d": info.claims_7d.iter().map(|(k, v)| {
+            (k.clone(), serde_json::json!({
+                "utilization": v.utilization,
+                "reset": v.reset,
+                "status": v.status,
+                "waste_risk": waste_risk(v.utilization, v.reset, now_epoch),
+            }))
+        }).collect::<serde_json::Map<String, serde_json::Value>>(),
+        "remaining_requests": info.remaining_requests,
+        "remaining_tokens": info.remaining_tokens,
+        "limit_requests": info.limit_requests,
+        "limit_tokens": info.limit_tokens,
+        "hard_limited_remaining_secs": hard_limited,
+        "burn_rate": {
+            "last_5m": (br_5m * 100.0).round() / 100.0,
+            "last_1h": (br_1h * 100.0).round() / 100.0,
+            "last_6h": (br_6h * 100.0).round() / 100.0,
+        },
+        "headroom_requests": headroom,
+        "projected_throttle_at": projected_throttle_at,
+        "token_usage": {
+            "input_tokens": token_counters[0].load(Ordering::Relaxed),
+            "output_tokens": token_counters[1].load(Ordering::Relaxed),
+            "cache_creation_input_tokens": token_counters[2].load(Ordering::Relaxed),
+            "cache_read_input_tokens": token_counters[3].load(Ordering::Relaxed),
+        },
+    });
+    if let Some(p) = protocol {
+        entry["protocol"] = serde_json::json!(p);
+    }
+    entry
+}
+
 async fn stats_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -5565,111 +5692,56 @@ async fn stats_handler(
     let mut out = Vec::new();
     let mut total_headroom: Option<u64> = Some(0);
     for acct in &state.accounts {
-        let info = acct.rate_info.read().await;
-        let hard_limited = match info.hard_limited_until {
-            Some(until) if Instant::now() < until => {
-                Some(until.duration_since(Instant::now()).as_secs())
-            }
-            _ => None,
+        out.push(
+            build_stats_entry(
+                &acct.name,
+                acct.passthrough,
+                acct.priority,
+                None,
+                &acct.rate_info,
+                &acct.burn_rate,
+                &acct.requests,
+                [
+                    &acct.input_tokens,
+                    &acct.output_tokens,
+                    &acct.cache_creation_tokens,
+                    &acct.cache_read_tokens,
+                ],
+                now_epoch,
+                &mut total_headroom,
+            )
+            .await,
+        );
+    }
+    // Parallel pass over the unified endpoint pool. Same field shape as the
+    // `accounts` entries, plus a "protocol" field. In a real config exactly
+    // one pool is non-empty.
+    let mut endpoint_stats = Vec::new();
+    for ep in &state.endpoints {
+        let protocol = match ep.protocol {
+            Protocol::Anthropic => "anthropic",
+            Protocol::OpenAI => "openai",
         };
-
-        // Burn rate from EWMA tracker
-        let (br_5m, br_1h, br_6h) = acct
-            .burn_rate
-            .lock()
-            .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
-            .unwrap_or((0.0, 0.0, 0.0));
-
-        // Headroom: prefer remaining_requests header, else (1-util)*limit, else null
-        let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
-            Some(rem)
-        } else if let (Some(util), Some(limit)) = (info.utilization, info.limit_requests) {
-            Some(((1.0 - util) * limit as f64).max(0.0) as u64)
-        } else {
-            None
-        };
-        match (total_headroom.as_mut(), headroom) {
-            (Some(total), Some(h)) => *total += h,
-            _ => total_headroom = None,
-        }
-
-        // Projected throttle time
-        let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
-        let projected_throttle_at: serde_json::Value = if eff_util < 0.5 || br_1h < 0.01 {
-            serde_json::Value::Null
-        } else if let Some(headroom_reqs) = headroom {
-            if headroom_reqs == 0 {
-                // Already at limit — check if hard-limited and report cooldown expiry
-                if let Some(hl_secs) = hard_limited {
-                    serde_json::Value::String(AppState::epoch_to_iso8601(now_epoch + hl_secs))
-                } else {
-                    serde_json::Value::String(AppState::epoch_to_iso8601(now_epoch))
-                }
-            } else {
-                let minutes_remaining = headroom_reqs as f64 / br_1h;
-                let secs_remaining = (minutes_remaining * 60.0) as u64;
-                let projected_epoch = now_epoch + secs_remaining;
-                // If projection is beyond next reset, account will recover → null
-                let mut next_reset = info.reset_5h.unwrap_or(u64::MAX);
-                for c in info.claims_7d.values() {
-                    if let Some(r) = c.reset {
-                        next_reset = next_reset.min(r);
-                    }
-                }
-                if projected_epoch > next_reset && next_reset != u64::MAX {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::Value::String(AppState::epoch_to_iso8601(projected_epoch))
-                }
-            }
-        } else {
-            serde_json::Value::Null
-        };
-
-        out.push(serde_json::json!({
-            "name": acct.name,
-            "passthrough": acct.passthrough,
-            "priority": acct.priority,
-            "requests_total": acct.requests.load(Ordering::Relaxed),
-            "utilization": info.utilization,
-            "utilization_7d": info.utilization_7d,
-            "utilization_5h": info.utilization_5h,
-            "representative_claim": info.representative_claim,
-            "reset_5h": info.reset_5h,
-            "reset_7d": info.reset_7d,
-            "status_5h": info.status_5h,
-            "status_7d": info.status_7d,
-            "overage_in_use": info.overage_in_use,
-            "overage_status": info.overage_status,
-            "overage_utilization": info.overage_utilization,
-            "overage_reset": info.overage_reset,
-            "claims_7d": info.claims_7d.iter().map(|(k, v)| {
-                (k.clone(), serde_json::json!({
-                    "utilization": v.utilization,
-                    "reset": v.reset,
-                    "status": v.status,
-                    "waste_risk": waste_risk(v.utilization, v.reset, now_epoch),
-                }))
-            }).collect::<serde_json::Map<String, serde_json::Value>>(),
-            "remaining_requests": info.remaining_requests,
-            "remaining_tokens": info.remaining_tokens,
-            "limit_requests": info.limit_requests,
-            "limit_tokens": info.limit_tokens,
-            "hard_limited_remaining_secs": hard_limited,
-            "burn_rate": {
-                "last_5m": (br_5m * 100.0).round() / 100.0,
-                "last_1h": (br_1h * 100.0).round() / 100.0,
-                "last_6h": (br_6h * 100.0).round() / 100.0,
-            },
-            "headroom_requests": headroom,
-            "projected_throttle_at": projected_throttle_at,
-            "token_usage": {
-                "input_tokens": acct.input_tokens.load(Ordering::Relaxed),
-                "output_tokens": acct.output_tokens.load(Ordering::Relaxed),
-                "cache_creation_input_tokens": acct.cache_creation_tokens.load(Ordering::Relaxed),
-                "cache_read_input_tokens": acct.cache_read_tokens.load(Ordering::Relaxed),
-            },
-        }));
+        endpoint_stats.push(
+            build_stats_entry(
+                &ep.name,
+                ep.passthrough,
+                ep.priority,
+                Some(protocol),
+                &ep.rate_info,
+                &ep.burn_rate,
+                &ep.requests,
+                [
+                    &ep.input_tokens,
+                    &ep.output_tokens,
+                    &ep.cache_creation_tokens,
+                    &ep.cache_read_tokens,
+                ],
+                now_epoch,
+                &mut total_headroom,
+            )
+            .await,
+        );
     }
     let mut upstream_stats = Vec::new();
     for u in &state.upstreams {
@@ -5812,6 +5884,7 @@ async fn stats_handler(
 
     let mut response = serde_json::json!({
         "accounts": out,
+        "endpoints": endpoint_stats,
         "upstreams": upstream_stats,
         "client_usage": client_usage,
         "client_budgets": budgets,
@@ -11471,6 +11544,60 @@ token = "sk-ant-test"
         let upstreams = body["upstreams"].as_array().unwrap();
         assert_eq!(upstreams.len(), 1);
         assert_eq!(upstreams[0]["name"], "mock");
+        // Endpoints array is always present (empty for a legacy accounts config).
+        assert_eq!(body["endpoints"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn stats_endpoint_exposes_endpoints_array() {
+        fn make_ep(name: &str, protocol: Protocol) -> Endpoint {
+            Endpoint {
+                name: name.to_string(),
+                protocol,
+                base_url: "https://api.anthropic.com".to_string(),
+                token: "sk-ant-api-test".to_string(),
+                passthrough: false,
+                models: vec![],
+                priority: 5,
+                requests: AtomicU64::new(0),
+                rate_info: RwLock::new(RateLimitInfo::default()),
+                burn_rate: Mutex::new(BurnRate::new()),
+                input_tokens: AtomicU64::new(0),
+                output_tokens: AtomicU64::new(0),
+                cache_creation_tokens: AtomicU64::new(0),
+                cache_read_tokens: AtomicU64::new(0),
+                last_routing_weight: AtomicU64::new(0),
+                last_routing_share: AtomicU64::new(0),
+                last_effective_gate: AtomicU64::new(0),
+            }
+        }
+        // Endpoints-only config: legacy accounts pool is empty.
+        let mut state = test_state_with(vec![]);
+        {
+            let st = Arc::get_mut(&mut state).expect("uniquely owned before router build");
+            st.endpoints
+                .push(make_ep("ep-anthropic", Protocol::Anthropic));
+            st.endpoints.push(make_ep("ep-openai", Protocol::OpenAI));
+        }
+        let addr = serve(build_router(state)).await;
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://{}/_stats", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // Legacy accounts array present and empty.
+        assert_eq!(body["accounts"].as_array().unwrap().len(), 0);
+        let endpoints = body["endpoints"].as_array().unwrap();
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0]["name"], "ep-anthropic");
+        assert_eq!(endpoints[0]["protocol"], "anthropic");
+        assert_eq!(endpoints[0]["priority"], 5);
+        assert_eq!(endpoints[1]["name"], "ep-openai");
+        assert_eq!(endpoints[1]["protocol"], "openai");
     }
 
     #[tokio::test]
