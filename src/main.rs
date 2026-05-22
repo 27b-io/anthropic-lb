@@ -2178,6 +2178,11 @@ impl AppState {
         for (i, ep) in self.endpoints.iter().enumerate() {
             match ep.protocol {
                 Protocol::OpenAI => {
+                    // NOTE: unlike persistence / stats / Redis sync (which all
+                    // `continue` on Protocol::OpenAI), metrics intentionally
+                    // emits OpenAI endpoints with a fixed (gate 0.0,
+                    // weight 1.0) — an OpenAI endpoint is a real routing
+                    // candidate and belongs on dashboards.
                     endpoint_entries[i] = Some((0.0, 1.0));
                 }
                 Protocol::Anthropic => {
@@ -6021,7 +6026,7 @@ struct ClaimMetricsSnap {
 
 #[allow(dead_code)]
 #[derive(Default, Clone)]
-struct AcctMetricsSnap {
+struct EndpointMetricsSnap {
     name: String,
     passthrough: bool,
     has_applicable_7d: bool,
@@ -6059,7 +6064,7 @@ struct AcctMetricsSnap {
 fn append_routing_weight_metrics(
     buf: &mut String,
     accounts: &[Account],
-    snaps: &[AcctMetricsSnap],
+    snaps: &[EndpointMetricsSnap],
 ) {
     prom_header(
         buf,
@@ -6108,7 +6113,7 @@ fn append_routing_weight_metrics(
     }
 }
 
-/// Build an `AcctMetricsSnap` from the shared (name, rate_info, burn_rate,
+/// Build an `EndpointMetricsSnap` from the shared (name, rate_info, burn_rate,
 /// counters, gauge atomics) field set common to both `Account` and the unified
 /// `Endpoint`. Pool-agnostic: callers pass field references, so one
 /// implementation serves both the legacy account pool and the endpoint pool.
@@ -6125,7 +6130,7 @@ async fn build_metrics_snap(
     effective_gate_atomic: &AtomicU64,
     now_epoch: u64,
     total_headroom: &mut Option<u64>,
-) -> AcctMetricsSnap {
+) -> EndpointMetricsSnap {
     let info = rate_info.read().await;
     let (br_5m, br_1h, br_6h) = burn_rate
         .lock()
@@ -6181,7 +6186,7 @@ async fn build_metrics_snap(
         })
         .collect();
 
-    AcctMetricsSnap {
+    EndpointMetricsSnap {
         name: name.to_string(),
         passthrough,
         has_applicable_7d: !claims.is_empty()
@@ -6242,7 +6247,7 @@ async fn metrics_handler(
 
     // ── Phase 1: Gather data (async — acquires locks) ──────────────
 
-    let mut snaps: Vec<AcctMetricsSnap> =
+    let mut snaps: Vec<EndpointMetricsSnap> =
         Vec::with_capacity(state.accounts.len() + state.endpoints.len());
     let mut total_headroom: Option<u64> = Some(0);
 
@@ -19319,7 +19324,7 @@ upstream = "https://api.anthropic.com"
         append_routing_weight_metrics(
             &mut buf,
             &[acct],
-            &[AcctMetricsSnap {
+            &[EndpointMetricsSnap {
                 name: "acct-a".to_string(),
                 ..Default::default()
             }],
@@ -19352,7 +19357,7 @@ upstream = "https://api.anthropic.com"
         append_routing_weight_metrics(
             &mut buf,
             &[acct],
-            &[AcctMetricsSnap {
+            &[EndpointMetricsSnap {
                 name: "acct-a".to_string(),
                 ..Default::default()
             }],
@@ -19408,7 +19413,7 @@ upstream = "https://api.anthropic.com"
             &mut buf,
             &state.accounts,
             &[
-                AcctMetricsSnap {
+                EndpointMetricsSnap {
                     name: "passthrough".to_string(),
                     passthrough: true,
                     utilization: Some(0.20),
@@ -19416,7 +19421,7 @@ upstream = "https://api.anthropic.com"
                     reset_5h: Some(now_epoch + 10000),
                     ..Default::default()
                 },
-                AcctMetricsSnap {
+                EndpointMetricsSnap {
                     name: "api".to_string(),
                     utilization: Some(0.40),
                     utilization_5h: Some(0.40),
@@ -20730,7 +20735,7 @@ upstream = "https://api.anthropic.com"
             &mut buf,
             &state.accounts,
             &[
-                AcctMetricsSnap {
+                EndpointMetricsSnap {
                     name: "healthy".to_string(),
                     utilization: Some(0.30),
                     utilization_5h: Some(0.30),
@@ -20738,7 +20743,7 @@ upstream = "https://api.anthropic.com"
                     status_5h: Some("allowed".to_string()),
                     ..Default::default()
                 },
-                AcctMetricsSnap {
+                EndpointMetricsSnap {
                     name: "soft-limited".to_string(),
                     utilization: Some(0.95),
                     utilization_5h: Some(0.95),
