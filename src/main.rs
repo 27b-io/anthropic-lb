@@ -2167,121 +2167,62 @@ impl AppState {
             }
 
             let info = acct.rate_info.read().await;
-
-            // Hard-limited accounts contribute zero (mirrors routing_candidates filter).
-            if let Some(until) = info.hard_limited_until {
-                if now < until {
-                    continue;
-                }
-            }
-
-            let stale_after_hard_limit = info
-                .hard_limited_until
-                .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
-
-            // 5h gate — same logic as routing_candidates
-            let gate_5h = if stale_after_hard_limit {
-                0.5
-            } else {
-                time_adjusted_utilization(
-                    info.utilization_5h,
-                    info.reset_5h,
-                    info.status_5h.as_deref(),
-                    NEAR_RESET_5H_SECS,
-                    now_epoch,
-                )
-                .unwrap_or_else(|| {
-                    if let Some(util) = info.utilization {
-                        util
-                    } else if let Some(remaining) = info.remaining_tokens {
-                        let limit = info.limit_tokens.unwrap_or(1_000_000);
-                        (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
-                    } else {
-                        0.5
-                    }
-                })
-            };
-
-            // 7d gate + waste_risk from a SINGLE representative ClaimWindowData
-            // — utilization, reset and status are read as a coherent triple
-            // from one real claim, not Frankensteined from independently
-            // aggregated maxima/minima across claims.
-            //
-            // Selection precedence:
-            //   1. info.representative_claim if it points to a 7d entry
-            //      (this is the LB's own "binding constraint" signal)
-            //   2. The general "seven_day" claim if present
-            //   3. The model-specific claim with the highest waste_risk
-            //      (worst-case representative for the dashboard)
-            //   4. None → no 7d data, fall back to headroom-only
-            let claim_is_fresh = |c: &&ClaimWindowData| {
-                c.reset.is_some()
-                    && time_adjusted_utilization(
-                        Some(0.0),
-                        c.reset,
-                        c.status.as_deref(),
-                        NEAR_RESET_7D_SECS,
-                        now_epoch,
-                    )
-                    .is_some()
-            };
-            let representative: Option<&ClaimWindowData> = {
-                let rep_key = info.representative_claim.as_deref();
-                rep_key
-                    .filter(|k| k.starts_with("seven_day"))
-                    .and_then(|k| info.claims_7d.get(k))
-                    .filter(claim_is_fresh)
-                    .or_else(|| info.claims_7d.get("seven_day").filter(claim_is_fresh))
-                    .or_else(|| {
-                        info.claims_7d
-                            .values()
-                            .filter(claim_is_fresh)
-                            .max_by(|a, b| {
-                                let wr_a = waste_risk(a.utilization, a.reset, now_epoch);
-                                let wr_b = waste_risk(b.utilization, b.reset, now_epoch);
-                                wr_a.partial_cmp(&wr_b).unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                    })
-            };
-
-            let (gate_7d, wr) = if let Some(claim) = representative {
-                let g = if stale_after_hard_limit {
-                    0.5
-                } else {
-                    time_adjusted_utilization(
-                        Some(0.0),
-                        claim.reset,
-                        claim.status.as_deref(),
-                        NEAR_RESET_7D_SECS,
-                        now_epoch,
-                    )
-                    .unwrap_or(0.0)
-                };
-                let w = waste_risk(claim.utilization, claim.reset, now_epoch);
-                (g, w)
-            } else {
-                // No 7d claim at all — headroom-only
-                let g = if stale_after_hard_limit { 0.5 } else { 0.0 };
-                (g, 0.0)
-            };
-
-            let gate = gate_5h.max(gate_7d);
-            let headroom = (1.0 - gate).max(0.01);
-            let weight = if wr > 0.0 { wr * headroom } else { headroom };
-            let weight = if gate >= 1.0 { 0.0 } else { weight };
-
-            entries[i] = Some((gate, weight));
+            entries[i] = metrics_gate_weight(&info, now_epoch, now);
         }
 
+        // Mirror the same computation over the unified endpoint pool. OpenAI
+        // endpoints carry no rate-limit data — their representative weight is
+        // the fixed (gate 0.0, weight 1.0) candidate that routing_candidates
+        // produces. Anthropic endpoints run the identical Anthropic computation.
+        let mut endpoint_entries: Vec<Option<(f64, f64)>> = vec![None; self.endpoints.len()];
+        for (i, ep) in self.endpoints.iter().enumerate() {
+            match ep.protocol {
+                Protocol::OpenAI => {
+                    endpoint_entries[i] = Some((0.0, 1.0));
+                }
+                Protocol::Anthropic => {
+                    if ep.passthrough {
+                        continue;
+                    }
+                    let info = ep.rate_info.read().await;
+                    endpoint_entries[i] = metrics_gate_weight(&info, now_epoch, now);
+                }
+            }
+        }
+
+        self.store_metrics_weights(&entries, &self.accounts, |a| {
+            (
+                &a.last_routing_weight,
+                &a.last_routing_share,
+                &a.last_effective_gate,
+            )
+        });
+        self.store_metrics_weights(&endpoint_entries, &self.endpoints, |e| {
+            (
+                &e.last_routing_weight,
+                &e.last_routing_share,
+                &e.last_effective_gate,
+            )
+        });
+    }
+
+    /// Normalize per-entry (gate, weight) pairs into the three gauge atomics
+    /// of each pool member, applying pick_account's graceful soft-limit
+    /// degradation. Pool-agnostic: works for both `Account` and `Endpoint`
+    /// since the gauge atomics share field names.
+    fn store_metrics_weights<T>(
+        &self,
+        entries: &[Option<(f64, f64)>],
+        pool: &[T],
+        gauges: impl Fn(&T) -> (&AtomicU64, &AtomicU64, &AtomicU64),
+    ) {
         // Mirror pick_account's graceful-degradation: only filter soft-limited
-        // accounts when at least one healthy account exists in the pool.
-        // Otherwise the entire pool is degraded and we still want the dashboard
-        // to reflect the routable accounts (pick_account would route to them).
+        // members when at least one healthy member exists in the pool.
         let has_healthy = entries
             .iter()
             .any(|e| matches!(e, Some((gate, _)) if *gate < self.soft_limit));
 
-        let mut weights = vec![0f64; self.accounts.len()];
+        let mut weights = vec![0f64; pool.len()];
         for (i, entry) in entries.iter().enumerate() {
             if let Some((gate, weight)) = entry {
                 if has_healthy && *gate >= self.soft_limit {
@@ -2292,23 +2233,133 @@ impl AppState {
         }
 
         let total: f64 = weights.iter().sum();
-        for (i, acct) in self.accounts.iter().enumerate() {
+        for (i, member) in pool.iter().enumerate() {
             let w = weights[i];
             let share = if total > 0.0 { w / total } else { 0.0 };
-            // Excluded accounts (passthrough, hard-limited) report gate=1.0
+            // Excluded members (passthrough, hard-limited) report gate=1.0
             // (fully gated) since they receive zero traffic.
             let gate = entries[i].map(|(g, _)| g).unwrap_or(1.0);
-            // Weight, share and gate are independent gauges, not a joint invariant —
-            // a torn read across them is harmless for dashboard consumers.
-            acct.last_routing_weight
-                .store(w.to_bits(), Ordering::Relaxed);
-            acct.last_routing_share
-                .store(share.to_bits(), Ordering::Relaxed);
-            acct.last_effective_gate
-                .store(gate.to_bits(), Ordering::Relaxed);
+            let (weight_g, share_g, gate_g) = gauges(member);
+            // Weight, share and gate are independent gauges, not a joint
+            // invariant — a torn read across them is harmless.
+            weight_g.store(w.to_bits(), Ordering::Relaxed);
+            share_g.store(share.to_bits(), Ordering::Relaxed);
+            gate_g.store(gate.to_bits(), Ordering::Relaxed);
+        }
+    }
+}
+
+/// Per-entry representative `(gate, weight)` for metrics gauges, model-agnostic.
+/// Returns `None` for hard-limited members (they contribute zero in any state).
+/// Shared by both the legacy account pool and the unified endpoint pool — only
+/// reads `RateLimitInfo`, so it is pool-agnostic.
+fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Option<(f64, f64)> {
+    // Hard-limited members contribute zero (mirrors routing_candidates filter).
+    if let Some(until) = info.hard_limited_until {
+        if now < until {
+            return None;
         }
     }
 
+    let stale_after_hard_limit = info
+        .hard_limited_until
+        .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
+
+    // 5h gate — same logic as routing_candidates
+    let gate_5h = if stale_after_hard_limit {
+        0.5
+    } else {
+        time_adjusted_utilization(
+            info.utilization_5h,
+            info.reset_5h,
+            info.status_5h.as_deref(),
+            NEAR_RESET_5H_SECS,
+            now_epoch,
+        )
+        .unwrap_or_else(|| {
+            if let Some(util) = info.utilization {
+                util
+            } else if let Some(remaining) = info.remaining_tokens {
+                let limit = info.limit_tokens.unwrap_or(1_000_000);
+                (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
+            } else {
+                0.5
+            }
+        })
+    };
+
+    // 7d gate + waste_risk from a SINGLE representative ClaimWindowData
+    // — utilization, reset and status are read as a coherent triple
+    // from one real claim, not Frankensteined from independently
+    // aggregated maxima/minima across claims.
+    //
+    // Selection precedence:
+    //   1. info.representative_claim if it points to a 7d entry
+    //      (this is the LB's own "binding constraint" signal)
+    //   2. The general "seven_day" claim if present
+    //   3. The model-specific claim with the highest waste_risk
+    //      (worst-case representative for the dashboard)
+    //   4. None → no 7d data, fall back to headroom-only
+    let claim_is_fresh = |c: &&ClaimWindowData| {
+        c.reset.is_some()
+            && time_adjusted_utilization(
+                Some(0.0),
+                c.reset,
+                c.status.as_deref(),
+                NEAR_RESET_7D_SECS,
+                now_epoch,
+            )
+            .is_some()
+    };
+    let representative: Option<&ClaimWindowData> = {
+        let rep_key = info.representative_claim.as_deref();
+        rep_key
+            .filter(|k| k.starts_with("seven_day"))
+            .and_then(|k| info.claims_7d.get(k))
+            .filter(claim_is_fresh)
+            .or_else(|| info.claims_7d.get("seven_day").filter(claim_is_fresh))
+            .or_else(|| {
+                info.claims_7d
+                    .values()
+                    .filter(claim_is_fresh)
+                    .max_by(|a, b| {
+                        let wr_a = waste_risk(a.utilization, a.reset, now_epoch);
+                        let wr_b = waste_risk(b.utilization, b.reset, now_epoch);
+                        wr_a.partial_cmp(&wr_b).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            })
+    };
+
+    let (gate_7d, wr) = if let Some(claim) = representative {
+        let g = if stale_after_hard_limit {
+            0.5
+        } else {
+            time_adjusted_utilization(
+                Some(0.0),
+                claim.reset,
+                claim.status.as_deref(),
+                NEAR_RESET_7D_SECS,
+                now_epoch,
+            )
+            .unwrap_or(0.0)
+        };
+        let w = waste_risk(claim.utilization, claim.reset, now_epoch);
+        (g, w)
+    } else {
+        // No 7d claim at all — headroom-only
+        let g = if stale_after_hard_limit { 0.5 } else { 0.0 };
+        (g, 0.0)
+    };
+
+    let gate = gate_5h.max(gate_7d);
+    let headroom = (1.0 - gate).max(0.01);
+    let weight = if wr > 0.0 { wr * headroom } else { headroom };
+    let weight = if gate >= 1.0 { 0.0 } else { weight };
+
+    Some((gate, weight))
+}
+
+impl AppState {
     fn routing_weight_publish_ttl(probe_interval_secs: u64) -> u64 {
         const FALLBACK_PUBLISH_INTERVAL_SECS: u64 = 60;
 
@@ -5882,6 +5933,11 @@ struct AcctMetricsSnap {
     last_updated_epoch: Option<u64>,
     overage_in_use: bool,
     overage_utilization: Option<f64>,
+    /// Routing-weight gauges, captured from the source struct's atomics at
+    /// snap time. Snap-carried so the routing-weight emission is pool-agnostic.
+    routing_weight: f64,
+    routing_share: f64,
+    effective_gate: f64,
 }
 
 #[cfg(test)]
@@ -5937,6 +5993,120 @@ fn append_routing_weight_metrics(
     }
 }
 
+/// Build an `AcctMetricsSnap` from the shared (name, rate_info, burn_rate,
+/// counters, gauge atomics) field set common to both `Account` and the unified
+/// `Endpoint`. Pool-agnostic: callers pass field references, so one
+/// implementation serves both the legacy account pool and the endpoint pool.
+#[allow(clippy::too_many_arguments)]
+async fn build_metrics_snap(
+    name: &str,
+    passthrough: bool,
+    rate_info: &RwLock<RateLimitInfo>,
+    burn_rate: &Mutex<BurnRate>,
+    requests: &AtomicU64,
+    token_counters: [&AtomicU64; 4],
+    routing_weight_atomic: &AtomicU64,
+    routing_share_atomic: &AtomicU64,
+    effective_gate_atomic: &AtomicU64,
+    now_epoch: u64,
+    total_headroom: &mut Option<u64>,
+) -> AcctMetricsSnap {
+    let info = rate_info.read().await;
+    let (br_5m, br_1h, br_6h) = burn_rate
+        .lock()
+        .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
+        .unwrap_or((0.0, 0.0, 0.0));
+
+    let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
+        Some(rem)
+    } else if let (Some(util), Some(limit)) = (info.utilization, info.limit_requests) {
+        Some(((1.0 - util) * limit as f64).max(0.0) as u64)
+    } else {
+        None
+    };
+    match (total_headroom.as_mut(), headroom) {
+        (Some(total), Some(h)) => *total += h,
+        _ => *total_headroom = None,
+    }
+
+    let hard_limited_secs = info
+        .hard_limited_until
+        .and_then(|until| until.checked_duration_since(Instant::now()))
+        .map(|d| d.as_secs() as f64)
+        .unwrap_or(0.0);
+    let hard_limited_active = info
+        .hard_limited_until
+        .is_some_and(|until| Instant::now() < until);
+    let stale_after_hard_limit = info
+        .hard_limited_until
+        .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
+
+    let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
+    let projected_throttle_secs = if eff_util < 0.5 || br_1h < 0.01 {
+        None
+    } else {
+        headroom.map(|h| {
+            if h == 0 {
+                0.0
+            } else {
+                (h as f64 / br_1h) * 60.0
+            }
+        })
+    };
+
+    let claims: Vec<ClaimMetricsSnap> = info
+        .claims_7d
+        .iter()
+        .map(|(k, d)| ClaimMetricsSnap {
+            key: k.clone(),
+            utilization: d.utilization,
+            waste_risk: waste_risk(d.utilization, d.reset, now_epoch),
+            reset: d.reset,
+            status: d.status.clone(),
+        })
+        .collect();
+
+    AcctMetricsSnap {
+        name: name.to_string(),
+        passthrough,
+        has_applicable_7d: !claims.is_empty()
+            || info.utilization_7d.is_some()
+            || info.reset_7d.is_some()
+            || info.status_7d.is_some(),
+        utilization: info.utilization,
+        utilization_5h: info.utilization_5h,
+        utilization_7d: info.utilization_7d,
+        reset_5h: info.reset_5h,
+        reset_7d: info.reset_7d,
+        status_5h: info.status_5h.clone(),
+        status_7d: info.status_7d.clone(),
+        stale_after_hard_limit,
+        hard_limited_active,
+        burn_rate: (br_5m, br_1h, br_6h),
+        headroom,
+        remaining_requests: info.remaining_requests,
+        remaining_tokens: info.remaining_tokens,
+        limit_requests: info.limit_requests,
+        limit_tokens: info.limit_tokens,
+        requests_total: requests.load(Ordering::Relaxed),
+        hard_limited_secs,
+        projected_throttle_secs,
+        token_usage: [
+            token_counters[0].load(Ordering::Relaxed),
+            token_counters[1].load(Ordering::Relaxed),
+            token_counters[2].load(Ordering::Relaxed),
+            token_counters[3].load(Ordering::Relaxed),
+        ],
+        claims,
+        last_updated_epoch: info.last_updated_epoch,
+        overage_in_use: info.overage_in_use,
+        overage_utilization: info.overage_utilization,
+        routing_weight: f64::from_bits(routing_weight_atomic.load(Ordering::Relaxed)),
+        routing_share: f64::from_bits(routing_share_atomic.load(Ordering::Relaxed)),
+        effective_gate: f64::from_bits(effective_gate_atomic.load(Ordering::Relaxed)),
+    }
+}
+
 async fn metrics_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -5957,102 +6127,59 @@ async fn metrics_handler(
 
     // ── Phase 1: Gather data (async — acquires locks) ──────────────
 
-    let mut snaps: Vec<AcctMetricsSnap> = Vec::with_capacity(state.accounts.len());
+    let mut snaps: Vec<AcctMetricsSnap> =
+        Vec::with_capacity(state.accounts.len() + state.endpoints.len());
     let mut total_headroom: Option<u64> = Some(0);
 
     for acct in &state.accounts {
-        let info = acct.rate_info.read().await;
-        let (br_5m, br_1h, br_6h) = acct
-            .burn_rate
-            .lock()
-            .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
-            .unwrap_or((0.0, 0.0, 0.0));
-
-        let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
-            Some(rem)
-        } else if let (Some(util), Some(limit)) = (info.utilization, info.limit_requests) {
-            Some(((1.0 - util) * limit as f64).max(0.0) as u64)
-        } else {
-            None
-        };
-        match (total_headroom.as_mut(), headroom) {
-            (Some(total), Some(h)) => *total += h,
-            _ => total_headroom = None,
-        }
-
-        let hard_limited_secs = info
-            .hard_limited_until
-            .and_then(|until| until.checked_duration_since(Instant::now()))
-            .map(|d| d.as_secs() as f64)
-            .unwrap_or(0.0);
-        let hard_limited_active = info
-            .hard_limited_until
-            .is_some_and(|until| Instant::now() < until);
-        let stale_after_hard_limit = info
-            .hard_limited_until
-            .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
-
-        let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
-        let projected_throttle_secs = if eff_util < 0.5 || br_1h < 0.01 {
-            None
-        } else {
-            headroom.map(|h| {
-                if h == 0 {
-                    0.0
-                } else {
-                    (h as f64 / br_1h) * 60.0
-                }
-            })
-        };
-
-        let claims: Vec<ClaimMetricsSnap> = info
-            .claims_7d
-            .iter()
-            .map(|(k, d)| ClaimMetricsSnap {
-                key: k.clone(),
-                utilization: d.utilization,
-                waste_risk: waste_risk(d.utilization, d.reset, now_epoch),
-                reset: d.reset,
-                status: d.status.clone(),
-            })
-            .collect();
-
-        snaps.push(AcctMetricsSnap {
-            name: acct.name.clone(),
-            passthrough: acct.passthrough,
-            has_applicable_7d: !claims.is_empty()
-                || info.utilization_7d.is_some()
-                || info.reset_7d.is_some()
-                || info.status_7d.is_some(),
-            utilization: info.utilization,
-            utilization_5h: info.utilization_5h,
-            utilization_7d: info.utilization_7d,
-            reset_5h: info.reset_5h,
-            reset_7d: info.reset_7d,
-            status_5h: info.status_5h.clone(),
-            status_7d: info.status_7d.clone(),
-            stale_after_hard_limit,
-            hard_limited_active,
-            burn_rate: (br_5m, br_1h, br_6h),
-            headroom,
-            remaining_requests: info.remaining_requests,
-            remaining_tokens: info.remaining_tokens,
-            limit_requests: info.limit_requests,
-            limit_tokens: info.limit_tokens,
-            requests_total: acct.requests.load(Ordering::Relaxed),
-            hard_limited_secs,
-            projected_throttle_secs,
-            token_usage: [
-                acct.input_tokens.load(Ordering::Relaxed),
-                acct.output_tokens.load(Ordering::Relaxed),
-                acct.cache_creation_tokens.load(Ordering::Relaxed),
-                acct.cache_read_tokens.load(Ordering::Relaxed),
-            ],
-            claims,
-            last_updated_epoch: info.last_updated_epoch,
-            overage_in_use: info.overage_in_use,
-            overage_utilization: info.overage_utilization,
-        });
+        snaps.push(
+            build_metrics_snap(
+                &acct.name,
+                acct.passthrough,
+                &acct.rate_info,
+                &acct.burn_rate,
+                &acct.requests,
+                [
+                    &acct.input_tokens,
+                    &acct.output_tokens,
+                    &acct.cache_creation_tokens,
+                    &acct.cache_read_tokens,
+                ],
+                &acct.last_routing_weight,
+                &acct.last_routing_share,
+                &acct.last_effective_gate,
+                now_epoch,
+                &mut total_headroom,
+            )
+            .await,
+        );
+    }
+    // Parallel pass over the unified endpoint pool. In a real config exactly
+    // one pool is non-empty, so there are no label collisions. OpenAI
+    // endpoints have a stub RateLimitInfo — their gauges read as zero/None,
+    // which is the correct representation for a pool with no rate-limit data.
+    for ep in &state.endpoints {
+        snaps.push(
+            build_metrics_snap(
+                &ep.name,
+                ep.passthrough,
+                &ep.rate_info,
+                &ep.burn_rate,
+                &ep.requests,
+                [
+                    &ep.input_tokens,
+                    &ep.output_tokens,
+                    &ep.cache_creation_tokens,
+                    &ep.cache_read_tokens,
+                ],
+                &ep.last_routing_weight,
+                &ep.last_routing_share,
+                &ep.last_effective_gate,
+                now_epoch,
+                &mut total_headroom,
+            )
+            .await,
+        );
     }
 
     // Extract global maps once (single lock per map, then drop guard)
@@ -6511,30 +6638,28 @@ async fn metrics_handler(
         "Effective routing gate: max(time_adjusted_5h, time_adjusted_7d) with status floors",
     );
 
-    for (acct, s) in state.accounts.iter().zip(snaps.iter()) {
+    // Snap-carried gauges (captured at snap time) — covers both pools.
+    for s in &snaps {
         if s.passthrough {
             continue;
         }
-        let weight = f64::from_bits(acct.last_routing_weight.load(Ordering::Relaxed));
-        let share = f64::from_bits(acct.last_routing_share.load(Ordering::Relaxed));
-        let gate = f64::from_bits(acct.last_effective_gate.load(Ordering::Relaxed));
         prom_gauge(
             &mut buf,
             "anthropic_account_routing_weight",
             &[("account", &s.name)],
-            weight,
+            s.routing_weight,
         );
         prom_gauge(
             &mut buf,
             "anthropic_account_routing_share",
             &[("account", &s.name)],
-            share,
+            s.routing_share,
         );
         prom_gauge(
             &mut buf,
             "anthropic_account_effective_gate",
             &[("account", &s.name)],
-            gate,
+            s.effective_gate,
         );
     }
 
@@ -20058,6 +20183,72 @@ upstream = "https://api.anthropic.com"
             read_share(0),
             read_share(1)
         );
+    }
+
+    /// Unit: refresh_metrics_weights() also populates the unified endpoint
+    /// pool's gauge atomics. Anthropic endpoints get the headroom computation;
+    /// OpenAI endpoints get the fixed (gate 0.0, weight 1.0) representative.
+    #[tokio::test]
+    async fn refresh_metrics_weights_populates_endpoint_pool() {
+        fn anthropic_ep(name: &str) -> Endpoint {
+            Endpoint {
+                name: name.to_string(),
+                protocol: Protocol::Anthropic,
+                base_url: "https://api.anthropic.com".to_string(),
+                token: "sk-ant-api-test".to_string(),
+                passthrough: false,
+                models: vec![],
+                priority: 0,
+                requests: AtomicU64::new(0),
+                rate_info: RwLock::new(RateLimitInfo::default()),
+                burn_rate: Mutex::new(BurnRate::new()),
+                input_tokens: AtomicU64::new(0),
+                output_tokens: AtomicU64::new(0),
+                cache_creation_tokens: AtomicU64::new(0),
+                cache_read_tokens: AtomicU64::new(0),
+                last_routing_weight: AtomicU64::new(0),
+                last_routing_share: AtomicU64::new(0),
+                last_effective_gate: AtomicU64::new(0),
+            }
+        }
+        let mut openai_ep = anthropic_ep("oai");
+        openai_ep.protocol = Protocol::OpenAI;
+
+        let mut state = test_state_with(vec![]);
+        {
+            let st = Arc::get_mut(&mut state).unwrap();
+            st.endpoints.push(anthropic_ep("ep-a"));
+            st.endpoints.push(openai_ep);
+        }
+        let now = AppState::now_epoch();
+        {
+            let mut info = state.endpoints[0].rate_info.write().await;
+            info.utilization_5h = Some(0.20);
+            info.reset_5h = Some(now + 10000);
+            info.utilization = Some(0.20);
+        }
+
+        state.refresh_metrics_weights().await;
+
+        let weight = |i: usize| {
+            f64::from_bits(
+                state.endpoints[i]
+                    .last_routing_weight
+                    .load(Ordering::Relaxed),
+            )
+        };
+        let gate = |i: usize| {
+            f64::from_bits(
+                state.endpoints[i]
+                    .last_effective_gate
+                    .load(Ordering::Relaxed),
+            )
+        };
+        // Anthropic endpoint: positive weight from headroom computation.
+        assert!(weight(0) > 0.0, "anthropic endpoint should have weight");
+        // OpenAI endpoint: fixed representative — gate 0.0, non-zero weight.
+        assert_eq!(gate(1), 0.0, "openai endpoint gate must be the fixed 0.0");
+        assert!(weight(1) > 0.0, "openai endpoint should carry weight");
     }
 
     /// Regression: when SOME accounts are above soft_limit but at least one
