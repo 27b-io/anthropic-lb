@@ -8955,19 +8955,6 @@ async fn main() {
         panic!("{msg}");
     }
 
-    // TRANSIENT GUARD (removed at the end of Phase 2c): handler dispatch for
-    // EndpointIdx::Unified is now wired in both handlers, but the unified pool
-    // is not yet covered by persistence (save/load_state), metrics, or Redis
-    // sync. Refuse to start with a populated [[endpoints]] config until those
-    // land, so the schema goes straight from "rejected" to "fully working"
-    // with no half-migrated window. This block is deleted by Phase 2c.
-    if !config.endpoints.is_empty() {
-        panic!(
-            "config: [[endpoints]] is declared ({} entries) but the unified-pool migration is incomplete (persistence/metrics pending, Phase 2c). Use [[accounts]] / [[upstreams]] for now.",
-            config.endpoints.len()
-        );
-    }
-
     // Set up tracing: stderr (info+) always, plus optional debug log file
     {
         use tracing_subscriber::prelude::*;
