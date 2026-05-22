@@ -3196,19 +3196,6 @@ async fn finalize_non_stream(
 }
 
 impl AppState {
-    /// Recover the index of an endpoint borrowed from `self.endpoints`.
-    ///
-    /// `pick_endpoint` hands callers an `&Endpoint`; a detached streaming task
-    /// (which owns only a cloned `Arc<AppState>`) cannot carry that borrow
-    /// across the `tokio::spawn` boundary, so it re-derives the endpoint by
-    /// index. `Vec` storage is contiguous, so the index is the pointer offset.
-    /// Caller contract: `ep` must point into `self.endpoints`.
-    fn endpoint_index(&self, ep: &Endpoint) -> usize {
-        let base = self.endpoints.as_ptr() as usize;
-        let here = ep as *const Endpoint as usize;
-        (here - base) / std::mem::size_of::<Endpoint>()
-    }
-
     /// Record token usage for an endpoint and client.
     async fn record_usage(&self, ep: &Endpoint, client_id: &str, usage: &TokenUsage) {
         if usage.is_empty() {
@@ -3850,6 +3837,11 @@ async fn classify_retry_status(
 /// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
 /// passes the picked endpoint and its pool index (used for `skip` and usage
 /// accounting).
+/// `ep` is the endpoint to forward to; `endpoint_idx` is its index in
+/// `state.endpoints`. Both are required: the streaming path spawns a
+/// detached 'static task that must re-borrow the endpoint from a cloned
+/// Arc<AppState> — a borrowed &Endpoint cannot cross the spawn boundary,
+/// so the task captures the Copy `endpoint_idx` and re-indexes.
 #[allow(clippy::too_many_arguments)]
 async fn forward_anthropic(
     state: &Arc<AppState>,
@@ -3857,6 +3849,7 @@ async fn forward_anthropic(
     body_bytes: &bytes::Bytes,
     oauth_body_bytes: &bytes::Bytes,
     ep: &Endpoint,
+    endpoint_idx: usize,
     req_id: &str,
     client_id: &str,
     client_ver: &str,
@@ -4054,8 +4047,7 @@ async fn forward_anthropic(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
         let state_clone = state.clone();
         // The detached task can't carry the `ep` borrow across the spawn
-        // boundary; capture the index and re-borrow from the owned `Arc`.
-        let endpoint_idx = state.endpoint_index(ep);
+        // boundary; capture the Copy index and re-borrow from the owned `Arc`.
         let client_id_clone = client_id.to_owned();
         let acct_name = endpoint_name.to_owned();
         let model_clone = model.to_owned();
@@ -4086,10 +4078,12 @@ async fn forward_anthropic(
                     }
                 }
             }
-            // Parse accumulated SSE data for usage
+            // Parse accumulated SSE data for usage. The detached task only
+            // holds a cloned Arc<AppState>; re-index it to recover &Endpoint.
+            let ep = &state_clone.endpoints[endpoint_idx];
             finalize_stream(
                 &state_clone,
-                &state_clone.endpoints[endpoint_idx],
+                ep,
                 &req_id_clone,
                 &client_id_clone,
                 &model_clone,
@@ -4306,6 +4300,7 @@ async fn proxy_handler(
                                     &body_bytes,
                                     &oauth_body_bytes,
                                     ep,
+                                    i,
                                     &req_id,
                                     &client_id,
                                     &client_ver,
@@ -7160,11 +7155,17 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
 /// Anthropic response back to OpenAI format. Structurally similar to
 /// `forward_anthropic`, but intentionally kept separate: it speaks OpenAI on
 /// both edges (request body already translated, response translated back).
+/// `ep` is the endpoint to forward to; `endpoint_idx` is its index in
+/// `state.endpoints`. Both are required: the streaming path spawns a
+/// detached 'static task that must re-borrow the endpoint from a cloned
+/// Arc<AppState> — a borrowed &Endpoint cannot cross the spawn boundary,
+/// so the task captures the Copy `endpoint_idx` and re-indexes.
 #[allow(clippy::too_many_arguments)]
 async fn forward_openai_compat_anthropic(
     state: &Arc<AppState>,
     parts: &axum::http::request::Parts,
     ep: &Endpoint,
+    endpoint_idx: usize,
     anthropic_body: &serde_json::Value,
     oauth_anthropic_body: &serde_json::Value,
     req_id: &str,
@@ -7364,8 +7365,7 @@ async fn forward_openai_compat_anthropic(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
         let state_clone = state.clone();
         // The detached task can't carry the `ep` borrow across the spawn
-        // boundary; capture the index and re-borrow from the owned `Arc`.
-        let endpoint_idx = state.endpoint_index(ep);
+        // boundary; capture the Copy index and re-borrow from the owned `Arc`.
         let client_id_clone = client_id.to_owned();
         let acct_name = endpoint_name.to_owned();
         let model_clone = model.to_owned();
@@ -7448,10 +7448,12 @@ async fn forward_openai_compat_anthropic(
                 client_gone = true;
             }
 
-            // Extract and record token usage from accumulated SSE data
+            // Extract and record token usage from accumulated SSE data. The
+            // detached task only holds a cloned Arc<AppState>; re-index it.
+            let ep = &state_clone.endpoints[endpoint_idx];
             finalize_stream(
                 &state_clone,
-                &state_clone.endpoints[endpoint_idx],
+                ep,
                 &req_id_clone,
                 &client_id_clone,
                 &model_clone,
@@ -7680,6 +7682,7 @@ async fn openai_chat_handler(
                                     &state,
                                     &parts,
                                     ep,
+                                    i,
                                     &anthropic_body,
                                     &oauth_anthropic_body,
                                     &req_id,
