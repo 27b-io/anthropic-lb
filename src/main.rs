@@ -703,13 +703,13 @@ impl AppState {
 
 #[derive(Serialize, Deserialize)]
 struct PersistedState {
-    accounts: Vec<PersistedAccount>,
+    endpoints: Vec<PersistedEndpoint>,
     #[serde(default)]
     saved_at: u64,
 }
 
 #[derive(Serialize, Deserialize)]
-struct PersistedAccount {
+struct PersistedEndpoint {
     name: String,
     requests_total: u64,
     utilization: Option<f64>,
@@ -812,22 +812,29 @@ impl AppState {
     }
 
     async fn save_state(&self) {
-        let mut accounts = Vec::new();
+        let mut endpoints = Vec::new();
         let now = Instant::now();
 
-        for acct in &self.accounts {
-            let info = acct.rate_info.read().await;
+        // Build a PersistedEndpoint from the shared (name, requests, rate_info)
+        // fields common to both Account and Endpoint.
+        async fn persist_one(
+            name: &str,
+            requests: &AtomicU64,
+            rate_info: &RwLock<RateLimitInfo>,
+            now: Instant,
+        ) -> PersistedEndpoint {
+            let info = rate_info.read().await;
             let hard_until_epoch = info.hard_limited_until.and_then(|until| {
                 if until > now {
                     let remaining = until.duration_since(now);
-                    Some(Self::now_epoch() + remaining.as_secs())
+                    Some(AppState::now_epoch() + remaining.as_secs())
                 } else {
                     None
                 }
             });
-            accounts.push(PersistedAccount {
-                name: acct.name.clone(),
-                requests_total: acct.requests.load(Ordering::Relaxed),
+            PersistedEndpoint {
+                name: name.to_string(),
+                requests_total: requests.load(Ordering::Relaxed),
                 utilization: info.utilization,
                 utilization_7d: info.utilization_7d,
                 utilization_5h: info.utilization_5h,
@@ -847,11 +854,24 @@ impl AppState {
                 overage_reset: info.overage_reset,
                 hard_limited_until_epoch: hard_until_epoch,
                 last_updated_epoch: info.last_updated_epoch,
-            });
+            }
+        }
+
+        // In practice exactly one pool is non-empty; persist both for safety.
+        // Accounts are always Anthropic. Skip OpenAI endpoints — their
+        // rate_info is a permanent stub with no state worth persisting.
+        for acct in &self.accounts {
+            endpoints.push(persist_one(&acct.name, &acct.requests, &acct.rate_info, now).await);
+        }
+        for ep in &self.endpoints {
+            if ep.protocol == Protocol::OpenAI {
+                continue;
+            }
+            endpoints.push(persist_one(&ep.name, &ep.requests, &ep.rate_info, now).await);
         }
 
         let state = PersistedState {
-            accounts,
+            endpoints,
             saved_at: Self::now_epoch(),
         };
 
@@ -1300,7 +1320,7 @@ impl AppState {
         let persisted: PersistedState = match serde_json::from_str(&data) {
             Ok(s) => s,
             Err(e) => {
-                warn!(error = %e, "failed to parse persisted state, starting fresh");
+                warn!(error = %e, "failed to parse persisted state (possible legacy 'accounts'-keyed format — that schema was removed); starting fresh");
                 return;
             }
         };
@@ -1308,10 +1328,23 @@ impl AppState {
         let now_epoch = Self::now_epoch();
         let now_instant = Instant::now();
 
-        for pa in &persisted.accounts {
-            if let Some(acct) = self.accounts.iter().find(|a| a.name == pa.name) {
-                acct.requests.store(pa.requests_total, Ordering::Relaxed);
-                let mut info = acct.rate_info.write().await;
+        for pa in &persisted.endpoints {
+            // Distribute each persisted entry to whichever pool holds a
+            // matching name: legacy accounts first, then unified endpoints.
+            let restore_target: Option<(&AtomicU64, &RwLock<RateLimitInfo>)> = self
+                .accounts
+                .iter()
+                .find(|a| a.name == pa.name)
+                .map(|a| (&a.requests, &a.rate_info))
+                .or_else(|| {
+                    self.endpoints
+                        .iter()
+                        .find(|e| e.name == pa.name)
+                        .map(|e| (&e.requests, &e.rate_info))
+                });
+            if let Some((requests, rate_info)) = restore_target {
+                requests.store(pa.requests_total, Ordering::Relaxed);
+                let mut info = rate_info.write().await;
                 info.utilization = pa.utilization;
                 info.utilization_7d = pa.utilization_7d;
                 info.utilization_5h = pa.utilization_5h;
@@ -18624,9 +18657,9 @@ upstream = "https://api.anthropic.com"
         // Verify file exists and is valid JSON
         let data = tokio::fs::read_to_string(&state_path).await.unwrap();
         let persisted: PersistedState = serde_json::from_str(&data).unwrap();
-        assert_eq!(persisted.accounts.len(), 2);
-        assert_eq!(persisted.accounts[0].requests_total, 42);
-        assert_eq!(persisted.accounts[1].requests_total, 17);
+        assert_eq!(persisted.endpoints.len(), 2);
+        assert_eq!(persisted.endpoints[0].requests_total, 42);
+        assert_eq!(persisted.endpoints[1].requests_total, 17);
         assert!(persisted.saved_at > 0);
 
         // Create a fresh state and load into it
@@ -18714,6 +18747,86 @@ upstream = "https://api.anthropic.com"
                 "hard_limited_until should survive round-trip"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn load_state_warns_and_starts_clean_on_legacy_accounts_key() {
+        // A state file using the legacy `accounts` top-level key must NOT
+        // deserialize into the new `endpoints`-keyed PersistedState. load_state
+        // logs a warn and starts clean.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"{"accounts":[{"name":"primary","requests_total":42}],"saved_at":0}"#,
+        )
+        .unwrap();
+        let mut state = test_state_with(vec![make_account("primary", "sk-ant")]);
+        Arc::get_mut(&mut state).unwrap().state_path = tmp.path().to_path_buf();
+        state.load_state().await; // must not panic
+        assert_eq!(
+            state.accounts[0].requests.load(Ordering::Relaxed),
+            0,
+            "legacy accounts-keyed state file must not load into the new schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_load_roundtrip_unified_endpoints() {
+        fn make_test_endpoint(name: &str) -> Endpoint {
+            Endpoint {
+                name: name.to_string(),
+                protocol: Protocol::Anthropic,
+                base_url: "https://api.anthropic.com".to_string(),
+                token: "sk-ant-api-test".to_string(),
+                passthrough: false,
+                models: vec![],
+                priority: 0,
+                requests: AtomicU64::new(0),
+                rate_info: RwLock::new(RateLimitInfo::default()),
+                burn_rate: Mutex::new(BurnRate::new()),
+                input_tokens: AtomicU64::new(0),
+                output_tokens: AtomicU64::new(0),
+                cache_creation_tokens: AtomicU64::new(0),
+                cache_read_tokens: AtomicU64::new(0),
+                last_routing_weight: AtomicU64::new(0),
+                last_routing_share: AtomicU64::new(0),
+                last_effective_gate: AtomicU64::new(0),
+            }
+        }
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut state = test_state_with(vec![]);
+        {
+            let st = Arc::get_mut(&mut state).unwrap();
+            st.state_path = tmp.path().to_path_buf();
+            st.endpoints.push(make_test_endpoint("ep1"));
+        }
+        let now_epoch = AppState::now_epoch();
+        state.endpoints[0].requests.store(7, Ordering::Relaxed);
+        {
+            // load_state recomputes `utilization` from the surviving 5h/7d
+            // windows, so a bare flat `utilization` would not survive. Set a
+            // 5h window with a future reset so it persists and drives util.
+            let mut info = state.endpoints[0].rate_info.write().await;
+            info.utilization = Some(0.42);
+            info.utilization_5h = Some(0.42);
+            info.reset_5h = Some(now_epoch + 18000);
+        }
+        state.save_state().await;
+
+        // Fresh state with the same endpoint name, load from the file.
+        let mut state2 = test_state_with(vec![]);
+        {
+            let st = Arc::get_mut(&mut state2).unwrap();
+            st.state_path = tmp.path().to_path_buf();
+            st.endpoints.push(make_test_endpoint("ep1"));
+        }
+        state2.load_state().await;
+        assert_eq!(state2.endpoints[0].requests.load(Ordering::Relaxed), 7);
+        assert_eq!(
+            state2.endpoints[0].rate_info.read().await.utilization,
+            Some(0.42)
+        );
     }
 
     // ── Budget day rollover ──────────────────────────────────────
