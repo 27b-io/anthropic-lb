@@ -4184,6 +4184,62 @@ enum ForwardOutcome {
     Retry { saw_529: bool, push_skip: bool },
 }
 
+/// Classify an upstream Anthropic response status into a retry decision.
+///
+/// Shared by both `forward_anthropic` and `forward_openai_compat_anthropic`,
+/// whose retry-classification logic is byte-identical. For 429 / 529 / other
+/// 5xx it records hard-limit state, persists, and logs exactly as the prior
+/// inline blocks did, returning `Err(ForwardOutcome::Retry { .. })`. For any
+/// non-retry status (2xx success or 4xx client error) it returns
+/// `Ok(resp)` — handing the response back so the caller can continue.
+async fn classify_retry_status(
+    state: &Arc<AppState>,
+    status: StatusCode,
+    rate_info: &RwLock<RateLimitInfo>,
+    endpoint_name: &str,
+    resp: reqwest::Response,
+) -> Result<reqwest::Response, ForwardOutcome> {
+    // 429 → mark hard-limited and try next account
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        state
+            .mark_hard_limited_for(rate_info, endpoint_name, resp.headers())
+            .await;
+        log_429_details(endpoint_name, resp).await;
+        state.save_state().await;
+        info!(account = endpoint_name, "got 429, rotating to next account");
+        return Err(ForwardOutcome::Retry {
+            saw_529: false,
+            push_skip: true,
+        });
+    }
+
+    // 529 → overloaded, try next account; flag for BEBO retry if all exhausted
+    if status.as_u16() == 529 {
+        state.save_state().await;
+        warn!(account = endpoint_name, "got 529, rotating to next account");
+        return Err(ForwardOutcome::Retry {
+            saw_529: true,
+            push_skip: true,
+        });
+    }
+
+    // Other 5xx → transient, try next account (no BEBO retry)
+    if status.is_server_error() {
+        state.save_state().await;
+        warn!(
+            account = endpoint_name,
+            status = status.as_u16(),
+            "got server error, rotating to next account"
+        );
+        return Err(ForwardOutcome::Retry {
+            saw_529: false,
+            push_skip: true,
+        });
+    }
+
+    Ok(resp)
+}
+
 /// Forward one Anthropic-protocol request to a single endpoint. Pool-agnostic:
 /// reusable for both `AppState.accounts` (legacy) and `AppState.endpoints`
 /// (unified) by passing the endpoint's identity, auth, and shared state in
@@ -4277,7 +4333,7 @@ async fn forward_anthropic(
     };
     upstream_req = upstream_req.body(req_body.clone());
 
-    let mut resp = match upstream_req.send().await {
+    let resp = match upstream_req.send().await {
         Ok(r) => r,
         Err(e) => {
             error!(account = endpoint_name, "upstream request failed: {e}");
@@ -4314,43 +4370,12 @@ async fn forward_anthropic(
     // Update burn rate (after rate-limit headers are parsed)
     state.update_burn_rate(burn_rate, client_id);
 
-    // 429 → mark hard-limited and try next account
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        state
-            .mark_hard_limited_for(rate_info, endpoint_name, resp.headers())
-            .await;
-        log_429_details(endpoint_name, resp).await;
-        state.save_state().await;
-        info!(account = endpoint_name, "got 429, rotating to next account");
-        return ForwardOutcome::Retry {
-            saw_529: false,
-            push_skip: true,
-        };
-    }
-
-    // 529 → overloaded, try next account; flag for BEBO retry if all exhausted
-    if status.as_u16() == 529 {
-        state.save_state().await;
-        warn!(account = endpoint_name, "got 529, rotating to next account");
-        return ForwardOutcome::Retry {
-            saw_529: true,
-            push_skip: true,
-        };
-    }
-
-    // Other 5xx → transient, try next account (no BEBO retry)
-    if status.is_server_error() {
-        state.save_state().await;
-        warn!(
-            account = endpoint_name,
-            status = status.as_u16(),
-            "got server error, rotating to next account"
-        );
-        return ForwardOutcome::Retry {
-            saw_529: false,
-            push_skip: true,
-        };
-    }
+    // Classify 429 / 529 / other 5xx into a retry decision (shared helper).
+    let mut resp = match classify_retry_status(state, status, rate_info, endpoint_name, resp).await
+    {
+        Ok(resp) => resp,
+        Err(outcome) => return outcome,
+    };
 
     // Clear hard limit and burst counter only on a genuine 2xx success.
     // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
@@ -7953,7 +7978,7 @@ async fn forward_openai_compat_anthropic(
         .headers(headers)
         .body(body_str);
 
-    let mut resp = match upstream_req.send().await {
+    let resp = match upstream_req.send().await {
         Ok(r) => r,
         Err(e) => {
             error!(account = endpoint_name, "upstream request failed: {e}");
@@ -7975,42 +8000,12 @@ async fn forward_openai_compat_anthropic(
     // Update burn rate (after rate-limit headers are parsed)
     state.update_burn_rate(burn_rate, client_id);
 
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        state
-            .mark_hard_limited_for(rate_info, endpoint_name, resp.headers())
-            .await;
-        log_429_details(endpoint_name, resp).await;
-        state.save_state().await;
-        info!(account = endpoint_name, "got 429, rotating to next account");
-        return ForwardOutcome::Retry {
-            saw_529: false,
-            push_skip: true,
-        };
-    }
-
-    // 529 → overloaded, try next account; flag for BEBO retry if all exhausted
-    if status.as_u16() == 529 {
-        state.save_state().await;
-        warn!(account = endpoint_name, "got 529, rotating to next account");
-        return ForwardOutcome::Retry {
-            saw_529: true,
-            push_skip: true,
-        };
-    }
-
-    // Other 5xx → transient, try next account (no BEBO retry)
-    if status.is_server_error() {
-        state.save_state().await;
-        warn!(
-            account = endpoint_name,
-            status = status.as_u16(),
-            "got server error, rotating to next account"
-        );
-        return ForwardOutcome::Retry {
-            saw_529: false,
-            push_skip: true,
-        };
-    }
+    // Classify 429 / 529 / other 5xx into a retry decision (shared helper).
+    let mut resp = match classify_retry_status(state, status, rate_info, endpoint_name, resp).await
+    {
+        Ok(resp) => resp,
+        Err(outcome) => return outcome,
+    };
 
     // Clear hard limit and burst counter only on a genuine 2xx success.
     // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
