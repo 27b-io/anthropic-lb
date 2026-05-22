@@ -9664,6 +9664,34 @@ token = "sk-ant-test"
         }
     }
 
+    /// Shared fixture for the unified `Endpoint` pool. Callers that need a
+    /// non-default field (priority, token, base_url, models) mutate the
+    /// returned struct.
+    fn make_endpoint(name: &str, protocol: Protocol) -> Endpoint {
+        Endpoint {
+            name: name.to_string(),
+            protocol,
+            base_url: match protocol {
+                Protocol::Anthropic => "https://api.anthropic.com".to_string(),
+                Protocol::OpenAI => "https://gateway.example".to_string(),
+            },
+            token: "sk-test".to_string(),
+            passthrough: false,
+            models: vec![],
+            priority: 0,
+            requests: AtomicU64::new(0),
+            rate_info: RwLock::new(RateLimitInfo::default()),
+            burn_rate: Mutex::new(BurnRate::new()),
+            input_tokens: AtomicU64::new(0),
+            output_tokens: AtomicU64::new(0),
+            cache_creation_tokens: AtomicU64::new(0),
+            cache_read_tokens: AtomicU64::new(0),
+            last_routing_weight: AtomicU64::new(0),
+            last_routing_share: AtomicU64::new(0),
+            last_effective_gate: AtomicU64::new(0),
+        }
+    }
+
     fn test_state_with_strategy(
         accounts: Vec<Account>,
         routing_strategy: RoutingStrategy,
@@ -11584,34 +11612,17 @@ token = "sk-ant-test"
 
     #[tokio::test]
     async fn stats_endpoint_exposes_endpoints_array() {
-        fn make_ep(name: &str, protocol: Protocol) -> Endpoint {
-            Endpoint {
-                name: name.to_string(),
-                protocol,
-                base_url: "https://api.anthropic.com".to_string(),
-                token: "sk-ant-api-test".to_string(),
-                passthrough: false,
-                models: vec![],
-                priority: 5,
-                requests: AtomicU64::new(0),
-                rate_info: RwLock::new(RateLimitInfo::default()),
-                burn_rate: Mutex::new(BurnRate::new()),
-                input_tokens: AtomicU64::new(0),
-                output_tokens: AtomicU64::new(0),
-                cache_creation_tokens: AtomicU64::new(0),
-                cache_read_tokens: AtomicU64::new(0),
-                last_routing_weight: AtomicU64::new(0),
-                last_routing_share: AtomicU64::new(0),
-                last_effective_gate: AtomicU64::new(0),
-            }
-        }
+        let ep = |name: &str, protocol: Protocol| {
+            let mut e = make_endpoint(name, protocol);
+            e.priority = 5;
+            e
+        };
         // Endpoints-only config: legacy accounts pool is empty.
         let mut state = test_state_with(vec![]);
         {
             let st = Arc::get_mut(&mut state).expect("uniquely owned before router build");
-            st.endpoints
-                .push(make_ep("ep-anthropic", Protocol::Anthropic));
-            st.endpoints.push(make_ep("ep-openai", Protocol::OpenAI));
+            st.endpoints.push(ep("ep-anthropic", Protocol::Anthropic));
+            st.endpoints.push(ep("ep-openai", Protocol::OpenAI));
         }
         let addr = serve(build_router(state)).await;
 
@@ -15672,25 +15683,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
         let mut state = test_state_with(vec![acct]);
         let st = Arc::get_mut(&mut state).expect("uniquely owned");
-        st.endpoints.push(Endpoint {
-            name: "openai".to_string(),
-            protocol: Protocol::OpenAI,
-            base_url: "https://gateway.example".to_string(),
-            token: "sk".to_string(),
-            passthrough: false,
-            models: vec![],
-            priority: 100,
-            requests: AtomicU64::new(0),
-            rate_info: RwLock::new(RateLimitInfo::default()),
-            burn_rate: Mutex::new(BurnRate::new()),
-            input_tokens: AtomicU64::new(0),
-            output_tokens: AtomicU64::new(0),
-            cache_creation_tokens: AtomicU64::new(0),
-            cache_read_tokens: AtomicU64::new(0),
-            last_routing_weight: AtomicU64::new(0),
-            last_routing_share: AtomicU64::new(0),
-            last_effective_gate: AtomicU64::new(0),
-        });
+        let mut openai_ep = make_endpoint("openai", Protocol::OpenAI);
+        openai_ep.priority = 100;
+        st.endpoints.push(openai_ep);
         st.emergency_threshold = 0.88;
         assert!(
             state.is_emergency_brake_active().await,
@@ -15704,25 +15699,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         // ran, `rate_info.utilization_5h` would become Some(0.25). The OpenAI
         // skip means the endpoint is never contacted and rate_info stays None.
         let (mock_url, _h) = spawn_mock_upstream().await;
-        let ep = Endpoint {
-            name: "openai".to_string(),
-            protocol: Protocol::OpenAI,
-            base_url: mock_url,
-            token: "sk-ant-api-test".to_string(),
-            passthrough: false,
-            models: vec![],
-            priority: 100,
-            requests: AtomicU64::new(0),
-            rate_info: RwLock::new(RateLimitInfo::default()),
-            burn_rate: Mutex::new(BurnRate::new()),
-            input_tokens: AtomicU64::new(0),
-            output_tokens: AtomicU64::new(0),
-            cache_creation_tokens: AtomicU64::new(0),
-            cache_read_tokens: AtomicU64::new(0),
-            last_routing_weight: AtomicU64::new(0),
-            last_routing_share: AtomicU64::new(0),
-            last_effective_gate: AtomicU64::new(0),
-        };
+        let mut ep = make_endpoint("openai", Protocol::OpenAI);
+        ep.base_url = mock_url;
+        ep.priority = 100;
         let mut state = test_state_with(vec![]);
         Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
 
@@ -18340,32 +18319,12 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// Anthropic + OpenAI protocols) neither path may panic.
     #[tokio::test]
     async fn sync_and_publish_handle_endpoint_pool_without_redis() {
-        fn make_ep(name: &str, protocol: Protocol) -> Endpoint {
-            Endpoint {
-                name: name.to_string(),
-                protocol,
-                base_url: "https://api.anthropic.com".to_string(),
-                token: "sk-ant-api-test".to_string(),
-                passthrough: false,
-                models: vec![],
-                priority: 0,
-                requests: AtomicU64::new(0),
-                rate_info: RwLock::new(RateLimitInfo::default()),
-                burn_rate: Mutex::new(BurnRate::new()),
-                input_tokens: AtomicU64::new(0),
-                output_tokens: AtomicU64::new(0),
-                cache_creation_tokens: AtomicU64::new(0),
-                cache_read_tokens: AtomicU64::new(0),
-                last_routing_weight: AtomicU64::new(0),
-                last_routing_share: AtomicU64::new(0),
-                last_effective_gate: AtomicU64::new(0),
-            }
-        }
         let mut state = test_state_with(vec![]);
         {
             let st = Arc::get_mut(&mut state).unwrap();
-            st.endpoints.push(make_ep("ep-a", Protocol::Anthropic));
-            st.endpoints.push(make_ep("ep-oai", Protocol::OpenAI));
+            st.endpoints
+                .push(make_endpoint("ep-a", Protocol::Anthropic));
+            st.endpoints.push(make_endpoint("ep-oai", Protocol::OpenAI));
         }
         // Both paths must be no-ops (redis is None) and must not panic.
         state.sync_from_redis().await;
@@ -19096,34 +19055,12 @@ upstream = "https://api.anthropic.com"
 
     #[tokio::test]
     async fn save_load_roundtrip_unified_endpoints() {
-        fn make_test_endpoint(name: &str) -> Endpoint {
-            Endpoint {
-                name: name.to_string(),
-                protocol: Protocol::Anthropic,
-                base_url: "https://api.anthropic.com".to_string(),
-                token: "sk-ant-api-test".to_string(),
-                passthrough: false,
-                models: vec![],
-                priority: 0,
-                requests: AtomicU64::new(0),
-                rate_info: RwLock::new(RateLimitInfo::default()),
-                burn_rate: Mutex::new(BurnRate::new()),
-                input_tokens: AtomicU64::new(0),
-                output_tokens: AtomicU64::new(0),
-                cache_creation_tokens: AtomicU64::new(0),
-                cache_read_tokens: AtomicU64::new(0),
-                last_routing_weight: AtomicU64::new(0),
-                last_routing_share: AtomicU64::new(0),
-                last_effective_gate: AtomicU64::new(0),
-            }
-        }
-
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let mut state = test_state_with(vec![]);
         {
             let st = Arc::get_mut(&mut state).unwrap();
             st.state_path = tmp.path().to_path_buf();
-            st.endpoints.push(make_test_endpoint("ep1"));
+            st.endpoints.push(make_endpoint("ep1", Protocol::Anthropic));
         }
         let now_epoch = AppState::now_epoch();
         state.endpoints[0].requests.store(7, Ordering::Relaxed);
@@ -19143,7 +19080,7 @@ upstream = "https://api.anthropic.com"
         {
             let st = Arc::get_mut(&mut state2).unwrap();
             st.state_path = tmp.path().to_path_buf();
-            st.endpoints.push(make_test_endpoint("ep1"));
+            st.endpoints.push(make_endpoint("ep1", Protocol::Anthropic));
         }
         state2.load_state().await;
         assert_eq!(state2.endpoints[0].requests.load(Ordering::Relaxed), 7);
@@ -20389,35 +20326,12 @@ upstream = "https://api.anthropic.com"
     /// OpenAI endpoints get the fixed (gate 0.0, weight 1.0) representative.
     #[tokio::test]
     async fn refresh_metrics_weights_populates_endpoint_pool() {
-        fn anthropic_ep(name: &str) -> Endpoint {
-            Endpoint {
-                name: name.to_string(),
-                protocol: Protocol::Anthropic,
-                base_url: "https://api.anthropic.com".to_string(),
-                token: "sk-ant-api-test".to_string(),
-                passthrough: false,
-                models: vec![],
-                priority: 0,
-                requests: AtomicU64::new(0),
-                rate_info: RwLock::new(RateLimitInfo::default()),
-                burn_rate: Mutex::new(BurnRate::new()),
-                input_tokens: AtomicU64::new(0),
-                output_tokens: AtomicU64::new(0),
-                cache_creation_tokens: AtomicU64::new(0),
-                cache_read_tokens: AtomicU64::new(0),
-                last_routing_weight: AtomicU64::new(0),
-                last_routing_share: AtomicU64::new(0),
-                last_effective_gate: AtomicU64::new(0),
-            }
-        }
-        let mut openai_ep = anthropic_ep("oai");
-        openai_ep.protocol = Protocol::OpenAI;
-
         let mut state = test_state_with(vec![]);
         {
             let st = Arc::get_mut(&mut state).unwrap();
-            st.endpoints.push(anthropic_ep("ep-a"));
-            st.endpoints.push(openai_ep);
+            st.endpoints
+                .push(make_endpoint("ep-a", Protocol::Anthropic));
+            st.endpoints.push(make_endpoint("oai", Protocol::OpenAI));
         }
         let now = AppState::now_epoch();
         {
