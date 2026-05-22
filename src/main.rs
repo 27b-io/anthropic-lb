@@ -21647,4 +21647,70 @@ upstream = "https://api.anthropic.com"
             "should return None when account is hard-limited"
         );
     }
+
+    // ── Unified endpoint: fallback retry semantics ─────────────────
+
+    #[tokio::test]
+    async fn try_fallback_upstream_unified_returns_none_on_429() {
+        // Mock upstream returns 429
+        let app = Router::new().fallback(any(|| async {
+            (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = test_state_with(vec![]);
+        let mut ep = make_endpoint("rl-gw", Protocol::OpenAI);
+        ep.base_url = format!("http://{}", addr);
+        Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+        let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+        let result = try_fallback_upstream_unified(
+            &state,
+            body,
+            "req-1",
+            "client-1",
+            "claude-opus-4-7",
+            0,
+            false,
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "429 must return None for retry, not Response"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_fallback_upstream_unified_returns_none_on_500() {
+        let app = Router::new().fallback(any(|| async {
+            (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = test_state_with(vec![]);
+        let mut ep = make_endpoint("broken", Protocol::OpenAI);
+        ep.base_url = format!("http://{}", addr);
+        Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+        let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+        let result = try_fallback_upstream_unified(
+            &state,
+            body,
+            "req-1",
+            "client-1",
+            "claude-opus-4-7",
+            0,
+            false,
+        )
+        .await;
+        assert!(result.is_none(), "500 must return None for retry");
+    }
 }
