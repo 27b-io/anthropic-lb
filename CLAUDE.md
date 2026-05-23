@@ -121,13 +121,13 @@ When an endpoint serves via Anthropic **overage** (paid extra usage — `anthrop
 | `allowed_ips` | string[]? | none (allow all) | IP/CIDR allowlist |
 | `auto_cache` | bool? | true | Auto-inject prompt cache breakpoints |
 | `shadow_log` | string? | none | Path for JSONL audit trail |
-| `soft_limit` | f64? | 0.90 | Utilization ceiling — endpoints above excluded from routing |
+| `soft_limit` | f64? | 0.90 | Utilization ceiling — endpoints above this are deprioritized within their tier; they are considered only when no healthy candidate is available and the tier degrades to its soft-limited members |
 | `client_names` | map? | {} | IP→client name mapping |
 | `client_budgets` | map? | {} | client_id→daily token limit |
 | `client_utilization_limits` | map? | {} | client_id→utilization ceiling (0.0–1.0) |
 | `operators` | string[]? | [] | Client IDs that bypass budget, utilization, and emergency brake enforcement (trust-based, not IP-verified; does not bypass IP allowlist) |
 | `emergency_brake` | bool? | true | Enable/disable the emergency brake |
-| `emergency_threshold` | f64? | 0.88 | All-endpoints utilization threshold for emergency brake |
+| `emergency_threshold` | f64? | 0.88 | Utilization threshold for the emergency brake — applied only to `Protocol::Anthropic` endpoints; OpenAI endpoints (stub `RateLimitInfo`) are excluded so they cannot prevent the brake from firing |
 | `redis_url` | string? | none | Redis/Valkey URL for distributed state (`redis://` or `rediss://`) |
 | `overage_penalty` | u32? | 10 | Priority penalty added to an endpoint while it serves via overage |
 | `endpoints[].name` | string | required | Endpoint display name |

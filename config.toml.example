@@ -27,8 +27,9 @@ probe_interval_secs = 300
 # gastown = 0.85
 # openclaw = 0.95
 
-# Emergency brake: when ALL endpoints exceed this threshold, all non-operator traffic
-# is automatically blocked. Default: 0.88.
+# Emergency brake: when ALL Anthropic endpoints exceed this threshold, all non-operator
+# traffic is automatically blocked. OpenAI endpoints (stub rate-limit data) are excluded
+# from the check so they cannot prevent the brake from firing. Default: 0.88.
 # emergency_threshold = 0.88
 
 # Redis/Valkey URL for distributed state (multi-replica coordination).

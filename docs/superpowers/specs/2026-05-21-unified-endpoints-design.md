@@ -1,8 +1,16 @@
 # Unified Endpoints — Design
 
 **Date:** 2026-05-21
-**Status:** Approved for planning
+**Status:** Shipped — preserved as a historical artifact
 **Author:** Ray Walker
+
+> **Note:** This document records the design as it was *specified*, including
+> mid-execution corrections (look for `REVISED` / `Correction` markers). The
+> implementation diverged from this spec in places — for example, the runtime
+> introduced `UsageTarget` and `ForwardOutcome` enums and the `classify_retry_status`
+> helper that are not described here. The **source code is the authoritative
+> reference**; this spec is kept in-tree to record the design process and the
+> decisions made along the way, not as a live API contract.
 
 ## Problem
 

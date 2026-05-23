@@ -458,6 +458,25 @@ fn test_example_config_file_is_valid() {
         "endpoints field should exist"
     );
 
+    // Verify removed legacy fields are absent — guards against accidental
+    // reintroduction of the old schema in the example config.
+    assert!(
+        config.get("upstream").is_none(),
+        "global `upstream` field was removed and must not reappear"
+    );
+    assert!(
+        config.get("accounts").is_none(),
+        "[[accounts]] section was removed and must not reappear"
+    );
+    assert!(
+        config.get("upstreams").is_none(),
+        "[[upstreams]] section was removed and must not reappear"
+    );
+    assert!(
+        config.get("fallback_upstream").is_none(),
+        "fallback_upstream was removed and must not reappear"
+    );
+
     // Verify endpoints is an array with at least one entry
     let endpoints = config["endpoints"]
         .as_array()

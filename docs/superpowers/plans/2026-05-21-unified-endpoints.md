@@ -1,5 +1,18 @@
 # Unified Endpoints Implementation Plan
 
+**Status:** Executed and shipped — preserved as a historical artifact.
+
+> **Note:** This is the implementation plan as it was *written* before execution,
+> including mid-execution corrections (look for `REVISED` markers). The actual
+> implementation diverged from this plan in several places — for example, the
+> runtime introduced `UsageTarget` and `ForwardOutcome` enums and a shared
+> `classify_retry_status` helper that this plan did not anticipate; Task 11 was
+> rewritten mid-execution when the spec's premise about `openai_chat_handler`
+> turned out to be wrong; line ranges and helper signatures evolved through
+> review. The **source code on `main` is the authoritative reference**; this
+> document is kept in-tree to record the planning process and the design
+> trade-offs made along the way, not as a live execution guide.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Collapse `[[accounts]]` and `[[upstreams]]` into a single `[[endpoints]]` concept with a `protocol` field, delete the `fallback_upstream` and global `upstream` config keys, and concentrate endpoint-type special-casing into three named, commented call sites.
