@@ -450,33 +450,43 @@ fn test_example_config_file_is_valid() {
 
     let config = result.unwrap();
 
-    // Verify essential fields exist
+    // Verify essential fields exist (unified [[endpoints]] schema — `upstream`
+    // and `[[accounts]]` were removed in the unified-endpoints refactor).
     assert!(config.get("listen").is_some(), "listen field should exist");
     assert!(
-        config.get("upstream").is_some(),
-        "upstream field should exist"
-    );
-    assert!(
-        config.get("accounts").is_some(),
-        "accounts field should exist"
+        config.get("endpoints").is_some(),
+        "endpoints field should exist"
     );
 
-    // Verify accounts is an array with at least one account
-    let accounts = config["accounts"]
+    // Verify removed legacy fields are absent — guards against accidental
+    // reintroduction of the old schema in the example config.
+    assert!(
+        config.get("upstream").is_none(),
+        "global `upstream` field was removed and must not reappear"
+    );
+    assert!(
+        config.get("accounts").is_none(),
+        "[[accounts]] section was removed and must not reappear"
+    );
+    assert!(
+        config.get("upstreams").is_none(),
+        "[[upstreams]] section was removed and must not reappear"
+    );
+    assert!(
+        config.get("fallback_upstream").is_none(),
+        "fallback_upstream was removed and must not reappear"
+    );
+
+    // Verify endpoints is an array with at least one entry
+    let endpoints = config["endpoints"]
         .as_array()
-        .expect("accounts should be an array");
-    assert!(!accounts.is_empty(), "accounts should not be empty");
+        .expect("endpoints should be an array");
+    assert!(!endpoints.is_empty(), "endpoints should not be empty");
 
-    // Verify first account has required fields
-    let first_account = &accounts[0];
-    assert!(
-        first_account.get("name").is_some(),
-        "account should have name"
-    );
-    assert!(
-        first_account.get("token").is_some(),
-        "account should have token"
-    );
+    // Verify first endpoint has required fields
+    let first = &endpoints[0];
+    assert!(first.get("name").is_some(), "endpoint should have name");
+    assert!(first.get("token").is_some(), "endpoint should have token");
 }
 
 #[test]

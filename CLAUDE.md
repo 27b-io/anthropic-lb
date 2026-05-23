@@ -51,85 +51,91 @@ Single-file Rust binary (`src/main.rs`, ~12000 lines) with inline tests. No libr
 ### Core Data Flow
 
 ```text
-Request → IP allowlist check → proxy_key auth → pre_request_gate(operator bypass → budget → utilization limit → emergency brake) → pick_account(affinity, model, skip) → forward to upstream → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
+Request → IP allowlist check → proxy_key auth → pre_request_gate(operator bypass → budget → utilization limit → emergency brake) → pick_endpoint(affinity, model, skip) → forward to endpoint → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
 ```
 
 ### Key Sections (in source order)
 
 | Section | What it does |
 |---------|-------------|
-| **Config** (`Config`, `AccountConfig`, `UpstreamConfig`) | TOML deserialization structs |
-| **Runtime state** (`AppState`, `Account`, `RateLimitInfo`) | Shared via `Arc<AppState>`, per-account `RwLock<RateLimitInfo>`, atomic counters, optional Redis `ConnectionManager` |
+| **Config** (`Config`, `EndpointConfig`) | TOML deserialization structs |
+| **Runtime state** (`AppState`, `Endpoint`, `RateLimitInfo`) | Shared via `Arc<AppState>`, per-endpoint `RwLock<RateLimitInfo>`, atomic counters, optional Redis `ConnectionManager` |
 | **Persistence** (`PersistedState`) | JSON state file at `<config_path>.state.json`, saved after every request and on shutdown. Redis for cross-replica state when configured. |
-| **Token usage** (`TokenUsage`, `record_usage`) | Extracts token counts from responses (streaming SSE + non-streaming JSON), tracks per-account and per-client |
+| **Token usage** (`TokenUsage`, `record_usage`) | Extracts token counts from responses (streaming SSE + non-streaming JSON), tracks per-endpoint and per-client |
 | **Auto-cache** (`inject_cache_breakpoints`) | Injects up to 3 prompt cache breakpoints (last tool, system, last user message) unless cache_control already present |
-| **Handlers** | Five axum handlers: `proxy_handler` (main Anthropic proxy), `upstream_handler` (OpenAI-compatible passthrough), `stats_handler` (`/_stats` JSON), `metrics_handler` (`/metrics` Prometheus), `openai_chat_handler` (OpenAI→Anthropic format translation) |
+| **Handlers** | Four axum handlers: `proxy_handler` (main Anthropic proxy), `stats_handler` (`/_stats` JSON), `metrics_handler` (`/metrics` Prometheus), `openai_chat_handler` (OpenAI→Anthropic format translation) |
 | **OpenAI compatibility** (`translate_*`, `StreamContext`) | Translates `/v1/chat/completions` requests/responses between OpenAI and Anthropic formats, including streaming SSE |
 | **Tests** (`mod tests`) | Inline at bottom — unit + integration tests using mock upstream servers |
 
-### Account Selection (`pick_account`)
+### Endpoint Selection (`pick_endpoint`)
 
 Headroom-proportional weighted bucket hashing:
-1. Filter by model compatibility (if account has `models` allowlist)
-2. Skip accounts in the `skip` list (already tried in this retry loop)
-3. Skip hard-limited (429) accounts
-4. Each remaining account gets a bucket proportional to `(1.0 - utilization)`
+1. Filter by model compatibility (if endpoint has `models` allowlist)
+2. Skip endpoints in the `skip` list (already tried in this retry loop)
+3. Skip hard-limited (429) endpoints
+4. Each remaining endpoint gets a bucket proportional to `(1.0 - utilization)`
 5. Affinity key (client+session hash) provides sticky routing; no-affinity uses Fibonacci scatter
-6. On 429 or 5xx/529, the failed account index is added to `skip` and `pick_account` is called again, guaranteeing a different account on retry
+6. On 429 or 5xx/529, the failed endpoint index is added to `skip` and `pick_endpoint` is called again, guaranteeing a different endpoint on retry
 
-### Token Type Detection (by prefix)
+### Token Type Detection
+
+`protocol = "anthropic"` endpoints use prefix-based auth on the configured `token`:
 
 - `sk-ant-oat*` → `Authorization: Bearer` + injects `anthropic-beta: oauth-2025-04-20` and `anthropic-dangerous-direct-browser-access: true`. The OpenAI-compat handler additionally injects `claude-code-20250219` beta flag.
 - `sk-ant-api*` → `x-api-key` header
 - `passthrough` → forwards caller's auth headers untouched
 
+`protocol = "openai"` endpoints use `Authorization: Bearer` with the configured `token`.
+
 ### OAuth System Prompt Requirement
 
 OAuth tokens (`sk-ant-oat*`) require the exact system prompt `"You are Claude Code, Anthropic's official CLI for Claude."` as the **first** system block to access sonnet/opus models. Without it, the API returns `400 invalid_request_error` with the unhelpful message `"Error"`. Haiku works without it.
 
-`inject_oauth_system_prompt()` handles this automatically for both handlers when OAuth accounts are configured. It prepends the prompt block, preserving any existing system content as subsequent blocks. Runs before auto-cache injection (which may add `cache_control` to the system block).
+`inject_oauth_system_prompt()` handles this automatically for both handlers when OAuth endpoints are configured. It prepends the prompt block, preserving any existing system content as subsequent blocks. Runs before auto-cache injection (which may add `cache_control` to the system block).
 
-### Upstream Routing
+### Unified Endpoints
 
-Named OpenAI-compatible upstreams configured in `[[upstreams]]` TOML sections. Requests to `/upstream/{name}/*` are forwarded with `Authorization: Bearer` API key injection.
+All routing targets are `[[endpoints]]` entries — there is one endpoint pool, no separate account/upstream concepts. Each endpoint has a `protocol`:
 
-### Unified Endpoint Priority
+- `protocol = "anthropic"` (default) — an Anthropic-native endpoint. `base_url` defaults to `https://api.anthropic.com`.
+- `protocol = "openai"` — an OpenAI-compatible endpoint. `base_url` is required and must be `https://`. When selected, the request is forwarded with automatic Anthropic↔OpenAI translation (`proxy_handler`) or direct passthrough (`openai_chat_handler`); streaming is supported on both paths.
 
-Accounts **and** the `fallback_upstream` share one priority space. Both `[[accounts]]` and `[[upstreams]]` have a `priority` field (u32, default 0; lower = preferred). `pick_endpoint` partitions all candidates by priority and tries tiers in ascending order.
+### Endpoint Priority
 
-Within a tier: healthy candidates (`gate < soft_limit`) are preferred; if none are healthy, the tier degrades to its soft-limited candidates. Routing only advances to the next tier when the current tier has **zero total weight** (genuinely exhausted). So `soft_limit` is intra-tier load-shedding — it never causes a tier jump. Free capacity is fully drained before any paid (overage or upstream) tier is touched.
+All endpoints (anthropic and openai) share one priority space via the `priority` field (u32, default 0; lower = preferred). `pick_endpoint` partitions all candidates by priority and tries tiers in ascending order.
 
-The `fallback_upstream` is a first-class routing candidate at its configured `priority`. Set it high (e.g. 100) so it is tried only after all account tiers; a startup `warn!` fires if its priority is not above every account's. When the upstream endpoint is selected, the request is forwarded with automatic Anthropic↔OpenAI translation (`proxy_handler`) or direct passthrough (`openai_chat_handler`); streaming is supported on both paths.
+Within a tier: healthy candidates (`gate < soft_limit`) are preferred; if none are healthy, the tier degrades to its soft-limited candidates. Routing only advances to the next tier when the current tier has **zero total weight** (genuinely exhausted). So `soft_limit` is intra-tier load-shedding — it never causes a tier jump. Free capacity is fully drained before any paid (overage or OpenAI-endpoint) tier is touched.
+
+An `openai`-protocol endpoint is a first-class routing candidate at its configured `priority` — it replaces the old `fallback_upstream`. Set it high (e.g. 100) so it is tried only after all Anthropic endpoint tiers. A startup `warn!` fires if an `openai` endpoint shares the lowest priority tier with an `anthropic` endpoint.
 
 ### Overage Awareness
 
-When an account serves via Anthropic **overage** (paid extra usage — `anthropic-ratelimit-unified-overage-in-use: true`), its exhausted 5h/7d subscription windows are superseded: the routing gate is computed from the overage window instead, so the account stays routable. Its effective priority is demoted by `overage_penalty` (default 10) so free subscription capacity is always preferred. When the overage window itself fills (`overage-utilization` → 1.0) the account's weight drops to 0 and routing moves on. The demotion auto-clears when the subscription window refills (`overage-in-use` goes absent → `false`).
+When an endpoint serves via Anthropic **overage** (paid extra usage — `anthropic-ratelimit-unified-overage-in-use: true`), its exhausted 5h/7d subscription windows are superseded: the routing gate is computed from the overage window instead, so the endpoint stays routable. Its effective priority is demoted by `overage_penalty` (default 10) so free subscription capacity is always preferred. When the overage window itself fills (`overage-utilization` → 1.0) the endpoint's weight drops to 0 and routing moves on. The demotion auto-clears when the subscription window refills (`overage-in-use` goes absent → `false`).
 
 ### Config Fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `listen` | string | required | Bind address (e.g. `"0.0.0.0:8080"`) |
-| `upstream` | string | required | Anthropic API base URL |
 | `proxy_key` | string? | none | Shared secret for `x-api-key` auth |
 | `allowed_ips` | string[]? | none (allow all) | IP/CIDR allowlist |
 | `auto_cache` | bool? | true | Auto-inject prompt cache breakpoints |
 | `shadow_log` | string? | none | Path for JSONL audit trail |
-| `soft_limit` | f64? | 0.90 | Utilization ceiling — accounts above excluded from routing |
+| `soft_limit` | f64? | 0.90 | Utilization ceiling — endpoints above this are deprioritized within their tier; they are considered only when no healthy candidate is available and the tier degrades to its soft-limited members |
 | `client_names` | map? | {} | IP→client name mapping |
 | `client_budgets` | map? | {} | client_id→daily token limit |
 | `client_utilization_limits` | map? | {} | client_id→utilization ceiling (0.0–1.0) |
 | `operators` | string[]? | [] | Client IDs that bypass budget, utilization, and emergency brake enforcement (trust-based, not IP-verified; does not bypass IP allowlist) |
 | `emergency_brake` | bool? | true | Enable/disable the emergency brake |
-| `emergency_threshold` | f64? | 0.88 | All-accounts utilization threshold for emergency brake |
+| `emergency_threshold` | f64? | 0.88 | Utilization threshold for the emergency brake — applied only to `Protocol::Anthropic` endpoints; OpenAI endpoints (stub `RateLimitInfo`) are excluded so they cannot prevent the brake from firing |
 | `redis_url` | string? | none | Redis/Valkey URL for distributed state (`redis://` or `rediss://`) |
-| `fallback_upstream` | string? | none | Name of an `[[upstreams]]` entry to route to as a priority tier |
-| `overage_penalty` | u32? | 10 | Priority penalty added to an account while it serves via overage |
-| `accounts[].name` | string | required | Account display name |
-| `accounts[].token` | string | required | API key, OAuth token, or `"passthrough"` |
-| `accounts[].models` | string[]? | [] (all) | Model allowlist (supports `*` suffix wildcards) |
-| `accounts[].priority` | u32? | 0 | Priority tier (0 = highest). Lower tiers tried first |
-| `upstreams[].priority` | u32? | 0 | Priority tier when this upstream is the `fallback_upstream` (set high) |
+| `overage_penalty` | u32? | 10 | Priority penalty added to an endpoint while it serves via overage |
+| `endpoints[].name` | string | required | Endpoint display name |
+| `endpoints[].protocol` | string? | `"anthropic"` | `"anthropic"` (default) or `"openai"` |
+| `endpoints[].base_url` | string? | `https://api.anthropic.com` | Base URL. Defaults to the Anthropic API for `anthropic`; required (and must be `https://`) for `openai` |
+| `endpoints[].token` | string | required | API key, OAuth token, or `"passthrough"` |
+| `endpoints[].models` | string[]? | [] (all) | Model allowlist (supports `*` suffix wildcards) |
+| `endpoints[].priority` | u32? | 0 | Priority tier (0 = highest). Lower tiers tried first |
 
 
 **Key headers parsed:**
@@ -142,7 +148,7 @@ When an account serves via Anthropic **overage** (paid extra usage — `anthropi
 | `anthropic-ratelimit-unified-7d-utilization` | Raw 7d usage fraction (0.0–1.0) |
 | `anthropic-ratelimit-unified-7d-reset` | Epoch timestamp when 7d window resets |
 | `anthropic-ratelimit-unified-5h-status` / `7d-status` | API pressure signal: `allowed`, `allowed_warning`, `throttled`, `rejected` |
-| `anthropic-ratelimit-unified-overage-in-use` | Account is currently serving via paid overage (always overwritten; absent → `false`) |
+| `anthropic-ratelimit-unified-overage-in-use` | Endpoint is currently serving via paid overage (always overwritten; absent → `false`) |
 | `anthropic-ratelimit-unified-overage-status` | Overage window status — feeds the routing gate floor while overage is in use |
 | `anthropic-ratelimit-unified-overage-utilization` | Overage budget consumed (0.0–1.0) |
 | `anthropic-ratelimit-unified-overage-reset` | Epoch timestamp when the overage window resets |

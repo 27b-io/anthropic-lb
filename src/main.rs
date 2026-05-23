@@ -28,7 +28,6 @@ use tracing::{debug, error, info, trace, warn};
 #[derive(Deserialize, Clone)]
 struct Config {
     listen: String,
-    upstream: String,
     #[allow(dead_code)]
     strategy: Option<String>,
     rate_limit_cooldown_secs: Option<u64>,
@@ -38,10 +37,12 @@ struct Config {
     proxy_key: Option<String>,
     /// Source IP allowlist. Supports individual IPs and CIDR ranges. None/empty = allow all.
     allowed_ips: Option<Vec<String>>,
-    accounts: Vec<AccountConfig>,
-    /// OpenAI-compatible upstream routes. Requests to /upstream/<name>/... are forwarded.
+    /// Unified routing endpoints. Each entry is either Anthropic-native or
+    /// OpenAI-compatible, distinguished by `protocol`. The sole endpoint pool —
+    /// the legacy [[accounts]] / [[upstreams]] / fallback_upstream keys are
+    /// rejected at startup by `reject_legacy_config_keys`.
     #[serde(default)]
-    upstreams: Vec<UpstreamConfig>,
+    endpoints: Vec<EndpointConfig>,
     /// IP-to-client-name mapping. Falls back to x-client-id header, then "-".
     #[serde(default)]
     client_names: HashMap<String, String>,
@@ -76,9 +77,6 @@ struct Config {
     /// Path for debug log file. When set, writes debug-level logs to this file while
     /// keeping info-level on stderr. For investigating cache/auth behavior.
     debug_log: Option<String>,
-    /// Name of an [[upstreams]] entry to use as fallback when all accounts are exhausted.
-    /// The upstream receives OpenAI-format requests; Anthropic↔OpenAI translation is automatic.
-    fallback_upstream: Option<String>,
     /// Priority penalty added to an account's effective priority tier while it is
     /// serving via Anthropic overage (paid extra usage). Keeps free subscription
     /// capacity preferred over paid overage. Default: 10.
@@ -86,30 +84,31 @@ struct Config {
 }
 
 #[derive(Deserialize, Clone)]
-struct AccountConfig {
+struct EndpointConfig {
     name: String,
-    /// Auth token. Use "passthrough" to forward caller's auth headers as-is.
+    /// Wire format. Default: anthropic (sends to api.anthropic.com via x-api-key).
+    #[serde(default)]
+    protocol: Protocol,
+    /// Override base URL. For protocol = anthropic, defaults to https://api.anthropic.com.
+    /// For protocol = openai, this field is required (validated at startup).
+    base_url: Option<String>,
+    /// Auth credential. "passthrough" (anthropic only) forwards caller's auth headers.
     token: String,
-    /// Optional model allowlist. If set, this account only serves these models.
-    /// Supports exact names ("claude-sonnet-4-6") and prefixes ("claude-opus-*").
+    /// Model allowlist (supports "*" suffix wildcards). Empty = all models.
     #[serde(default)]
     models: Vec<String>,
-    /// Priority tier (0 = highest). Lower tiers are tried first; higher tiers
-    /// only receive traffic when all lower tiers are exhausted. Default: 0.
+    /// Priority tier (0 = highest). Lower tiers tried first.
     #[serde(default)]
     priority: u32,
 }
 
-#[derive(Deserialize, Clone)]
-struct UpstreamConfig {
-    name: String,
-    base_url: String,
-    api_key: String,
-    /// Priority tier (0 = highest) used when this upstream is the `fallback_upstream`
-    /// and participates in unified endpoint routing. Set high (e.g. 100) so the
-    /// upstream is tried only after all account tiers are exhausted. Default: 0.
-    #[serde(default)]
-    priority: u32,
+/// Wire format on config / state: "anthropic" | "openai".
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Protocol {
+    #[default]
+    Anthropic,
+    OpenAI,
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
@@ -418,56 +417,64 @@ fn compute_pressure_status(effective_util: f64, client_id: &str, state: &AppStat
     status
 }
 
-struct Account {
+/// Unified routing endpoint — the sole runtime endpoint pool.
+///
+/// Rate-limit/utilization fields are populated only for `Protocol::Anthropic`.
+/// `Protocol::OpenAI` endpoints carry a stub `RateLimitInfo` (all fields None);
+/// three code sites branch on `protocol` to handle this correctly:
+///   1. `routing_candidates()` — short-circuits to a fixed RoutingCandidate.
+///   2. `is_emergency_brake_active()` — iterates only Anthropic endpoints.
+///   3. probe loop — skips OpenAI endpoints.
+struct Endpoint {
     name: String,
+    protocol: Protocol,
+    /// Resolved at startup: api.anthropic.com for Anthropic default, else the
+    /// explicit base_url. No trailing slash.
+    base_url: String,
     token: String,
+    /// True iff token == "passthrough". Only meaningful for Protocol::Anthropic.
     passthrough: bool,
-    /// Model allowlist — empty means all models allowed.
     models: Vec<String>,
-    /// Priority tier (0 = highest). Lower tiers are tried first.
     priority: u32,
     requests: AtomicU64,
     rate_info: RwLock<RateLimitInfo>,
-    /// Per-account burn rate tracker (requests per minute EWMA)
     burn_rate: Mutex<BurnRate>,
-    // Token usage counters (atomic for lock-free concurrent updates)
     input_tokens: AtomicU64,
     output_tokens: AtomicU64,
     cache_creation_tokens: AtomicU64,
     cache_read_tokens: AtomicU64,
-    /// Representative routing weight (f64 stored as u64 bits). Refreshed by
-    /// `refresh_metrics_weights()` once per probe cycle. Backs the
-    /// `anthropic_account_routing_weight` Prometheus gauge.
     last_routing_weight: AtomicU64,
-    /// Representative routing share (weight/total, 0.0-1.0, f64 as bits).
-    /// Refreshed by `refresh_metrics_weights()` once per probe cycle. Backs
-    /// the `anthropic_account_routing_share` Prometheus gauge.
     last_routing_share: AtomicU64,
-    /// Effective routing gate (f64 as bits): max(gate_5h, gate_7d) after
-    /// time-adjustment and status floors. Refreshed by `refresh_metrics_weights()`.
     last_effective_gate: AtomicU64,
 }
 
-struct Upstream {
-    name: String,
-    base_url: String,
-    api_key: String,
-    /// Priority tier when this upstream participates in unified routing as the fallback.
-    priority: u32,
-    requests: AtomicU64,
+impl Endpoint {
+    /// Check if this endpoint can serve the given model. Empty allowlist = all.
+    /// Identical to the historical `Account::serves_model` predicate.
+    fn serves_model(&self, model: &str) -> bool {
+        if self.models.is_empty() || model.is_empty() {
+            return true;
+        }
+        self.models.iter().any(|pattern| {
+            if let Some(prefix) = pattern.strip_suffix('*') {
+                model.starts_with(prefix)
+            } else {
+                model == pattern
+            }
+        })
+    }
 }
 
 struct AppState {
     client: Client,
-    upstream: String,
-    accounts: Vec<Account>,
+    /// Unified routing endpoints — the sole endpoint pool.
+    endpoints: Vec<Endpoint>,
     robin: AtomicUsize,
     routing_strategy: RoutingStrategy,
     cooldown: Duration,
     state_path: PathBuf,
     proxy_key: Option<String>,
     allowed_ips: Vec<IpAllowEntry>,
-    upstreams: Vec<Upstream>,
     client_names: HashMap<String, String>,
     auto_cache: bool,
     /// Per-client token usage: client_id → [input, output, cache_creation, cache_read]
@@ -503,53 +510,17 @@ struct AppState {
     instance_id: u16,
     /// Probe interval in seconds. Used for freshness check and distributed lock TTL.
     probe_interval_secs: u64,
-    /// Index into `upstreams` for the fallback when all accounts are exhausted.
-    /// The upstream receives OpenAI-format requests; format translation is automatic.
-    fallback_upstream: Option<usize>,
-    /// Priority penalty added to an account's effective priority while it serves
+    /// Priority penalty added to an endpoint's effective priority while it serves
     /// via overage. Default: 10.
     overage_penalty: u32,
 }
 
-impl Account {
-    /// Check if this account can serve the given model.
-    fn serves_model(&self, model: &str) -> bool {
-        if self.models.is_empty() || model.is_empty() {
-            return true; // no filter or no model = allow all
-        }
-        self.models.iter().any(|pattern| {
-            if let Some(prefix) = pattern.strip_suffix('*') {
-                model.starts_with(prefix)
-            } else {
-                model == pattern
-            }
-        })
-    }
-}
-
-/// A routable endpoint: an Anthropic account or the fallback OpenAI-compatible upstream.
-/// Accounts and the fallback upstream share one priority space so routing order is
-/// decided entirely by tier numbers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Endpoint {
-    Account(usize),
-    Upstream(usize),
-}
-
-impl Endpoint {
-    /// The account index, or None if this is an upstream.
-    #[cfg(test)]
-    fn account(self) -> Option<usize> {
-        match self {
-            Endpoint::Account(i) => Some(i),
-            Endpoint::Upstream(_) => None,
-        }
-    }
-}
+/// Index into `AppState.endpoints` — the sole runtime endpoint pool.
+type EndpointIdx = usize;
 
 #[derive(Clone, Copy, Debug)]
 struct RoutingCandidate {
-    endpoint: Endpoint,
+    endpoint: EndpointIdx,
     /// Effective priority tier — includes the overage penalty when applicable.
     priority: u32,
     gate_5h: f64,
@@ -613,13 +584,13 @@ impl AppState {
 
 #[derive(Serialize, Deserialize)]
 struct PersistedState {
-    accounts: Vec<PersistedAccount>,
+    endpoints: Vec<PersistedEndpoint>,
     #[serde(default)]
     saved_at: u64,
 }
 
 #[derive(Serialize, Deserialize)]
-struct PersistedAccount {
+struct PersistedEndpoint {
     name: String,
     requests_total: u64,
     utilization: Option<f64>,
@@ -722,22 +693,29 @@ impl AppState {
     }
 
     async fn save_state(&self) {
-        let mut accounts = Vec::new();
+        let mut endpoints = Vec::new();
         let now = Instant::now();
 
-        for acct in &self.accounts {
-            let info = acct.rate_info.read().await;
+        // Build a PersistedEndpoint from an endpoint's (name, requests,
+        // rate_info) fields.
+        async fn persist_one(
+            name: &str,
+            requests: &AtomicU64,
+            rate_info: &RwLock<RateLimitInfo>,
+            now: Instant,
+        ) -> PersistedEndpoint {
+            let info = rate_info.read().await;
             let hard_until_epoch = info.hard_limited_until.and_then(|until| {
                 if until > now {
                     let remaining = until.duration_since(now);
-                    Some(Self::now_epoch() + remaining.as_secs())
+                    Some(AppState::now_epoch() + remaining.as_secs())
                 } else {
                     None
                 }
             });
-            accounts.push(PersistedAccount {
-                name: acct.name.clone(),
-                requests_total: acct.requests.load(Ordering::Relaxed),
+            PersistedEndpoint {
+                name: name.to_string(),
+                requests_total: requests.load(Ordering::Relaxed),
                 utilization: info.utilization,
                 utilization_7d: info.utilization_7d,
                 utilization_5h: info.utilization_5h,
@@ -757,11 +735,20 @@ impl AppState {
                 overage_reset: info.overage_reset,
                 hard_limited_until_epoch: hard_until_epoch,
                 last_updated_epoch: info.last_updated_epoch,
-            });
+            }
+        }
+
+        // Skip OpenAI endpoints — their rate_info is a permanent stub with no
+        // state worth persisting.
+        for ep in &self.endpoints {
+            if ep.protocol == Protocol::OpenAI {
+                continue;
+            }
+            endpoints.push(persist_one(&ep.name, &ep.requests, &ep.rate_info, now).await);
         }
 
         let state = PersistedState {
-            accounts,
+            endpoints,
             saved_at: Self::now_epoch(),
         };
 
@@ -777,27 +764,61 @@ impl AppState {
         }
     }
 
-    /// Fire a minimal request (max_tokens=1) to refresh rate limit headers for an account.
-    /// The `model` parameter controls which model is probed, rotating across families
-    /// so that per-model 7d utilization claims get populated for each family.
-    async fn probe_account(&self, idx: usize, model: &str) {
-        let acct = &self.accounts[idx];
-        if acct.passthrough {
+    /// True if `model`'s 7d claim was refreshed recently enough to skip a probe.
+    ///
+    /// Pure freshness check used by `probe_endpoint`.
+    /// Looks up only the model-specific claim key (e.g. `seven_day_opus`), NOT the
+    /// general `seven_day` fallback, so probing one family doesn't suppress another.
+    /// An empty `model_family` (unrecognized model) never counts as fresh.
+    /// "Recent" means the claim's age is under half the probe interval.
+    fn claim_recently_probed(
+        info: &RateLimitInfo,
+        model: &str,
+        probe_interval_secs: u64,
+        now_epoch: u64,
+    ) -> bool {
+        let family = model_family(model);
+        if family.is_empty() {
+            return false;
+        }
+        let claim_key = format!("seven_day_{}", family);
+        match info.claims_7d.get(&claim_key) {
+            Some(claim) => {
+                let age = now_epoch.saturating_sub(claim.last_seen);
+                age < probe_interval_secs / 2
+            }
+            None => false,
+        }
+    }
+
+    /// Fire a minimal request (max_tokens=1) to refresh rate-limit headers for
+    /// the endpoint at `idx`. The `model` parameter controls which model is
+    /// probed, rotating across families so that per-model 7d utilization claims
+    /// get populated for each family. Skips `Protocol::OpenAI` endpoints — they
+    /// expose no Anthropic rate-limit headers, so a probe would only burn a
+    /// request. One of the three named `match protocol` sites.
+    async fn probe_endpoint(&self, idx: usize, model: &str) {
+        let ep = &self.endpoints[idx];
+        if ep.protocol == Protocol::OpenAI {
+            debug!(endpoint = ep.name, "skipping probe for openai endpoint");
+            return;
+        }
+        if ep.passthrough {
             debug!(
-                account = acct.name,
-                "skipping probe for passthrough account"
+                endpoint = ep.name,
+                "skipping probe for passthrough endpoint"
             );
             return;
         }
 
         // Check if hard-limited — don't waste a request
         {
-            let info = acct.rate_info.read().await;
+            let info = ep.rate_info.read().await;
             if let Some(until) = info.hard_limited_until {
                 if Instant::now() < until {
                     debug!(
-                        account = acct.name,
-                        "skipping probe, account is hard-limited"
+                        endpoint = ep.name,
+                        "skipping probe, endpoint is hard-limited"
                     );
                     return;
                 }
@@ -805,36 +826,23 @@ impl AppState {
         }
 
         // Local freshness check: skip if this model's 7d claim was recently refreshed.
-        // Looks up only the model-specific claim key (e.g. "seven_day_opus"), NOT the
-        // general "seven_day" fallback, so probing one family doesn't block another.
         let now_epoch = Self::now_epoch();
         {
-            let info = acct.rate_info.read().await;
-            let family = model_family(model);
-            if !family.is_empty() {
-                let claim_key = format!("seven_day_{}", family);
-                if let Some(claim) = info.claims_7d.get(&claim_key) {
-                    let age = now_epoch.saturating_sub(claim.last_seen);
-                    if age < self.probe_interval_secs / 2 {
-                        trace!(
-                            account = acct.name,
-                            probe_model = model,
-                            claim_key,
-                            age_secs = age,
-                            "probe skipped, model claim is fresh"
-                        );
-                        return;
-                    }
-                }
+            let info = ep.rate_info.read().await;
+            if Self::claim_recently_probed(&info, model, self.probe_interval_secs, now_epoch) {
+                trace!(
+                    endpoint = ep.name,
+                    probe_model = model,
+                    "probe skipped, model claim is fresh"
+                );
+                return;
             }
         }
 
-        // Distributed probe lock: one pod per account+model per interval.
-        // TTL = full configured interval so the lock covers the entire
-        // dedup window (no early-rollover race).
+        // Distributed probe lock: one pod per endpoint+model per interval.
         if let Some(redis) = &self.redis {
             let mut conn = redis.clone();
-            let lock_key = format!("alb:probe:{}:{}", acct.name, model);
+            let lock_key = format!("alb:probe:{}:{}", ep.name, model);
             let lock_ttl = self.probe_interval_secs.max(1);
             let acquired: redis::RedisResult<bool> = redis::cmd("SET")
                 .arg(&lock_key)
@@ -848,7 +856,7 @@ impl AppState {
                 Ok(true) => {} // Lock acquired, proceed with probe
                 Ok(false) => {
                     trace!(
-                        account = acct.name,
+                        endpoint = ep.name,
                         probe_model = model,
                         "probe skipped, another replica is probing"
                     );
@@ -856,12 +864,13 @@ impl AppState {
                 }
                 Err(e) => {
                     // Fail-open: if Redis is down, probe anyway
-                    trace!(account = acct.name, error = %e, "probe lock failed, probing anyway");
+                    trace!(endpoint = ep.name, error = %e, "probe lock failed, probing anyway");
                 }
             }
         }
 
-        let url = format!("{}/v1/messages", self.upstream);
+        // Each endpoint carries its own base URL.
+        let url = format!("{}/v1/messages", ep.base_url);
         let body = serde_json::json!({
             "model": model,
             "max_tokens": 1,
@@ -869,66 +878,65 @@ impl AppState {
             "messages": [{"role": "user", "content": "."}]
         });
 
-        let mut req = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", OAUTH_BETA_FLAGS.join(","))
-            .header("user-agent", "claude-cli/2.1.2 (external, cli)")
-            .header("x-app", "cli")
-            .header("anthropic-dangerous-direct-browser-access", "true")
-            .json(&body);
+        // Build headers in a HeaderMap so auth injection can reuse the shared
+        // `inject_account_auth` (token-prefix dispatch + OAuth beta-flag merge)
+        // instead of a hand-rolled copy.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_str(&OAUTH_BETA_FLAGS.join(",")).unwrap(),
+        );
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("claude-cli/2.1.2 (external, cli)"),
+        );
+        headers.insert("x-app", HeaderValue::from_static("cli"));
+        headers.insert(
+            "anthropic-dangerous-direct-browser-access",
+            HeaderValue::from_static("true"),
+        );
+        inject_account_auth(&mut headers, &ep.token, ep.passthrough);
 
-        // Inject auth
-        if acct.token.starts_with("sk-ant-api") {
-            req = req.header("x-api-key", &acct.token);
-        } else if acct.token.starts_with("sk-ant-oat") {
-            req = req.header("authorization", format!("Bearer {}", acct.token));
-        } else {
-            req = req.header("x-api-key", &acct.token);
-        }
+        let req = self.client.post(&url).headers(headers).json(&body);
 
         match req.send().await {
             Ok(resp) => {
                 let status = resp.status();
-                self.update_rate_info(idx, resp.headers()).await;
+                self.update_rate_info_for(&ep.rate_info, &ep.name, resp.headers())
+                    .await;
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    self.mark_hard_limited(idx, resp.headers()).await;
+                    self.mark_hard_limited_for(&ep.rate_info, &ep.name, resp.headers())
+                        .await;
                 } else if status.is_success() {
-                    // 2xx only: account is responsive, clear hard limit and burst counter
-                    // so pick_account stops treating rate data as stale.
-                    // 5xx/529 are upstream errors, not proof the account recovered —
-                    // clearing the hard limit on those would flood a saturated account
-                    // during an Anthropic incident.
+                    // 2xx only: endpoint is responsive — clear hard limit and
+                    // burst counter. 5xx/529 are upstream errors, not recovery.
                     let recovered = {
-                        let mut info = acct.rate_info.write().await;
+                        let mut info = ep.rate_info.write().await;
                         let was_hard_limited = info.hard_limited_until.is_some();
                         if was_hard_limited {
                             info.hard_limited_until = None;
                             debug!(
-                                account = acct.name,
+                                endpoint = ep.name,
                                 "cleared hard limit after successful probe"
                             );
                         }
                         info.consecutive_burst_429s = 0;
                         was_hard_limited
                     };
-                    // Recovery is a sparse, high-impact event — refresh metrics
-                    // immediately so the dashboard reflects the account coming
-                    // back online without waiting for the next probe cycle.
                     if recovered {
-                        self.signal_hard_limit_recovery(acct).await;
+                        self.signal_hard_limit_recovery(&ep.name).await;
                     }
                 }
-                // else: 5xx/529 — leave account state untouched. Next probe cycle retries.
+                // else: 5xx/529 — leave endpoint state untouched.
                 self.save_state().await;
-                let info = acct.rate_info.read().await;
+                let info = ep.rate_info.read().await;
                 let now_epoch = Self::now_epoch();
                 let (eff_util, constraint, _adj_5h, _adj_7d) =
                     effective_utilization(&info, now_epoch, model);
                 // Only compute routing weight on 2xx — non-success responses leave
-                // the account state either mutated (429 → hard-limited) or untouched
+                // the endpoint state either mutated (429 → hard-limited) or untouched
                 // (5xx), and the pre-response weight no longer reflects reality.
                 let rw = if status.is_success() {
                     compute_routing_weight(&info, model, now_epoch, false)
@@ -936,7 +944,7 @@ impl AppState {
                     None
                 };
                 info!(
-                    account = acct.name,
+                    endpoint = ep.name,
                     status = status.as_u16(),
                     probe_model = model,
                     utilization = format_args!("{eff_util:.2}"),
@@ -977,7 +985,7 @@ impl AppState {
                 );
             }
             Err(e) => {
-                warn!(account = acct.name, error = %e, "probe failed");
+                warn!(endpoint = ep.name, error = %e, "probe failed");
             }
         }
     }
@@ -994,7 +1002,7 @@ impl AppState {
         let persisted: PersistedState = match serde_json::from_str(&data) {
             Ok(s) => s,
             Err(e) => {
-                warn!(error = %e, "failed to parse persisted state, starting fresh");
+                warn!(error = %e, "failed to parse persisted state (possible legacy 'accounts'-keyed format — that schema was removed); starting fresh");
                 return;
             }
         };
@@ -1002,10 +1010,16 @@ impl AppState {
         let now_epoch = Self::now_epoch();
         let now_instant = Instant::now();
 
-        for pa in &persisted.accounts {
-            if let Some(acct) = self.accounts.iter().find(|a| a.name == pa.name) {
-                acct.requests.store(pa.requests_total, Ordering::Relaxed);
-                let mut info = acct.rate_info.write().await;
+        for pa in &persisted.endpoints {
+            // Match each persisted entry to the endpoint with the same name.
+            let restore_target: Option<(&AtomicU64, &RwLock<RateLimitInfo>)> = self
+                .endpoints
+                .iter()
+                .find(|e| e.name == pa.name)
+                .map(|e| (&e.requests, &e.rate_info));
+            if let Some((requests, rate_info)) = restore_target {
+                requests.store(pa.requests_total, Ordering::Relaxed);
+                let mut info = rate_info.write().await;
                 info.utilization = pa.utilization;
                 info.utilization_7d = pa.utilization_7d;
                 info.utilization_5h = pa.utilization_5h;
@@ -1426,10 +1440,10 @@ fn effective_utilization(
     }
 }
 
-/// Computed routing weight for a single account+model. Extracted so both
-/// `routing_candidates()` (real requests) and `probe_account()` (periodic probes)
-/// use identical logic. Returns `None` when the account's 7d claim is actively
-/// rejected (caller should skip it).
+/// Computed routing weight for a single endpoint+model. Extracted so both
+/// `routing_candidates()` (real requests) and `probe_endpoint()` (periodic
+/// probes) use identical logic. Returns `None` when the endpoint's 7d claim is
+/// actively rejected (caller should skip it).
 struct RoutingWeight {
     gate_5h: f64,
     gate_7d: f64,
@@ -1580,119 +1594,97 @@ fn classify_hard_limit_sync(
 }
 
 impl AppState {
-    /// Display name for an endpoint (account or upstream), for logging.
-    fn endpoint_name(&self, ep: Endpoint) -> &str {
-        match ep {
-            Endpoint::Account(i) => &self.accounts[i].name,
-            Endpoint::Upstream(i) => &self.upstreams[i].name,
-        }
+    /// Display name for an endpoint, for logging.
+    fn endpoint_name(&self, ep: EndpointIdx) -> &str {
+        &self.endpoints[ep].name
     }
 
-    async fn routing_candidates(&self, model: &str, skip: &[Endpoint]) -> Vec<RoutingCandidate> {
+    async fn routing_candidates(&self, model: &str, skip: &[EndpointIdx]) -> Vec<RoutingCandidate> {
         let now = Instant::now();
         let now_epoch = Self::now_epoch();
         let mut candidates: Vec<RoutingCandidate> = Vec::new();
-        for (i, acct) in self.accounts.iter().enumerate() {
-            if skip.contains(&Endpoint::Account(i)) {
-                trace!(account = acct.name, "pick: skipping, already tried");
+        for (i, ep) in self.endpoints.iter().enumerate() {
+            if skip.contains(&i) {
                 continue;
             }
-            if !acct.serves_model(model) {
-                trace!(
-                    account = acct.name,
-                    model = model,
-                    "pick: skipping, model not in allowlist"
-                );
+            if !ep.serves_model(model) {
                 continue;
             }
-
-            let info = acct.rate_info.read().await;
-
-            if let Some(until) = info.hard_limited_until {
-                if now < until {
+            match ep.protocol {
+                Protocol::OpenAI => {
+                    // OpenAI endpoints carry no rate-limit data — push a fixed candidate
+                    // at the configured priority. This is one of the three named
+                    // `match protocol` sites (see Endpoint struct docs).
                     trace!(
-                        account = acct.name,
-                        hard_limited_secs = until.duration_since(now).as_secs(),
-                        "pick: skipping hard-limited account"
+                        endpoint = ep.name,
+                        priority = ep.priority,
+                        "pick: candidate (openai, fixed)"
                     );
-                    continue;
+                    candidates.push(RoutingCandidate {
+                        endpoint: i,
+                        priority: ep.priority,
+                        gate_5h: 0.0,
+                        gate_7d: 0.0,
+                        gate: 0.0,
+                        wr: 0.0,
+                        weight: 1.0,
+                        source: "openai",
+                    });
                 }
-            }
-
-            // Detect stale data: hard limit expired but no fresh response since.
-            // mark_hard_limited poisons remaining_tokens/requests and update_rate_info
-            // on the 429 stores high utilization + "rejected" statuses. Without this
-            // check, those stale values prevent the account from ever being selected
-            // again — only probes can refresh the data, and they run infrequently.
-            let stale_after_hard_limit = info
-                .hard_limited_until
-                .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
-
-            let rw = match compute_routing_weight(&info, model, now_epoch, stale_after_hard_limit) {
-                Some(rw) => rw,
-                None => {
+                Protocol::Anthropic => {
+                    let info = ep.rate_info.read().await;
+                    if let Some(until) = info.hard_limited_until {
+                        if now < until {
+                            trace!(
+                                endpoint = ep.name,
+                                hard_limited_secs = until.duration_since(now).as_secs(),
+                                "pick: skipping hard-limited endpoint"
+                            );
+                            continue;
+                        }
+                    }
+                    let stale_after_hard_limit = info
+                        .hard_limited_until
+                        .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
+                    let rw = match compute_routing_weight(
+                        &info,
+                        model,
+                        now_epoch,
+                        stale_after_hard_limit,
+                    ) {
+                        Some(rw) => rw,
+                        None => {
+                            trace!(
+                                endpoint = ep.name,
+                                model = model,
+                                "pick: skipping, 7d claim rejected"
+                            );
+                            continue;
+                        }
+                    };
+                    let effective_priority = if rw.overage_active {
+                        ep.priority.saturating_add(self.overage_penalty)
+                    } else {
+                        ep.priority
+                    };
                     trace!(
-                        account = acct.name,
-                        model = model,
-                        "pick: skipping, 7d claim rejected"
+                        endpoint = ep.name,
+                        gate = format!("{:.4}", rw.gate),
+                        weight = format!("{:.4}", rw.weight),
+                        priority = effective_priority,
+                        "pick: candidate (anthropic)"
                     );
-                    continue;
+                    candidates.push(RoutingCandidate {
+                        endpoint: i,
+                        priority: effective_priority,
+                        gate_5h: rw.gate_5h,
+                        gate_7d: rw.gate_7d,
+                        gate: rw.gate,
+                        wr: rw.wr,
+                        weight: rw.weight,
+                        source: rw.source,
+                    });
                 }
-            };
-
-            // Effective priority: an account serving via paid overage is demoted by
-            // `overage_penalty` so free subscription capacity is always preferred.
-            let effective_priority = if rw.overage_active {
-                acct.priority.saturating_add(self.overage_penalty)
-            } else {
-                acct.priority
-            };
-
-            trace!(
-                account = acct.name,
-                gate_5h = format!("{:.4}", rw.gate_5h),
-                gate_7d = format!("{:.4}", rw.gate_7d),
-                gate = format!("{:.4}", rw.gate),
-                waste_risk = format!("{:.4}", rw.wr),
-                weight = format!("{:.4}", rw.weight),
-                source = rw.source,
-                priority = effective_priority,
-                overage = rw.overage_active,
-                "pick: candidate"
-            );
-
-            candidates.push(RoutingCandidate {
-                endpoint: Endpoint::Account(i),
-                priority: effective_priority,
-                gate_5h: rw.gate_5h,
-                gate_7d: rw.gate_7d,
-                gate: rw.gate,
-                wr: rw.wr,
-                weight: rw.weight,
-                source: rw.source,
-            });
-        }
-
-        // The fallback upstream is a first-class routing candidate at its configured
-        // priority. It has no rate-limit data: gate 0 (always "healthy"), weight 1.
-        if let Some(u_idx) = self.fallback_upstream {
-            if !skip.contains(&Endpoint::Upstream(u_idx)) {
-                let upstream = &self.upstreams[u_idx];
-                trace!(
-                    upstream = upstream.name,
-                    priority = upstream.priority,
-                    "pick: candidate (upstream)"
-                );
-                candidates.push(RoutingCandidate {
-                    endpoint: Endpoint::Upstream(u_idx),
-                    priority: upstream.priority,
-                    gate_5h: 0.0,
-                    gate_7d: 0.0,
-                    gate: 0.0,
-                    wr: 0.0,
-                    weight: 1.0,
-                    source: "upstream",
-                });
             }
         }
         candidates
@@ -1728,131 +1720,47 @@ impl AppState {
         let now_epoch = Self::now_epoch();
         let now = Instant::now();
 
-        // Collect (gate, weight) per account. None = excluded entirely
+        // Collect (gate, weight) per endpoint. None = excluded entirely
         // (passthrough or hard-limited — never weighted in any condition).
-        let mut entries: Vec<Option<(f64, f64)>> = vec![None; self.accounts.len()];
-
-        for (i, acct) in self.accounts.iter().enumerate() {
-            if acct.passthrough {
-                continue;
-            }
-
-            let info = acct.rate_info.read().await;
-
-            // Hard-limited accounts contribute zero (mirrors routing_candidates filter).
-            if let Some(until) = info.hard_limited_until {
-                if now < until {
-                    continue;
+        // OpenAI endpoints carry no rate-limit data — their representative
+        // weight is the fixed (gate 0.0, weight 1.0) candidate that
+        // routing_candidates produces. Anthropic endpoints run the identical
+        // Anthropic computation.
+        let mut entries: Vec<Option<(f64, f64)>> = vec![None; self.endpoints.len()];
+        for (i, ep) in self.endpoints.iter().enumerate() {
+            match ep.protocol {
+                Protocol::OpenAI => {
+                    // NOTE: unlike persistence / stats / Redis sync (which all
+                    // `continue` on Protocol::OpenAI), metrics intentionally
+                    // emits OpenAI endpoints with a fixed (gate 0.0,
+                    // weight 1.0) — an OpenAI endpoint is a real routing
+                    // candidate and belongs on dashboards.
+                    entries[i] = Some((0.0, 1.0));
+                }
+                Protocol::Anthropic => {
+                    if ep.passthrough {
+                        continue;
+                    }
+                    let info = ep.rate_info.read().await;
+                    entries[i] = metrics_gate_weight(&info, now_epoch, now);
                 }
             }
-
-            let stale_after_hard_limit = info
-                .hard_limited_until
-                .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
-
-            // 5h gate — same logic as routing_candidates
-            let gate_5h = if stale_after_hard_limit {
-                0.5
-            } else {
-                time_adjusted_utilization(
-                    info.utilization_5h,
-                    info.reset_5h,
-                    info.status_5h.as_deref(),
-                    NEAR_RESET_5H_SECS,
-                    now_epoch,
-                )
-                .unwrap_or_else(|| {
-                    if let Some(util) = info.utilization {
-                        util
-                    } else if let Some(remaining) = info.remaining_tokens {
-                        let limit = info.limit_tokens.unwrap_or(1_000_000);
-                        (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
-                    } else {
-                        0.5
-                    }
-                })
-            };
-
-            // 7d gate + waste_risk from a SINGLE representative ClaimWindowData
-            // — utilization, reset and status are read as a coherent triple
-            // from one real claim, not Frankensteined from independently
-            // aggregated maxima/minima across claims.
-            //
-            // Selection precedence:
-            //   1. info.representative_claim if it points to a 7d entry
-            //      (this is the LB's own "binding constraint" signal)
-            //   2. The general "seven_day" claim if present
-            //   3. The model-specific claim with the highest waste_risk
-            //      (worst-case representative for the dashboard)
-            //   4. None → no 7d data, fall back to headroom-only
-            let claim_is_fresh = |c: &&ClaimWindowData| {
-                c.reset.is_some()
-                    && time_adjusted_utilization(
-                        Some(0.0),
-                        c.reset,
-                        c.status.as_deref(),
-                        NEAR_RESET_7D_SECS,
-                        now_epoch,
-                    )
-                    .is_some()
-            };
-            let representative: Option<&ClaimWindowData> = {
-                let rep_key = info.representative_claim.as_deref();
-                rep_key
-                    .filter(|k| k.starts_with("seven_day"))
-                    .and_then(|k| info.claims_7d.get(k))
-                    .filter(claim_is_fresh)
-                    .or_else(|| info.claims_7d.get("seven_day").filter(claim_is_fresh))
-                    .or_else(|| {
-                        info.claims_7d
-                            .values()
-                            .filter(claim_is_fresh)
-                            .max_by(|a, b| {
-                                let wr_a = waste_risk(a.utilization, a.reset, now_epoch);
-                                let wr_b = waste_risk(b.utilization, b.reset, now_epoch);
-                                wr_a.partial_cmp(&wr_b).unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                    })
-            };
-
-            let (gate_7d, wr) = if let Some(claim) = representative {
-                let g = if stale_after_hard_limit {
-                    0.5
-                } else {
-                    time_adjusted_utilization(
-                        Some(0.0),
-                        claim.reset,
-                        claim.status.as_deref(),
-                        NEAR_RESET_7D_SECS,
-                        now_epoch,
-                    )
-                    .unwrap_or(0.0)
-                };
-                let w = waste_risk(claim.utilization, claim.reset, now_epoch);
-                (g, w)
-            } else {
-                // No 7d claim at all — headroom-only
-                let g = if stale_after_hard_limit { 0.5 } else { 0.0 };
-                (g, 0.0)
-            };
-
-            let gate = gate_5h.max(gate_7d);
-            let headroom = (1.0 - gate).max(0.01);
-            let weight = if wr > 0.0 { wr * headroom } else { headroom };
-            let weight = if gate >= 1.0 { 0.0 } else { weight };
-
-            entries[i] = Some((gate, weight));
         }
 
-        // Mirror pick_account's graceful-degradation: only filter soft-limited
-        // accounts when at least one healthy account exists in the pool.
-        // Otherwise the entire pool is degraded and we still want the dashboard
-        // to reflect the routable accounts (pick_account would route to them).
+        self.store_metrics_weights(&entries);
+    }
+
+    /// Normalize per-endpoint (gate, weight) pairs into the three gauge atomics
+    /// of each endpoint, applying pick_endpoint's graceful soft-limit
+    /// degradation.
+    fn store_metrics_weights(&self, entries: &[Option<(f64, f64)>]) {
+        // Mirror pick_endpoint's graceful-degradation: only filter soft-limited
+        // members when at least one healthy member exists in the pool.
         let has_healthy = entries
             .iter()
             .any(|e| matches!(e, Some((gate, _)) if *gate < self.soft_limit));
 
-        let mut weights = vec![0f64; self.accounts.len()];
+        let mut weights = vec![0f64; self.endpoints.len()];
         for (i, entry) in entries.iter().enumerate() {
             if let Some((gate, weight)) = entry {
                 if has_healthy && *gate >= self.soft_limit {
@@ -1863,23 +1771,133 @@ impl AppState {
         }
 
         let total: f64 = weights.iter().sum();
-        for (i, acct) in self.accounts.iter().enumerate() {
+        for (i, ep) in self.endpoints.iter().enumerate() {
             let w = weights[i];
             let share = if total > 0.0 { w / total } else { 0.0 };
-            // Excluded accounts (passthrough, hard-limited) report gate=1.0
+            // Excluded members (passthrough, hard-limited) report gate=1.0
             // (fully gated) since they receive zero traffic.
             let gate = entries[i].map(|(g, _)| g).unwrap_or(1.0);
-            // Weight, share and gate are independent gauges, not a joint invariant —
-            // a torn read across them is harmless for dashboard consumers.
-            acct.last_routing_weight
-                .store(w.to_bits(), Ordering::Relaxed);
-            acct.last_routing_share
+            // Weight, share and gate are independent gauges, not a joint
+            // invariant — a torn read across them is harmless.
+            ep.last_routing_weight.store(w.to_bits(), Ordering::Relaxed);
+            ep.last_routing_share
                 .store(share.to_bits(), Ordering::Relaxed);
-            acct.last_effective_gate
+            ep.last_effective_gate
                 .store(gate.to_bits(), Ordering::Relaxed);
         }
     }
+}
 
+/// Per-entry representative `(gate, weight)` for metrics gauges, model-agnostic.
+/// Returns `None` for hard-limited members (they contribute zero in any state).
+/// Computed purely from a `RateLimitInfo`.
+fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Option<(f64, f64)> {
+    // Hard-limited members contribute zero (mirrors routing_candidates filter).
+    if let Some(until) = info.hard_limited_until {
+        if now < until {
+            return None;
+        }
+    }
+
+    let stale_after_hard_limit = info
+        .hard_limited_until
+        .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
+
+    // 5h gate — same logic as routing_candidates
+    let gate_5h = if stale_after_hard_limit {
+        0.5
+    } else {
+        time_adjusted_utilization(
+            info.utilization_5h,
+            info.reset_5h,
+            info.status_5h.as_deref(),
+            NEAR_RESET_5H_SECS,
+            now_epoch,
+        )
+        .unwrap_or_else(|| {
+            if let Some(util) = info.utilization {
+                util
+            } else if let Some(remaining) = info.remaining_tokens {
+                let limit = info.limit_tokens.unwrap_or(1_000_000);
+                (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
+            } else {
+                0.5
+            }
+        })
+    };
+
+    // 7d gate + waste_risk from a SINGLE representative ClaimWindowData
+    // — utilization, reset and status are read as a coherent triple
+    // from one real claim, not Frankensteined from independently
+    // aggregated maxima/minima across claims.
+    //
+    // Selection precedence:
+    //   1. info.representative_claim if it points to a 7d entry
+    //      (this is the LB's own "binding constraint" signal)
+    //   2. The general "seven_day" claim if present
+    //   3. The model-specific claim with the highest waste_risk
+    //      (worst-case representative for the dashboard)
+    //   4. None → no 7d data, fall back to headroom-only
+    let claim_is_fresh = |c: &&ClaimWindowData| {
+        c.reset.is_some()
+            && time_adjusted_utilization(
+                Some(0.0),
+                c.reset,
+                c.status.as_deref(),
+                NEAR_RESET_7D_SECS,
+                now_epoch,
+            )
+            .is_some()
+    };
+    let representative: Option<&ClaimWindowData> = {
+        let rep_key = info.representative_claim.as_deref();
+        rep_key
+            .filter(|k| k.starts_with("seven_day"))
+            .and_then(|k| info.claims_7d.get(k))
+            .filter(claim_is_fresh)
+            .or_else(|| info.claims_7d.get("seven_day").filter(claim_is_fresh))
+            .or_else(|| {
+                info.claims_7d
+                    .values()
+                    .filter(claim_is_fresh)
+                    .max_by(|a, b| {
+                        let wr_a = waste_risk(a.utilization, a.reset, now_epoch);
+                        let wr_b = waste_risk(b.utilization, b.reset, now_epoch);
+                        wr_a.partial_cmp(&wr_b).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            })
+    };
+
+    let (gate_7d, wr) = if let Some(claim) = representative {
+        let g = if stale_after_hard_limit {
+            0.5
+        } else {
+            time_adjusted_utilization(
+                Some(0.0),
+                claim.reset,
+                claim.status.as_deref(),
+                NEAR_RESET_7D_SECS,
+                now_epoch,
+            )
+            .unwrap_or(0.0)
+        };
+        let w = waste_risk(claim.utilization, claim.reset, now_epoch);
+        (g, w)
+    } else {
+        // No 7d claim at all — headroom-only
+        let g = if stale_after_hard_limit { 0.5 } else { 0.0 };
+        (g, 0.0)
+    };
+
+    let gate = gate_5h.max(gate_7d);
+    let headroom = (1.0 - gate).max(0.01);
+    let weight = if wr > 0.0 { wr * headroom } else { headroom };
+    let weight = if gate >= 1.0 { 0.0 } else { weight };
+
+    Some((gate, weight))
+}
+
+impl AppState {
     fn routing_weight_publish_ttl(probe_interval_secs: u64) -> u64 {
         const FALLBACK_PUBLISH_INTERVAL_SECS: u64 = 60;
 
@@ -1900,20 +1918,33 @@ impl AppState {
             None => return,
         };
         use redis::AsyncCommands;
-        for acct in &self.accounts {
-            let w = f64::from_bits(acct.last_routing_weight.load(Ordering::Relaxed));
-            let s = f64::from_bits(acct.last_routing_share.load(Ordering::Relaxed));
-            let g = f64::from_bits(acct.last_effective_gate.load(Ordering::Relaxed));
-            let key = format!("alb:weight:{}", acct.name);
+        let ttl = Self::routing_weight_publish_ttl(self.probe_interval_secs);
+        let publish = |name: &str, weight: &AtomicU64, share: &AtomicU64, gate: &AtomicU64| {
+            let w = f64::from_bits(weight.load(Ordering::Relaxed));
+            let s = f64::from_bits(share.load(Ordering::Relaxed));
+            let g = f64::from_bits(gate.load(Ordering::Relaxed));
+            let key = format!("alb:weight:{}", name);
             let val = format!("{w},{s},{g}");
             let mut conn = redis.clone();
-            let ttl = Self::routing_weight_publish_ttl(self.probe_interval_secs);
             tokio::spawn(async move {
                 let result: redis::RedisResult<()> = conn.set_ex(&key, val, ttl).await;
                 if let Err(e) = result {
                     tracing::warn!(error = %e, "redis routing weight publish failed");
                 }
             });
+        };
+        // OpenAI endpoints are skipped — sync_from_redis only reads weights
+        // for Anthropic targets.
+        for ep in &self.endpoints {
+            if ep.protocol == Protocol::OpenAI {
+                continue;
+            }
+            publish(
+                &ep.name,
+                &ep.last_routing_weight,
+                &ep.last_routing_share,
+                &ep.last_effective_gate,
+            );
         }
     }
 
@@ -1932,10 +1963,12 @@ impl AppState {
     ///
     /// Also refreshes metric gauges and publishes updated routing weights so all
     /// replicas reflect the recovery within the next sync tick.
-    async fn signal_hard_limit_recovery(&self, acct: &Account) {
+    /// Broadcast a hard-limit recovery for an endpoint by name. The Redis
+    /// sentinel key is derived from the name alone.
+    async fn signal_hard_limit_recovery(&self, endpoint_name: &str) {
         if let Some(redis) = &self.redis {
             let mut conn = redis.clone();
-            let key = format!("alb:hard:{}", acct.name);
+            let key = format!("alb:hard:{}", endpoint_name);
             let now_epoch = Self::now_epoch();
             // Lua CAS: only write the sentinel if the current value is absent,
             // already the sentinel, or an expired hard-limit (epoch <= now).
@@ -2076,7 +2109,7 @@ impl AppState {
         total_weight: f64,
         affinity_key: Option<&str>,
         tier: u32,
-    ) -> Endpoint {
+    ) -> EndpointIdx {
         let picked = match self.routing_strategy {
             RoutingStrategy::DynamicCapacityV1 => {
                 self.pick_dynamic_capacity_v1(effective, total_weight, affinity_key)
@@ -2117,8 +2150,8 @@ impl AppState {
         &self,
         affinity_key: Option<&str>,
         model: &str,
-        skip: &[Endpoint],
-    ) -> Option<Endpoint> {
+        skip: &[EndpointIdx],
+    ) -> Option<EndpointIdx> {
         let candidates = self.routing_candidates(model, skip).await;
         if candidates.is_empty() {
             debug!("pick: no available endpoints");
@@ -2169,24 +2202,23 @@ impl AppState {
         None
     }
 
-    /// Test-only convenience: `pick_endpoint` restricted to account results.
+    /// Test-only convenience: parse rate-limit headers into endpoint `idx`.
     #[cfg(test)]
-    async fn pick_account(
-        &self,
-        affinity_key: Option<&str>,
-        model: &str,
-        skip: &[usize],
-    ) -> Option<usize> {
-        let skip: Vec<Endpoint> = skip.iter().map(|&i| Endpoint::Account(i)).collect();
-        self.pick_endpoint(affinity_key, model, &skip)
-            .await
-            .and_then(|ep| ep.account())
+    async fn update_rate_info(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
+        let ep = &self.endpoints[idx];
+        self.update_rate_info_for(&ep.rate_info, &ep.name, headers)
+            .await;
     }
 
-    /// Update rate limit info from response headers.
-    async fn update_rate_info(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
-        let acct = &self.accounts[idx];
-        let mut info = acct.rate_info.write().await;
+    /// Parse rate-limit headers from a response into the supplied
+    /// `RateLimitInfo` lock.
+    async fn update_rate_info_for(
+        &self,
+        rate_info: &RwLock<RateLimitInfo>,
+        endpoint_name: &str,
+        headers: &reqwest::header::HeaderMap,
+    ) {
+        let mut info = rate_info.write().await;
 
         // Debug: log all ratelimit headers
         for (name, value) in headers.iter() {
@@ -2194,7 +2226,7 @@ impl AppState {
             if name_str.contains("ratelimit") || name_str.contains("retry") {
                 if let Ok(v) = value.to_str() {
                     tracing::trace!(
-                        account = acct.name,
+                        account = endpoint_name,
                         header = name_str,
                         value = v,
                         "rate-limit header"
@@ -2432,7 +2464,7 @@ impl AppState {
         }
 
         trace!(
-            account = acct.name,
+            account = endpoint_name,
             utilization = ?info.utilization,
             util_7d = ?info.utilization_7d,
             util_5h = ?info.utilization_5h,
@@ -2481,7 +2513,7 @@ impl AppState {
                 .unwrap_or(3600); // default 1h if no reset known
 
             let mut conn = redis.clone();
-            let key = format!("alb:rate:{}", acct.name);
+            let key = format!("alb:rate:{}", endpoint_name);
             tokio::spawn(async move {
                 if let Ok(json) = serde_json::to_string(&rate_data) {
                     use redis::AsyncCommands;
@@ -2494,10 +2526,22 @@ impl AppState {
         }
     }
 
-    /// Mark an account as hard rate-limited (got a 429).
+    /// Test-only convenience: mark endpoint `idx` as hard rate-limited.
+    #[cfg(test)]
     async fn mark_hard_limited(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
-        let acct = &self.accounts[idx];
-        let mut info = acct.rate_info.write().await;
+        let ep = &self.endpoints[idx];
+        self.mark_hard_limited_for(&ep.rate_info, &ep.name, headers)
+            .await;
+    }
+
+    /// Apply a 429 cooldown to the supplied `RateLimitInfo` lock.
+    async fn mark_hard_limited_for(
+        &self,
+        rate_info: &RwLock<RateLimitInfo>,
+        endpoint_name: &str,
+        headers: &reqwest::header::HeaderMap,
+    ) {
+        let mut info = rate_info.write().await;
 
         let raw_retry_after = headers
             .get("retry-after")
@@ -2559,7 +2603,7 @@ impl AppState {
         info.last_updated_epoch = Some(Self::now_epoch());
 
         warn!(
-            account = acct.name,
+            account = endpoint_name,
             cooldown_secs = cooldown.as_secs(),
             retry_after_raw = ?raw_retry_after,
             burst = is_burst_limit,
@@ -2570,7 +2614,7 @@ impl AppState {
         // Propagate to Redis for cross-replica awareness
         if let Some(redis) = &self.redis {
             let mut conn = redis.clone();
-            let key = format!("alb:hard:{}", acct.name);
+            let key = format!("alb:hard:{}", endpoint_name);
             let until_epoch = Self::now_epoch()
                 + cooldown.as_secs()
                 + if cooldown.subsec_nanos() > 0 { 1 } else { 0 };
@@ -2610,11 +2654,33 @@ impl AppState {
         let now_epoch = Self::now_epoch();
         let now_instant = Instant::now();
 
-        // 1. Sync hard limits (MGET for all accounts in one round-trip)
-        let hard_keys: Vec<String> = self
-            .accounts
+        // Sync target list over the endpoint pool. OpenAI endpoints are
+        // skipped: they carry no Anthropic rate-limit data.
+        struct SyncTarget<'a> {
+            name: &'a str,
+            rate_info: &'a RwLock<RateLimitInfo>,
+            weight: &'a AtomicU64,
+            share: &'a AtomicU64,
+            gate: &'a AtomicU64,
+        }
+        let mut targets: Vec<SyncTarget<'_>> = Vec::new();
+        for e in &self.endpoints {
+            if e.protocol == Protocol::OpenAI {
+                continue;
+            }
+            targets.push(SyncTarget {
+                name: &e.name,
+                rate_info: &e.rate_info,
+                weight: &e.last_routing_weight,
+                share: &e.last_routing_share,
+                gate: &e.last_effective_gate,
+            });
+        }
+
+        // 1. Sync hard limits (MGET for all targets in one round-trip)
+        let hard_keys: Vec<String> = targets
             .iter()
-            .map(|a| format!("alb:hard:{}", a.name))
+            .map(|t| format!("alb:hard:{}", t.name))
             .collect();
 
         if let Ok(values) = conn.mget::<_, Vec<Option<String>>>(&hard_keys).await {
@@ -2629,26 +2695,23 @@ impl AppState {
                         // escalation, and resetting it based on another replica's
                         // unrelated success would mask abuse patterns and thrash
                         // the exponential backoff.
-                        let mut info = self.accounts[i].rate_info.write().await;
+                        let mut info = targets[i].rate_info.write().await;
                         if info.hard_limited_until.is_some() {
                             info.hard_limited_until = None;
                             trace!(
-                                account = self.accounts[i].name,
+                                endpoint = targets[i].name,
                                 "synced hard-limit clear sentinel from redis"
                             );
                         }
                     }
                     HardLimitSync::Update(until_instant) => {
-                        let mut info = self.accounts[i].rate_info.write().await;
+                        let mut info = targets[i].rate_info.write().await;
                         let should_update = info
                             .hard_limited_until
                             .is_none_or(|local| until_instant > local);
                         if should_update {
                             info.hard_limited_until = Some(until_instant);
-                            trace!(
-                                account = self.accounts[i].name,
-                                "synced hard-limit from redis"
-                            );
+                            trace!(endpoint = targets[i].name, "synced hard-limit from redis");
                         }
                     }
                     HardLimitSync::Ignore => {}
@@ -2656,18 +2719,17 @@ impl AppState {
             }
         }
 
-        // 2. Sync rate info (MGET for all accounts in one round-trip)
-        let rate_keys: Vec<String> = self
-            .accounts
+        // 2. Sync rate info (MGET for all targets in one round-trip)
+        let rate_keys: Vec<String> = targets
             .iter()
-            .map(|a| format!("alb:rate:{}", a.name))
+            .map(|t| format!("alb:rate:{}", t.name))
             .collect();
 
         if let Ok(values) = conn.mget::<_, Vec<Option<String>>>(&rate_keys).await {
             for (i, val) in values.iter().enumerate() {
                 if let Some(json) = val {
                     if let Ok(remote) = serde_json::from_str::<RedisRateInfo>(json) {
-                        let mut info = self.accounts[i].rate_info.write().await;
+                        let mut info = targets[i].rate_info.write().await;
                         // "Most recent wins": only apply remote data if it's newer
                         // Both ages use wall-clock epoch to avoid mixed-clock-domain bugs
                         let local_age = info
@@ -2696,7 +2758,7 @@ impl AppState {
                             info.last_updated = Some(now_instant);
                             info.last_updated_epoch = Some(remote.updated_at);
                             trace!(
-                                account = self.accounts[i].name,
+                                endpoint = targets[i].name,
                                 remote_age,
                                 "synced rate info from redis"
                             );
@@ -2707,10 +2769,9 @@ impl AppState {
         }
 
         // 3. Sync precomputed routing weights (published by probing pod)
-        let weight_keys: Vec<String> = self
-            .accounts
+        let weight_keys: Vec<String> = targets
             .iter()
-            .map(|a| format!("alb:weight:{}", a.name))
+            .map(|t| format!("alb:weight:{}", t.name))
             .collect();
         if let Ok(values) = conn.mget::<_, Vec<Option<String>>>(&weight_keys).await {
             for (i, val) in values.iter().enumerate() {
@@ -2718,17 +2779,11 @@ impl AppState {
                     let mut parts = csv.splitn(3, ',');
                     if let (Some(w_str), Some(s_str)) = (parts.next(), parts.next()) {
                         if let (Ok(w), Ok(s)) = (w_str.parse::<f64>(), s_str.parse::<f64>()) {
-                            self.accounts[i]
-                                .last_routing_weight
-                                .store(w.to_bits(), Ordering::Relaxed);
-                            self.accounts[i]
-                                .last_routing_share
-                                .store(s.to_bits(), Ordering::Relaxed);
+                            targets[i].weight.store(w.to_bits(), Ordering::Relaxed);
+                            targets[i].share.store(s.to_bits(), Ordering::Relaxed);
                             // Gate is optional (backward compat with older publishers)
                             if let Some(Ok(g)) = parts.next().map(|g| g.parse::<f64>()) {
-                                self.accounts[i]
-                                    .last_effective_gate
-                                    .store(g.to_bits(), Ordering::Relaxed);
+                                targets[i].gate.store(g.to_bits(), Ordering::Relaxed);
                             }
                         }
                     }
@@ -3019,7 +3074,7 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
 #[allow(clippy::too_many_arguments)]
 async fn finalize_stream(
     state: &AppState,
-    idx: usize,
+    ep: &Endpoint,
     req_id: &str,
     client_id: &str,
     model: &str,
@@ -3038,7 +3093,7 @@ async fn finalize_stream(
     let usage = TokenUsage::from_sse_text(&text);
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
     if !usage.is_empty() {
-        state.record_usage(idx, client_id, &usage).await;
+        state.record_usage(ep, client_id, &usage).await;
         log_usage(req_id, client_id, model, acct_name, &usage);
     } else {
         let reason = if upstream_error {
@@ -3101,7 +3156,7 @@ async fn finalize_stream(
 #[allow(clippy::too_many_arguments)]
 async fn finalize_non_stream(
     state: &AppState,
-    idx: usize,
+    ep: &Endpoint,
     req_id: &str,
     client_id: &str,
     model: &str,
@@ -3115,7 +3170,7 @@ async fn finalize_non_stream(
     openai_compat: bool,
 ) {
     if !usage.is_empty() {
-        state.record_usage(idx, client_id, usage).await;
+        state.record_usage(ep, client_id, usage).await;
         log_usage(req_id, client_id, model, acct_name, usage);
     }
     let mut log = serde_json::json!({
@@ -3141,19 +3196,18 @@ async fn finalize_non_stream(
 }
 
 impl AppState {
-    /// Record token usage for an account and client.
-    async fn record_usage(&self, account_idx: usize, client_id: &str, usage: &TokenUsage) {
+    /// Record token usage for an endpoint and client.
+    async fn record_usage(&self, ep: &Endpoint, client_id: &str, usage: &TokenUsage) {
         if usage.is_empty() {
             return;
         }
-        let acct = &self.accounts[account_idx];
-        acct.input_tokens
+        ep.input_tokens
             .fetch_add(usage.input_tokens, Ordering::Relaxed);
-        acct.output_tokens
+        ep.output_tokens
             .fetch_add(usage.output_tokens, Ordering::Relaxed);
-        acct.cache_creation_tokens
+        ep.cache_creation_tokens
             .fetch_add(usage.cache_creation_input_tokens, Ordering::Relaxed);
-        acct.cache_read_tokens
+        ep.cache_read_tokens
             .fetch_add(usage.cache_read_input_tokens, Ordering::Relaxed);
 
         // Per-client tracking
@@ -3175,9 +3229,9 @@ impl AppState {
     }
 
     /// Update burn rate for an account and per-client request tracking.
-    fn update_burn_rate(&self, acct: &Account, client_id: &str) {
+    fn update_burn_rate(&self, burn_rate: &Mutex<BurnRate>, client_id: &str) {
         let now = Instant::now();
-        if let Ok(mut br) = acct.burn_rate.lock() {
+        if let Ok(mut br) = burn_rate.lock() {
             br.update(now);
         }
         if let Ok(mut rates) = self.client_request_rates.lock() {
@@ -3286,9 +3340,11 @@ impl AppState {
         self.operators.iter().any(|op| op == client_id)
     }
 
-    /// Check if all model-compatible accounts exceed this client's utilization limit.
-    /// Returns Ok(()) if no limit configured or at least one account is below the limit.
-    /// Returns Err(retry_after_secs) if all accounts exceed the limit.
+    /// Check if all model-compatible endpoints exceed this client's utilization limit.
+    /// Returns Ok(()) if no limit configured or at least one endpoint is below the limit.
+    /// Returns Err(retry_after_secs) if all endpoints exceed the limit.
+    /// OpenAI endpoints carry no rate-limit data and are skipped — they neither
+    /// gate nor relieve the limit (mirrors `is_emergency_brake_active`).
     async fn check_utilization_limit(&self, client_id: &str, model: &str) -> Result<(), u64> {
         let limit = match self.client_utilization_limits.get(client_id) {
             Some(&limit) => limit,
@@ -3301,15 +3357,18 @@ impl AppState {
         let mut any_compatible = false;
         let mut any_known = false;
 
-        for acct in &self.accounts {
-            if !acct.serves_model(model) {
+        for ep in &self.endpoints {
+            if ep.protocol != Protocol::Anthropic {
+                continue;
+            }
+            if !ep.serves_model(model) {
                 continue;
             }
             any_compatible = true;
-            let info = acct.rate_info.read().await;
+            let info = ep.rate_info.read().await;
             let (util, source, _, _) = effective_utilization(&info, now_epoch, model);
             if source == "unknown" {
-                all_above = false; // fail-open: unknown account may have capacity
+                all_above = false; // fail-open: unknown endpoint may have capacity
                 break;
             }
             any_known = true;
@@ -3323,7 +3382,7 @@ impl AppState {
                 "7d" => resolve_7d_claim(&info, model)
                     .and_then(|c| c.reset)
                     .or(info.reset_7d),
-                _ => info.reset_5h.or(info.reset_7d), // unified/legacy best-effort
+                _ => info.reset_5h.or(info.reset_7d), // unified best-effort
             };
             if let Some(r) = reset_epoch {
                 if r > now_epoch {
@@ -3341,8 +3400,8 @@ impl AppState {
         }
     }
 
-    /// Check if all accounts are above the emergency threshold.
-    /// Fail-open: returns false if all accounts return (0.5, "unknown") — no data.
+    /// Check if all endpoints are above the emergency threshold.
+    /// Fail-open: returns false if all endpoints return (0.5, "unknown") — no data.
     async fn is_emergency_brake_active(&self) -> bool {
         if !self.emergency_brake {
             return false;
@@ -3351,8 +3410,15 @@ impl AppState {
         let mut all_above = true;
         let mut any_known = false;
 
-        for acct in &self.accounts {
-            let info = acct.rate_info.read().await;
+        // ONLY Protocol::Anthropic endpoints. OpenAI endpoints carry a stub
+        // RateLimitInfo (all None) which effective_utilization() resolves to
+        // (0.5, "unknown"); including them would force all_above = false and the
+        // brake could never fire. One of the three named `match protocol` sites.
+        for ep in &self.endpoints {
+            if ep.protocol != Protocol::Anthropic {
+                continue;
+            }
+            let info = ep.rate_info.read().await;
             let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
             if source != "unknown" {
                 any_known = true;
@@ -3363,7 +3429,7 @@ impl AppState {
             }
         }
 
-        // Fail-open: if no account has real data, don't activate
+        // Fail-open: if no endpoint has real data, don't activate
         all_above && any_known
     }
 
@@ -3700,6 +3766,380 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 
 // ── Handler ─────────────────────────────────────────────────────────
 
+/// Outcome of a single forward attempt to an Anthropic-protocol endpoint.
+/// The retry loop in `proxy_handler` interprets the outcome:
+///   - `Done(resp)`: final response — return it to the caller.
+///   - `Retry { saw_529, push_skip }`: try the next candidate. If
+///     `push_skip` is true the caller appends the failed endpoint index to
+///     its `skip` list; if `saw_529` is true the loop will BEBO-retry once
+///     this round exhausts.
+enum ForwardOutcome {
+    Done(Response),
+    Retry { saw_529: bool, push_skip: bool },
+}
+
+/// Classify an upstream Anthropic response status into a retry decision.
+///
+/// Shared by both `forward_anthropic` and `forward_openai_compat_anthropic`,
+/// whose retry-classification logic is byte-identical. For 429 / 529 / other
+/// 5xx it records hard-limit state, persists, and logs exactly as the prior
+/// inline blocks did, returning `Err(ForwardOutcome::Retry { .. })`. For any
+/// non-retry status (2xx success or 4xx client error) it returns
+/// `Ok(resp)` — handing the response back so the caller can continue.
+async fn classify_retry_status(
+    state: &Arc<AppState>,
+    status: StatusCode,
+    rate_info: &RwLock<RateLimitInfo>,
+    endpoint_name: &str,
+    resp: reqwest::Response,
+) -> Result<reqwest::Response, ForwardOutcome> {
+    // 429 → mark hard-limited and try next account
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        state
+            .mark_hard_limited_for(rate_info, endpoint_name, resp.headers())
+            .await;
+        log_429_details(endpoint_name, resp).await;
+        state.save_state().await;
+        info!(account = endpoint_name, "got 429, rotating to next account");
+        return Err(ForwardOutcome::Retry {
+            saw_529: false,
+            push_skip: true,
+        });
+    }
+
+    // 529 → overloaded, try next account; flag for BEBO retry if all exhausted
+    if status.as_u16() == 529 {
+        state.save_state().await;
+        warn!(account = endpoint_name, "got 529, rotating to next account");
+        return Err(ForwardOutcome::Retry {
+            saw_529: true,
+            push_skip: true,
+        });
+    }
+
+    // Other 5xx → transient, try next account (no BEBO retry)
+    if status.is_server_error() {
+        state.save_state().await;
+        warn!(
+            account = endpoint_name,
+            status = status.as_u16(),
+            "got server error, rotating to next account"
+        );
+        return Err(ForwardOutcome::Retry {
+            saw_529: false,
+            push_skip: true,
+        });
+    }
+
+    Ok(resp)
+}
+
+/// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
+/// passes the picked endpoint and its pool index (used for `skip` and usage
+/// accounting).
+/// `ep` is the endpoint to forward to; `endpoint_idx` is its index in
+/// `state.endpoints`. Both are required: the streaming path spawns a
+/// detached 'static task that must re-borrow the endpoint from a cloned
+/// Arc<AppState> — a borrowed &Endpoint cannot cross the spawn boundary,
+/// so the task captures the Copy `endpoint_idx` and re-indexes.
+#[allow(clippy::too_many_arguments)]
+async fn forward_anthropic(
+    state: &Arc<AppState>,
+    parts: &axum::http::request::Parts,
+    body_bytes: &bytes::Bytes,
+    oauth_body_bytes: &bytes::Bytes,
+    ep: &Endpoint,
+    endpoint_idx: usize,
+    req_id: &str,
+    client_id: &str,
+    client_ver: &str,
+    client_ip: &std::net::IpAddr,
+    agent_id: &str,
+    session_id: &str,
+    model: &str,
+    request_start: std::time::Instant,
+) -> ForwardOutcome {
+    let token = ep.token.as_str();
+    let passthrough = ep.passthrough;
+    let endpoint_name = ep.name.as_str();
+    let rate_info = &ep.rate_info;
+    let url = format!(
+        "{}{}",
+        ep.base_url,
+        parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/")
+    );
+
+    let mut upstream_req = state.client.request(parts.method.clone(), &url);
+
+    // Forward headers
+    let mut headers = parts.headers.clone();
+    headers.remove("host");
+    headers.remove("content-length"); // body size may change after cache injection
+    headers.remove("accept-encoding"); // need plaintext SSE to extract token usage
+
+    // Default anthropic-version if client didn't set it
+    if !headers.contains_key("anthropic-version") {
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    }
+
+    // Auth: passthrough keeps caller's headers, otherwise inject account token
+    inject_account_auth(&mut headers, token, passthrough);
+
+    // Debug: log outbound auth method and key headers
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let auth_method = if passthrough {
+            "passthrough"
+        } else if token.starts_with("sk-ant-oat") {
+            "oauth"
+        } else {
+            "api-key"
+        };
+        debug!(
+            req_id,
+            account = endpoint_name,
+            auth_method,
+            body_bytes = if token.starts_with("sk-ant-oat") {
+                oauth_body_bytes.len()
+            } else {
+                body_bytes.len()
+            },
+            has_anthropic_beta = headers
+                .get("anthropic-beta")
+                .map(|v| v.to_str().unwrap_or("-")),
+            has_anthropic_version = headers
+                .get("anthropic-version")
+                .map(|v| v.to_str().unwrap_or("-")),
+            "<<< outbound to upstream"
+        );
+    }
+
+    upstream_req = upstream_req.headers(headers);
+    // Use OAuth variant (with CC system prompt) for OAuth tokens
+    let req_body = if token.starts_with("sk-ant-oat") {
+        oauth_body_bytes
+    } else {
+        body_bytes
+    };
+    upstream_req = upstream_req.body(req_body.clone());
+
+    let resp = match upstream_req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(account = endpoint_name, "upstream request failed: {e}");
+            // Preserve original behavior: transport errors retry without
+            // adding the endpoint to the skip list.
+            return ForwardOutcome::Retry {
+                saw_529: false,
+                push_skip: false,
+            };
+        }
+    };
+
+    let status = resp.status();
+    ep.requests.fetch_add(1, Ordering::Relaxed);
+
+    // Debug: dump all response headers
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        debug!(
+            req_id,
+            status = status.as_u16(),
+            account = endpoint_name,
+            "<<< upstream response"
+        );
+        for (k, v) in resp.headers().iter() {
+            debug!(req_id, header = %k, value = debug_header_value(k, v), "<<< resp header");
+        }
+    }
+
+    // Always update rate limit info and persist
+    state
+        .update_rate_info_for(rate_info, endpoint_name, resp.headers())
+        .await;
+
+    // Update burn rate (after rate-limit headers are parsed)
+    state.update_burn_rate(&ep.burn_rate, client_id);
+
+    // Classify 429 / 529 / other 5xx into a retry decision (shared helper).
+    let mut resp = match classify_retry_status(state, status, rate_info, endpoint_name, resp).await
+    {
+        Ok(resp) => resp,
+        Err(outcome) => return outcome,
+    };
+
+    // Clear hard limit and burst counter only on a genuine 2xx success.
+    // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
+    // that the rate-limit window has drained — don't clobber state on
+    // client errors.
+    let recovered = if status.is_success() {
+        let mut info = rate_info.write().await;
+        let was = info.hard_limited_until.is_some();
+        info.hard_limited_until = None;
+        info.consecutive_burst_429s = 0;
+        was
+    } else {
+        false
+    };
+
+    // Persist state after updating rate-limit state so completed 4xx
+    // responses and other terminal outcomes aren't dropped on restart.
+    state.save_state().await;
+
+    if recovered {
+        state.signal_hard_limit_recovery(endpoint_name).await;
+    }
+
+    // Log with capacity info + inject budget status header
+    let budget_status = {
+        let info = rate_info.read().await;
+        let (eff_util, constraint, _adj_5h, _adj_7d) =
+            effective_utilization(&info, AppState::now_epoch(), model);
+        info!(
+            req_id,
+            client = %client_ip,
+            client_id = %client_id,
+            ver = %client_ver,
+            agent = %agent_id,
+            session = %session_id,
+            model = %model,
+            account = endpoint_name,
+            status = status.as_u16(),
+            utilization = format_args!("{eff_util:.2}"),
+            util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+            util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+            constraint,
+            overage = info.overage_in_use,
+            total = ep.requests.load(Ordering::Relaxed),
+            "proxied"
+        );
+        compute_pressure_status(eff_util, client_id, state)
+    };
+
+    let latency_ms = request_start.elapsed().as_millis() as u64;
+
+    // Stream response through, extracting token usage
+    let resp_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let resp_headers = resp.headers().clone();
+
+    let mut builder = Response::builder().status(resp_status);
+    for (k, v) in resp_headers.iter() {
+        if k == "transfer-encoding" {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+
+    // Inject budget status header
+    builder = builder.header("x-budget-status", budget_status);
+
+    // Detect streaming from content-type
+    let is_streaming = resp_headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false);
+
+    if is_streaming {
+        // Streaming: tee the byte stream to accumulate SSE text for usage extraction
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+        let state_clone = state.clone();
+        // The detached task can't carry the `ep` borrow across the spawn
+        // boundary; capture the Copy index and re-borrow from the owned `Arc`.
+        let client_id_clone = client_id.to_owned();
+        let acct_name = endpoint_name.to_owned();
+        let model_clone = model.to_owned();
+        let client_ip_str = client_ip.to_string();
+        let agent_clone = agent_id.to_owned();
+        let session_clone = session_id.to_owned();
+        let req_id_clone = req_id.to_owned();
+        let status_code = status.as_u16();
+
+        tokio::spawn(async move {
+            let mut sse_buf = Vec::new();
+            let mut client_disconnected = false;
+            let mut upstream_error = false;
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        sse_buf.extend_from_slice(&chunk);
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            client_disconnected = true;
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        upstream_error = true;
+                        warn!(req_id = req_id_clone, error = %e, "upstream SSE read failed");
+                        break;
+                    }
+                }
+            }
+            // Parse accumulated SSE data for usage. The detached task only
+            // holds a cloned Arc<AppState>; re-index it to recover &Endpoint.
+            let ep = &state_clone.endpoints[endpoint_idx];
+            finalize_stream(
+                &state_clone,
+                ep,
+                &req_id_clone,
+                &client_id_clone,
+                &model_clone,
+                &acct_name,
+                &client_ip_str,
+                &agent_clone,
+                &session_clone,
+                status_code,
+                &sse_buf,
+                request_start,
+                client_disconnected,
+                upstream_error,
+                false,
+            )
+            .await;
+        });
+
+        let body_stream = ReceiverStream::new(rx);
+        let response = builder
+            .body(Body::from_stream(body_stream))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+            });
+        ForwardOutcome::Done(response)
+    } else {
+        // Non-streaming: buffer, extract usage, forward
+        let resp_body_bytes = resp.bytes().await.unwrap_or_default();
+        let mut usage = TokenUsage::default();
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&resp_body_bytes) {
+            usage = TokenUsage::from_response_body(&parsed);
+        }
+        finalize_non_stream(
+            state,
+            ep,
+            req_id,
+            client_id,
+            model,
+            endpoint_name,
+            &client_ip.to_string(),
+            agent_id,
+            session_id,
+            status.as_u16(),
+            &usage,
+            latency_ms,
+            false,
+        )
+        .await;
+        let response = builder
+            .body(Body::from(resp_body_bytes))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+            });
+        ForwardOutcome::Done(response)
+    }
+}
+
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -3830,337 +4270,94 @@ async fn proxy_handler(
         return resp;
     }
 
-    let n = state.accounts.len();
+    let n = state.endpoints.len();
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
             let delay = RETRY_529_BASE_DELAY * 2u32.pow(retry_round - 1);
             warn!(
                 retry_round = retry_round,
                 delay_ms = delay.as_millis() as u64,
-                "529 backoff: retrying all accounts"
+                "529 backoff: retrying all endpoints"
             );
             tokio::time::sleep(delay).await;
         }
-        let mut skip: Vec<Endpoint> = Vec::new();
+        let mut skip: Vec<EndpointIdx> = Vec::new();
         let mut saw_529 = false;
-        // n accounts + 1 fallback upstream is the candidate ceiling.
-        for _attempt in 0..(n + 1) {
-            let idx = match state.pick_endpoint(affinity, &model, &skip).await {
-                Some(Endpoint::Account(i)) => i,
-                Some(Endpoint::Upstream(u)) => {
-                    // All account tiers exhausted — route through the fallback upstream.
-                    match try_fallback_upstream(
-                        &state,
-                        &body_bytes,
-                        &req_id,
-                        &client_id,
-                        &model,
-                        u,
-                        true,
-                    )
-                    .await
-                    {
-                        Some(resp) => return resp,
-                        None => {
-                            skip.push(Endpoint::Upstream(u));
-                            continue;
-                        }
-                    }
-                }
-                None => {
-                    warn!("all endpoints exhausted");
-                    return (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "all upstream endpoints exhausted",
-                    )
-                        .into_response();
-                }
-            };
-
-            let acct = &state.accounts[idx];
-            let url = format!(
-                "{}{}",
-                state.upstream,
-                parts
-                    .uri
-                    .path_and_query()
-                    .map(|pq| pq.as_str())
-                    .unwrap_or("/")
-            );
-
-            let mut upstream_req = state.client.request(parts.method.clone(), &url);
-
-            // Forward headers
-            let mut headers = parts.headers.clone();
-            headers.remove("host");
-            headers.remove("content-length"); // body size may change after cache injection
-            headers.remove("accept-encoding"); // need plaintext SSE to extract token usage
-
-            // Default anthropic-version if client didn't set it
-            if !headers.contains_key("anthropic-version") {
-                headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-            }
-
-            // Auth: passthrough keeps caller's headers, otherwise inject account token
-            inject_account_auth(&mut headers, &acct.token, acct.passthrough);
-
-            // Debug: log outbound auth method and key headers
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                let auth_method = if acct.passthrough {
-                    "passthrough"
-                } else if acct.token.starts_with("sk-ant-oat") {
-                    "oauth"
-                } else {
-                    "api-key"
-                };
-                debug!(
-                    req_id,
-                    account = acct.name,
-                    auth_method,
-                    body_bytes = if acct.token.starts_with("sk-ant-oat") {
-                        oauth_body_bytes.len()
-                    } else {
-                        body_bytes.len()
-                    },
-                    has_anthropic_beta = headers
-                        .get("anthropic-beta")
-                        .map(|v| v.to_str().unwrap_or("-")),
-                    has_anthropic_version = headers
-                        .get("anthropic-version")
-                        .map(|v| v.to_str().unwrap_or("-")),
-                    "<<< outbound to upstream"
-                );
-            }
-
-            upstream_req = upstream_req.headers(headers);
-            // Use OAuth variant (with CC system prompt) for OAuth tokens
-            let req_body = if acct.token.starts_with("sk-ant-oat") {
-                &oauth_body_bytes
-            } else {
-                &body_bytes
-            };
-            upstream_req = upstream_req.body(req_body.clone());
-
-            let mut resp = match upstream_req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    error!(account = acct.name, "upstream request failed: {e}");
-                    continue;
-                }
-            };
-
-            let status = resp.status();
-            acct.requests.fetch_add(1, Ordering::Relaxed);
-
-            // Debug: dump all response headers
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(
-                    req_id,
-                    status = status.as_u16(),
-                    account = acct.name,
-                    "<<< upstream response"
-                );
-                for (k, v) in resp.headers().iter() {
-                    debug!(req_id, header = %k, value = debug_header_value(k, v), "<<< resp header");
-                }
-            }
-
-            // Always update rate limit info and persist
-            state.update_rate_info(idx, resp.headers()).await;
-
-            // Update burn rate (after rate-limit headers are parsed)
-            state.update_burn_rate(acct, &client_id);
-
-            // 429 → mark hard-limited and try next account
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                state.mark_hard_limited(idx, resp.headers()).await;
-                log_429_details(&acct.name, resp).await;
-                state.save_state().await;
-                info!(account = acct.name, "got 429, rotating to next account");
-                skip.push(Endpoint::Account(idx));
-                continue;
-            }
-
-            // 529 → overloaded, try next account; flag for BEBO retry if all exhausted
-            if status.as_u16() == 529 {
-                state.save_state().await;
-                warn!(account = acct.name, "got 529, rotating to next account");
-                saw_529 = true;
-                skip.push(Endpoint::Account(idx));
-                continue;
-            }
-
-            // Other 5xx → transient, try next account (no BEBO retry)
-            if status.is_server_error() {
-                state.save_state().await;
-                warn!(
-                    account = acct.name,
-                    status = status.as_u16(),
-                    "got server error, rotating to next account"
-                );
-                skip.push(Endpoint::Account(idx));
-                continue;
-            }
-
-            // Clear hard limit and burst counter only on a genuine 2xx success.
-            // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
-            // that the rate-limit window has drained — don't clobber state on
-            // client errors.
-            let recovered = if status.is_success() {
-                let mut info = acct.rate_info.write().await;
-                let was = info.hard_limited_until.is_some();
-                info.hard_limited_until = None;
-                info.consecutive_burst_429s = 0;
-                was
-            } else {
-                false
-            };
-
-            // Persist state after updating rate-limit state so completed 4xx
-            // responses and other terminal outcomes aren't dropped on restart.
-            state.save_state().await;
-
-            if recovered {
-                state.signal_hard_limit_recovery(acct).await;
-            }
-
-            // Log with capacity info + inject budget status header
-            let budget_status = {
-                let info = acct.rate_info.read().await;
-                let (eff_util, constraint, _adj_5h, _adj_7d) =
-                    effective_utilization(&info, AppState::now_epoch(), &model);
-                info!(
-                    req_id,
-                    client = %client_ip,
-                    client_id = %client_id,
-                    ver = %client_ver,
-                    agent = %agent_id,
-                    session = %session_id,
-                    model = %model,
-                    account = acct.name,
-                    status = status.as_u16(),
-                    utilization = format_args!("{eff_util:.2}"),
-                    util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-                    util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-                    constraint,
-                    overage = info.overage_in_use,
-                    total = acct.requests.load(Ordering::Relaxed),
-                    "proxied"
-                );
-                compute_pressure_status(eff_util, &client_id, &state)
-            };
-
-            let latency_ms = request_start.elapsed().as_millis() as u64;
-
-            // Stream response through, extracting token usage
-            let resp_status =
-                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let resp_headers = resp.headers().clone();
-
-            let mut builder = Response::builder().status(resp_status);
-            for (k, v) in resp_headers.iter() {
-                if k == "transfer-encoding" {
-                    continue;
-                }
-                builder = builder.header(k, v);
-            }
-
-            // Inject budget status header
-            builder = builder.header("x-budget-status", budget_status);
-
-            // Detect streaming from content-type
-            let is_streaming = resp_headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .map(|ct| ct.contains("text/event-stream"))
-                .unwrap_or(false);
-
-            if is_streaming {
-                // Streaming: tee the byte stream to accumulate SSE text for usage extraction
-                let (tx, rx) =
-                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
-                let state_clone = state.clone();
-                let client_id_clone = client_id.clone();
-                let acct_name = acct.name.clone();
-                let model_clone = model.clone();
-                let client_ip_str = client_ip.to_string();
-                let agent_clone = agent_id.clone();
-                let session_clone = session_id.clone();
-
-                tokio::spawn(async move {
-                    let mut sse_buf = Vec::new();
-                    let mut client_disconnected = false;
-                    let mut upstream_error = false;
-                    loop {
-                        match resp.chunk().await {
-                            Ok(Some(chunk)) => {
-                                sse_buf.extend_from_slice(&chunk);
-                                if tx.send(Ok(chunk)).await.is_err() {
-                                    client_disconnected = true;
-                                    break;
+        for _attempt in 0..n {
+            // Pick the next endpoint and dispatch by protocol:
+            // `forward_anthropic` (Anthropic) or `try_fallback_upstream`
+            // (OpenAI). The latter handles its `Option<Response>` inline by
+            // `return`/`continue`-ing.
+            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) =
+                match state.pick_endpoint(affinity, &model, &skip).await {
+                    Some(i) => {
+                        let ep = &state.endpoints[i];
+                        match ep.protocol {
+                            Protocol::Anthropic => {
+                                let out = forward_anthropic(
+                                    &state,
+                                    &parts,
+                                    &body_bytes,
+                                    &oauth_body_bytes,
+                                    ep,
+                                    i,
+                                    &req_id,
+                                    &client_id,
+                                    &client_ver,
+                                    &client_ip,
+                                    &agent_id,
+                                    &session_id,
+                                    &model,
+                                    request_start,
+                                )
+                                .await;
+                                (out, i)
+                            }
+                            Protocol::OpenAI => {
+                                match try_fallback_upstream(
+                                    &state,
+                                    &body_bytes,
+                                    &req_id,
+                                    &client_id,
+                                    &model,
+                                    i,
+                                    true,
+                                )
+                                .await
+                                {
+                                    Some(resp) => return resp,
+                                    None => {
+                                        skip.push(i);
+                                        continue;
+                                    }
                                 }
                             }
-                            Ok(None) => break,
-                            Err(e) => {
-                                upstream_error = true;
-                                warn!(req_id, error = %e, "upstream SSE read failed");
-                                break;
-                            }
                         }
                     }
-                    // Parse accumulated SSE data for usage
-                    finalize_stream(
-                        &state_clone,
-                        idx,
-                        &req_id,
-                        &client_id_clone,
-                        &model_clone,
-                        &acct_name,
-                        &client_ip_str,
-                        &agent_clone,
-                        &session_clone,
-                        status.as_u16(),
-                        &sse_buf,
-                        request_start,
-                        client_disconnected,
-                        upstream_error,
-                        false,
-                    )
-                    .await;
-                });
+                    None => {
+                        warn!("all endpoints exhausted");
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "all upstream endpoints exhausted",
+                        )
+                            .into_response();
+                    }
+                };
 
-                let body_stream = ReceiverStream::new(rx);
-                return builder
-                    .body(Body::from_stream(body_stream))
-                    .unwrap_or_else(|_| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                    });
-            } else {
-                // Non-streaming: buffer, extract usage, forward
-                let body_bytes = resp.bytes().await.unwrap_or_default();
-                let mut usage = TokenUsage::default();
-                if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                    usage = TokenUsage::from_response_body(&parsed);
+            match outcome {
+                ForwardOutcome::Done(resp) => return resp,
+                ForwardOutcome::Retry {
+                    saw_529: this_529,
+                    push_skip,
+                } => {
+                    if this_529 {
+                        saw_529 = true;
+                    }
+                    if push_skip {
+                        skip.push(picked_idx);
+                    }
+                    continue;
                 }
-                finalize_non_stream(
-                    &state,
-                    idx,
-                    &req_id,
-                    &client_id,
-                    &model,
-                    &acct.name,
-                    &client_ip.to_string(),
-                    &agent_id,
-                    &session_id,
-                    status.as_u16(),
-                    &usage,
-                    latency_ms,
-                    false,
-                )
-                .await;
-                return builder.body(Body::from(body_bytes)).unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                });
             }
         }
         // If no 529s in this round, don't retry (e.g. all were 429s or errors)
@@ -4174,31 +4371,39 @@ async fn proxy_handler(
 
 // ── Fallback upstream handler ────────────────────────────────────────
 
-/// Forward a request to the fallback upstream (OpenAI-compatible) when all
-/// accounts are exhausted. For Anthropic-format callers (proxy_handler),
-/// translates the request to OpenAI format and the response back.
-/// For OpenAI-format callers (openai_chat_handler), forwards directly.
+/// Forward a request to a `Protocol::OpenAI` endpoint. For Anthropic-format
+/// callers (`proxy_handler`) it translates the request to OpenAI format and the
+/// response back (`translate = true`); for OpenAI-format callers
+/// (`openai_chat_handler`) it forwards directly (`translate = false`).
+///
+/// Returns `None` on upstream 429/5xx so the retry loop advances to the next
+/// candidate. Other 4xx (e.g. 400, 401) are returned to the caller as a final
+/// response — retry won't help on client-side errors.
+///
+/// Only increments the endpoint's request counter; it does not call
+/// `record_usage` (OpenAI-compat responses don't carry the same usage signal we
+/// extract for Anthropic).
 async fn try_fallback_upstream(
     state: &AppState,
     body_bytes: &[u8],
     req_id: &str,
     client_id: &str,
     model: &str,
-    upstream_idx: usize,
+    endpoint_idx: usize,
     translate: bool, // true = Anthropic↔OpenAI translation needed
 ) -> Option<Response> {
-    let upstream = &state.upstreams[upstream_idx];
+    let ep = &state.endpoints[endpoint_idx];
 
     info!(
         req_id,
         client_id,
         model,
-        upstream = upstream.name,
+        upstream = ep.name,
         translate,
-        "fallback: routing to upstream"
+        "fallback: routing to unified OpenAI endpoint"
     );
 
-    upstream.requests.fetch_add(1, Ordering::Relaxed);
+    ep.requests.fetch_add(1, Ordering::Relaxed);
 
     // Parse once to extract streaming flag before potential translation
     let parsed: serde_json::Value = serde_json::from_slice(body_bytes).ok()?;
@@ -4215,12 +4420,12 @@ async fn try_fallback_upstream(
         body_bytes.to_vec()
     };
 
-    let url = format!("{}/v1/chat/completions", upstream.base_url);
+    let url = format!("{}/v1/chat/completions", ep.base_url);
 
     let mut resp = match state
         .client
         .post(&url)
-        .header("authorization", format!("Bearer {}", upstream.api_key))
+        .header("authorization", format!("Bearer {}", ep.token))
         .header("content-type", "application/json")
         .body(request_body)
         .send()
@@ -4230,9 +4435,9 @@ async fn try_fallback_upstream(
         Err(e) => {
             error!(
                 req_id,
-                upstream = upstream.name,
+                upstream = ep.name,
                 error = %e,
-                "fallback: upstream request failed"
+                "fallback: unified OpenAI endpoint request failed"
             );
             return None;
         }
@@ -4244,12 +4449,24 @@ async fn try_fallback_upstream(
             .text()
             .await
             .unwrap_or_else(|_| "upstream error".to_string());
+        // Retry-eligible: 429 or 5xx → return None so the retry loop advances
+        // to the next candidate.
+        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            warn!(
+                req_id,
+                upstream = ep.name,
+                status = status.as_u16(),
+                body = %err_body,
+                "fallback: unified endpoint returned retry-eligible error, advancing"
+            );
+            return None;
+        }
         warn!(
             req_id,
-            upstream = upstream.name,
+            upstream = ep.name,
             status = status.as_u16(),
             body = %err_body,
-            "fallback: upstream returned error"
+            "fallback: unified endpoint returned error"
         );
         if translate {
             // Return error in Anthropic format
@@ -4287,7 +4504,7 @@ async fn try_fallback_upstream(
     if is_streaming {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
         let req_id = req_id.to_string();
-        let upstream_name = upstream.name.clone();
+        let upstream_name = ep.name.clone();
         let translate_response = translate;
 
         tokio::spawn(async move {
@@ -4300,12 +4517,10 @@ async fn try_fallback_upstream(
                     Ok(Some(chunk)) => {
                         if translate_response {
                             buffer.extend_from_slice(&chunk);
-                            // Parse SSE events delimited by \n\n
                             while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
                                 let event = String::from_utf8_lossy(&buffer[..pos]).into_owned();
                                 buffer.drain(..pos + 2);
 
-                                // Extract data line
                                 for line in event.lines() {
                                     if let Some(data) = line.strip_prefix("data: ") {
                                         let events =
@@ -4322,11 +4537,8 @@ async fn try_fallback_upstream(
                                     break;
                                 }
                             }
-                        } else {
-                            // OpenAI format — forward directly
-                            if tx.send(Ok(chunk)).await.is_err() {
-                                client_gone = true;
-                            }
+                        } else if tx.send(Ok(chunk)).await.is_err() {
+                            client_gone = true;
                         }
                         if client_gone {
                             break;
@@ -4334,7 +4546,7 @@ async fn try_fallback_upstream(
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        warn!(req_id, error = %e, "fallback: upstream SSE read failed");
+                        warn!(req_id, error = %e, "fallback: unified endpoint SSE read failed");
                         break;
                     }
                 }
@@ -4361,7 +4573,7 @@ async fn try_fallback_upstream(
             info!(
                 req_id,
                 upstream = upstream_name,
-                "fallback: stream complete"
+                "fallback: unified endpoint stream complete"
             );
         });
 
@@ -4384,7 +4596,7 @@ async fn try_fallback_upstream(
     let resp_body = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            error!(req_id, error = %e, "fallback: failed to read response body");
+            error!(req_id, error = %e, "fallback: failed to read unified endpoint response body");
             return None;
         }
     };
@@ -4395,8 +4607,8 @@ async fn try_fallback_upstream(
         let anthropic_resp = translate_openai_response_to_anthropic(&openai_resp);
         info!(
             req_id,
-            upstream = upstream.name,
-            "fallback: translated response"
+            upstream = ep.name,
+            "fallback: unified endpoint translated response"
         );
         Some(
             Response::builder()
@@ -4410,8 +4622,8 @@ async fn try_fallback_upstream(
     } else {
         info!(
             req_id,
-            upstream = upstream.name,
-            "fallback: forwarded response"
+            upstream = ep.name,
+            "fallback: unified endpoint forwarded response"
         );
         Some(
             Response::builder()
@@ -4425,123 +4637,133 @@ async fn try_fallback_upstream(
     }
 }
 
-// ── Upstream passthrough handler ─────────────────────────────────────
-
-async fn upstream_handler(
-    State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
-    axum::extract::Path((upstream_name, _rest)): axum::extract::Path<(String, String)>,
-    req: Request<Body>,
-) -> Response {
-    let client_ip = client_addr.ip();
-
-    if !state.is_ip_allowed(&client_ip) {
-        warn!(client = %client_ip, "rejected: IP not in allowlist");
-        return (StatusCode::FORBIDDEN, "forbidden").into_response();
-    }
-
-    if let Some(ref key) = state.proxy_key {
-        let provided = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-        if provided != Some(key.as_str()) {
-            warn!(client = %client_ip, "rejected: invalid or missing proxy key");
-            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
-    }
-
-    let upstream = match state.upstreams.iter().find(|u| u.name == upstream_name) {
-        Some(u) => u,
-        None => {
-            warn!(client = %client_ip, upstream = %upstream_name, "unknown upstream");
-            return (StatusCode::NOT_FOUND, "unknown upstream").into_response();
-        }
-    };
-
-    let (parts, body) = req.into_parts();
-
-    // Extract client identification headers
-    let client_id = state.resolve_client_id(&client_ip, &parts.headers);
-
-    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(e) => {
-            error!("failed to read request body: {e}");
-            return (StatusCode::BAD_REQUEST, "bad request body").into_response();
-        }
-    };
-
-    // Extract model from request body for logging
-    let model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-        .ok()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str().map(String::from)))
-        .unwrap_or_default();
-
-    // Build upstream URL: strip /upstream/<name> prefix, forward the rest
-    let path = parts.uri.path();
-    let prefix = format!("/upstream/{}", upstream_name);
-    let remainder = path.strip_prefix(&prefix).unwrap_or("/");
-    let remainder = if remainder.is_empty() { "/" } else { remainder };
-    let query = parts
-        .uri
-        .query()
-        .map(|q| format!("?{}", q))
-        .unwrap_or_default();
-    let url = format!("{}{}{}", upstream.base_url, remainder, query);
-
-    let mut headers = parts.headers.clone();
-    headers.remove("host");
-    headers.remove("authorization");
-    headers.remove("x-api-key");
-    // Inject upstream API key as Bearer token (OpenAI-compatible)
-    headers.insert(
-        "authorization",
-        HeaderValue::from_str(&format!("Bearer {}", upstream.api_key)).unwrap(),
-    );
-
-    let upstream_req = state
-        .client
-        .request(parts.method.clone(), &url)
-        .headers(headers)
-        .body(body_bytes);
-
-    let resp = match upstream_req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            error!(upstream = upstream.name, error = %e, "upstream request failed");
-            return (StatusCode::BAD_GATEWAY, "upstream request failed").into_response();
-        }
-    };
-
-    let status = resp.status();
-    upstream.requests.fetch_add(1, Ordering::Relaxed);
-
-    info!(
-        client = %client_ip,
-        client_id = %client_id,
-        model = %model,
-        upstream = upstream.name,
-        status = status.as_u16(),
-        total = upstream.requests.load(Ordering::Relaxed),
-        "proxied (upstream)"
-    );
-
-    let resp_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let resp_headers = resp.headers().clone();
-
-    let mut builder = Response::builder().status(resp_status);
-    for (k, v) in resp_headers.iter() {
-        if k == "transfer-encoding" {
-            continue;
-        }
-        builder = builder.header(k, v);
-    }
-    builder
-        .body(Body::from_stream(resp.bytes_stream()))
-        .unwrap_or_else(|_| {
-            (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-        })
-}
-
 // ── Stats endpoint ──────────────────────────────────────────────────
+
+/// Build one `/stats` JSON entry from an endpoint's (name, priority,
+/// rate_info, burn_rate, counters) fields. When `protocol` is `Some`, a
+/// `"protocol"` field is added to the entry.
+#[allow(clippy::too_many_arguments)]
+async fn build_stats_entry(
+    name: &str,
+    passthrough: bool,
+    priority: u32,
+    protocol: Option<&str>,
+    rate_info: &RwLock<RateLimitInfo>,
+    burn_rate: &Mutex<BurnRate>,
+    requests: &AtomicU64,
+    token_counters: [&AtomicU64; 4],
+    now_epoch: u64,
+    total_headroom: &mut Option<u64>,
+) -> serde_json::Value {
+    let info = rate_info.read().await;
+    let hard_limited = match info.hard_limited_until {
+        Some(until) if Instant::now() < until => {
+            Some(until.duration_since(Instant::now()).as_secs())
+        }
+        _ => None,
+    };
+
+    // Burn rate from EWMA tracker
+    let (br_5m, br_1h, br_6h) = burn_rate
+        .lock()
+        .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
+        .unwrap_or((0.0, 0.0, 0.0));
+
+    // Headroom: prefer remaining_requests header, else (1-util)*limit, else null
+    let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
+        Some(rem)
+    } else if let (Some(util), Some(limit)) = (info.utilization, info.limit_requests) {
+        Some(((1.0 - util) * limit as f64).max(0.0) as u64)
+    } else {
+        None
+    };
+    match (total_headroom.as_mut(), headroom) {
+        (Some(total), Some(h)) => *total += h,
+        _ => *total_headroom = None,
+    }
+
+    // Projected throttle time
+    let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
+    let projected_throttle_at: serde_json::Value = if eff_util < 0.5 || br_1h < 0.01 {
+        serde_json::Value::Null
+    } else if let Some(headroom_reqs) = headroom {
+        if headroom_reqs == 0 {
+            // Already at limit — check if hard-limited and report cooldown expiry
+            if let Some(hl_secs) = hard_limited {
+                serde_json::Value::String(AppState::epoch_to_iso8601(now_epoch + hl_secs))
+            } else {
+                serde_json::Value::String(AppState::epoch_to_iso8601(now_epoch))
+            }
+        } else {
+            let minutes_remaining = headroom_reqs as f64 / br_1h;
+            let secs_remaining = (minutes_remaining * 60.0) as u64;
+            let projected_epoch = now_epoch + secs_remaining;
+            // If projection is beyond next reset, account will recover → null
+            let mut next_reset = info.reset_5h.unwrap_or(u64::MAX);
+            for c in info.claims_7d.values() {
+                if let Some(r) = c.reset {
+                    next_reset = next_reset.min(r);
+                }
+            }
+            if projected_epoch > next_reset && next_reset != u64::MAX {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(AppState::epoch_to_iso8601(projected_epoch))
+            }
+        }
+    } else {
+        serde_json::Value::Null
+    };
+
+    let mut entry = serde_json::json!({
+        "name": name,
+        "passthrough": passthrough,
+        "priority": priority,
+        "requests_total": requests.load(Ordering::Relaxed),
+        "utilization": info.utilization,
+        "utilization_7d": info.utilization_7d,
+        "utilization_5h": info.utilization_5h,
+        "representative_claim": info.representative_claim,
+        "reset_5h": info.reset_5h,
+        "reset_7d": info.reset_7d,
+        "status_5h": info.status_5h,
+        "status_7d": info.status_7d,
+        "overage_in_use": info.overage_in_use,
+        "overage_status": info.overage_status,
+        "overage_utilization": info.overage_utilization,
+        "overage_reset": info.overage_reset,
+        "claims_7d": info.claims_7d.iter().map(|(k, v)| {
+            (k.clone(), serde_json::json!({
+                "utilization": v.utilization,
+                "reset": v.reset,
+                "status": v.status,
+                "waste_risk": waste_risk(v.utilization, v.reset, now_epoch),
+            }))
+        }).collect::<serde_json::Map<String, serde_json::Value>>(),
+        "remaining_requests": info.remaining_requests,
+        "remaining_tokens": info.remaining_tokens,
+        "limit_requests": info.limit_requests,
+        "limit_tokens": info.limit_tokens,
+        "hard_limited_remaining_secs": hard_limited,
+        "burn_rate": {
+            "last_5m": (br_5m * 100.0).round() / 100.0,
+            "last_1h": (br_1h * 100.0).round() / 100.0,
+            "last_6h": (br_6h * 100.0).round() / 100.0,
+        },
+        "headroom_requests": headroom,
+        "projected_throttle_at": projected_throttle_at,
+        "token_usage": {
+            "input_tokens": token_counters[0].load(Ordering::Relaxed),
+            "output_tokens": token_counters[1].load(Ordering::Relaxed),
+            "cache_creation_input_tokens": token_counters[2].load(Ordering::Relaxed),
+            "cache_read_input_tokens": token_counters[3].load(Ordering::Relaxed),
+        },
+    });
+    if let Some(p) = protocol {
+        entry["protocol"] = serde_json::json!(p);
+    }
+    entry
+}
 
 async fn stats_handler(
     State(state): State<Arc<AppState>>,
@@ -4559,122 +4781,33 @@ async fn stats_handler(
     }
 
     let now_epoch = AppState::now_epoch();
-    let mut out = Vec::new();
     let mut total_headroom: Option<u64> = Some(0);
-    for acct in &state.accounts {
-        let info = acct.rate_info.read().await;
-        let hard_limited = match info.hard_limited_until {
-            Some(until) if Instant::now() < until => {
-                Some(until.duration_since(Instant::now()).as_secs())
-            }
-            _ => None,
+    let mut endpoint_stats = Vec::new();
+    for ep in &state.endpoints {
+        let protocol = match ep.protocol {
+            Protocol::Anthropic => "anthropic",
+            Protocol::OpenAI => "openai",
         };
-
-        // Burn rate from EWMA tracker
-        let (br_5m, br_1h, br_6h) = acct
-            .burn_rate
-            .lock()
-            .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
-            .unwrap_or((0.0, 0.0, 0.0));
-
-        // Headroom: prefer remaining_requests header, else (1-util)*limit, else null
-        let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
-            Some(rem)
-        } else if let (Some(util), Some(limit)) = (info.utilization, info.limit_requests) {
-            Some(((1.0 - util) * limit as f64).max(0.0) as u64)
-        } else {
-            None
-        };
-        match (total_headroom.as_mut(), headroom) {
-            (Some(total), Some(h)) => *total += h,
-            _ => total_headroom = None,
-        }
-
-        // Projected throttle time
-        let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
-        let projected_throttle_at: serde_json::Value = if eff_util < 0.5 || br_1h < 0.01 {
-            serde_json::Value::Null
-        } else if let Some(headroom_reqs) = headroom {
-            if headroom_reqs == 0 {
-                // Already at limit — check if hard-limited and report cooldown expiry
-                if let Some(hl_secs) = hard_limited {
-                    serde_json::Value::String(AppState::epoch_to_iso8601(now_epoch + hl_secs))
-                } else {
-                    serde_json::Value::String(AppState::epoch_to_iso8601(now_epoch))
-                }
-            } else {
-                let minutes_remaining = headroom_reqs as f64 / br_1h;
-                let secs_remaining = (minutes_remaining * 60.0) as u64;
-                let projected_epoch = now_epoch + secs_remaining;
-                // If projection is beyond next reset, account will recover → null
-                let mut next_reset = info.reset_5h.unwrap_or(u64::MAX);
-                for c in info.claims_7d.values() {
-                    if let Some(r) = c.reset {
-                        next_reset = next_reset.min(r);
-                    }
-                }
-                if projected_epoch > next_reset && next_reset != u64::MAX {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::Value::String(AppState::epoch_to_iso8601(projected_epoch))
-                }
-            }
-        } else {
-            serde_json::Value::Null
-        };
-
-        out.push(serde_json::json!({
-            "name": acct.name,
-            "passthrough": acct.passthrough,
-            "priority": acct.priority,
-            "requests_total": acct.requests.load(Ordering::Relaxed),
-            "utilization": info.utilization,
-            "utilization_7d": info.utilization_7d,
-            "utilization_5h": info.utilization_5h,
-            "representative_claim": info.representative_claim,
-            "reset_5h": info.reset_5h,
-            "reset_7d": info.reset_7d,
-            "status_5h": info.status_5h,
-            "status_7d": info.status_7d,
-            "overage_in_use": info.overage_in_use,
-            "overage_status": info.overage_status,
-            "overage_utilization": info.overage_utilization,
-            "overage_reset": info.overage_reset,
-            "claims_7d": info.claims_7d.iter().map(|(k, v)| {
-                (k.clone(), serde_json::json!({
-                    "utilization": v.utilization,
-                    "reset": v.reset,
-                    "status": v.status,
-                    "waste_risk": waste_risk(v.utilization, v.reset, now_epoch),
-                }))
-            }).collect::<serde_json::Map<String, serde_json::Value>>(),
-            "remaining_requests": info.remaining_requests,
-            "remaining_tokens": info.remaining_tokens,
-            "limit_requests": info.limit_requests,
-            "limit_tokens": info.limit_tokens,
-            "hard_limited_remaining_secs": hard_limited,
-            "burn_rate": {
-                "last_5m": (br_5m * 100.0).round() / 100.0,
-                "last_1h": (br_1h * 100.0).round() / 100.0,
-                "last_6h": (br_6h * 100.0).round() / 100.0,
-            },
-            "headroom_requests": headroom,
-            "projected_throttle_at": projected_throttle_at,
-            "token_usage": {
-                "input_tokens": acct.input_tokens.load(Ordering::Relaxed),
-                "output_tokens": acct.output_tokens.load(Ordering::Relaxed),
-                "cache_creation_input_tokens": acct.cache_creation_tokens.load(Ordering::Relaxed),
-                "cache_read_input_tokens": acct.cache_read_tokens.load(Ordering::Relaxed),
-            },
-        }));
-    }
-    let mut upstream_stats = Vec::new();
-    for u in &state.upstreams {
-        upstream_stats.push(serde_json::json!({
-            "name": u.name,
-            "base_url": u.base_url,
-            "requests_total": u.requests.load(Ordering::Relaxed),
-        }));
+        endpoint_stats.push(
+            build_stats_entry(
+                &ep.name,
+                ep.passthrough,
+                ep.priority,
+                Some(protocol),
+                &ep.rate_info,
+                &ep.burn_rate,
+                &ep.requests,
+                [
+                    &ep.input_tokens,
+                    &ep.output_tokens,
+                    &ep.cache_creation_tokens,
+                    &ep.cache_read_tokens,
+                ],
+                now_epoch,
+                &mut total_headroom,
+            )
+            .await,
+        );
     }
 
     // Per-client usage (tokens + request rates)
@@ -4808,8 +4941,7 @@ async fn stats_handler(
         state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
 
     let mut response = serde_json::json!({
-        "accounts": out,
-        "upstreams": upstream_stats,
+        "endpoints": endpoint_stats,
         "client_usage": client_usage,
         "client_budgets": budgets,
         "aggregate": aggregate,
@@ -4903,7 +5035,7 @@ struct ClaimMetricsSnap {
 
 #[allow(dead_code)]
 #[derive(Default, Clone)]
-struct AcctMetricsSnap {
+struct EndpointMetricsSnap {
     name: String,
     passthrough: bool,
     has_applicable_7d: bool,
@@ -4930,13 +5062,18 @@ struct AcctMetricsSnap {
     last_updated_epoch: Option<u64>,
     overage_in_use: bool,
     overage_utilization: Option<f64>,
+    /// Routing-weight gauges, captured from the source struct's atomics at
+    /// snap time. Snap-carried so the routing-weight emission is pool-agnostic.
+    routing_weight: f64,
+    routing_share: f64,
+    effective_gate: f64,
 }
 
 #[cfg(test)]
 fn append_routing_weight_metrics(
     buf: &mut String,
-    accounts: &[Account],
-    snaps: &[AcctMetricsSnap],
+    endpoints: &[Endpoint],
+    snaps: &[EndpointMetricsSnap],
 ) {
     prom_header(
         buf,
@@ -4957,13 +5094,13 @@ fn append_routing_weight_metrics(
         "Effective routing gate: max(time_adjusted_5h, time_adjusted_7d) with status floors",
     );
 
-    for (acct, snap) in accounts.iter().zip(snaps.iter()) {
+    for (ep, snap) in endpoints.iter().zip(snaps.iter()) {
         if snap.passthrough {
             continue;
         }
-        let weight = f64::from_bits(acct.last_routing_weight.load(Ordering::Relaxed));
-        let share = f64::from_bits(acct.last_routing_share.load(Ordering::Relaxed));
-        let gate = f64::from_bits(acct.last_effective_gate.load(Ordering::Relaxed));
+        let weight = f64::from_bits(ep.last_routing_weight.load(Ordering::Relaxed));
+        let share = f64::from_bits(ep.last_routing_share.load(Ordering::Relaxed));
+        let gate = f64::from_bits(ep.last_effective_gate.load(Ordering::Relaxed));
         prom_gauge(
             buf,
             "anthropic_account_routing_weight",
@@ -4982,6 +5119,119 @@ fn append_routing_weight_metrics(
             &[("account", &snap.name)],
             gate,
         );
+    }
+}
+
+/// Build an `EndpointMetricsSnap` from an endpoint's (name, rate_info,
+/// burn_rate, counters, gauge atomics) fields. Callers pass field references
+/// rather than an `&Endpoint`.
+#[allow(clippy::too_many_arguments)]
+async fn build_metrics_snap(
+    name: &str,
+    passthrough: bool,
+    rate_info: &RwLock<RateLimitInfo>,
+    burn_rate: &Mutex<BurnRate>,
+    requests: &AtomicU64,
+    token_counters: [&AtomicU64; 4],
+    routing_weight_atomic: &AtomicU64,
+    routing_share_atomic: &AtomicU64,
+    effective_gate_atomic: &AtomicU64,
+    now_epoch: u64,
+    total_headroom: &mut Option<u64>,
+) -> EndpointMetricsSnap {
+    let info = rate_info.read().await;
+    let (br_5m, br_1h, br_6h) = burn_rate
+        .lock()
+        .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
+        .unwrap_or((0.0, 0.0, 0.0));
+
+    let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
+        Some(rem)
+    } else if let (Some(util), Some(limit)) = (info.utilization, info.limit_requests) {
+        Some(((1.0 - util) * limit as f64).max(0.0) as u64)
+    } else {
+        None
+    };
+    match (total_headroom.as_mut(), headroom) {
+        (Some(total), Some(h)) => *total += h,
+        _ => *total_headroom = None,
+    }
+
+    let hard_limited_secs = info
+        .hard_limited_until
+        .and_then(|until| until.checked_duration_since(Instant::now()))
+        .map(|d| d.as_secs() as f64)
+        .unwrap_or(0.0);
+    let hard_limited_active = info
+        .hard_limited_until
+        .is_some_and(|until| Instant::now() < until);
+    let stale_after_hard_limit = info
+        .hard_limited_until
+        .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
+
+    let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
+    let projected_throttle_secs = if eff_util < 0.5 || br_1h < 0.01 {
+        None
+    } else {
+        headroom.map(|h| {
+            if h == 0 {
+                0.0
+            } else {
+                (h as f64 / br_1h) * 60.0
+            }
+        })
+    };
+
+    let claims: Vec<ClaimMetricsSnap> = info
+        .claims_7d
+        .iter()
+        .map(|(k, d)| ClaimMetricsSnap {
+            key: k.clone(),
+            utilization: d.utilization,
+            waste_risk: waste_risk(d.utilization, d.reset, now_epoch),
+            reset: d.reset,
+            status: d.status.clone(),
+        })
+        .collect();
+
+    EndpointMetricsSnap {
+        name: name.to_string(),
+        passthrough,
+        has_applicable_7d: !claims.is_empty()
+            || info.utilization_7d.is_some()
+            || info.reset_7d.is_some()
+            || info.status_7d.is_some(),
+        utilization: info.utilization,
+        utilization_5h: info.utilization_5h,
+        utilization_7d: info.utilization_7d,
+        reset_5h: info.reset_5h,
+        reset_7d: info.reset_7d,
+        status_5h: info.status_5h.clone(),
+        status_7d: info.status_7d.clone(),
+        stale_after_hard_limit,
+        hard_limited_active,
+        burn_rate: (br_5m, br_1h, br_6h),
+        headroom,
+        remaining_requests: info.remaining_requests,
+        remaining_tokens: info.remaining_tokens,
+        limit_requests: info.limit_requests,
+        limit_tokens: info.limit_tokens,
+        requests_total: requests.load(Ordering::Relaxed),
+        hard_limited_secs,
+        projected_throttle_secs,
+        token_usage: [
+            token_counters[0].load(Ordering::Relaxed),
+            token_counters[1].load(Ordering::Relaxed),
+            token_counters[2].load(Ordering::Relaxed),
+            token_counters[3].load(Ordering::Relaxed),
+        ],
+        claims,
+        last_updated_epoch: info.last_updated_epoch,
+        overage_in_use: info.overage_in_use,
+        overage_utilization: info.overage_utilization,
+        routing_weight: f64::from_bits(routing_weight_atomic.load(Ordering::Relaxed)),
+        routing_share: f64::from_bits(routing_share_atomic.load(Ordering::Relaxed)),
+        effective_gate: f64::from_bits(effective_gate_atomic.load(Ordering::Relaxed)),
     }
 }
 
@@ -5005,102 +5255,34 @@ async fn metrics_handler(
 
     // ── Phase 1: Gather data (async — acquires locks) ──────────────
 
-    let mut snaps: Vec<AcctMetricsSnap> = Vec::with_capacity(state.accounts.len());
+    let mut snaps: Vec<EndpointMetricsSnap> = Vec::with_capacity(state.endpoints.len());
     let mut total_headroom: Option<u64> = Some(0);
 
-    for acct in &state.accounts {
-        let info = acct.rate_info.read().await;
-        let (br_5m, br_1h, br_6h) = acct
-            .burn_rate
-            .lock()
-            .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
-            .unwrap_or((0.0, 0.0, 0.0));
-
-        let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
-            Some(rem)
-        } else if let (Some(util), Some(limit)) = (info.utilization, info.limit_requests) {
-            Some(((1.0 - util) * limit as f64).max(0.0) as u64)
-        } else {
-            None
-        };
-        match (total_headroom.as_mut(), headroom) {
-            (Some(total), Some(h)) => *total += h,
-            _ => total_headroom = None,
-        }
-
-        let hard_limited_secs = info
-            .hard_limited_until
-            .and_then(|until| until.checked_duration_since(Instant::now()))
-            .map(|d| d.as_secs() as f64)
-            .unwrap_or(0.0);
-        let hard_limited_active = info
-            .hard_limited_until
-            .is_some_and(|until| Instant::now() < until);
-        let stale_after_hard_limit = info
-            .hard_limited_until
-            .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
-
-        let (eff_util, _, _, _) = effective_utilization(&info, now_epoch, "");
-        let projected_throttle_secs = if eff_util < 0.5 || br_1h < 0.01 {
-            None
-        } else {
-            headroom.map(|h| {
-                if h == 0 {
-                    0.0
-                } else {
-                    (h as f64 / br_1h) * 60.0
-                }
-            })
-        };
-
-        let claims: Vec<ClaimMetricsSnap> = info
-            .claims_7d
-            .iter()
-            .map(|(k, d)| ClaimMetricsSnap {
-                key: k.clone(),
-                utilization: d.utilization,
-                waste_risk: waste_risk(d.utilization, d.reset, now_epoch),
-                reset: d.reset,
-                status: d.status.clone(),
-            })
-            .collect();
-
-        snaps.push(AcctMetricsSnap {
-            name: acct.name.clone(),
-            passthrough: acct.passthrough,
-            has_applicable_7d: !claims.is_empty()
-                || info.utilization_7d.is_some()
-                || info.reset_7d.is_some()
-                || info.status_7d.is_some(),
-            utilization: info.utilization,
-            utilization_5h: info.utilization_5h,
-            utilization_7d: info.utilization_7d,
-            reset_5h: info.reset_5h,
-            reset_7d: info.reset_7d,
-            status_5h: info.status_5h.clone(),
-            status_7d: info.status_7d.clone(),
-            stale_after_hard_limit,
-            hard_limited_active,
-            burn_rate: (br_5m, br_1h, br_6h),
-            headroom,
-            remaining_requests: info.remaining_requests,
-            remaining_tokens: info.remaining_tokens,
-            limit_requests: info.limit_requests,
-            limit_tokens: info.limit_tokens,
-            requests_total: acct.requests.load(Ordering::Relaxed),
-            hard_limited_secs,
-            projected_throttle_secs,
-            token_usage: [
-                acct.input_tokens.load(Ordering::Relaxed),
-                acct.output_tokens.load(Ordering::Relaxed),
-                acct.cache_creation_tokens.load(Ordering::Relaxed),
-                acct.cache_read_tokens.load(Ordering::Relaxed),
-            ],
-            claims,
-            last_updated_epoch: info.last_updated_epoch,
-            overage_in_use: info.overage_in_use,
-            overage_utilization: info.overage_utilization,
-        });
+    // OpenAI endpoints have a stub RateLimitInfo — their gauges read as
+    // zero/None, which is the correct representation for an endpoint with no
+    // rate-limit data.
+    for ep in &state.endpoints {
+        snaps.push(
+            build_metrics_snap(
+                &ep.name,
+                ep.passthrough,
+                &ep.rate_info,
+                &ep.burn_rate,
+                &ep.requests,
+                [
+                    &ep.input_tokens,
+                    &ep.output_tokens,
+                    &ep.cache_creation_tokens,
+                    &ep.cache_read_tokens,
+                ],
+                &ep.last_routing_weight,
+                &ep.last_routing_share,
+                &ep.last_effective_gate,
+                now_epoch,
+                &mut total_headroom,
+            )
+            .await,
+        );
     }
 
     // Extract global maps once (single lock per map, then drop guard)
@@ -5559,30 +5741,28 @@ async fn metrics_handler(
         "Effective routing gate: max(time_adjusted_5h, time_adjusted_7d) with status floors",
     );
 
-    for (acct, s) in state.accounts.iter().zip(snaps.iter()) {
+    // Snap-carried gauges (captured at snap time).
+    for s in &snaps {
         if s.passthrough {
             continue;
         }
-        let weight = f64::from_bits(acct.last_routing_weight.load(Ordering::Relaxed));
-        let share = f64::from_bits(acct.last_routing_share.load(Ordering::Relaxed));
-        let gate = f64::from_bits(acct.last_effective_gate.load(Ordering::Relaxed));
         prom_gauge(
             &mut buf,
             "anthropic_account_routing_weight",
             &[("account", &s.name)],
-            weight,
+            s.routing_weight,
         );
         prom_gauge(
             &mut buf,
             "anthropic_account_routing_share",
             &[("account", &s.name)],
-            share,
+            s.routing_share,
         );
         prom_gauge(
             &mut buf,
             "anthropic_account_effective_gate",
             &[("account", &s.name)],
-            gate,
+            s.effective_gate,
         );
     }
 
@@ -5797,22 +5977,6 @@ async fn metrics_handler(
                 limit.saturating_sub(used) as f64,
             );
         }
-    }
-
-    // Upstreams — label is "upstream" (not "name"), no base_url exposed
-    prom_header(
-        &mut buf,
-        "anthropic_upstream_requests_total",
-        "counter",
-        "Requests per upstream",
-    );
-    for u in &state.upstreams {
-        prom_counter(
-            &mut buf,
-            "anthropic_upstream_requests_total",
-            &[("upstream", &u.name)],
-            u.requests.load(Ordering::Relaxed),
-        );
     }
 
     // Cluster (Redis)
@@ -6984,6 +7148,402 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
     events
 }
 
+/// Forward one OpenAI-compat request to a single Anthropic-protocol `Endpoint`.
+/// The caller has already translated the OpenAI request into `anthropic_body`
+/// (plus the OAuth variant `oauth_anthropic_body`); this helper picks the right
+/// variant by token prefix, forwards to the endpoint, and translates the
+/// Anthropic response back to OpenAI format. Structurally similar to
+/// `forward_anthropic`, but intentionally kept separate: it speaks OpenAI on
+/// both edges (request body already translated, response translated back).
+/// `ep` is the endpoint to forward to; `endpoint_idx` is its index in
+/// `state.endpoints`. Both are required: the streaming path spawns a
+/// detached 'static task that must re-borrow the endpoint from a cloned
+/// Arc<AppState> — a borrowed &Endpoint cannot cross the spawn boundary,
+/// so the task captures the Copy `endpoint_idx` and re-indexes.
+#[allow(clippy::too_many_arguments)]
+async fn forward_openai_compat_anthropic(
+    state: &Arc<AppState>,
+    parts: &axum::http::request::Parts,
+    ep: &Endpoint,
+    endpoint_idx: usize,
+    anthropic_body: &serde_json::Value,
+    oauth_anthropic_body: &serde_json::Value,
+    req_id: &str,
+    client_id: &str,
+    client_ver: &str,
+    client_ip: &std::net::IpAddr,
+    agent_id: &str,
+    session_id: &str,
+    model: &str,
+    is_streaming: bool,
+    request_start: std::time::Instant,
+) -> ForwardOutcome {
+    let token = ep.token.as_str();
+    let passthrough = ep.passthrough;
+    let endpoint_name = ep.name.as_str();
+    let rate_info = &ep.rate_info;
+    let url = format!("{}/v1/messages", ep.base_url);
+
+    let mut headers = parts.headers.clone();
+    headers.remove("host");
+    if !passthrough {
+        headers.remove("authorization");
+        headers.remove("x-api-key");
+    }
+    headers.remove("content-length"); // body size changes after translation
+    headers.remove("accept-encoding"); // we need plaintext to translate the response
+
+    // Inject required Anthropic headers
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+
+    // Auth injection
+    inject_account_auth(&mut headers, token, passthrough);
+
+    // Use OAuth variant (with CC system prompt) for OAuth tokens
+    let req_body = if token.starts_with("sk-ant-oat") {
+        oauth_anthropic_body
+    } else {
+        anthropic_body
+    };
+    let body_str = req_body.to_string();
+    debug!(
+        account = endpoint_name,
+        model = %model,
+        body_len = body_str.len(),
+        "openai-compat: upstream request"
+    );
+
+    let upstream_req = state
+        .client
+        .request(reqwest::Method::POST, &url)
+        .headers(headers)
+        .body(body_str);
+
+    let resp = match upstream_req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(account = endpoint_name, "upstream request failed: {e}");
+            // Preserve original behavior: transport errors retry without
+            // adding the endpoint to the skip list.
+            return ForwardOutcome::Retry {
+                saw_529: false,
+                push_skip: false,
+            };
+        }
+    };
+
+    let status = resp.status();
+    ep.requests.fetch_add(1, Ordering::Relaxed);
+    state
+        .update_rate_info_for(rate_info, endpoint_name, resp.headers())
+        .await;
+
+    // Update burn rate (after rate-limit headers are parsed)
+    state.update_burn_rate(&ep.burn_rate, client_id);
+
+    // Classify 429 / 529 / other 5xx into a retry decision (shared helper).
+    let mut resp = match classify_retry_status(state, status, rate_info, endpoint_name, resp).await
+    {
+        Ok(resp) => resp,
+        Err(outcome) => return outcome,
+    };
+
+    // Clear hard limit and burst counter only on a genuine 2xx success.
+    // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
+    // that the rate-limit window has drained — don't clobber state on
+    // client errors.
+    let recovered = if status.is_success() {
+        let mut info = rate_info.write().await;
+        let was = info.hard_limited_until.is_some();
+        info.hard_limited_until = None;
+        info.consecutive_burst_429s = 0;
+        was
+    } else {
+        false
+    };
+
+    // Persist state after updating rate-limit state so completed 4xx
+    // responses and other terminal outcomes aren't dropped on restart.
+    state.save_state().await;
+
+    if recovered {
+        state.signal_hard_limit_recovery(endpoint_name).await;
+    }
+
+    // Compute budget pressure status for response header + log
+    let budget_status = {
+        let info = rate_info.read().await;
+        let (eff_util, constraint, _adj_5h, _adj_7d) =
+            effective_utilization(&info, AppState::now_epoch(), model);
+        info!(
+            req_id,
+            client = %client_ip,
+            client_id = %client_id,
+            ver = %client_ver,
+            agent = %agent_id,
+            session = %session_id,
+            model = %model,
+            account = endpoint_name,
+            status = status.as_u16(),
+            utilization = format_args!("{eff_util:.2}"),
+            util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+            util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+            constraint,
+            openai_compat = true,
+            stream = is_streaming,
+            "proxied (openai-compat)"
+        );
+        compute_pressure_status(eff_util, client_id, state)
+    };
+
+    // Non-2xx: log error detail, translate to OpenAI error format, return
+    if !status.is_success() {
+        let error_body = resp.bytes().await.unwrap_or_default();
+        let error_msg = serde_json::from_slice::<serde_json::Value>(&error_body)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/error/message")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+            });
+        warn!(
+            account = endpoint_name,
+            model = %model,
+            status = status.as_u16(),
+            error_message = ?error_msg,
+            "openai-compat: upstream error"
+        );
+
+        // Translate Anthropic error to OpenAI error format so clients
+        // (LiteLLM, etc.) can parse the actual error message.
+        let openai_error =
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&error_body) {
+                // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
+                let msg = parsed
+                    .pointer("/error/message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown upstream error");
+                let err_type = parsed
+                    .pointer("/error/type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("api_error");
+                serde_json::json!({
+                    "error": {
+                        "message": msg,
+                        "type": err_type,
+                        "param": null,
+                        "code": null
+                    }
+                })
+            } else {
+                let raw = String::from_utf8_lossy(&error_body);
+                serde_json::json!({
+                    "error": {
+                        "message": raw.as_ref(),
+                        "type": "api_error",
+                        "param": null,
+                        "code": null
+                    }
+                })
+            };
+
+        let response = Response::builder()
+            .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+            .header("content-type", "application/json")
+            .header("x-budget-status", budget_status)
+            .body(Body::from(
+                serde_json::to_vec(&openai_error).unwrap_or_default(),
+            ))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+            });
+        return ForwardOutcome::Done(response);
+    }
+
+    if is_streaming {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+        let state_clone = state.clone();
+        // The detached task can't carry the `ep` borrow across the spawn
+        // boundary; capture the Copy index and re-borrow from the owned `Arc`.
+        let client_id_clone = client_id.to_owned();
+        let acct_name = endpoint_name.to_owned();
+        let model_clone = model.to_owned();
+        let client_ip_str = client_ip.to_string();
+        let agent_clone = agent_id.to_owned();
+        let session_clone = session_id.to_owned();
+        let req_id_clone = req_id.to_owned();
+        let status_code = status.as_u16();
+
+        tokio::spawn(async move {
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut raw_sse: Vec<u8> = Vec::new();
+            let mut ctx = StreamContext::default();
+            let mut sent_done = false;
+
+            let mut client_gone = false;
+            let mut upstream_error = false;
+
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        buffer.extend_from_slice(&chunk);
+                        raw_sse.extend_from_slice(&chunk);
+
+                        while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
+                            let event = String::from_utf8_lossy(&buffer[..pos]).into_owned();
+                            buffer.drain(..pos + 2);
+
+                            if event.trim().is_empty() {
+                                continue;
+                            }
+
+                            if let Some(translated) = translate_sse_event(&event, &mut ctx) {
+                                if translated.trim() == "data: [DONE]" {
+                                    sent_done = true;
+                                }
+                                if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
+                                    client_gone = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if client_gone {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        upstream_error = true;
+                        warn!(req_id = req_id_clone, error = %e, "upstream SSE read failed");
+                        break;
+                    }
+                }
+            }
+
+            // Process any remaining data in buffer (skip if upstream errored)
+            if !upstream_error && !buffer.is_empty() {
+                let remaining = String::from_utf8_lossy(&buffer).into_owned();
+                if !remaining.trim().is_empty() {
+                    if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
+                        if translated.trim() == "data: [DONE]" {
+                            sent_done = true;
+                        }
+                        if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
+                            client_gone = true;
+                        }
+                    }
+                }
+            }
+
+            // Ensure [DONE] is always sent (skip on upstream error — would fake clean completion)
+            if !sent_done
+                && !client_gone
+                && !upstream_error
+                && tx
+                    .send(Ok(bytes::Bytes::from("data: [DONE]\n\n")))
+                    .await
+                    .is_err()
+            {
+                client_gone = true;
+            }
+
+            // Extract and record token usage from accumulated SSE data. The
+            // detached task only holds a cloned Arc<AppState>; re-index it.
+            let ep = &state_clone.endpoints[endpoint_idx];
+            finalize_stream(
+                &state_clone,
+                ep,
+                &req_id_clone,
+                &client_id_clone,
+                &model_clone,
+                &acct_name,
+                &client_ip_str,
+                &agent_clone,
+                &session_clone,
+                status_code,
+                &raw_sse,
+                request_start,
+                client_gone,
+                upstream_error,
+                true,
+            )
+            .await;
+        });
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("connection", "keep-alive")
+            .header("x-budget-status", budget_status)
+            .body(Body::from_stream(ReceiverStream::new(rx)))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+            });
+        return ForwardOutcome::Done(response);
+    }
+
+    // Non-streaming: buffer, translate, return
+    let resp_bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("failed to read upstream response: {e}");
+            return ForwardOutcome::Done(
+                (StatusCode::BAD_GATEWAY, "failed to read upstream response").into_response(),
+            );
+        }
+    };
+
+    let anthropic_resp: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("x-budget-status", budget_status)
+                .body(Body::from(resp_bytes))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+                });
+            return ForwardOutcome::Done(response);
+        }
+    };
+
+    let openai_resp = translate_anthropic_to_openai(&anthropic_resp);
+
+    // Extract and record token usage from non-streaming response
+    let usage = TokenUsage::from_response_body(&anthropic_resp);
+    finalize_non_stream(
+        state,
+        ep,
+        req_id,
+        client_id,
+        model,
+        endpoint_name,
+        &client_ip.to_string(),
+        agent_id,
+        session_id,
+        status.as_u16(),
+        &usage,
+        request_start.elapsed().as_millis() as u64,
+        true,
+    )
+    .await;
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .header("x-budget-status", budget_status)
+        .body(Body::from(
+            serde_json::to_vec(&openai_resp).unwrap_or_default(),
+        ))
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+        });
+    ForwardOutcome::Done(response)
+}
+
 async fn openai_chat_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -7094,430 +7654,98 @@ async fn openai_chat_handler(
     let mut oauth_anthropic_body = anthropic_body.clone();
     inject_oauth_system_prompt(&mut oauth_anthropic_body);
 
-    let n = state.accounts.len();
+    let n = state.endpoints.len();
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
             let delay = RETRY_529_BASE_DELAY * 2u32.pow(retry_round - 1);
             warn!(
                 retry_round = retry_round,
                 delay_ms = delay.as_millis() as u64,
-                "529 backoff: retrying all accounts"
+                "529 backoff: retrying all endpoints"
             );
             tokio::time::sleep(delay).await;
         }
-        let mut skip: Vec<Endpoint> = Vec::new();
+        let mut skip: Vec<EndpointIdx> = Vec::new();
         let mut saw_529 = false;
-        // n accounts + 1 fallback upstream is the candidate ceiling.
-        for _attempt in 0..(n + 1) {
-            let idx = match state.pick_endpoint(affinity, &model, &skip).await {
-                Some(Endpoint::Account(i)) => i,
-                Some(Endpoint::Upstream(u)) => {
-                    // All account tiers exhausted — the upstream is OpenAI-native,
-                    // so forward the original request body without translation.
-                    match try_fallback_upstream(
-                        &state,
-                        &body_bytes,
-                        &req_id,
-                        &client_id,
-                        &model,
-                        u,
-                        false,
-                    )
-                    .await
-                    {
-                        Some(resp) => return resp,
-                        None => {
-                            skip.push(Endpoint::Upstream(u));
-                            continue;
-                        }
-                    }
-                }
-                None => {
-                    warn!("all endpoints exhausted");
-                    return (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "all upstream endpoints exhausted",
-                    )
-                        .into_response();
-                }
-            };
-
-            let acct = &state.accounts[idx];
-            let url = format!("{}/v1/messages", state.upstream);
-
-            let mut headers = parts.headers.clone();
-            headers.remove("host");
-            if !acct.passthrough {
-                headers.remove("authorization");
-                headers.remove("x-api-key");
-            }
-            headers.remove("content-length"); // body size changes after translation
-            headers.remove("accept-encoding"); // we need plaintext to translate the response
-
-            // Inject required Anthropic headers
-            headers.insert("content-type", HeaderValue::from_static("application/json"));
-            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-
-            // Auth injection
-            inject_account_auth(&mut headers, &acct.token, acct.passthrough);
-
-            // Use OAuth variant (with CC system prompt) for OAuth tokens
-            let req_body = if acct.token.starts_with("sk-ant-oat") {
-                &oauth_anthropic_body
-            } else {
-                &anthropic_body
-            };
-            let body_str = req_body.to_string();
-            debug!(
-                account = acct.name,
-                model = %model,
-                body_len = body_str.len(),
-                "openai-compat: upstream request"
-            );
-
-            let upstream_req = state
-                .client
-                .request(reqwest::Method::POST, &url)
-                .headers(headers)
-                .body(body_str);
-
-            let mut resp = match upstream_req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    error!(account = acct.name, "upstream request failed: {e}");
-                    continue;
-                }
-            };
-
-            let status = resp.status();
-            acct.requests.fetch_add(1, Ordering::Relaxed);
-            state.update_rate_info(idx, resp.headers()).await;
-
-            // Update burn rate (after rate-limit headers are parsed)
-            state.update_burn_rate(acct, &client_id);
-
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                state.mark_hard_limited(idx, resp.headers()).await;
-                log_429_details(&acct.name, resp).await;
-                state.save_state().await;
-                info!(account = acct.name, "got 429, rotating to next account");
-                skip.push(Endpoint::Account(idx));
-                continue;
-            }
-
-            // 529 → overloaded, try next account; flag for BEBO retry if all exhausted
-            if status.as_u16() == 529 {
-                state.save_state().await;
-                warn!(account = acct.name, "got 529, rotating to next account");
-                saw_529 = true;
-                skip.push(Endpoint::Account(idx));
-                continue;
-            }
-
-            // Other 5xx → transient, try next account (no BEBO retry)
-            if status.is_server_error() {
-                state.save_state().await;
-                warn!(
-                    account = acct.name,
-                    status = status.as_u16(),
-                    "got server error, rotating to next account"
-                );
-                skip.push(Endpoint::Account(idx));
-                continue;
-            }
-
-            // Clear hard limit and burst counter only on a genuine 2xx success.
-            // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
-            // that the rate-limit window has drained — don't clobber state on
-            // client errors.
-            let recovered = if status.is_success() {
-                let mut info = acct.rate_info.write().await;
-                let was = info.hard_limited_until.is_some();
-                info.hard_limited_until = None;
-                info.consecutive_burst_429s = 0;
-                was
-            } else {
-                false
-            };
-
-            // Persist state after updating rate-limit state so completed 4xx
-            // responses and other terminal outcomes aren't dropped on restart.
-            state.save_state().await;
-
-            if recovered {
-                state.signal_hard_limit_recovery(acct).await;
-            }
-
-            // Compute budget pressure status for response header + log
-            let budget_status = {
-                let info = acct.rate_info.read().await;
-                let (eff_util, constraint, _adj_5h, _adj_7d) =
-                    effective_utilization(&info, AppState::now_epoch(), &model);
-                info!(
-                    req_id,
-                    client = %client_ip,
-                    client_id = %client_id,
-                    ver = %client_ver,
-                    agent = %agent_id,
-                    session = %session_id,
-                    model = %model,
-                    account = acct.name,
-                    status = status.as_u16(),
-                    utilization = format_args!("{eff_util:.2}"),
-                    util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-                    util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-                    constraint,
-                    openai_compat = true,
-                    stream = is_streaming,
-                    "proxied (openai-compat)"
-                );
-                compute_pressure_status(eff_util, &client_id, &state)
-            };
-
-            // Non-2xx: log error detail, translate to OpenAI error format, return
-            if !status.is_success() {
-                let error_body = resp.bytes().await.unwrap_or_default();
-                let error_msg = serde_json::from_slice::<serde_json::Value>(&error_body)
-                    .ok()
-                    .and_then(|v| {
-                        v.pointer("/error/message")
-                            .and_then(|m| m.as_str())
-                            .map(String::from)
-                    });
-                warn!(
-                    account = acct.name,
-                    model = %model,
-                    status = status.as_u16(),
-                    error_message = ?error_msg,
-                    "openai-compat: upstream error"
-                );
-
-                // Translate Anthropic error to OpenAI error format so clients
-                // (LiteLLM, etc.) can parse the actual error message.
-                let openai_error =
-                    if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&error_body) {
-                        // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
-                        let msg = parsed
-                            .pointer("/error/message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown upstream error");
-                        let err_type = parsed
-                            .pointer("/error/type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("api_error");
-                        serde_json::json!({
-                            "error": {
-                                "message": msg,
-                                "type": err_type,
-                                "param": null,
-                                "code": null
+        for _attempt in 0..n {
+            // Pick the next endpoint and dispatch by protocol: Anthropic
+            // endpoints resolve to a `(ForwardOutcome, EndpointIdx)` pair;
+            // OpenAI endpoints handle their `Option<Response>` inline by
+            // `return`/`continue`-ing.
+            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) =
+                match state.pick_endpoint(affinity, &model, &skip).await {
+                    Some(i) => {
+                        let ep = &state.endpoints[i];
+                        match ep.protocol {
+                            Protocol::Anthropic => {
+                                let out = forward_openai_compat_anthropic(
+                                    &state,
+                                    &parts,
+                                    ep,
+                                    i,
+                                    &anthropic_body,
+                                    &oauth_anthropic_body,
+                                    &req_id,
+                                    &client_id,
+                                    &client_ver,
+                                    &client_ip,
+                                    &agent_id,
+                                    &session_id,
+                                    &model,
+                                    is_streaming,
+                                    request_start,
+                                )
+                                .await;
+                                (out, i)
                             }
-                        })
-                    } else {
-                        let raw = String::from_utf8_lossy(&error_body);
-                        serde_json::json!({
-                            "error": {
-                                "message": raw.as_ref(),
-                                "type": "api_error",
-                                "param": null,
-                                "code": null
-                            }
-                        })
-                    };
-
-                return Response::builder()
-                    .status(
-                        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-                    )
-                    .header("content-type", "application/json")
-                    .header("x-budget-status", budget_status)
-                    .body(Body::from(
-                        serde_json::to_vec(&openai_error).unwrap_or_default(),
-                    ))
-                    .unwrap_or_else(|_| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                    });
-            }
-
-            if is_streaming {
-                let (tx, rx) =
-                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
-                let state_clone = state.clone();
-                let client_id_clone = client_id.clone();
-                let acct_name = acct.name.clone();
-                let model_clone = model.clone();
-                let client_ip_str = client_ip.to_string();
-                let agent_clone = agent_id.clone();
-                let session_clone = session_id.clone();
-
-                tokio::spawn(async move {
-                    let mut buffer: Vec<u8> = Vec::new();
-                    let mut raw_sse: Vec<u8> = Vec::new();
-                    let mut ctx = StreamContext::default();
-                    let mut sent_done = false;
-
-                    let mut client_gone = false;
-                    let mut upstream_error = false;
-
-                    loop {
-                        match resp.chunk().await {
-                            Ok(Some(chunk)) => {
-                                buffer.extend_from_slice(&chunk);
-                                raw_sse.extend_from_slice(&chunk);
-
-                                while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
-                                    let event =
-                                        String::from_utf8_lossy(&buffer[..pos]).into_owned();
-                                    buffer.drain(..pos + 2);
-
-                                    if event.trim().is_empty() {
+                            Protocol::OpenAI => {
+                                // The endpoint is OpenAI-native — forward the
+                                // original request body without translation.
+                                match try_fallback_upstream(
+                                    &state,
+                                    &body_bytes,
+                                    &req_id,
+                                    &client_id,
+                                    &model,
+                                    i,
+                                    false,
+                                )
+                                .await
+                                {
+                                    Some(resp) => return resp,
+                                    None => {
+                                        skip.push(i);
                                         continue;
                                     }
-
-                                    if let Some(translated) = translate_sse_event(&event, &mut ctx)
-                                    {
-                                        if translated.trim() == "data: [DONE]" {
-                                            sent_done = true;
-                                        }
-                                        if tx
-                                            .send(Ok(bytes::Bytes::from(translated)))
-                                            .await
-                                            .is_err()
-                                        {
-                                            client_gone = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if client_gone {
-                                    break;
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                upstream_error = true;
-                                warn!(req_id, error = %e, "upstream SSE read failed");
-                                break;
-                            }
-                        }
-                    }
-
-                    // Process any remaining data in buffer (skip if upstream errored)
-                    if !upstream_error && !buffer.is_empty() {
-                        let remaining = String::from_utf8_lossy(&buffer).into_owned();
-                        if !remaining.trim().is_empty() {
-                            if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
-                                if translated.trim() == "data: [DONE]" {
-                                    sent_done = true;
-                                }
-                                if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
-                                    client_gone = true;
                                 }
                             }
                         }
                     }
-
-                    // Ensure [DONE] is always sent (skip on upstream error — would fake clean completion)
-                    if !sent_done
-                        && !client_gone
-                        && !upstream_error
-                        && tx
-                            .send(Ok(bytes::Bytes::from("data: [DONE]\n\n")))
-                            .await
-                            .is_err()
-                    {
-                        client_gone = true;
+                    None => {
+                        warn!("all endpoints exhausted");
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "all upstream endpoints exhausted",
+                        )
+                            .into_response();
                     }
+                };
 
-                    // Extract and record token usage from accumulated SSE data
-                    finalize_stream(
-                        &state_clone,
-                        idx,
-                        &req_id,
-                        &client_id_clone,
-                        &model_clone,
-                        &acct_name,
-                        &client_ip_str,
-                        &agent_clone,
-                        &session_clone,
-                        status.as_u16(),
-                        &raw_sse,
-                        request_start,
-                        client_gone,
-                        upstream_error,
-                        true,
-                    )
-                    .await;
-                });
-
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/event-stream")
-                    .header("cache-control", "no-cache")
-                    .header("connection", "keep-alive")
-                    .header("x-budget-status", budget_status)
-                    .body(Body::from_stream(ReceiverStream::new(rx)))
-                    .unwrap_or_else(|_| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                    });
+            match outcome {
+                ForwardOutcome::Done(resp) => return resp,
+                ForwardOutcome::Retry {
+                    saw_529: this_529,
+                    push_skip,
+                } => {
+                    if this_529 {
+                        saw_529 = true;
+                    }
+                    if push_skip {
+                        skip.push(picked_idx);
+                    }
+                    continue;
+                }
             }
-
-            // Non-streaming: buffer, translate, return
-            let resp_bytes = match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    error!("failed to read upstream response: {e}");
-                    return (StatusCode::BAD_GATEWAY, "failed to read upstream response")
-                        .into_response();
-                }
-            };
-
-            let anthropic_resp: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
-                Ok(v) => v,
-                Err(_) => {
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .header("x-budget-status", budget_status)
-                        .body(Body::from(resp_bytes))
-                        .unwrap_or_else(|_| {
-                            (StatusCode::INTERNAL_SERVER_ERROR, "response build error")
-                                .into_response()
-                        });
-                }
-            };
-
-            let openai_resp = translate_anthropic_to_openai(&anthropic_resp);
-
-            // Extract and record token usage from non-streaming response
-            let usage = TokenUsage::from_response_body(&anthropic_resp);
-            finalize_non_stream(
-                &state,
-                idx,
-                &req_id,
-                &client_id,
-                &model,
-                &acct.name,
-                &client_ip.to_string(),
-                &agent_id,
-                &session_id,
-                status.as_u16(),
-                &usage,
-                request_start.elapsed().as_millis() as u64,
-                true,
-            )
-            .await;
-
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .header("x-budget-status", budget_status)
-                .body(Body::from(
-                    serde_json::to_vec(&openai_resp).unwrap_or_default(),
-                ))
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                });
         }
         if !saw_529 {
             break;
@@ -7529,6 +7757,103 @@ async fn openai_chat_handler(
 
 // ── Main ────────────────────────────────────────────────────────────
 
+/// Validate endpoint configuration. Returns the first hard error encountered.
+/// Soft warnings (non-canonical anthropic host, priority collision with an
+/// openai endpoint) are emitted as `warn!` and do not return an error.
+fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
+    for ep in endpoints {
+        if let Some(url) = ep.base_url.as_deref() {
+            if !url.starts_with("https://") {
+                return Err(format!(
+                    "endpoint '{}': base_url must start with https:// (got '{}')",
+                    ep.name, url
+                ));
+            }
+        }
+        match ep.protocol {
+            Protocol::OpenAI => {
+                if ep.base_url.is_none() {
+                    return Err(format!(
+                        "endpoint '{}': base_url is required for protocol = openai",
+                        ep.name
+                    ));
+                }
+            }
+            Protocol::Anthropic => {
+                if let Some(url) = ep.base_url.as_deref() {
+                    // Parse the URL and compare hosts exactly. A naive
+                    // `starts_with("https://api.anthropic.com")` would accept
+                    // `https://api.anthropic.com.evil.example` as canonical.
+                    let host = reqwest::Url::parse(url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(str::to_string));
+                    if host.as_deref() != Some("api.anthropic.com") {
+                        warn!(
+                            endpoint = ep.name,
+                            base_url = url,
+                            "anthropic endpoint base_url is non-canonical — verify this is intentional"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Priority-collision warning: an OpenAI endpoint sharing the lowest tier
+    // with any Anthropic endpoint recreates the bug §Problem cites.
+    let lowest = endpoints.iter().map(|e| e.priority).min().unwrap_or(0);
+    let openai_at_lowest: Vec<&str> = endpoints
+        .iter()
+        .filter(|e| e.protocol == Protocol::OpenAI && e.priority == lowest)
+        .map(|e| e.name.as_str())
+        .collect();
+    let anthropic_at_lowest: Vec<&str> = endpoints
+        .iter()
+        .filter(|e| e.protocol == Protocol::Anthropic && e.priority == lowest)
+        .map(|e| e.name.as_str())
+        .collect();
+    if !openai_at_lowest.is_empty() && !anthropic_at_lowest.is_empty() {
+        warn!(
+            priority = lowest,
+            openai = ?openai_at_lowest,
+            anthropic = ?anthropic_at_lowest,
+            "openai endpoint(s) share the lowest priority tier with anthropic endpoint(s) — paid OpenAI capacity will compete with free Anthropic capacity"
+        );
+    }
+    Ok(())
+}
+
+/// Reject removed config keys with explicit errors. Run after the raw TOML
+/// has been parsed to a `toml::Value`, before strongly-typed deserialization.
+///
+/// `serde` silently drops unknown keys by default; this gives the operator
+/// a clear migration message instead of a silent misconfiguration.
+fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
+    let table = match value.as_table() {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    if table.contains_key("accounts") {
+        return Err(
+            "config: [[accounts]] is no longer supported — use [[endpoints]] (see CLAUDE.md)"
+                .to_string(),
+        );
+    }
+    if table.contains_key("upstreams") {
+        return Err(
+            "config: [[upstreams]] is no longer supported — use [[endpoints]] with protocol = \"openai\" (see CLAUDE.md)"
+                .to_string(),
+        );
+    }
+    if table.contains_key("fallback_upstream") {
+        return Err(
+            "config: fallback_upstream is no longer supported — set a high priority on the OpenAI endpoint instead (see CLAUDE.md)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     // Parse config first so debug_log path is available for tracing setup
@@ -7537,8 +7862,17 @@ async fn main() {
         .unwrap_or_else(|| "config.toml".to_string());
     let config_str = std::fs::read_to_string(&config_path)
         .unwrap_or_else(|e| panic!("failed to read {config_path}: {e}"));
-    let config: Config =
-        toml::from_str(&config_str).unwrap_or_else(|e| panic!("invalid config: {e}"));
+    let raw_value: toml::Value =
+        toml::from_str(&config_str).unwrap_or_else(|e| panic!("config parse error: {e}"));
+    if let Err(msg) = reject_legacy_config_keys(&raw_value) {
+        panic!("{msg}");
+    }
+    let config: Config = raw_value
+        .try_into()
+        .unwrap_or_else(|e| panic!("config parse error: {e}"));
+    if let Err(msg) = validate_endpoints(&config.endpoints) {
+        panic!("{msg}");
+    }
 
     // Set up tracing: stderr (info+) always, plus optional debug log file
     {
@@ -7570,7 +7904,10 @@ async fn main() {
     let routing_strategy = RoutingStrategy::parse(config.strategy.as_deref())
         .unwrap_or_else(|e| panic!("invalid strategy: {e}"));
 
-    assert!(!config.accounts.is_empty(), "at least one account required");
+    assert!(
+        !config.endpoints.is_empty(),
+        "at least one [[endpoints]] entry required"
+    );
 
     // Validate new config fields
     for (client, limit) in &config.client_utilization_limits {
@@ -7615,22 +7952,38 @@ async fn main() {
         info!(count = allowed_ips.len(), "IP allowlist enabled");
     }
 
-    let accounts: Vec<Account> = config
-        .accounts
-        .into_iter()
-        .map(|a| {
-            let passthrough = a.token == "passthrough";
-            if !a.models.is_empty() || a.priority > 0 {
-                info!(name = a.name, passthrough, priority = a.priority, models = ?a.models, "loaded account");
-            } else {
-                info!(name = a.name, passthrough, "loaded account");
-            }
-            Account {
-                name: a.name,
+    // Build the unified endpoint vector from the [[endpoints]] config.
+    let endpoints: Vec<Endpoint> = config
+        .endpoints
+        .iter()
+        .map(|ec| {
+            let passthrough = ec.token == "passthrough";
+            let base_url = match ec.protocol {
+                Protocol::Anthropic => ec
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
+                Protocol::OpenAI => ec.base_url.clone().expect(
+                    "validate_endpoints should have rejected an openai endpoint without base_url",
+                ),
+            };
+            info!(
+                name = ec.name,
+                protocol = ?ec.protocol,
+                base_url = base_url.as_str(),
+                priority = ec.priority,
                 passthrough,
-                models: a.models,
-                priority: a.priority,
-                token: a.token,
+                models = ?ec.models,
+                "loaded endpoint"
+            );
+            Endpoint {
+                name: ec.name.clone(),
+                protocol: ec.protocol,
+                base_url: base_url.trim_end_matches('/').to_string(),
+                token: ec.token.clone(),
+                passthrough,
+                models: ec.models.clone(),
+                priority: ec.priority,
                 requests: AtomicU64::new(0),
                 rate_info: RwLock::new(RateLimitInfo::default()),
                 burn_rate: Mutex::new(BurnRate::new()),
@@ -7645,21 +7998,6 @@ async fn main() {
         })
         .collect();
 
-    let upstreams: Vec<Upstream> = config
-        .upstreams
-        .iter()
-        .map(|u| {
-            info!(name = u.name, base_url = u.base_url, "loaded upstream");
-            Upstream {
-                name: u.name.clone(),
-                base_url: u.base_url.clone(),
-                api_key: u.api_key.clone(),
-                priority: u.priority,
-                requests: AtomicU64::new(0),
-            }
-        })
-        .collect();
-
     if config.proxy_key.is_some() {
         info!("proxy authentication enabled (x-api-key)");
     } else {
@@ -7668,8 +8006,7 @@ async fn main() {
 
     info!(
         strategy = routing_strategy.as_str(),
-        num_accounts = accounts.len(),
-        num_upstreams = upstreams.len(),
+        num_endpoints = endpoints.len(),
         "routing strategy selected"
     );
 
@@ -7733,55 +8070,18 @@ async fn main() {
         None
     };
 
-    // Resolve fallback_upstream name to index
-    let fallback_upstream_idx = config.fallback_upstream.as_ref().map(|name| {
-        upstreams
-            .iter()
-            .position(|u| u.name == *name)
-            .unwrap_or_else(|| {
-                panic!(
-                    "fallback_upstream '{}' not found in [[upstreams]] — available: {:?}",
-                    name,
-                    upstreams.iter().map(|u| &u.name).collect::<Vec<_>>()
-                )
-            })
-    });
-    if let Some(idx) = fallback_upstream_idx {
-        info!(
-            upstream = upstreams[idx].name,
-            base_url = upstreams[idx].base_url,
-            priority = upstreams[idx].priority,
-            "fallback upstream configured"
-        );
-        // Guardrail: the fallback upstream is a paid endpoint. If its priority is
-        // not strictly above every account's, it shares (or beats) the free tier
-        // and leaks paid traffic. Warn loudly — it should be set high (e.g. 100).
-        let max_acct_priority = accounts.iter().map(|a| a.priority).max().unwrap_or(0);
-        if upstreams[idx].priority <= max_acct_priority {
-            warn!(
-                upstream = upstreams[idx].name,
-                upstream_priority = upstreams[idx].priority,
-                max_account_priority = max_acct_priority,
-                "fallback upstream priority is not above account priorities — it will \
-                 compete with (or preempt) free accounts; set a higher priority"
-            );
-        }
-    }
-
     let state = Arc::new(AppState {
         client: Client::builder()
             .timeout(Duration::from_secs(600))
             .build()
             .expect("failed to build HTTP client"),
-        upstream: config.upstream,
-        accounts,
+        endpoints,
         robin: AtomicUsize::new(0),
         routing_strategy,
         cooldown,
         state_path,
         proxy_key: config.proxy_key.clone(),
         allowed_ips,
-        upstreams,
         client_names: config.client_names.clone(),
         auto_cache: config.auto_cache.unwrap_or(true),
         client_usage: Mutex::new(HashMap::new()),
@@ -7806,7 +8106,6 @@ async fn main() {
             RandomState::new().build_hasher().finish() as u16
         },
         probe_interval_secs: config.probe_interval_secs.unwrap_or(300),
-        fallback_upstream: fallback_upstream_idx,
         overage_penalty: config.overage_penalty.unwrap_or(10),
     });
 
@@ -7827,7 +8126,6 @@ async fn main() {
             "/v1/chat/completions",
             axum::routing::post(openai_chat_handler),
         )
-        .route("/upstream/{name}/{*rest}", any(upstream_handler))
         .fallback(any(proxy_handler))
         .with_state(state.clone());
 
@@ -7847,27 +8145,28 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
 
-    // Spawn periodic probe task
+    // Spawn periodic probe task. `probe_endpoint` internally skips OpenAI
+    // endpoints (they expose no Anthropic rate-limit headers).
     let probe_interval = config.probe_interval_secs.unwrap_or(300);
     if probe_interval > 0 {
         let probe_state = state.clone();
-        let n_accounts = probe_state.accounts.len();
+        let n_endpoints = probe_state.endpoints.len();
         tokio::spawn(async move {
             const PROBE_MODELS: &[&str] =
                 &["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6"];
-            // Stagger initial probes: wait 10s then probe all accounts
+            // Stagger initial probes: wait 10s then probe all endpoints
             tokio::time::sleep(Duration::from_secs(10)).await;
             info!(
                 interval_secs = probe_interval,
                 "starting utilization probes"
             );
             loop {
-                for i in 0..n_accounts {
-                    let acct = &probe_state.accounts[i];
-                    // Probe all model families per account per cycle
+                for i in 0..n_endpoints {
+                    let ep = &probe_state.endpoints[i];
+                    // Probe all model families per endpoint per cycle
                     for model in PROBE_MODELS {
-                        if acct.serves_model(model) {
-                            probe_state.probe_account(i, model).await;
+                        if ep.serves_model(model) {
+                            probe_state.probe_endpoint(i, model).await;
                             tokio::time::sleep(Duration::from_secs(2)).await;
                         }
                     }
@@ -7881,8 +8180,8 @@ async fn main() {
             }
         });
     } else {
-        // Probes disabled — but `update_rate_info()` still refreshes data on
-        // every inbound request. Without this fallback ticker the routing
+        // Probes disabled — but `update_rate_info_for()` still refreshes data
+        // on every inbound request. Without this fallback ticker the routing
         // weight gauges would freeze at startup values forever.
         let metrics_state = state.clone();
         tokio::spawn(async move {
@@ -7954,11 +8253,207 @@ async fn main() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn protocol_deserializes_lowercase_strings() {
+        let p: Protocol = serde_json::from_str(r#""anthropic""#).unwrap();
+        assert_eq!(p, Protocol::Anthropic);
+        let p: Protocol = serde_json::from_str(r#""openai""#).unwrap();
+        assert_eq!(p, Protocol::OpenAI);
+    }
+
+    #[test]
+    fn protocol_default_is_anthropic() {
+        assert_eq!(Protocol::default(), Protocol::Anthropic);
+        assert_ne!(Protocol::default(), Protocol::OpenAI);
+    }
+
+    #[test]
+    fn endpoint_config_parses_minimal_anthropic_block() {
+        let toml_str = r#"
+listen = "0.0.0.0:8080"
+upstream = "https://api.anthropic.com"
+accounts = []
+
+[[endpoints]]
+name = "primary"
+token = "sk-ant-test"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.endpoints.len(), 1);
+        assert_eq!(cfg.endpoints[0].name, "primary");
+        assert_eq!(cfg.endpoints[0].protocol, Protocol::Anthropic);
+        assert_eq!(cfg.endpoints[0].base_url, None);
+        assert_eq!(cfg.endpoints[0].token, "sk-ant-test");
+        assert!(cfg.endpoints[0].models.is_empty());
+        assert_eq!(cfg.endpoints[0].priority, 0);
+    }
+
+    #[test]
+    fn endpoint_config_parses_openai_with_base_url() {
+        let toml_str = r#"
+listen = "0.0.0.0:8080"
+upstream = "https://api.anthropic.com"
+accounts = []
+
+[[endpoints]]
+name = "gateway"
+protocol = "openai"
+base_url = "https://gateway.example.com"
+token = "sk-test"
+priority = 100
+models = ["claude-opus-*"]
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let ep = &cfg.endpoints[0];
+        assert_eq!(ep.protocol, Protocol::OpenAI);
+        assert_eq!(ep.base_url.as_deref(), Some("https://gateway.example.com"));
+        assert_eq!(ep.priority, 100);
+        assert_eq!(ep.models, vec!["claude-opus-*".to_string()]);
+    }
+
+    #[test]
+    fn config_rejects_legacy_accounts_block() {
+        let toml_str = r#"
+listen = "0.0.0.0:8080"
+upstream = "https://api.anthropic.com"
+
+[[accounts]]
+name = "primary"
+token = "sk-ant-test"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = reject_legacy_config_keys(&value).unwrap_err();
+        assert!(
+            err.contains("accounts"),
+            "error must name 'accounts': {err}"
+        );
+        assert!(
+            err.contains("endpoints"),
+            "error must mention replacement: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_legacy_upstreams_block() {
+        let toml_str = r#"
+listen = "0.0.0.0:8080"
+upstream = "https://api.anthropic.com"
+
+[[upstreams]]
+name = "fallback"
+base_url = "https://example.com"
+api_key = "key"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = reject_legacy_config_keys(&value).unwrap_err();
+        assert!(err.contains("upstreams"));
+        assert!(err.contains("endpoints"));
+    }
+
+    #[test]
+    fn config_rejects_fallback_upstream_key() {
+        let toml_str = r#"
+listen = "0.0.0.0:8080"
+upstream = "https://api.anthropic.com"
+fallback_upstream = "anything"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = reject_legacy_config_keys(&value).unwrap_err();
+        assert!(err.contains("fallback_upstream"));
+        assert!(err.contains("priority"));
+    }
+
+    #[test]
+    fn config_accepts_endpoints_only_schema() {
+        let toml_str = r#"
+listen = "0.0.0.0:8080"
+upstream = "https://api.anthropic.com"
+
+[[endpoints]]
+name = "primary"
+token = "sk-ant-test"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        assert!(reject_legacy_config_keys(&value).is_ok());
+    }
+
+    #[test]
+    fn validate_endpoints_warns_on_non_anthropic_host() {
+        let endpoints = vec![EndpointConfig {
+            name: "primary".to_string(),
+            protocol: Protocol::Anthropic,
+            base_url: Some("https://staging.anthropic.example".to_string()),
+            token: "sk-ant".to_string(),
+            models: vec![],
+            priority: 0,
+        }];
+        assert!(validate_endpoints(&endpoints).is_ok());
+    }
+
+    #[test]
+    fn validate_endpoints_rejects_http_base_url() {
+        let endpoints = vec![EndpointConfig {
+            name: "primary".to_string(),
+            protocol: Protocol::Anthropic,
+            base_url: Some("http://insecure.example".to_string()),
+            token: "sk-ant".to_string(),
+            models: vec![],
+            priority: 0,
+        }];
+        let err = validate_endpoints(&endpoints).unwrap_err();
+        assert!(err.contains("https"), "error must mention https: {err}");
+        assert!(err.contains("primary"));
+    }
+
+    #[test]
+    fn validate_endpoints_requires_base_url_for_openai() {
+        let endpoints = vec![EndpointConfig {
+            name: "gateway".to_string(),
+            protocol: Protocol::OpenAI,
+            base_url: None,
+            token: "sk-test".to_string(),
+            models: vec![],
+            priority: 100,
+        }];
+        let err = validate_endpoints(&endpoints).unwrap_err();
+        assert!(err.contains("base_url"));
+        assert!(err.contains("gateway"));
+    }
+
+    #[test]
+    fn validate_endpoints_accepts_well_formed_mix() {
+        let endpoints = vec![
+            EndpointConfig {
+                name: "primary".to_string(),
+                protocol: Protocol::Anthropic,
+                base_url: None,
+                token: "sk-ant".to_string(),
+                models: vec![],
+                priority: 0,
+            },
+            EndpointConfig {
+                name: "gateway".to_string(),
+                protocol: Protocol::OpenAI,
+                base_url: Some("https://gateway.example".to_string()),
+                token: "sk-test".to_string(),
+                models: vec![],
+                priority: 100,
+            },
+        ];
+        assert!(validate_endpoints(&endpoints).is_ok());
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────
 
-    fn make_account(name: &str, token: &str) -> Account {
-        Account {
+    /// Build an Anthropic-protocol `Endpoint` with the given name and token.
+    /// Token prefix drives auth behavior (`sk-ant-oat*` = OAuth,
+    /// `"passthrough"` = passthrough). Callers that need a non-default field
+    /// (priority, base_url, models) mutate the returned struct.
+    fn mk_endpoint(name: &str, token: &str) -> Endpoint {
+        Endpoint {
             name: name.to_string(),
+            protocol: Protocol::Anthropic,
+            base_url: "https://api.anthropic.com".to_string(),
             token: token.to_string(),
             passthrough: token == "passthrough",
             models: vec![],
@@ -7976,8 +8471,44 @@ mod tests {
         }
     }
 
+    /// Anthropic-protocol `Endpoint` whose `base_url` points at a given
+    /// upstream — for integration tests that forward to a mock server.
+    fn mk_endpoint_at(name: &str, token: &str, base_url: &str) -> Endpoint {
+        let mut ep = mk_endpoint(name, token);
+        ep.base_url = base_url.to_string();
+        ep
+    }
+
+    /// Shared fixture for the `Endpoint` pool, parameterized by protocol.
+    /// Callers that need a non-default field (priority, token, base_url,
+    /// models) mutate the returned struct.
+    fn make_endpoint(name: &str, protocol: Protocol) -> Endpoint {
+        Endpoint {
+            name: name.to_string(),
+            protocol,
+            base_url: match protocol {
+                Protocol::Anthropic => "https://api.anthropic.com".to_string(),
+                Protocol::OpenAI => "https://gateway.example".to_string(),
+            },
+            token: "sk-test".to_string(),
+            passthrough: false,
+            models: vec![],
+            priority: 0,
+            requests: AtomicU64::new(0),
+            rate_info: RwLock::new(RateLimitInfo::default()),
+            burn_rate: Mutex::new(BurnRate::new()),
+            input_tokens: AtomicU64::new(0),
+            output_tokens: AtomicU64::new(0),
+            cache_creation_tokens: AtomicU64::new(0),
+            cache_read_tokens: AtomicU64::new(0),
+            last_routing_weight: AtomicU64::new(0),
+            last_routing_share: AtomicU64::new(0),
+            last_effective_gate: AtomicU64::new(0),
+        }
+    }
+
     fn test_state_with_strategy(
-        accounts: Vec<Account>,
+        endpoints: Vec<Endpoint>,
         routing_strategy: RoutingStrategy,
     ) -> Arc<AppState> {
         Arc::new(AppState {
@@ -7985,15 +8516,13 @@ mod tests {
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(), // unused in unit tests
-            accounts,
+            endpoints,
             robin: AtomicUsize::new(0),
             routing_strategy,
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -8012,35 +8541,19 @@ mod tests {
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         })
     }
 
-    fn test_state_with(accounts: Vec<Account>) -> Arc<AppState> {
-        test_state_with_strategy(accounts, RoutingStrategy::default())
+    fn test_state_with(endpoints: Vec<Endpoint>) -> Arc<AppState> {
+        test_state_with_strategy(endpoints, RoutingStrategy::default())
     }
 
-    fn test_state_with_soft_limit(accounts: Vec<Account>, soft_limit: f64) -> Arc<AppState> {
-        let mut state = test_state_with(accounts);
+    fn test_state_with_soft_limit(endpoints: Vec<Endpoint>, soft_limit: f64) -> Arc<AppState> {
+        let mut state = test_state_with(endpoints);
         Arc::get_mut(&mut state)
             .expect("test fixture should be uniquely owned")
             .soft_limit = soft_limit;
-        state
-    }
-
-    /// Test state with a single fallback upstream registered at `upstream_priority`.
-    fn test_state_with_fallback(accounts: Vec<Account>, upstream_priority: u32) -> Arc<AppState> {
-        let mut state = test_state_with(accounts);
-        let st = Arc::get_mut(&mut state).expect("test fixture should be uniquely owned");
-        st.upstreams.push(Upstream {
-            name: "fallback".to_string(),
-            base_url: "http://127.0.0.1:1".to_string(),
-            api_key: "test".to_string(),
-            priority: upstream_priority,
-            requests: AtomicU64::new(0),
-        });
-        st.fallback_upstream = Some(0);
         state
     }
 
@@ -8094,37 +8607,31 @@ mod tests {
         resp
     }
 
-    /// Build the full app router against a given upstream URL.
+    /// Build the full app router against a given upstream URL. The two
+    /// Anthropic endpoints both point at `upstream_url` (the mock upstream).
     fn test_app_with_strategy(
         upstream_url: &str,
         proxy_key: Option<String>,
         routing_strategy: RoutingStrategy,
     ) -> (Router, Arc<AppState>) {
-        let accounts = vec![
-            make_account("acct-a", "sk-ant-api-test-aaa"),
-            make_account("acct-b", "sk-ant-api-test-bbb"),
-        ];
+        let mut acct_a = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
+        acct_a.base_url = upstream_url.to_string();
+        let mut acct_b = mk_endpoint("acct-b", "sk-ant-api-test-bbb");
+        acct_b.base_url = upstream_url.to_string();
+        let endpoints = vec![acct_a, acct_b];
 
         let state = Arc::new(AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: upstream_url.to_string(),
-            accounts,
+            endpoints,
             robin: AtomicUsize::new(0),
             routing_strategy,
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key,
             allowed_ips: vec![],
-            upstreams: vec![Upstream {
-                name: "mock".to_string(),
-                base_url: upstream_url.to_string(),
-                api_key: "test-key".to_string(),
-                priority: 0,
-                requests: AtomicU64::new(0),
-            }],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -8143,7 +8650,6 @@ mod tests {
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -8160,7 +8666,6 @@ mod tests {
                 "/v1/chat/completions",
                 axum::routing::post(openai_chat_handler),
             )
-            .route("/upstream/{name}/{*rest}", any(upstream_handler))
             .fallback(any(proxy_handler))
             .with_state(state)
     }
@@ -8200,7 +8705,7 @@ mod tests {
 
     #[test]
     fn empty_allowlist_allows_all() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         assert!(state.is_ip_allowed(&"192.168.1.1".parse().unwrap()));
         assert!(state.is_ip_allowed(&"8.8.8.8".parse().unwrap()));
     }
@@ -8212,15 +8717,13 @@ mod tests {
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![IpAllowEntry::Addr("10.0.0.1".parse().unwrap())],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -8239,7 +8742,6 @@ mod tests {
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
@@ -8253,23 +8755,23 @@ mod tests {
         // With weighted buckets, the account with more headroom should get
         // a proportionally larger share of traffic
         let state = test_state_with(vec![
-            make_account("high", "sk-ant-api-high"),
-            make_account("low", "sk-ant-api-low"),
+            mk_endpoint("high", "sk-ant-api-high"),
+            mk_endpoint("low", "sk-ant-api-low"),
         ]);
 
         // high=0.8 (headroom 0.2), low=0.2 (headroom 0.8) → 80% should go to "low"
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.8);
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization = Some(0.2);
         }
 
         let mut counts = [0u32; 2];
         for _ in 0..1000 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             counts[idx] += 1;
         }
 
@@ -8285,22 +8787,22 @@ mod tests {
     #[tokio::test]
     async fn pick_skips_hard_limited() {
         let state = test_state_with(vec![
-            make_account("limited", "sk-ant-api-a"),
-            make_account("available", "sk-ant-api-b"),
+            mk_endpoint("limited", "sk-ant-api-a"),
+            mk_endpoint("available", "sk-ant-api-b"),
         ]);
 
         // Hard-limit the first account
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.1); // great utilization but hard-limited
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization = Some(0.9);
         }
 
-        let idx = state.pick_account(None, "", &[]).await.unwrap();
+        let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
         assert_eq!(
             idx, 1,
             "should skip hard-limited account despite lower utilization"
@@ -8311,15 +8813,15 @@ mod tests {
     async fn pick_round_robin_when_no_info() {
         // With no utilization data, all accounts get headroom=0.5 (equal buckets)
         let state = test_state_with(vec![
-            make_account("a", "sk-ant-api-a"),
-            make_account("b", "sk-ant-api-b"),
-            make_account("c", "sk-ant-api-c"),
+            mk_endpoint("a", "sk-ant-api-a"),
+            mk_endpoint("b", "sk-ant-api-b"),
+            mk_endpoint("c", "sk-ant-api-c"),
         ]);
 
         // Call many times without affinity — Fibonacci scatter should distribute evenly
         let mut counts = [0u32; 3];
         for _ in 0..300 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             counts[idx] += 1;
         }
 
@@ -8338,28 +8840,28 @@ mod tests {
     #[tokio::test]
     async fn pick_returns_none_when_all_limited() {
         let state = test_state_with(vec![
-            make_account("a", "sk-ant-api-a"),
-            make_account("b", "sk-ant-api-b"),
+            mk_endpoint("a", "sk-ant-api-a"),
+            mk_endpoint("b", "sk-ant-api-b"),
         ]);
 
-        for acct in &state.accounts {
+        for acct in &state.endpoints {
             let mut info = acct.rate_info.write().await;
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
         }
 
-        assert!(state.pick_account(None, "", &[]).await.is_none());
+        assert!(state.pick_endpoint(None, "", &[]).await.is_none());
     }
 
     #[tokio::test]
     async fn pick_recovers_after_hard_limit_expires() {
         // After a hard limit expires with stale data, the account should still be
         // selectable with 0.5 (unknown) utilization instead of being permanently stuck.
-        let state = test_state_with(vec![make_account("recovering", "sk-ant-api-a")]);
+        let state = test_state_with(vec![mk_endpoint("recovering", "sk-ant-api-a")]);
 
         // Simulate mark_hard_limited: set hard_limited_until in the past (expired),
         // poison remaining_tokens to 0, set high utilization from the 429 response.
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             let hard_limit_time = Instant::now() - Duration::from_secs(10);
             info.hard_limited_until = Some(hard_limit_time);
             info.remaining_tokens = Some(0);
@@ -8370,7 +8872,7 @@ mod tests {
             info.last_updated = Some(hard_limit_time - Duration::from_secs(1));
         }
 
-        let result = state.pick_account(None, "", &[]).await;
+        let result = state.pick_endpoint(None, "", &[]).await;
         assert!(
             result.is_some(),
             "account with expired hard limit should be selectable despite stale high utilization"
@@ -8381,11 +8883,11 @@ mod tests {
     async fn pick_ignores_stale_rejected_claim_after_hard_limit() {
         // A "rejected" 7d claim from a 429 response should not permanently block the
         // account once the hard limit has expired without fresh data.
-        let state = test_state_with(vec![make_account("recovering", "sk-ant-api-a")]);
+        let state = test_state_with(vec![mk_endpoint("recovering", "sk-ant-api-a")]);
         let now_epoch = AppState::now_epoch();
 
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             let hard_limit_time = Instant::now() - Duration::from_secs(10);
             info.hard_limited_until = Some(hard_limit_time);
             info.last_updated = Some(hard_limit_time - Duration::from_secs(1));
@@ -8403,7 +8905,7 @@ mod tests {
         }
 
         let result = state
-            .pick_account(Some("test"), "claude-sonnet-4-6", &[])
+            .pick_endpoint(Some("test"), "claude-sonnet-4-6", &[])
             .await;
         assert!(
             result.is_some(),
@@ -8416,13 +8918,13 @@ mod tests {
         // If data was refreshed AFTER the hard limit (e.g., by a probe that got fresh
         // "rejected" status), the account should still be skipped.
         let state = test_state_with(vec![
-            make_account("rejected", "sk-ant-api-a"),
-            make_account("available", "sk-ant-api-b"),
+            mk_endpoint("rejected", "sk-ant-api-a"),
+            mk_endpoint("available", "sk-ant-api-b"),
         ]);
         let now_epoch = AppState::now_epoch();
 
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             let hard_limit_time = Instant::now() - Duration::from_secs(300);
             info.hard_limited_until = Some(hard_limit_time);
             // last_updated AFTER the hard limit → data is fresh, not stale
@@ -8440,12 +8942,12 @@ mod tests {
             );
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization = Some(0.5);
         }
 
         let result = state
-            .pick_account(Some("test"), "claude-sonnet-4-6", &[])
+            .pick_endpoint(Some("test"), "claude-sonnet-4-6", &[])
             .await;
         assert_eq!(
             result,
@@ -8457,13 +8959,13 @@ mod tests {
     #[tokio::test]
     async fn pick_ignores_expired_rejected_claim_without_hard_limit() {
         let state = test_state_with(vec![
-            make_account("recovered", "sk-ant-api-a"),
-            make_account("available", "sk-ant-api-b"),
+            mk_endpoint("recovered", "sk-ant-api-a"),
+            mk_endpoint("available", "sk-ant-api-b"),
         ]);
         let now_epoch = AppState::now_epoch();
 
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.30);
             info.utilization_5h = Some(0.30);
             info.reset_5h = Some(now_epoch + 10000);
@@ -8478,14 +8980,14 @@ mod tests {
             );
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization = Some(0.80);
             info.utilization_5h = Some(0.80);
             info.reset_5h = Some(now_epoch + 10000);
         }
 
         let result = state
-            .pick_account(Some("test"), "claude-sonnet-4-6", &[])
+            .pick_endpoint(Some("test"), "claude-sonnet-4-6", &[])
             .await;
         assert_eq!(
             result,
@@ -8499,18 +9001,18 @@ mod tests {
         // After a probe clears hard_limited_until and refreshes data, the normal
         // routing logic should apply (not the 0.5 fallback).
         let state = test_state_with(vec![
-            make_account("low_util", "sk-ant-api-a"),
-            make_account("high_util", "sk-ant-api-b"),
+            mk_endpoint("low_util", "sk-ant-api-a"),
+            mk_endpoint("high_util", "sk-ant-api-b"),
         ]);
 
         {
             // hard_limited_until is None (cleared by probe), fresh data available
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.2);
             info.last_updated = Some(Instant::now());
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization = Some(0.8);
             info.last_updated = Some(Instant::now());
         }
@@ -8518,7 +9020,7 @@ mod tests {
         // low_util should get ~80% of traffic (headroom=0.8 vs 0.2)
         let mut counts = [0u32; 2];
         for _ in 0..1000 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             counts[idx] += 1;
         }
         let low_pct = counts[0] as f64 / 1000.0;
@@ -8533,11 +9035,11 @@ mod tests {
     async fn mark_hard_limited_detects_burst_429() {
         // Burst 429: x-should-retry=true, no retry-after, no rate-limit headers.
         // Should use short cooldown, NOT poison remaining_tokens/requests.
-        let state = test_state_with(vec![make_account("burst-test", "sk-ant-api-a")]);
+        let state = test_state_with(vec![mk_endpoint("burst-test", "sk-ant-api-a")]);
 
         // Pre-set some remaining tokens to verify they aren't poisoned
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.remaining_tokens = Some(5000);
             info.remaining_requests = Some(10);
         }
@@ -8548,7 +9050,7 @@ mod tests {
 
         state.mark_hard_limited(0, &headers).await;
 
-        let info = state.accounts[0].rate_info.read().await;
+        let info = state.endpoints[0].rate_info.read().await;
         assert!(
             info.hard_limited_until.is_some(),
             "burst 429 should still set hard_limited_until"
@@ -8569,10 +9071,10 @@ mod tests {
     #[tokio::test]
     async fn mark_hard_limited_capacity_429_poisons_state() {
         // Capacity 429: has rate-limit headers → should poison remaining_tokens/requests to 0.
-        let state = test_state_with(vec![make_account("cap-test", "sk-ant-api-a")]);
+        let state = test_state_with(vec![mk_endpoint("cap-test", "sk-ant-api-a")]);
 
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.remaining_tokens = Some(5000);
             info.remaining_requests = Some(10);
         }
@@ -8587,7 +9089,7 @@ mod tests {
 
         state.mark_hard_limited(0, &headers).await;
 
-        let info = state.accounts[0].rate_info.read().await;
+        let info = state.endpoints[0].rate_info.read().await;
         assert_eq!(
             info.remaining_tokens,
             Some(0),
@@ -8607,7 +9109,7 @@ mod tests {
     #[tokio::test]
     async fn mark_hard_limited_burst_exponential_backoff() {
         // Consecutive burst 429s should produce increasing cooldowns.
-        let state = test_state_with(vec![make_account("backoff-test", "sk-ant-api-a")]);
+        let state = test_state_with(vec![mk_endpoint("backoff-test", "sk-ant-api-a")]);
 
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("x-should-retry", HeaderValue::from_static("true"));
@@ -8616,7 +9118,7 @@ mod tests {
         let mut cooldowns = Vec::new();
         for _ in 0..5 {
             state.mark_hard_limited(0, &headers).await;
-            let info = state.accounts[0].rate_info.read().await;
+            let info = state.endpoints[0].rate_info.read().await;
             let until = info.hard_limited_until.unwrap();
             let remaining = until.duration_since(Instant::now());
             cooldowns.push(remaining.as_secs());
@@ -8649,21 +9151,21 @@ mod tests {
             cooldowns[4]
         );
 
-        let info = state.accounts[0].rate_info.read().await;
+        let info = state.endpoints[0].rate_info.read().await;
         assert_eq!(info.consecutive_burst_429s, 5);
     }
 
     #[tokio::test]
     async fn mark_hard_limited_retry_after_overrides_default() {
         // When retry-after is present, it should be used regardless of x-should-retry.
-        let state = test_state_with(vec![make_account("retry-test", "sk-ant-api-a")]);
+        let state = test_state_with(vec![mk_endpoint("retry-test", "sk-ant-api-a")]);
 
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("30"));
 
         state.mark_hard_limited(0, &headers).await;
 
-        let info = state.accounts[0].rate_info.read().await;
+        let info = state.endpoints[0].rate_info.read().await;
         let until = info.hard_limited_until.unwrap();
         let remaining = until.duration_since(Instant::now()).as_secs();
         assert!(
@@ -8682,12 +9184,12 @@ mod tests {
         // Unknown accounts get headroom=0.5, known account with 0.1 util gets headroom=0.9
         // Traffic should favor the known account proportionally
         let state = test_state_with(vec![
-            make_account("known", "sk-ant-api-known"),
-            make_account("unknown", "sk-ant-api-unknown"),
+            mk_endpoint("known", "sk-ant-api-known"),
+            mk_endpoint("unknown", "sk-ant-api-unknown"),
         ]);
 
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.1); // headroom = 0.9
         }
         // accounts[1] has no rate info → headroom = 0.5
@@ -8695,7 +9197,7 @@ mod tests {
         // known should get ~64% (0.9 / 1.4), unknown ~36% (0.5 / 1.4)
         let mut counts = [0u32; 2];
         for _ in 0..1000 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             counts[idx] += 1;
         }
 
@@ -8714,29 +9216,29 @@ mod tests {
         // account's weight to the best — affinity is preserved when the ratio
         // exceeds the threshold, i.e. no single account is 2x better.
         let state = test_state_with(vec![
-            make_account("a", "sk-ant-api-a"),
-            make_account("b", "sk-ant-api-b"),
-            make_account("c", "sk-ant-api-c"),
+            mk_endpoint("a", "sk-ant-api-a"),
+            mk_endpoint("b", "sk-ant-api-b"),
+            mk_endpoint("c", "sk-ant-api-c"),
         ]);
 
         // Similar utilization → similar weights → ratio stays above 0.5
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.40);
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization = Some(0.45);
         }
         {
-            let mut info = state.accounts[2].rate_info.write().await;
+            let mut info = state.endpoints[2].rate_info.write().await;
             info.utilization = Some(0.50);
         }
 
         let key = "192.168.1.1:client-42:agent-7:session-abc";
-        let first = state.pick_account(Some(key), "", &[]).await.unwrap();
+        let first = state.pick_endpoint(Some(key), "", &[]).await.unwrap();
         for _ in 0..100 {
-            let idx = state.pick_account(Some(key), "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(Some(key), "", &[]).await.unwrap();
             assert_eq!(
                 idx, first,
                 "same affinity key must always pick same account"
@@ -8751,15 +9253,15 @@ mod tests {
         // where 5h utilization is similar but 7d utilization is vastly different —
         // the weight formula captures the 7d disparity via waste_risk.
         let state = test_state_with(vec![
-            make_account("low_7d", "sk-ant-api-a"),
-            make_account("high_7d", "sk-ant-api-b"),
+            mk_endpoint("low_7d", "sk-ant-api-a"),
+            mk_endpoint("high_7d", "sk-ant-api-b"),
         ]);
         let now_epoch = AppState::now_epoch();
 
         // Both have similar 5h utilization (so gate_5h is similar)
         // but vastly different 7d utilization via claims_7d.
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.12);
             info.reset_5h = Some(now_epoch + 10000);
             info.claims_7d.insert(
@@ -8773,7 +9275,7 @@ mod tests {
             );
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(0.10);
             info.reset_5h = Some(now_epoch + 10000);
             info.claims_7d.insert(
@@ -8792,7 +9294,7 @@ mod tests {
         for i in 0..200 {
             let key = format!("sticky-client-{}", i);
             let idx = state
-                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
                 .await
                 .unwrap();
             assert_eq!(
@@ -8818,7 +9320,7 @@ mod tests {
         for i in 0..attempts {
             let key = format!("{}-{}", prefix, i);
             let idx = state
-                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
                 .await
                 .unwrap();
             match expect_index {
@@ -8848,16 +9350,16 @@ mod tests {
         // Primary 5h=0.20, Jeff 5h=0.25, no claims_7d
         // Weights: headroom_only → 0.80 vs 0.75, ratio=0.94 > 0.5
         let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("jeff", "sk-ant-api-b"),
+            mk_endpoint("primary", "sk-ant-api-a"),
+            mk_endpoint("jeff", "sk-ant-api-b"),
         ]);
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.20);
             info.reset_5h = Some(AppState::now_epoch() + 10000);
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(0.25);
             info.reset_5h = Some(AppState::now_epoch() + 10000);
         }
@@ -8878,8 +9380,8 @@ mod tests {
         // Primary 5h=0.15, 7d=0.40 vs Jeff 5h=0.15, 7d=0.60
         // waste_risk ratio isn't extreme enough to trigger override
         let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("jeff", "sk-ant-api-b"),
+            mk_endpoint("primary", "sk-ant-api-a"),
+            mk_endpoint("jeff", "sk-ant-api-b"),
         ]);
         let now = AppState::now_epoch();
         set_account_utilization(&state, 0, 0.15, 0.40, now + 10000, now + 300000).await;
@@ -8902,8 +9404,8 @@ mod tests {
         // Primary's waste_risk is enormous, jeff's is near zero
         // Weight ratio far below 0.25 → all traffic overridden to primary
         let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("jeff", "sk-ant-api-b"),
+            mk_endpoint("primary", "sk-ant-api-a"),
+            mk_endpoint("jeff", "sk-ant-api-b"),
         ]);
         let now = AppState::now_epoch();
         set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
@@ -8925,8 +9427,8 @@ mod tests {
         // Primary 5h=0.10, 7d=0.10 vs Jeff 5h=0.10, 7d=0.90
         // Extreme weight ratio → all traffic to primary
         let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("jeff", "sk-ant-api-b"),
+            mk_endpoint("primary", "sk-ant-api-a"),
+            mk_endpoint("jeff", "sk-ant-api-b"),
         ]);
         let now = AppState::now_epoch();
         set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
@@ -8949,8 +9451,8 @@ mod tests {
         // Primary has 5h pressure but 7d budget; Jeff has 5h headroom but 7d exhausted
         // Weights should be close enough to preserve affinity
         let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("jeff", "sk-ant-api-b"),
+            mk_endpoint("primary", "sk-ant-api-a"),
+            mk_endpoint("jeff", "sk-ant-api-b"),
         ]);
         let now = AppState::now_epoch();
         set_account_utilization(&state, 0, 0.85, 0.20, now + 10000, now + 300000).await;
@@ -8973,9 +9475,9 @@ mod tests {
         // accounts receive sticky traffic via proportional bucket hashing.
         let state = test_state_with_strategy(
             vec![
-                make_account("primary", "sk-ant-api-a"),
-                make_account("steve", "sk-ant-api-b"),
-                make_account("jeff", "sk-ant-api-c"),
+                mk_endpoint("primary", "sk-ant-api-a"),
+                mk_endpoint("steve", "sk-ant-api-b"),
+                mk_endpoint("jeff", "sk-ant-api-c"),
             ],
             RoutingStrategy::StickyWeightedV2,
         );
@@ -8989,7 +9491,7 @@ mod tests {
         for i in 0..1000 {
             let key = format!("three-way-client-{}", i);
             let idx = state
-                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
                 .await
                 .unwrap();
             saw[idx] = true;
@@ -9010,9 +9512,9 @@ mod tests {
         // bucket should be overridden to the best account.
         let state = test_state_with_strategy(
             vec![
-                make_account("primary", "sk-ant-api-a"),
-                make_account("jeff", "sk-ant-api-b"),
-                make_account("insight", "sk-ant-api-c"),
+                mk_endpoint("primary", "sk-ant-api-a"),
+                mk_endpoint("jeff", "sk-ant-api-b"),
+                mk_endpoint("insight", "sk-ant-api-c"),
             ],
             RoutingStrategy::StickyWeightedV2,
         );
@@ -9029,7 +9531,7 @@ mod tests {
         let mut cumulative = 0.0;
         for c in &candidates {
             cumulative += c.weight;
-            boundaries.push((c.endpoint.account().unwrap(), cumulative));
+            boundaries.push((c.endpoint, cumulative));
         }
 
         let mut insight_key = None;
@@ -9052,7 +9554,7 @@ mod tests {
 
         // With the override, pick_account should redirect away from insight
         let idx = state
-            .pick_account(Some(&key), "claude-opus-4-6", &[])
+            .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
             .await
             .unwrap();
         assert_ne!(
@@ -9066,31 +9568,31 @@ mod tests {
     async fn dynamic_capacity_v1_ignores_replica_local_request_history() {
         let state = test_state_with_strategy(
             vec![
-                make_account("primary", "sk-ant-api-a"),
-                make_account("jeff", "sk-ant-api-b"),
+                mk_endpoint("primary", "sk-ant-api-a"),
+                mk_endpoint("jeff", "sk-ant-api-b"),
             ],
             RoutingStrategy::DynamicCapacityV1,
         );
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.10);
             info.reset_5h = Some(AppState::now_epoch() + 10000);
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(0.10);
             info.reset_5h = Some(AppState::now_epoch() + 10000);
         }
 
-        state.accounts[1].requests.store(900, Ordering::Relaxed);
-        state.accounts[0].requests.store(100, Ordering::Relaxed);
+        state.endpoints[1].requests.store(900, Ordering::Relaxed);
+        state.endpoints[0].requests.store(100, Ordering::Relaxed);
 
         let mut primary_count = 0u32;
         let total = 200u32;
         for i in 0..total {
             let key = format!("balance-test-{}", i);
             let idx = state
-                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
                 .await
                 .unwrap();
             if idx == 0 {
@@ -9110,31 +9612,31 @@ mod tests {
     async fn sticky_weighted_v2_preserves_hash_distribution_under_skewed_history() {
         let state = test_state_with_strategy(
             vec![
-                make_account("primary", "sk-ant-api-a"),
-                make_account("jeff", "sk-ant-api-b"),
+                mk_endpoint("primary", "sk-ant-api-a"),
+                mk_endpoint("jeff", "sk-ant-api-b"),
             ],
             RoutingStrategy::StickyWeightedV2,
         );
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.10);
             info.reset_5h = Some(AppState::now_epoch() + 10000);
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(0.10);
             info.reset_5h = Some(AppState::now_epoch() + 10000);
         }
 
-        state.accounts[1].requests.store(900, Ordering::Relaxed);
-        state.accounts[0].requests.store(100, Ordering::Relaxed);
+        state.endpoints[1].requests.store(900, Ordering::Relaxed);
+        state.endpoints[0].requests.store(100, Ordering::Relaxed);
 
         let mut primary_count = 0u32;
         let total = 200u32;
         for i in 0..total {
             let key = format!("balance-test-{}", i);
             let idx = state
-                .pick_account(Some(&key), "claude-opus-4-6", &[])
+                .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
                 .await
                 .unwrap();
             if idx == 0 {
@@ -9159,19 +9661,19 @@ mod tests {
         // sessions that hashed to primary.
         let state = test_state_with_strategy(
             vec![
-                make_account("primary", "sk-ant-api-a"),
-                make_account("backup", "sk-ant-api-b"),
+                mk_endpoint("primary", "sk-ant-api-a"),
+                mk_endpoint("backup", "sk-ant-api-b"),
             ],
             RoutingStrategy::StickyWeightedV2,
         );
 
         // Start with primary having lots of headroom
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.2); // headroom = 0.8
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization = Some(0.5); // headroom = 0.5
         }
 
@@ -9179,7 +9681,7 @@ mod tests {
         let mut primary_keys: Vec<String> = Vec::new();
         for i in 0..500 {
             let key = format!("test-client-{}", i);
-            if state.pick_account(Some(&key), "", &[]).await.unwrap() == 0 {
+            if state.pick_endpoint(Some(&key), "", &[]).await.unwrap() == 0 {
                 primary_keys.push(key);
             }
         }
@@ -9190,14 +9692,14 @@ mod tests {
 
         // Now overload primary: util=0.99 (headroom=0.01), backup stays at 0.5 (headroom=0.5)
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.99);
         }
 
         // All sessions that hashed to primary should migrate (egregious disparity)
         let mut migrated = 0usize;
         for key in &primary_keys {
-            if state.pick_account(Some(key), "", &[]).await.unwrap() == 1 {
+            if state.pick_endpoint(Some(key), "", &[]).await.unwrap() == 1 {
                 migrated += 1;
             }
         }
@@ -9218,8 +9720,8 @@ mod tests {
         // perfectly stable session routing. This is the prompt-cache scenario —
         // bouncing between accounts wastes cache-creation tokens.
         let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("jeff", "sk-ant-api-b"),
+            mk_endpoint("primary", "sk-ant-api-a"),
+            mk_endpoint("jeff", "sk-ant-api-b"),
         ]);
         let now = AppState::now_epoch();
         set_account_utilization(&state, 0, 0.07, 0.73, now + 10000, now + 300000).await;
@@ -9227,14 +9729,14 @@ mod tests {
 
         let session = "10.42.0.1:claude:first-steps:-:9e8efc8c-2891-4206-ae10-8bcd5fa7e1f0";
         let first = state
-            .pick_account(Some(session), "claude-opus-4-6", &[])
+            .pick_endpoint(Some(session), "claude-opus-4-6", &[])
             .await
             .unwrap();
 
         // Same session, 100 consecutive requests: must ALWAYS pick the same account
         for i in 0..100 {
             let pick = state
-                .pick_account(Some(session), "claude-opus-4-6", &[])
+                .pick_endpoint(Some(session), "claude-opus-4-6", &[])
                 .await
                 .unwrap();
             assert_eq!(
@@ -9253,8 +9755,8 @@ mod tests {
         // Uses multiple sessions and asserts low aggregate migration rate,
         // avoiding boundary-sensitivity from any single hard-coded key.
         let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("jeff", "sk-ant-api-b"),
+            mk_endpoint("primary", "sk-ant-api-a"),
+            mk_endpoint("jeff", "sk-ant-api-b"),
         ]);
         let now = AppState::now_epoch();
         set_account_utilization(&state, 0, 0.05, 0.70, now + 10000, now + 300000).await;
@@ -9269,7 +9771,7 @@ mod tests {
         for s in &sessions {
             initial_picks.push(
                 state
-                    .pick_account(Some(s), "claude-opus-4-6", &[])
+                    .pick_endpoint(Some(s), "claude-opus-4-6", &[])
                     .await
                     .unwrap(),
             );
@@ -9279,11 +9781,11 @@ mod tests {
         for i in 0..50 {
             let drift = 0.002 * (i as f64);
             {
-                let mut info = state.accounts[0].rate_info.write().await;
+                let mut info = state.endpoints[0].rate_info.write().await;
                 info.utilization_5h = Some(0.05 + drift);
             }
             {
-                let mut info = state.accounts[1].rate_info.write().await;
+                let mut info = state.endpoints[1].rate_info.write().await;
                 info.utilization_5h = Some(0.05 + drift * 0.8);
             }
         }
@@ -9292,7 +9794,7 @@ mod tests {
         let mut migrated = 0usize;
         for (j, s) in sessions.iter().enumerate() {
             let pick = state
-                .pick_account(Some(s), "claude-opus-4-6", &[])
+                .pick_endpoint(Some(s), "claude-opus-4-6", &[])
                 .await
                 .unwrap();
             if pick != initial_picks[j] {
@@ -9317,8 +9819,8 @@ mod tests {
         // accounts via hash, providing cross-account balance without per-session
         // instability. This is the balancing mechanism.
         let state = test_state_with(vec![
-            make_account("primary", "sk-ant-api-a"),
-            make_account("jeff", "sk-ant-api-b"),
+            mk_endpoint("primary", "sk-ant-api-a"),
+            mk_endpoint("jeff", "sk-ant-api-b"),
         ]);
         let now = AppState::now_epoch();
         set_account_utilization(&state, 0, 0.10, 0.50, now + 10000, now + 300000).await;
@@ -9328,7 +9830,7 @@ mod tests {
         for i in 0..500 {
             let session = format!("session-{}", i);
             let idx = state
-                .pick_account(Some(&session), "claude-opus-4-6", &[])
+                .pick_endpoint(Some(&session), "claude-opus-4-6", &[])
                 .await
                 .unwrap();
             picks[idx] += 1;
@@ -9350,8 +9852,8 @@ mod tests {
         // Game theory: when one account is under extreme pressure,
         // cache locality cost is worth paying to avoid quota exhaustion.
         let state = test_state_with(vec![
-            make_account("healthy", "sk-ant-api-a"),
-            make_account("dying", "sk-ant-api-b"),
+            mk_endpoint("healthy", "sk-ant-api-a"),
+            mk_endpoint("dying", "sk-ant-api-b"),
         ]);
         let now = AppState::now_epoch();
         // healthy: 5h=0.10, 7d=0.20 (lots of capacity)
@@ -9364,7 +9866,7 @@ mod tests {
         for i in 0..200 {
             let session = format!("session-{}", i);
             if state
-                .pick_account(Some(&session), "claude-opus-4-6", &[])
+                .pick_endpoint(Some(&session), "claude-opus-4-6", &[])
                 .await
                 .unwrap()
                 == 0
@@ -9386,8 +9888,8 @@ mod tests {
         // benefit at this disparity level.
         let state = test_state_with_strategy(
             vec![
-                make_account("primary", "sk-ant-api-a"),
-                make_account("jeff", "sk-ant-api-b"),
+                mk_endpoint("primary", "sk-ant-api-a"),
+                mk_endpoint("jeff", "sk-ant-api-b"),
             ],
             RoutingStrategy::StickyWeightedV2,
         );
@@ -9401,7 +9903,7 @@ mod tests {
         for i in 0..500 {
             let session = format!("moderate-session-{}", i);
             match state
-                .pick_account(Some(&session), "claude-opus-4-6", &[])
+                .pick_endpoint(Some(&session), "claude-opus-4-6", &[])
                 .await
                 .unwrap()
             {
@@ -9422,30 +9924,30 @@ mod tests {
     async fn pick_proportional_distribution() {
         // Verify distribution matches headroom ratios over many calls
         let state = test_state_with(vec![
-            make_account("a", "sk-ant-api-a"),
-            make_account("b", "sk-ant-api-b"),
-            make_account("c", "sk-ant-api-c"),
+            mk_endpoint("a", "sk-ant-api-a"),
+            mk_endpoint("b", "sk-ant-api-b"),
+            mk_endpoint("c", "sk-ant-api-c"),
         ]);
 
         // a=0.2 util (headroom 0.8), b=0.5 util (headroom 0.5), c=0.8 util (headroom 0.2)
         // Total headroom = 1.5. Expected: a=53.3%, b=33.3%, c=13.3%
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.2);
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization = Some(0.5);
         }
         {
-            let mut info = state.accounts[2].rate_info.write().await;
+            let mut info = state.endpoints[2].rate_info.write().await;
             info.utilization = Some(0.8);
         }
 
         let mut counts = [0u32; 3];
         let total = 10000u32;
         for _ in 0..total {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             counts[idx] += 1;
         }
 
@@ -9527,7 +10029,7 @@ mod tests {
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
         // Verify rate info was updated from mock response headers
-        let info = state.accounts[0].rate_info.read().await;
+        let info = state.endpoints[0].rate_info.read().await;
         assert_eq!(info.utilization, Some(0.25));
         assert_eq!(info.representative_claim.as_deref(), Some("five_hour"));
     }
@@ -9766,22 +10268,22 @@ mod tests {
             axum::serve(mock_listener, mock_app).await.unwrap();
         });
 
-        // Single OAuth account — forces all requests through the oauth_body_bytes path
-        let accounts = vec![make_account("oauth-acct", "sk-ant-oat01-test-token")];
+        // Single OAuth endpoint — forces all requests through the oauth_body_bytes path
+        let mut oauth_ep = mk_endpoint("oauth-acct", "sk-ant-oat01-test-token");
+        oauth_ep.base_url = format!("http://{}", mock_addr);
+        let accounts = vec![oauth_ep];
         let state = Arc::new(AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: format!("http://{}", mock_addr),
-            accounts,
+            endpoints: accounts,
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-oauth-cache-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true, // KEY: auto-cache enabled
             client_usage: Mutex::new(HashMap::new()),
@@ -9800,7 +10302,6 @@ mod tests {
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -9877,74 +10378,45 @@ mod tests {
 
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         let body: serde_json::Value = resp.json().await.unwrap();
-        let accounts = body["accounts"].as_array().unwrap();
-        assert_eq!(accounts.len(), 2);
-        assert_eq!(accounts[0]["name"], "acct-a");
-        assert_eq!(accounts[1]["name"], "acct-b");
+        let endpoints = body["endpoints"].as_array().unwrap();
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0]["name"], "acct-a");
+        assert_eq!(endpoints[1]["name"], "acct-b");
+        assert_eq!(endpoints[0]["protocol"], "anthropic");
         assert_eq!(body["strategy"], "dynamic-capacity-v1");
-        // Upstreams section should be present
-        let upstreams = body["upstreams"].as_array().unwrap();
-        assert_eq!(upstreams.len(), 1);
-        assert_eq!(upstreams[0]["name"], "mock");
+        // Legacy `accounts` and `upstreams` arrays are gone from the schema.
+        assert!(body.get("accounts").is_none());
+        assert!(body.get("upstreams").is_none());
     }
 
     #[tokio::test]
-    async fn upstream_handler_forwards_to_named_upstream() {
-        let (mock_url, _handle) = spawn_mock_upstream().await;
-        let (app, _state) = test_app(&mock_url, None);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
-        });
+    async fn stats_endpoint_exposes_endpoints_array() {
+        let ep = |name: &str, protocol: Protocol| {
+            let mut e = make_endpoint(name, protocol);
+            e.priority = 5;
+            e
+        };
+        let state = test_state_with(vec![
+            ep("ep-anthropic", Protocol::Anthropic),
+            ep("ep-openai", Protocol::OpenAI),
+        ]);
+        let addr = serve(build_router(state)).await;
 
         let client = Client::new();
         let resp = client
-            .post(format!("http://{}/upstream/mock/v1/chat/completions", addr))
-            .header("content-type", "application/json")
-            .body(r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#)
+            .get(format!("http://{}/_stats", addr))
             .send()
             .await
             .unwrap();
-
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn upstream_handler_rejects_unknown_upstream() {
-        let (mock_url, _handle) = spawn_mock_upstream().await;
-        let (app, _state) = test_app(&mock_url, None);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
-        });
-
-        let client = Client::new();
-        let resp = client
-            .post(format!(
-                "http://{}/upstream/nonexistent/v1/chat/completions",
-                addr
-            ))
-            .header("content-type", "application/json")
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let endpoints = body["endpoints"].as_array().unwrap();
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0]["name"], "ep-anthropic");
+        assert_eq!(endpoints[0]["protocol"], "anthropic");
+        assert_eq!(endpoints[0]["priority"], 5);
+        assert_eq!(endpoints[1]["name"], "ep-openai");
+        assert_eq!(endpoints[1]["protocol"], "openai");
     }
 
     // ── Unit: OpenAI request translation ────────────────────────────
@@ -11010,27 +11482,27 @@ mod tests {
             .unwrap()
     }
 
-    /// Build test app with separate handlers for streaming vs non-streaming
+    /// Build test app with separate handlers for streaming vs non-streaming.
+    /// Both Anthropic endpoints point at `upstream_url` (the mock upstream).
     fn test_openai_app(upstream_url: &str, proxy_key: Option<String>) -> (Router, Arc<AppState>) {
-        let accounts = vec![
-            make_account("acct-a", "sk-ant-api-test-aaa"),
-            make_account("acct-b", "sk-ant-api-test-bbb"),
-        ];
+        let mut acct_a = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
+        acct_a.base_url = upstream_url.to_string();
+        let mut acct_b = mk_endpoint("acct-b", "sk-ant-api-test-bbb");
+        acct_b.base_url = upstream_url.to_string();
+        let accounts = vec![acct_a, acct_b];
 
         let state = Arc::new(AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: upstream_url.to_string(),
-            accounts,
+            endpoints: accounts,
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-openai-test.state.json"),
             proxy_key,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -11049,7 +11521,6 @@ mod tests {
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -11577,25 +12048,27 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn record_usage_updates_account_and_client() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         let usage = TokenUsage {
             input_tokens: 100,
             output_tokens: 50,
             cache_creation_input_tokens: 20,
             cache_read_input_tokens: 30,
         };
-        state.record_usage(0, "test-client", &usage).await;
+        state
+            .record_usage(&state.endpoints[0], "test-client", &usage)
+            .await;
 
-        assert_eq!(state.accounts[0].input_tokens.load(Ordering::Relaxed), 100);
-        assert_eq!(state.accounts[0].output_tokens.load(Ordering::Relaxed), 50);
+        assert_eq!(state.endpoints[0].input_tokens.load(Ordering::Relaxed), 100);
+        assert_eq!(state.endpoints[0].output_tokens.load(Ordering::Relaxed), 50);
         assert_eq!(
-            state.accounts[0]
+            state.endpoints[0]
                 .cache_creation_tokens
                 .load(Ordering::Relaxed),
             20
         );
         assert_eq!(
-            state.accounts[0].cache_read_tokens.load(Ordering::Relaxed),
+            state.endpoints[0].cache_read_tokens.load(Ordering::Relaxed),
             30
         );
 
@@ -11606,17 +12079,17 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn record_usage_ignores_anonymous() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         let usage = TokenUsage {
             input_tokens: 100,
             output_tokens: 50,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         };
-        state.record_usage(0, "-", &usage).await;
+        state.record_usage(&state.endpoints[0], "-", &usage).await;
 
         // Account gets updated
-        assert_eq!(state.accounts[0].input_tokens.load(Ordering::Relaxed), 100);
+        assert_eq!(state.endpoints[0].input_tokens.load(Ordering::Relaxed), 100);
         // But no client entry for anonymous
         let map = state.client_usage.lock().unwrap();
         assert!(!map.contains_key("-"));
@@ -11626,7 +12099,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn account_serves_model_no_filter() {
-        let acct = make_account("a", "sk-ant-api-x");
+        let acct = mk_endpoint("a", "sk-ant-api-x");
         assert!(acct.serves_model("claude-opus-4-6"));
         assert!(acct.serves_model("claude-haiku-4-5"));
         assert!(acct.serves_model(""));
@@ -11634,7 +12107,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn account_serves_model_exact_match() {
-        let mut acct = make_account("a", "sk-ant-api-x");
+        let mut acct = mk_endpoint("a", "sk-ant-api-x");
         acct.models = vec!["claude-sonnet-4-6".to_string()];
         assert!(acct.serves_model("claude-sonnet-4-6"));
         assert!(!acct.serves_model("claude-opus-4-6"));
@@ -11642,7 +12115,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn account_serves_model_prefix_match() {
-        let mut acct = make_account("a", "sk-ant-api-x");
+        let mut acct = mk_endpoint("a", "sk-ant-api-x");
         acct.models = vec!["claude-opus-*".to_string(), "claude-sonnet-*".to_string()];
         assert!(acct.serves_model("claude-opus-4-6"));
         assert!(acct.serves_model("claude-sonnet-4-6"));
@@ -11651,23 +12124,23 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn pick_account_filters_by_model() {
-        let mut acct_a = make_account("opus-only", "sk-ant-api-a");
+        let mut acct_a = mk_endpoint("opus-only", "sk-ant-api-a");
         acct_a.models = vec!["claude-opus-*".to_string()];
 
-        let acct_b = make_account("any-model", "sk-ant-api-b");
+        let acct_b = mk_endpoint("any-model", "sk-ant-api-b");
 
         let state = test_state_with(vec![acct_a, acct_b]);
 
         // Requesting opus: both accounts eligible
         let idx = state
-            .pick_account(None, "claude-opus-4-6", &[])
+            .pick_endpoint(None, "claude-opus-4-6", &[])
             .await
             .unwrap();
         assert!(idx == 0 || idx == 1);
 
         // Requesting haiku: only acct_b eligible
         let idx = state
-            .pick_account(None, "claude-haiku-4-5", &[])
+            .pick_endpoint(None, "claude-haiku-4-5", &[])
             .await
             .unwrap();
         assert_eq!(idx, 1);
@@ -11675,8 +12148,8 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn soft_limit_excludes_overloaded_accounts() {
-        let acct_a = make_account("healthy", "sk-ant-api-a");
-        let acct_b = make_account("overloaded", "sk-ant-api-b");
+        let acct_a = mk_endpoint("healthy", "sk-ant-api-a");
+        let acct_b = mk_endpoint("overloaded", "sk-ant-api-b");
 
         let accounts = vec![acct_a, acct_b];
 
@@ -11700,15 +12173,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts,
+            endpoints: accounts,
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -11727,14 +12198,13 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
         // Try many affinity keys — all should route to healthy (idx 0)
         for i in 0..20 {
             let key = format!("client-{}", i);
-            let idx = state.pick_account(Some(&key), "any", &[]).await.unwrap();
+            let idx = state.pick_endpoint(Some(&key), "any", &[]).await.unwrap();
             assert_eq!(
                 idx, 0,
                 "client '{}' routed to overloaded account despite soft limit",
@@ -11745,11 +12215,11 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn routing_candidates_ignore_unmatched_7d_state() {
-        let state = test_state_with(vec![make_account("acct-a", "sk-ant-api-a")]);
+        let state = test_state_with(vec![mk_endpoint("acct-a", "sk-ant-api-a")]);
         let now = AppState::now_epoch();
 
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.20);
             info.utilization_5h = Some(0.20);
             info.reset_5h = Some(now + 10000);
@@ -11786,11 +12256,53 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
+    // ── Unit: unified endpoint participation in routing ────────────
+
+    #[tokio::test]
+    async fn openai_endpoint_participates_at_configured_priority() {
+        let acct = mk_endpoint("anthropic", "sk-ant-api-a");
+        {
+            let mut info = acct.rate_info.write().await;
+            info.utilization = Some(0.0); // healthy
+        }
+        let mut state = test_state_with(vec![acct]);
+        let st = Arc::get_mut(&mut state).unwrap();
+        let mut ep = make_endpoint("openai", Protocol::OpenAI);
+        ep.priority = 100;
+        st.endpoints.push(ep);
+
+        let candidates = state.routing_candidates("claude-opus-4-7", &[]).await;
+        let openai_candidate = candidates.iter().find(|c| c.source == "openai");
+        assert!(
+            openai_candidate.is_some(),
+            "openai endpoint must be a candidate"
+        );
+        let c = openai_candidate.unwrap();
+        assert_eq!(c.endpoint, 1, "openai endpoint is at index 1");
+        assert_eq!(c.priority, 100);
+        assert_eq!(c.weight, 1.0);
+        assert_eq!(c.gate, 0.0);
+    }
+
+    #[tokio::test]
+    async fn openai_endpoint_with_opus_only_allowlist_excludes_sonnet() {
+        let mut state = test_state_with(vec![]);
+        let st = Arc::get_mut(&mut state).unwrap();
+        let mut ep = make_endpoint("opus-gw", Protocol::OpenAI);
+        ep.models = vec!["claude-opus-*".to_string()];
+        st.endpoints.push(ep);
+
+        let cs_opus = state.routing_candidates("claude-opus-4-7", &[]).await;
+        let cs_sonnet = state.routing_candidates("claude-sonnet-4-6", &[]).await;
+        assert_eq!(cs_opus.len(), 1, "opus must hit the opus-only endpoint");
+        assert_eq!(cs_sonnet.len(), 0, "sonnet must be filtered out");
+    }
+
     // ── Unit: per-client budget ────────────────────────────────────
 
     #[tokio::test]
     async fn budget_check_no_limit_configured() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         assert!(state.check_budget("any-client").await.is_ok());
     }
 
@@ -11803,15 +12315,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -11830,7 +12340,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -12125,7 +12634,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn status_clears_when_header_absent() {
         // Bug #1: stale status should clear when API sends utilization but no status header
-        let accounts = vec![make_account("acct-a", "sk-ant-api-test-aaa")];
+        let accounts = vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")];
         let state = test_state_with(accounts);
 
         // First response: set throttled status
@@ -12144,7 +12653,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         state.update_rate_info(0, &headers1).await;
         {
-            let info = state.accounts[0].rate_info.read().await;
+            let info = state.endpoints[0].rate_info.read().await;
             assert_eq!(info.status_5h.as_deref(), Some("throttled"));
         }
 
@@ -12160,7 +12669,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         state.update_rate_info(0, &headers2).await;
         {
-            let info = state.accounts[0].rate_info.read().await;
+            let info = state.endpoints[0].rate_info.read().await;
             assert_eq!(
                 info.status_5h, None,
                 "status should clear when header absent"
@@ -12172,7 +12681,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn status_persists_when_no_util_header() {
         // If neither util nor status header is present for a window, don't clear status
         // (the response might be for a different window entirely)
-        let accounts = vec![make_account("acct-a", "sk-ant-api-test-aaa")];
+        let accounts = vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")];
         let state = test_state_with(accounts);
 
         // Set throttled status
@@ -12191,7 +12700,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let headers2 = reqwest::header::HeaderMap::new();
         state.update_rate_info(0, &headers2).await;
         {
-            let info = state.accounts[0].rate_info.read().await;
+            let info = state.endpoints[0].rate_info.read().await;
             assert_eq!(
                 info.status_5h.as_deref(),
                 Some("throttled"),
@@ -12205,10 +12714,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Bug #5: all-rejected accounts should return None (zero total headroom)
         let now_epoch = AppState::now_epoch();
         let state = test_state_with(vec![
-            make_account("acct-a", "sk-ant-api-test-aaa"),
-            make_account("acct-b", "sk-ant-api-test-bbb"),
+            mk_endpoint("acct-a", "sk-ant-api-test-aaa"),
+            mk_endpoint("acct-b", "sk-ant-api-test-bbb"),
         ]);
-        for acct in &state.accounts {
+        for acct in &state.endpoints {
             let mut info = acct.rate_info.write().await;
             info.utilization_5h = Some(0.50);
             info.utilization_7d = Some(0.30);
@@ -12217,14 +12726,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             info.reset_5h = Some(now_epoch + 7200);
             info.reset_7d = Some(now_epoch + 86400);
         }
-        let result = state.pick_account(None, "", &[]).await;
+        let result = state.pick_endpoint(None, "", &[]).await;
         assert_eq!(result, None, "all-rejected should return None");
     }
 
     #[tokio::test]
     async fn reset_sanity_rejects_far_future() {
         // Bug #6: reset timestamp > block duration from now should be rejected
-        let accounts = vec![make_account("acct-a", "sk-ant-api-test-aaa")];
+        let accounts = vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")];
         let state = test_state_with(accounts);
 
         let mut headers = reqwest::header::HeaderMap::new();
@@ -12240,7 +12749,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         state.update_rate_info(0, &headers).await;
         {
-            let info = state.accounts[0].rate_info.read().await;
+            let info = state.endpoints[0].rate_info.read().await;
             assert_eq!(
                 info.reset_5h, None,
                 "far-future 5h reset should be rejected"
@@ -12261,12 +12770,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         // A's 5h gets heavily discounted, 7d=0.30 becomes binding → A has more headroom than B
         let now_epoch = AppState::now_epoch();
         let accounts = vec![
-            make_account("acct-a", "sk-ant-api-test-aaa"),
-            make_account("acct-b", "sk-ant-api-test-bbb"),
+            mk_endpoint("acct-a", "sk-ant-api-test-aaa"),
+            mk_endpoint("acct-b", "sk-ant-api-test-bbb"),
         ];
         let state = test_state_with(accounts);
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.95);
             info.utilization_7d = Some(0.30);
             info.utilization = Some(0.95);
@@ -12274,7 +12783,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             info.reset_7d = Some(now_epoch + 86400); // 1 day out
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(0.60);
             info.utilization_7d = Some(0.50);
             info.utilization = Some(0.60);
@@ -12285,7 +12794,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Run 100 picks without affinity to see distribution
         let mut a_count = 0;
         for _ in 0..100 {
-            if let Some(idx) = state.pick_account(None, "", &[]).await {
+            if let Some(idx) = state.pick_endpoint(None, "", &[]).await {
                 if idx == 0 {
                     a_count += 1;
                 }
@@ -12310,10 +12819,9 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![
-                make_account("acct-a", "sk-ant-api-test-aaa"),
-                make_account("acct-b", "sk-ant-api-test-bbb"),
+            endpoints: vec![
+                mk_endpoint("acct-a", "sk-ant-api-test-aaa"),
+                mk_endpoint("acct-b", "sk-ant-api-test-bbb"),
             ],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
@@ -12321,7 +12829,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -12340,11 +12847,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.30);
             info.utilization_7d = Some(0.20);
             info.utilization = Some(0.30);
@@ -12353,7 +12859,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             info.reset_7d = Some(now_epoch + 86400);
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(0.40);
             info.utilization_7d = Some(0.30);
             info.utilization = Some(0.40);
@@ -12364,7 +12870,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         let mut b_count = 0;
         for _ in 0..100 {
-            if let Some(idx) = state.pick_account(None, "", &[]).await {
+            if let Some(idx) = state.pick_endpoint(None, "", &[]).await {
                 if idx == 1 {
                     b_count += 1;
                 }
@@ -12383,10 +12889,9 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![
-                make_account("acct-a", "sk-ant-api-test-aaa"),
-                make_account("acct-b", "sk-ant-api-test-bbb"),
+            endpoints: vec![
+                mk_endpoint("acct-a", "sk-ant-api-test-aaa"),
+                mk_endpoint("acct-b", "sk-ant-api-test-bbb"),
             ],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
@@ -12394,7 +12899,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -12413,11 +12917,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.20);
             info.utilization = Some(0.20);
             info.status_5h = Some("allowed".to_string());
@@ -12433,7 +12936,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             );
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(0.40);
             info.utilization = Some(0.40);
             info.status_5h = Some("allowed".to_string());
@@ -12443,7 +12946,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut b_count = 0;
         for i in 0..100 {
             let key = format!("sticky-opus-{i}");
-            if let Some(idx) = state.pick_account(Some(&key), "claude-opus-4-6", &[]).await {
+            if let Some(idx) = state
+                .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
+                .await
+            {
                 if idx == 1 {
                     b_count += 1;
                 }
@@ -12462,12 +12968,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Should behave identically to raw utilization
         let now_epoch = AppState::now_epoch();
         let accounts = vec![
-            make_account("acct-a", "sk-ant-api-test-aaa"),
-            make_account("acct-b", "sk-ant-api-test-bbb"),
+            mk_endpoint("acct-a", "sk-ant-api-test-aaa"),
+            mk_endpoint("acct-b", "sk-ant-api-test-bbb"),
         ];
         let state = test_state_with(accounts);
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.80);
             info.utilization_7d = Some(0.40);
             info.utilization = Some(0.80);
@@ -12475,7 +12981,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             info.reset_7d = Some(now_epoch + 86400);
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(0.40);
             info.utilization_7d = Some(0.30);
             info.utilization = Some(0.40);
@@ -12485,7 +12991,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         let mut b_count = 0;
         for _ in 0..100 {
-            if let Some(idx) = state.pick_account(None, "", &[]).await {
+            if let Some(idx) = state.pick_endpoint(None, "", &[]).await {
                 if idx == 1 {
                     b_count += 1;
                 }
@@ -13034,16 +13540,18 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn signal_hard_limit_recovery_without_redis_is_noop() {
         // Without Redis, the helper must still refresh metrics + publish weights
         // locally. It must not panic and must not attempt Redis I/O.
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-test")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-test")]);
         // Pre-seed a non-zero weight so we can assert refresh_metrics_weights ran
-        state.accounts[0]
+        state.endpoints[0]
             .last_routing_weight
             .store(0u64, Ordering::Relaxed);
-        state.signal_hard_limit_recovery(&state.accounts[0]).await;
+        state
+            .signal_hard_limit_recovery(&state.endpoints[0].name)
+            .await;
         // refresh_metrics_weights always writes a value (even zero) — the point
         // is that the method completed without Redis and without panicking.
         let w = f64::from_bits(
-            state.accounts[0]
+            state.endpoints[0]
                 .last_routing_weight
                 .load(Ordering::Relaxed),
         );
@@ -13146,15 +13654,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names,
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -13173,7 +13679,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -13190,7 +13695,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn resolve_header_fallback() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         let mut headers = hyper::HeaderMap::new();
         headers.insert("x-client-id", HeaderValue::from_static("gastown"));
         let ip: IpAddr = "192.168.1.99".parse().unwrap();
@@ -13199,7 +13704,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn resolve_unknown() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         let headers = hyper::HeaderMap::new();
         let ip: IpAddr = "192.168.1.99".parse().unwrap();
         assert_eq!(state.resolve_client_id(&ip, &headers), "-");
@@ -13216,15 +13721,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names,
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -13243,7 +13746,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -13648,8 +14150,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Account A: Sonnet 7d at 0.90 (high), Opus 7d at 0.10 (low)
         // Account B: Sonnet 7d at 0.10 (low), Opus 7d at 0.90 (high)
         // Routing for Sonnet should prefer B, routing for Opus should prefer A
-        let acct_a = make_account("a", "sk-ant-api-a");
-        let acct_b = make_account("b", "sk-ant-api-b");
+        let acct_a = mk_endpoint("a", "sk-ant-api-a");
+        let acct_b = mk_endpoint("b", "sk-ant-api-b");
         let state = test_state_with(vec![acct_a, acct_b]);
         let now = AppState::now_epoch();
 
@@ -13669,12 +14171,15 @@ data: {\"type\":\"message_stop\"}\n\n";
         for i in 0..100 {
             let key = format!("client_{}", i);
             if let Some(idx) = state
-                .pick_account(Some(&key), "claude-sonnet-4-6", &[])
+                .pick_endpoint(Some(&key), "claude-sonnet-4-6", &[])
                 .await
             {
                 sonnet_picks[idx] += 1;
             }
-            if let Some(idx) = state.pick_account(Some(&key), "claude-opus-4-6", &[]).await {
+            if let Some(idx) = state
+                .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
+                .await
+            {
                 opus_picks[idx] += 1;
             }
         }
@@ -13700,8 +14205,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn pick_account_prefers_expiring_quota() {
         // Account A: 7d=0.40, reset in 1 day → high waste_risk
         // Account B: 7d=0.40, reset in 6 days → low waste_risk
-        let acct_a = make_account("a", "sk-ant-api-a");
-        let acct_b = make_account("b", "sk-ant-api-b");
+        let acct_a = mk_endpoint("a", "sk-ant-api-a");
+        let acct_b = mk_endpoint("b", "sk-ant-api-b");
         let state = test_state_with(vec![acct_a, acct_b]);
         let now = AppState::now_epoch();
 
@@ -13711,7 +14216,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         // Override claims with different resets
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.claims_7d.insert(
                 "seven_day_sonnet".to_string(),
                 ClaimWindowData {
@@ -13723,7 +14228,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             );
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.claims_7d.insert(
                 "seven_day_sonnet".to_string(),
                 ClaimWindowData {
@@ -13739,7 +14244,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         for i in 0..200 {
             let key = format!("client_{}", i);
             if let Some(idx) = state
-                .pick_account(Some(&key), "claude-sonnet-4-6", &[])
+                .pick_endpoint(Some(&key), "claude-sonnet-4-6", &[])
                 .await
             {
                 picks[idx] += 1;
@@ -13757,15 +14262,15 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn pick_account_dampens_by_5h() {
         // Account A: high waste_risk but high 5h → dampened
         // Account B: lower waste_risk but low 5h → more traffic
-        let acct_a = make_account("a", "sk-ant-api-a");
-        let acct_b = make_account("b", "sk-ant-api-b");
+        let acct_a = mk_endpoint("a", "sk-ant-api-a");
+        let acct_b = mk_endpoint("b", "sk-ant-api-b");
         let state = test_state_with(vec![acct_a, acct_b]);
         let now = AppState::now_epoch();
 
         // A: 5h=0.85, 7d=0.20 (waste_risk ~5.0 with 1.5d remaining)
         set_account_utilization(&state, 0, 0.85, 0.20, now + 10000, now + 129600).await;
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.claims_7d.insert(
                 "seven_day_sonnet".to_string(),
                 ClaimWindowData {
@@ -13780,7 +14285,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // B: 5h=0.30, 7d=0.50 (waste_risk ~1.2 with 3.5d remaining)
         set_account_utilization(&state, 1, 0.30, 0.50, now + 10000, now + 302400).await;
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.claims_7d.insert(
                 "seven_day_sonnet".to_string(),
                 ClaimWindowData {
@@ -13796,7 +14301,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         for i in 0..500 {
             let key = format!("client_{}", i);
             if let Some(idx) = state
-                .pick_account(Some(&key), "claude-sonnet-4-6", &[])
+                .pick_endpoint(Some(&key), "claude-sonnet-4-6", &[])
                 .await
             {
                 picks[idx] += 1;
@@ -13818,21 +14323,21 @@ data: {\"type\":\"message_stop\"}\n\n";
         // No 7d claims → falls back to headroom-only weighting
         // Uses affinity (sticky) traffic to verify weight-proportional distribution
         // across distinct session keys, exercising the affinity path.
-        let acct_a = make_account("a", "sk-ant-api-a");
-        let acct_b = make_account("b", "sk-ant-api-b");
+        let acct_a = mk_endpoint("a", "sk-ant-api-a");
+        let acct_b = mk_endpoint("b", "sk-ant-api-b");
         let state = test_state_with(vec![acct_a, acct_b]);
         let now = AppState::now_epoch();
 
         // Set 5h only, no claims_7d
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.30);
             info.reset_5h = Some(now + 10000);
             info.utilization = Some(0.30);
             info.claims_7d.clear();
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(0.70);
             info.reset_5h = Some(now + 10000);
             info.utilization = Some(0.70);
@@ -13845,7 +14350,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         for i in 0..200 {
             let key = format!("session-{}", i);
             if let Some(idx) = state
-                .pick_account(Some(&key), "claude-sonnet-4-6", &[])
+                .pick_endpoint(Some(&key), "claude-sonnet-4-6", &[])
                 .await
             {
                 picks[idx] += 1;
@@ -13856,7 +14361,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let session = "10.42.0.1:client-test:agent-1:session-fallback";
         assert!(
             state
-                .pick_account(Some(session), "claude-sonnet-4-6", &[])
+                .pick_endpoint(Some(session), "claude-sonnet-4-6", &[])
                 .await
                 .is_some(),
             "affinity pick should return Some when accounts are available"
@@ -13876,8 +14381,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn emergency_brake_triggers_at_88() {
         // All accounts at 88% raw 7d → brake engages with new threshold
         let now = AppState::now_epoch();
-        let acct_a = make_account("a", "sk-ant-api-a");
-        let acct_b = make_account("b", "sk-ant-api-b");
+        let acct_a = mk_endpoint("a", "sk-ant-api-a");
+        let acct_b = mk_endpoint("b", "sk-ant-api-b");
         let state = test_state_with(vec![acct_a, acct_b]);
 
         // Verify DEFAULT_EMERGENCY_THRESHOLD is 0.88
@@ -13890,7 +14395,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         set_account_utilization(&state, 1, 0.89, 0.89, now + 10000, now + 100000).await;
 
         // effective_utilization for both should be >= 0.88
-        let info0 = state.accounts[0].rate_info.read().await;
+        let info0 = state.endpoints[0].rate_info.read().await;
         let (util0, _, _, _) = effective_utilization(&info0, now, "");
         drop(info0);
         assert!(
@@ -13900,15 +14405,64 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
+    async fn emergency_brake_fires_when_only_anthropic_above_threshold_with_openai_present() {
+        // 1 anthropic account at utilization 0.95, 1 openai endpoint with stub rate info.
+        // A naive "iterate all endpoints" version sees the openai stub at (0.5, "unknown")
+        // and forces all_above = false → brake never fires. The correct "skip OpenAI"
+        // version excludes it and the brake fires.
+        let acct = mk_endpoint("anthropic", "sk-ant");
+        {
+            let mut info = acct.rate_info.write().await;
+            info.utilization = Some(0.95);
+            info.utilization_5h = Some(0.95);
+        }
+        let mut state = test_state_with(vec![acct]);
+        let st = Arc::get_mut(&mut state).expect("uniquely owned");
+        let mut openai_ep = make_endpoint("openai", Protocol::OpenAI);
+        openai_ep.priority = 100;
+        st.endpoints.push(openai_ep);
+        st.emergency_threshold = 0.88;
+        assert!(
+            state.is_emergency_brake_active().await,
+            "brake must fire: anthropic is above threshold; openai must not vote"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_endpoint_skips_openai() {
+        // The mock upstream injects `5h-utilization: 0.25` headers. If the probe
+        // ran, `rate_info.utilization_5h` would become Some(0.25). The OpenAI
+        // skip means the endpoint is never contacted and rate_info stays None.
+        let (mock_url, _h) = spawn_mock_upstream().await;
+        let mut ep = make_endpoint("openai", Protocol::OpenAI);
+        ep.base_url = mock_url;
+        ep.priority = 100;
+        let mut state = test_state_with(vec![]);
+        Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+        state.probe_endpoint(0, "claude-haiku-4-5").await;
+
+        // rate_info must be untouched: the OpenAI endpoint was skipped, no HTTP
+        // call was made. A naive "probe all endpoints" version would have hit
+        // the mock and set utilization_5h to Some(0.25).
+        let info = state.endpoints[0].rate_info.read().await;
+        assert!(
+            info.utilization_5h.is_none(),
+            "probe must short-circuit for OpenAI endpoints — rate_info must stay untouched"
+        );
+        assert_eq!(state.endpoints[0].requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn pick_account_all_7d_rejected_returns_none() {
         // If all accounts have rejected 7d claims for the model, pick_account returns None
-        let acct_a = make_account("a", "sk-ant-api-a");
-        let acct_b = make_account("b", "sk-ant-api-b");
+        let acct_a = mk_endpoint("a", "sk-ant-api-a");
+        let acct_b = mk_endpoint("b", "sk-ant-api-b");
         let state = test_state_with(vec![acct_a, acct_b]);
         let now = AppState::now_epoch();
 
         for idx in 0..2 {
-            let mut info = state.accounts[idx].rate_info.write().await;
+            let mut info = state.endpoints[idx].rate_info.write().await;
             info.utilization_5h = Some(0.30);
             info.reset_5h = Some(now + 10000);
             info.claims_7d.insert(
@@ -13923,7 +14477,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
 
         let result = state
-            .pick_account(Some("test"), "claude-sonnet-4-6", &[])
+            .pick_endpoint(Some("test"), "claude-sonnet-4-6", &[])
             .await;
         assert!(
             result.is_none(),
@@ -13943,7 +14497,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         reset_5h: u64,
         reset_7d: u64,
     ) {
-        let mut info = state.accounts[idx].rate_info.write().await;
+        let mut info = state.endpoints[idx].rate_info.write().await;
         info.utilization_5h = Some(util_5h);
         info.utilization_7d = Some(util_7d);
         info.utilization = Some(util_5h.max(util_7d));
@@ -13975,7 +14529,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         } else {
             format!("seven_day_{}", family)
         };
-        let mut info = state.accounts[idx].rate_info.write().await;
+        let mut info = state.endpoints[idx].rate_info.write().await;
         info.claims_7d.insert(
             key,
             ClaimWindowData {
@@ -14009,10 +14563,9 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![
-                make_account("a", "sk-ant-api-x"),
-                make_account("b", "sk-ant-api-y"),
+            endpoints: vec![
+                mk_endpoint("a", "sk-ant-api-x"),
+                mk_endpoint("b", "sk-ant-api-y"),
             ],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
@@ -14020,7 +14573,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14039,7 +14591,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -14060,10 +14611,9 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![
-                make_account("a", "sk-ant-api-x"),
-                make_account("b", "sk-ant-api-y"),
+            endpoints: vec![
+                mk_endpoint("a", "sk-ant-api-x"),
+                mk_endpoint("b", "sk-ant-api-y"),
             ],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
@@ -14071,7 +14621,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14090,7 +14639,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -14112,10 +14660,9 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![
-                make_account("a", "sk-ant-api-x"),
-                make_account("b", "sk-ant-api-y"),
+            endpoints: vec![
+                mk_endpoint("a", "sk-ant-api-x"),
+                mk_endpoint("b", "sk-ant-api-y"),
             ],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
@@ -14123,7 +14670,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14142,7 +14688,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
@@ -14155,7 +14700,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn limit_no_config() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         assert!(state.check_utilization_limit("anyone", "").await.is_ok());
     }
 
@@ -14169,15 +14714,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14196,7 +14739,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
@@ -14213,22 +14755,20 @@ data: {\"type\":\"message_stop\"}\n\n";
         // should return Ok (let pick_account handle the "no account" error later)
         let mut limits = HashMap::new();
         limits.insert("test-client".to_string(), 0.01); // very low limit
-        let mut acct = make_account("a", "sk-ant-api-x");
+        let mut acct = mk_endpoint("a", "sk-ant-api-x");
         acct.models = vec!["claude-sonnet".to_string()]; // only serves sonnet
         let state = Arc::new(AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![acct],
+            endpoints: vec![acct],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14247,7 +14787,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         // Request for "claude-opus" — no account serves it → should pass
@@ -14270,10 +14809,9 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![
-                make_account("a", "sk-ant-api-x"),
-                make_account("b", "sk-ant-api-y"),
+            endpoints: vec![
+                mk_endpoint("a", "sk-ant-api-x"),
+                mk_endpoint("b", "sk-ant-api-y"),
             ],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
@@ -14281,7 +14819,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14300,7 +14837,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         // Don't set any utilization — accounts remain "unknown" (0.5)
@@ -14326,11 +14862,10 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![
-                make_account("a", "sk-ant-api-x"),
-                make_account("b", "sk-ant-api-y"),
-                make_account("c", "sk-ant-api-z"),
+            endpoints: vec![
+                mk_endpoint("a", "sk-ant-api-x"),
+                mk_endpoint("b", "sk-ant-api-y"),
+                mk_endpoint("c", "sk-ant-api-z"),
             ],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
@@ -14338,7 +14873,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14357,7 +14891,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         // Two known accounts above limit, one unknown (no data set)
@@ -14377,8 +14910,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn emergency_all_above_threshold() {
         let now = AppState::now_epoch();
         let state = test_state_with(vec![
-            make_account("a", "sk-ant-api-x"),
-            make_account("b", "sk-ant-api-y"),
+            mk_endpoint("a", "sk-ant-api-x"),
+            mk_endpoint("b", "sk-ant-api-y"),
         ]);
         set_account_utilization(&state, 0, 0.96, 0.90, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.97, 0.95, now + 10000, now + 100000).await;
@@ -14389,8 +14922,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn emergency_one_below() {
         let now = AppState::now_epoch();
         let state = test_state_with(vec![
-            make_account("a", "sk-ant-api-x"),
-            make_account("b", "sk-ant-api-y"),
+            mk_endpoint("a", "sk-ant-api-x"),
+            mk_endpoint("b", "sk-ant-api-y"),
         ]);
         set_account_utilization(&state, 0, 0.96, 0.90, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -14407,15 +14940,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14434,7 +14965,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
@@ -14449,8 +14979,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn emergency_no_data() {
         // All accounts have default (0.5, "unknown") — brake should NOT activate (fail-open)
         let state = test_state_with(vec![
-            make_account("a", "sk-ant-api-x"),
-            make_account("b", "sk-ant-api-y"),
+            mk_endpoint("a", "sk-ant-api-x"),
+            mk_endpoint("b", "sk-ant-api-y"),
         ]);
         assert!(
             !state.is_emergency_brake_active().await,
@@ -14461,9 +14991,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn emergency_stale_data_with_unified() {
         // Stale reset times but valid unified utilization at 0.97
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             // Resets in the past → stale per-window data
             info.utilization_5h = Some(0.97);
             info.reset_5h = Some(1);
@@ -14486,15 +15016,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14513,7 +15041,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.85, 0.70, now + 10000, now + 100000).await;
@@ -14539,9 +15066,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Brake stays inactive: the unknown account might have available quota.
         let now = AppState::now_epoch();
         let state = test_state_with(vec![
-            make_account("known-a", "sk-ant-api-a"),
-            make_account("known-b", "sk-ant-api-b"),
-            make_account("unknown-c", "sk-ant-api-c"), // no rate data set
+            mk_endpoint("known-a", "sk-ant-api-a"),
+            mk_endpoint("known-b", "sk-ant-api-b"),
+            mk_endpoint("unknown-c", "sk-ant-api-c"), // no rate data set
         ]);
         set_account_utilization(&state, 0, 0.96, 0.92, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.95, 0.91, now + 10000, now + 100000).await;
@@ -14557,9 +15084,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Some known above, some known below, plus an unknown. Brake inactive on multiple grounds.
         let now = AppState::now_epoch();
         let state = test_state_with(vec![
-            make_account("high", "sk-ant-api-a"),
-            make_account("low", "sk-ant-api-b"),
-            make_account("unknown", "sk-ant-api-c"),
+            mk_endpoint("high", "sk-ant-api-a"),
+            mk_endpoint("low", "sk-ant-api-b"),
+            mk_endpoint("unknown", "sk-ant-api-c"),
         ]);
         set_account_utilization(&state, 0, 0.96, 0.92, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -14580,15 +15107,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("mystery", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("mystery", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14607,7 +15132,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         // No rate data set — account returns (0.5, "unknown")
@@ -14631,10 +15155,9 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![
-                make_account("known", "sk-ant-api-a"),
-                make_account("unknown", "sk-ant-api-b"),
+            endpoints: vec![
+                mk_endpoint("known", "sk-ant-api-a"),
+                mk_endpoint("unknown", "sk-ant-api-b"),
             ],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
@@ -14642,7 +15165,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14661,7 +15183,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.60, 0.55, now + 10000, now + 100000).await;
@@ -14678,8 +15199,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         // so util == threshold means NOT below → all_above stays true → brake fires.
         let now = AppState::now_epoch();
         let state = test_state_with(vec![
-            make_account("a", "sk-ant-api-a"),
-            make_account("b", "sk-ant-api-b"),
+            mk_endpoint("a", "sk-ant-api-a"),
+            mk_endpoint("b", "sk-ant-api-b"),
         ]);
         set_account_utilization(&state, 0, 0.88, 0.88, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.88, 0.88, now + 10000, now + 100000).await;
@@ -14694,8 +15215,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Boundary: one account at threshold - epsilon. Just below → all_above = false.
         let now = AppState::now_epoch();
         let state = test_state_with(vec![
-            make_account("a", "sk-ant-api-a"),
-            make_account("b", "sk-ant-api-b"),
+            mk_endpoint("a", "sk-ant-api-a"),
+            mk_endpoint("b", "sk-ant-api-b"),
         ]);
         set_account_utilization(&state, 0, 0.96, 0.92, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.879, 0.85, now + 10000, now + 100000).await;
@@ -14709,7 +15230,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn emergency_single_known_above_threshold_fires() {
         // Single account fleet, known and above threshold → brake fires.
         let now = AppState::now_epoch();
-        let state = test_state_with(vec![make_account("solo", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("solo", "sk-ant-api-x")]);
         set_account_utilization(&state, 0, 0.95, 0.92, now + 10000, now + 100000).await;
         assert!(
             state.is_emergency_brake_active().await,
@@ -14721,7 +15242,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn emergency_single_unknown_account_fails_open() {
         // Single unknown account — both guards prevent activation:
         // 0.5 < 0.88 → all_above = false, AND any_known = false.
-        let state = test_state_with(vec![make_account("solo", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("solo", "sk-ant-api-x")]);
         assert!(
             !state.is_emergency_brake_active().await,
             "single unknown account: must fail-open"
@@ -14735,15 +15256,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14762,7 +15281,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         // "-" is not the operator
@@ -14814,15 +15332,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14841,7 +15357,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         // Operator always gets "healthy" regardless of utilization
@@ -14860,15 +15375,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -14887,7 +15400,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         // gastown has limit 0.85, 80% of that = 0.68
@@ -15012,11 +15524,11 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         let body: serde_json::Value = resp.json().await.unwrap();
-        let accounts = body["accounts"].as_array().unwrap();
-        assert!(!accounts.is_empty());
+        let endpoints = body["endpoints"].as_array().unwrap();
+        assert!(!endpoints.is_empty());
 
-        // burn_rate object should exist on every account
-        let acct = &accounts[0];
+        // burn_rate object should exist on every endpoint
+        let acct = &endpoints[0];
         assert!(
             acct["burn_rate"].is_object(),
             "burn_rate should be an object"
@@ -15082,15 +15594,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: mock_url.clone(),
-            accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
+            endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-limit-reject.state.json"),
             proxy_key: Some("key".to_string()),
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
@@ -15109,7 +15619,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         // Set utilization above client's limit (0.80 > 0.50)
@@ -15146,15 +15655,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: mock_url.clone(),
-            accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
+            endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-limit-pass.state.json"),
             proxy_key: Some("key".to_string()),
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
@@ -15173,7 +15680,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         // Set utilization below client's limit (0.50 < 0.90)
@@ -15204,10 +15710,9 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: mock_url.clone(),
-            accounts: vec![
-                make_account("a", "sk-ant-api-test-aaa"),
-                make_account("b", "sk-ant-api-test-bbb"),
+            endpoints: vec![
+                mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url),
+                mk_endpoint_at("b", "sk-ant-api-test-bbb", &mock_url),
             ],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
@@ -15215,7 +15720,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             state_path: PathBuf::from("/tmp/test-emergency-block.state.json"),
             proxy_key: Some("key".to_string()),
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
@@ -15234,7 +15738,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         // All accounts above emergency threshold. 5h=0.96 > emergency threshold (0.88).
@@ -15273,10 +15776,9 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: mock_url.clone(),
-            accounts: vec![
-                make_account("a", "sk-ant-api-test-aaa"),
-                make_account("b", "sk-ant-api-test-bbb"),
+            endpoints: vec![
+                mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url),
+                mk_endpoint_at("b", "sk-ant-api-test-bbb", &mock_url),
             ],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
@@ -15284,7 +15786,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             state_path: PathBuf::from("/tmp/test-emergency-operator.state.json"),
             proxy_key: Some("key".to_string()),
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names,
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
@@ -15303,7 +15804,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         // All accounts above emergency threshold — 5h only (avoid claim penalty on 7d)
@@ -15342,15 +15842,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: mock_url.clone(),
-            accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
+            endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-openai-limit.state.json"),
             proxy_key: Some("key".to_string()),
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
@@ -15369,7 +15867,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -15403,15 +15900,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: mock_url.clone(),
-            accounts: vec![make_account("a", "sk-ant-api-test-aaa")],
+            endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-openai-emergency.state.json"),
             proxy_key: Some("key".to_string()),
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
@@ -15430,7 +15925,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -15488,7 +15982,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .unwrap();
         assert_eq!(stats.status(), reqwest::StatusCode::OK);
         let body: serde_json::Value = stats.json().await.unwrap();
-        assert!(body["accounts"].is_array());
+        assert!(body["endpoints"].is_array());
         assert!(body["aggregate"].is_object());
         assert_eq!(body["strategy"], "dynamic-capacity-v1");
     }
@@ -15497,7 +15991,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn resolve_client_id_prefers_header() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
         let mut headers = hyper::HeaderMap::new();
         headers.insert("x-client-id", HeaderValue::from_static("header-client"));
@@ -15515,15 +16009,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         client_names.insert("192.168.1.100".to_string(), "mapped-client".to_string());
         let state = Arc::new(AppState {
             client: Client::new(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names,
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -15542,7 +16034,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -15555,7 +16046,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn resolve_client_id_defaults_to_dash() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         let ip: IpAddr = "203.0.113.1".parse().unwrap();
         let headers = hyper::HeaderMap::new();
 
@@ -15565,7 +16056,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn resolve_client_id_ignores_empty_header() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
         let mut headers = hyper::HeaderMap::new();
         headers.insert("x-client-id", HeaderValue::from_static(""));
@@ -15576,7 +16067,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn resolve_client_id_ignores_dash_header() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
         let mut headers = hyper::HeaderMap::new();
         headers.insert("x-client-id", HeaderValue::from_static("-"));
@@ -15589,15 +16080,13 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn compute_pressure_status_operator_always_healthy() {
         let state = Arc::new(AppState {
             client: Client::new(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -15616,7 +16105,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -15643,15 +16131,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         limits.insert("client".to_string(), 0.80);
         let state = Arc::new(AppState {
             client: Client::new(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -15670,7 +16156,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -15813,7 +16298,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn account_serves_model_empty_filter_allows_all() {
-        let acct = make_account("test", "sk-ant-api-x");
+        let acct = mk_endpoint("test", "sk-ant-api-x");
         assert!(acct.serves_model("claude-sonnet-4-6"));
         assert!(acct.serves_model("claude-opus-4-6"));
         assert!(acct.serves_model(""));
@@ -15821,7 +16306,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn account_serves_model_prefix_wildcard() {
-        let mut acct = make_account("test", "sk-ant-api-x");
+        let mut acct = mk_endpoint("test", "sk-ant-api-x");
         acct.models = vec!["claude-opus-*".to_string()];
 
         assert!(acct.serves_model("claude-opus-4-6"));
@@ -15831,7 +16316,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn account_serves_model_multiple_patterns() {
-        let mut acct = make_account("test", "sk-ant-api-x");
+        let mut acct = mk_endpoint("test", "sk-ant-api-x");
         acct.models = vec!["claude-opus-*".to_string(), "claude-sonnet-4-6".to_string()];
 
         assert!(acct.serves_model("claude-opus-4-6"));
@@ -15899,25 +16384,25 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn pick_account_rejected_account_gets_no_traffic() {
         let state = test_state_with(vec![
-            make_account("rejected", "sk-ant-api-a"),
-            make_account("healthy", "sk-ant-api-b"),
+            mk_endpoint("rejected", "sk-ant-api-a"),
+            mk_endpoint("healthy", "sk-ant-api-b"),
         ]);
 
         let now = AppState::now_epoch();
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.90);
             info.reset_5h = Some(now + 10000);
             info.status_5h = Some("rejected".to_string()); // Rejected = util floor 1.0
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization = Some(0.50);
         }
 
         // All requests should go to healthy account
         for _ in 0..100 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             assert_eq!(idx, 1, "rejected account should receive no traffic");
         }
     }
@@ -15942,12 +16427,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         // When all accounts are throttled (status=throttled, floor=0.98 > soft_limit=0.90),
         // should use all accounts (graceful degradation)
         let state = test_state_with(vec![
-            make_account("a", "sk-ant-api-a"),
-            make_account("b", "sk-ant-api-b"),
+            mk_endpoint("a", "sk-ant-api-a"),
+            mk_endpoint("b", "sk-ant-api-b"),
         ]);
 
         let now = AppState::now_epoch();
-        for acct in &state.accounts {
+        for acct in &state.endpoints {
             let mut info = acct.rate_info.write().await;
             info.utilization_5h = Some(0.80);
             info.reset_5h = Some(now + 10000);
@@ -15957,7 +16442,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Both accounts should receive traffic
         let mut counts = [0u32; 2];
         for _ in 0..1000 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             counts[idx] += 1;
         }
 
@@ -15976,21 +16461,21 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn pick_account_respects_priority_tiers() {
         // Tier 0 accounts with headroom should get ALL traffic — tier 1 gets nothing.
-        let mut primary = make_account("primary", "sk-ant-api-a");
+        let mut primary = mk_endpoint("primary", "sk-ant-api-a");
         primary.priority = 0;
-        let mut fallback = make_account("fallback", "sk-ant-api-b");
+        let mut fallback = mk_endpoint("fallback", "sk-ant-api-b");
         fallback.priority = 1;
         let state = test_state_with(vec![primary, fallback]);
 
         let now = AppState::now_epoch();
-        for acct in &state.accounts {
+        for acct in &state.endpoints {
             let mut info = acct.rate_info.write().await;
             info.utilization_5h = Some(0.30);
             info.reset_5h = Some(now + 10000);
         }
 
         for _ in 0..100 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             assert_eq!(idx, 0, "all traffic should go to tier 0 when healthy");
         }
     }
@@ -15998,27 +16483,27 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn pick_account_falls_through_to_lower_priority() {
         // Tier 0 hard-limited → tier 1 should receive traffic.
-        let mut primary = make_account("primary", "sk-ant-api-a");
+        let mut primary = mk_endpoint("primary", "sk-ant-api-a");
         primary.priority = 0;
-        let mut fallback = make_account("fallback", "sk-ant-api-b");
+        let mut fallback = mk_endpoint("fallback", "sk-ant-api-b");
         fallback.priority = 1;
         let state = test_state_with(vec![primary, fallback]);
 
         // Hard-limit tier 0
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
         }
 
         let now = AppState::now_epoch();
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(0.30);
             info.reset_5h = Some(now + 10000);
         }
 
         for _ in 0..100 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             assert_eq!(
                 idx, 1,
                 "tier 1 should get traffic when tier 0 is hard-limited"
@@ -16029,14 +16514,14 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn pick_account_priority_default_zero() {
         // Accounts without explicit priority should behave as tier 0.
-        let a = make_account("a", "sk-ant-api-a");
-        let b = make_account("b", "sk-ant-api-b");
+        let a = mk_endpoint("a", "sk-ant-api-a");
+        let b = mk_endpoint("b", "sk-ant-api-b");
         assert_eq!(a.priority, 0);
         assert_eq!(b.priority, 0);
 
         let state = test_state_with(vec![a, b]);
         let now = AppState::now_epoch();
-        for acct in &state.accounts {
+        for acct in &state.endpoints {
             let mut info = acct.rate_info.write().await;
             info.utilization_5h = Some(0.30);
             info.reset_5h = Some(now + 10000);
@@ -16045,7 +16530,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Both should receive traffic (same tier)
         let mut counts = [0u32; 2];
         for _ in 0..1000 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             counts[idx] += 1;
         }
         assert!(counts[0] > 0, "account a should get traffic");
@@ -16057,30 +16542,30 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Tier 0 accounts above soft_limit but still alive (weight > 0) → tier 0 is
         // degraded-used, NOT skipped. soft_limit is intra-tier load-shedding; it must
         // never cause a jump to a lower-priority (paid) tier while free capacity remains.
-        let mut primary_a = make_account("primary_a", "sk-ant-api-a");
+        let mut primary_a = mk_endpoint("primary_a", "sk-ant-api-a");
         primary_a.priority = 0;
-        let mut primary_b = make_account("primary_b", "sk-ant-api-b");
+        let mut primary_b = mk_endpoint("primary_b", "sk-ant-api-b");
         primary_b.priority = 0;
-        let mut fallback = make_account("fallback", "sk-ant-api-c");
+        let mut fallback = mk_endpoint("fallback", "sk-ant-api-c");
         fallback.priority = 1;
         let state = test_state_with_soft_limit(vec![primary_a, primary_b, fallback], 0.90);
 
         let now = AppState::now_epoch();
         // Tier 0: above soft limit (0.95) but still has headroom — weight > 0.
         for i in 0..2 {
-            let mut info = state.accounts[i].rate_info.write().await;
+            let mut info = state.endpoints[i].rate_info.write().await;
             info.utilization_5h = Some(0.95);
             info.reset_5h = Some(now + 10000);
         }
         // Tier 1: healthy.
         {
-            let mut info = state.accounts[2].rate_info.write().await;
+            let mut info = state.endpoints[2].rate_info.write().await;
             info.utilization_5h = Some(0.30);
             info.reset_5h = Some(now + 10000);
         }
 
         for _ in 0..100 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             assert!(
                 idx == 0 || idx == 1,
                 "tier 0 must be drained (degraded) before tier 1 is touched"
@@ -16092,30 +16577,30 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn pick_account_priority_zero_weight_tier_falls_through() {
         // Tier 0 accounts at zero weight (util 1.0 → gate 1.0) → genuinely exhausted →
         // routing falls through to tier 1.
-        let mut primary_a = make_account("primary_a", "sk-ant-api-a");
+        let mut primary_a = mk_endpoint("primary_a", "sk-ant-api-a");
         primary_a.priority = 0;
-        let mut primary_b = make_account("primary_b", "sk-ant-api-b");
+        let mut primary_b = mk_endpoint("primary_b", "sk-ant-api-b");
         primary_b.priority = 0;
-        let mut fallback = make_account("fallback", "sk-ant-api-c");
+        let mut fallback = mk_endpoint("fallback", "sk-ant-api-c");
         fallback.priority = 1;
         let state = test_state_with_soft_limit(vec![primary_a, primary_b, fallback], 0.90);
 
         let now = AppState::now_epoch();
         // Tier 0: fully exhausted — util 1.0 → gate 1.0 → weight 0.
         for i in 0..2 {
-            let mut info = state.accounts[i].rate_info.write().await;
+            let mut info = state.endpoints[i].rate_info.write().await;
             info.utilization_5h = Some(1.0);
             info.reset_5h = Some(now + 10000);
         }
         // Tier 1: healthy.
         {
-            let mut info = state.accounts[2].rate_info.write().await;
+            let mut info = state.endpoints[2].rate_info.write().await;
             info.utilization_5h = Some(0.30);
             info.reset_5h = Some(now + 10000);
         }
 
         for _ in 0..100 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             assert_eq!(idx, 2, "tier 1 used once tier 0 is genuinely zero-weight");
         }
     }
@@ -16123,29 +16608,29 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn pick_account_multiple_tiers_cascade() {
         // Three tiers: 0, 1, 2. Tier 0 and 1 exhausted → tier 2 gets traffic.
-        let mut t0 = make_account("t0", "sk-ant-api-a");
+        let mut t0 = mk_endpoint("t0", "sk-ant-api-a");
         t0.priority = 0;
-        let mut t1 = make_account("t1", "sk-ant-api-b");
+        let mut t1 = mk_endpoint("t1", "sk-ant-api-b");
         t1.priority = 1;
-        let mut t2 = make_account("t2", "sk-ant-api-c");
+        let mut t2 = mk_endpoint("t2", "sk-ant-api-c");
         t2.priority = 2;
         let state = test_state_with(vec![t0, t1, t2]);
 
         // Hard-limit tiers 0 and 1
         for i in 0..2 {
-            let mut info = state.accounts[i].rate_info.write().await;
+            let mut info = state.endpoints[i].rate_info.write().await;
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
         }
 
         let now = AppState::now_epoch();
         {
-            let mut info = state.accounts[2].rate_info.write().await;
+            let mut info = state.endpoints[2].rate_info.write().await;
             info.utilization_5h = Some(0.30);
             info.reset_5h = Some(now + 10000);
         }
 
         for _ in 0..100 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             assert_eq!(
                 idx, 2,
                 "tier 2 should get traffic when tiers 0 and 1 are exhausted"
@@ -16156,25 +16641,25 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn pick_account_all_tiers_exhausted_returns_none() {
         // All tiers hard-limited → None.
-        let mut t0 = make_account("t0", "sk-ant-api-a");
+        let mut t0 = mk_endpoint("t0", "sk-ant-api-a");
         t0.priority = 0;
-        let mut t1 = make_account("t1", "sk-ant-api-b");
+        let mut t1 = mk_endpoint("t1", "sk-ant-api-b");
         t1.priority = 1;
         let state = test_state_with(vec![t0, t1]);
 
-        for acct in &state.accounts {
+        for acct in &state.endpoints {
             let mut info = acct.rate_info.write().await;
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
         }
 
-        assert!(state.pick_account(None, "", &[]).await.is_none());
+        assert!(state.pick_endpoint(None, "", &[]).await.is_none());
     }
 
     // ── Overage tests ────────────────────────────────────────────────
 
     #[tokio::test]
     async fn update_rate_info_parses_overage_headers() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-a")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a")]);
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "anthropic-ratelimit-unified-overage-in-use",
@@ -16195,7 +16680,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         state.update_rate_info(0, &headers).await;
 
-        let info = state.accounts[0].rate_info.read().await;
+        let info = state.endpoints[0].rate_info.read().await;
         assert!(info.overage_in_use);
         assert_eq!(info.overage_status.as_deref(), Some("allowed"));
         assert_eq!(info.overage_utilization, Some(0.25));
@@ -16206,9 +16691,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn update_rate_info_overage_absent_resets_to_false() {
         // Corner 1: an account previously in overage whose next response omits the
         // overage-in-use header must drop back to overage_in_use=false.
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-a")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a")]);
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.overage_in_use = true;
             info.overage_status = Some("allowed".to_string());
             info.overage_utilization = Some(0.5);
@@ -16217,7 +16702,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let headers = reqwest::header::HeaderMap::new();
         state.update_rate_info(0, &headers).await;
 
-        let info = state.accounts[0].rate_info.read().await;
+        let info = state.endpoints[0].rate_info.read().await;
         assert!(!info.overage_in_use, "overage_in_use must reset to false");
         assert_eq!(info.overage_status, None);
         assert_eq!(info.overage_utilization, None);
@@ -16274,18 +16759,18 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn pick_account_overage_demoted_below_free() {
         // Free account (eff. priority 0) must drain before an overage account
         // (eff. priority 0 + overage_penalty 10) receives any traffic.
-        let free = make_account("free", "sk-ant-api-a");
-        let overage = make_account("overage", "sk-ant-api-b");
+        let free = mk_endpoint("free", "sk-ant-api-a");
+        let overage = mk_endpoint("overage", "sk-ant-api-b");
         let state = test_state_with(vec![free, overage]);
 
         let now = AppState::now_epoch();
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.30);
             info.reset_5h = Some(now + 10000);
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(1.0);
             info.reset_5h = Some(now + 3000);
             info.status_5h = Some("rejected".to_string());
@@ -16296,7 +16781,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
 
         for _ in 0..100 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             assert_eq!(idx, 0, "free account preferred over overage account");
         }
     }
@@ -16304,18 +16789,18 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn pick_account_overage_used_when_free_exhausted() {
         // Free account at zero weight → the overage account (demoted) is used.
-        let free = make_account("free", "sk-ant-api-a");
-        let overage = make_account("overage", "sk-ant-api-b");
+        let free = mk_endpoint("free", "sk-ant-api-a");
+        let overage = mk_endpoint("overage", "sk-ant-api-b");
         let state = test_state_with(vec![free, overage]);
 
         let now = AppState::now_epoch();
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(1.0); // zero weight
             info.reset_5h = Some(now + 10000);
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(1.0);
             info.reset_5h = Some(now + 3000);
             info.status_5h = Some("rejected".to_string());
@@ -16326,19 +16811,22 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
 
         for _ in 0..100 {
-            let idx = state.pick_account(None, "", &[]).await.unwrap();
+            let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
             assert_eq!(idx, 1, "overage account used once free tier is exhausted");
         }
     }
 
     #[tokio::test]
-    async fn pick_endpoint_upstream_is_last_resort() {
-        // The fallback upstream (priority 100) is a unified routing candidate: a
-        // healthy account beats it; it is selected only once accounts are exhausted.
-        let state = test_state_with_fallback(vec![make_account("a", "sk-ant-api-a")], 100);
+    async fn pick_endpoint_openai_is_last_resort() {
+        // A priority-100 OpenAI endpoint is a routing candidate: a healthy
+        // Anthropic endpoint beats it; it is selected only once the lower
+        // tier is exhausted.
+        let mut openai = make_endpoint("fallback", Protocol::OpenAI);
+        openai.priority = 100;
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a"), openai]);
         let now = AppState::now_epoch();
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.30);
             info.reset_5h = Some(now + 10000);
         }
@@ -16346,20 +16834,21 @@ data: {\"type\":\"message_stop\"}\n\n";
         for _ in 0..50 {
             assert_eq!(
                 state.pick_endpoint(None, "", &[]).await,
-                Some(Endpoint::Account(0)),
-                "healthy account beats the priority-100 upstream"
+                Some(0),
+                "healthy endpoint beats the priority-100 openai endpoint"
             );
         }
 
-        // Hard-limit the account → the upstream is the only remaining candidate.
+        // Hard-limit the Anthropic endpoint → the openai endpoint is the only
+        // remaining candidate.
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
         }
         assert_eq!(
             state.pick_endpoint(None, "", &[]).await,
-            Some(Endpoint::Upstream(0)),
-            "upstream selected once the account tier is exhausted"
+            Some(1),
+            "openai endpoint selected once the lower tier is exhausted"
         );
     }
 
@@ -16367,15 +16856,13 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn is_operator_checks_configured_operator() {
         let state = Arc::new(AppState {
             client: Client::new(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -16394,7 +16881,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -16412,15 +16898,13 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn is_operator_supports_multiple_operators() {
         let state = Arc::new(AppState {
             client: Client::new(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![],
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -16443,7 +16927,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
         assert!(state.is_operator("ray"));
@@ -16457,16 +16940,34 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn cluster_info_returns_none_without_redis() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         assert!(state.cluster_info().await.is_none());
     }
 
     #[tokio::test]
     async fn sync_from_redis_noop_without_redis() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         // Should not panic or error when redis is None
         state.sync_from_redis().await;
         // Cluster cache should remain None
+        assert!(state.cluster_info_cache.lock().unwrap().is_none());
+    }
+
+    /// sync_from_redis / publish_routing_weights build the SyncTarget list over
+    /// the endpoint pool. With an endpoints-only config (and a mix of
+    /// Anthropic + OpenAI protocols) neither path may panic.
+    #[tokio::test]
+    async fn sync_and_publish_handle_endpoint_pool_without_redis() {
+        let mut state = test_state_with(vec![]);
+        {
+            let st = Arc::get_mut(&mut state).unwrap();
+            st.endpoints
+                .push(make_endpoint("ep-a", Protocol::Anthropic));
+            st.endpoints.push(make_endpoint("ep-oai", Protocol::OpenAI));
+        }
+        // Both paths must be no-ops (redis is None) and must not panic.
+        state.sync_from_redis().await;
+        state.publish_routing_weights().await;
         assert!(state.cluster_info_cache.lock().unwrap().is_none());
     }
 
@@ -16479,15 +16980,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -16506,7 +17005,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -16599,18 +17097,18 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn hard_limit_unchanged_by_sync_without_redis() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
 
         // Set a local hard limit
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(30));
         }
 
         // sync_from_redis should not touch it when redis is None
         state.sync_from_redis().await;
 
-        let info = state.accounts[0].rate_info.read().await;
+        let info = state.endpoints[0].rate_info.read().await;
         assert!(info.hard_limited_until.is_some());
     }
 
@@ -16623,15 +17121,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -16650,7 +17146,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -16662,7 +17157,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn record_budget_usage_skips_unknown_client() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         // No budgets configured — recording should be a no-op
         state.record_budget_usage("unknown-client", 500).await;
         let map = state.budget_usage.lock().unwrap();
@@ -16675,17 +17170,15 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn config_deser_minimal() {
         let toml = r#"
 listen = "127.0.0.1:8082"
-upstream = "https://api.anthropic.com"
 
-[[accounts]]
+[[endpoints]]
 name = "primary"
 token = "sk-ant-api-test"
 "#;
         let cfg: Config = toml::from_str(toml).expect("minimal config should deserialize");
         assert_eq!(cfg.listen, "127.0.0.1:8082");
-        assert_eq!(cfg.upstream, "https://api.anthropic.com");
-        assert_eq!(cfg.accounts.len(), 1);
-        assert_eq!(cfg.accounts[0].name, "primary");
+        assert_eq!(cfg.endpoints.len(), 1);
+        assert_eq!(cfg.endpoints[0].name, "primary");
         // Optional fields absent
         assert!(cfg.proxy_key.is_none());
         assert!(cfg.redis_url.is_none());
@@ -16695,14 +17188,12 @@ token = "sk-ant-api-test"
         assert!(cfg.client_budgets.is_empty());
         assert!(cfg.client_utilization_limits.is_empty());
         assert!(cfg.client_names.is_empty());
-        assert!(cfg.upstreams.is_empty());
     }
 
     #[test]
     fn config_deser_all_optional_fields() {
         let toml = r#"
 listen = "0.0.0.0:8082"
-upstream = "https://api.anthropic.com"
 strategy = "dynamic-capacity"
 rate_limit_cooldown_secs = 120
 probe_interval_secs = 600
@@ -16727,19 +17218,21 @@ bob = 500000
 alice = 0.95
 bob = 0.80
 
-[[accounts]]
+[[endpoints]]
 name = "acct-a"
 token = "sk-ant-oat01-token1"
 
-[[accounts]]
+[[endpoints]]
 name = "acct-b"
 token = "sk-ant-api-token2"
 models = ["claude-opus-*", "claude-sonnet-4-6"]
 
-[[upstreams]]
+[[endpoints]]
 name = "openai"
+protocol = "openai"
 base_url = "https://api.openai.com"
-api_key = "sk-openai-key"
+token = "sk-openai-key"
+priority = 100
 "#;
         let cfg: Config = toml::from_str(toml).expect("full config should deserialize");
         assert_eq!(cfg.proxy_key.as_deref(), Some("secret"));
@@ -16756,13 +17249,12 @@ api_key = "sk-openai-key"
         assert_eq!(cfg.client_names.get("10.0.0.1").unwrap(), "alice");
         assert_eq!(*cfg.client_budgets.get("alice").unwrap(), 1000000u64);
         assert_eq!(*cfg.client_utilization_limits.get("alice").unwrap(), 0.95);
-        // Accounts
-        assert_eq!(cfg.accounts.len(), 2);
-        assert_eq!(cfg.accounts[1].models.len(), 2);
-        assert_eq!(cfg.accounts[1].models[0], "claude-opus-*");
-        // Upstreams
-        assert_eq!(cfg.upstreams.len(), 1);
-        assert_eq!(cfg.upstreams[0].name, "openai");
+        // Endpoints
+        assert_eq!(cfg.endpoints.len(), 3);
+        assert_eq!(cfg.endpoints[1].models.len(), 2);
+        assert_eq!(cfg.endpoints[1].models[0], "claude-opus-*");
+        assert_eq!(cfg.endpoints[2].protocol, Protocol::OpenAI);
+        assert_eq!(cfg.endpoints[2].priority, 100);
     }
 
     #[test]
@@ -16792,44 +17284,40 @@ api_key = "sk-openai-key"
 
     #[test]
     fn config_deser_missing_required_field_fails() {
-        // Missing `upstream`
+        // Missing `listen` (the sole required top-level key).
         let toml = r#"
-listen = "127.0.0.1:8082"
-
-[[accounts]]
+[[endpoints]]
 name = "test"
 token = "sk-ant-api-test"
 "#;
         let result = toml::from_str::<Config>(toml);
         assert!(
             result.is_err(),
-            "missing upstream should fail deserialization"
+            "missing listen should fail deserialization"
         );
     }
 
     #[test]
-    fn config_deser_missing_accounts_fails() {
+    fn config_deser_endpoints_default_empty() {
+        // `endpoints` defaults to an empty vec at the deserialization layer;
+        // the non-empty requirement is enforced in `main()`, not by serde.
         let toml = r#"
 listen = "127.0.0.1:8082"
-upstream = "https://api.anthropic.com"
 "#;
-        let result = toml::from_str::<Config>(toml);
-        assert!(
-            result.is_err(),
-            "missing accounts should fail deserialization"
-        );
+        let cfg: Config = toml::from_str(toml).expect("config without endpoints deserializes");
+        assert!(cfg.endpoints.is_empty());
     }
 
     // ── Rate info merge: "most recent wins" ─────────────────────
 
     #[tokio::test]
     async fn rate_info_merge_remote_newer_wins() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         let now_epoch = AppState::now_epoch();
 
         // Set local rate info with an older timestamp
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.30);
             info.last_updated_epoch = Some(now_epoch - 60); // 60s ago
         }
@@ -16858,7 +17346,7 @@ upstream = "https://api.anthropic.com"
 
         // Apply same merge logic as sync_from_redis
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             let local_age = info
                 .last_updated_epoch
                 .map(|epoch| now_epoch.saturating_sub(epoch))
@@ -16875,19 +17363,19 @@ upstream = "https://api.anthropic.com"
             info.last_updated_epoch = Some(remote.updated_at);
         }
 
-        let info = state.accounts[0].rate_info.read().await;
+        let info = state.endpoints[0].rate_info.read().await;
         assert_eq!(info.utilization_5h, Some(0.75));
         assert_eq!(info.last_updated_epoch, Some(now_epoch - 10));
     }
 
     #[tokio::test]
     async fn rate_info_merge_local_newer_preserved() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         let now_epoch = AppState::now_epoch();
 
         // Set local rate info with a recent timestamp (5s ago)
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.30);
             info.last_updated_epoch = Some(now_epoch - 5);
         }
@@ -16916,7 +17404,7 @@ upstream = "https://api.anthropic.com"
 
         // Apply same merge logic as sync_from_redis
         {
-            let info = state.accounts[0].rate_info.read().await;
+            let info = state.endpoints[0].rate_info.read().await;
             let local_age = info
                 .last_updated_epoch
                 .map(|epoch| now_epoch.saturating_sub(epoch))
@@ -16931,7 +17419,7 @@ upstream = "https://api.anthropic.com"
             // Local wins — do NOT apply remote
         }
 
-        let info = state.accounts[0].rate_info.read().await;
+        let info = state.endpoints[0].rate_info.read().await;
         assert_eq!(
             info.utilization_5h,
             Some(0.30),
@@ -16941,12 +17429,12 @@ upstream = "https://api.anthropic.com"
 
     #[tokio::test]
     async fn rate_info_merge_no_local_epoch_remote_wins() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         let now_epoch = AppState::now_epoch();
 
         // Local has no last_updated_epoch (fresh state)
         {
-            let info = state.accounts[0].rate_info.read().await;
+            let info = state.endpoints[0].rate_info.read().await;
             assert!(info.last_updated_epoch.is_none());
         }
 
@@ -16973,7 +17461,7 @@ upstream = "https://api.anthropic.com"
 
         // When local has no epoch, local_age = u64::MAX, so remote always wins
         {
-            let info = state.accounts[0].rate_info.read().await;
+            let info = state.endpoints[0].rate_info.read().await;
             let local_age = info
                 .last_updated_epoch
                 .map(|epoch| now_epoch.saturating_sub(epoch))
@@ -16998,10 +17486,9 @@ upstream = "https://api.anthropic.com"
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![
-                make_account("primary", "sk-ant-api-aaa"),
-                make_account("secondary", "sk-ant-api-bbb"),
+            endpoints: vec![
+                mk_endpoint("primary", "sk-ant-api-aaa"),
+                mk_endpoint("secondary", "sk-ant-api-bbb"),
             ],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
@@ -17009,7 +17496,6 @@ upstream = "https://api.anthropic.com"
             state_path: state_path.clone(),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -17028,16 +17514,15 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
         // Set up some state to persist
         let now_epoch = AppState::now_epoch();
-        state.accounts[0].requests.store(42, Ordering::Relaxed);
-        state.accounts[1].requests.store(17, Ordering::Relaxed);
+        state.endpoints[0].requests.store(42, Ordering::Relaxed);
+        state.endpoints[1].requests.store(17, Ordering::Relaxed);
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.65);
             info.utilization_5h = Some(0.50);
             info.utilization_7d = Some(0.70);
@@ -17062,7 +17547,7 @@ upstream = "https://api.anthropic.com"
             );
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(0.20);
             info.reset_5h = Some(now_epoch + 18000);
             // hard-limit 60s from now
@@ -17075,9 +17560,9 @@ upstream = "https://api.anthropic.com"
         // Verify file exists and is valid JSON
         let data = tokio::fs::read_to_string(&state_path).await.unwrap();
         let persisted: PersistedState = serde_json::from_str(&data).unwrap();
-        assert_eq!(persisted.accounts.len(), 2);
-        assert_eq!(persisted.accounts[0].requests_total, 42);
-        assert_eq!(persisted.accounts[1].requests_total, 17);
+        assert_eq!(persisted.endpoints.len(), 2);
+        assert_eq!(persisted.endpoints[0].requests_total, 42);
+        assert_eq!(persisted.endpoints[1].requests_total, 17);
         assert!(persisted.saved_at > 0);
 
         // Create a fresh state and load into it
@@ -17086,10 +17571,9 @@ upstream = "https://api.anthropic.com"
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![
-                make_account("primary", "sk-ant-api-aaa"),
-                make_account("secondary", "sk-ant-api-bbb"),
+            endpoints: vec![
+                mk_endpoint("primary", "sk-ant-api-aaa"),
+                mk_endpoint("secondary", "sk-ant-api-bbb"),
             ],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
@@ -17097,7 +17581,6 @@ upstream = "https://api.anthropic.com"
             state_path,
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -17116,7 +17599,6 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -17125,14 +17607,14 @@ upstream = "https://api.anthropic.com"
 
         // Verify fields survived the round-trip
         assert_eq!(
-            state2.accounts[0].requests.load(Ordering::Relaxed),
+            state2.endpoints[0].requests.load(Ordering::Relaxed),
             42,
             "request count should persist"
         );
-        assert_eq!(state2.accounts[1].requests.load(Ordering::Relaxed), 17);
+        assert_eq!(state2.endpoints[1].requests.load(Ordering::Relaxed), 17);
 
         {
-            let info = state2.accounts[0].rate_info.read().await;
+            let info = state2.endpoints[0].rate_info.read().await;
             // Unified is recomputed as max(utilization_5h, utilization_7d)
             assert_eq!(info.utilization, Some(0.70));
             assert_eq!(info.utilization_5h, Some(0.50));
@@ -17156,7 +17638,7 @@ upstream = "https://api.anthropic.com"
         }
 
         {
-            let info = state2.accounts[1].rate_info.read().await;
+            let info = state2.endpoints[1].rate_info.read().await;
             assert_eq!(info.utilization_5h, Some(0.20));
             // Hard limit should have been restored (future epoch)
             assert!(
@@ -17164,6 +17646,64 @@ upstream = "https://api.anthropic.com"
                 "hard_limited_until should survive round-trip"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn load_state_warns_and_starts_clean_on_legacy_accounts_key() {
+        // A state file using the legacy `accounts` top-level key must NOT
+        // deserialize into the new `endpoints`-keyed PersistedState. load_state
+        // logs a warn and starts clean.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"{"accounts":[{"name":"primary","requests_total":42}],"saved_at":0}"#,
+        )
+        .unwrap();
+        let mut state = test_state_with(vec![mk_endpoint("primary", "sk-ant")]);
+        Arc::get_mut(&mut state).unwrap().state_path = tmp.path().to_path_buf();
+        state.load_state().await; // must not panic
+        assert_eq!(
+            state.endpoints[0].requests.load(Ordering::Relaxed),
+            0,
+            "legacy accounts-keyed state file must not load into the new schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_load_roundtrip_unified_endpoints() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut state = test_state_with(vec![]);
+        {
+            let st = Arc::get_mut(&mut state).unwrap();
+            st.state_path = tmp.path().to_path_buf();
+            st.endpoints.push(make_endpoint("ep1", Protocol::Anthropic));
+        }
+        let now_epoch = AppState::now_epoch();
+        state.endpoints[0].requests.store(7, Ordering::Relaxed);
+        {
+            // load_state recomputes `utilization` from the surviving 5h/7d
+            // windows, so a bare flat `utilization` would not survive. Set a
+            // 5h window with a future reset so it persists and drives util.
+            let mut info = state.endpoints[0].rate_info.write().await;
+            info.utilization = Some(0.42);
+            info.utilization_5h = Some(0.42);
+            info.reset_5h = Some(now_epoch + 18000);
+        }
+        state.save_state().await;
+
+        // Fresh state with the same endpoint name, load from the file.
+        let mut state2 = test_state_with(vec![]);
+        {
+            let st = Arc::get_mut(&mut state2).unwrap();
+            st.state_path = tmp.path().to_path_buf();
+            st.endpoints.push(make_endpoint("ep1", Protocol::Anthropic));
+        }
+        state2.load_state().await;
+        assert_eq!(state2.endpoints[0].requests.load(Ordering::Relaxed), 7);
+        assert_eq!(
+            state2.endpoints[0].rate_info.read().await.utilization,
+            Some(0.42)
+        );
     }
 
     // ── Budget day rollover ──────────────────────────────────────
@@ -17177,15 +17717,13 @@ upstream = "https://api.anthropic.com"
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -17204,7 +17742,6 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -17234,15 +17771,13 @@ upstream = "https://api.anthropic.com"
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("a", "sk-ant-api-x")],
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -17261,7 +17796,6 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -17325,7 +17859,7 @@ upstream = "https://api.anthropic.com"
 
     #[test]
     fn routing_metrics_present() {
-        let acct = make_account("acct-a", "sk-ant-api-a");
+        let acct = mk_endpoint("acct-a", "sk-ant-api-a");
         acct.last_routing_weight
             .store(0.4f64.to_bits(), Ordering::Relaxed);
         acct.last_routing_share
@@ -17335,7 +17869,7 @@ upstream = "https://api.anthropic.com"
         append_routing_weight_metrics(
             &mut buf,
             &[acct],
-            &[AcctMetricsSnap {
+            &[EndpointMetricsSnap {
                 name: "acct-a".to_string(),
                 ..Default::default()
             }],
@@ -17358,7 +17892,7 @@ upstream = "https://api.anthropic.com"
     }
     #[test]
     fn routing_metrics_zero_weight_for_rejected_claim() {
-        let acct = make_account("acct-a", "sk-ant-api-a");
+        let acct = mk_endpoint("acct-a", "sk-ant-api-a");
         acct.last_routing_weight
             .store(0.0f64.to_bits(), Ordering::Relaxed);
         acct.last_routing_share
@@ -17368,7 +17902,7 @@ upstream = "https://api.anthropic.com"
         append_routing_weight_metrics(
             &mut buf,
             &[acct],
-            &[AcctMetricsSnap {
+            &[EndpointMetricsSnap {
                 name: "acct-a".to_string(),
                 ..Default::default()
             }],
@@ -17392,20 +17926,20 @@ upstream = "https://api.anthropic.com"
     #[tokio::test]
     async fn passthrough_accounts_participate_in_routing_candidates_and_metrics() {
         let mut state = test_state_with(vec![
-            make_account("passthrough", "passthrough"),
-            make_account("api", "sk-ant-api-b"),
+            mk_endpoint("passthrough", "passthrough"),
+            mk_endpoint("api", "sk-ant-api-b"),
         ]);
         Arc::get_mut(&mut state).unwrap().soft_limit = 1.0;
 
         let now_epoch = AppState::now_epoch();
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.20);
             info.utilization_5h = Some(0.20);
             info.reset_5h = Some(now_epoch + 10000);
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization = Some(0.40);
             info.utilization_5h = Some(0.40);
             info.reset_5h = Some(now_epoch + 10000);
@@ -17422,9 +17956,9 @@ upstream = "https://api.anthropic.com"
         let mut buf = String::new();
         append_routing_weight_metrics(
             &mut buf,
-            &state.accounts,
+            &state.endpoints,
             &[
-                AcctMetricsSnap {
+                EndpointMetricsSnap {
                     name: "passthrough".to_string(),
                     passthrough: true,
                     utilization: Some(0.20),
@@ -17432,7 +17966,7 @@ upstream = "https://api.anthropic.com"
                     reset_5h: Some(now_epoch + 10000),
                     ..Default::default()
                 },
-                AcctMetricsSnap {
+                EndpointMetricsSnap {
                     name: "api".to_string(),
                     utilization: Some(0.40),
                     utilization_5h: Some(0.40),
@@ -17463,7 +17997,7 @@ upstream = "https://api.anthropic.com"
 
         // Set some state so metrics are interesting
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.42);
             info.utilization_7d = Some(0.35);
             info.remaining_requests = Some(1000);
@@ -17473,22 +18007,22 @@ upstream = "https://api.anthropic.com"
         }
         // Set burn rate values (R2.2)
         {
-            let mut br = state.accounts[0].burn_rate.lock().unwrap();
+            let mut br = state.endpoints[0].burn_rate.lock().unwrap();
             br.rate_5m.value = 2.5;
             br.rate_1h.value = 1.8;
             br.rate_6h.value = 0.9;
         }
-        state.accounts[0].requests.store(123, Ordering::Relaxed);
-        state.accounts[0]
+        state.endpoints[0].requests.store(123, Ordering::Relaxed);
+        state.endpoints[0]
             .input_tokens
             .store(90000, Ordering::Relaxed);
-        state.accounts[0]
+        state.endpoints[0]
             .output_tokens
             .store(30000, Ordering::Relaxed);
-        state.accounts[0]
+        state.endpoints[0]
             .cache_creation_tokens
             .store(5000, Ordering::Relaxed);
-        state.accounts[0]
+        state.endpoints[0]
             .cache_read_tokens
             .store(15000, Ordering::Relaxed);
 
@@ -17616,12 +18150,6 @@ upstream = "https://api.anthropic.com"
             body.contains("# TYPE anthropic_account_utilization gauge"),
             "missing TYPE header:\n{body}"
         );
-
-        // Upstream metrics
-        assert!(
-            body.contains("anthropic_upstream_requests_total{upstream=\"mock\""),
-            "missing upstream:\n{body}"
-        );
     }
 
     #[tokio::test]
@@ -17698,21 +18226,19 @@ upstream = "https://api.anthropic.com"
     #[tokio::test]
     async fn metrics_operator_hiding() {
         let (mock_url, _handle) = spawn_mock_upstream().await;
-        let accounts = vec![make_account("acct-a", "sk-ant-api-test-aaa")];
+        let accounts = vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &mock_url)];
         let state = Arc::new(AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: mock_url.clone(),
-            accounts,
+            endpoints: accounts,
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -17731,7 +18257,6 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -17831,14 +18356,14 @@ upstream = "https://api.anthropic.com"
 
         // Set some state so all metric families are populated
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.5);
             info.remaining_requests = Some(100);
             info.remaining_tokens = Some(50000);
             info.limit_requests = Some(1000);
             info.limit_tokens = Some(100000);
         }
-        state.accounts[0].requests.store(10, Ordering::Relaxed);
+        state.endpoints[0].requests.store(10, Ordering::Relaxed);
 
         let addr = serve(app).await;
         let client = Client::new();
@@ -17900,13 +18425,13 @@ upstream = "https://api.anthropic.com"
 
         // acct-a: eff_util >= 0.5 and br_1h >= 0.01 → projected_throttle IS emitted
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.7);
             info.remaining_requests = Some(500);
             info.limit_requests = Some(2000);
         }
         {
-            let mut br = state.accounts[0].burn_rate.lock().unwrap();
+            let mut br = state.endpoints[0].burn_rate.lock().unwrap();
             br.rate_1h.value = 2.0;
         }
 
@@ -17935,7 +18460,7 @@ upstream = "https://api.anthropic.com"
 
     #[tokio::test]
     async fn metrics_client_budgets_and_rpm() {
-        let accounts = vec![make_account("acct-a", "sk-ant-api-test-aaa")];
+        let accounts = vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")];
         let today = AppState::now_epoch() / 86400;
 
         let mut client_budgets = HashMap::new();
@@ -17954,15 +18479,13 @@ upstream = "https://api.anthropic.com"
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts,
+            endpoints: accounts,
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: true,
             client_usage: Mutex::new(HashMap::new()),
@@ -17981,7 +18504,6 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -18023,11 +18545,11 @@ upstream = "https://api.anthropic.com"
 
         // Set headroom on both accounts
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.remaining_requests = Some(1000);
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.remaining_requests = Some(500);
         }
 
@@ -18079,7 +18601,7 @@ upstream = "https://api.anthropic.com"
         let reset_epoch = now_epoch + 302400; // 3.5 * 86400
 
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.claims_7d.insert(
                 "claude-sonnet".to_string(),
                 ClaimWindowData {
@@ -18137,7 +18659,7 @@ upstream = "https://api.anthropic.com"
         let reset_7d = now_epoch + 302400; // 3.5 days
 
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.reset_5h = Some(reset_5h);
             info.reset_7d = Some(reset_7d);
             info.claims_7d.insert(
@@ -18231,7 +18753,7 @@ upstream = "https://api.anthropic.com"
         let data_age_secs = 120u64;
 
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.60);
             info.reset_5h = Some(now_epoch + 7200);
             info.status_5h = Some("allowed_warning".to_string());
@@ -18330,16 +18852,16 @@ upstream = "https://api.anthropic.com"
     /// for rejected accounts and accounts above soft_limit.
     #[tokio::test]
     async fn refresh_metrics_weights_persists_atomics() {
-        let acct_a = make_account("a", "sk-ant-api-a");
-        let acct_b = make_account("b", "sk-ant-api-b");
-        let acct_c = make_account("c", "sk-ant-api-c");
+        let acct_a = mk_endpoint("a", "sk-ant-api-a");
+        let acct_b = mk_endpoint("b", "sk-ant-api-b");
+        let acct_c = mk_endpoint("c", "sk-ant-api-c");
         let state = test_state_with(vec![acct_a, acct_b, acct_c]);
 
         let now = AppState::now_epoch();
 
         // a: 5h=0.20 (healthy), b: 5h=0.30 (healthy)
         for (i, util) in [(0, 0.20), (1, 0.30)].iter() {
-            let mut info = state.accounts[*i].rate_info.write().await;
+            let mut info = state.endpoints[*i].rate_info.write().await;
             info.utilization_5h = Some(*util);
             info.reset_5h = Some(now + 10000);
             info.utilization = Some(*util);
@@ -18347,7 +18869,7 @@ upstream = "https://api.anthropic.com"
         }
         // c: status=rejected → status_to_floor → gate=1.0 → weight=0
         {
-            let mut info = state.accounts[2].rate_info.write().await;
+            let mut info = state.endpoints[2].rate_info.write().await;
             info.utilization_5h = Some(0.10);
             info.reset_5h = Some(now + 10000);
             info.utilization = Some(0.10);
@@ -18359,13 +18881,18 @@ upstream = "https://api.anthropic.com"
 
         let read_weight = |i: usize| {
             f64::from_bits(
-                state.accounts[i]
+                state.endpoints[i]
                     .last_routing_weight
                     .load(Ordering::Relaxed),
             )
         };
-        let read_share =
-            |i: usize| f64::from_bits(state.accounts[i].last_routing_share.load(Ordering::Relaxed));
+        let read_share = |i: usize| {
+            f64::from_bits(
+                state.endpoints[i]
+                    .last_routing_share
+                    .load(Ordering::Relaxed),
+            )
+        };
 
         // a and b are healthy: positive weight + positive share
         assert!(read_weight(0) > 0.0, "a should have non-zero weight");
@@ -18393,6 +18920,49 @@ upstream = "https://api.anthropic.com"
         );
     }
 
+    /// Unit: refresh_metrics_weights() also populates the unified endpoint
+    /// pool's gauge atomics. Anthropic endpoints get the headroom computation;
+    /// OpenAI endpoints get the fixed (gate 0.0, weight 1.0) representative.
+    #[tokio::test]
+    async fn refresh_metrics_weights_populates_endpoint_pool() {
+        let mut state = test_state_with(vec![]);
+        {
+            let st = Arc::get_mut(&mut state).unwrap();
+            st.endpoints
+                .push(make_endpoint("ep-a", Protocol::Anthropic));
+            st.endpoints.push(make_endpoint("oai", Protocol::OpenAI));
+        }
+        let now = AppState::now_epoch();
+        {
+            let mut info = state.endpoints[0].rate_info.write().await;
+            info.utilization_5h = Some(0.20);
+            info.reset_5h = Some(now + 10000);
+            info.utilization = Some(0.20);
+        }
+
+        state.refresh_metrics_weights().await;
+
+        let weight = |i: usize| {
+            f64::from_bits(
+                state.endpoints[i]
+                    .last_routing_weight
+                    .load(Ordering::Relaxed),
+            )
+        };
+        let gate = |i: usize| {
+            f64::from_bits(
+                state.endpoints[i]
+                    .last_effective_gate
+                    .load(Ordering::Relaxed),
+            )
+        };
+        // Anthropic endpoint: positive weight from headroom computation.
+        assert!(weight(0) > 0.0, "anthropic endpoint should have weight");
+        // OpenAI endpoint: fixed representative — gate 0.0, non-zero weight.
+        assert_eq!(gate(1), 0.0, "openai endpoint gate must be the fixed 0.0");
+        assert!(weight(1) > 0.0, "openai endpoint should carry weight");
+    }
+
     /// Regression: when SOME accounts are above soft_limit but at least one
     /// is healthy, the soft-limited ones must be zeroed (mirrors pick_account
     /// excluding them). When ALL accounts are above soft_limit, none are
@@ -18407,13 +18977,13 @@ upstream = "https://api.anthropic.com"
         {
             let state = test_state_with_soft_limit(
                 vec![
-                    make_account("a", "sk-ant-api-a"),
-                    make_account("b", "sk-ant-api-b"),
+                    mk_endpoint("a", "sk-ant-api-a"),
+                    mk_endpoint("b", "sk-ant-api-b"),
                 ],
                 0.90,
             );
             for (i, util) in [(0, 0.20), (1, 0.95)].iter() {
-                let mut info = state.accounts[*i].rate_info.write().await;
+                let mut info = state.endpoints[*i].rate_info.write().await;
                 info.utilization_5h = Some(*util);
                 info.reset_5h = Some(now + 10000);
                 info.utilization = Some(*util);
@@ -18423,17 +18993,25 @@ upstream = "https://api.anthropic.com"
             state.refresh_metrics_weights().await;
 
             let w_a = f64::from_bits(
-                state.accounts[0]
+                state.endpoints[0]
                     .last_routing_weight
                     .load(Ordering::Relaxed),
             );
             let w_b = f64::from_bits(
-                state.accounts[1]
+                state.endpoints[1]
                     .last_routing_weight
                     .load(Ordering::Relaxed),
             );
-            let s_a = f64::from_bits(state.accounts[0].last_routing_share.load(Ordering::Relaxed));
-            let s_b = f64::from_bits(state.accounts[1].last_routing_share.load(Ordering::Relaxed));
+            let s_a = f64::from_bits(
+                state.endpoints[0]
+                    .last_routing_share
+                    .load(Ordering::Relaxed),
+            );
+            let s_b = f64::from_bits(
+                state.endpoints[1]
+                    .last_routing_share
+                    .load(Ordering::Relaxed),
+            );
 
             assert!(w_a > 0.0, "healthy a should have non-zero weight");
             assert_eq!(
@@ -18454,13 +19032,13 @@ upstream = "https://api.anthropic.com"
         {
             let state = test_state_with_soft_limit(
                 vec![
-                    make_account("a", "sk-ant-api-a"),
-                    make_account("b", "sk-ant-api-b"),
+                    mk_endpoint("a", "sk-ant-api-a"),
+                    mk_endpoint("b", "sk-ant-api-b"),
                 ],
                 0.90,
             );
             for (i, util) in [(0, 0.95), (1, 0.92)].iter() {
-                let mut info = state.accounts[*i].rate_info.write().await;
+                let mut info = state.endpoints[*i].rate_info.write().await;
                 info.utilization_5h = Some(*util);
                 info.reset_5h = Some(now + 10000);
                 info.utilization = Some(*util);
@@ -18470,17 +19048,25 @@ upstream = "https://api.anthropic.com"
             state.refresh_metrics_weights().await;
 
             let w_a = f64::from_bits(
-                state.accounts[0]
+                state.endpoints[0]
                     .last_routing_weight
                     .load(Ordering::Relaxed),
             );
             let w_b = f64::from_bits(
-                state.accounts[1]
+                state.endpoints[1]
                     .last_routing_weight
                     .load(Ordering::Relaxed),
             );
-            let s_a = f64::from_bits(state.accounts[0].last_routing_share.load(Ordering::Relaxed));
-            let s_b = f64::from_bits(state.accounts[1].last_routing_share.load(Ordering::Relaxed));
+            let s_a = f64::from_bits(
+                state.endpoints[0]
+                    .last_routing_share
+                    .load(Ordering::Relaxed),
+            );
+            let s_b = f64::from_bits(
+                state.endpoints[1]
+                    .last_routing_share
+                    .load(Ordering::Relaxed),
+            );
 
             assert!(
                 w_a > 0.0,
@@ -18510,7 +19096,7 @@ upstream = "https://api.anthropic.com"
         let now_epoch = AppState::now_epoch();
 
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.20);
             info.utilization_5h = Some(0.20);
             info.reset_5h = Some(now_epoch + NEAR_RESET_5H_SECS as u64 + 600);
@@ -18529,7 +19115,7 @@ upstream = "https://api.anthropic.com"
             info.status_7d = Some("allowed".to_string());
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization = Some(1.0);
             info.utilization_5h = Some(1.0);
             info.reset_5h = Some(now_epoch + NEAR_RESET_5H_SECS as u64 + 600);
@@ -18575,14 +19161,14 @@ upstream = "https://api.anthropic.com"
         // Default test_app builds 2 non-passthrough accounts: acct-a, acct-b.
         let now = AppState::now_epoch();
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.25);
             info.reset_5h = Some(now + 10000);
             info.utilization = Some(0.25);
             info.claims_7d.clear();
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization_5h = Some(0.50);
             info.reset_5h = Some(now + 10000);
             info.utilization = Some(0.50);
@@ -18651,21 +19237,21 @@ upstream = "https://api.anthropic.com"
     #[tokio::test]
     async fn routing_metrics_zero_share_for_soft_limited_account_matches_pick_account() {
         let mut state = test_state_with(vec![
-            make_account("healthy", "sk-ant-api-a"),
-            make_account("soft-limited", "sk-ant-api-b"),
+            mk_endpoint("healthy", "sk-ant-api-a"),
+            mk_endpoint("soft-limited", "sk-ant-api-b"),
         ]);
         Arc::get_mut(&mut state).unwrap().soft_limit = 0.90;
         let now_epoch = AppState::now_epoch();
 
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization = Some(0.30);
             info.utilization_5h = Some(0.30);
             info.reset_5h = Some(now_epoch + 10000);
             info.status_5h = Some("allowed".to_string());
         }
         {
-            let mut info = state.accounts[1].rate_info.write().await;
+            let mut info = state.endpoints[1].rate_info.write().await;
             info.utilization = Some(0.95);
             info.utilization_5h = Some(0.95);
             info.reset_5h = Some(now_epoch + 10000);
@@ -18676,9 +19262,9 @@ upstream = "https://api.anthropic.com"
         let mut buf = String::new();
         append_routing_weight_metrics(
             &mut buf,
-            &state.accounts,
+            &state.endpoints,
             &[
-                AcctMetricsSnap {
+                EndpointMetricsSnap {
                     name: "healthy".to_string(),
                     utilization: Some(0.30),
                     utilization_5h: Some(0.30),
@@ -18686,7 +19272,7 @@ upstream = "https://api.anthropic.com"
                     status_5h: Some("allowed".to_string()),
                     ..Default::default()
                 },
-                AcctMetricsSnap {
+                EndpointMetricsSnap {
                     name: "soft-limited".to_string(),
                     utilization: Some(0.95),
                     utilization_5h: Some(0.95),
@@ -18715,7 +19301,7 @@ upstream = "https://api.anthropic.com"
 
         for i in 0..20 {
             let key = format!("client-{i}");
-            let idx = state.pick_account(Some(&key), "any", &[]).await.unwrap();
+            let idx = state.pick_endpoint(Some(&key), "any", &[]).await.unwrap();
             assert_eq!(
                 idx, 0,
                 "client '{}' routed to soft-limited account despite exported zero share",
@@ -18728,13 +19314,13 @@ upstream = "https://api.anthropic.com"
     /// routing_share output (refresh_metrics_weights skips them).
     #[tokio::test]
     async fn metrics_routing_weight_omits_passthrough() {
-        let acct_a = make_account("a", "sk-ant-api-a");
-        let acct_pt = make_account("pt", "passthrough");
+        let acct_a = mk_endpoint("a", "sk-ant-api-a");
+        let acct_pt = mk_endpoint("pt", "passthrough");
         let state = test_state_with(vec![acct_a, acct_pt]);
 
         let now = AppState::now_epoch();
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.utilization_5h = Some(0.25);
             info.reset_5h = Some(now + 10000);
             info.utilization = Some(0.25);
@@ -18967,21 +19553,23 @@ upstream = "https://api.anthropic.com"
         });
 
         // Build app with an OAuth account, auto_cache off for clean signal
-        let accounts = vec![make_account("oauth-acct", "sk-ant-oat01-test-token")];
+        let accounts = vec![mk_endpoint_at(
+            "oauth-acct",
+            "sk-ant-oat01-test-token",
+            &format!("http://{}", mock_addr),
+        )];
         let state = Arc::new(AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: format!("http://{}", mock_addr),
-            accounts,
+            endpoints: accounts,
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-oauth-regression.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
@@ -19000,7 +19588,6 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -19105,21 +19692,23 @@ upstream = "https://api.anthropic.com"
         });
 
         // Build app with an OAuth account
-        let accounts = vec![make_account("oauth-acct", "sk-ant-oat01-test-token")];
+        let accounts = vec![mk_endpoint_at(
+            "oauth-acct",
+            "sk-ant-oat01-test-token",
+            &format!("http://{}", mock_addr),
+        )];
         let state = Arc::new(AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: format!("http://{}", mock_addr),
-            accounts,
+            endpoints: accounts,
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-oauth-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![],
             client_names: HashMap::new(),
             auto_cache: false, // disable to keep body simple
             client_usage: Mutex::new(HashMap::new()),
@@ -19138,7 +19727,6 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: None,
             overage_penalty: 10,
         });
 
@@ -19327,7 +19915,7 @@ upstream = "https://api.anthropic.com"
 
     #[test]
     fn request_context_trims_whitespace_headers() {
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-x")]);
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-agent-id", HeaderValue::from_static("  "));
         headers.insert("x-session-id", HeaderValue::from_static(" \t "));
@@ -19412,27 +20000,23 @@ upstream = "https://api.anthropic.com"
         });
         let mock_url = format!("http://{}", mock_addr);
 
-        // Build state with all accounts hard-limited and a fallback upstream
+        // Build state with the Anthropic endpoint hard-limited and a
+        // priority-100 OpenAI endpoint as the fallback.
+        let mut openai = make_endpoint("fallback", Protocol::OpenAI);
+        openai.base_url = mock_url.clone();
+        openai.priority = 100;
         let state = Arc::new(AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(), // unused — accounts are hard-limited
-            accounts: vec![make_account("acct-a", "sk-ant-api-a")],
+            endpoints: vec![mk_endpoint("acct-a", "sk-ant-api-a"), openai],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-fallback-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![Upstream {
-                name: "litellm".to_string(),
-                base_url: mock_url,
-                api_key: "sk-test-key".to_string(),
-                priority: 0,
-                requests: AtomicU64::new(0),
-            }],
             client_names: HashMap::new(),
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
@@ -19451,13 +20035,12 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: Some(0), // index into upstreams
             overage_penalty: 10,
         });
 
         // Hard-limit the only account
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
         }
 
@@ -19498,8 +20081,8 @@ upstream = "https://api.anthropic.com"
         assert_eq!(body["content"][0]["text"], "Fallback response");
         assert_eq!(body["stop_reason"], "end_turn");
 
-        // Verify upstream got the request
-        assert_eq!(state.upstreams[0].requests.load(Ordering::Relaxed), 1);
+        // Verify the OpenAI endpoint got the request
+        assert_eq!(state.endpoints[1].requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -19513,26 +20096,21 @@ upstream = "https://api.anthropic.com"
         });
         let mock_url = format!("http://{}", mock_addr);
 
+        let mut openai = make_endpoint("fallback", Protocol::OpenAI);
+        openai.base_url = mock_url.clone();
+        openai.priority = 100;
         let state = Arc::new(AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            upstream: "http://127.0.0.1:1".to_string(),
-            accounts: vec![make_account("acct-a", "sk-ant-api-a")],
+            endpoints: vec![mk_endpoint("acct-a", "sk-ant-api-a"), openai],
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-fallback-stream-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
-            upstreams: vec![Upstream {
-                name: "litellm".to_string(),
-                base_url: mock_url,
-                api_key: "sk-test-key".to_string(),
-                priority: 0,
-                requests: AtomicU64::new(0),
-            }],
             client_names: HashMap::new(),
             auto_cache: false,
             client_usage: Mutex::new(HashMap::new()),
@@ -19551,12 +20129,11 @@ upstream = "https://api.anthropic.com"
             next_req_id: AtomicU64::new(0),
             instance_id: 0,
             probe_interval_secs: 300,
-            fallback_upstream: Some(0),
             overage_penalty: 10,
         });
 
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
         }
 
@@ -19613,20 +20190,217 @@ upstream = "https://api.anthropic.com"
 
     #[tokio::test]
     async fn proxy_handler_no_fallback_returns_429() {
-        // Without fallback_upstream, exhausted accounts should return 429
-        let state = test_state_with(vec![make_account("a", "sk-ant-api-a")]);
+        // With no fallback endpoint, an exhausted pool yields None (→ 429).
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a")]);
 
-        // Hard-limit the account
+        // Hard-limit the only endpoint
         {
-            let mut info = state.accounts[0].rate_info.write().await;
+            let mut info = state.endpoints[0].rate_info.write().await;
             info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
         }
 
-        assert!(state.fallback_upstream.is_none());
-        let result = state.pick_account(None, "", &[]).await;
+        let result = state.pick_endpoint(None, "", &[]).await;
         assert!(
             result.is_none(),
-            "should return None when account is hard-limited"
+            "should return None when endpoint is hard-limited"
         );
+    }
+
+    // ── Unified endpoint: fallback retry semantics ─────────────────
+
+    #[tokio::test]
+    async fn try_fallback_upstream_returns_none_on_429() {
+        // Mock upstream returns 429
+        let app = Router::new().fallback(any(|| async {
+            (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = test_state_with(vec![]);
+        let mut ep = make_endpoint("rl-gw", Protocol::OpenAI);
+        ep.base_url = format!("http://{}", addr);
+        Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+        let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+        let result = try_fallback_upstream(
+            &state,
+            body,
+            "req-1",
+            "client-1",
+            "claude-opus-4-7",
+            0,
+            false,
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "429 must return None for retry, not Response"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_fallback_upstream_returns_none_on_500() {
+        let app = Router::new().fallback(any(|| async {
+            (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = test_state_with(vec![]);
+        let mut ep = make_endpoint("broken", Protocol::OpenAI);
+        ep.base_url = format!("http://{}", addr);
+        Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+        let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+        let result = try_fallback_upstream(
+            &state,
+            body,
+            "req-1",
+            "client-1",
+            "claude-opus-4-7",
+            0,
+            false,
+        )
+        .await;
+        assert!(result.is_none(), "500 must return None for retry");
+    }
+    // ── Unified endpoint: cross-protocol handler routing ───────────
+
+    #[tokio::test]
+    async fn openai_chat_handler_routes_to_unified_anthropic_endpoint() {
+        // Mock Anthropic upstream: returns a minimal messages response.
+        let mock = Router::new().fallback(any(|| async {
+            axum::Json(serde_json::json!({
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "model": "claude-opus-4-7",
+                "content": [{"type": "text", "text": "hi back"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 2}
+            }))
+            .into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock).await.unwrap();
+        });
+
+        let mut state = test_state_with(vec![]); // no legacy accounts
+        let mut ep = make_endpoint("unified-anthropic", Protocol::Anthropic);
+        ep.base_url = format!("http://{}", mock_addr);
+        ep.token = "sk-ant-api-test".to_string();
+        Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(openai_chat_handler),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .json(&serde_json::json!({
+                "model": "claude-opus-4-7",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["choices"][0]["message"]["content"].is_string(),
+            "response must be OpenAI-shaped after round-trip translation"
+        );
+    }
+    #[tokio::test]
+    async fn proxy_handler_translates_to_openai_endpoint() {
+        // Mock OpenAI upstream: capture the request body to assert it was
+        // translated to OpenAI shape, then return an OpenAI-format response.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(1);
+        let app = Router::new().fallback(any(move |req: Request<Body>| {
+            let tx = tx.clone();
+            async move {
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let _ = tx.send(v).await;
+                (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "id": "chatcmpl-x",
+                        "object": "chat.completion",
+                        "model": "claude-opus-4-7",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "hi back"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+                    })),
+                )
+                    .into_response()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = test_state_with(vec![]);
+        let mut ep = make_endpoint("openai-gw", Protocol::OpenAI);
+        ep.base_url = format!("http://{}", upstream_addr);
+        Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+        let proxy_app = Router::new().fallback(any(proxy_handler)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                proxy_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .json(&serde_json::json!({
+                "model": "claude-opus-4-7",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        let received = rx.recv().await.expect("upstream must receive a request");
+        assert!(
+            received.get("messages").is_some(),
+            "translated request must have OpenAI `messages` field"
+        );
+        assert_eq!(received["model"], "claude-opus-4-7");
     }
 }
