@@ -8,4 +8,3 @@ shadow.jsonl
 .spec-workflow/
 .claude/
 AGENTS.md
-.claude/coderabbit-loop-*.json

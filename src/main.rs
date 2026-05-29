@@ -14,7 +14,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -4526,6 +4526,11 @@ async fn try_fallback_upstream(
             // Not needed in the translate branch — translation converts
             // `[DONE]` to `message_stop`, which has no analogous terminator.
             let mut sent_done = false;
+            // Rolling tail of (pattern_len - 1) bytes so a `data: [DONE]`
+            // marker split across two `resp.chunk()` boundaries is still
+            // detected. A naive per-chunk window scan misses splits.
+            const DONE_PATTERN: &[u8] = b"data: [DONE]";
+            let mut done_scan_tail: Vec<u8> = Vec::with_capacity(DONE_PATTERN.len() - 1);
 
             loop {
                 match resp.chunk().await {
@@ -4553,11 +4558,21 @@ async fn try_fallback_upstream(
                                 }
                             }
                         } else {
-                            if chunk
-                                .windows(b"data: [DONE]".len())
-                                .any(|w| w == b"data: [DONE]")
-                            {
-                                sent_done = true;
+                            if !sent_done {
+                                done_scan_tail.extend_from_slice(&chunk);
+                                if done_scan_tail
+                                    .windows(DONE_PATTERN.len())
+                                    .any(|w| w == DONE_PATTERN)
+                                {
+                                    sent_done = true;
+                                    done_scan_tail.clear();
+                                } else {
+                                    let keep = DONE_PATTERN.len() - 1;
+                                    if done_scan_tail.len() > keep {
+                                        let drop_n = done_scan_tail.len() - keep;
+                                        done_scan_tail.drain(..drop_n);
+                                    }
+                                }
                             }
                             if tx.send(Ok(chunk)).await.is_err() {
                                 client_gone = true;
@@ -8336,8 +8351,17 @@ async fn main() {
     // process start — `tokio::time::timeout(d, server)` would arm `d` when
     // first polled and force-exit any uptime > d. The signal handler fires
     // notify_waiters(), and the deadline future awaits that before its sleep.
+    //
+    // `drain_triggered` closes a race in `Notify::notify_waiters()`: it only
+    // wakes waiters registered at call time. Without the flag, a signal that
+    // arrives before drain_deadline registers its waiter is lost and the
+    // deadline never fires. With the flag, drain_deadline registers the
+    // waiter eagerly via Notified::enable(), then checks the flag — so
+    // either path (signal-before-poll, signal-after-poll) is observed.
     let drain_signal = Arc::new(tokio::sync::Notify::new());
     let drain_signal_in = drain_signal.clone();
+    let drain_triggered = Arc::new(AtomicBool::new(false));
+    let drain_triggered_in = drain_triggered.clone();
 
     let shutdown = async move {
         let ctrl_c = tokio::signal::ctrl_c();
@@ -8351,6 +8375,7 @@ async fn main() {
             drain_budget_secs = SHUTDOWN_DRAIN_SECS,
             "draining in-flight requests"
         );
+        drain_triggered_in.store(true, Ordering::SeqCst);
         drain_signal_in.notify_waiters();
     };
 
@@ -8361,7 +8386,12 @@ async fn main() {
     .with_graceful_shutdown(shutdown);
 
     let drain_deadline = async {
-        drain_signal.notified().await;
+        let notified = drain_signal.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !drain_triggered.load(Ordering::SeqCst) {
+            notified.await;
+        }
         tokio::time::sleep(Duration::from_secs(SHUTDOWN_DRAIN_SECS)).await;
     };
 
