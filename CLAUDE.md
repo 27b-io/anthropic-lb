@@ -40,9 +40,10 @@ Production runs on the **mem** k8s cluster (`kubectl --context mem`), namespace 
 
 ```bash
 kubectl --context mem -n anthropic-lb rollout restart deployment/anthropic-lb
+kubectl --context lab -n mcp           rollout restart deployment/anthropic-lb
 ```
 
-Local dev instance also runs as systemd user unit: `systemctl --user restart anthropic-lb`
+Also deployed on `lab` (namespace `mcp`) as a 2-pod Deployment serving real Claude Code traffic via Tailscale. There is no local systemd unit.
 
 ## Architecture
 
