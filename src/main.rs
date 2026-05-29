@@ -4074,6 +4074,15 @@ async fn forward_anthropic(
                     Err(e) => {
                         upstream_error = true;
                         warn!(req_id = req_id_clone, error = %e, "upstream SSE read failed");
+                        if tx
+                            .send(Ok(anthropic_error_frame(&format!(
+                                "upstream stream interrupted: {e}"
+                            ))))
+                            .await
+                            .is_err()
+                        {
+                            client_disconnected = true;
+                        }
                         break;
                     }
                 }
@@ -4511,6 +4520,12 @@ async fn try_fallback_upstream(
             let mut buffer: Vec<u8> = Vec::new();
             let mut ctx = ReverseStreamContext::default();
             let mut client_gone = false;
+            // Passthrough-only: tracks whether upstream's `[DONE]` terminator
+            // has been forwarded verbatim, so an error frame on the next read
+            // doesn't ship a second `[DONE]` and break strict OpenAI parsers.
+            // Not needed in the translate branch — translation converts
+            // `[DONE]` to `message_stop`, which has no analogous terminator.
+            let mut sent_done = false;
 
             loop {
                 match resp.chunk().await {
@@ -4537,8 +4552,16 @@ async fn try_fallback_upstream(
                                     break;
                                 }
                             }
-                        } else if tx.send(Ok(chunk)).await.is_err() {
-                            client_gone = true;
+                        } else {
+                            if chunk
+                                .windows(b"data: [DONE]".len())
+                                .any(|w| w == b"data: [DONE]")
+                            {
+                                sent_done = true;
+                            }
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                client_gone = true;
+                            }
                         }
                         if client_gone {
                             break;
@@ -4547,6 +4570,25 @@ async fn try_fallback_upstream(
                     Ok(None) => break,
                     Err(e) => {
                         warn!(req_id, error = %e, "fallback: unified endpoint SSE read failed");
+                        // Downstream protocol depends on whether we're translating:
+                        // translate_response=true → /v1/messages client expects
+                        // Anthropic SSE; translate_response=false → /v1/chat/completions
+                        // passthrough, downstream is the OpenAI SSE format. Skip
+                        // the openai error frame when `[DONE]` was already
+                        // forwarded — emitting it would ship a second `[DONE]`.
+                        let msg = format!("upstream stream interrupted: {e}");
+                        let frame = if translate_response {
+                            Some(anthropic_error_frame(&msg))
+                        } else if !sent_done {
+                            Some(openai_error_frame(&msg))
+                        } else {
+                            None
+                        };
+                        if let Some(frame) = frame {
+                            if tx.send(Ok(frame)).await.is_err() {
+                                client_gone = true;
+                            }
+                        }
                         break;
                     }
                 }
@@ -6952,6 +6994,35 @@ fn make_anthropic_event(event_type: &str, data: &serde_json::Value) -> String {
     format!("event: {}\ndata: {}\n\n", event_type, data)
 }
 
+/// Final-frame Anthropic SSE error event for downstream when an upstream
+/// stream dies mid-flight. Without this the client sees a bare TCP FIN
+/// ("socket closed unexpectedly"). Emits a single `event: error` frame; the
+/// Anthropic SSE protocol has no terminator analogous to OpenAI's `[DONE]`,
+/// so the channel may close naturally after this frame.
+fn anthropic_error_frame(message: &str) -> bytes::Bytes {
+    // `error.type` must be one of Anthropic's documented values
+    // (overloaded_error, api_error, invalid_request_error, ...). Using a
+    // custom type like "upstream_error" risks the SDK rejecting the frame
+    // and the client falling back to "socket closed unexpectedly" — the
+    // exact failure mode this helper exists to prevent. `api_error` is the
+    // documented catch-all; the descriptive detail lives in `message`.
+    let body = serde_json::json!({
+        "type": "error",
+        "error": { "type": "api_error", "message": message }
+    });
+    bytes::Bytes::from(make_anthropic_event("error", &body))
+}
+
+/// Final-frame OpenAI SSE error for downstream. Emits the error JSON
+/// followed by `data: [DONE]` (OpenAI's stream terminator) — callers MUST
+/// NOT emit an additional `[DONE]` after this frame.
+fn openai_error_frame(message: &str) -> bytes::Bytes {
+    let err = serde_json::json!({
+        "error": { "message": message, "type": "upstream_error" }
+    });
+    bytes::Bytes::from(format!("data: {err}\n\ndata: [DONE]\n\n"))
+}
+
 /// Translate an OpenAI SSE chunk to Anthropic SSE events.
 /// Returns Vec because one OpenAI chunk may produce multiple Anthropic events.
 /// `raw` is the raw SSE data line (after stripping "data: " prefix).
@@ -7416,6 +7487,20 @@ async fn forward_openai_compat_anthropic(
                     Err(e) => {
                         upstream_error = true;
                         warn!(req_id = req_id_clone, error = %e, "upstream SSE read failed");
+                        // The post-loop "ensure DONE sent" block gates on
+                        // !upstream_error (set above), so emitting the error
+                        // frame here — which already ships [DONE] — cannot
+                        // race with a second [DONE] from the post-loop guard.
+                        if !sent_done
+                            && tx
+                                .send(Ok(openai_error_frame(&format!(
+                                    "upstream stream interrupted: {e}"
+                                ))))
+                                .await
+                                .is_err()
+                        {
+                            client_gone = true;
+                        }
                         break;
                     }
                 }
@@ -8071,8 +8156,23 @@ async fn main() {
     };
 
     let state = Arc::new(AppState {
+        // Liveness knobs are load-bearing against Anthropic's Cloudflare edge:
+        // h2 PING (while_idle) evicts half-closed pooled streams before they're
+        // reused; read_timeout catches mid-stream stalls without waiting out
+        // the full request budget; pool_idle_timeout keeps connections warm
+        // through Claude Code read/think pauses to avoid paying a fresh TLS
+        // handshake on every burst. read_timeout is set at 180s so Opus's
+        // extended-thinking pauses (which can exceed 90s of inter-chunk
+        // silence on deep reasoning) don't trip a false-positive interruption.
         client: Client::builder()
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_secs(900))
+            .read_timeout(Duration::from_secs(180))
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(30))
+            .http2_keep_alive_interval(Duration::from_secs(20))
+            .http2_keep_alive_timeout(Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
+            .pool_idle_timeout(Duration::from_secs(300))
             .build()
             .expect("failed to build HTTP client"),
         endpoints,
@@ -8223,8 +8323,22 @@ async fn main() {
         });
     }
 
-    // Graceful shutdown: save state on SIGTERM/SIGINT
+    // Bounded drain so a wedged stream can't hold the process past the
+    // orchestrator's kill deadline and earn a SIGKILL with unsaved state.
+    // In k8s this is `terminationGracePeriodSeconds`; keep SHUTDOWN_DRAIN_SECS
+    // strictly less so the proxy exits cleanly before SIGKILL. Long Claude
+    // Code streams (Opus on long outputs) can run 60–120s, so the budget
+    // must accommodate that or in-flight responses get cut.
+    const SHUTDOWN_DRAIN_SECS: u64 = 160;
     let shutdown_state = state.clone();
+
+    // The drain deadline must start ticking from signal-arrival, not from
+    // process start — `tokio::time::timeout(d, server)` would arm `d` when
+    // first polled and force-exit any uptime > d. The signal handler fires
+    // notify_waiters(), and the deadline future awaits that before its sleep.
+    let drain_signal = Arc::new(tokio::sync::Notify::new());
+    let drain_signal_in = drain_signal.clone();
+
     let shutdown = async move {
         let ctrl_c = tokio::signal::ctrl_c();
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -8233,18 +8347,37 @@ async fn main() {
             _ = ctrl_c => info!("received SIGINT"),
             _ = sigterm.recv() => info!("received SIGTERM"),
         }
-        info!("saving state before shutdown...");
-        shutdown_state.save_state().await;
-        info!("state saved, shutting down");
+        info!(
+            drain_budget_secs = SHUTDOWN_DRAIN_SECS,
+            "draining in-flight requests"
+        );
+        drain_signal_in.notify_waiters();
     };
 
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown)
-    .await
-    .unwrap_or_else(|e| panic!("server error: {e}"));
+    .with_graceful_shutdown(shutdown);
+
+    let drain_deadline = async {
+        drain_signal.notified().await;
+        tokio::time::sleep(Duration::from_secs(SHUTDOWN_DRAIN_SECS)).await;
+    };
+
+    tokio::select! {
+        res = server => match res {
+            Ok(()) => info!("drain complete"),
+            Err(e) => error!(error = %e, "server error during drain"),
+        },
+        _ = drain_deadline => warn!(
+            drain_budget_secs = SHUTDOWN_DRAIN_SECS,
+            "drain timeout exceeded — forcing exit; in-flight streams will be cut"
+        ),
+    }
+    info!("saving state");
+    shutdown_state.save_state().await;
+    info!("state saved, shutdown complete");
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -20402,5 +20535,125 @@ listen = "127.0.0.1:8082"
             "translated request must have OpenAI `messages` field"
         );
         assert_eq!(received["model"], "claude-opus-4-7");
+    }
+
+    // ── Connection resilience: synthetic SSE error on upstream disconnect ──
+
+    #[test]
+    fn anthropic_error_frame_is_well_formed_sse() {
+        let bytes = anthropic_error_frame("connection reset by peer");
+        let s = std::str::from_utf8(&bytes).expect("frame must be utf8");
+        assert!(s.starts_with("event: error\n"), "must use SSE event syntax");
+        assert!(s.ends_with("\n\n"), "must terminate with blank line");
+        let data_line = s
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .expect("must have a data: line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(data_line).expect("data payload must be valid JSON");
+        assert_eq!(parsed["type"], "error");
+        // Must be one of Anthropic's documented SSE error types so the
+        // SDK doesn't reject the frame and fall back to "socket closed".
+        assert_eq!(parsed["error"]["type"], "api_error");
+        assert_eq!(parsed["error"]["message"], "connection reset by peer");
+    }
+
+    #[test]
+    fn openai_error_frame_includes_done_marker() {
+        let bytes = openai_error_frame("upstream gone");
+        let s = std::str::from_utf8(&bytes).expect("frame must be utf8");
+        assert!(
+            s.contains("\ndata: [DONE]\n\n"),
+            "must terminate with OpenAI [DONE] marker so the client parser closes cleanly: {s:?}"
+        );
+        let first_data = s
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .expect("must have a leading data: line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(first_data).expect("first data payload must be valid JSON");
+        assert_eq!(parsed["error"]["type"], "upstream_error");
+        assert_eq!(parsed["error"]["message"], "upstream gone");
+    }
+
+    /// When an upstream Anthropic SSE stream dies mid-flight, the downstream
+    /// client must receive a synthetic `event: error` frame rather than a bare
+    /// TCP FIN. Without this guarantee the Claude Code CLI surfaces the
+    /// uninterpretable "socket connection was closed unexpectedly" error.
+    #[tokio::test]
+    async fn streaming_upstream_disconnect_emits_sse_error_to_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Mock upstream: replies with text/event-stream + one partial SSE
+        // chunk, then drops the socket without writing the terminating
+        // `message_stop` event or a 0-length chunked terminator.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let reset = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600)
+                .to_string();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 content-type: text/event-stream\r\n\
+                 transfer-encoding: chunked\r\n\
+                 anthropic-ratelimit-unified-representative-claim: five_hour\r\n\
+                 anthropic-ratelimit-unified-5h-utilization: 0.10\r\n\
+                 anthropic-ratelimit-unified-5h-reset: {reset}\r\n\
+                 \r\n"
+            );
+            let _ = stream.write_all(head.as_bytes()).await;
+            // One valid chunk, then drop. Chunk = hex-size, CRLF, bytes, CRLF.
+            let body = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n";
+            let chunk = format!("{:x}\r\n{}\r\n", body.len(), body);
+            let _ = stream.write_all(chunk.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let upstream_url = format!("http://{}", mock_addr);
+        let (app, _state) = test_app(&upstream_url, None);
+
+        let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_addr = app_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                app_listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", app_addr))
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .header("x-api-key", "any")
+            .body(
+                r#"{"model":"claude-sonnet-4-6","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            )
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body = resp.bytes().await.unwrap();
+        let body_s = std::str::from_utf8(&body).expect("body utf8");
+
+        assert!(
+            body_s.contains("event: error\n"),
+            "downstream must receive synthetic SSE error frame on upstream disconnect, got: {body_s:?}"
+        );
+        assert!(
+            body_s.contains("\"type\":\"api_error\""),
+            "error frame must use Anthropic's documented api_error type, got: {body_s:?}"
+        );
     }
 }
