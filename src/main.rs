@@ -4526,11 +4526,13 @@ async fn try_fallback_upstream(
             // Not needed in the translate branch — translation converts
             // `[DONE]` to `message_stop`, which has no analogous terminator.
             let mut sent_done = false;
-            // Rolling tail of (pattern_len - 1) bytes so a `data: [DONE]`
-            // marker split across two `resp.chunk()` boundaries is still
-            // detected. A naive per-chunk window scan misses splits.
-            const DONE_PATTERN: &[u8] = b"data: [DONE]";
-            let mut done_scan_tail: Vec<u8> = Vec::with_capacity(DONE_PATTERN.len() - 1);
+            // Carries any partial trailing SSE line between chunks so the
+            // `[DONE]` terminator is detected across resp.chunk() boundaries.
+            // A naive byte-window scan would false-positive on the literal
+            // string "data: [DONE]" appearing inside a JSON content delta,
+            // so we split on SSE newline boundaries and only treat a complete
+            // `data: [DONE]` line as the terminator.
+            let mut done_scan_tail: Vec<u8> = Vec::new();
 
             loop {
                 match resp.chunk().await {
@@ -4560,17 +4562,25 @@ async fn try_fallback_upstream(
                         } else {
                             if !sent_done {
                                 done_scan_tail.extend_from_slice(&chunk);
-                                if done_scan_tail
-                                    .windows(DONE_PATTERN.len())
-                                    .any(|w| w == DONE_PATTERN)
+                                while let Some(nl) = done_scan_tail.iter().position(|&b| b == b'\n')
                                 {
-                                    sent_done = true;
-                                    done_scan_tail.clear();
-                                } else {
-                                    let keep = DONE_PATTERN.len() - 1;
-                                    if done_scan_tail.len() > keep {
-                                        let drop_n = done_scan_tail.len() - keep;
-                                        done_scan_tail.drain(..drop_n);
+                                    let line_end = if nl > 0 && done_scan_tail[nl - 1] == b'\r' {
+                                        nl - 1
+                                    } else {
+                                        nl
+                                    };
+                                    let is_done_marker = if let Some(payload) =
+                                        done_scan_tail[..line_end].strip_prefix(b"data:")
+                                    {
+                                        payload.trim_ascii() == b"[DONE]"
+                                    } else {
+                                        false
+                                    };
+                                    done_scan_tail.drain(..=nl);
+                                    if is_done_marker {
+                                        sent_done = true;
+                                        done_scan_tail.clear();
+                                        break;
                                     }
                                 }
                             }
