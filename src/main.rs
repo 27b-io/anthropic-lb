@@ -943,7 +943,11 @@ impl AppState {
                 } else {
                     None
                 };
-                info!(
+                // DEBUG, not INFO: per-probe completion is high-volume periodic
+                // noise (every probe_interval × model-family × endpoint). The
+                // routing-weight metrics this computes are still exported via
+                // Prometheus; this line is only the human-readable echo.
+                debug!(
                     endpoint = ep.name,
                     status = status.as_u16(),
                     probe_model = model,
@@ -3068,7 +3072,11 @@ impl RequestContext {
 }
 
 fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &TokenUsage) {
-    info!(
+    // DEBUG, not INFO: per-request usage is high-volume operator noise. Token
+    // accounting is preserved regardless of log level via the shadow-log JSONL
+    // audit trail and the Prometheus counters — this line is only the
+    // human-readable echo.
+    debug!(
         req_id,
         client_id,
         model,
