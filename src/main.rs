@@ -2048,14 +2048,18 @@ impl AppState {
                 effective[0]
             };
             if picked.weight < other.weight * LEGACY_AFFINITY_OVERRIDE_RATIO {
-                debug!(
+                // Loud on purpose — see the StickyWeightedV2 override below for
+                // the cascade rationale. Breaking affinity is a pool-health
+                // warning sign, not routine.
+                warn!(
                     strategy = RoutingStrategy::DynamicCapacityV1.as_str(),
+                    affinity = affinity_key.unwrap_or("-"),
                     picked_account = self.endpoint_name(picked.endpoint),
                     picked_weight = format!("{:.3}", picked.weight),
                     other_account = self.endpoint_name(other.endpoint),
                     other_weight = format!("{:.3}", other.weight),
                     ratio = format!("{:.3}", picked.weight / other.weight),
-                    "pick: affinity override, weight ratio below threshold"
+                    "affinity broken: sticky endpoint too loaded, migrating session (cascade risk)"
                 );
                 picked = other;
             }
@@ -2086,14 +2090,22 @@ impl AppState {
             if best.endpoint != picked.endpoint
                 && picked.weight < best.weight * STICKY_WEIGHTED_OVERRIDE_RATIO
             {
-                debug!(
+                // Loud on purpose: breaking stickiness is a cascade risk. When
+                // every account is near exhaustion a large session migrating to
+                // the "best" account can spike it past the next account, which
+                // then becomes "best" on the following request, sweeping the
+                // session across the whole pool and burning down accounts in
+                // sequence. If this fires repeatedly under load, the pool is the
+                // bottleneck — add capacity, don't tune the ratio.
+                warn!(
                     strategy = RoutingStrategy::StickyWeightedV2.as_str(),
+                    affinity = affinity_key.unwrap_or("-"),
                     picked_account = self.endpoint_name(picked.endpoint),
                     picked_weight = format!("{:.3}", picked.weight),
                     best_account = self.endpoint_name(best.endpoint),
                     best_weight = format!("{:.3}", best.weight),
                     ratio = format!("{:.3}", picked.weight / best.weight),
-                    "pick: affinity override, breaking session stickiness"
+                    "affinity broken: sticky endpoint too loaded, migrating session (cascade risk)"
                 );
                 picked = best;
             }
@@ -4118,8 +4130,56 @@ async fn forward_anthropic(
             });
         ForwardOutcome::Done(response)
     } else {
-        // Non-streaming: buffer, extract usage, forward
-        let resp_body_bytes = resp.bytes().await.unwrap_or_default();
+        // Non-streaming: buffer, extract usage, forward.
+        //
+        // A socket error while reading the body must NOT be swallowed. The
+        // previous `unwrap_or_default()` turned a mid-body connection reset into
+        // an empty body forwarded under the upstream's 2xx status — the caller
+        // (Claude Code) then saw a truncated "success" and reported it as a
+        // socket error, while our logs showed a clean `proxied status=200`
+        // (that line is emitted above, before the body is read). Log loudly and
+        // return a real 502 so the failure is visible and the SDK gets a
+        // well-formed error frame instead of a silent corruption. Mirrors the
+        // error-detection structure of the sibling body-read sites
+        // (`forward_openai_compat_anthropic`, `try_fallback_upstream`); the
+        // exact error-frame format differs per path because each has a different
+        // downstream contract.
+        let resp_body_bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                error!(
+                    req_id,
+                    account = endpoint_name,
+                    status = status.as_u16(),
+                    error = %e,
+                    "upstream response body read failed mid-stream"
+                );
+                let body = serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": format!("upstream response body read failed: {e}"),
+                    }
+                })
+                .to_string();
+                // Forward the upstream's rate-limit headers + budget status so the
+                // client's limit tracking stays consistent with the success arms.
+                // Deliberately NOT content-length: the upstream's value describes
+                // the truncated body it promised, not our short JSON frame.
+                let mut err_builder = Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header("content-type", "application/json")
+                    .header("x-budget-status", budget_status);
+                for (k, v) in resp_headers.iter() {
+                    if k.as_str().starts_with("anthropic-ratelimit-") {
+                        err_builder = err_builder.header(k, v);
+                    }
+                }
+                return ForwardOutcome::Done(err_builder.body(Body::from(body)).unwrap_or_else(
+                    |_| (StatusCode::BAD_GATEWAY, "upstream body read failed").into_response(),
+                ));
+            }
+        };
         let mut usage = TokenUsage::default();
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&resp_body_bytes) {
             usage = TokenUsage::from_response_body(&parsed);
@@ -10205,6 +10265,90 @@ token = "sk-ant-test"
         let info = state.endpoints[0].rate_info.read().await;
         assert_eq!(info.utilization, Some(0.25));
         assert_eq!(info.representative_claim.as_deref(), Some("five_hour"));
+    }
+
+    /// A non-streaming upstream that promises N bytes via Content-Length then
+    /// closes the socket early must surface as a 502, NOT a truncated 200.
+    /// Regression for the silently-swallowed `unwrap_or_default()` body read.
+    #[tokio::test]
+    async fn proxy_returns_502_when_upstream_body_read_fails() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Raw TCP mock: send a 200 with content-length far larger than the
+        // bytes actually written, then drop the connection mid-body.
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = mock_listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = sock.read(&mut buf).await; // best-effort drain request
+                                                       // Promise 4096 bytes, send a partial JSON prefix, then close.
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\n\
+                              content-type: application/json\r\n\
+                              anthropic-ratelimit-unified-5h-utilization: 0.42\r\n\
+                              content-length: 4096\r\n\r\n\
+                              {\"id\":\"msg_partial\",\"type\":\"message\",\"content\":[{\"type\":\"text\",\"text\":\"par",
+                        )
+                        .await;
+                    let _ = sock.flush().await;
+                    // Drop without sending the remaining promised bytes.
+                });
+            }
+        });
+
+        let (app, _state) = test_app(
+            &format!("http://{}", mock_addr),
+            Some("secret-key".to_string()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "secret-key")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_GATEWAY,
+            "truncated upstream body must become a 502, not a silent empty 200"
+        );
+        // The 502 must still forward the upstream's rate-limit headers (and the
+        // budget status) so the client's limit tracking doesn't go blind on the
+        // error arm — parity with every success arm.
+        assert_eq!(
+            resp.headers()
+                .get("anthropic-ratelimit-unified-5h-utilization")
+                .and_then(|v| v.to_str().ok()),
+            Some("0.42"),
+            "502 should forward upstream anthropic-ratelimit-* headers"
+        );
+        assert!(
+            resp.headers().contains_key("x-budget-status"),
+            "502 should carry x-budget-status like other response arms"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("upstream response body read failed"),
+            "502 body should carry the upstream read error, got: {body}"
+        );
     }
 
     #[tokio::test]
