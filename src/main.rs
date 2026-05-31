@@ -8444,7 +8444,10 @@ async fn main() {
         client: Client::builder()
             .timeout(Duration::from_secs(900))
             .read_timeout(Duration::from_secs(180))
-            .connect_timeout(Duration::from_secs(10))
+            // 4s (was 10): a blackholed connect fails fast so the transient
+            // backoff-retry recovers in seconds. pool_idle_timeout stays 300s —
+            // it keeps conns warm across Claude Code think-pauses (see above).
+            .connect_timeout(Duration::from_secs(4))
             .tcp_keepalive(Duration::from_secs(30))
             .http2_keep_alive_interval(Duration::from_secs(20))
             .http2_keep_alive_timeout(Duration::from_secs(10))
