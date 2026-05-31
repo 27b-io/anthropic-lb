@@ -26,24 +26,17 @@ Run the proxy: `./target/release/anthropic-lb config.toml`
 
 ## Deployment
 
-Production runs on the **mem** k8s cluster (`kubectl --context mem`), namespace `anthropic-lb`, managed by **Flux** from `27b-io/fleet-infra` repo.
+Deployed via GitOps to internal Kubernetes clusters as a multi-replica
+`Deployment` (RollingUpdate, `maxUnavailable=0`). Cluster names, namespaces,
+manifest paths, and the operational runbook live in a **private ops repo** —
+they are intentionally not documented here.
 
-| What | Where |
-|------|-------|
-| Flux manifests | `27b-io/fleet-infra` repo, `apps/mem/anthropic-lb/` |
-| Config template | `externalsecret.yaml` (ExternalSecret → 1Password tokens + redis password) |
-| Image policy | Flux `imagepolicy` auto-updates digest from `ghcr.io/27b-io/anthropic-lb:main` |
-| Replicas | 2 (RollingUpdate, maxUnavailable=0) |
-| Config delivery | init container copies secret → `/data/config.toml` at pod start |
-
-**Config changes** require a pod restart after the ExternalSecret refreshes (secret is copied at init time, not watched):
-
-```bash
-kubectl --context mem -n anthropic-lb rollout restart deployment/anthropic-lb
-kubectl --context lab -n mcp           rollout restart deployment/anthropic-lb
-```
-
-Also deployed on `lab` (namespace `mcp`) as a 2-pod Deployment serving real Claude Code traffic via Tailscale. There is no local systemd unit.
+Operational notes that affect the code:
+- **Config delivery:** an init container copies the rendered config into the
+  pod at startup; the running process does not watch it. **Config changes
+  therefore require a pod restart** after the secret store refreshes.
+- **Image updates:** the deployed image digest is updated automatically from
+  the container registry; picking up a new image or config needs a pod restart.
 
 ## Architecture
 
