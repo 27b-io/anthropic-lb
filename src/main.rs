@@ -513,6 +513,11 @@ struct AppState {
     /// Priority penalty added to an endpoint's effective priority while it serves
     /// via overage. Default: 10.
     overage_penalty: u32,
+    /// Count of upstream transport send-failures, keyed by kind
+    /// (`timeout`/`connect`/`other`). Surfaces a flaky egress on the dashboard
+    /// (`anthropic_upstream_transport_errors_total`) before it becomes client
+    /// errors. Process-scoped; not persisted or Redis-synced.
+    upstream_transport_errors: Mutex<HashMap<&'static str, u64>>,
 }
 
 /// Index into `AppState.endpoints` — the sole runtime endpoint pool.
@@ -4124,6 +4129,19 @@ async fn forward_anthropic(
         Ok(r) => r,
         Err(e) => {
             error!(account = endpoint_name, detail = %describe_reqwest_error(&e), "upstream request failed: {e}");
+            // Surface the failure on the dashboard by kind before it becomes a
+            // client error. `is_timeout`/`is_connect` are the same classifiers
+            // `describe_reqwest_error` uses for the log line above.
+            let kind = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else {
+                "other"
+            };
+            if let Ok(mut m) = state.upstream_transport_errors.lock() {
+                *m.entry(kind).or_insert(0) += 1;
+            }
             // Transport-level send failure (ETIMEDOUT/reset/closed/DNS). Mark it
             // `transient`; rotation policy is round-gated and owned by the retry
             // loop (it knows `retry_round`), so `push_skip` stays false here —
@@ -6380,6 +6398,28 @@ async fn metrics_handler(
         dropped as f64,
     );
 
+    // Upstream transport send-failures by kind (timeout/connect/other) — a flaky
+    // egress shows here before it cascades into client-visible errors.
+    prom_header(
+        &mut buf,
+        "anthropic_upstream_transport_errors_total",
+        "counter",
+        "Upstream transport send-failures by kind",
+    );
+    let transport_errors: Vec<(&'static str, u64)> = state
+        .upstream_transport_errors
+        .lock()
+        .map(|m| m.iter().map(|(k, v)| (*k, *v)).collect())
+        .unwrap_or_default();
+    for (kind, n) in transport_errors {
+        prom_counter(
+            &mut buf,
+            "anthropic_upstream_transport_errors_total",
+            &[("kind", kind)],
+            n,
+        );
+    }
+
     (
         StatusCode::OK,
         [(
@@ -7567,6 +7607,19 @@ async fn forward_openai_compat_anthropic(
         Ok(r) => r,
         Err(e) => {
             error!(account = endpoint_name, detail = %describe_reqwest_error(&e), "upstream request failed: {e}");
+            // Surface the failure on the dashboard by kind before it becomes a
+            // client error. `is_timeout`/`is_connect` are the same classifiers
+            // `describe_reqwest_error` uses for the log line above.
+            let kind = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else {
+                "other"
+            };
+            if let Ok(mut m) = state.upstream_transport_errors.lock() {
+                *m.entry(kind).or_insert(0) += 1;
+            }
             // Transport-level send failure (ETIMEDOUT/reset/closed/DNS). Mark it
             // `transient`; rotation policy is round-gated and owned by the retry
             // loop (it knows `retry_round`), so `push_skip` stays false here —
@@ -8487,6 +8540,7 @@ async fn main() {
         },
         probe_interval_secs: config.probe_interval_secs.unwrap_or(300),
         overage_penalty: config.overage_penalty.unwrap_or(10),
+        upstream_transport_errors: Mutex::new(HashMap::new()),
     });
 
     if state.auto_cache {
@@ -8993,6 +9047,7 @@ token = "sk-ant-test"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         })
     }
 
@@ -9102,6 +9157,7 @@ token = "sk-ant-test"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         (build_router(state.clone()), state)
@@ -9194,6 +9250,7 @@ token = "sk-ant-test"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -10838,6 +10895,7 @@ token = "sk-ant-test"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let app = build_router(state);
@@ -12057,6 +12115,7 @@ token = "sk-ant-test"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let app = Router::new()
@@ -12228,6 +12287,38 @@ token = "sk-ant-test"
         assert!(
             resp.headers().get("retry-after").is_some(),
             "503 exhaustion should carry Retry-After so the client times its backoff"
+        );
+    }
+
+    // ── Task 5: transport-error metric ─────────────────────────────────
+
+    /// After a transport failure, `/metrics` must expose a by-kind transport
+    /// error counter so a flaky egress shows on the dashboard before it becomes
+    /// client errors. The `{kind=...}` data line only renders once a transport
+    /// error has been recorded — so this proves the increment, not just a header.
+    #[tokio::test]
+    async fn metrics_expose_transport_error_counter() {
+        let url = spawn_dead_upstream().await;
+        let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)]);
+        let addr = serve(build_router(state)).await;
+        let c = reqwest::Client::new();
+        let _ = c
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await;
+        let m = c
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            m.contains("anthropic_upstream_transport_errors_total{kind="),
+            "by-kind transport-error counter must appear after a transport failure:\n{m}"
         );
     }
 
@@ -12892,6 +12983,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Try many affinity keys — all should route to healthy (idx 0)
@@ -13034,6 +13126,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Within budget
@@ -13541,6 +13634,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         {
             let mut info = state.endpoints[0].rate_info.write().await;
@@ -13611,6 +13705,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         {
             let mut info = state.endpoints[0].rate_info.write().await;
@@ -14373,6 +14468,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Header overrides IP mapping (supports multiple clients per IP)
@@ -14440,6 +14536,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -15285,6 +15382,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.60, 0.50, now + 10000, now + 100000).await;
@@ -15333,6 +15431,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
@@ -15382,6 +15481,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -15433,6 +15533,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
         // Operator bypasses everything
@@ -15481,6 +15582,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // Request for "claude-opus" — no account serves it → should pass
         assert!(
@@ -15531,6 +15633,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // Don't set any utilization — accounts remain "unknown" (0.5)
         // With limit=0.30, unknown 0.5 would appear "above limit" without fail-open
@@ -15585,6 +15688,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // Two known accounts above limit, one unknown (no data set)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -15659,6 +15763,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
         assert!(state.is_emergency_brake_active().await);
@@ -15735,6 +15840,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.85, 0.70, now + 10000, now + 100000).await;
         assert!(
@@ -15826,6 +15932,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // No rate data set — account returns (0.5, "unknown")
         // 0.5 >= 0.4 threshold → all_above is true
@@ -15877,6 +15984,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.60, 0.55, now + 10000, now + 100000).await;
         // Account 1: no data → (0.5, "unknown"), 0.5 >= 0.4 → all_above stays true
@@ -15975,6 +16083,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // "-" is not the operator
         assert!(!state.is_operator("-"));
@@ -16051,6 +16160,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // Operator always gets "healthy" regardless of utilization
         assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
@@ -16094,6 +16204,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // gastown has limit 0.85, 80% of that = 0.68
         // At 0.60, below 0.68 → no upgrade → "healthy"
@@ -16313,6 +16424,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // Set utilization above client's limit (0.80 > 0.50)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -16374,6 +16486,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // Set utilization below client's limit (0.50 < 0.90)
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -16432,6 +16545,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // All accounts above emergency threshold. 5h=0.96 > emergency threshold (0.88).
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -16498,6 +16612,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // All accounts above emergency threshold — 5h only (avoid claim penalty on 7d)
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -16561,6 +16676,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
 
@@ -16619,6 +16735,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
 
@@ -16728,6 +16845,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
@@ -16799,6 +16917,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let status = compute_pressure_status(0.99, "operator-id", &state);
@@ -16850,6 +16969,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
@@ -17575,6 +17695,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         assert!(state.is_operator("special-operator"));
@@ -17621,6 +17742,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         assert!(state.is_operator("ray"));
         assert!(state.is_operator("openclaw"));
@@ -17699,6 +17821,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Budget check uses local path when redis is None
@@ -17840,6 +17963,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Recording 0 tokens should be a no-op
@@ -18208,6 +18332,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Set up some state to persist
@@ -18293,6 +18418,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Load state
@@ -18436,6 +18562,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Pre-populate with yesterday's usage (high usage that would exceed budget)
@@ -18490,6 +18617,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Pre-populate with yesterday's exhausted budget
@@ -18951,6 +19079,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Seed two operator clients and one regular client with token usage
@@ -19198,6 +19327,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let app = build_router(state);
@@ -20282,6 +20412,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let app = build_router(state);
@@ -20421,6 +20552,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let app = Router::new()
@@ -20729,6 +20861,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Hard-limit the only account
@@ -20823,6 +20956,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         {
