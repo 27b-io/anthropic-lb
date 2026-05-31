@@ -18,7 +18,7 @@ probe_interval_secs = 300
 keepalive_idle_secs = 120
 
 # Proxy authentication: clients must send this as x-api-key to access the proxy.
-# Omit to leave proxy open (use only behind Tailscale/VPN).
+# Omit to leave proxy open (only do so on a trusted/private network).
 # proxy_key = "your-secret-key-here"
 
 # IP allowlist: only accept connections from these IPs/CIDRs.

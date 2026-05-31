@@ -8,3 +8,6 @@ shadow.jsonl
 .spec-workflow/
 .claude/
 AGENTS.md
+
+# Internal planning artifacts (specs/plans) — not for the public repo
+docs/superpowers/
