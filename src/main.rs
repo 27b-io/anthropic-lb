@@ -1173,6 +1173,18 @@ const MAX_529_RETRIES: u32 = 3;
 /// Base delay for 529 BEBO retries. Doubles each round: 1s, 2s, 4s.
 const RETRY_529_BASE_DELAY: Duration = Duration::from_secs(1);
 
+/// Base backoff for a round that failed on transient transport errors
+/// (ETIMEDOUT/reset/closed/DNS). Doubles per round: 150ms, 300ms. Kept short
+/// because egress blips are sub-second; 529 overload uses the longer 1s base.
+const TRANSIENT_BASE_DELAY: Duration = Duration::from_millis(150);
+
+/// Transient (transport-error) rounds get a SMALLER budget than 529 overload.
+/// Round 0 retries the affinity/cache-warm endpoint in place (no rotation);
+/// rounds 1..=MAX_TRANSIENT_RETRIES rotate the pool. Total rounds = this + 1.
+/// Capped at 1 so a genuinely-down egress fails clean (→ 503) in ~one rotation
+/// instead of stalling through all MAX_529_RETRIES rounds of connect timeouts.
+const MAX_TRANSIENT_RETRIES: u32 = 1;
+
 /// Sentinel value written to `alb:hard:{account}` when a replica has observed
 /// recovery from a hard rate limit. Other replicas interpret this as an
 /// instruction to proactively clear their local `hard_limited_until`, which
@@ -3910,6 +3922,89 @@ async fn classify_retry_status(
     Ok(resp)
 }
 
+/// What the retry loop should do after one forward attempt's `ForwardOutcome`.
+enum RetryStep {
+    /// `Done` — hand this response back to the caller (return from the handler).
+    Return(Response),
+    /// Try the next candidate this round (`continue` the attempt loop).
+    NextAttempt,
+    /// End this round now (`break` the attempt loop) → backoff, then retry the
+    /// pool. Used for a round-0 transient so the affinity/cache-warm endpoint is
+    /// retried in place rather than rotated away from.
+    EndRound,
+}
+
+/// Apply one forward attempt's outcome to the round bookkeeping and decide the
+/// loop's next move. Shared by `proxy_handler` and `openai_chat_handler` so the
+/// round-gated transient policy lives in exactly ONE place — the two retry loops
+/// are otherwise byte-identical and have diverged before.
+///
+/// `retry_round` gates rotation: a transient (transport-level) failure on round
+/// 0 keeps the affinity/cache-warm endpoint (`EndRound` → backoff → retry IT);
+/// on rounds ≥1 it rotates (push skip). 429/5xx/529 always rotate immediately.
+fn apply_round_outcome(
+    retry_round: u32,
+    outcome: ForwardOutcome,
+    picked_idx: EndpointIdx,
+    skip: &mut Vec<EndpointIdx>,
+    saw_529: &mut bool,
+    saw_transient: &mut bool,
+) -> RetryStep {
+    match outcome {
+        ForwardOutcome::Done(resp) => RetryStep::Return(resp),
+        ForwardOutcome::Retry {
+            saw_529: s,
+            push_skip,
+            transient,
+        } => {
+            if s {
+                *saw_529 = true;
+            }
+            if transient {
+                *saw_transient = true;
+                // Round 0: do NOT rotate — keep the affinity/cache-warm endpoint
+                // and end the round so the backoff retries IT (a sub-second blip
+                // becomes a cache HIT, not a cold-cache write on a cold endpoint).
+                if retry_round == 0 {
+                    return RetryStep::EndRound;
+                }
+                // Round ≥1: the warm endpoint failed a backoff-retry too — it is
+                // genuinely down, so rotate across the pool.
+                skip.push(picked_idx);
+            } else if push_skip {
+                skip.push(picked_idx); // 429/5xx/529: immediate rotation (unchanged)
+            }
+            RetryStep::NextAttempt
+        }
+    }
+}
+
+/// After a round completes, decide whether to retry the whole pool (after a
+/// backoff). Pure rate-limit exhaustion (no 529, no transient) does not retry —
+/// rotating cannot help. A transient-only round gets the smaller
+/// `MAX_TRANSIENT_RETRIES` budget; a 529 round keeps the loop's full
+/// `MAX_529_RETRIES` budget.
+fn round_should_continue(retry_round: u32, saw_529: bool, saw_transient: bool) -> bool {
+    if !(saw_529 || saw_transient) {
+        return false; // (a) pure rate-limit exhaustion — rotating won't help
+    }
+    if !saw_529 && saw_transient && retry_round >= MAX_TRANSIENT_RETRIES {
+        return false; // (b) transient budget spent → fail clean
+    }
+    true // (c) 529 keeps its full loop budget
+}
+
+/// Backoff before re-trying the whole pool. A 529 (overload) round uses the long
+/// base; a purely-transient round uses the short base. Doubles per round.
+fn round_backoff_delay(retry_round: u32, last_saw_529: bool) -> Duration {
+    let base = if last_saw_529 {
+        RETRY_529_BASE_DELAY
+    } else {
+        TRANSIENT_BASE_DELAY
+    };
+    base * 2u32.pow(retry_round - 1)
+}
+
 /// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
 /// passes the picked endpoint and its pool index (used for `skip` and usage
 /// accounting).
@@ -4408,18 +4503,22 @@ async fn proxy_handler(
     }
 
     let n = state.endpoints.len();
+    let mut last_saw_529 = false;
+    let mut last_saw_transient = false;
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
-            let delay = RETRY_529_BASE_DELAY * 2u32.pow(retry_round - 1);
+            let delay = round_backoff_delay(retry_round, last_saw_529);
             warn!(
                 retry_round = retry_round,
                 delay_ms = delay.as_millis() as u64,
-                "529 backoff: retrying all endpoints"
+                saw_529 = last_saw_529,
+                "backoff: retrying all endpoints after transient/overload round"
             );
             tokio::time::sleep(delay).await;
         }
         let mut skip: Vec<EndpointIdx> = Vec::new();
         let mut saw_529 = false;
+        let mut saw_transient = false;
         for _attempt in 0..n {
             // Pick the next endpoint and dispatch by protocol:
             // `forward_anthropic` (Anthropic) or `try_fallback_upstream`
@@ -4471,42 +4570,37 @@ async fn proxy_handler(
                             }
                         }
                     }
-                    None => {
-                        warn!("all endpoints exhausted");
-                        return (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "all upstream endpoints exhausted",
-                        )
-                            .into_response();
-                    }
+                    // Candidates exhausted mid-round (all skipped / hard-limited /
+                    // model-filtered). Break to the round-end logic rather than
+                    // returning here, so a transient-only round still reaches the
+                    // transient-aware exhaustion status instead of short-circuiting
+                    // to a premature 429.
+                    None => break,
                 };
 
-            match outcome {
-                ForwardOutcome::Done(resp) => return resp,
-                ForwardOutcome::Retry {
-                    saw_529: this_529,
-                    push_skip,
-                    transient: this_transient,
-                } => {
-                    if this_529 {
-                        saw_529 = true;
-                    }
-                    // `transient` is consumed by Task 2's round-gated loop; bound
-                    // here only to keep this compile-only step green.
-                    let _ = this_transient;
-                    if push_skip {
-                        skip.push(picked_idx);
-                    }
-                    continue;
-                }
+            match apply_round_outcome(
+                retry_round,
+                outcome,
+                picked_idx,
+                &mut skip,
+                &mut saw_529,
+                &mut saw_transient,
+            ) {
+                RetryStep::Return(resp) => return resp,
+                RetryStep::NextAttempt => continue,
+                RetryStep::EndRound => break,
             }
         }
-        // If no 529s in this round, don't retry (e.g. all were 429s or errors)
-        if !saw_529 {
+        last_saw_529 = saw_529;
+        last_saw_transient = saw_transient;
+        if !round_should_continue(retry_round, saw_529, saw_transient) {
             break;
         }
     }
 
+    // `last_saw_transient` is consumed by Task 3's transient-aware exhaustion
+    // status; bound here to keep this step's exhaustion return unchanged.
+    let _ = last_saw_transient;
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
 }
 
@@ -7902,18 +7996,22 @@ async fn openai_chat_handler(
     inject_oauth_system_prompt(&mut oauth_anthropic_body);
 
     let n = state.endpoints.len();
+    let mut last_saw_529 = false;
+    let mut last_saw_transient = false;
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
-            let delay = RETRY_529_BASE_DELAY * 2u32.pow(retry_round - 1);
+            let delay = round_backoff_delay(retry_round, last_saw_529);
             warn!(
                 retry_round = retry_round,
                 delay_ms = delay.as_millis() as u64,
-                "529 backoff: retrying all endpoints"
+                saw_529 = last_saw_529,
+                "backoff: retrying all endpoints after transient/overload round"
             );
             tokio::time::sleep(delay).await;
         }
         let mut skip: Vec<EndpointIdx> = Vec::new();
         let mut saw_529 = false;
+        let mut saw_transient = false;
         for _attempt in 0..n {
             // Pick the next endpoint and dispatch by protocol: Anthropic
             // endpoints resolve to a `(ForwardOutcome, EndpointIdx)` pair;
@@ -7968,41 +8066,37 @@ async fn openai_chat_handler(
                             }
                         }
                     }
-                    None => {
-                        warn!("all endpoints exhausted");
-                        return (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "all upstream endpoints exhausted",
-                        )
-                            .into_response();
-                    }
+                    // Candidates exhausted mid-round (all skipped / hard-limited /
+                    // model-filtered). Break to the round-end logic rather than
+                    // returning here, so a transient-only round still reaches the
+                    // transient-aware exhaustion status instead of short-circuiting
+                    // to a premature 429.
+                    None => break,
                 };
 
-            match outcome {
-                ForwardOutcome::Done(resp) => return resp,
-                ForwardOutcome::Retry {
-                    saw_529: this_529,
-                    push_skip,
-                    transient: this_transient,
-                } => {
-                    if this_529 {
-                        saw_529 = true;
-                    }
-                    // `transient` is consumed by Task 2's round-gated loop; bound
-                    // here only to keep this compile-only step green.
-                    let _ = this_transient;
-                    if push_skip {
-                        skip.push(picked_idx);
-                    }
-                    continue;
-                }
+            match apply_round_outcome(
+                retry_round,
+                outcome,
+                picked_idx,
+                &mut skip,
+                &mut saw_529,
+                &mut saw_transient,
+            ) {
+                RetryStep::Return(resp) => return resp,
+                RetryStep::NextAttempt => continue,
+                RetryStep::EndRound => break,
             }
         }
-        if !saw_529 {
+        last_saw_529 = saw_529;
+        last_saw_transient = saw_transient;
+        if !round_should_continue(retry_round, saw_529, saw_transient) {
             break;
         }
     }
 
+    // `last_saw_transient` is consumed by Task 3's transient-aware exhaustion
+    // status; bound here to keep this step's exhaustion return unchanged.
+    let _ = last_saw_transient;
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
 }
 
@@ -11957,6 +12051,122 @@ token = "sk-ant-test"
 
     fn test_app(upstream_url: &str, proxy_key: Option<String>) -> (Router, Arc<AppState>) {
         test_app_with_strategy(upstream_url, proxy_key, RoutingStrategy::default())
+    }
+
+    /// Raw-TCP upstream that RSTs its FIRST connection (→ a reqwest transport
+    /// error, i.e. a `transient` `ForwardOutcome`) then serves a valid Anthropic
+    /// 200 on every later connection. Returns `(base_url, per_connection_hits)`.
+    /// Used to simulate a sub-second egress blip that recovers.
+    async fn spawn_blip_upstream() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                if h.fetch_add(1, Ordering::SeqCst) == 0 {
+                    drop(s); // first connection: reset before responding → transport error
+                    continue;
+                }
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await; // drain the request before responding
+                let body = br#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"model":"test","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(body).await;
+                let _ = s.flush().await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    // ── Task 2: round-gated transient backoff-retry ─────────────────────
+
+    /// A transient blip that recovers must surface as 200, not a 429-exhausted.
+    /// Today (529-only backoff) the single round breaks straight to 429.
+    #[tokio::test]
+    async fn proxy_rides_out_transient_upstream_blip() {
+        let (url, _hits) = spawn_blip_upstream().await;
+        let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)]);
+        let addr = serve(build_router(state)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "a transient blip that recovers must surface as 200, not 429-exhausted"
+        );
+    }
+
+    /// Option B: round 0 must RE-TRY the affinity/cache-warm endpoint in place,
+    /// NOT rotate to a cold endpoint. Two distinct upstreams both blip-then-200;
+    /// whichever affinity picks serves after the backoff, and the OTHER endpoint
+    /// must stay at ZERO hits. A flat `push_skip:true` would rotate on round 0,
+    /// hitting both. (Mutation-test: delete the `retry_round==0` guard → fails.)
+    #[tokio::test]
+    async fn transient_blip_retries_warm_endpoint_not_rotates() {
+        use std::sync::atomic::Ordering;
+        let (url_a, a_hits) = spawn_blip_upstream().await;
+        let (url_b, b_hits) = spawn_blip_upstream().await;
+        let state = test_state_with(vec![
+            mk_endpoint_at("a", "sk-ant-api-aaa", &url_a),
+            mk_endpoint_at("b", "sk-ant-api-bbb", &url_b),
+        ]);
+        let addr = serve(build_router(state)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            // identity headers → deterministic (non-round-robin) affinity, so
+            // round 0 and round 1 pick the SAME endpoint.
+            .header("x-client-id", "sticky")
+            .header("x-session-id", "sticky")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let (a, b) = (a_hits.load(Ordering::SeqCst), b_hits.load(Ordering::SeqCst));
+        assert!(
+            a == 0 || b == 0,
+            "round-0 transient must NOT rotate to a cold endpoint (a_hits={a}, b_hits={b})"
+        );
+        assert!(
+            a >= 2 || b >= 2,
+            "the warm endpoint should be retried after the blip (a_hits={a}, b_hits={b})"
+        );
+    }
+
+    /// The openai_chat_handler retry loop must ride out a transient blip too —
+    /// proves it is wired to the same shared round-gated helper as proxy_handler.
+    #[tokio::test]
+    async fn openai_chat_rides_out_transient_upstream_blip() {
+        let (url, _hits) = spawn_blip_upstream().await;
+        let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)]);
+        let addr = serve(build_router(state)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "openai_chat_handler must also ride out a transient blip via the shared helper"
+        );
     }
 
     #[tokio::test]
