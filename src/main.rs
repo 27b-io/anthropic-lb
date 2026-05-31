@@ -14,7 +14,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -33,6 +33,12 @@ struct Config {
     rate_limit_cooldown_secs: Option<u64>,
     /// Seconds between utilization probes per account (0 = disabled). Default: 300 (5 min)
     probe_interval_secs: Option<u64>,
+    /// Seconds of idle before the server closes an inbound keep-alive connection
+    /// (hyper `header_read_timeout`). If the proxy is reached through an
+    /// intermediary that closes idle connections, set this below that idle
+    /// timeout so the client retires the socket before the intermediary kills
+    /// it silently. 0 = disabled. Default: 120.
+    keepalive_idle_secs: Option<u64>,
     /// Shared secret clients must send as x-api-key to access the proxy. None = open.
     proxy_key: Option<String>,
     /// Source IP allowlist. Supports individual IPs and CIDR ranges. None/empty = allow all.
@@ -8032,6 +8038,99 @@ fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Serve the axum `app` with a manual hyper connection loop so we can set
+/// hyper's HTTP/1 `header_read_timeout` — i.e. retire idle inbound keep-alive
+/// connections from *our* side at `keepalive_idle`.
+///
+/// Why this exists: if the proxy is reached through an intermediary that
+/// closes idle connections (e.g. a connection-terminating reverse proxy or TCP
+/// forwarder with an idle timeout), a socket left idle past that timeout is
+/// killed silently. The client's HTTP pool (undici / Node `fetch` in Claude
+/// Code) then reuses a socket the intermediary already closed and reports
+/// "socket connection closed unexpectedly" (`UND_ERR_SOCKET`). By closing idle
+/// connections ourselves first, with a clean FIN, the client observes the close
+/// and evicts the socket before reuse. `axum::serve` does not expose hyper's
+/// `header_read_timeout`, hence the manual loop. Active streams are unaffected
+/// (the timeout only bounds the idle gap *between* requests). Graceful drain is
+/// preserved via `GracefulShutdown` bounded by `drain_budget`;
+/// `keepalive_idle = None` disables the idle close (matches `axum::serve`'s old
+/// behavior).
+async fn run_server(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    keepalive_idle: Option<Duration>,
+    drain_budget: Duration,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) {
+    use tower::ServiceExt;
+
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    if let Some(idle) = keepalive_idle {
+        // header_read_timeout requires a timer to be wired, or hyper panics
+        // ("timeout set, but no timer set") when it tries to arm the deadline.
+        builder
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(idle);
+    }
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let mut shutdown = std::pin::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, peer_addr) = match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        warn!(error = %e, "accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                let app = app.clone();
+                let io = hyper_util::rt::TokioIo::new(stream);
+                // Per-connection hyper service: map the body, inject the peer
+                // addr as ConnectInfo<SocketAddr> (handlers extract it), then
+                // hand off to the cloned axum Router.
+                let service = hyper::service::service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| {
+                        let app = app.clone();
+                        async move {
+                            let mut req = req.map(axum::body::Body::new);
+                            req.extensions_mut()
+                                .insert(axum::extract::ConnectInfo(peer_addr));
+                            app.oneshot(req).await
+                        }
+                    },
+                );
+                let conn = builder.serve_connection_with_upgrades(io, service);
+                // into_owned() detaches the connection from the borrowed builder
+                // so it can be driven on its own task.
+                let conn = graceful.watch(conn.into_owned());
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        debug!(error = %e, "inbound connection closed with error");
+                    }
+                });
+            }
+            _ = &mut shutdown => {
+                info!(drain_budget_secs = drain_budget.as_secs(), "draining in-flight requests");
+                break;
+            }
+        }
+    }
+    // Stop accepting, then let in-flight requests finish within the budget.
+    drop(listener);
+    tokio::select! {
+        _ = graceful.shutdown() => info!("drain complete"),
+        _ = tokio::time::sleep(drain_budget) => warn!(
+            drain_budget_secs = drain_budget.as_secs(),
+            "drain timeout exceeded — forcing exit; in-flight streams will be cut"
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Parse config first so debug_log path is available for tracing setup
@@ -8425,23 +8524,22 @@ async fn main() {
     const SHUTDOWN_DRAIN_SECS: u64 = 160;
     let shutdown_state = state.clone();
 
-    // The drain deadline must start ticking from signal-arrival, not from
-    // process start — `tokio::time::timeout(d, server)` would arm `d` when
-    // first polled and force-exit any uptime > d. The signal handler fires
-    // notify_waiters(), and the deadline future awaits that before its sleep.
-    //
-    // `drain_triggered` closes a race in `Notify::notify_waiters()`: it only
-    // wakes waiters registered at call time. Without the flag, a signal that
-    // arrives before drain_deadline registers its waiter is lost and the
-    // deadline never fires. With the flag, drain_deadline registers the
-    // waiter eagerly via Notified::enable(), then checks the flag — so
-    // either path (signal-before-poll, signal-after-poll) is observed.
-    let drain_signal = Arc::new(tokio::sync::Notify::new());
-    let drain_signal_in = drain_signal.clone();
-    let drain_triggered = Arc::new(AtomicBool::new(false));
-    let drain_triggered_in = drain_triggered.clone();
+    // Retire idle inbound keep-alive connections ourselves so a fronting
+    // intermediary doesn't kill them silently first. 0 = disabled.
+    let keepalive_idle = match config.keepalive_idle_secs {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+        None => Some(Duration::from_secs(120)),
+    };
+    info!(
+        keepalive_idle_secs = keepalive_idle.map(|d| d.as_secs()),
+        "inbound keep-alive idle timeout"
+    );
 
-    let shutdown = async move {
+    // Signal future: resolves on SIGINT/SIGTERM. The accept loop in
+    // `run_server` selects on this directly, so the previous Notify/AtomicBool
+    // signal-before-poll dance is no longer needed.
+    let shutdown = async {
         let ctrl_c = tokio::signal::ctrl_c();
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to register SIGTERM");
@@ -8449,40 +8547,17 @@ async fn main() {
             _ = ctrl_c => info!("received SIGINT"),
             _ = sigterm.recv() => info!("received SIGTERM"),
         }
-        info!(
-            drain_budget_secs = SHUTDOWN_DRAIN_SECS,
-            "draining in-flight requests"
-        );
-        drain_triggered_in.store(true, Ordering::SeqCst);
-        drain_signal_in.notify_waiters();
     };
 
-    let server = axum::serve(
+    run_server(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        app,
+        keepalive_idle,
+        Duration::from_secs(SHUTDOWN_DRAIN_SECS),
+        shutdown,
     )
-    .with_graceful_shutdown(shutdown);
+    .await;
 
-    let drain_deadline = async {
-        let notified = drain_signal.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if !drain_triggered.load(Ordering::SeqCst) {
-            notified.await;
-        }
-        tokio::time::sleep(Duration::from_secs(SHUTDOWN_DRAIN_SECS)).await;
-    };
-
-    tokio::select! {
-        res = server => match res {
-            Ok(()) => info!("drain complete"),
-            Err(e) => error!(error = %e, "server error during drain"),
-        },
-        _ = drain_deadline => warn!(
-            drain_budget_secs = SHUTDOWN_DRAIN_SECS,
-            "drain timeout exceeded — forcing exit; in-flight streams will be cut"
-        ),
-    }
     info!("saving state");
     shutdown_state.save_state().await;
     info!("state saved, shutdown complete");
@@ -10239,6 +10314,148 @@ token = "sk-ant-test"
             .unwrap();
 
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// The server must close idle inbound keep-alive connections itself (hyper
+    /// `header_read_timeout`) so a client HTTP pool never reuses a socket that a
+    /// fronting intermediary already closed on its own idle timeout.
+    /// Regression for the "socket connection closed unexpectedly" reuse race.
+    #[tokio::test]
+    async fn server_closes_idle_keepalive_connection_after_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mock_url, _h) = spawn_mock_upstream().await;
+        let (app, _state) = test_app(&mock_url, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 1s idle close; generous drain; shutdown never fires.
+        tokio::spawn(async move {
+            run_server(
+                listener,
+                app,
+                Some(Duration::from_secs(1)),
+                Duration::from_secs(5),
+                std::future::pending::<()>(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /_stats HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(n > 0, "expected an HTTP response");
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).contains("200 OK"),
+            "expected 200 from /_stats"
+        );
+
+        // Idle past the 1s header_read_timeout. The server must close the idle
+        // keep-alive connection itself — observed by the client as either a
+        // clean EOF (Ok(0)) or a reset (ECONNRESET); both retire the socket
+        // from a pool before reuse, which is the fix. Bound the read so a
+        // regression (no idle close) fails on the timeout instead of hanging.
+        let closed = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+            .await
+            .expect("server did not close the idle keep-alive connection within 3s");
+        match closed {
+            Ok(0) => {} // clean FIN
+            Ok(n) => panic!("expected idle connection to be closed, got {n} more bytes"),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ) => {} // reset-class close
+            Err(e) => panic!("unexpected read error: {e}"),
+        }
+    }
+
+    /// Graceful drain must let an in-flight request COMPLETE when shutdown
+    /// fires, not cut it. Protects the drain semantics across the switch from
+    /// the old Notify/AtomicBool dance to hyper_util GracefulShutdown.
+    #[tokio::test]
+    async fn drain_lets_inflight_request_complete() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Mock upstream that signals when hit, then blocks until released.
+        let hit = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (hit_h, release_h) = (hit.clone(), release.clone());
+        let mock = Router::new().fallback(any(move || {
+            let (hit_h, release_h) = (hit_h.clone(), release_h.clone());
+            async move {
+                hit_h.notify_one();
+                release_h.notified().await;
+                axum::Json(serde_json::json!({
+                    "id": "m", "type": "message",
+                    "content": [{"type": "text", "text": "ok"}]
+                }))
+            }
+        }));
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+        let (app, _state) = test_app(&format!("http://{mock_addr}"), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            run_server(listener, app, None, Duration::from_secs(5), async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Send a request; it reaches the (blocked) mock and is now in-flight.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+        let req = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\ncontent-length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), hit.notified())
+            .await
+            .expect("request should reach upstream");
+
+        // Trigger shutdown WHILE the request is in-flight.
+        let _ = shutdown_tx.send(());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // run_server must still be draining — it cannot return until the
+        // in-flight request finishes. (In production the process exits right
+        // after run_server returns, so returning early = cutting the request.)
+        assert!(
+            !server.is_finished(),
+            "run_server returned while a request was still in-flight — drain not waiting"
+        );
+        // Now release upstream so the in-flight request can complete.
+        release.notify_one();
+
+        // The in-flight request must complete with its full 200 response.
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut resp))
+            .await
+            .expect("in-flight response should complete during drain")
+            .unwrap();
+        let txt = String::from_utf8_lossy(&resp);
+        assert!(
+            txt.contains("200 OK"),
+            "in-flight request must complete during graceful drain, got: {txt}"
+        );
+
+        // run_server must return after the drain finishes.
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("run_server should return after draining")
+            .unwrap();
     }
 
     #[tokio::test]
