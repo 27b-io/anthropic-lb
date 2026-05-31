@@ -87,7 +87,7 @@ upstream = "https://api.anthropic.com"
 rate_limit_cooldown_secs = 60
 probe_interval_secs = 300
 
-# Proxy authentication (optional — omit for local/Tailscale use)
+# Proxy authentication (optional — omit for local / trusted-network use)
 # proxy_key = "your-secret-key-here"
 
 # IP allowlist (optional — omit to allow all source IPs)
@@ -205,7 +205,7 @@ When a request specifies a model, only accounts whose `models` list matches (exa
 
 ## Client Setup
 
-### Local / Tailscale (no proxy_key)
+### Local / trusted network (no proxy_key)
 
 Omit `proxy_key` from config. Point Claude Code at the proxy:
 
@@ -252,7 +252,7 @@ Three layers, all optional — use what fits:
 IP check runs first, then proxy key. Both apply to all endpoints including `/_stats`.
 
 > [!WARNING]
-> With no `proxy_key` and no `allowed_ips`, the proxy is **open to all**. This is fine behind Tailscale or on localhost, but never expose an open proxy to the internet.
+> With no `proxy_key` and no `allowed_ips`, the proxy is **open to all**. This is fine on a private network (VPN) or localhost, but never expose an open proxy to the internet.
 
 ### Known Limitations
 
