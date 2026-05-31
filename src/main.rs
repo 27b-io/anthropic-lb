@@ -4005,6 +4005,29 @@ fn round_backoff_delay(retry_round: u32, last_saw_529: bool) -> Duration {
     base * 2u32.pow(retry_round - 1)
 }
 
+/// Final response when all retry rounds are exhausted. A transient-only
+/// exhaustion (transport failures, no 529) is a retryable `503 + Retry-After`:
+/// the client reads `Retry-After` to time its backoff, and `503` honestly
+/// signals a transient upstream rather than account rate-limiting. Both Claude
+/// Code and the Anthropic SDKs retry 429 and 503 alike — `Retry-After` is the
+/// load-bearing signal here, not the status class. Rate-limit exhaustion (or any
+/// round that also saw a 529) stays `429` with NO `Retry-After`: recovery there
+/// is on the order of minutes/hours, so a short retry hint would tight-loop the
+/// client into a still-exhausted pool.
+fn exhaustion_response(last_saw_transient: bool, last_saw_529: bool) -> Response {
+    if last_saw_transient && !last_saw_529 {
+        warn!("all endpoints transient-failed after backoff; returning retryable 503");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "1")],
+            "upstream temporarily unreachable",
+        )
+            .into_response();
+    }
+    warn!("all endpoints exhausted (rate-limited)");
+    (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
+}
+
 /// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
 /// passes the picked endpoint and its pool index (used for `skip` and usage
 /// accounting).
@@ -4598,10 +4621,7 @@ async fn proxy_handler(
         }
     }
 
-    // `last_saw_transient` is consumed by Task 3's transient-aware exhaustion
-    // status; bound here to keep this step's exhaustion return unchanged.
-    let _ = last_saw_transient;
-    (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
+    exhaustion_response(last_saw_transient, last_saw_529)
 }
 
 // ── Fallback upstream handler ────────────────────────────────────────
@@ -8094,10 +8114,7 @@ async fn openai_chat_handler(
         }
     }
 
-    // `last_saw_transient` is consumed by Task 3's transient-aware exhaustion
-    // status; bound here to keep this step's exhaustion return unchanged.
-    let _ = last_saw_transient;
-    (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
+    exhaustion_response(last_saw_transient, last_saw_529)
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -12166,6 +12183,48 @@ token = "sk-ant-test"
             resp.status(),
             reqwest::StatusCode::OK,
             "openai_chat_handler must also ride out a transient blip via the shared helper"
+        );
+    }
+
+    /// Raw-TCP upstream that RSTs EVERY connection — a genuinely-down egress.
+    async fn spawn_dead_upstream() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((s, _)) = listener.accept().await {
+                    drop(s); // reset before responding → transport error, every time
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    // ── Task 3: transient exhaustion returns a retryable 503 ────────────
+
+    /// When every endpoint transport-fails through all backoff rounds, the
+    /// client must get a retryable `503 + Retry-After`, not a `429` (which
+    /// reads as account rate-limiting). Task 2 still returned 429 here.
+    #[tokio::test]
+    async fn proxy_returns_503_when_upstream_unreachable_transiently() {
+        let url = spawn_dead_upstream().await;
+        let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)]);
+        let addr = serve(build_router(state)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "transient upstream exhaustion must be a retryable 503, not 429"
+        );
+        assert!(
+            resp.headers().get("retry-after").is_some(),
+            "503 exhaustion should carry Retry-After so the client times its backoff"
         );
     }
 
