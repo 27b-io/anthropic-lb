@@ -3789,13 +3789,20 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 /// Outcome of a single forward attempt to an Anthropic-protocol endpoint.
 /// The retry loop in `proxy_handler` interprets the outcome:
 ///   - `Done(resp)`: final response — return it to the caller.
-///   - `Retry { saw_529, push_skip }`: try the next candidate. If
+///   - `Retry { saw_529, push_skip, transient }`: try the next candidate. If
 ///     `push_skip` is true the caller appends the failed endpoint index to
 ///     its `skip` list; if `saw_529` is true the loop will BEBO-retry once
-///     this round exhausts.
+///     this round exhausts. `transient` marks a transport-level send failure
+///     (ETIMEDOUT/reset/closed/DNS) — the loop treats these with round-gated
+///     rotation (retry the affinity/cache-warm endpoint in place on round 0,
+///     rotate only on later rounds) and a transient-aware exhaustion status.
 enum ForwardOutcome {
     Done(Response),
-    Retry { saw_529: bool, push_skip: bool },
+    Retry {
+        saw_529: bool,
+        push_skip: bool,
+        transient: bool,
+    },
 }
 
 /// Surface the real cause of a `reqwest::Error`. The Display form only shows
@@ -3870,6 +3877,7 @@ async fn classify_retry_status(
         return Err(ForwardOutcome::Retry {
             saw_529: false,
             push_skip: true,
+            transient: false,
         });
     }
 
@@ -3880,6 +3888,7 @@ async fn classify_retry_status(
         return Err(ForwardOutcome::Retry {
             saw_529: true,
             push_skip: true,
+            transient: false,
         });
     }
 
@@ -3894,6 +3903,7 @@ async fn classify_retry_status(
         return Err(ForwardOutcome::Retry {
             saw_529: false,
             push_skip: true,
+            transient: false,
         });
     }
 
@@ -3996,11 +4006,15 @@ async fn forward_anthropic(
         Ok(r) => r,
         Err(e) => {
             error!(account = endpoint_name, detail = %describe_reqwest_error(&e), "upstream request failed: {e}");
-            // Preserve original behavior: transport errors retry without
-            // adding the endpoint to the skip list.
+            // Transport-level send failure (ETIMEDOUT/reset/closed/DNS). Mark it
+            // `transient`; rotation policy is round-gated and owned by the retry
+            // loop (it knows `retry_round`), so `push_skip` stays false here —
+            // round 0 retries the SAME affinity/cache-warm endpoint after a
+            // backoff rather than rotating to a cold-cache endpoint on every blip.
             return ForwardOutcome::Retry {
                 saw_529: false,
                 push_skip: false,
+                transient: true,
             };
         }
     };
@@ -4472,10 +4486,14 @@ async fn proxy_handler(
                 ForwardOutcome::Retry {
                     saw_529: this_529,
                     push_skip,
+                    transient: this_transient,
                 } => {
                     if this_529 {
                         saw_529 = true;
                     }
+                    // `transient` is consumed by Task 2's round-gated loop; bound
+                    // here only to keep this compile-only step green.
+                    let _ = this_transient;
                     if push_skip {
                         skip.push(picked_idx);
                     }
@@ -7435,11 +7453,15 @@ async fn forward_openai_compat_anthropic(
         Ok(r) => r,
         Err(e) => {
             error!(account = endpoint_name, detail = %describe_reqwest_error(&e), "upstream request failed: {e}");
-            // Preserve original behavior: transport errors retry without
-            // adding the endpoint to the skip list.
+            // Transport-level send failure (ETIMEDOUT/reset/closed/DNS). Mark it
+            // `transient`; rotation policy is round-gated and owned by the retry
+            // loop (it knows `retry_round`), so `push_skip` stays false here —
+            // round 0 retries the SAME affinity/cache-warm endpoint after a
+            // backoff rather than rotating to a cold-cache endpoint on every blip.
             return ForwardOutcome::Retry {
                 saw_529: false,
                 push_skip: false,
+                transient: true,
             };
         }
     };
@@ -7961,10 +7983,14 @@ async fn openai_chat_handler(
                 ForwardOutcome::Retry {
                     saw_529: this_529,
                     push_skip,
+                    transient: this_transient,
                 } => {
                     if this_529 {
                         saw_529 = true;
                     }
+                    // `transient` is consumed by Task 2's round-gated loop; bound
+                    // here only to keep this compile-only step green.
+                    let _ = this_transient;
                     if push_skip {
                         skip.push(picked_idx);
                     }
