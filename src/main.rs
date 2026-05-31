@@ -989,7 +989,7 @@ impl AppState {
                 );
             }
             Err(e) => {
-                warn!(endpoint = ep.name, error = %e, "probe failed");
+                warn!(endpoint = ep.name, error = %e, detail = %describe_reqwest_error(&e), "probe failed");
             }
         }
     }
@@ -3798,6 +3798,52 @@ enum ForwardOutcome {
     Retry { saw_529: bool, push_skip: bool },
 }
 
+/// Surface the real cause of a `reqwest::Error`. The Display form only shows
+/// "error sending request for url (...)" — the actionable detail (stale pooled
+/// connection closed, connection reset, DNS failure, connect refused, timeout)
+/// lives in the error's `source()` chain and its `is_*` classifiers. Returns a
+/// compact `kind=... cause=a -> b -> c` string for structured logs so we can
+/// tell *why* upstream sends fail without guessing.
+fn describe_reqwest_error(e: &reqwest::Error) -> String {
+    let mut kinds: Vec<&str> = Vec::new();
+    if e.is_connect() {
+        kinds.push("connect");
+    }
+    if e.is_timeout() {
+        kinds.push("timeout");
+    }
+    if e.is_body() {
+        kinds.push("body");
+    }
+    if e.is_decode() {
+        kinds.push("decode");
+    }
+    if e.is_request() {
+        kinds.push("request");
+    }
+    if e.is_redirect() {
+        kinds.push("redirect");
+    }
+    let kind = if kinds.is_empty() {
+        "other".to_string()
+    } else {
+        kinds.join("+")
+    };
+
+    // Walk the source chain (reqwest -> hyper -> io) for the root cause.
+    let mut causes: Vec<String> = Vec::new();
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        causes.push(s.to_string());
+        src = s.source();
+    }
+    if causes.is_empty() {
+        format!("kind={kind}")
+    } else {
+        format!("kind={kind} cause={}", causes.join(" -> "))
+    }
+}
+
 /// Classify an upstream Anthropic response status into a retry decision.
 ///
 /// Shared by both `forward_anthropic` and `forward_openai_compat_anthropic`,
@@ -3949,7 +3995,7 @@ async fn forward_anthropic(
     let resp = match upstream_req.send().await {
         Ok(r) => r,
         Err(e) => {
-            error!(account = endpoint_name, "upstream request failed: {e}");
+            error!(account = endpoint_name, detail = %describe_reqwest_error(&e), "upstream request failed: {e}");
             // Preserve original behavior: transport errors retry without
             // adding the endpoint to the skip list.
             return ForwardOutcome::Retry {
@@ -4514,6 +4560,7 @@ async fn try_fallback_upstream(
                 req_id,
                 upstream = ep.name,
                 error = %e,
+                detail = %describe_reqwest_error(&e),
                 "fallback: unified OpenAI endpoint request failed"
             );
             return None;
@@ -7387,7 +7434,7 @@ async fn forward_openai_compat_anthropic(
     let resp = match upstream_req.send().await {
         Ok(r) => r,
         Err(e) => {
-            error!(account = endpoint_name, "upstream request failed: {e}");
+            error!(account = endpoint_name, detail = %describe_reqwest_error(&e), "upstream request failed: {e}");
             // Preserve original behavior: transport errors retry without
             // adding the endpoint to the skip list.
             return ForwardOutcome::Retry {
@@ -8493,6 +8540,29 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The error describer must surface the real cause + classification, not
+    /// just reqwest's opaque "error sending request" Display. Uses a genuine
+    /// connect failure so it exercises the is_connect classifier and the
+    /// source-chain walk.
+    #[tokio::test]
+    async fn describe_reqwest_error_surfaces_cause_and_kind() {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .expect_err("connect to 127.0.0.1:1 should fail");
+        let desc = describe_reqwest_error(&err);
+        assert!(
+            desc.starts_with("kind="),
+            "should classify kind, got: {desc}"
+        );
+        assert!(
+            desc.contains("connect") || desc.contains("cause="),
+            "should surface connect classification or root cause, got: {desc}"
+        );
+    }
 
     #[test]
     fn protocol_deserializes_lowercase_strings() {
