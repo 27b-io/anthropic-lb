@@ -9,14 +9,6 @@ strategy = "dynamic-capacity-v1"
 rate_limit_cooldown_secs = 60
 probe_interval_secs = 300
 
-# Seconds of idle before the proxy closes an inbound keep-alive connection.
-# If the proxy is reached through an intermediary that closes idle connections,
-# keep this BELOW that idle timeout so the proxy retires the socket cleanly
-# first — otherwise a client's HTTP pool (Node fetch / undici) reuses a socket
-# the intermediary already closed and reports "socket connection closed
-# unexpectedly". 0 disables. Default: 120.
-keepalive_idle_secs = 120
-
 # Proxy authentication: clients must send this as x-api-key to access the proxy.
 # Omit to leave proxy open (only do so on a trusted/private network).
 # proxy_key = "your-secret-key-here"
