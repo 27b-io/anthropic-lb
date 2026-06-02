@@ -688,7 +688,16 @@ struct PersistedEndpoint {
     /// Used by sync_from_redis "most recent wins" merge after restart.
     #[serde(default)]
     last_updated_epoch: Option<u64>,
+    /// Burst-429 backoff stage (consecutive no-Retry-After 429s). Persisted so a
+    /// restart mid-escalation doesn't reset exponential backoff to stage 0 (B3-07).
+    #[serde(default)]
+    consecutive_burst_429s: u32,
 }
+
+/// Process-global monotonic nonce for unique state-file temp names, so
+/// concurrent save_state calls never share a temp path (which could interleave
+/// into a torn file before the atomic rename promotes it).
+static STATE_SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 impl AppState {
     fn now_epoch() -> u64 {
@@ -796,6 +805,7 @@ impl AppState {
                 overage_reset: info.overage_reset,
                 hard_limited_until_epoch: hard_until_epoch,
                 last_updated_epoch: info.last_updated_epoch,
+                consecutive_burst_429s: info.consecutive_burst_429s,
             }
         }
 
@@ -813,10 +823,24 @@ impl AppState {
             saved_at: Self::now_epoch(),
         };
 
-        match serde_json::to_string_pretty(&state) {
+        // Atomic write: serialize compactly to a unique temp sibling, then rename
+        // it into place. Rename is atomic on the same filesystem, so a crash
+        // mid-write leaves the previous complete file intact (not a truncated
+        // one) and concurrent writers can't interleave into a torn file. Compact
+        // `to_vec` (not `to_string_pretty`) roughly halves the bytes per save.
+        match serde_json::to_vec(&state) {
             Ok(json) => {
-                if let Err(e) = tokio::fs::write(&self.state_path, json).await {
-                    error!(path = %self.state_path.display(), error = %e, "failed to save state");
+                let nonce = STATE_SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
+                let mut tmp_os = self.state_path.clone().into_os_string();
+                tmp_os.push(format!(".{nonce}.tmp"));
+                let tmp_path = PathBuf::from(tmp_os);
+                if let Err(e) = tokio::fs::write(&tmp_path, &json).await {
+                    error!(path = %tmp_path.display(), error = %e, "failed to write temp state");
+                    return;
+                }
+                if let Err(e) = tokio::fs::rename(&tmp_path, &self.state_path).await {
+                    error!(path = %self.state_path.display(), error = %e, "failed to rename state into place");
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
                 } else {
                     trace!(path = %self.state_path.display(), "state saved");
                 }
@@ -1095,6 +1119,7 @@ impl AppState {
                 info.overage_status = pa.overage_status.clone();
                 info.overage_utilization = pa.overage_utilization;
                 info.overage_reset = pa.overage_reset;
+                info.consecutive_burst_429s = pa.consecutive_burst_429s;
 
                 // Load claims_7d: either from persisted map or migrate from flat fields
                 if !pa.claims_7d.is_empty() {
@@ -4019,7 +4044,6 @@ async fn classify_retry_status(
 
     // 529 → overloaded, try next account; flag for BEBO retry if all exhausted
     if status.as_u16() == 529 {
-        state.save_state().await;
         warn!(account = endpoint_name, "got 529, rotating to next account");
         return Err(ForwardOutcome::Retry {
             saw_529: true,
@@ -4030,7 +4054,6 @@ async fn classify_retry_status(
 
     // Other 5xx → transient, try next account (no BEBO retry)
     if status.is_server_error() {
-        state.save_state().await;
         warn!(
             account = endpoint_name,
             status = status.as_u16(),
@@ -4319,11 +4342,13 @@ async fn forward_anthropic(
         false
     };
 
-    // Persist state after updating rate-limit state so completed 4xx
-    // responses and other terminal outcomes aren't dropped on restart.
-    state.save_state().await;
-
+    // Per-request persistence removed: it re-serialized the whole endpoint pool
+    // and did a blocking write on every successful request (a memory + IO
+    // amplifier under load). Persist only on the hard-limit RECOVERY transition
+    // here; 429 hard-limit entry still persists immediately, and utilization /
+    // request counts persist at probe cadence + shutdown.
     if recovered {
+        state.save_state().await;
         state.signal_hard_limit_recovery(endpoint_name).await;
     }
 
@@ -7817,11 +7842,13 @@ async fn forward_openai_compat_anthropic(
         false
     };
 
-    // Persist state after updating rate-limit state so completed 4xx
-    // responses and other terminal outcomes aren't dropped on restart.
-    state.save_state().await;
-
+    // Per-request persistence removed: it re-serialized the whole endpoint pool
+    // and did a blocking write on every successful request (a memory + IO
+    // amplifier under load). Persist only on the hard-limit RECOVERY transition
+    // here; 429 hard-limit entry still persists immediately, and utilization /
+    // request counts persist at probe cadence + shutdown.
     if recovered {
+        state.save_state().await;
         state.signal_hard_limit_recovery(endpoint_name).await;
     }
 
@@ -17774,6 +17801,49 @@ listen = "127.0.0.1:8082"
     }
 
     // ── State persistence round-trip ─────────────────────────────
+
+    #[tokio::test]
+    async fn state_roundtrip_preserves_burst_backoff_and_leaves_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let state = Arc::new(AppState {
+            endpoints: vec![mk_endpoint("primary", "sk-ant-api-aaa")],
+            state_path: state_path.clone(),
+            ..test_state_base()
+        });
+        {
+            let mut info = state.endpoints[0].rate_info.write().await;
+            info.consecutive_burst_429s = 3;
+            info.utilization_5h = Some(0.4);
+            info.reset_5h = Some(AppState::now_epoch() + 18000);
+        }
+        state.save_state().await;
+
+        // Atomic write must leave no temp sibling behind in the directory.
+        let leftover: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "atomic save must clean up its temp file(s): {leftover:?}"
+        );
+
+        // Restart: a fresh state restores the burst-429 backoff stage (B3-07).
+        let restored = Arc::new(AppState {
+            endpoints: vec![mk_endpoint("primary", "sk-ant-api-aaa")],
+            state_path: state_path.clone(),
+            ..test_state_base()
+        });
+        restored.load_state().await;
+        let info = restored.endpoints[0].rate_info.read().await;
+        assert_eq!(
+            info.consecutive_burst_429s, 3,
+            "burst-429 backoff stage must survive a restart (B3-07)"
+        );
+    }
 
     #[tokio::test]
     async fn state_persistence_roundtrip() {
