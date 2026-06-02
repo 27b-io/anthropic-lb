@@ -12511,8 +12511,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     // eviction; an unbounded set of distinct values would grow them without
     // limit (a memory-DoS vector — anthropic-lb#73 audit). Bound new-key inserts.
 
-    #[tokio::test]
-    async fn client_request_rates_is_bounded() {
+    #[test]
+    fn client_request_rates_is_bounded() {
         let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
         let br = std::sync::Mutex::new(BurnRate::new());
         for i in 0..10_050 {
