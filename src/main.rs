@@ -9028,18 +9028,22 @@ token = "sk-ant-test"
         }
     }
 
-    fn test_state_with_strategy(
-        endpoints: Vec<Endpoint>,
-        routing_strategy: RoutingStrategy,
-    ) -> Arc<AppState> {
-        Arc::new(AppState {
+    /// Canonical `AppState` test default — the single place every test fixture
+    /// derives from. Tests build state via `AppState { <overrides>, ..test_state_base() }`
+    /// so adding a field to `AppState` is a one-line edit here (plus the
+    /// config-derived production constructor), not a 49-site shotgun edit.
+    ///
+    /// Note: `soft_limit` is 1.0 here (open ceiling for routing tests), NOT
+    /// production's 0.90.
+    fn test_state_base() -> AppState {
+        AppState {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            endpoints,
+            endpoints: vec![],
             robin: AtomicUsize::new(0),
-            routing_strategy,
+            routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
@@ -9064,6 +9068,17 @@ token = "sk-ant-test"
             probe_interval_secs: 300,
             overage_penalty: 10,
             upstream_transport_errors: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn test_state_with_strategy(
+        endpoints: Vec<Endpoint>,
+        routing_strategy: RoutingStrategy,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            endpoints,
+            routing_strategy,
+            ..test_state_base()
         })
     }
 
@@ -9143,37 +9158,10 @@ token = "sk-ant-test"
         let endpoints = vec![acct_a, acct_b];
 
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints,
-            robin: AtomicUsize::new(0),
             routing_strategy,
-            cooldown: Duration::from_secs(60),
-            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         (build_router(state.clone()), state)
@@ -9236,37 +9224,10 @@ token = "sk-ant-test"
     #[test]
     fn populated_allowlist_blocks_unknown() {
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
             allowed_ips: vec![IpAllowEntry::Addr("10.0.0.1".parse().unwrap())],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -10881,37 +10842,10 @@ token = "sk-ant-test"
         oauth_ep.base_url = format!("http://{}", mock_addr);
         let accounts = vec![oauth_ep];
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: accounts,
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-oauth-cache-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true, // KEY: auto-cache enabled
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            auto_cache: true, // KEY: this test exercises the auto-cache injection path
+            ..test_state_base()
         });
 
         let app = build_router(state);
@@ -12101,37 +12035,10 @@ token = "sk-ant-test"
         let accounts = vec![acct_a, acct_b];
 
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: accounts,
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-openai-test.state.json"),
             proxy_key,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         let app = Router::new()
@@ -13009,37 +12916,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
 
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: accounts,
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
-            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 0.90,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         // Try many affinity keys — all should route to healthy (idx 0)
@@ -13152,37 +13031,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut budgets = HashMap::new();
         budgets.insert("client-a".to_string(), 1000u64);
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
-            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: budgets,
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         // Within budget
@@ -13657,40 +13508,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Account B: healthy
         let now_epoch = AppState::now_epoch();
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![
                 mk_endpoint("acct-a", "sk-ant-api-test-aaa"),
                 mk_endpoint("acct-b", "sk-ant-api-test-bbb"),
             ],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
-            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 0.90, // Key: not 1.0 — throttled (0.98) will be excluded
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         {
             let mut info = state.endpoints[0].rate_info.write().await;
@@ -13728,40 +13551,12 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn pick_model_specific_7d_throttled_claim_excludes() {
         let now_epoch = AppState::now_epoch();
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![
                 mk_endpoint("acct-a", "sk-ant-api-test-aaa"),
                 mk_endpoint("acct-b", "sk-ant-api-test-bbb"),
             ],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
-            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
             soft_limit: 0.90,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         {
             let mut info = state.endpoints[0].rate_info.write().await;
@@ -14494,37 +14289,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut client_names = HashMap::new();
         client_names.insert("10.0.0.1".to_string(), "ray".to_string());
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
             client_names,
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         // Header overrides IP mapping (supports multiple clients per IP)
@@ -14562,37 +14330,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut client_names = HashMap::new();
         client_names.insert("10.0.0.1".to_string(), "ray".to_string());
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
             client_names,
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
             operators: vec!["ray".to_string()],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -15405,40 +15147,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut limits = HashMap::new();
         limits.insert("testclient".to_string(), 0.80);
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![
                 mk_endpoint("a", "sk-ant-api-x"),
                 mk_endpoint("b", "sk-ant-api-y"),
             ],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.60, 0.50, now + 10000, now + 100000).await;
@@ -15454,40 +15169,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut limits = HashMap::new();
         limits.insert("testclient".to_string(), 0.50);
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![
                 mk_endpoint("a", "sk-ant-api-x"),
                 mk_endpoint("b", "sk-ant-api-y"),
             ],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
@@ -15504,40 +15192,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut limits = HashMap::new();
         limits.insert("testclient".to_string(), 0.70);
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![
                 mk_endpoint("a", "sk-ant-api-x"),
                 mk_endpoint("b", "sk-ant-api-y"),
             ],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -15559,37 +15220,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut limits = HashMap::new();
         limits.insert("ray".to_string(), 0.10); // very low limit
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
             operators: vec!["ray".to_string()],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
         // Operator bypasses everything
@@ -15608,37 +15243,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut acct = mk_endpoint("a", "sk-ant-api-x");
         acct.models = vec!["claude-sonnet".to_string()]; // only serves sonnet
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![acct],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         // Request for "claude-opus" — no account serves it → should pass
         assert!(
@@ -15656,40 +15264,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut limits = HashMap::new();
         limits.insert("testclient".to_string(), 0.30); // below the 0.5 unknown default
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![
                 mk_endpoint("a", "sk-ant-api-x"),
                 mk_endpoint("b", "sk-ant-api-y"),
             ],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         // Don't set any utilization — accounts remain "unknown" (0.5)
         // With limit=0.30, unknown 0.5 would appear "above limit" without fail-open
@@ -15710,41 +15291,14 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut limits = HashMap::new();
         limits.insert("testclient".to_string(), 0.50);
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![
                 mk_endpoint("a", "sk-ant-api-x"),
                 mk_endpoint("b", "sk-ant-api-y"),
                 mk_endpoint("c", "sk-ant-api-z"),
             ],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         // Two known accounts above limit, one unknown (no data set)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -15789,37 +15343,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut limits = HashMap::new();
         limits.insert("ray".to_string(), 0.10);
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
             operators: vec!["ray".to_string()],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
         assert!(state.is_emergency_brake_active().await);
@@ -15866,37 +15394,10 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn emergency_configurable_threshold() {
         let now = AppState::now_epoch();
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
             emergency_threshold: 0.80, // custom low threshold
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         set_account_utilization(&state, 0, 0.85, 0.70, now + 10000, now + 100000).await;
         assert!(
@@ -15958,37 +15459,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Unknown's 0.5 >= 0.4 so all_above stays true, BUT any_known is false.
         // The any_known guard prevents firing — fail-open even with aggressive threshold.
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("mystery", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
             emergency_threshold: 0.40, // below unknown's default 0.5
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         // No rate data set — account returns (0.5, "unknown")
         // 0.5 >= 0.4 threshold → all_above is true
@@ -16007,40 +15481,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Brake fires. This is correct because we have real data showing distress.
         let now = AppState::now_epoch();
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![
                 mk_endpoint("known", "sk-ant-api-a"),
                 mk_endpoint("unknown", "sk-ant-api-b"),
             ],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
             emergency_threshold: 0.40,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         set_account_utilization(&state, 0, 0.60, 0.55, now + 10000, now + 100000).await;
         // Account 1: no data → (0.5, "unknown"), 0.5 >= 0.4 → all_above stays true
@@ -16109,37 +15556,10 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn gate_unknown_client_not_operator() {
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
             operators: vec!["ray".to_string()],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         // "-" is not the operator
         assert!(!state.is_operator("-"));
@@ -16186,37 +15606,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn pressure_status_operator_always_healthy() {
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
-            endpoints: vec![],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
             operators: vec!["ray".to_string()],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         // Operator always gets "healthy" regardless of utilization
         assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
@@ -16230,37 +15622,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut limits = HashMap::new();
         limits.insert("gastown".to_string(), 0.85);
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
-            endpoints: vec![],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         // gastown has limit 0.85, 80% of that = 0.68
         // At 0.60, below 0.68 → no upgrade → "healthy"
@@ -16450,37 +15814,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut limits = HashMap::new();
         limits.insert("-".to_string(), 0.50); // default client gets 0.50 limit
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-limit-reject.state.json"),
             proxy_key: Some("key".to_string()),
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
             auto_cache: false,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         // Set utilization above client's limit (0.80 > 0.50)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -16512,37 +15851,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut limits = HashMap::new();
         limits.insert("-".to_string(), 0.90);
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-limit-pass.state.json"),
             proxy_key: Some("key".to_string()),
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
             auto_cache: false,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         // Set utilization below client's limit (0.50 < 0.90)
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -16568,40 +15882,15 @@ data: {\"type\":\"message_stop\"}\n\n";
         let (mock_url, _handle) = spawn_mock_upstream().await;
         let now = AppState::now_epoch();
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![
                 mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url),
                 mk_endpoint_at("b", "sk-ant-api-test-bbb", &mock_url),
             ],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-emergency-block.state.json"),
             proxy_key: Some("key".to_string()),
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
             auto_cache: false,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
             operators: vec!["ray".to_string()],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         // All accounts above emergency threshold. 5h=0.96 > emergency threshold (0.88).
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -16635,40 +15924,16 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut client_names = HashMap::new();
         client_names.insert("127.0.0.1".to_string(), "ray".to_string());
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![
                 mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url),
                 mk_endpoint_at("b", "sk-ant-api-test-bbb", &mock_url),
             ],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-emergency-operator.state.json"),
             proxy_key: Some("key".to_string()),
-            allowed_ips: vec![],
             client_names,
             auto_cache: false,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
             operators: vec!["ray".to_string()],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         // All accounts above emergency threshold — 5h only (avoid claim penalty on 7d)
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -16702,37 +15967,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut limits = HashMap::new();
         limits.insert("-".to_string(), 0.50);
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-openai-limit.state.json"),
             proxy_key: Some("key".to_string()),
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
             auto_cache: false,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
 
@@ -16761,37 +16001,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         let (mock_url, _handle) = spawn_mock_upstream().await;
         let now = AppState::now_epoch();
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test-openai-emergency.state.json"),
             proxy_key: Some("key".to_string()),
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
             auto_cache: false,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
 
@@ -16876,32 +16090,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         let state = Arc::new(AppState {
             client: Client::new(),
             endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
             client_names,
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
@@ -16947,33 +16138,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn compute_pressure_status_operator_always_healthy() {
         let state = Arc::new(AppState {
             client: Client::new(),
-            endpoints: vec![],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
             operators: vec!["operator-id".to_string()],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         let status = compute_pressure_status(0.99, "operator-id", &state);
@@ -16999,33 +16166,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         limits.insert("client".to_string(), 0.80);
         let state = Arc::new(AppState {
             client: Client::new(),
-            endpoints: vec![],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
             client_utilization_limits: limits,
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
@@ -17725,33 +16868,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn is_operator_checks_configured_operator() {
         let state = Arc::new(AppState {
             client: Client::new(),
-            endpoints: vec![],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
             operators: vec!["special-operator".to_string()],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         assert!(state.is_operator("special-operator"));
@@ -17768,37 +16887,13 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn is_operator_supports_multiple_operators() {
         let state = Arc::new(AppState {
             client: Client::new(),
-            endpoints: vec![],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
             operators: vec![
                 "ray".to_string(),
                 "openclaw".to_string(),
                 "claude".to_string(),
             ],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
         assert!(state.is_operator("ray"));
         assert!(state.is_operator("openclaw"));
@@ -17847,37 +16942,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut budgets = HashMap::new();
         budgets.insert("client-a".to_string(), 100u64);
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
-            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: budgets,
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         // Budget check uses local path when redis is None
@@ -17989,37 +17056,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut budgets = HashMap::new();
         budgets.insert("client-a".to_string(), 100u64);
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
-            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: budgets,
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         // Recording 0 tokens should be a no-op
@@ -18355,40 +17394,12 @@ listen = "127.0.0.1:8082"
         let state_path = PathBuf::from(tmp.path());
 
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![
                 mk_endpoint("primary", "sk-ant-api-aaa"),
                 mk_endpoint("secondary", "sk-ant-api-bbb"),
             ],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: state_path.clone(),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         // Set up some state to persist
@@ -18441,40 +17452,12 @@ listen = "127.0.0.1:8082"
 
         // Create a fresh state and load into it
         let state2 = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![
                 mk_endpoint("primary", "sk-ant-api-aaa"),
                 mk_endpoint("secondary", "sk-ant-api-bbb"),
             ],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path,
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         // Load state
@@ -18588,37 +17571,9 @@ listen = "127.0.0.1:8082"
         let mut budgets = HashMap::new();
         budgets.insert("client-a".to_string(), 10000u64);
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
-            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: budgets,
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         // Pre-populate with yesterday's usage (high usage that would exceed budget)
@@ -18643,37 +17598,9 @@ listen = "127.0.0.1:8082"
         let mut budgets = HashMap::new();
         budgets.insert("client-a".to_string(), 1000u64);
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
-            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
             client_budgets: budgets,
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         // Pre-populate with yesterday's exhausted budget
@@ -19105,37 +18032,9 @@ listen = "127.0.0.1:8082"
         let (mock_url, _handle) = spawn_mock_upstream().await;
         let accounts = vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &mock_url)];
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: accounts,
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
-            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
             operators: vec!["op-alice".to_string(), "op-bob".to_string()],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         // Seed two operator clients and one regular client with token usage
@@ -19353,37 +18252,11 @@ listen = "127.0.0.1:8082"
         client_rates_map.insert("claude-code".to_string(), (50, ewma));
 
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: accounts,
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
-            state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
-            auto_cache: true,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
             client_budgets,
             budget_usage: Mutex::new(budget_usage_map),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
             client_request_rates: Mutex::new(client_rates_map),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         let app = build_router(state);
@@ -20438,37 +19311,10 @@ listen = "127.0.0.1:8082"
             &format!("http://{}", mock_addr),
         )];
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: accounts,
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-oauth-regression.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
             auto_cache: false,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         let app = build_router(state);
@@ -20578,37 +19424,10 @@ listen = "127.0.0.1:8082"
             &format!("http://{}", mock_addr),
         )];
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: accounts,
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-oauth-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
             auto_cache: false, // disable to keep body simple
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         let app = Router::new()
@@ -20887,37 +19706,10 @@ listen = "127.0.0.1:8082"
         openai.base_url = mock_url.clone();
         openai.priority = 100;
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("acct-a", "sk-ant-api-a"), openai],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-fallback-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
             auto_cache: false,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         // Hard-limit the only account
@@ -20982,37 +19774,10 @@ listen = "127.0.0.1:8082"
         openai.base_url = mock_url.clone();
         openai.priority = 100;
         let state = Arc::new(AppState {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
             endpoints: vec![mk_endpoint("acct-a", "sk-ant-api-a"), openai],
-            robin: AtomicUsize::new(0),
-            routing_strategy: RoutingStrategy::default(),
-            cooldown: Duration::from_secs(60),
             state_path: PathBuf::from("/tmp/anthropic-lb-fallback-stream-test.state.json"),
-            proxy_key: None,
-            allowed_ips: vec![],
-            client_names: HashMap::new(),
             auto_cache: false,
-            client_usage: Mutex::new(HashMap::new()),
-            shadow_log_tx: None,
-            shadow_log_dropped: AtomicU64::new(0),
-            client_budgets: HashMap::new(),
-            budget_usage: Mutex::new(HashMap::new()),
-            client_utilization_limits: HashMap::new(),
-            operators: vec![],
-            emergency_brake: true,
-            emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
-            client_request_rates: Mutex::new(HashMap::new()),
-            soft_limit: 1.0,
-            redis: None,
-            cluster_info_cache: Mutex::new(None),
-            next_req_id: AtomicU64::new(0),
-            instance_id: 0,
-            probe_interval_secs: 300,
-            overage_penalty: 10,
-            upstream_transport_errors: Mutex::new(HashMap::new()),
+            ..test_state_base()
         });
 
         {
