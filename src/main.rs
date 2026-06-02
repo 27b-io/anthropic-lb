@@ -521,6 +521,11 @@ struct AppState {
     /// Priority penalty added to an endpoint's effective priority while it serves
     /// via overage. Default: 10.
     overage_penalty: u32,
+    /// Count of upstream transport send-failures, keyed by kind
+    /// (`timeout`/`connect`/`other`). Surfaces a flaky egress on the dashboard
+    /// (`anthropic_upstream_transport_errors_total`) before it becomes client
+    /// errors. Process-scoped; not persisted or Redis-synced.
+    upstream_transport_errors: Mutex<HashMap<&'static str, u64>>,
 }
 
 /// Index into `AppState.endpoints` — the sole runtime endpoint pool.
@@ -1180,6 +1185,18 @@ const MAX_529_RETRIES: u32 = 3;
 
 /// Base delay for 529 BEBO retries. Doubles each round: 1s, 2s, 4s.
 const RETRY_529_BASE_DELAY: Duration = Duration::from_secs(1);
+
+/// Base backoff for a round that failed on transient transport errors
+/// (ETIMEDOUT/reset/closed/DNS). Doubles per round: 150ms, 300ms. Kept short
+/// because egress blips are sub-second; 529 overload uses the longer 1s base.
+const TRANSIENT_BASE_DELAY: Duration = Duration::from_millis(150);
+
+/// Transient (transport-error) rounds get a SMALLER budget than 529 overload.
+/// Round 0 retries the affinity/cache-warm endpoint in place (no rotation);
+/// rounds 1..=MAX_TRANSIENT_RETRIES rotate the pool. Total rounds = this + 1.
+/// Capped at 1 so a genuinely-down egress fails clean (→ 503) in ~one rotation
+/// instead of stalling through all MAX_529_RETRIES rounds of connect timeouts.
+const MAX_TRANSIENT_RETRIES: u32 = 1;
 
 /// Sentinel value written to `alb:hard:{account}` when a replica has observed
 /// recovery from a hard rate limit. Other replicas interpret this as an
@@ -3805,13 +3822,20 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 /// Outcome of a single forward attempt to an Anthropic-protocol endpoint.
 /// The retry loop in `proxy_handler` interprets the outcome:
 ///   - `Done(resp)`: final response — return it to the caller.
-///   - `Retry { saw_529, push_skip }`: try the next candidate. If
+///   - `Retry { saw_529, push_skip, transient }`: try the next candidate. If
 ///     `push_skip` is true the caller appends the failed endpoint index to
 ///     its `skip` list; if `saw_529` is true the loop will BEBO-retry once
-///     this round exhausts.
+///     this round exhausts. `transient` marks a transport-level send failure
+///     (ETIMEDOUT/reset/closed/DNS) — the loop treats these with round-gated
+///     rotation (retry the affinity/cache-warm endpoint in place on round 0,
+///     rotate only on later rounds) and a transient-aware exhaustion status.
 enum ForwardOutcome {
     Done(Response),
-    Retry { saw_529: bool, push_skip: bool },
+    Retry {
+        saw_529: bool,
+        push_skip: bool,
+        transient: bool,
+    },
 }
 
 /// Surface the real cause of a `reqwest::Error`. The Display form only shows
@@ -3886,6 +3910,7 @@ async fn classify_retry_status(
         return Err(ForwardOutcome::Retry {
             saw_529: false,
             push_skip: true,
+            transient: false,
         });
     }
 
@@ -3896,6 +3921,7 @@ async fn classify_retry_status(
         return Err(ForwardOutcome::Retry {
             saw_529: true,
             push_skip: true,
+            transient: false,
         });
     }
 
@@ -3910,10 +3936,117 @@ async fn classify_retry_status(
         return Err(ForwardOutcome::Retry {
             saw_529: false,
             push_skip: true,
+            transient: false,
         });
     }
 
     Ok(resp)
+}
+
+/// What the retry loop should do after one forward attempt's `ForwardOutcome`.
+enum RetryStep {
+    /// `Done` — hand this response back to the caller (return from the handler).
+    Return(Response),
+    /// Try the next candidate this round (`continue` the attempt loop).
+    NextAttempt,
+    /// End this round now (`break` the attempt loop) → backoff, then retry the
+    /// pool. Used for a round-0 transient so the affinity/cache-warm endpoint is
+    /// retried in place rather than rotated away from.
+    EndRound,
+}
+
+/// Apply one forward attempt's outcome to the round bookkeeping and decide the
+/// loop's next move. Shared by `proxy_handler` and `openai_chat_handler` so the
+/// round-gated transient policy lives in exactly ONE place — the two retry loops
+/// are otherwise byte-identical and have diverged before.
+///
+/// `retry_round` gates rotation: a transient (transport-level) failure on round
+/// 0 keeps the affinity/cache-warm endpoint (`EndRound` → backoff → retry IT);
+/// on rounds ≥1 it rotates (push skip). 429/5xx/529 always rotate immediately.
+fn apply_round_outcome(
+    retry_round: u32,
+    outcome: ForwardOutcome,
+    picked_idx: EndpointIdx,
+    skip: &mut Vec<EndpointIdx>,
+    saw_529: &mut bool,
+    saw_transient: &mut bool,
+) -> RetryStep {
+    match outcome {
+        ForwardOutcome::Done(resp) => RetryStep::Return(resp),
+        ForwardOutcome::Retry {
+            saw_529: s,
+            push_skip,
+            transient,
+        } => {
+            if s {
+                *saw_529 = true;
+            }
+            if transient {
+                *saw_transient = true;
+                // Round 0: do NOT rotate — keep the affinity/cache-warm endpoint
+                // and end the round so the backoff retries IT (a sub-second blip
+                // becomes a cache HIT, not a cold-cache write on a cold endpoint).
+                if retry_round == 0 {
+                    return RetryStep::EndRound;
+                }
+                // Round ≥1: the warm endpoint failed a backoff-retry too — it is
+                // genuinely down, so rotate across the pool.
+                skip.push(picked_idx);
+            } else if push_skip {
+                skip.push(picked_idx); // 429/5xx/529: immediate rotation (unchanged)
+            }
+            RetryStep::NextAttempt
+        }
+    }
+}
+
+/// After a round completes, decide whether to retry the whole pool (after a
+/// backoff). Pure rate-limit exhaustion (no 529, no transient) does not retry —
+/// rotating cannot help. A transient-only round gets the smaller
+/// `MAX_TRANSIENT_RETRIES` budget; a 529 round keeps the loop's full
+/// `MAX_529_RETRIES` budget.
+fn round_should_continue(retry_round: u32, saw_529: bool, saw_transient: bool) -> bool {
+    if !(saw_529 || saw_transient) {
+        return false; // (a) pure rate-limit exhaustion — rotating won't help
+    }
+    if !saw_529 && saw_transient && retry_round >= MAX_TRANSIENT_RETRIES {
+        return false; // (b) transient budget spent → fail clean
+    }
+    true // (c) 529 keeps its full loop budget
+}
+
+/// Backoff before re-trying the whole pool. A 529 (overload) round uses the long
+/// base; a purely-transient round uses the short base. Doubles per round.
+fn round_backoff_delay(retry_round: u32, last_saw_529: bool) -> Duration {
+    let base = if last_saw_529 {
+        RETRY_529_BASE_DELAY
+    } else {
+        TRANSIENT_BASE_DELAY
+    };
+    base * 2u32.pow(retry_round - 1)
+}
+
+/// Final response when all retry rounds are exhausted. A transient-only
+/// exhaustion (transport failures, no 529) is a retryable `503 + Retry-After`:
+/// the client reads `Retry-After` to time its backoff, and `503` honestly
+/// signals a transient upstream rather than account rate-limiting. Both Claude
+/// Code and the Anthropic SDKs retry 429 and 503 alike — `Retry-After` is the
+/// load-bearing signal here, not the status class. Rate-limit exhaustion (or any
+/// round that also saw a 529) stays `429` with NO `Retry-After`: recovery there
+/// is on the order of minutes/hours, so a short retry hint would tight-loop the
+/// client into a still-exhausted pool.
+fn exhaustion_response(last_saw_transient: bool, last_saw_529: bool) -> Response {
+    if last_saw_transient && !last_saw_529 {
+        warn!("all endpoints transient-failed after backoff; returning retryable 503");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "1")],
+            "upstream temporarily unreachable",
+        )
+            .into_response();
+    }
+    warn!("all endpoints exhausted (rate-limited)");
+    (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
 }
 
 /// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
@@ -4012,11 +4145,28 @@ async fn forward_anthropic(
         Ok(r) => r,
         Err(e) => {
             error!(account = endpoint_name, detail = %describe_reqwest_error(&e), "upstream request failed: {e}");
-            // Preserve original behavior: transport errors retry without
-            // adding the endpoint to the skip list.
+            // Surface the failure on the dashboard by kind before it becomes a
+            // client error. `is_timeout`/`is_connect` are the same classifiers
+            // `describe_reqwest_error` uses for the log line above.
+            let kind = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else {
+                "other"
+            };
+            if let Ok(mut m) = state.upstream_transport_errors.lock() {
+                *m.entry(kind).or_insert(0) += 1;
+            }
+            // Transport-level send failure (ETIMEDOUT/reset/closed/DNS). Mark it
+            // `transient`; rotation policy is round-gated and owned by the retry
+            // loop (it knows `retry_round`), so `push_skip` stays false here —
+            // round 0 retries the SAME affinity/cache-warm endpoint after a
+            // backoff rather than rotating to a cold-cache endpoint on every blip.
             return ForwardOutcome::Retry {
                 saw_529: false,
                 push_skip: false,
+                transient: true,
             };
         }
     };
@@ -4410,18 +4560,22 @@ async fn proxy_handler(
     }
 
     let n = state.endpoints.len();
+    let mut last_saw_529 = false;
+    let mut last_saw_transient = false;
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
-            let delay = RETRY_529_BASE_DELAY * 2u32.pow(retry_round - 1);
+            let delay = round_backoff_delay(retry_round, last_saw_529);
             warn!(
                 retry_round = retry_round,
                 delay_ms = delay.as_millis() as u64,
-                "529 backoff: retrying all endpoints"
+                saw_529 = last_saw_529,
+                "backoff: retrying all endpoints after transient/overload round"
             );
             tokio::time::sleep(delay).await;
         }
         let mut skip: Vec<EndpointIdx> = Vec::new();
         let mut saw_529 = false;
+        let mut saw_transient = false;
         for _attempt in 0..n {
             // Pick the next endpoint and dispatch by protocol:
             // `forward_anthropic` (Anthropic) or `try_fallback_upstream`
@@ -4473,39 +4627,35 @@ async fn proxy_handler(
                             }
                         }
                     }
-                    None => {
-                        warn!("all endpoints exhausted");
-                        return (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "all upstream endpoints exhausted",
-                        )
-                            .into_response();
-                    }
+                    // Candidates exhausted mid-round (all skipped / hard-limited /
+                    // model-filtered). Break to the round-end logic rather than
+                    // returning here, so a transient-only round still reaches the
+                    // transient-aware exhaustion status instead of short-circuiting
+                    // to a premature 429.
+                    None => break,
                 };
 
-            match outcome {
-                ForwardOutcome::Done(resp) => return resp,
-                ForwardOutcome::Retry {
-                    saw_529: this_529,
-                    push_skip,
-                } => {
-                    if this_529 {
-                        saw_529 = true;
-                    }
-                    if push_skip {
-                        skip.push(picked_idx);
-                    }
-                    continue;
-                }
+            match apply_round_outcome(
+                retry_round,
+                outcome,
+                picked_idx,
+                &mut skip,
+                &mut saw_529,
+                &mut saw_transient,
+            ) {
+                RetryStep::Return(resp) => return resp,
+                RetryStep::NextAttempt => continue,
+                RetryStep::EndRound => break,
             }
         }
-        // If no 529s in this round, don't retry (e.g. all were 429s or errors)
-        if !saw_529 {
+        last_saw_529 = saw_529;
+        last_saw_transient = saw_transient;
+        if !round_should_continue(retry_round, saw_529, saw_transient) {
             break;
         }
     }
 
-    (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
+    exhaustion_response(last_saw_transient, last_saw_529)
 }
 
 // ── Fallback upstream handler ────────────────────────────────────────
@@ -6264,6 +6414,28 @@ async fn metrics_handler(
         dropped as f64,
     );
 
+    // Upstream transport send-failures by kind (timeout/connect/other) — a flaky
+    // egress shows here before it cascades into client-visible errors.
+    prom_header(
+        &mut buf,
+        "anthropic_upstream_transport_errors_total",
+        "counter",
+        "Upstream transport send-failures by kind",
+    );
+    let transport_errors: Vec<(&'static str, u64)> = state
+        .upstream_transport_errors
+        .lock()
+        .map(|m| m.iter().map(|(k, v)| (*k, *v)).collect())
+        .unwrap_or_default();
+    for (kind, n) in transport_errors {
+        prom_counter(
+            &mut buf,
+            "anthropic_upstream_transport_errors_total",
+            &[("kind", kind)],
+            n,
+        );
+    }
+
     (
         StatusCode::OK,
         [(
@@ -7451,11 +7623,28 @@ async fn forward_openai_compat_anthropic(
         Ok(r) => r,
         Err(e) => {
             error!(account = endpoint_name, detail = %describe_reqwest_error(&e), "upstream request failed: {e}");
-            // Preserve original behavior: transport errors retry without
-            // adding the endpoint to the skip list.
+            // Surface the failure on the dashboard by kind before it becomes a
+            // client error. `is_timeout`/`is_connect` are the same classifiers
+            // `describe_reqwest_error` uses for the log line above.
+            let kind = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else {
+                "other"
+            };
+            if let Ok(mut m) = state.upstream_transport_errors.lock() {
+                *m.entry(kind).or_insert(0) += 1;
+            }
+            // Transport-level send failure (ETIMEDOUT/reset/closed/DNS). Mark it
+            // `transient`; rotation policy is round-gated and owned by the retry
+            // loop (it knows `retry_round`), so `push_skip` stays false here —
+            // round 0 retries the SAME affinity/cache-warm endpoint after a
+            // backoff rather than rotating to a cold-cache endpoint on every blip.
             return ForwardOutcome::Retry {
                 saw_529: false,
                 push_skip: false,
+                transient: true,
             };
         }
     };
@@ -7896,18 +8085,22 @@ async fn openai_chat_handler(
     inject_oauth_system_prompt(&mut oauth_anthropic_body);
 
     let n = state.endpoints.len();
+    let mut last_saw_529 = false;
+    let mut last_saw_transient = false;
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
-            let delay = RETRY_529_BASE_DELAY * 2u32.pow(retry_round - 1);
+            let delay = round_backoff_delay(retry_round, last_saw_529);
             warn!(
                 retry_round = retry_round,
                 delay_ms = delay.as_millis() as u64,
-                "529 backoff: retrying all endpoints"
+                saw_529 = last_saw_529,
+                "backoff: retrying all endpoints after transient/overload round"
             );
             tokio::time::sleep(delay).await;
         }
         let mut skip: Vec<EndpointIdx> = Vec::new();
         let mut saw_529 = false;
+        let mut saw_transient = false;
         for _attempt in 0..n {
             // Pick the next endpoint and dispatch by protocol: Anthropic
             // endpoints resolve to a `(ForwardOutcome, EndpointIdx)` pair;
@@ -7962,38 +8155,35 @@ async fn openai_chat_handler(
                             }
                         }
                     }
-                    None => {
-                        warn!("all endpoints exhausted");
-                        return (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "all upstream endpoints exhausted",
-                        )
-                            .into_response();
-                    }
+                    // Candidates exhausted mid-round (all skipped / hard-limited /
+                    // model-filtered). Break to the round-end logic rather than
+                    // returning here, so a transient-only round still reaches the
+                    // transient-aware exhaustion status instead of short-circuiting
+                    // to a premature 429.
+                    None => break,
                 };
 
-            match outcome {
-                ForwardOutcome::Done(resp) => return resp,
-                ForwardOutcome::Retry {
-                    saw_529: this_529,
-                    push_skip,
-                } => {
-                    if this_529 {
-                        saw_529 = true;
-                    }
-                    if push_skip {
-                        skip.push(picked_idx);
-                    }
-                    continue;
-                }
+            match apply_round_outcome(
+                retry_round,
+                outcome,
+                picked_idx,
+                &mut skip,
+                &mut saw_529,
+                &mut saw_transient,
+            ) {
+                RetryStep::Return(resp) => return resp,
+                RetryStep::NextAttempt => continue,
+                RetryStep::EndRound => break,
             }
         }
-        if !saw_529 {
+        last_saw_529 = saw_529;
+        last_saw_transient = saw_transient;
+        if !round_should_continue(retry_round, saw_529, saw_transient) {
             break;
         }
     }
 
-    (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
+    exhaustion_response(last_saw_transient, last_saw_529)
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -8323,7 +8513,10 @@ async fn main() {
         client: Client::builder()
             .timeout(Duration::from_secs(900))
             .read_timeout(Duration::from_secs(180))
-            .connect_timeout(Duration::from_secs(10))
+            // 4s (was 10): a blackholed connect fails fast so the transient
+            // backoff-retry recovers in seconds. pool_idle_timeout stays 300s —
+            // it keeps conns warm across Claude Code think-pauses (see above).
+            .connect_timeout(Duration::from_secs(4))
             .tcp_keepalive(Duration::from_secs(30))
             .http2_keep_alive_interval(Duration::from_secs(20))
             .http2_keep_alive_timeout(Duration::from_secs(10))
@@ -8363,6 +8556,7 @@ async fn main() {
         },
         probe_interval_secs: config.probe_interval_secs.unwrap_or(300),
         overage_penalty: config.overage_penalty.unwrap_or(10),
+        upstream_transport_errors: Mutex::new(HashMap::new()),
     });
 
     if state.auto_cache {
@@ -8869,6 +9063,7 @@ token = "sk-ant-test"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         })
     }
 
@@ -8978,6 +9173,7 @@ token = "sk-ant-test"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         (build_router(state.clone()), state)
@@ -9070,6 +9266,7 @@ token = "sk-ant-test"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         assert!(state.is_ip_allowed(&"10.0.0.1".parse().unwrap()));
         assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
@@ -10714,6 +10911,7 @@ token = "sk-ant-test"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let app = build_router(state);
@@ -11933,6 +12131,7 @@ token = "sk-ant-test"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let app = Router::new()
@@ -11947,6 +12146,196 @@ token = "sk-ant-test"
 
     fn test_app(upstream_url: &str, proxy_key: Option<String>) -> (Router, Arc<AppState>) {
         test_app_with_strategy(upstream_url, proxy_key, RoutingStrategy::default())
+    }
+
+    /// Raw-TCP upstream that RSTs its FIRST connection (→ a reqwest transport
+    /// error, i.e. a `transient` `ForwardOutcome`) then serves a valid Anthropic
+    /// 200 on every later connection. Returns `(base_url, per_connection_hits)`.
+    /// Used to simulate a sub-second egress blip that recovers.
+    async fn spawn_blip_upstream() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                if h.fetch_add(1, Ordering::SeqCst) == 0 {
+                    drop(s); // first connection: reset before responding → transport error
+                    continue;
+                }
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await; // drain the request before responding
+                let body = br#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"model":"test","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(body).await;
+                let _ = s.flush().await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    // ── Task 2: round-gated transient backoff-retry ─────────────────────
+
+    /// A transient blip that recovers must surface as 200, not a 429-exhausted.
+    /// Today (529-only backoff) the single round breaks straight to 429.
+    #[tokio::test]
+    async fn proxy_rides_out_transient_upstream_blip() {
+        let (url, _hits) = spawn_blip_upstream().await;
+        let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)]);
+        let addr = serve(build_router(state)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "a transient blip that recovers must surface as 200, not 429-exhausted"
+        );
+    }
+
+    /// Option B: round 0 must RE-TRY the affinity/cache-warm endpoint in place,
+    /// NOT rotate to a cold endpoint. Two distinct upstreams both blip-then-200;
+    /// whichever affinity picks serves after the backoff, and the OTHER endpoint
+    /// must stay at ZERO hits. A flat `push_skip:true` would rotate on round 0,
+    /// hitting both. (Mutation-test: delete the `retry_round==0` guard → fails.)
+    #[tokio::test]
+    async fn transient_blip_retries_warm_endpoint_not_rotates() {
+        use std::sync::atomic::Ordering;
+        let (url_a, a_hits) = spawn_blip_upstream().await;
+        let (url_b, b_hits) = spawn_blip_upstream().await;
+        let state = test_state_with(vec![
+            mk_endpoint_at("a", "sk-ant-api-aaa", &url_a),
+            mk_endpoint_at("b", "sk-ant-api-bbb", &url_b),
+        ]);
+        let addr = serve(build_router(state)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            // identity headers → deterministic (non-round-robin) affinity, so
+            // round 0 and round 1 pick the SAME endpoint.
+            .header("x-client-id", "sticky")
+            .header("x-session-id", "sticky")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let (a, b) = (a_hits.load(Ordering::SeqCst), b_hits.load(Ordering::SeqCst));
+        assert!(
+            a == 0 || b == 0,
+            "round-0 transient must NOT rotate to a cold endpoint (a_hits={a}, b_hits={b})"
+        );
+        assert!(
+            a >= 2 || b >= 2,
+            "the warm endpoint should be retried after the blip (a_hits={a}, b_hits={b})"
+        );
+    }
+
+    /// The openai_chat_handler retry loop must ride out a transient blip too —
+    /// proves it is wired to the same shared round-gated helper as proxy_handler.
+    #[tokio::test]
+    async fn openai_chat_rides_out_transient_upstream_blip() {
+        let (url, _hits) = spawn_blip_upstream().await;
+        let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)]);
+        let addr = serve(build_router(state)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "openai_chat_handler must also ride out a transient blip via the shared helper"
+        );
+    }
+
+    /// Raw-TCP upstream that RSTs EVERY connection — a genuinely-down egress.
+    async fn spawn_dead_upstream() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((s, _)) = listener.accept().await {
+                    drop(s); // reset before responding → transport error, every time
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    // ── Task 3: transient exhaustion returns a retryable 503 ────────────
+
+    /// When every endpoint transport-fails through all backoff rounds, the
+    /// client must get a retryable `503 + Retry-After`, not a `429` (which
+    /// reads as account rate-limiting). Task 2 still returned 429 here.
+    #[tokio::test]
+    async fn proxy_returns_503_when_upstream_unreachable_transiently() {
+        let url = spawn_dead_upstream().await;
+        let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)]);
+        let addr = serve(build_router(state)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "transient upstream exhaustion must be a retryable 503, not 429"
+        );
+        assert!(
+            resp.headers().get("retry-after").is_some(),
+            "503 exhaustion should carry Retry-After so the client times its backoff"
+        );
+    }
+
+    // ── Task 5: transport-error metric ─────────────────────────────────
+
+    /// After a transport failure, `/metrics` must expose a by-kind transport
+    /// error counter so a flaky egress shows on the dashboard before it becomes
+    /// client errors. The `{kind=...}` data line only renders once a transport
+    /// error has been recorded — so this proves the increment, not just a header.
+    #[tokio::test]
+    async fn metrics_expose_transport_error_counter() {
+        let url = spawn_dead_upstream().await;
+        let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)]);
+        let addr = serve(build_router(state)).await;
+        let c = reqwest::Client::new();
+        let _ = c
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await;
+        let m = c
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            m.contains("anthropic_upstream_transport_errors_total{kind="),
+            "by-kind transport-error counter must appear after a transport failure:\n{m}"
+        );
     }
 
     #[tokio::test]
@@ -12650,6 +13039,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Try many affinity keys — all should route to healthy (idx 0)
@@ -12792,6 +13182,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Within budget
@@ -13299,6 +13690,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         {
             let mut info = state.endpoints[0].rate_info.write().await;
@@ -13369,6 +13761,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         {
             let mut info = state.endpoints[0].rate_info.write().await;
@@ -14131,6 +14524,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Header overrides IP mapping (supports multiple clients per IP)
@@ -14198,6 +14592,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -15043,6 +15438,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.60, 0.50, now + 10000, now + 100000).await;
@@ -15091,6 +15487,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
@@ -15140,6 +15537,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
         set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -15191,6 +15589,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
         // Operator bypasses everything
@@ -15239,6 +15638,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // Request for "claude-opus" — no account serves it → should pass
         assert!(
@@ -15289,6 +15689,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // Don't set any utilization — accounts remain "unknown" (0.5)
         // With limit=0.30, unknown 0.5 would appear "above limit" without fail-open
@@ -15343,6 +15744,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // Two known accounts above limit, one unknown (no data set)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -15417,6 +15819,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
         assert!(state.is_emergency_brake_active().await);
@@ -15493,6 +15896,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.85, 0.70, now + 10000, now + 100000).await;
         assert!(
@@ -15584,6 +15988,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // No rate data set — account returns (0.5, "unknown")
         // 0.5 >= 0.4 threshold → all_above is true
@@ -15635,6 +16040,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.60, 0.55, now + 10000, now + 100000).await;
         // Account 1: no data → (0.5, "unknown"), 0.5 >= 0.4 → all_above stays true
@@ -15733,6 +16139,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // "-" is not the operator
         assert!(!state.is_operator("-"));
@@ -15809,6 +16216,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // Operator always gets "healthy" regardless of utilization
         assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
@@ -15852,6 +16260,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // gastown has limit 0.85, 80% of that = 0.68
         // At 0.60, below 0.68 → no upgrade → "healthy"
@@ -16071,6 +16480,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // Set utilization above client's limit (0.80 > 0.50)
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
@@ -16132,6 +16542,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // Set utilization below client's limit (0.50 < 0.90)
         set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
@@ -16190,6 +16601,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // All accounts above emergency threshold. 5h=0.96 > emergency threshold (0.88).
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -16256,6 +16668,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         // All accounts above emergency threshold — 5h only (avoid claim penalty on 7d)
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
@@ -16319,6 +16732,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
 
@@ -16377,6 +16791,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
 
@@ -16486,6 +16901,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
@@ -16557,6 +16973,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let status = compute_pressure_status(0.99, "operator-id", &state);
@@ -16608,6 +17025,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
@@ -17333,6 +17751,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         assert!(state.is_operator("special-operator"));
@@ -17379,6 +17798,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
         assert!(state.is_operator("ray"));
         assert!(state.is_operator("openclaw"));
@@ -17457,6 +17877,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Budget check uses local path when redis is None
@@ -17598,6 +18019,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Recording 0 tokens should be a no-op
@@ -17966,6 +18388,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Set up some state to persist
@@ -18051,6 +18474,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Load state
@@ -18194,6 +18618,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Pre-populate with yesterday's usage (high usage that would exceed budget)
@@ -18248,6 +18673,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Pre-populate with yesterday's exhausted budget
@@ -18709,6 +19135,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Seed two operator clients and one regular client with token usage
@@ -18956,6 +19383,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let app = build_router(state);
@@ -20040,6 +20468,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let app = build_router(state);
@@ -20179,6 +20608,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         let app = Router::new()
@@ -20487,6 +20917,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         // Hard-limit the only account
@@ -20581,6 +21012,7 @@ listen = "127.0.0.1:8082"
             instance_id: 0,
             probe_interval_secs: 300,
             overage_penalty: 10,
+            upstream_transport_errors: Mutex::new(HashMap::new()),
         });
 
         {
