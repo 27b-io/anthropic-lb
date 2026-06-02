@@ -292,6 +292,14 @@ impl Ewma {
 /// Half-life = tau * ln(2): TAU_5M → ~3.5min half-life, TAU_1H → ~42min, TAU_6H → ~4.2hr.
 const TAU_5M: f64 = 300.0;
 const TAU_1H: f64 = 3600.0;
+
+/// Upper bound on distinct clients tracked in the per-client metric maps
+/// (`client_usage`, `client_request_rates`). These are keyed by the
+/// user-controlled `x-client-id` header with no eviction, so an unbounded set of
+/// distinct values would grow them without limit (a memory-DoS vector). Real
+/// deployments have a handful of clients, far below this; the cap only bounds
+/// unknown/abusive header values — existing clients keep updating past it.
+const MAX_TRACKED_CLIENTS: usize = 10_000;
 const TAU_6H: f64 = 21600.0;
 
 /// Per-account burn rate tracker: requests per minute at three time scales.
@@ -3237,11 +3245,15 @@ impl AppState {
                 + usage.cache_creation_input_tokens
                 + usage.cache_read_input_tokens;
             if let Ok(mut map) = self.client_usage.lock() {
-                let entry = map.entry(client_id.to_owned()).or_insert([0; 4]);
-                entry[0] += usage.input_tokens;
-                entry[1] += usage.output_tokens;
-                entry[2] += usage.cache_creation_input_tokens;
-                entry[3] += usage.cache_read_input_tokens;
+                // Bound new-key growth (user-controlled x-client-id); already-tracked
+                // clients keep accumulating past the cap.
+                if map.len() < MAX_TRACKED_CLIENTS || map.contains_key(client_id) {
+                    let entry = map.entry(client_id.to_owned()).or_insert([0; 4]);
+                    entry[0] += usage.input_tokens;
+                    entry[1] += usage.output_tokens;
+                    entry[2] += usage.cache_creation_input_tokens;
+                    entry[3] += usage.cache_read_input_tokens;
+                }
             }
             // Budget accounting
             self.record_budget_usage(client_id, total).await;
@@ -3255,11 +3267,15 @@ impl AppState {
             br.update(now);
         }
         if let Ok(mut rates) = self.client_request_rates.lock() {
-            let entry = rates
-                .entry(client_id.to_owned())
-                .or_insert_with(|| (0, Ewma::new(TAU_1H)));
-            entry.0 += 1;
-            entry.1.update(now);
+            // Bound new-key growth (client_id is the user-controlled x-client-id
+            // header); already-tracked clients keep updating past the cap.
+            if rates.len() < MAX_TRACKED_CLIENTS || rates.contains_key(client_id) {
+                let entry = rates
+                    .entry(client_id.to_owned())
+                    .or_insert_with(|| (0, Ewma::new(TAU_1H)));
+                entry.0 += 1;
+                entry.1.update(now);
+            }
         }
     }
 
@@ -12488,6 +12504,46 @@ data: {\"type\":\"message_stop\"}\n\n";
         // But no client entry for anonymous
         let map = state.client_usage.lock().unwrap();
         assert!(!map.contains_key("-"));
+    }
+
+    // ── Memory hardening: per-client maps must be bounded ──────────
+    // These maps are keyed by the user-controlled x-client-id header with no
+    // eviction; an unbounded set of distinct values would grow them without
+    // limit (a memory-DoS vector — anthropic-lb#73 audit). Bound new-key inserts.
+
+    #[tokio::test]
+    async fn client_request_rates_is_bounded() {
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+        let br = std::sync::Mutex::new(BurnRate::new());
+        for i in 0..10_050 {
+            state.update_burn_rate(&br, &format!("c{i}"));
+        }
+        let n = state.client_request_rates.lock().unwrap().len();
+        assert!(
+            n <= 10_000,
+            "client_request_rates must be bounded against unbounded x-client-id values, got {n}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_usage_is_bounded() {
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+        let usage = TokenUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        for i in 0..10_050 {
+            state
+                .record_usage(&state.endpoints[0], &format!("c{i}"), &usage)
+                .await;
+        }
+        let n = state.client_usage.lock().unwrap().len();
+        assert!(
+            n <= 10_000,
+            "client_usage must be bounded against unbounded x-client-id values, got {n}"
+        );
     }
 
     // ── Unit: model-based routing ──────────────────────────────────
