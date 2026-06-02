@@ -81,6 +81,11 @@ struct Config {
     /// serving via Anthropic overage (paid extra usage). Keeps free subscription
     /// capacity preferred over paid overage. Default: 10.
     overage_penalty: Option<u32>,
+    /// Aggregate in-flight request-body memory budget, in MiB. New requests are
+    /// load-shed with `503 + Retry-After` once the sum of in-flight request
+    /// bodies would exceed this, bounding peak memory under bursts of concurrent
+    /// large requests. Default: 128. Set to 0 to disable (unbounded — old behavior).
+    max_inflight_body_mb: Option<u64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -526,6 +531,70 @@ struct AppState {
     /// (`anthropic_upstream_transport_errors_total`) before it becomes client
     /// errors. Process-scoped; not persisted or Redis-synced.
     upstream_transport_errors: Mutex<HashMap<&'static str, u64>>,
+    /// Current sum of reserved in-flight request-body bytes (admission control).
+    inflight_body_bytes: AtomicU64,
+    /// Ceiling for `inflight_body_bytes`; over it, requests are shed with 503.
+    /// 0 = disabled (unbounded).
+    max_inflight_body_bytes: u64,
+    /// Count of requests load-shed because admitting them would exceed
+    /// `max_inflight_body_bytes`. Exposed as `anthropic_body_shed_total`.
+    body_shed_total: AtomicU64,
+}
+
+/// RAII reservation against `AppState::inflight_body_bytes`. Holding it keeps the
+/// reserved bytes counted as in-flight; dropping it releases them. Held for the
+/// duration of a request handler so the budget reflects real resident body memory.
+struct BodyReservation {
+    state: Arc<AppState>,
+    bytes: u64,
+}
+
+impl Drop for BodyReservation {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.state
+                .inflight_body_bytes
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
+}
+
+impl AppState {
+    /// Try to reserve `bytes` of the in-flight request-body memory budget.
+    /// Returns a guard that releases the reservation on drop, or `None` if
+    /// admitting would push `inflight_body_bytes` over `max_inflight_body_bytes`
+    /// (the caller then load-sheds with `503 + Retry-After`). A budget of 0
+    /// disables the limit (always admits, no tracking). Lock-free CAS so the
+    /// hot path never blocks.
+    fn try_reserve_body(self: &Arc<Self>, bytes: u64) -> Option<BodyReservation> {
+        let max = self.max_inflight_body_bytes;
+        if max == 0 {
+            return Some(BodyReservation {
+                state: Arc::clone(self),
+                bytes: 0,
+            });
+        }
+        let mut cur = self.inflight_body_bytes.load(Ordering::Acquire);
+        loop {
+            if cur.saturating_add(bytes) > max {
+                return None;
+            }
+            match self.inflight_body_bytes.compare_exchange_weak(
+                cur,
+                cur + bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(BodyReservation {
+                        state: Arc::clone(self),
+                        bytes,
+                    })
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
 }
 
 /// Index into `AppState.endpoints` — the sole runtime endpoint pool.
@@ -1380,6 +1449,16 @@ const HARD_LIMIT_SENTINEL_TTL_SECS: u64 = 60;
 
 /// Maximum request body size (25 MB).
 const MAX_REQUEST_BODY_BYTES: usize = 25 * 1024 * 1024;
+
+/// Default aggregate in-flight request-body memory budget (bytes). Requests are
+/// admission-controlled against this ceiling: when the sum of in-flight request
+/// bodies would exceed it, new requests are load-shed with `503 + Retry-After`
+/// rather than buffered. Unbounded buffering OOM-kills the pod under a burst of
+/// concurrent large requests, and a dropped pod takes ALL its in-flight requests
+/// with it — far worse than shedding a few. Sized as a backstop for a ~512Mi pod
+/// with headroom for parse amplification + baseline RSS. Override with the
+/// `max_inflight_body_mb` config key; set it to 0 to disable the limit.
+const DEFAULT_MAX_INFLIGHT_BODY_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Required OAuth beta flags. Both needed: oauth-2025-04-20 for OAuth auth,
 /// claude-code-20250219 for Claude Code API access quota routing.
@@ -4702,6 +4781,38 @@ async fn proxy_handler(
         }
     }
 
+    // Admission control (P1-01): reserve the request-body memory budget BEFORE
+    // buffering. Bounds aggregate in-flight body bytes so a burst of concurrent
+    // large requests load-sheds (503) instead of OOM-killing the pod (which would
+    // drop ALL in-flight requests). Reserve from Content-Length when present,
+    // else conservatively the cap. Held until the handler returns, by which point
+    // the body has been forwarded upstream and freed.
+    let reserve_bytes = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(MAX_REQUEST_BODY_BYTES as u64)
+        .min(MAX_REQUEST_BODY_BYTES as u64);
+    let _body_reservation = match state.try_reserve_body(reserve_bytes) {
+        Some(g) => g,
+        None => {
+            warn!(
+                req_id,
+                client = %client_ip,
+                reserve = reserve_bytes,
+                "rejected: in-flight request-body memory budget exhausted (load-shedding)"
+            );
+            state.body_shed_total.fetch_add(1, Ordering::Relaxed);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("retry-after", "1")],
+                "overloaded: request-body memory budget exhausted",
+            )
+                .into_response();
+        }
+    };
+
     let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
@@ -6706,6 +6817,46 @@ async fn metrics_handler(
         );
     }
 
+    // In-flight request-body memory admission (P1-01): current reserved bytes,
+    // the configured ceiling, and the load-shed counter — together these let an
+    // operator size `max_inflight_body_mb` from observed peak rather than guess.
+    prom_header(
+        &mut buf,
+        "anthropic_inflight_body_bytes",
+        "gauge",
+        "Current sum of reserved in-flight request-body bytes",
+    );
+    prom_gauge(
+        &mut buf,
+        "anthropic_inflight_body_bytes",
+        &[],
+        state.inflight_body_bytes.load(Ordering::Relaxed) as f64,
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_inflight_body_limit_bytes",
+        "gauge",
+        "Configured in-flight request-body memory budget in bytes (0 = disabled)",
+    );
+    prom_gauge(
+        &mut buf,
+        "anthropic_inflight_body_limit_bytes",
+        &[],
+        state.max_inflight_body_bytes as f64,
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_body_shed_total",
+        "counter",
+        "Requests load-shed because the in-flight body-memory budget was exhausted",
+    );
+    prom_counter(
+        &mut buf,
+        "anthropic_body_shed_total",
+        &[],
+        state.body_shed_total.load(Ordering::Relaxed),
+    );
+
     (
         StatusCode::OK,
         [(
@@ -8301,6 +8452,35 @@ async fn openai_chat_handler(
         session_id,
     } = rctx;
 
+    // Admission control (P1-01): bound aggregate in-flight request-body memory so
+    // a burst of concurrent large requests load-sheds (503) instead of OOM-killing
+    // the pod. Mirrors proxy_handler; held until this handler returns.
+    let reserve_bytes = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(MAX_REQUEST_BODY_BYTES as u64)
+        .min(MAX_REQUEST_BODY_BYTES as u64);
+    let _body_reservation = match state.try_reserve_body(reserve_bytes) {
+        Some(g) => g,
+        None => {
+            warn!(
+                req_id,
+                client = %client_ip,
+                reserve = reserve_bytes,
+                "rejected: in-flight request-body memory budget exhausted (load-shedding)"
+            );
+            state.body_shed_total.fetch_add(1, Ordering::Relaxed);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("retry-after", "1")],
+                "overloaded: request-body memory budget exhausted",
+            )
+                .into_response();
+        }
+    };
+
     let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
@@ -8829,6 +9009,12 @@ async fn main() {
         probe_interval_secs: config.probe_interval_secs.unwrap_or(300),
         overage_penalty: config.overage_penalty.unwrap_or(10),
         upstream_transport_errors: Mutex::new(HashMap::new()),
+        inflight_body_bytes: AtomicU64::new(0),
+        max_inflight_body_bytes: config
+            .max_inflight_body_mb
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(DEFAULT_MAX_INFLIGHT_BODY_BYTES),
+        body_shed_total: AtomicU64::new(0),
     });
 
     if state.auto_cache {
@@ -9340,6 +9526,9 @@ token = "sk-ant-test"
             probe_interval_secs: 300,
             overage_penalty: 10,
             upstream_transport_errors: Mutex::new(HashMap::new()),
+            inflight_body_bytes: AtomicU64::new(0),
+            max_inflight_body_bytes: 0,
+            body_shed_total: AtomicU64::new(0),
         }
     }
 
@@ -12806,6 +12995,165 @@ token = "sk-ant-test"
         assert!(
             resp.headers().get("retry-after").is_some(),
             "503 exhaustion should carry Retry-After so the client times its backoff"
+        );
+    }
+
+    // ── P1-01: in-flight request-body memory admission ──────────────────
+
+    /// Reservation accounting: reserve adds, over-budget sheds (None), drop releases.
+    #[test]
+    fn body_reservation_accounts_and_releases() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let state = Arc::new(AppState {
+            max_inflight_body_bytes: 100,
+            ..test_state_base()
+        });
+        {
+            let r1 = state.try_reserve_body(60).expect("60 fits in budget 100");
+            assert_eq!(state.inflight_body_bytes.load(Relaxed), 60);
+            assert!(
+                state.try_reserve_body(60).is_none(),
+                "60+60 exceeds budget 100 → must be shed (None)"
+            );
+            let r2 = state
+                .try_reserve_body(40)
+                .expect("60+40 == 100 fits exactly");
+            assert_eq!(state.inflight_body_bytes.load(Relaxed), 100);
+            drop(r2);
+            assert_eq!(
+                state.inflight_body_bytes.load(Relaxed),
+                60,
+                "dropping a reservation releases its bytes"
+            );
+            let _ = &r1;
+        }
+        assert_eq!(
+            state.inflight_body_bytes.load(Relaxed),
+            0,
+            "all reservations released after scope"
+        );
+    }
+
+    /// A request whose body would exceed the in-flight memory budget is shed with
+    /// a retryable 503 + Retry-After, not buffered (the P1-01 OOM backstop).
+    #[tokio::test]
+    async fn body_memory_budget_sheds_oversized_with_503() {
+        let (url, _h) = spawn_mock_upstream().await;
+        let state = Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)],
+            max_inflight_body_bytes: 8, // any real request body exceeds 8 bytes
+            ..test_state_base()
+        });
+        let addr = serve(build_router(state)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "a body over the in-flight memory budget must be shed with 503, not buffered"
+        );
+        assert!(
+            resp.headers().get("retry-after").is_some(),
+            "memory-pressure 503 must carry Retry-After"
+        );
+    }
+
+    /// Control: with a generous budget the same request is served normally — the
+    /// limiter must not throttle traffic that fits (no false-positive shed).
+    #[tokio::test]
+    async fn body_memory_budget_admits_request_that_fits() {
+        let (url, _h) = spawn_mock_upstream().await;
+        let state = Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)],
+            max_inflight_body_bytes: 64 * 1024 * 1024,
+            ..test_state_base()
+        });
+        let addr = serve(build_router(state)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "a request within the budget must be served, not shed"
+        );
+    }
+
+    /// The OpenAI-compat handler shares the same body-memory admission backstop.
+    #[tokio::test]
+    async fn openai_handler_body_budget_sheds_with_503() {
+        let (url, _h) = spawn_mock_upstream().await;
+        let state = Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)],
+            max_inflight_body_bytes: 8,
+            ..test_state_base()
+        });
+        let addr = serve(build_router(state)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "openai-compat path must share the body-memory load-shed"
+        );
+        assert!(resp.headers().get("retry-after").is_some());
+    }
+
+    /// The body-memory backstop must be observable so the budget can be tuned
+    /// from measured peak rather than guessed: a gauge for current in-flight body
+    /// bytes, a gauge for the configured limit, and a counter that increments on
+    /// each load-shed.
+    #[tokio::test]
+    async fn metrics_expose_body_budget_and_shed_counter() {
+        let (url, _h) = spawn_mock_upstream().await;
+        let state = Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)],
+            max_inflight_body_bytes: 8, // force a shed
+            ..test_state_base()
+        });
+        let addr = serve(build_router(state)).await;
+        let c = reqwest::Client::new();
+        let shed = c
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(shed.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let m = c
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            m.contains("anthropic_inflight_body_bytes"),
+            "current in-flight body-bytes gauge must be exported:\n{m}"
+        );
+        assert!(
+            m.contains("anthropic_inflight_body_limit_bytes"),
+            "the configured budget must be exported as a gauge:\n{m}"
+        );
+        assert!(
+            m.contains("anthropic_body_shed_total 1"),
+            "shed counter must increment after a load-shed:\n{m}"
         );
     }
 

@@ -32,6 +32,13 @@ probe_interval_secs = 300
 # from the check so they cannot prevent the brake from firing. Default: 0.88.
 # emergency_threshold = 0.88
 
+# In-flight request-body memory budget (MiB). New requests are load-shed with
+# 503 + Retry-After once the sum of in-flight request bodies would exceed this —
+# an OOM backstop against bursts of concurrent large requests. Default: 128.
+# Set to 0 to disable (unbounded). Tune to your pod memory limit and measured
+# peak; the proxy buffers bodies uncompressed, so this is real resident bytes.
+# max_inflight_body_mb = 128
+
 # Redis/Valkey URL for distributed state (multi-replica coordination).
 # When set, budget enforcement and hard-limit propagation use Redis for cross-replica sync.
 # Omit for single-instance deployments (local-only state).
