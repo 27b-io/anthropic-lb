@@ -25,5 +25,12 @@ ipnet = "2.11.0"
 tokio-stream = "0.1"
 redis = { version = "1.0.3", features = ["tokio-comp", "connection-manager", "tls-rustls", "tokio-rustls-comp"] }
 
+# Heap-profiling allocator. jemalloc's prof support is compiled in but stays
+# INERT until enabled at runtime via MALLOC_CONF, so this is safe to ship. Capture:
+#   MALLOC_CONF=prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:30,prof_prefix:/data/jeprof
+# auto-dumps /data/jeprof.*.heap to the mounted volume; analyze with `jeprof`.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["profiling"] }
+
 [dev-dependencies]
 tempfile = "3.25.0"

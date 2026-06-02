@@ -1,3 +1,11 @@
+// Heap-profiling allocator (profiling/jemalloc-heap branch). jemalloc's prof is
+// inert until enabled via MALLOC_CONF at runtime (see Cargo.toml), so this is
+// safe to ship; it lets us capture an allocation profile to pinpoint the OOM
+// leak (issue #73) without a code-path bisect.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use axum::{
     body::Body,
     extract::State,
