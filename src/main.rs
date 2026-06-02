@@ -763,6 +763,16 @@ impl AppState {
     }
 
     async fn save_state(&self) {
+        // Serialize save executions (not just temp filenames): hold this lock
+        // across snapshot + write + rename so the last writer observes the
+        // freshest in-memory state and its rename lands last. Without it, two
+        // overlapping saves could let an older snapshot's rename finish last and
+        // roll back fresher persisted state (e.g. a hard-limit just recorded).
+        // Saves are infrequent (probe / hard-limit / recovery / shutdown), so
+        // contention is negligible.
+        static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _save_guard = SAVE_LOCK.lock().await;
+
         let mut endpoints = Vec::new();
         let now = Instant::now();
 
@@ -17842,6 +17852,41 @@ listen = "127.0.0.1:8082"
         assert_eq!(
             info.consecutive_burst_429s, 3,
             "burst-429 backoff stage must survive a restart (B3-07)"
+        );
+    }
+
+    /// Concurrent save_state calls must serialize cleanly: a valid, parseable
+    /// final file and no temp file left behind (no deadlock, no torn file). The
+    /// freshness-ordering guarantee itself is structural (the save lock); this
+    /// guards the concurrent path against corruption/deadlock.
+    #[tokio::test]
+    async fn concurrent_save_state_is_serialized_and_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let state = Arc::new(AppState {
+            endpoints: vec![mk_endpoint("primary", "sk-ant-api-aaa")],
+            state_path: state_path.clone(),
+            ..test_state_base()
+        });
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = state.clone();
+            handles.push(tokio::spawn(async move { s.save_state().await }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let data = tokio::fs::read_to_string(&state_path).await.unwrap();
+        serde_json::from_str::<PersistedState>(&data).expect("final state file must be valid JSON");
+        let leftover: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no temp files may remain after concurrent saves: {leftover:?}"
         );
     }
 
