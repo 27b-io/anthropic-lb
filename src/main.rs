@@ -597,6 +597,45 @@ impl AppState {
     }
 }
 
+/// Admission control (P1-01): reserve the request-body memory budget from the
+/// request's Content-Length before buffering. Returns the reservation guard to
+/// hold for the request, or a `503 + Retry-After` Response to return when the
+/// budget is exhausted (load-shedding). Shared by `proxy_handler` and
+/// `openai_chat_handler` so the two paths can't drift.
+fn reserve_request_body(
+    state: &Arc<AppState>,
+    parts: &axum::http::request::Parts,
+    req_id: &str,
+    client_ip: IpAddr,
+) -> Result<BodyReservation, Box<Response>> {
+    let reserve_bytes = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(MAX_REQUEST_BODY_BYTES as u64)
+        .min(MAX_REQUEST_BODY_BYTES as u64);
+    match state.try_reserve_body(reserve_bytes) {
+        Some(g) => Ok(g),
+        None => {
+            warn!(
+                req_id,
+                client = %client_ip,
+                reserve = reserve_bytes,
+                "rejected: in-flight request-body memory budget exhausted (load-shedding)"
+            );
+            state.body_shed_total.fetch_add(1, Ordering::Relaxed);
+            let resp = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("retry-after", "1")],
+                "overloaded: request-body memory budget exhausted",
+            )
+                .into_response();
+            Err(Box::new(resp))
+        }
+    }
+}
+
 /// Index into `AppState.endpoints` — the sole runtime endpoint pool.
 type EndpointIdx = usize;
 
@@ -4782,35 +4821,12 @@ async fn proxy_handler(
     }
 
     // Admission control (P1-01): reserve the request-body memory budget BEFORE
-    // buffering. Bounds aggregate in-flight body bytes so a burst of concurrent
-    // large requests load-sheds (503) instead of OOM-killing the pod (which would
-    // drop ALL in-flight requests). Reserve from Content-Length when present,
-    // else conservatively the cap. Held until the handler returns, by which point
-    // the body has been forwarded upstream and freed.
-    let reserve_bytes = parts
-        .headers
-        .get(axum::http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(MAX_REQUEST_BODY_BYTES as u64)
-        .min(MAX_REQUEST_BODY_BYTES as u64);
-    let _body_reservation = match state.try_reserve_body(reserve_bytes) {
-        Some(g) => g,
-        None => {
-            warn!(
-                req_id,
-                client = %client_ip,
-                reserve = reserve_bytes,
-                "rejected: in-flight request-body memory budget exhausted (load-shedding)"
-            );
-            state.body_shed_total.fetch_add(1, Ordering::Relaxed);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [("retry-after", "1")],
-                "overloaded: request-body memory budget exhausted",
-            )
-                .into_response();
-        }
+    // buffering, so a burst of concurrent large requests load-sheds (503) instead
+    // of OOM-killing the pod. Held until the handler returns, by which point the
+    // body has been forwarded upstream and freed.
+    let _body_reservation = match reserve_request_body(&state, &parts, &req_id, client_ip) {
+        Ok(g) => g,
+        Err(resp) => return *resp,
     };
 
     let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
@@ -8452,33 +8468,10 @@ async fn openai_chat_handler(
         session_id,
     } = rctx;
 
-    // Admission control (P1-01): bound aggregate in-flight request-body memory so
-    // a burst of concurrent large requests load-sheds (503) instead of OOM-killing
-    // the pod. Mirrors proxy_handler; held until this handler returns.
-    let reserve_bytes = parts
-        .headers
-        .get(axum::http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(MAX_REQUEST_BODY_BYTES as u64)
-        .min(MAX_REQUEST_BODY_BYTES as u64);
-    let _body_reservation = match state.try_reserve_body(reserve_bytes) {
-        Some(g) => g,
-        None => {
-            warn!(
-                req_id,
-                client = %client_ip,
-                reserve = reserve_bytes,
-                "rejected: in-flight request-body memory budget exhausted (load-shedding)"
-            );
-            state.body_shed_total.fetch_add(1, Ordering::Relaxed);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [("retry-after", "1")],
-                "overloaded: request-body memory budget exhausted",
-            )
-                .into_response();
-        }
+    // Admission control (P1-01): same body-memory backstop as proxy_handler.
+    let _body_reservation = match reserve_request_body(&state, &parts, &req_id, client_ip) {
+        Ok(g) => g,
+        Err(resp) => return *resp,
     };
 
     let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
