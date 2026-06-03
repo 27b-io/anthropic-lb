@@ -846,6 +846,10 @@ impl AppState {
                 let tmp_path = PathBuf::from(tmp_os);
                 if let Err(e) = tokio::fs::write(&tmp_path, &json).await {
                     error!(path = %tmp_path.display(), error = %e, "failed to write temp state");
+                    // A failed write may still have created a partial temp file
+                    // (open truncates before write_all). Best-effort cleanup, same
+                    // as the rename branch, so failed saves don't leak temp files.
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
                     return;
                 }
                 if let Err(e) = tokio::fs::rename(&tmp_path, &self.state_path).await {
