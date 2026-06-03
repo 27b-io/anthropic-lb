@@ -10340,6 +10340,45 @@ token = "sk-ant-test"
         );
     }
 
+    #[test]
+    fn content_fingerprint_handles_missing_and_empty_fields_without_panic() {
+        // This runs on every headerless request, parsing untrusted bodies — it
+        // must never panic and must stay deterministic on malformed input.
+        let empty = serde_json::json!({});
+        let (fp, fps) = content_fingerprints(&empty);
+        assert_eq!(fp.len(), 12, "fp must be a well-formed 12-hex digest");
+        assert_eq!(fps.len(), 12);
+        // Deterministic for identical (degenerate) input.
+        assert_eq!(content_fingerprints(&empty), (fp.clone(), fps.clone()));
+        // Missing "messages" and a system with no extractable text / wrong types.
+        let no_msgs = serde_json::json!({"system": []});
+        let weird = serde_json::json!({"system": 42, "messages": "not-an-array"});
+        let _ = content_fingerprints(&no_msgs);
+        let _ = content_fingerprints(&weird);
+        // No user message present -> first-user contributes empty, still stable.
+        let no_user =
+            serde_json::json!({"system":"S","messages":[{"role":"assistant","content":"hi"}]});
+        assert_eq!(
+            content_fingerprints(&no_user),
+            content_fingerprints(&no_user)
+        );
+    }
+
+    #[test]
+    fn content_fingerprint_handles_string_content_format() {
+        // Covers the string (non-array) branch for both system and content. The
+        // SDK fleet may send either form; both must yield a usable fingerprint
+        // that still separates different first tasks.
+        let a =
+            serde_json::json!({"system":"sys", "messages":[{"role":"user","content":"task A"}]});
+        let b =
+            serde_json::json!({"system":"sys", "messages":[{"role":"user","content":"task B"}]});
+        let (fp_a, fps_a) = content_fingerprints(&a);
+        let (fp_b, fps_b) = content_fingerprints(&b);
+        assert_ne!(fp_a, fp_b, "string-form first tasks must still separate");
+        assert_eq!(fps_a, fps_b, "string-form shared system must still collide");
+    }
+
     #[tokio::test]
     async fn dynamic_capacity_v1_ignores_replica_local_request_history() {
         let state = test_state_with_strategy(
