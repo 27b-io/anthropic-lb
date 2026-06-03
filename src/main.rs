@@ -557,25 +557,29 @@ fn stable_affinity_hash(key: &str) -> u64 {
 
 /// Measurement-only: walk the request in Anthropic cache-prefix order (tools →
 /// system → messages) and, at every `cache_control` breakpoint, snapshot
-/// `(prefix_char_len, prefix_digest)`. This exposes the *actual* cacheable-prefix
+/// `(prefix_byte_len, prefix_digest)`. This exposes the *actual* cacheable-prefix
 /// hierarchy (the first breakpoint is the stable system/tools prefix; later ones
 /// grow with the conversation), which a flat system+first-user fingerprint can't
 /// see. No body content is retained — only lengths and digests. Used to size the
 /// avoidable-cache_write prize before deciding on a routing key.
 fn prefix_breakpoint_hashes(body: &serde_json::Value) -> Vec<(usize, String)> {
+    // Accumulate a canonical, STRUCTURE-PRESERVING representation in Anthropic
+    // cache-prefix order. Each element is tagged with its section/role (unit
+    // separator) and serialized whole, so distinct payloads with the same raw
+    // text can't collide and overstate cache reuse. `pos` is the accumulated
+    // BYTE length (a valid char boundary — we only ever push whole strings).
     let mut acc = String::new();
     let mut positions: Vec<usize> = Vec::new();
-    let feed = |acc: &mut String, v: &serde_json::Value| {
-        if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
-            acc.push_str(t);
-        } else {
-            acc.push_str(&serde_json::to_string(v).unwrap_or_default());
-        }
+    let push = |acc: &mut String, tag: &str, v: &serde_json::Value| {
+        acc.push('\u{1f}');
+        acc.push_str(tag);
+        acc.push('\u{1f}');
+        acc.push_str(&serde_json::to_string(v).unwrap_or_default());
     };
-    // tools (each tool object; cache_control marks the end of the tools prefix)
+    // tools (cache_control marks the end of the tools prefix)
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         for t in tools {
-            acc.push_str(&serde_json::to_string(t).unwrap_or_default());
+            push(&mut acc, "tool", t);
             if t.get("cache_control").is_some() {
                 positions.push(acc.len());
             }
@@ -583,10 +587,13 @@ fn prefix_breakpoint_hashes(body: &serde_json::Value) -> Vec<(usize, String)> {
     }
     // system (string or array of blocks)
     match body.get("system") {
-        Some(serde_json::Value::String(s)) => acc.push_str(s),
+        Some(serde_json::Value::String(s)) => {
+            acc.push_str("\u{1f}sys\u{1f}");
+            acc.push_str(s);
+        }
         Some(serde_json::Value::Array(arr)) => {
             for b in arr {
-                feed(&mut acc, b);
+                push(&mut acc, "sys", b);
                 if b.get("cache_control").is_some() {
                     positions.push(acc.len());
                 }
@@ -594,11 +601,15 @@ fn prefix_breakpoint_hashes(body: &serde_json::Value) -> Vec<(usize, String)> {
         }
         _ => {}
     }
-    // messages (content string, or array of blocks; cache_control on a block)
+    // messages (role-tagged; content string, or array of blocks)
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
         for m in msgs {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
             match m.get("content") {
                 Some(serde_json::Value::String(s)) => {
+                    acc.push('\u{1f}');
+                    acc.push_str(role);
+                    acc.push('\u{1f}');
                     acc.push_str(s);
                     if m.get("cache_control").is_some() {
                         positions.push(acc.len());
@@ -606,7 +617,7 @@ fn prefix_breakpoint_hashes(body: &serde_json::Value) -> Vec<(usize, String)> {
                 }
                 Some(serde_json::Value::Array(blocks)) => {
                     for b in blocks {
-                        feed(&mut acc, b);
+                        push(&mut acc, role, b);
                         if b.get("cache_control").is_some() {
                             positions.push(acc.len());
                         }
@@ -4710,36 +4721,14 @@ async fn proxy_handler(
             let mut mutated = false;
 
             // Privacy-safe fingerprint instrumentation (digests only, no body
-            // content). Logged for EVERY request, tagged with session + agent, to
-            // answer two questions before wiring fp into routing:
-            //   (1) headerless: does fp separate the fleet? (distinct fp vs volume)
-            //   (2) sessioned:  is fp STABLE across a conversation's turns? — group
-            //       by session_id and expect ONE fp per session. The Messages API
-            //       is stateless (history is resent each turn) so messages[0] is
-            //       fixed; this verifies that holds for real bodies (catches any
-            //       volatile system-prompt content). Computed before auto-cache
-            //       injection so it reflects the client's original prefix.
+            // content), logged for EVERY request and joined to `usage`/`proxied`
+            // by req_id. fp/fps = the flat affinity discriminator; bps = the
+            // per-breakpoint cacheable-prefix hierarchy used to size the
+            // avoidable-cache_write prize. fp/fps hash text only
+            // (cache_control-invariant), so they are computed pre-injection and
+            // double as the affinity discriminator; bps is computed POST-injection
+            // (below) to reflect the breakpoints actually forwarded upstream.
             let (fp, fps) = content_fingerprints(&parsed);
-            // Cache-prefix breakpoints (pos:digest at each cache_control), in
-            // cache order, for the prize-sizing analysis. model is included
-            // because caches are per-model. Join to `usage` (cache_read/write)
-            // and `proxied` (account) by req_id offline.
-            let bps = prefix_breakpoint_hashes(&parsed)
-                .into_iter()
-                .map(|(pos, h)| format!("{pos}:{h}"))
-                .collect::<Vec<_>>()
-                .join("|");
-            info!(
-                req_id,
-                client_id = %client_id,
-                session = %session_id,
-                agent = %agent_id,
-                model = %model,
-                fp = %fp,
-                fps = %fps,
-                bps = %bps,
-                "fingerprint"
-            );
 
             // Debug: dump cache_control structures found in request body
             if tracing::enabled!(tracing::Level::DEBUG) {
@@ -4760,6 +4749,29 @@ async fn proxy_handler(
                     );
                 }
             }
+
+            // Cache-prefix breakpoints (pos:digest at each cache_control), in
+            // cache order, for prize-sizing. Computed AFTER auto-injection so it
+            // reflects the breakpoints actually forwarded upstream (covers the
+            // headerless fleet that relies on the proxy's injected breakpoints).
+            // model is included because caches are per-model. Join to `usage`
+            // (cache_read/write) and `proxied` (account) by req_id offline.
+            let bps = prefix_breakpoint_hashes(&parsed)
+                .into_iter()
+                .map(|(pos, h)| format!("{pos}:{h}"))
+                .collect::<Vec<_>>()
+                .join("|");
+            info!(
+                req_id,
+                client_id = %client_id,
+                session = %session_id,
+                agent = %agent_id,
+                model = %model,
+                fp = %fp,
+                fps = %fps,
+                bps = %bps,
+                "fingerprint"
+            );
 
             // Re-serialize. The `preserve_order` feature on serde_json is critical:
             // without it, serde uses BTreeMap which reorders JSON keys alphabetically,
@@ -10593,6 +10605,31 @@ token = "sk-ant-test"
         assert_ne!(
             b1[1].1, b3[1].1,
             "last breakpoint must change as the conversation grows"
+        );
+    }
+
+    #[test]
+    fn prefix_breakpoints_preserve_block_structure() {
+        // Same raw text, different block structure → MUST yield different digests,
+        // otherwise the offline analysis would overstate cache reuse. One block
+        // "AB" vs two blocks "A","B".
+        let cc = serde_json::json!({"type": "ephemeral"});
+        let one = serde_json::json!({
+            "messages": [{"role":"user","content":[{"type":"text","text":"AB","cache_control": cc}]}],
+        });
+        let two = serde_json::json!({
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"A"},
+                {"type":"text","text":"B","cache_control": cc},
+            ]}],
+        });
+        let a = prefix_breakpoint_hashes(&one);
+        let b = prefix_breakpoint_hashes(&two);
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_ne!(
+            a[0].1, b[0].1,
+            "different block structure with identical text must not collide"
         );
     }
 
