@@ -3119,6 +3119,31 @@ struct RequestContext {
     session_id: String,
 }
 
+/// Build the routing affinity key. `fp` is the content fingerprint
+/// (system+first-user digest); when present it is APPENDED as the finest
+/// discriminator so fan-out agents that share one coarse session-id (e.g. an
+/// 80-agent workflow all tagged with the parent session) get distinct keys and
+/// distribute, while a stable-prefix conversation keeps a stable fp and stays
+/// sticky. When `fp` is absent the key is byte-identical to the legacy
+/// header-only form (no mass rehash of existing traffic).
+fn affinity_routing_key(
+    client_ip: &IpAddr,
+    client_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    fp: Option<&str>,
+) -> Option<String> {
+    let has_identity = client_id != "-" || agent_id != "-" || session_id != "-" || fp.is_some();
+    if !has_identity {
+        return None;
+    }
+    let base = format!("{}:{}:{}:{}", client_ip, client_id, agent_id, session_id);
+    Some(match fp {
+        Some(f) => format!("{base}:{f}"),
+        None => base,
+    })
+}
+
 impl RequestContext {
     fn from_request(state: &AppState, client_ip: &IpAddr, headers: &axum::http::HeaderMap) -> Self {
         Self {
@@ -3153,25 +3178,33 @@ impl RequestContext {
         }
     }
 
-    fn affinity_key(&self, client_ip: &IpAddr) -> Option<String> {
-        let has_identity = self.client_id != "-" || self.agent_id != "-" || self.session_id != "-";
-        if has_identity {
-            Some(format!(
-                "{}:{}:{}:{}",
-                client_ip, self.client_id, self.agent_id, self.session_id
-            ))
-        } else {
-            None
-        }
+    /// Build the routing affinity key. `fp` is the content fingerprint
+    /// (system+first-user digest); when present it is APPENDED as the finest
+    /// discriminator so fan-out agents that share one coarse session-id (e.g. an
+    /// 80-agent workflow all tagged with the parent session) get distinct keys
+    /// and distribute, while a stable-prefix conversation keeps a stable fp and
+    /// stays sticky. When `fp` is absent the key is unchanged from header-only
+    /// behaviour (no mass rehash).
+    fn affinity_key(&self, client_ip: &IpAddr, fp: Option<&str>) -> Option<String> {
+        affinity_routing_key(
+            client_ip,
+            &self.client_id,
+            &self.agent_id,
+            &self.session_id,
+            fp,
+        )
     }
 }
 
 fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &TokenUsage) {
-    // DEBUG, not INFO: per-request usage is high-volume operator noise. Token
-    // accounting is preserved regardless of log level via the shadow-log JSONL
-    // audit trail and the Prometheus counters — this line is only the
-    // human-readable echo.
-    debug!(
+    // INFO (temporarily): surfaces per-request cache_read vs cache_write so we can
+    // join it to the `fingerprint` line by req_id and learn whether fan-out agents
+    // share a cacheable preamble (reads) or are independent (creates) — and whether
+    // a real multi-turn session keeps getting reads after fp-keying (the fp
+    // stability check). Revert to debug! once that question is answered. Token
+    // accounting is independent of log level (Prometheus counters + optional
+    // shadow-log); this line is only the human-readable echo.
+    info!(
         req_id,
         client_id,
         model,
@@ -4532,14 +4565,14 @@ async fn proxy_handler(
 
     // Extract client identification headers
     let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers);
-    let affinity_key = rctx.affinity_key(&client_ip);
-    let affinity = affinity_key.as_deref();
     let RequestContext {
         client_id,
         client_ver,
         agent_id,
         session_id,
     } = rctx;
+    // affinity_key is built AFTER the body is parsed, so the content fingerprint
+    // (fp) can be folded in as the finest routing discriminator.
 
     // Debug: dump all inbound request headers
     if tracing::enabled!(tracing::Level::DEBUG) {
@@ -4558,7 +4591,7 @@ async fn proxy_handler(
     };
 
     // Parse body once for model extraction and optional cache injection
-    let (body_bytes, oauth_body_bytes, model) =
+    let (body_bytes, oauth_body_bytes, model, fp) =
         if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             let model = parsed
                 .get("model")
@@ -4577,18 +4610,16 @@ async fn proxy_handler(
             //       fixed; this verifies that holds for real bodies (catches any
             //       volatile system-prompt content). Computed before auto-cache
             //       injection so it reflects the client's original prefix.
-            {
-                let (fp, fps) = content_fingerprints(&parsed);
-                info!(
-                    req_id,
-                    client_id = %client_id,
-                    session = %session_id,
-                    agent = %agent_id,
-                    fp = %fp,
-                    fps = %fps,
-                    "fingerprint"
-                );
-            }
+            let (fp, fps) = content_fingerprints(&parsed);
+            info!(
+                req_id,
+                client_id = %client_id,
+                session = %session_id,
+                agent = %agent_id,
+                fp = %fp,
+                fps = %fps,
+                "fingerprint"
+            );
 
             // Debug: dump cache_control structures found in request body
             if tracing::enabled!(tracing::Level::DEBUG) {
@@ -4638,11 +4669,25 @@ async fn proxy_handler(
                 bytes::Bytes::from(bytes),
                 bytes::Bytes::from(oauth_bytes),
                 model,
+                Some(fp),
             )
         } else {
             let clone = body_bytes.clone();
-            (body_bytes, clone, String::new())
+            (body_bytes, clone, String::new(), None)
         };
+
+    // Build the affinity key now that fp is known. fp is the finest routing
+    // discriminator: it splits fan-out agents that share one coarse session-id
+    // (an 80-agent workflow tagged with the parent session) so they distribute,
+    // while a stable-prefix conversation keeps a stable fp and stays sticky.
+    let affinity_key = affinity_routing_key(
+        &client_ip,
+        &client_id,
+        &agent_id,
+        &session_id,
+        fp.as_deref(),
+    );
+    let affinity = affinity_key.as_deref();
 
     // Pre-request gate: operator bypass, budget, utilization limit, emergency brake.
     // Note: budget + emergency don't need `model` and could run before body parsing,
@@ -8113,7 +8158,7 @@ async fn openai_chat_handler(
 
     // Extract client identification headers
     let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers);
-    let affinity_key = rctx.affinity_key(&client_ip);
+    let affinity_key = rctx.affinity_key(&client_ip, None);
     let affinity = affinity_key.as_deref();
     let RequestContext {
         client_id,
@@ -19968,7 +20013,73 @@ listen = "127.0.0.1:8082"
             rctx.session_id, "-",
             "whitespace-only session_id should be -"
         );
-        assert!(rctx.affinity_key(&ip).is_none(), "no meaningful identity");
+        assert!(
+            rctx.affinity_key(&ip, None).is_none(),
+            "no meaningful identity"
+        );
+    }
+
+    fn rctx_for(client_id: &str, agent: &str, session: &str) -> RequestContext {
+        RequestContext {
+            client_id: client_id.to_string(),
+            client_ver: "-".to_string(),
+            agent_id: agent.to_string(),
+            session_id: session.to_string(),
+        }
+    }
+
+    #[test]
+    fn affinity_key_fp_distinguishes_fanout_under_one_session() {
+        // The workflow case: many agents share ONE coarse session-id but have
+        // distinct content fingerprints. They MUST get distinct keys so they
+        // distribute instead of funneling onto one account.
+        let ip: IpAddr = "10.88.0.1".parse().unwrap();
+        let rctx = rctx_for("claude:first-steps", "-", "aaee4c00");
+        let a = rctx.affinity_key(&ip, Some("fp_agent_a")).unwrap();
+        let b = rctx.affinity_key(&ip, Some("fp_agent_b")).unwrap();
+        assert_ne!(
+            a, b,
+            "same session, different fp must yield different keys (distribute the fan-out)"
+        );
+    }
+
+    #[test]
+    fn affinity_key_fp_stable_sticks() {
+        // A stable-prefix conversation produces the same fp across turns → same
+        // key → stays sticky.
+        let ip: IpAddr = "10.88.0.1".parse().unwrap();
+        let rctx = rctx_for("claude:first-steps", "-", "aaee4c00");
+        let t1 = rctx.affinity_key(&ip, Some("stable_fp")).unwrap();
+        let t2 = rctx.affinity_key(&ip, Some("stable_fp")).unwrap();
+        assert_eq!(t1, t2, "same fp must yield the same key (sticky)");
+    }
+
+    #[test]
+    fn affinity_key_without_fp_is_unchanged() {
+        // When fp is absent the key must be byte-identical to the legacy
+        // header-only form — no mass rehash of existing header-identity traffic.
+        let ip: IpAddr = "10.88.0.1".parse().unwrap();
+        let rctx = rctx_for("claude:fish", "-", "5f4a96c6");
+        assert_eq!(
+            rctx.affinity_key(&ip, None).unwrap(),
+            "10.88.0.1:claude:fish:-:5f4a96c6"
+        );
+    }
+
+    #[test]
+    fn affinity_key_fp_alone_provides_identity() {
+        // Headerless one-shot (no client/agent/session) still gets a key from fp,
+        // so it distributes deterministically instead of falling to round-robin.
+        let ip: IpAddr = "10.88.0.1".parse().unwrap();
+        let rctx = rctx_for("-", "-", "-");
+        assert!(
+            rctx.affinity_key(&ip, None).is_none(),
+            "no identity and no fp → None"
+        );
+        assert!(
+            rctx.affinity_key(&ip, Some("fp_x")).is_some(),
+            "fp alone must provide an affinity key"
+        );
     }
 
     // ── Integration: fallback upstream ──────────────────────────────
