@@ -4567,15 +4567,27 @@ async fn proxy_handler(
                 .to_string();
             let mut mutated = false;
 
-            // Privacy-safe fingerprint instrumentation. For HEADERLESS traffic
-            // (no session/agent id — the sessionless SDK fleet we can't pin), log
-            // only the content-prefix digests so we can measure whether a content
-            // fingerprint would separate the fleet (distinct fp count vs request
-            // volume). No body content is logged — digests only. Computed before
-            // auto-cache injection so it reflects the client's original prefix.
-            if agent_id == "-" && session_id == "-" {
+            // Privacy-safe fingerprint instrumentation (digests only, no body
+            // content). Logged for EVERY request, tagged with session + agent, to
+            // answer two questions before wiring fp into routing:
+            //   (1) headerless: does fp separate the fleet? (distinct fp vs volume)
+            //   (2) sessioned:  is fp STABLE across a conversation's turns? — group
+            //       by session_id and expect ONE fp per session. The Messages API
+            //       is stateless (history is resent each turn) so messages[0] is
+            //       fixed; this verifies that holds for real bodies (catches any
+            //       volatile system-prompt content). Computed before auto-cache
+            //       injection so it reflects the client's original prefix.
+            {
                 let (fp, fps) = content_fingerprints(&parsed);
-                info!(req_id, client_id = %client_id, fp = %fp, fps = %fps, "fingerprint");
+                info!(
+                    req_id,
+                    client_id = %client_id,
+                    session = %session_id,
+                    agent = %agent_id,
+                    fp = %fp,
+                    fps = %fps,
+                    "fingerprint"
+                );
             }
 
             // Debug: dump cache_control structures found in request body
