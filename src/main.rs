@@ -555,6 +555,76 @@ fn stable_affinity_hash(key: &str) -> u64 {
     hasher.finish()
 }
 
+/// Measurement-only: walk the request in Anthropic cache-prefix order (tools →
+/// system → messages) and, at every `cache_control` breakpoint, snapshot
+/// `(prefix_char_len, prefix_digest)`. This exposes the *actual* cacheable-prefix
+/// hierarchy (the first breakpoint is the stable system/tools prefix; later ones
+/// grow with the conversation), which a flat system+first-user fingerprint can't
+/// see. No body content is retained — only lengths and digests. Used to size the
+/// avoidable-cache_write prize before deciding on a routing key.
+fn prefix_breakpoint_hashes(body: &serde_json::Value) -> Vec<(usize, String)> {
+    let mut acc = String::new();
+    let mut positions: Vec<usize> = Vec::new();
+    let feed = |acc: &mut String, v: &serde_json::Value| {
+        if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
+            acc.push_str(t);
+        } else {
+            acc.push_str(&serde_json::to_string(v).unwrap_or_default());
+        }
+    };
+    // tools (each tool object; cache_control marks the end of the tools prefix)
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        for t in tools {
+            acc.push_str(&serde_json::to_string(t).unwrap_or_default());
+            if t.get("cache_control").is_some() {
+                positions.push(acc.len());
+            }
+        }
+    }
+    // system (string or array of blocks)
+    match body.get("system") {
+        Some(serde_json::Value::String(s)) => acc.push_str(s),
+        Some(serde_json::Value::Array(arr)) => {
+            for b in arr {
+                feed(&mut acc, b);
+                if b.get("cache_control").is_some() {
+                    positions.push(acc.len());
+                }
+            }
+        }
+        _ => {}
+    }
+    // messages (content string, or array of blocks; cache_control on a block)
+    if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+        for m in msgs {
+            match m.get("content") {
+                Some(serde_json::Value::String(s)) => {
+                    acc.push_str(s);
+                    if m.get("cache_control").is_some() {
+                        positions.push(acc.len());
+                    }
+                }
+                Some(serde_json::Value::Array(blocks)) => {
+                    for b in blocks {
+                        feed(&mut acc, b);
+                        if b.get("cache_control").is_some() {
+                            positions.push(acc.len());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    positions
+        .into_iter()
+        .map(|pos| {
+            let h = stable_affinity_hash(&acc[..pos]) & 0xFFFF_FFFF_FFFF;
+            (pos, format!("{h:012x}"))
+        })
+        .collect()
+}
+
 /// Privacy-safe session fingerprints for headerless traffic. Returns
 /// `(system+first-user, system-only)` as 12-hex-char digests of the pinned
 /// SipHash. Only the IMMUTABLE conversation prefix is hashed (system blocks +
@@ -4650,13 +4720,24 @@ async fn proxy_handler(
             //       volatile system-prompt content). Computed before auto-cache
             //       injection so it reflects the client's original prefix.
             let (fp, fps) = content_fingerprints(&parsed);
+            // Cache-prefix breakpoints (pos:digest at each cache_control), in
+            // cache order, for the prize-sizing analysis. model is included
+            // because caches are per-model. Join to `usage` (cache_read/write)
+            // and `proxied` (account) by req_id offline.
+            let bps = prefix_breakpoint_hashes(&parsed)
+                .into_iter()
+                .map(|(pos, h)| format!("{pos}:{h}"))
+                .collect::<Vec<_>>()
+                .join("|");
             info!(
                 req_id,
                 client_id = %client_id,
                 session = %session_id,
                 agent = %agent_id,
+                model = %model,
                 fp = %fp,
                 fps = %fps,
+                bps = %bps,
                 "fingerprint"
             );
 
@@ -10475,6 +10556,56 @@ token = "sk-ant-test"
         let (fp_b, fps_b) = content_fingerprints(&b);
         assert_ne!(fp_a, fp_b, "string-form first tasks must still separate");
         assert_eq!(fps_a, fps_b, "string-form shared system must still collide");
+    }
+
+    #[test]
+    fn prefix_breakpoints_capture_hierarchy_and_first_is_turn_stable() {
+        let cc = serde_json::json!({"type": "ephemeral"});
+        // Turn 1: system has a cache_control breakpoint; the (only) user turn has one.
+        let turn1 = serde_json::json!({
+            "system": [{"type":"text","text":"STABLE-SYSTEM","cache_control": cc}],
+            "messages": [{"role":"user","content":[{"type":"text","text":"U1","cache_control": cc}]}],
+        });
+        // A later turn: SAME system breakpoint, but the conversation grew and the
+        // cache_control moved to a new last user turn.
+        let turn3 = serde_json::json!({
+            "system": [{"type":"text","text":"STABLE-SYSTEM","cache_control": cc}],
+            "messages": [
+                {"role":"user","content":[{"type":"text","text":"U1"}]},
+                {"role":"assistant","content":[{"type":"text","text":"A1"}]},
+                {"role":"user","content":[{"type":"text","text":"U2-grown","cache_control": cc}]},
+            ],
+        });
+        let b1 = prefix_breakpoint_hashes(&turn1);
+        let b3 = prefix_breakpoint_hashes(&turn3);
+        assert_eq!(b1.len(), 2, "turn1 has 2 cache_control breakpoints");
+        assert_eq!(b3.len(), 2, "turn3 has 2 cache_control breakpoints");
+        // Positions are monotonically increasing (prefix grows).
+        assert!(b1[0].0 < b1[1].0, "breakpoint positions must increase");
+        // FIRST breakpoint (the stable system prefix) is identical across turns —
+        // this is the turn-stable level. The naive system+first-user hash can't
+        // isolate it.
+        assert_eq!(
+            b1[0].1, b3[0].1,
+            "first breakpoint (system) must be turn-stable across growing turns"
+        );
+        // LAST breakpoint differs (the conversation tail grew).
+        assert_ne!(
+            b1[1].1, b3[1].1,
+            "last breakpoint must change as the conversation grows"
+        );
+    }
+
+    #[test]
+    fn prefix_breakpoints_empty_when_no_cache_control() {
+        let body = serde_json::json!({
+            "system": "plain",
+            "messages": [{"role":"user","content":"hi"}],
+        });
+        assert!(
+            prefix_breakpoint_hashes(&body).is_empty(),
+            "no cache_control → no breakpoints"
+        );
     }
 
     #[tokio::test]
