@@ -2110,7 +2110,7 @@ impl AppState {
     ) -> &'a RoutingCandidate {
         let mut picked = self.pick_weighted_bucket(effective, total_weight, affinity_key);
 
-        if affinity_key.is_some() {
+        if let Some(key) = affinity_key {
             let best = effective
                 .iter()
                 .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap())
@@ -2119,24 +2119,46 @@ impl AppState {
             if best.endpoint != picked.endpoint
                 && picked.weight < best.weight * STICKY_WEIGHTED_OVERRIDE_RATIO
             {
-                // Loud on purpose: breaking stickiness is a cascade risk. When
-                // every account is near exhaustion a large session migrating to
-                // the "best" account can spike it past the next account, which
-                // then becomes "best" on the following request, sweeping the
-                // session across the whole pool and burning down accounts in
-                // sequence. If this fires repeatedly under load, the pool is the
+                // The sticky account is too loaded to keep this session. Do NOT
+                // migrate to `best` (the global argmax): that target rotates every
+                // request as utilizations drift, so a session chases it across the
+                // whole pool and pays a cold-cache `cache_creation` charge on every
+                // hop (measured in prod: a swept client ran a 1.18 create:read ratio
+                // vs ~0.05 for sticky clients — it created more cache than it ever
+                // read back). Instead re-pick over the healthy remainder using a
+                // SALTED hash of the same affinity key: deterministic per session
+                // (so the cache warms on the replacement and stays there) yet spread
+                // across sessions (distinct keys → distinct replacements), and
+                // independent of which account is momentarily `best`.
+                let remaining: Vec<&RoutingCandidate> = effective
+                    .iter()
+                    .copied()
+                    .filter(|c| c.endpoint != picked.endpoint)
+                    .collect();
+                let remaining_weight: f64 = remaining.iter().map(|c| c.weight).sum();
+                let replacement = if remaining_weight > 0.0 {
+                    // NUL separator can't appear in a header-derived affinity key
+                    // (ip:client:agent:session), so the salted key never collides
+                    // with a real one.
+                    let salted = format!("{key}\u{0}migrate");
+                    self.pick_weighted_bucket(&remaining, remaining_weight, Some(&salted))
+                } else {
+                    best
+                };
+                // Loud on purpose: sustained breaking means the pool is the
                 // bottleneck — add capacity, don't tune the ratio.
                 warn!(
                     strategy = RoutingStrategy::StickyWeightedV2.as_str(),
-                    affinity = affinity_key.unwrap_or("-"),
+                    affinity = key,
                     picked_account = self.endpoint_name(picked.endpoint),
                     picked_weight = format!("{:.3}", picked.weight),
+                    replacement_account = self.endpoint_name(replacement.endpoint),
+                    replacement_weight = format!("{:.3}", replacement.weight),
                     best_account = self.endpoint_name(best.endpoint),
-                    best_weight = format!("{:.3}", best.weight),
                     ratio = format!("{:.3}", picked.weight / best.weight),
-                    "affinity broken: sticky endpoint too loaded, migrating session (cascade risk)"
+                    "affinity broken: sticky endpoint too loaded, migrating session to stable replacement"
                 );
-                picked = best;
+                picked = replacement;
             }
         }
 
@@ -10042,11 +10064,172 @@ token = "sk-ant-test"
             .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
             .await
             .unwrap();
+        // New contract: the override migrates to a session-stable replacement
+        // re-picked from the healthy remainder (deterministic per session, NOT the
+        // global argmax). It must be one of the healthy accounts, never the loaded
+        // one — but which healthy account is the session's stable hash, not "best".
         assert_ne!(
             idx, 2,
             "insight (85% util) should be overridden despite affinity hash landing there"
         );
-        assert_eq!(idx, 0, "should override to primary (best headroom)");
+        assert!(
+            idx == 0 || idx == 1,
+            "override must land on a healthy account (primary or jeff), got {idx}"
+        );
+    }
+
+    /// Helper: under StickyWeightedV2, find affinity keys whose *sticky* bucket is
+    /// `target_idx` (i.e. the sessions that get overridden when that account is the
+    /// loaded one). Boundaries are static given fixed utilizations.
+    async fn keys_hashing_to(
+        state: &AppState,
+        target_idx: usize,
+        want: usize,
+        scan: usize,
+        prefix: &str,
+    ) -> Vec<String> {
+        let candidates = state.routing_candidates("claude-opus-4-6", &[]).await;
+        let total_weight: f64 = candidates.iter().map(|c| c.weight).sum();
+        let mut boundaries: Vec<(usize, f64)> = Vec::new();
+        let mut cumulative = 0.0;
+        for c in &candidates {
+            cumulative += c.weight;
+            boundaries.push((c.endpoint, cumulative));
+        }
+        let mut out = Vec::new();
+        for i in 0..scan {
+            let key = format!("{}-{}", prefix, i);
+            let target = (stable_affinity_hash(&key) as f64 / u64::MAX as f64) * total_weight;
+            for &(idx, boundary) in &boundaries {
+                if target < boundary {
+                    if idx == target_idx {
+                        out.push(key);
+                    }
+                    break;
+                }
+            }
+            if out.len() >= want {
+                break;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn affinity_override_spreads_across_pool_not_single_best() {
+        // Regression: when a session's sticky account is too loaded, the override
+        // must NOT funnel every such session onto the single global argmax (`best`).
+        // That target rotates as utilizations drift, sweeping sessions across the
+        // pool and paying a cold-cache `cache_creation` charge on every hop
+        // (measured: a swept client ran a 1.18 create:read ratio vs ~0.05 for sticky
+        // clients). Overridden sessions must spread across the healthy remainder.
+        let state = test_state_with_strategy(
+            vec![
+                mk_endpoint("loaded", "sk-ant-api-a"),
+                mk_endpoint("h1", "sk-ant-api-b"),
+                mk_endpoint("h2", "sk-ant-api-c"),
+                mk_endpoint("h3", "sk-ant-api-d"),
+            ],
+            RoutingStrategy::StickyWeightedV2,
+        );
+        let now = AppState::now_epoch();
+        // idx0 is loaded enough to trigger the override (weight << best * 0.25).
+        set_account_utilization(&state, 0, 0.80, 0.80, now + 10000, now + 300000).await;
+        // Three healthy accounts with a clear single best (h1): under the old
+        // `picked = best` code every overridden session would herd onto h1.
+        set_account_utilization(&state, 1, 0.08, 0.15, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 2, 0.15, 0.30, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 3, 0.22, 0.45, now + 10000, now + 300000).await;
+
+        let sessions = keys_hashing_to(&state, 0, 60, 30000, "spread-session").await;
+        assert!(
+            sessions.len() >= 30,
+            "need enough overridden sessions to judge spread, got {}",
+            sessions.len()
+        );
+
+        let mut destinations = std::collections::HashSet::new();
+        for s in &sessions {
+            let idx = state
+                .pick_endpoint(Some(s), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            assert_ne!(idx, 0, "overridden session must leave the loaded account");
+            destinations.insert(idx);
+        }
+        assert!(
+            destinations.len() >= 2,
+            "overridden sessions herded onto {} account(s) {:?}; expected spread across the healthy pool",
+            destinations.len(),
+            destinations,
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_override_destination_independent_of_argmax() {
+        // Regression for the cascade: the override must not chase the global argmax.
+        // When the healthy argmax flips (utilizations drift), a session that was
+        // already overridden must NOT migrate with it. The old behavior (picked =
+        // best) moved EVERY overridden session to whichever account was momentarily
+        // best, so a single argmax flip migrated ~100% of them — the cache-burning
+        // sweep. A session-stable replacement keeps migration low.
+        let state = test_state_with_strategy(
+            vec![
+                mk_endpoint("loaded", "sk-ant-api-a"),
+                mk_endpoint("h1", "sk-ant-api-b"),
+                mk_endpoint("h2", "sk-ant-api-c"),
+                mk_endpoint("h3", "sk-ant-api-d"),
+            ],
+            RoutingStrategy::StickyWeightedV2,
+        );
+        let now = AppState::now_epoch();
+        set_account_utilization(&state, 0, 0.80, 0.80, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 3, 0.15, 0.30, now + 10000, now + 300000).await;
+        // Config A: h1 is best.
+        set_account_utilization(&state, 1, 0.08, 0.18, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 2, 0.22, 0.42, now + 10000, now + 300000).await;
+
+        // The override set (sessions whose sticky bucket is the loaded account) is
+        // fixed by idx0's weight, which the later h1/h2 swap leaves untouched.
+        let sessions = keys_hashing_to(&state, 0, 60, 40000, "flip-session").await;
+        assert!(
+            sessions.len() >= 30,
+            "need override sessions, got {}",
+            sessions.len()
+        );
+        let mut dest_a = Vec::with_capacity(sessions.len());
+        for s in &sessions {
+            dest_a.push(
+                state
+                    .pick_endpoint(Some(s), "claude-opus-4-6", &[])
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // Config B: swap h1 and h2 utilizations so h2 becomes best. The healthy
+        // weight *set* is unchanged (symmetric swap) — only the argmax label moves.
+        set_account_utilization(&state, 1, 0.22, 0.42, now + 10000, now + 300000).await;
+        set_account_utilization(&state, 2, 0.08, 0.18, now + 10000, now + 300000).await;
+
+        let mut migrated = 0usize;
+        for (k, s) in sessions.iter().enumerate() {
+            let idx = state
+                .pick_endpoint(Some(s), "claude-opus-4-6", &[])
+                .await
+                .unwrap();
+            if idx != dest_a[k] {
+                migrated += 1;
+            }
+        }
+        let rate = migrated as f64 / sessions.len() as f64;
+        assert!(
+            rate < 0.40,
+            "argmax flip migrated {}/{} ({:.0}%) overridden sessions; destination must not chase the argmax",
+            migrated,
+            sessions.len(),
+            rate * 100.0,
+        );
     }
 
     #[tokio::test]
