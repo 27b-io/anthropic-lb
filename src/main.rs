@@ -555,6 +555,54 @@ fn stable_affinity_hash(key: &str) -> u64 {
     hasher.finish()
 }
 
+/// Privacy-safe session fingerprints for headerless traffic. Returns
+/// `(system+first-user, system-only)` as 12-hex-char digests of the pinned
+/// SipHash. Only the IMMUTABLE conversation prefix is hashed (system blocks +
+/// the first user message), so the value is stable across a conversation's
+/// growing turns. No content is retained or logged — only the digest. Used to
+/// measure whether a content fingerprint could separate the headerless fleet.
+fn content_fingerprints(body: &serde_json::Value) -> (String, String) {
+    // Extract text from an Anthropic `system`/`content` field, which may be a
+    // plain string or an array of `{type, text}` blocks.
+    fn block_text(v: &serde_json::Value) -> String {
+        if let Some(s) = v.as_str() {
+            return s.to_string();
+        }
+        let mut out = String::new();
+        if let Some(arr) = v.as_array() {
+            for b in arr {
+                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                    out.push_str(t);
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+
+    let system = body.get("system").map(block_text).unwrap_or_default();
+    let first_user = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        })
+        .and_then(|m| m.get("content"))
+        .map(block_text)
+        .unwrap_or_default();
+
+    let fps = stable_affinity_hash(&system);
+    let mut combined = system;
+    combined.push('\u{0}');
+    combined.push_str(&first_user);
+    let fp = stable_affinity_hash(&combined);
+    (
+        format!("{:012x}", fp & 0xFFFF_FFFF_FFFF),
+        format!("{:012x}", fps & 0xFFFF_FFFF_FFFF),
+    )
+}
+
 /// Parsed IP allow entry — either a single IP or a CIDR range.
 enum IpAllowEntry {
     Addr(IpAddr),
@@ -4518,6 +4566,17 @@ async fn proxy_handler(
                 .unwrap_or("")
                 .to_string();
             let mut mutated = false;
+
+            // Privacy-safe fingerprint instrumentation. For HEADERLESS traffic
+            // (no session/agent id — the sessionless SDK fleet we can't pin), log
+            // only the content-prefix digests so we can measure whether a content
+            // fingerprint would separate the fleet (distinct fp count vs request
+            // volume). No body content is logged — digests only. Computed before
+            // auto-cache injection so it reflects the client's original prefix.
+            if agent_id == "-" && session_id == "-" {
+                let (fp, fps) = content_fingerprints(&parsed);
+                info!(req_id, client_id = %client_id, fp = %fp, fps = %fps, "fingerprint");
+            }
 
             // Debug: dump cache_control structures found in request body
             if tracing::enabled!(tracing::Level::DEBUG) {
@@ -10229,6 +10288,55 @@ token = "sk-ant-test"
             migrated,
             sessions.len(),
             rate * 100.0,
+        );
+    }
+
+    #[test]
+    fn content_fingerprint_stable_across_growing_turns() {
+        // Same system + same first user, with later turns appended, must yield the
+        // SAME fingerprint. Hashing the growing body would change every turn —
+        // which is exactly the migration we must avoid for headerless sessions.
+        let system = serde_json::json!([{"type":"text","text":"You are Claude Code."}]);
+        let turn1 = serde_json::json!({
+            "system": system,
+            "messages": [{"role":"user","content":"implement feature X"}],
+        });
+        let turn3 = serde_json::json!({
+            "system": system,
+            "messages": [
+                {"role":"user","content":"implement feature X"},
+                {"role":"assistant","content":"ok, on it"},
+                {"role":"user","content":"now add tests (this grows the tail)"},
+            ],
+        });
+        let (fp1, _) = content_fingerprints(&turn1);
+        let (fp3, _) = content_fingerprints(&turn3);
+        assert_eq!(
+            fp1, fp3,
+            "fingerprint must be stable across a conversation's growing turns"
+        );
+    }
+
+    #[test]
+    fn content_fingerprint_separates_first_user_but_system_only_collides() {
+        // Two agents share a system prompt but seed different first tasks. The
+        // system+first-user fingerprint must DIFFER (so they route independently);
+        // the system-only fingerprint must COLLIDE — demonstrating why first-user
+        // must be included (system-only would herd the whole fleet onto one key).
+        let system = serde_json::json!([{"type":"text","text":"shared harness system prompt"}]);
+        let a =
+            serde_json::json!({"system": system, "messages":[{"role":"user","content":"task A"}]});
+        let b =
+            serde_json::json!({"system": system, "messages":[{"role":"user","content":"task B"}]});
+        let (fp_a, fps_a) = content_fingerprints(&a);
+        let (fp_b, fps_b) = content_fingerprints(&b);
+        assert_ne!(
+            fp_a, fp_b,
+            "different first tasks must produce different fingerprints"
+        );
+        assert_eq!(
+            fps_a, fps_b,
+            "system-only fingerprints must collide (why we include the first user turn)"
         );
     }
 
