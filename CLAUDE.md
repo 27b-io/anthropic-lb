@@ -108,14 +108,17 @@ When an endpoint serves via Anthropic **overage** (paid extra usage — `anthrop
 
 ### Fable-Aware Routing (LAB-387)
 
-Max plans include Fable only up to **50% of the weekly limit** (the "band"); past that, Fable bills as paid usage credits. Pro / standard Team plans include no Fable at all. The band surfaces as a `seven_day_fable` claim in the unified headers, but unlike other per-model claims it is a **carve-out within the shared weekly pool**, not an independent sub-budget — usable Fable headroom is `min(band remaining, weekly pool remaining)`.
+Max plans include Fable only up to **50% of the weekly limit** (the "band"); past that, Fable bills as paid usage credits. Pro / standard Team plans include no Fable at all. Unlike other per-model claims the band is a **carve-out within the shared weekly pool**, not an independent sub-budget — usable Fable headroom is `min(band remaining, weekly pool remaining)`.
+
+**Wire format (verified against a live `claude-fable-5` response, 2026-07-21):** the API does NOT emit a `seven_day_fable` representative claim. The band arrives as the `anthropic-ratelimit-unified-7d_oi-{utilization,reset,status}` triplet ("oi" = overage-included), present **only on Fable responses** — a sonnet response from the same account omits it. The parser normalises the triplet into an internal `seven_day_fable` claims_7d entry (`FABLE_BAND_CLAIM`) so the standard claims machinery applies; a one-shot `info!` fires per account on first sighting. Note: accounts with credits disabled report `overage-status: rejected` + `overage-disabled-reason: member_zero_credit_limit` — past-band Fable on such accounts **fails outright** rather than billing, so routing away before band exhaustion is availability, not just cost.
 
 Routing consequences (`constraining_7d_claims`):
 - A Fable request gates on **both** the band claim and the general `seven_day` claim: worse status wins, and waste-risk is capped by the pool's — a roomy band never masks a drained pool.
-- The band claim is **excluded from the model-agnostic worst case** (emergency brake, stats): an exhausted band constrains only Fable requests, so it must not brake all traffic.
+- The model-agnostic worst case (emergency brake, stats) reads claims through the `claim_gates_all_traffic` **allowlist** (`seven_day` + sonnet/opus/haiku sub-budgets): carve-outs like the band constrain only their own requests and must not brake all traffic.
 - Fable is **never probed** (`PROBE_MODELS`): probes burn real quota at Fable's accelerated weekly-pool burn rate, and past the band would spend paid credits. Band claims refresh from organic Fable traffic; until one is seen, Fable routes on the general `seven_day` claim.
 - `endpoints[].fable_included = false` (Pro accounts) demotes the endpoint by `overage_penalty` for Fable requests only — the tier system then drains included (Max) Fable capacity before touching always-paid accounts.
 - Past-band Fable served via credits is signalled by the existing overage headers and handled by the overage machinery above (demoted tier, overage window governs). When every account is past its band, tier degradation routes Fable to whichever account has the most weekly headroom.
+- **Observability:** `/_stats` exposes each endpoint's `claims_7d` map — a `seven_day_fable` key there means the account has served Fable and the band is being tracked; its absence after Fable traffic means the feature is inert (investigate).
 
 ### Config Fields
 
@@ -154,6 +157,7 @@ Routing consequences (`constraining_7d_claims`):
 | `anthropic-ratelimit-unified-7d-utilization` | Raw 7d usage fraction (0.0–1.0) |
 | `anthropic-ratelimit-unified-7d-reset` | Epoch timestamp when 7d window resets |
 | `anthropic-ratelimit-unified-5h-status` / `7d-status` | API pressure signal: `allowed`, `allowed_warning`, `throttled`, `rejected` |
+| `anthropic-ratelimit-unified-7d_oi-utilization` / `-reset` / `-status` | Fable included-band triplet ("oi" = overage-included) — fraction of the Max-plan Fable band (50% of weekly) consumed. Emitted only on Fable responses; normalised into the internal `seven_day_fable` claim |
 | `anthropic-ratelimit-unified-overage-in-use` | Endpoint is currently serving via paid overage (always overwritten; absent → `false`) |
 | `anthropic-ratelimit-unified-overage-status` | Overage window status — feeds the routing gate floor while overage is in use |
 | `anthropic-ratelimit-unified-overage-utilization` | Overage budget consumed (0.0–1.0) |
