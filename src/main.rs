@@ -1360,29 +1360,34 @@ impl AppState {
                 info.claims_7d
                     .retain(|_, c| c.reset.is_some_and(|r| r > now_epoch));
 
-                // Derive flat 7d fields from claims_7d
-                if info.claims_7d.is_empty() {
-                    info.utilization_7d = None;
-                    info.reset_7d = None;
-                    info.status_7d = None;
-                } else {
-                    info.utilization_7d = info
-                        .claims_7d
-                        .values()
-                        .filter_map(|c| c.utilization)
-                        .reduce(f64::max);
-                    info.reset_7d = info.claims_7d.values().filter_map(|c| c.reset).min();
-                    info.status_7d = info
-                        .claims_7d
-                        .values()
-                        .filter_map(|c| c.status.as_ref())
-                        .max_by(|a, b| {
-                            status_to_floor(Some(a))
-                                .partial_cmp(&status_to_floor(Some(b)))
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .cloned();
-                }
+                // Derive flat 7d fields from claims_7d. Allowlist-filtered for
+                // the same reason as update_rate_info_for: the flat fields feed
+                // the model-agnostic fallback chain, and a persisted carve-out
+                // claim (Fable band) must not resurrect into the emergency
+                // brake's input on boot.
+                info.utilization_7d = info
+                    .claims_7d
+                    .iter()
+                    .filter(|(k, _)| claim_gates_all_traffic(k))
+                    .filter_map(|(_, c)| c.utilization)
+                    .reduce(f64::max);
+                info.reset_7d = info
+                    .claims_7d
+                    .iter()
+                    .filter(|(k, _)| claim_gates_all_traffic(k))
+                    .filter_map(|(_, c)| c.reset)
+                    .min();
+                info.status_7d = info
+                    .claims_7d
+                    .iter()
+                    .filter(|(k, _)| claim_gates_all_traffic(k))
+                    .filter_map(|(_, c)| c.status.as_ref())
+                    .max_by(|a, b| {
+                        status_to_floor(Some(a))
+                            .partial_cmp(&status_to_floor(Some(b)))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .cloned();
 
                 // Invalidate stale 5h data
                 if info.reset_5h.is_none_or(|r| r <= now_epoch) {
@@ -2884,39 +2889,48 @@ impl AppState {
 
         // Derive flat convenience fields from claims_7d (backward compat for logs/stats).
         // utilization_7d = max utilization, reset_7d = min reset, status_7d = worst status.
-        // When claims_7d is empty (all evicted or never populated), clear the flat fields
-        // so effective_utilization() doesn't fall back to stale derived values.
-        if !info.claims_7d.is_empty() {
-            info.utilization_7d = info
-                .claims_7d
-                .values()
-                .filter_map(|c| c.utilization)
-                .reduce(f64::max);
-            info.reset_7d = info.claims_7d.values().filter_map(|c| c.reset).min();
-            info.status_7d = info
-                .claims_7d
-                .values()
-                .filter_map(|c| c.status.as_deref())
-                .max_by(|a, b| {
-                    status_to_floor(Some(a))
-                        .partial_cmp(&status_to_floor(Some(b)))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|s| s.to_string());
-        } else {
-            info.utilization_7d = None;
-            info.reset_7d = None;
-            info.status_7d = None;
-        }
+        // Only claims that gate ALL traffic participate (allowlist): these flat
+        // fields feed effective_utilization()'s model-agnostic fallback chain, so
+        // a carve-out (Fable band) leaking in here could trip the emergency brake
+        // for all traffic when the adjusted windows are stale. When no such claim
+        // exists, clear the flat fields so the fallback doesn't read stale values.
+        info.utilization_7d = info
+            .claims_7d
+            .iter()
+            .filter(|(k, _)| claim_gates_all_traffic(k))
+            .filter_map(|(_, c)| c.utilization)
+            .reduce(f64::max);
+        info.reset_7d = info
+            .claims_7d
+            .iter()
+            .filter(|(k, _)| claim_gates_all_traffic(k))
+            .filter_map(|(_, c)| c.reset)
+            .min();
+        info.status_7d = info
+            .claims_7d
+            .iter()
+            .filter(|(k, _)| claim_gates_all_traffic(k))
+            .filter_map(|(_, c)| c.status.as_deref())
+            .max_by(|a, b| {
+                status_to_floor(Some(a))
+                    .partial_cmp(&status_to_floor(Some(b)))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|s| s.to_string());
 
-        // Derive unified utilization = max across all windows (5h + all 7d claims).
+        // Derive unified utilization = max across all windows (5h + all-traffic
+        // 7d claims — same allowlist as above; this is the brake's last-resort
+        // fallback when both adjusted windows are unavailable).
         // Recompute unconditionally so stale unified values don't survive eviction.
         // Include 5h if reset is absent (no staleness info) or in the future;
         // exclude only when reset is present AND expired (stale data).
         let mut max_util: Option<f64> = info
             .utilization_5h
             .filter(|_| info.reset_5h.is_none_or(|r| r > now_epoch));
-        for cd in info.claims_7d.values() {
+        for (key, cd) in info.claims_7d.iter() {
+            if !claim_gates_all_traffic(key) {
+                continue;
+            }
             if let Some(u) = cd.utilization {
                 max_util = Some(max_util.map_or(u, |cur| cur.max(u)));
             }
@@ -15993,6 +16007,53 @@ data: {\"type\":\"message_stop\"}\n\n";
                 "general claim refreshed by the non-fable response"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn band_only_signal_never_drives_brake_fallback() {
+        // CodeRabbit finding on PR #87: the flat `info.utilization` derivation
+        // included the band, so with 5h absent/stale and no allowlisted 7d
+        // claim, a drained band could reach the brake via the raw-unified
+        // fallback. A band-only account must resolve to "unknown" (fail-open),
+        // not to the band's utilization.
+        let accounts = vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")];
+        let state = test_state_with(accounts);
+        let now_epoch = AppState::now_epoch();
+
+        // Fable response shape carrying ONLY the band triplet (no 5h/7d data).
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-utilization",
+            HeaderValue::from_static("1.0"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-reset",
+            HeaderValue::from_str(&format!("{}", now_epoch + 302400)).unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-status",
+            HeaderValue::from_static("rejected"),
+        );
+        state.update_rate_info(0, &headers).await;
+
+        let info = state.endpoints[0].rate_info.read().await;
+        assert!(
+            info.claims_7d.contains_key(FABLE_BAND_CLAIM),
+            "band claim parsed"
+        );
+        assert_eq!(
+            info.utilization, None,
+            "flat unified utilization must not derive from the band"
+        );
+        assert_eq!(
+            info.utilization_7d, None,
+            "flat 7d utilization must not derive from the band"
+        );
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
+        assert_eq!(
+            source, "unknown",
+            "model-agnostic view of a band-only account is unknown, got {util} from {source}"
+        );
     }
 
     #[tokio::test]
