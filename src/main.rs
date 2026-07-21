@@ -1486,6 +1486,22 @@ const HARD_LIMIT_CLEARED_SENTINEL: u64 = 0;
 /// enough that the key does not linger past the intended recovery window.
 const HARD_LIMIT_SENTINEL_TTL_SECS: u64 = 60;
 
+/// Redis hash aggregating upstream transport send-failures across all replicas,
+/// keyed by kind (`timeout`/`connect`/`other`). Each replica flushes its local
+/// delta accumulator into this hash via `HINCRBY` every sync tick, so the
+/// dashboard/metrics endpoint reports a fleet-wide count rather than one pod's
+/// local observations. A single fixed key (not per-day like budgets) → one
+/// monotonic counter family that survives pod restarts.
+const TRANSPORT_ERRORS_KEY: &str = "alb:transport_errors";
+
+/// TTL refreshed on every flush of `TRANSPORT_ERRORS_KEY`. Chosen far larger
+/// than the 5s sync interval so the key never expires while any replica is
+/// alive (some pod re-`EXPIRE`s it every 5s). It only lapses once the ENTIRE
+/// fleet has been down for two days, at which point resetting the counter is
+/// correct — there is no live count left to preserve — and it prevents an
+/// orphaned key lingering forever after a permanent teardown.
+const TRANSPORT_ERRORS_TTL_SECS: u64 = 172_800;
+
 /// Maximum request body size (25 MB).
 const MAX_REQUEST_BODY_BYTES: usize = 25 * 1024 * 1024;
 
@@ -3140,10 +3156,82 @@ impl AppState {
             }
         }
 
-        // 4. Refresh cluster info cache for /_stats endpoint
+        // 4. Flush this replica's transport-error deltas into the shared Redis
+        //    hash so the fleet-wide by-kind count is visible cluster-wide.
+        //    Drains the local accumulator; the cluster_info refresh below then
+        //    reads the freshly-flushed total back via HGETALL.
+        self.flush_transport_errors().await;
+
+        // 5. Refresh cluster info cache for /_stats endpoint
         let info = self.cluster_info().await;
         if let Ok(mut cache) = self.cluster_info_cache.lock() {
             *cache = info;
+        }
+    }
+
+    /// Flush this replica's accumulated transport-error deltas into the shared
+    /// Redis hash (`TRANSPORT_ERRORS_KEY`) so the fleet-wide count is visible
+    /// cluster-wide. `upstream_transport_errors` is a DELTA accumulator: it is
+    /// drained here each tick and its counts folded into Redis via `HINCRBY`,
+    /// so the same delta is never pushed twice (no double-counting across
+    /// ticks). On Redis failure the drained deltas are returned to the local
+    /// map — they retry next tick and stay visible via the local metrics
+    /// fallback rather than being lost. No-op without Redis, so single-instance
+    /// deployments keep accumulating locally.
+    async fn flush_transport_errors(&self) {
+        let redis = match &self.redis {
+            Some(r) => r,
+            None => return,
+        };
+
+        // Drain the accumulator atomically: take the deltas AND reset to empty
+        // under one lock, so any increment arriving mid-flush belongs to the
+        // NEXT tick's delta and cannot be double-flushed. Recover a poisoned
+        // lock — a stale count must not wedge the flush loop forever.
+        let deltas: Vec<(&'static str, u64)> = {
+            let mut m = match self.upstream_transport_errors.lock() {
+                Ok(m) => m,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            m.drain().filter(|(_, n)| *n > 0).collect()
+        };
+        if deltas.is_empty() {
+            return;
+        }
+
+        // One round-trip: HINCRBY every kind, then refresh the TTL. Low-level
+        // cmd/arg form so this does not depend on generated fluent pipe methods.
+        let mut conn = redis.clone();
+        let mut pipe = redis::pipe();
+        for (kind, n) in &deltas {
+            pipe.cmd("HINCRBY")
+                .arg(TRANSPORT_ERRORS_KEY)
+                .arg(*kind)
+                .arg(*n)
+                .ignore();
+        }
+        pipe.cmd("EXPIRE")
+            .arg(TRANSPORT_ERRORS_KEY)
+            .arg(TRANSPORT_ERRORS_TTL_SECS)
+            .ignore();
+
+        let result: redis::RedisResult<()> = pipe.query_async(&mut conn).await;
+        if let Err(e) = result {
+            // Redis is unreachable (or the pipeline reply was lost) — return the
+            // drained deltas to the local accumulator so error signal is not
+            // dropped. This is at-least-once: if the connection died AFTER Redis
+            // applied some HINCRBYs, re-queuing can over-count by a few next
+            // tick. For an error *counter* that bias is correct — a slight
+            // over-report beats a silently missed egress fault. (Contrast
+            // record_budget_usage, which deletes-on-failure: over-counting a
+            // budget would wrongly throttle a client.) The deltas also stay
+            // visible via the local metrics fallback until Redis heals.
+            warn!(error = %e, "redis HINCRBY failed for transport errors; re-queuing deltas locally");
+            if let Ok(mut m) = self.upstream_transport_errors.lock() {
+                for (kind, n) in deltas {
+                    *m.entry(kind).or_insert(0) += n;
+                }
+            }
         }
     }
     async fn cluster_info(&self) -> Option<serde_json::Value> {
@@ -3207,11 +3295,41 @@ impl AppState {
             }
         }
 
-        Some(serde_json::json!({
-            "redis_connected": redis_ok,
-            "replicas_seen": replicas,
-            "budget_usage": redis_budgets,
-        }))
+        // Aggregate upstream transport errors from the shared Redis hash so the
+        // fleet-wide by-kind count surfaces on the dashboard/metrics endpoint.
+        // Only included when the HGETALL succeeds: its absence tells the metrics
+        // handler to fall back to this replica's local accumulator.
+        let mut transport_errors: Option<serde_json::Map<String, serde_json::Value>> = None;
+        if redis_ok {
+            match conn
+                .hgetall::<_, HashMap<String, u64>>(TRANSPORT_ERRORS_KEY)
+                .await
+            {
+                Ok(map) => {
+                    let mut te = serde_json::Map::new();
+                    for (kind, n) in map {
+                        te.insert(kind, serde_json::json!(n));
+                    }
+                    transport_errors = Some(te);
+                }
+                Err(e) => {
+                    warn!(error = %e, "redis HGETALL failed for transport-error aggregation");
+                    redis_ok = false;
+                }
+            }
+        }
+
+        let mut out = serde_json::Map::new();
+        out.insert("redis_connected".into(), serde_json::json!(redis_ok));
+        out.insert("replicas_seen".into(), serde_json::json!(replicas));
+        out.insert(
+            "budget_usage".into(),
+            serde_json::Value::Object(redis_budgets),
+        );
+        if let Some(te) = transport_errors {
+            out.insert("transport_errors".into(), serde_json::Value::Object(te));
+        }
+        Some(serde_json::Value::Object(out))
     }
 }
 
@@ -6819,16 +6937,31 @@ async fn metrics_handler(
         "counter",
         "Upstream transport send-failures by kind",
     );
-    let transport_errors: Vec<(&'static str, u64)> = state
-        .upstream_transport_errors
-        .lock()
-        .map(|m| m.iter().map(|(k, v)| (*k, *v)).collect())
-        .unwrap_or_default();
+    // Prefer the Redis fleet-wide aggregate (cached every 5s by the sync task)
+    // so multi-replica deployments report a cluster-wide count; fall back to the
+    // local accumulator when Redis is absent or the aggregate is unavailable
+    // (single-instance, pre-first-sync, or a Redis blip).
+    let transport_errors: Vec<(String, u64)> = cluster_info
+        .as_ref()
+        .and_then(|ci| ci.get("transport_errors"))
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n)))
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            state
+                .upstream_transport_errors
+                .lock()
+                .map(|m| m.iter().map(|(k, v)| (k.to_string(), *v)).collect())
+                .unwrap_or_default()
+        });
     for (kind, n) in transport_errors {
         prom_counter(
             &mut buf,
             "anthropic_upstream_transport_errors_total",
-            &[("kind", kind)],
+            &[("kind", kind.as_str())],
             n,
         );
     }
@@ -13179,6 +13312,69 @@ token = "sk-ant-test"
         assert!(
             m.contains("anthropic_upstream_transport_errors_total{kind="),
             "by-kind transport-error counter must appear after a transport failure:\n{m}"
+        );
+    }
+
+    /// AC4 (graceful without Redis): a single-instance deployment has no Redis,
+    /// so `flush_transport_errors` must be a no-op that leaves the local
+    /// accumulator intact — otherwise local `/metrics` counts would vanish.
+    #[tokio::test]
+    async fn flush_transport_errors_noop_without_redis() {
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-aaa")]);
+        {
+            let mut m = state.upstream_transport_errors.lock().unwrap();
+            m.insert("timeout", 3);
+            m.insert("connect", 1);
+        }
+        state.flush_transport_errors().await;
+        let m = state.upstream_transport_errors.lock().unwrap();
+        assert_eq!(
+            m.get("timeout"),
+            Some(&3),
+            "local accumulator must be retained without redis"
+        );
+        assert_eq!(m.get("connect"), Some(&1));
+    }
+
+    /// AC3 (aggregate exposed): when the sync task has cached a fleet-wide
+    /// aggregate, `/metrics` must report THOSE counts (cluster-wide), not this
+    /// replica's local unflushed delta. Proves the Redis view supersedes local.
+    #[tokio::test]
+    async fn metrics_prefer_redis_transport_error_aggregate() {
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-aaa")]);
+        // A local (unflushed) delta that must be SUPERSEDED by the fleet view.
+        state
+            .upstream_transport_errors
+            .lock()
+            .unwrap()
+            .insert("timeout", 2);
+        // Simulate the sync task having cached a fleet-wide aggregate.
+        *state.cluster_info_cache.lock().unwrap() = Some(serde_json::json!({
+            "redis_connected": true,
+            "replicas_seen": 3,
+            "transport_errors": { "timeout": 40, "connect": 5 },
+        }));
+        let addr = serve(build_router(state)).await;
+        let c = reqwest::Client::new();
+        let m = c
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            m.contains("anthropic_upstream_transport_errors_total{kind=\"timeout\"} 40"),
+            "fleet aggregate (40) must win over local delta (2):\n{m}"
+        );
+        assert!(
+            m.contains("anthropic_upstream_transport_errors_total{kind=\"connect\"} 5"),
+            "fleet aggregate must include all kinds:\n{m}"
+        );
+        assert!(
+            !m.contains("anthropic_upstream_transport_errors_total{kind=\"timeout\"} 2"),
+            "local delta must not leak once the fleet aggregate is present:\n{m}"
         );
     }
 
