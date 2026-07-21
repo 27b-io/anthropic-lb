@@ -1360,34 +1360,11 @@ impl AppState {
                 info.claims_7d
                     .retain(|_, c| c.reset.is_some_and(|r| r > now_epoch));
 
-                // Derive flat 7d fields from claims_7d. Allowlist-filtered for
-                // the same reason as update_rate_info_for: the flat fields feed
-                // the model-agnostic fallback chain, and a persisted carve-out
+                // Derive flat 7d fields from claims_7d — a persisted carve-out
                 // claim (Fable band) must not resurrect into the emergency
-                // brake's input on boot.
-                info.utilization_7d = info
-                    .claims_7d
-                    .iter()
-                    .filter(|(k, _)| claim_gates_all_traffic(k))
-                    .filter_map(|(_, c)| c.utilization)
-                    .reduce(f64::max);
-                info.reset_7d = info
-                    .claims_7d
-                    .iter()
-                    .filter(|(k, _)| claim_gates_all_traffic(k))
-                    .filter_map(|(_, c)| c.reset)
-                    .min();
-                info.status_7d = info
-                    .claims_7d
-                    .iter()
-                    .filter(|(k, _)| claim_gates_all_traffic(k))
-                    .filter_map(|(_, c)| c.status.as_ref())
-                    .max_by(|a, b| {
-                        status_to_floor(Some(a))
-                            .partial_cmp(&status_to_floor(Some(b)))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .cloned();
+                // brake's input on boot; see derive_flat_7d_fields.
+                (info.utilization_7d, info.reset_7d, info.status_7d) =
+                    derive_flat_7d_fields(&info.claims_7d);
 
                 // Invalidate stale 5h data
                 if info.reset_5h.is_none_or(|r| r <= now_epoch) {
@@ -1585,6 +1562,39 @@ fn claim_gates_all_traffic(key: &str) -> bool {
         key,
         "seven_day" | "seven_day_sonnet" | "seven_day_opus" | "seven_day_haiku"
     )
+}
+
+/// Derive the flat 7d convenience fields from a claims map: utilization_7d =
+/// max utilization, reset_7d = min reset, status_7d = worst status. Only
+/// claims that gate ALL traffic participate (`claim_gates_all_traffic`) —
+/// these fields feed `effective_utilization()`'s model-agnostic fallback
+/// chain, so a carve-out (Fable band) leaking in could trip the emergency
+/// brake for all traffic. Single implementation shared by `load_state()` and
+/// `update_rate_info_for()` so the filter policy cannot drift between them.
+fn derive_flat_7d_fields(
+    claims_7d: &HashMap<String, ClaimWindowData>,
+) -> (Option<f64>, Option<u64>, Option<String>) {
+    let utilization_7d = claims_7d
+        .iter()
+        .filter(|(k, _)| claim_gates_all_traffic(k))
+        .filter_map(|(_, c)| c.utilization)
+        .reduce(f64::max);
+    let reset_7d = claims_7d
+        .iter()
+        .filter(|(k, _)| claim_gates_all_traffic(k))
+        .filter_map(|(_, c)| c.reset)
+        .min();
+    let status_7d = claims_7d
+        .iter()
+        .filter(|(k, _)| claim_gates_all_traffic(k))
+        .filter_map(|(_, c)| c.status.as_deref())
+        .max_by(|a, b| {
+            status_to_floor(Some(a))
+                .partial_cmp(&status_to_floor(Some(b)))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|s| s.to_string());
+    (utilization_7d, reset_7d, status_7d)
 }
 
 fn resolve_7d_claim<'a>(info: &'a RateLimitInfo, model: &str) -> Option<&'a ClaimWindowData> {
@@ -2887,36 +2897,11 @@ impl AppState {
             }
         });
 
-        // Derive flat convenience fields from claims_7d (backward compat for logs/stats).
-        // utilization_7d = max utilization, reset_7d = min reset, status_7d = worst status.
-        // Only claims that gate ALL traffic participate (allowlist): these flat
-        // fields feed effective_utilization()'s model-agnostic fallback chain, so
-        // a carve-out (Fable band) leaking in here could trip the emergency brake
-        // for all traffic when the adjusted windows are stale. When no such claim
-        // exists, clear the flat fields so the fallback doesn't read stale values.
-        info.utilization_7d = info
-            .claims_7d
-            .iter()
-            .filter(|(k, _)| claim_gates_all_traffic(k))
-            .filter_map(|(_, c)| c.utilization)
-            .reduce(f64::max);
-        info.reset_7d = info
-            .claims_7d
-            .iter()
-            .filter(|(k, _)| claim_gates_all_traffic(k))
-            .filter_map(|(_, c)| c.reset)
-            .min();
-        info.status_7d = info
-            .claims_7d
-            .iter()
-            .filter(|(k, _)| claim_gates_all_traffic(k))
-            .filter_map(|(_, c)| c.status.as_deref())
-            .max_by(|a, b| {
-                status_to_floor(Some(a))
-                    .partial_cmp(&status_to_floor(Some(b)))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|s| s.to_string());
+        // Derive flat convenience fields from claims_7d (backward compat for
+        // logs/stats; also the model-agnostic fallback input — see
+        // derive_flat_7d_fields for why only all-traffic claims participate).
+        (info.utilization_7d, info.reset_7d, info.status_7d) =
+            derive_flat_7d_fields(&info.claims_7d);
 
         // Derive unified utilization = max across all windows (5h + all-traffic
         // 7d claims — same allowlist as above; this is the brake's last-resort
