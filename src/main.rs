@@ -105,6 +105,13 @@ struct EndpointConfig {
     /// Priority tier (0 = highest). Lower tiers tried first.
     #[serde(default)]
     priority: u32,
+    /// Whether this account's plan includes Fable usage. Max plans include
+    /// Fable up to 50% of the weekly limit; Pro / standard Team plans bill
+    /// Fable as paid credits from the first token. Set to false for such
+    /// accounts: Fable requests then treat the endpoint as paid capacity,
+    /// demoting its priority by `overage_penalty` so included (Max) capacity
+    /// drains first. Non-Fable routing is unaffected. Default: true.
+    fable_included: Option<bool>,
 }
 
 /// Wire format on config / state: "anthropic" | "openai".
@@ -449,6 +456,9 @@ struct Endpoint {
     passthrough: bool,
     models: Vec<String>,
     priority: u32,
+    /// Plan includes Fable's 50%-of-weekly band. False = Fable is always paid
+    /// here (Pro plan) → Fable requests demote this endpoint by `overage_penalty`.
+    fable_included: bool,
     requests: AtomicU64,
     rate_info: RwLock<RateLimitInfo>,
     burn_rate: Mutex<BurnRate>,
@@ -1352,29 +1362,11 @@ impl AppState {
                 info.claims_7d
                     .retain(|_, c| c.reset.is_some_and(|r| r > now_epoch));
 
-                // Derive flat 7d fields from claims_7d
-                if info.claims_7d.is_empty() {
-                    info.utilization_7d = None;
-                    info.reset_7d = None;
-                    info.status_7d = None;
-                } else {
-                    info.utilization_7d = info
-                        .claims_7d
-                        .values()
-                        .filter_map(|c| c.utilization)
-                        .reduce(f64::max);
-                    info.reset_7d = info.claims_7d.values().filter_map(|c| c.reset).min();
-                    info.status_7d = info
-                        .claims_7d
-                        .values()
-                        .filter_map(|c| c.status.as_ref())
-                        .max_by(|a, b| {
-                            status_to_floor(Some(a))
-                                .partial_cmp(&status_to_floor(Some(b)))
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .cloned();
-                }
+                // Derive flat 7d fields from claims_7d — a persisted carve-out
+                // claim (Fable band) must not resurrect into the emergency
+                // brake's input on boot; see derive_flat_7d_fields.
+                (info.utilization_7d, info.reset_7d, info.status_7d) =
+                    derive_flat_7d_fields(&info.claims_7d);
 
                 // Invalidate stale 5h data
                 if info.reset_5h.is_none_or(|r| r <= now_epoch) {
@@ -1553,9 +1545,74 @@ fn model_family(model: &str) -> &str {
         "opus"
     } else if model.contains("haiku") {
         "haiku"
+    } else if model.contains("fable") {
+        "fable"
     } else {
         ""
     }
+}
+
+/// Internal claim key for the Fable included-usage band. On Max plans Fable is
+/// included only up to 50% of the weekly limit; past that it bills as paid
+/// usage credits (support.claude.com article 15424964). Unlike other per-model
+/// claims, this band is a carve-out *within* the shared weekly pool, not an
+/// independent sub-budget — see `constraining_7d_claims`.
+///
+/// WIRE MAPPING (verified against a live claude-fable-5 response, 2026-07-21):
+/// the API does NOT emit a `seven_day_fable` representative claim. The band
+/// arrives as the `anthropic-ratelimit-unified-7d_oi-{utilization,reset,status}`
+/// triplet ("oi" = overage-included), present ONLY on Fable responses — a
+/// sonnet response from the same account omits it. `update_rate_info_for`
+/// normalises that triplet into this claims_7d entry so the standard claims
+/// machinery (gating, waste-risk, persistence, Redis sync, eviction) applies.
+const FABLE_BAND_CLAIM: &str = "seven_day_fable";
+
+/// Claims that participate in the model-agnostic worst case (emergency brake,
+/// stats with no model context). Allowlist, NOT denylist: only the general
+/// weekly pool and the per-family sub-budgets that gate whole traffic classes
+/// qualify. Carve-outs (the Fable band) and any future unknown keys are
+/// excluded — an unknown carve-out silently joining the brake input could
+/// freeze ALL traffic while every regular budget is healthy. Under-braking on
+/// a genuinely new model family is the safer failure mode: per-model routing
+/// gates still protect it, the brake is only a last-resort backstop.
+fn claim_gates_all_traffic(key: &str) -> bool {
+    matches!(
+        key,
+        "seven_day" | "seven_day_sonnet" | "seven_day_opus" | "seven_day_haiku"
+    )
+}
+
+/// Derive the flat 7d convenience fields from a claims map: utilization_7d =
+/// max utilization, reset_7d = min reset, status_7d = worst status. Only
+/// claims that gate ALL traffic participate (`claim_gates_all_traffic`) —
+/// these fields feed `effective_utilization()`'s model-agnostic fallback
+/// chain, so a carve-out (Fable band) leaking in could trip the emergency
+/// brake for all traffic. Single implementation shared by `load_state()` and
+/// `update_rate_info_for()` so the filter policy cannot drift between them.
+fn derive_flat_7d_fields(
+    claims_7d: &HashMap<String, ClaimWindowData>,
+) -> (Option<f64>, Option<u64>, Option<String>) {
+    let utilization_7d = claims_7d
+        .iter()
+        .filter(|(k, _)| claim_gates_all_traffic(k))
+        .filter_map(|(_, c)| c.utilization)
+        .reduce(f64::max);
+    let reset_7d = claims_7d
+        .iter()
+        .filter(|(k, _)| claim_gates_all_traffic(k))
+        .filter_map(|(_, c)| c.reset)
+        .min();
+    let status_7d = claims_7d
+        .iter()
+        .filter(|(k, _)| claim_gates_all_traffic(k))
+        .filter_map(|(_, c)| c.status.as_deref())
+        .max_by(|a, b| {
+            status_to_floor(Some(a))
+                .partial_cmp(&status_to_floor(Some(b)))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|s| s.to_string());
+    (utilization_7d, reset_7d, status_7d)
 }
 
 fn resolve_7d_claim<'a>(info: &'a RateLimitInfo, model: &str) -> Option<&'a ClaimWindowData> {
@@ -1574,6 +1631,27 @@ fn resolve_7d_claim<'a>(info: &'a RateLimitInfo, model: &str) -> Option<&'a Clai
     } else {
         info.claims_7d.get("seven_day")
     }
+}
+
+/// The 7d claims that constrain `model` on this account: `(primary, pool_cap)`.
+///
+/// The primary is `resolve_7d_claim`'s pick (model-specific claim, falling back
+/// to the general `seven_day` bucket). For Fable, when the band claim exists,
+/// the general claim is returned as a second constraint: Fable's usable
+/// headroom is `min(band remaining, weekly pool remaining)`, so a roomy band
+/// must not mask a drained pool. For every other family the pool cap is `None`
+/// — their sub-budget claim is already the binding constraint (unchanged
+/// pre-Fable behaviour).
+fn constraining_7d_claims<'a>(
+    info: &'a RateLimitInfo,
+    model: &str,
+) -> (Option<&'a ClaimWindowData>, Option<&'a ClaimWindowData>) {
+    let primary = resolve_7d_claim(info, model);
+    if model_family(model) != "fable" || !info.claims_7d.contains_key(FABLE_BAND_CLAIM) {
+        // Without a band claim the primary already IS the general claim.
+        return (primary, None);
+    }
+    (primary, info.claims_7d.get("seven_day"))
 }
 
 const TOTAL_7D_SECS: f64 = 604800.0;
@@ -1714,7 +1792,7 @@ fn effective_utilization(
     // 7d window — model-aware lookup from claims_7d map
     let adj_7d = if !info.claims_7d.is_empty() {
         if !model.is_empty() {
-            resolve_7d_claim(info, model).and_then(|c| {
+            let adj = |c: &ClaimWindowData| {
                 time_adjusted_utilization(
                     c.utilization,
                     c.reset,
@@ -1722,12 +1800,25 @@ fn effective_utilization(
                     NEAR_RESET_7D_SECS,
                     now_epoch,
                 )
-            })
+            };
+            let (primary, pool_cap) = constraining_7d_claims(info, model);
+            match (primary.and_then(adj), pool_cap.and_then(adj)) {
+                // Fable: band and shared weekly pool both constrain — the more
+                // utilized window is the binding one.
+                (Some(band), Some(pool)) => Some(band.max(pool)),
+                (band, pool) => band.or(pool),
+            }
         } else {
-            // No model specified (emergency brake, stats) — worst-case across all claims
+            // No model specified (emergency brake, stats) — worst-case across the
+            // claims that gate ALL traffic (allowlist). Carve-outs like the Fable
+            // band constrain only their own requests (which gate on them
+            // per-model above); letting a carve-out's exhaustion drive the
+            // model-agnostic worst case would trip the emergency brake for ALL
+            // traffic while every regular sub-budget still has capacity.
             info.claims_7d
-                .values()
-                .filter_map(|c| {
+                .iter()
+                .filter(|(key, _)| claim_gates_all_traffic(key))
+                .filter_map(|(_, c)| {
                     time_adjusted_utilization(
                         c.utilization,
                         c.reset,
@@ -1822,31 +1913,53 @@ fn compute_routing_weight(
         })
     };
 
-    // 7d model-specific gate and waste risk
-    let (gate_7d, wr_7d, source_7d) = if let Some(claim) = resolve_7d_claim(info, model) {
-        let rejected_claim_active = claim.status.as_deref() == Some("rejected")
-            && claim.reset.is_none_or(|reset| reset > now_epoch);
+    // 7d model-specific gate and waste risk. For Fable both the band claim and
+    // the general weekly claim constrain (headroom = min of the two remainders);
+    // for other families pool_cap is None and this reduces to the single-claim
+    // logic below.
+    let (primary_7d, pool_cap_7d) = constraining_7d_claims(info, model);
+    let (gate_7d, wr_7d, source_7d) = if let Some(claim) = primary_7d {
+        let rejected = |c: &ClaimWindowData| {
+            c.status.as_deref() == Some("rejected") && c.reset.is_none_or(|reset| reset > now_epoch)
+        };
+        let rejected_claim_active = rejected(claim) || pool_cap_7d.is_some_and(rejected);
         // A rejected 7d claim normally skips the account — but not while overage is
         // covering it (overage serves requests despite the rejected subscription claim).
         if rejected_claim_active && !stale_after_hard_limit && !overage_active {
             return None; // caller should skip this account
         }
-        (
-            if stale_after_hard_limit {
-                0.5
-            } else {
-                time_adjusted_utilization(
-                    Some(0.0),
-                    claim.reset,
-                    claim.status.as_deref(),
-                    NEAR_RESET_7D_SECS,
-                    now_epoch,
-                )
-                .unwrap_or(0.0)
-            },
-            waste_risk(claim.utilization, claim.reset, now_epoch),
-            "waste_risk",
-        )
+        let gate_of = |c: &ClaimWindowData| {
+            time_adjusted_utilization(
+                Some(0.0),
+                c.reset,
+                c.status.as_deref(),
+                NEAR_RESET_7D_SECS,
+                now_epoch,
+            )
+            .unwrap_or(0.0)
+        };
+        let gate = if stale_after_hard_limit {
+            0.5
+        } else {
+            // Worse status of band vs pool governs (max of the two floors).
+            pool_cap_7d
+                .iter()
+                .fold(gate_of(claim), |g, c| g.max(gate_of(c)))
+        };
+        let mut wr = waste_risk(claim.utilization, claim.reset, now_epoch);
+        if let Some(pool) = pool_cap_7d {
+            // A drained weekly pool caps how much of the Fable band is actually
+            // usable — but only cap on a meaningful signal: waste_risk yields
+            // 0.0 for missing/stale inputs (util OR reset absent), and a 0.0
+            // cap would erase the band's urgency rather than bound it. Cost: a
+            // pool at exactly util=1.0 (true wr of 0.0) also skips the cap —
+            // acceptable, its status floor gates the account instead.
+            let pool_wr = waste_risk(pool.utilization, pool.reset, now_epoch);
+            if pool_wr > 0.0 {
+                wr = wr.min(pool_wr);
+            }
+        }
+        (gate, wr, "waste_risk")
     } else {
         (
             if stale_after_hard_limit { 0.5 } else { 0.0 },
@@ -1995,7 +2108,12 @@ impl AppState {
                             continue;
                         }
                     };
-                    let effective_priority = if rw.overage_active {
+                    // Paid-capacity demotion: overage in use, or a Fable request
+                    // on an account whose plan bills Fable from the first token
+                    // (fable_included = false). Same penalty for both — the
+                    // semantics are identical: drain included capacity first.
+                    let fable_paid = !ep.fable_included && model_family(model) == "fable";
+                    let effective_priority = if rw.overage_active || fable_paid {
                         ep.priority.saturating_add(self.overage_penalty)
                     } else {
                         ep.priority
@@ -2709,6 +2827,50 @@ impl AppState {
             }
         }
 
+        // Fable included-band triplet ("7d_oi" = 7d overage-included). Emitted
+        // ONLY on Fable responses (verified live 2026-07-21, LAB-387): a sonnet
+        // response from the same account carries no 7d_oi headers, and there is
+        // no `seven_day_fable` representative claim on the wire. Normalised into
+        // the internal FABLE_BAND_CLAIM entry so the standard claims machinery
+        // applies. Absence of the triplet (every non-Fable response) must NOT
+        // clear the entry — reset-based eviction below handles staleness,
+        // exactly like every other claim. Anchored on the utilization header so
+        // a partial triplet never creates a utilization-less placeholder (same
+        // shadowing rule as the general 7d claim).
+        if let Some(v) = headers.get("anthropic-ratelimit-unified-7d_oi-utilization") {
+            if let Ok(s) = v.to_str() {
+                if let Ok(util) = s.parse::<f64>() {
+                    let first_sighting = !info.claims_7d.contains_key(FABLE_BAND_CLAIM);
+                    let entry = info
+                        .claims_7d
+                        .entry(FABLE_BAND_CLAIM.to_string())
+                        .or_default();
+                    entry.utilization = Some(util.clamp(0.0, 1.0));
+                    entry.last_seen = now_epoch;
+                    entry.reset = headers
+                        .get("anthropic-ratelimit-unified-7d_oi-reset")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .filter(|&epoch| epoch <= now_epoch + 604800) // 7d sanity cap
+                        .or(entry.reset);
+                    // Status absent within a present triplet = pressure subsided
+                    // (same semantics as the general 7d claim, Bug #1).
+                    entry.status = headers
+                        .get("anthropic-ratelimit-unified-7d_oi-status")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    if first_sighting {
+                        info!(
+                            account = endpoint_name,
+                            utilization = util,
+                            "fable band claim first observed (7d_oi headers) — \
+                             fable-aware routing active for this account"
+                        );
+                    }
+                }
+            }
+        }
+
         // Overage (paid extra usage) — account-level, covers whichever subscription
         // window is exhausted. `overage-in-use` is always overwritten: header absent
         // or "false" → false (so demotion auto-clears when the window refills).
@@ -2753,41 +2915,25 @@ impl AppState {
             }
         });
 
-        // Derive flat convenience fields from claims_7d (backward compat for logs/stats).
-        // utilization_7d = max utilization, reset_7d = min reset, status_7d = worst status.
-        // When claims_7d is empty (all evicted or never populated), clear the flat fields
-        // so effective_utilization() doesn't fall back to stale derived values.
-        if !info.claims_7d.is_empty() {
-            info.utilization_7d = info
-                .claims_7d
-                .values()
-                .filter_map(|c| c.utilization)
-                .reduce(f64::max);
-            info.reset_7d = info.claims_7d.values().filter_map(|c| c.reset).min();
-            info.status_7d = info
-                .claims_7d
-                .values()
-                .filter_map(|c| c.status.as_deref())
-                .max_by(|a, b| {
-                    status_to_floor(Some(a))
-                        .partial_cmp(&status_to_floor(Some(b)))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|s| s.to_string());
-        } else {
-            info.utilization_7d = None;
-            info.reset_7d = None;
-            info.status_7d = None;
-        }
+        // Derive flat convenience fields from claims_7d (backward compat for
+        // logs/stats; also the model-agnostic fallback input — see
+        // derive_flat_7d_fields for why only all-traffic claims participate).
+        (info.utilization_7d, info.reset_7d, info.status_7d) =
+            derive_flat_7d_fields(&info.claims_7d);
 
-        // Derive unified utilization = max across all windows (5h + all 7d claims).
+        // Derive unified utilization = max across all windows (5h + all-traffic
+        // 7d claims — same allowlist as above; this is the brake's last-resort
+        // fallback when both adjusted windows are unavailable).
         // Recompute unconditionally so stale unified values don't survive eviction.
         // Include 5h if reset is absent (no staleness info) or in the future;
         // exclude only when reset is present AND expired (stale data).
         let mut max_util: Option<f64> = info
             .utilization_5h
             .filter(|_| info.reset_5h.is_none_or(|r| r > now_epoch));
-        for cd in info.claims_7d.values() {
+        for (key, cd) in info.claims_7d.iter() {
+            if !claim_gates_all_traffic(key) {
+                continue;
+            }
             if let Some(u) = cd.utilization {
                 max_util = Some(max_util.map_or(u, |cur| cur.max(u)));
             }
@@ -9023,6 +9169,7 @@ async fn main() {
                 passthrough,
                 models: ec.models.clone(),
                 priority: ec.priority,
+                fable_included: ec.fable_included.unwrap_or(true),
                 requests: AtomicU64::new(0),
                 rate_info: RwLock::new(RateLimitInfo::default()),
                 burn_rate: Mutex::new(BurnRate::new()),
@@ -9216,6 +9363,11 @@ async fn main() {
         let probe_state = state.clone();
         let n_endpoints = probe_state.endpoints.len();
         tokio::spawn(async move {
+            // Fable is deliberately NOT probed: probes burn real quota, Fable
+            // burns the shared weekly pool faster than other families, and past
+            // the included band a probe would spend paid credits. The Fable band
+            // claim (seven_day_fable) refreshes from organic Fable traffic; until
+            // one is seen, routing falls back to the general seven_day claim.
             const PROBE_MODELS: &[&str] =
                 &["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6"];
             // Stagger initial probes: wait 10s then probe all endpoints
@@ -9521,6 +9673,7 @@ token = "sk-ant-test"
             token: "sk-ant".to_string(),
             models: vec![],
             priority: 0,
+            fable_included: None,
         }];
         assert!(validate_endpoints(&endpoints).is_ok());
     }
@@ -9534,6 +9687,7 @@ token = "sk-ant-test"
             token: "sk-ant".to_string(),
             models: vec![],
             priority: 0,
+            fable_included: None,
         }];
         let err = validate_endpoints(&endpoints).unwrap_err();
         assert!(err.contains("https"), "error must mention https: {err}");
@@ -9549,6 +9703,7 @@ token = "sk-ant-test"
             token: "sk-test".to_string(),
             models: vec![],
             priority: 100,
+            fable_included: None,
         }];
         let err = validate_endpoints(&endpoints).unwrap_err();
         assert!(err.contains("base_url"));
@@ -9565,6 +9720,7 @@ token = "sk-ant-test"
                 token: "sk-ant".to_string(),
                 models: vec![],
                 priority: 0,
+                fable_included: None,
             },
             EndpointConfig {
                 name: "gateway".to_string(),
@@ -9573,6 +9729,7 @@ token = "sk-ant-test"
                 token: "sk-test".to_string(),
                 models: vec![],
                 priority: 100,
+                fable_included: None,
             },
         ];
         assert!(validate_endpoints(&endpoints).is_ok());
@@ -9593,6 +9750,7 @@ token = "sk-ant-test"
             passthrough: token == "passthrough",
             models: vec![],
             priority: 0,
+            fable_included: true,
             requests: AtomicU64::new(0),
             rate_info: RwLock::new(RateLimitInfo::default()),
             burn_rate: Mutex::new(BurnRate::new()),
@@ -9629,6 +9787,7 @@ token = "sk-ant-test"
             passthrough: false,
             models: vec![],
             priority: 0,
+            fable_included: true,
             requests: AtomicU64::new(0),
             rate_info: RwLock::new(RateLimitInfo::default()),
             burn_rate: Mutex::new(BurnRate::new()),
@@ -15900,7 +16059,287 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(model_family("claude-opus-4-6"), "opus");
         assert_eq!(model_family("claude-haiku-4-5"), "haiku");
         assert_eq!(model_family("claude-3-5-sonnet"), "sonnet");
+        assert_eq!(model_family("claude-fable-5"), "fable");
         assert_eq!(model_family("unknown-model"), "");
+    }
+
+    #[tokio::test]
+    async fn constraining_claims_fable_pairs_band_with_pool() {
+        let mut info = RateLimitInfo::default();
+        info.claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: Some(0.30),
+                ..Default::default()
+            },
+        );
+
+        // No band claim yet → primary is the general claim, no pool cap.
+        let (primary, cap) = constraining_7d_claims(&info, "claude-fable-5");
+        assert_eq!(primary.unwrap().utilization, Some(0.30));
+        assert!(cap.is_none(), "no band claim → nothing to pair");
+
+        // Band claim present → (band, Some(pool)).
+        info.claims_7d.insert(
+            FABLE_BAND_CLAIM.to_string(),
+            ClaimWindowData {
+                utilization: Some(0.80),
+                ..Default::default()
+            },
+        );
+        let (primary, cap) = constraining_7d_claims(&info, "claude-fable-5");
+        assert_eq!(primary.unwrap().utilization, Some(0.80));
+        assert_eq!(cap.unwrap().utilization, Some(0.30));
+
+        // Non-Fable families never get a pool cap, even with a band claim present.
+        let (_, cap) = constraining_7d_claims(&info, "claude-sonnet-4-6");
+        assert!(cap.is_none(), "sonnet must keep single-claim semantics");
+    }
+
+    #[tokio::test]
+    async fn fable_effective_utilization_binds_on_worse_of_band_and_pool() {
+        let now_epoch = AppState::now_epoch();
+        let mut info = RateLimitInfo::default();
+        info.claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: Some(0.90),
+                reset: Some(now_epoch + 302400),
+                status: None,
+                ..Default::default()
+            },
+        );
+        info.claims_7d.insert(
+            FABLE_BAND_CLAIM.to_string(),
+            ClaimWindowData {
+                utilization: Some(0.20),
+                reset: Some(now_epoch + 302400),
+                status: None,
+                ..Default::default()
+            },
+        );
+
+        // Fable is bound by the drained pool (0.90), not its roomy band (0.20).
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "claude-fable-5");
+        assert_eq!(source, "7d");
+        assert!((util - 0.90).abs() < 0.01, "pool should bind: got {util}");
+    }
+
+    #[tokio::test]
+    async fn worst_case_utilization_allowlists_claims() {
+        // Model-agnostic worst case (emergency brake path) reads ONLY claims
+        // that gate all traffic. Neither the exhausted Fable band nor an
+        // unknown future carve-out may drive it — either would brake ALL
+        // traffic while regular budgets are healthy.
+        let now_epoch = AppState::now_epoch();
+        let mut info = RateLimitInfo::default();
+        info.claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: Some(0.30),
+                reset: Some(now_epoch + 302400),
+                status: None,
+                ..Default::default()
+            },
+        );
+        info.claims_7d.insert(
+            FABLE_BAND_CLAIM.to_string(),
+            ClaimWindowData {
+                utilization: Some(1.0),
+                reset: Some(now_epoch + 302400),
+                status: Some("rejected".to_string()),
+                ..Default::default()
+            },
+        );
+        info.claims_7d.insert(
+            "seven_day_future_carveout_oi".to_string(),
+            ClaimWindowData {
+                utilization: Some(0.95),
+                reset: Some(now_epoch + 302400),
+                status: None,
+                ..Default::default()
+            },
+        );
+
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
+        assert_eq!(source, "7d");
+        assert!(
+            (util - 0.30).abs() < 0.01,
+            "only allowlisted claims may drive the worst case: got {util}"
+        );
+
+        // Sanity on the predicate itself.
+        assert!(claim_gates_all_traffic("seven_day"));
+        assert!(claim_gates_all_traffic("seven_day_sonnet"));
+        assert!(claim_gates_all_traffic("seven_day_opus"));
+        assert!(claim_gates_all_traffic("seven_day_haiku"));
+        assert!(!claim_gates_all_traffic(FABLE_BAND_CLAIM));
+        assert!(!claim_gates_all_traffic("seven_day_future_carveout_oi"));
+    }
+
+    #[tokio::test]
+    async fn parse_7d_oi_headers_populates_band_claim() {
+        // Header shape captured from a live claude-fable-5 response through the
+        // LB on 2026-07-21 (LAB-387 verification): the Fable band arrives as the
+        // 7d_oi triplet, NOT as a seven_day_fable representative claim.
+        let accounts = vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")];
+        let state = test_state_with(accounts);
+        let now_epoch = AppState::now_epoch();
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-representative-claim",
+            HeaderValue::from_static("five_hour"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.09"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            HeaderValue::from_static("0.15"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-reset",
+            HeaderValue::from_str(&format!("{}", now_epoch + 302400)).unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-status",
+            HeaderValue::from_static("allowed"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-utilization",
+            HeaderValue::from_static("0.26"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-reset",
+            HeaderValue::from_str(&format!("{}", now_epoch + 302400)).unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-status",
+            HeaderValue::from_static("allowed"),
+        );
+        state.update_rate_info(0, &headers).await;
+
+        {
+            let info = state.endpoints[0].rate_info.read().await;
+            let band = info.claims_7d.get(FABLE_BAND_CLAIM).expect("band claim");
+            assert_eq!(band.utilization, Some(0.26));
+            assert_eq!(band.reset, Some(now_epoch + 302400));
+            assert_eq!(band.status.as_deref(), Some("allowed"));
+            let general = info.claims_7d.get("seven_day").expect("general claim");
+            assert_eq!(general.utilization, Some(0.15));
+        }
+
+        // A later non-Fable response (no 7d_oi triplet — the sonnet shape
+        // captured from the same account) must NOT clear the band claim.
+        let mut sonnet_headers = reqwest::header::HeaderMap::new();
+        sonnet_headers.insert(
+            "anthropic-ratelimit-unified-representative-claim",
+            HeaderValue::from_static("five_hour"),
+        );
+        sonnet_headers.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            HeaderValue::from_static("0.16"),
+        );
+        state.update_rate_info(0, &sonnet_headers).await;
+
+        {
+            let info = state.endpoints[0].rate_info.read().await;
+            let band = info.claims_7d.get(FABLE_BAND_CLAIM).expect("band persists");
+            assert_eq!(band.utilization, Some(0.26), "absence must not clear band");
+            assert_eq!(
+                info.claims_7d.get("seven_day").unwrap().utilization,
+                Some(0.16),
+                "general claim refreshed by the non-fable response"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn band_only_signal_never_drives_brake_fallback() {
+        // CodeRabbit finding on PR #87: the flat `info.utilization` derivation
+        // included the band, so with 5h absent/stale and no allowlisted 7d
+        // claim, a drained band could reach the brake via the raw-unified
+        // fallback. A band-only account must resolve to "unknown" (fail-open),
+        // not to the band's utilization.
+        let accounts = vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")];
+        let state = test_state_with(accounts);
+        let now_epoch = AppState::now_epoch();
+
+        // Fable response shape carrying ONLY the band triplet (no 5h/7d data).
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-utilization",
+            HeaderValue::from_static("1.0"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-reset",
+            HeaderValue::from_str(&format!("{}", now_epoch + 302400)).unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-status",
+            HeaderValue::from_static("rejected"),
+        );
+        state.update_rate_info(0, &headers).await;
+
+        let info = state.endpoints[0].rate_info.read().await;
+        assert!(
+            info.claims_7d.contains_key(FABLE_BAND_CLAIM),
+            "band claim parsed"
+        );
+        assert_eq!(
+            info.utilization, None,
+            "flat unified utilization must not derive from the band"
+        );
+        assert_eq!(
+            info.utilization_7d, None,
+            "flat 7d utilization must not derive from the band"
+        );
+        let (util, source, _, _) = effective_utilization(&info, now_epoch, "");
+        assert_eq!(
+            source, "unknown",
+            "model-agnostic view of a band-only account is unknown, got {util} from {source}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fable_band_wr_survives_pool_with_missing_reset() {
+        // A pool claim with utilization but NO reset yields waste_risk 0.0
+        // (missing data, not a real zero) — it must not erase the band's
+        // urgency signal via min().
+        let now_epoch = AppState::now_epoch();
+        let mut info = RateLimitInfo {
+            utilization_5h: Some(0.30),
+            reset_5h: Some(now_epoch + 10000),
+            ..Default::default()
+        };
+        info.claims_7d.insert(
+            FABLE_BAND_CLAIM.to_string(),
+            ClaimWindowData {
+                utilization: Some(0.20),
+                reset: Some(now_epoch + 302400),
+                status: None,
+                ..Default::default()
+            },
+        );
+        info.claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: Some(0.90),
+                reset: None, // stale/missing — waste_risk yields 0.0
+                status: None,
+                last_seen: now_epoch,
+            },
+        );
+
+        let rw = compute_routing_weight(&info, "claude-fable-5", now_epoch, false)
+            .expect("account routable");
+        assert!(
+            rw.wr > 0.0,
+            "band waste_risk must survive a data-less pool cap: got {}",
+            rw.wr
+        );
     }
 
     #[tokio::test]
@@ -16043,6 +16482,185 @@ data: {\"type\":\"message_stop\"}\n\n";
             picks[0],
             picks[1]
         );
+    }
+
+    #[tokio::test]
+    async fn pick_fable_prefers_band_headroom() {
+        // Two Max accounts, equal 5h and weekly pool; A's Fable band is nearly
+        // spent (0.90), B's is roomy (0.20) → Fable traffic should prefer B.
+        let acct_a = mk_endpoint("a", "sk-ant-api-a");
+        let acct_b = mk_endpoint("b", "sk-ant-api-b");
+        let state = test_state_with(vec![acct_a, acct_b]);
+        let now = AppState::now_epoch();
+
+        set_account_utilization(&state, 0, 0.30, 0.30, now + 10000, now + 302400).await;
+        set_account_utilization(&state, 1, 0.30, 0.30, now + 10000, now + 302400).await;
+        set_model_utilization(&state, 0, "claude-fable-5", 0.90, now + 302400).await;
+        set_model_utilization(&state, 1, "claude-fable-5", 0.20, now + 302400).await;
+
+        let mut picks = [0u32; 2];
+        for i in 0..200 {
+            let key = format!("client_{}", i);
+            if let Some(idx) = state.pick_endpoint(Some(&key), "claude-fable-5", &[]).await {
+                picks[idx] += 1;
+            }
+        }
+        assert!(
+            picks[1] > picks[0] * 2,
+            "B (roomy fable band) should get >2x traffic vs A: A={}, B={}",
+            picks[0],
+            picks[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_fable_capped_by_shared_pool() {
+        // Fable shares the weekly pool: A's band is barely touched (0.10) but its
+        // weekly pool is nearly drained (0.95). B is balanced (0.50/0.50).
+        // Without the pool cap A's roomy band would win; with it, B must win.
+        let acct_a = mk_endpoint("a", "sk-ant-api-a");
+        let acct_b = mk_endpoint("b", "sk-ant-api-b");
+        let state = test_state_with(vec![acct_a, acct_b]);
+        let now = AppState::now_epoch();
+
+        set_account_utilization(&state, 0, 0.30, 0.95, now + 10000, now + 302400).await;
+        set_account_utilization(&state, 1, 0.30, 0.50, now + 10000, now + 302400).await;
+        set_model_utilization(&state, 0, "claude-fable-5", 0.10, now + 302400).await;
+        set_model_utilization(&state, 1, "claude-fable-5", 0.50, now + 302400).await;
+
+        let mut picks = [0u32; 2];
+        for i in 0..200 {
+            let key = format!("client_{}", i);
+            if let Some(idx) = state.pick_endpoint(Some(&key), "claude-fable-5", &[]).await {
+                picks[idx] += 1;
+            }
+        }
+        assert!(
+            picks[1] > picks[0] * 2,
+            "B should win — A's drained pool caps its roomy band: A={}, B={}",
+            picks[0],
+            picks[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn fable_band_rejected_skips_for_fable_only() {
+        // Exhausted Fable band (rejected, no overage) → account skipped for Fable
+        // requests but still fully routable for other families.
+        let acct = mk_endpoint("a", "sk-ant-api-a");
+        let state = test_state_with(vec![acct]);
+        let now = AppState::now_epoch();
+
+        set_account_utilization(&state, 0, 0.30, 0.30, now + 10000, now + 302400).await;
+        {
+            let mut info = state.endpoints[0].rate_info.write().await;
+            info.claims_7d.insert(
+                FABLE_BAND_CLAIM.to_string(),
+                ClaimWindowData {
+                    utilization: Some(1.0),
+                    reset: Some(now + 302400),
+                    status: Some("rejected".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert!(
+            state
+                .routing_candidates("claude-fable-5", &[])
+                .await
+                .is_empty(),
+            "rejected band must skip the account for fable"
+        );
+        assert_eq!(
+            state
+                .routing_candidates("claude-sonnet-4-6", &[])
+                .await
+                .len(),
+            1,
+            "sonnet routing must be unaffected by the fable band"
+        );
+    }
+
+    #[tokio::test]
+    async fn fable_pool_rejected_skips_fable_despite_roomy_band() {
+        // The shared weekly pool is rejected — a roomy band claim must not keep
+        // the account routable for Fable.
+        let acct = mk_endpoint("a", "sk-ant-api-a");
+        let state = test_state_with(vec![acct]);
+        let now = AppState::now_epoch();
+
+        {
+            let mut info = state.endpoints[0].rate_info.write().await;
+            info.utilization_5h = Some(0.30);
+            info.reset_5h = Some(now + 10000);
+            info.claims_7d.insert(
+                "seven_day".to_string(),
+                ClaimWindowData {
+                    utilization: Some(1.0),
+                    reset: Some(now + 302400),
+                    status: Some("rejected".to_string()),
+                    ..Default::default()
+                },
+            );
+            info.claims_7d.insert(
+                FABLE_BAND_CLAIM.to_string(),
+                ClaimWindowData {
+                    utilization: Some(0.20),
+                    reset: Some(now + 302400),
+                    status: None,
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert!(
+            state
+                .routing_candidates("claude-fable-5", &[])
+                .await
+                .is_empty(),
+            "rejected weekly pool must skip the account for fable"
+        );
+    }
+
+    #[tokio::test]
+    async fn fable_included_false_demotes_for_fable_only() {
+        // A Pro-plan account (fable_included = false) is paid capacity for Fable
+        // from the first token: demoted by overage_penalty for Fable requests,
+        // untouched for everything else.
+        let mut acct_a = mk_endpoint("a", "sk-ant-api-a");
+        acct_a.fable_included = false;
+        let acct_b = mk_endpoint("b", "sk-ant-api-b");
+        let state = test_state_with(vec![acct_a, acct_b]);
+        let now = AppState::now_epoch();
+
+        set_account_utilization(&state, 0, 0.30, 0.30, now + 10000, now + 302400).await;
+        set_account_utilization(&state, 1, 0.30, 0.30, now + 10000, now + 302400).await;
+
+        let fable = state.routing_candidates("claude-fable-5", &[]).await;
+        let a = fable.iter().find(|c| c.endpoint == 0).unwrap();
+        let b = fable.iter().find(|c| c.endpoint == 1).unwrap();
+        assert_eq!(
+            a.priority, 10,
+            "paid-fable account demoted by overage_penalty"
+        );
+        assert_eq!(b.priority, 0, "included account keeps its tier");
+
+        let sonnet = state.routing_candidates("claude-sonnet-4-6", &[]).await;
+        assert!(
+            sonnet.iter().all(|c| c.priority == 0),
+            "non-fable traffic must not see the demotion"
+        );
+
+        // Tier ordering: all Fable traffic lands on the included account.
+        for i in 0..50 {
+            let key = format!("client_{}", i);
+            let idx = state
+                .pick_endpoint(Some(&key), "claude-fable-5", &[])
+                .await
+                .unwrap();
+            assert_eq!(idx, 1, "fable must drain included capacity first");
+        }
     }
 
     #[tokio::test]
