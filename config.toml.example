@@ -56,6 +56,15 @@ token = "sk-ant-oat01-YOUR_TOKEN_HERE"
 name = "secondary"
 token = "sk-ant-oat01-YOUR_TOKEN_HERE"
 
+# Pro-plan (or standard Team) account: Fable is billed as paid credits from the
+# first token — no included 50%-of-weekly band. Setting fable_included = false
+# demotes this endpoint by overage_penalty for Fable requests only, so Max
+# accounts' included Fable capacity drains first. Default: true.
+#[[endpoints]]
+#name = "pro-account"
+#token = "sk-ant-oat01-YOUR_TOKEN_HERE"
+#fable_included = false
+
 # OpenAI-compatible endpoint — set a high priority so it is tried only
 # after all Anthropic endpoints are exhausted.
 #[[endpoints]]
