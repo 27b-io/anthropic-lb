@@ -7285,10 +7285,10 @@ async fn metrics_handler(
         })
         .unwrap_or_else(|| {
             state
-                .upstream_transport_errors
-                .lock()
-                .map(|m| m.iter().map(|(k, v)| (k.to_string(), *v)).collect())
-                .unwrap_or_default()
+                .lock_transport_errors()
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect()
         });
     for (kind, n) in transport_errors {
         prom_counter(
@@ -14058,6 +14058,51 @@ token = "sk-ant-test"
         assert!(
             !m.contains("anthropic_upstream_transport_errors_total{kind=\"timeout\"} 2"),
             "local delta must not leak once the fleet aggregate is present:\n{m}"
+        );
+    }
+
+    /// LAB-466: the `/metrics` local-fallback branch must recover a poisoned
+    /// `upstream_transport_errors` lock instead of reporting zero. Poisons the
+    /// mutex directly (not via `lock_transport_errors()`) so this proves the
+    /// FALLBACK itself recovers, not just the helper in isolation.
+    #[tokio::test]
+    async fn metrics_local_fallback_recovers_poisoned_lock() {
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-aaa")]);
+        // Seed local counts, then poison the mutex from a panicking thread —
+        // bypassing `lock_transport_errors()` so the poison isn't pre-cleared.
+        state
+            .upstream_transport_errors
+            .lock()
+            .unwrap()
+            .insert("timeout", 40);
+        {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let _g = state.upstream_transport_errors.lock().unwrap();
+                panic!("poison the transport-error mutex");
+            })
+            .join()
+            .unwrap_err();
+        }
+        assert!(state.upstream_transport_errors.is_poisoned());
+        // No fleet aggregate cached, so /metrics must take the local fallback path.
+        assert!(state.cluster_info_cache.lock().unwrap().is_none());
+
+        let addr = serve(build_router(state)).await;
+        let c = reqwest::Client::new();
+        let resp = c
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "metrics endpoint must stay usable after a poisoned lock"
+        );
+        let m = resp.text().await.unwrap();
+        assert!(
+            m.contains("anthropic_upstream_transport_errors_total{kind=\"timeout\"} 40"),
+            "poisoned local counts must survive the fallback, not be reported as zero:\n{m}"
         );
     }
 
