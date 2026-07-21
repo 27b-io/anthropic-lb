@@ -86,6 +86,12 @@ struct Config {
     /// bodies would exceed this, bounding peak memory under bursts of concurrent
     /// large requests. Default: 128. Set to 0 to disable (unbounded — old behavior).
     max_inflight_body_mb: Option<u64>,
+    /// Wall-clock ceiling (seconds) for receiving a request body. A slow or
+    /// stalled client is shed with `408` when the body has not fully arrived
+    /// within this window, releasing its body-memory reservation — otherwise a
+    /// handful of hung uploads could pin the `max_inflight_body_mb` budget
+    /// indefinitely. Default: 60. Set to 0 to disable.
+    body_read_timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -567,6 +573,13 @@ struct AppState {
     /// Count of requests load-shed because admitting them would exceed
     /// `max_inflight_body_bytes`. Exposed as `anthropic_body_shed_total`.
     body_shed_total: AtomicU64,
+    /// Wall-clock ceiling for buffering a request body (P1-01). Bounds how long
+    /// a slow or stalled client can hold its body-memory reservation.
+    /// `Duration::ZERO` disables the timeout.
+    body_read_timeout: Duration,
+    /// Count of requests shed because the body was not fully received within
+    /// `body_read_timeout`. Exposed as `anthropic_body_read_timeout_total`.
+    body_read_timeout_total: AtomicU64,
 }
 
 /// RAII reservation against `AppState::inflight_body_bytes`. Holding it keeps the
@@ -660,6 +673,51 @@ fn reserve_request_body(
             )
                 .into_response();
             Err(Box::new(resp))
+        }
+    }
+}
+
+/// Buffer the request body with a wall-clock ceiling (P1-01): the caller holds
+/// a `BodyReservation` while this runs, so a slow-loris or stalled upload must
+/// not be allowed to wait forever — six header-complete uploads that omit
+/// Content-Length (reserving the full 25 MiB each) and then stall would
+/// otherwise pin the entire `max_inflight_body_bytes` budget and shed all
+/// traffic. Times out with `408` (retried by the Anthropic SDKs); read errors
+/// (body over `MAX_REQUEST_BODY_BYTES`, client disconnect) stay `400`. Shared
+/// by `proxy_handler` and `openai_chat_handler` so the two paths can't drift.
+async fn read_body_bounded(
+    state: &Arc<AppState>,
+    body: Body,
+    req_id: &str,
+) -> Result<bytes::Bytes, Box<Response>> {
+    let read = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES);
+    let result = if state.body_read_timeout.is_zero() {
+        read.await
+    } else {
+        match tokio::time::timeout(state.body_read_timeout, read).await {
+            Ok(r) => r,
+            Err(_) => {
+                state
+                    .body_read_timeout_total
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    req_id,
+                    timeout_secs = state.body_read_timeout.as_secs(),
+                    "request body read timed out (releasing body-memory reservation)"
+                );
+                let resp =
+                    (StatusCode::REQUEST_TIMEOUT, "request body read timed out").into_response();
+                return Err(Box::new(resp));
+            }
+        }
+    };
+    match result {
+        Ok(b) => Ok(b),
+        Err(e) => {
+            error!("failed to read request body: {e}");
+            Err(Box::new(
+                (StatusCode::BAD_REQUEST, "bad request body").into_response(),
+            ))
         }
     }
 }
@@ -1526,8 +1584,23 @@ const TRANSPORT_ERRORS_KEY: &str = "alb:transport_errors";
 /// orphaned key lingering forever after a permanent teardown.
 const TRANSPORT_ERRORS_TTL_SECS: u64 = 172_800;
 
-/// Maximum request body size (25 MB).
+/// Maximum request body size (25 MiB). Kept deliberately below Anthropic's own
+/// 32 MB Messages API request limit so multi-image/PDF payloads upstream would
+/// accept still pass. Aggregate concurrent-body memory is NOT this × N — that
+/// is bounded by the `max_inflight_body_mb` admission budget (P1-01), and how
+/// long a body can hold its reservation is bounded by `body_read_timeout_secs`;
+/// this cap only bounds a single request's share of the budget (and its
+/// transient JSON parse amplification). `to_bytes` stops buffering at this
+/// ceiling, so an oversized body is rejected without being fully buffered.
 const MAX_REQUEST_BODY_BYTES: usize = 25 * 1024 * 1024;
+
+/// Default wall-clock ceiling for receiving a request body (seconds). Real
+/// clients push even a max-size body in seconds; 60s is generous headroom for
+/// a slow relayed path while guaranteeing a stalled upload cannot pin its
+/// body-memory reservation (up to `MAX_REQUEST_BODY_BYTES` when Content-Length
+/// is absent) against the P1-01 budget indefinitely. Override with the
+/// `body_read_timeout_secs` config key; 0 disables.
+const DEFAULT_BODY_READ_TIMEOUT_SECS: u64 = 60;
 
 /// Default aggregate in-flight request-body memory budget (bytes). Requests are
 /// admission-controlled against this ceiling: when the sum of in-flight request
@@ -5246,12 +5319,9 @@ async fn proxy_handler(
         Err(resp) => return *resp,
     };
 
-    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+    let body_bytes = match read_body_bounded(&state, body, &req_id).await {
         Ok(b) => b,
-        Err(e) => {
-            error!("failed to read request body: {e}");
-            return (StatusCode::BAD_REQUEST, "bad request body").into_response();
-        }
+        Err(resp) => return *resp,
     };
 
     // Parse body once for model extraction and optional cache injection
@@ -7338,6 +7408,18 @@ async fn metrics_handler(
         &[],
         state.body_shed_total.load(Ordering::Relaxed),
     );
+    prom_header(
+        &mut buf,
+        "anthropic_body_read_timeout_total",
+        "counter",
+        "Requests shed with 408 because the body was not received within body_read_timeout_secs",
+    );
+    prom_counter(
+        &mut buf,
+        "anthropic_body_read_timeout_total",
+        &[],
+        state.body_read_timeout_total.load(Ordering::Relaxed),
+    );
 
     (
         StatusCode::OK,
@@ -8946,12 +9028,9 @@ async fn openai_chat_handler(
         Err(resp) => return *resp,
     };
 
-    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+    let body_bytes = match read_body_bounded(&state, body, &req_id).await {
         Ok(b) => b,
-        Err(e) => {
-            error!("failed to read request body: {e}");
-            return (StatusCode::BAD_REQUEST, "bad request body").into_response();
-        }
+        Err(resp) => return *resp,
     };
 
     let openai_body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
@@ -9475,6 +9554,12 @@ async fn main() {
             .map(|mb| mb.saturating_mul(1024 * 1024))
             .unwrap_or(DEFAULT_MAX_INFLIGHT_BODY_BYTES),
         body_shed_total: AtomicU64::new(0),
+        body_read_timeout: Duration::from_secs(
+            config
+                .body_read_timeout_secs
+                .unwrap_or(DEFAULT_BODY_READ_TIMEOUT_SECS),
+        ),
+        body_read_timeout_total: AtomicU64::new(0),
     });
 
     if state.auto_cache {
@@ -10002,6 +10087,8 @@ token = "sk-ant-test"
             inflight_body_bytes: AtomicU64::new(0),
             max_inflight_body_bytes: 0,
             body_shed_total: AtomicU64::new(0),
+            body_read_timeout: Duration::from_secs(DEFAULT_BODY_READ_TIMEOUT_SECS),
+            body_read_timeout_total: AtomicU64::new(0),
         }
     }
 
@@ -13928,6 +14015,105 @@ token = "sk-ant-test"
             m.contains("anthropic_body_shed_total 1"),
             "shed counter must increment after a load-shed:\n{m}"
         );
+    }
+
+    /// A stalled upload (partial body, connection held open) must be shed with
+    /// `408` when `body_read_timeout` elapses, releasing its body-memory
+    /// reservation and incrementing the timeout counter — otherwise slow-loris
+    /// bodies pin the P1-01 budget indefinitely.
+    #[tokio::test]
+    async fn body_read_timeout_sheds_stalled_body_with_408() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (url, _h) = spawn_mock_upstream().await;
+        let state = Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)],
+            max_inflight_body_bytes: 1024 * 1024,
+            body_read_timeout: Duration::from_millis(200),
+            ..test_state_base()
+        });
+        let addr = serve(build_router(state.clone())).await;
+
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(
+            b"POST /v1/messages HTTP/1.1\r\n\
+              Host: localhost\r\n\
+              Content-Type: application/json\r\n\
+              Content-Length: 4096\r\n\
+              \r\n\
+              {\"model\":\"test\"",
+        )
+        .await
+        .unwrap();
+        // Send nothing further — the handler must time out rather than wait
+        // for the remaining 4080 bytes forever.
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+            .await
+            .expect("server must respond within the timeout, not hang")
+            .unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            resp.starts_with("HTTP/1.1 408"),
+            "stalled body must be shed with 408, got: {resp}"
+        );
+        assert_eq!(
+            state.inflight_body_bytes.load(Ordering::Relaxed),
+            0,
+            "timing out must release the body-memory reservation"
+        );
+        assert_eq!(state.body_read_timeout_total.load(Ordering::Relaxed), 1);
+
+        let m = reqwest::Client::new()
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            m.contains("anthropic_body_read_timeout_total 1"),
+            "timeout counter must be exported:\n{m}"
+        );
+    }
+
+    /// The OpenAI-compat handler shares the same body-read timeout guard.
+    #[tokio::test]
+    async fn openai_handler_body_read_timeout_sheds_with_408() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (url, _h) = spawn_mock_upstream().await;
+        let state = Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)],
+            max_inflight_body_bytes: 1024 * 1024,
+            body_read_timeout: Duration::from_millis(200),
+            ..test_state_base()
+        });
+        let addr = serve(build_router(state.clone())).await;
+
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\n\
+              Host: localhost\r\n\
+              Content-Type: application/json\r\n\
+              Content-Length: 4096\r\n\
+              \r\n\
+              {\"model\":\"test\"",
+        )
+        .await
+        .unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+            .await
+            .expect("server must respond within the timeout, not hang")
+            .unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            resp.starts_with("HTTP/1.1 408"),
+            "openai-compat path must share the body-read timeout, got: {resp}"
+        );
+        assert_eq!(state.inflight_body_bytes.load(Ordering::Relaxed), 0);
     }
 
     // ── Task 5: transport-error metric ─────────────────────────────────

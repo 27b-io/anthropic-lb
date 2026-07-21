@@ -39,6 +39,12 @@ probe_interval_secs = 300
 # peak; the proxy buffers bodies uncompressed, so this is real resident bytes.
 # max_inflight_body_mb = 128
 
+# Wall-clock ceiling (seconds) for receiving a request body. A slow or stalled
+# upload is shed with 408 when the body hasn't fully arrived in time, releasing
+# its slice of the max_inflight_body_mb budget — otherwise a few hung
+# connections could pin the budget indefinitely. Default: 60. Set to 0 to disable.
+# body_read_timeout_secs = 60
+
 # Redis/Valkey URL for distributed state (multi-replica coordination).
 # When set, budget enforcement and hard-limit propagation use Redis for cross-replica sync.
 # Omit for single-instance deployments (local-only state).
