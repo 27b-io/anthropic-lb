@@ -238,6 +238,18 @@ struct RateLimitInfo {
     /// Counts consecutive burst 429s (no retry-after) for exponential backoff.
     /// Reset to 0 on any successful response.
     consecutive_burst_429s: u32,
+    /// Consecutive upstream transport failures (ETIMEDOUT/reset/closed/DNS).
+    /// Transport health, NOT rate-limit state — independent of
+    /// hard_limited_until, and deliberately process-scoped (never persisted or
+    /// Redis-synced, same as `upstream_transport_errors`): each replica has its
+    /// own egress path, so another replica's connectivity says nothing about ours.
+    consecutive_transport_failures: u32,
+    /// Circuit breaker: while set and in the future, the endpoint is excluded
+    /// from `routing_candidates` so a stateless affinity recompute cannot snap
+    /// a session back to a persistently-dead endpoint every request. Opened
+    /// after TRANSPORT_FAILURE_THRESHOLD consecutive transport failures;
+    /// cleared on any successful forward or after the cooldown elapses.
+    transport_unhealthy_until: Option<Instant>,
     #[allow(dead_code)]
     last_updated: Option<Instant>,
     /// Wall-clock epoch of last update, for cross-replica age comparison.
@@ -495,6 +507,10 @@ struct AppState {
     robin: AtomicUsize,
     routing_strategy: RoutingStrategy,
     cooldown: Duration,
+    /// How long a transport-circuit-broken endpoint stays out of routing.
+    /// TRANSPORT_UNHEALTHY_COOLDOWN in production; overridable so tests can
+    /// exercise breaker re-entry without a 30s sleep.
+    transport_cooldown: Duration,
     state_path: PathBuf,
     proxy_key: Option<String>,
     allowed_ips: Vec<IpAllowEntry>,
@@ -1468,6 +1484,20 @@ const TRANSIENT_BASE_DELAY: Duration = Duration::from_millis(150);
 /// instead of stalling through all MAX_529_RETRIES rounds of connect timeouts.
 const MAX_TRANSIENT_RETRIES: u32 = 1;
 
+/// Consecutive transport failures before an endpoint is circuit-broken out of
+/// the routing candidate set. One dead-endpoint request contributes at most 2
+/// failures (round-0 in-place retry + round 1), so 3 only trips across ≥2
+/// separate requests — a sub-second blip (which round-gating rides out) cannot
+/// open the breaker, only a persistently-dead endpoint can.
+const TRANSPORT_FAILURE_THRESHOLD: u32 = 3;
+
+/// How long a circuit-broken endpoint stays out of the candidate set. Bounds
+/// the affinity tax: without the breaker a stateless affinity recompute snaps
+/// back to the dead endpoint every request (~8s of connect timeouts each);
+/// with it, at most ~1.5 requests per cooldown window pay the probe cost.
+/// ponytail: constant, add a config knob if operators ever need to tune it.
+const TRANSPORT_UNHEALTHY_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// Sentinel value written to `alb:hard:{account}` when a replica has observed
 /// recovery from a hard rate limit. Other replicas interpret this as an
 /// instruction to proactively clear their local `hard_limited_until`, which
@@ -2058,9 +2088,27 @@ impl AppState {
             }
             match ep.protocol {
                 Protocol::OpenAI => {
-                    // OpenAI endpoints carry no rate-limit data — push a fixed candidate
-                    // at the configured priority. This is one of the three named
-                    // `match protocol` sites (see Endpoint struct docs).
+                    // OpenAI endpoints carry no rate-limit data, but they DO
+                    // carry transport health — a circuit-broken endpoint leaves
+                    // the pool the same way an Anthropic one does. If the whole
+                    // pool is circuit-broken this fails closed (429), matching
+                    // the hard-limited precedent; the cooldown bounds the window.
+                    {
+                        let info = ep.rate_info.read().await;
+                        if let Some(until) = info.transport_unhealthy_until {
+                            if now < until {
+                                trace!(
+                                    endpoint = ep.name,
+                                    unhealthy_secs = until.duration_since(now).as_secs(),
+                                    "pick: skipping transport-unhealthy endpoint"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    // Push a fixed candidate at the configured priority. This
+                    // is one of the three named `match protocol` sites (see
+                    // Endpoint struct docs).
                     trace!(
                         endpoint = ep.name,
                         priority = ep.priority,
@@ -2085,6 +2133,18 @@ impl AppState {
                                 endpoint = ep.name,
                                 hard_limited_secs = until.duration_since(now).as_secs(),
                                 "pick: skipping hard-limited endpoint"
+                            );
+                            continue;
+                        }
+                    }
+                    // Transport circuit breaker — independent of the 429 path
+                    // above (rate limit ≠ transport health).
+                    if let Some(until) = info.transport_unhealthy_until {
+                        if now < until {
+                            trace!(
+                                endpoint = ep.name,
+                                unhealthy_secs = until.duration_since(now).as_secs(),
+                                "pick: skipping transport-unhealthy endpoint"
                             );
                             continue;
                         }
@@ -3153,6 +3213,63 @@ impl AppState {
         // new routing gauge immediately rather than reading a stale
         // alb:weight:{account} until the next probe cycle.
         self.publish_routing_weights().await;
+    }
+
+    /// Record one upstream transport failure (ETIMEDOUT/reset/closed/DNS)
+    /// against an endpoint. After TRANSPORT_FAILURE_THRESHOLD consecutive
+    /// failures the endpoint is circuit-broken out of routing for
+    /// `transport_cooldown` so a stateless affinity recompute stops paying
+    /// ~2 connect timeouts per request against a persistently-dead endpoint.
+    /// Transport health only — never touches the 429 `hard_limited_until` path.
+    async fn record_transport_failure(&self, endpoint_idx: usize) {
+        let ep = &self.endpoints[endpoint_idx];
+        let mut info = ep.rate_info.write().await;
+        let now = Instant::now();
+        // Cooldown elapsed → fresh era: the expired breaker's failures don't
+        // carry over, so re-opening takes a full threshold of new evidence.
+        if info
+            .transport_unhealthy_until
+            .is_some_and(|until| now >= until)
+        {
+            info.transport_unhealthy_until = None;
+            info.consecutive_transport_failures = 0;
+        }
+        info.consecutive_transport_failures = info.consecutive_transport_failures.saturating_add(1);
+        if info.consecutive_transport_failures >= TRANSPORT_FAILURE_THRESHOLD
+            && info.transport_unhealthy_until.is_none()
+        {
+            info.transport_unhealthy_until = Some(now + self.transport_cooldown);
+            warn!(
+                endpoint = ep.name,
+                consecutive_failures = info.consecutive_transport_failures,
+                cooldown_secs = self.transport_cooldown.as_secs(),
+                "transport circuit-breaker OPEN: endpoint leaves the routing pool"
+            );
+        }
+    }
+
+    /// Clear transport-failure state after a successful forward (any HTTP
+    /// response proves the transport path is alive — even a 429 or 5xx).
+    async fn record_transport_success(&self, endpoint_idx: usize) {
+        let ep = &self.endpoints[endpoint_idx];
+        // Fast path: requests are overwhelmingly healthy-on-healthy; skip the
+        // write lock unless there is actually state to clear.
+        {
+            let info = ep.rate_info.read().await;
+            if info.consecutive_transport_failures == 0 && info.transport_unhealthy_until.is_none()
+            {
+                return;
+            }
+        }
+        let mut info = ep.rate_info.write().await;
+        if info.transport_unhealthy_until.is_some() {
+            info!(
+                endpoint = ep.name,
+                "transport circuit-breaker CLOSED: endpoint recovered"
+            );
+        }
+        info.consecutive_transport_failures = 0;
+        info.transport_unhealthy_until = None;
     }
 
     /// Sync shared state from Redis: hard limits + rate info.
@@ -4791,6 +4908,9 @@ async fn forward_anthropic(
             if let Ok(mut m) = state.upstream_transport_errors.lock() {
                 *m.entry(kind).or_insert(0) += 1;
             }
+            // Feed the per-endpoint circuit breaker: enough consecutive
+            // failures and this endpoint leaves the routing pool entirely.
+            state.record_transport_failure(endpoint_idx).await;
             // Transport-level send failure (ETIMEDOUT/reset/closed/DNS). Mark it
             // `transient`; rotation policy is round-gated and owned by the retry
             // loop (it knows `retry_round`), so `push_skip` stays false here —
@@ -4806,6 +4926,9 @@ async fn forward_anthropic(
 
     let status = resp.status();
     ep.requests.fetch_add(1, Ordering::Relaxed);
+    // Any HTTP response (even 429/5xx) proves the transport path is alive —
+    // clear the circuit-breaker counter.
+    state.record_transport_success(endpoint_idx).await;
 
     // Debug: dump all response headers
     if tracing::enabled!(tracing::Level::DEBUG) {
@@ -5270,8 +5393,8 @@ async fn proxy_handler(
         for _attempt in 0..n {
             // Pick the next endpoint and dispatch by protocol:
             // `forward_anthropic` (Anthropic) or `try_fallback_upstream`
-            // (OpenAI). The latter handles its `Option<Response>` inline by
-            // `return`/`continue`-ing.
+            // (OpenAI). Both return a `ForwardOutcome` so the shared
+            // round-gated policy in `apply_round_outcome` covers both.
             let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) =
                 match state.pick_endpoint(affinity, &model, &skip).await {
                     Some(i) => {
@@ -5298,7 +5421,7 @@ async fn proxy_handler(
                                 (out, i)
                             }
                             Protocol::OpenAI => {
-                                match try_fallback_upstream(
+                                let out = try_fallback_upstream(
                                     &state,
                                     &body_bytes,
                                     &req_id,
@@ -5307,14 +5430,8 @@ async fn proxy_handler(
                                     i,
                                     true,
                                 )
-                                .await
-                                {
-                                    Some(resp) => return resp,
-                                    None => {
-                                        skip.push(i);
-                                        continue;
-                                    }
-                                }
+                                .await;
+                                (out, i)
                             }
                         }
                     }
@@ -5356,9 +5473,12 @@ async fn proxy_handler(
 /// response back (`translate = true`); for OpenAI-format callers
 /// (`openai_chat_handler`) it forwards directly (`translate = false`).
 ///
-/// Returns `None` on upstream 429/5xx so the retry loop advances to the next
-/// candidate. Other 4xx (e.g. 400, 401) are returned to the caller as a final
-/// response — retry won't help on client-side errors.
+/// Returns `ForwardOutcome` so the caller's retry loop applies the SAME
+/// round-gated policy as the Anthropic path (`apply_round_outcome`): a
+/// transport send failure is `transient` (round 0 retries this endpoint in
+/// place, later rounds rotate, exhaustion is a retryable 503) and feeds the
+/// per-endpoint circuit breaker; upstream 429/5xx rotate immediately. Other
+/// 4xx (e.g. 400, 401) are `Done` — retry won't help on client-side errors.
 ///
 /// Only increments the endpoint's request counter; it does not call
 /// `record_usage` (OpenAI-compat responses don't carry the same usage signal we
@@ -5371,7 +5491,14 @@ async fn try_fallback_upstream(
     model: &str,
     endpoint_idx: usize,
     translate: bool, // true = Anthropic↔OpenAI translation needed
-) -> Option<Response> {
+) -> ForwardOutcome {
+    // Non-transient rotation: skip this endpoint and try the next candidate.
+    // Pre-dates the ForwardOutcome return type as a bare `None`.
+    const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
+        saw_529: false,
+        push_skip: true,
+        transient: false,
+    };
     let ep = &state.endpoints[endpoint_idx];
 
     info!(
@@ -5386,7 +5513,10 @@ async fn try_fallback_upstream(
     ep.requests.fetch_add(1, Ordering::Relaxed);
 
     // Parse once to extract streaming flag before potential translation
-    let parsed: serde_json::Value = serde_json::from_slice(body_bytes).ok()?;
+    let parsed: serde_json::Value = match serde_json::from_slice(body_bytes) {
+        Ok(v) => v,
+        Err(_) => return ROTATE,
+    };
     let is_streaming = parsed
         .get("stream")
         .and_then(|s| s.as_bool())
@@ -5395,7 +5525,10 @@ async fn try_fallback_upstream(
     // Build request body
     let request_body = if translate {
         let openai_body = translate_anthropic_request_to_openai(&parsed);
-        serde_json::to_vec(&openai_body).ok()?
+        match serde_json::to_vec(&openai_body) {
+            Ok(b) => b,
+            Err(_) => return ROTATE,
+        }
     } else {
         body_bytes.to_vec()
     };
@@ -5420,9 +5553,31 @@ async fn try_fallback_upstream(
                 detail = %describe_reqwest_error(&e),
                 "fallback: unified OpenAI endpoint request failed"
             );
-            return None;
+            // Same dashboard counter the Anthropic forward paths feed.
+            let kind = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else {
+                "other"
+            };
+            if let Ok(mut m) = state.upstream_transport_errors.lock() {
+                *m.entry(kind).or_insert(0) += 1;
+            }
+            // Health signal + transient classification — closes the #69 gap
+            // where this branch swallowed transport errors to a bare `None`.
+            state.record_transport_failure(endpoint_idx).await;
+            return ForwardOutcome::Retry {
+                saw_529: false,
+                push_skip: false,
+                transient: true,
+            };
         }
     };
+
+    // Any HTTP response (even 429/5xx) proves the transport path is alive —
+    // clear the circuit-breaker counter.
+    state.record_transport_success(endpoint_idx).await;
 
     let status = resp.status();
     if !status.is_success() {
@@ -5430,7 +5585,7 @@ async fn try_fallback_upstream(
             .text()
             .await
             .unwrap_or_else(|_| "upstream error".to_string());
-        // Retry-eligible: 429 or 5xx → return None so the retry loop advances
+        // Retry-eligible: 429 or 5xx → rotate so the retry loop advances
         // to the next candidate.
         if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
             warn!(
@@ -5440,7 +5595,7 @@ async fn try_fallback_upstream(
                 body = %err_body,
                 "fallback: unified endpoint returned retry-eligible error, advancing"
             );
-            return None;
+            return ROTATE;
         }
         warn!(
             req_id,
@@ -5451,7 +5606,7 @@ async fn try_fallback_upstream(
         );
         if translate {
             // Return error in Anthropic format
-            return Some(
+            return ForwardOutcome::Done(
                 Response::builder()
                     .status(status)
                     .header("content-type", "application/json")
@@ -5470,7 +5625,7 @@ async fn try_fallback_upstream(
                     }),
             );
         }
-        return Some(
+        return ForwardOutcome::Done(
             Response::builder()
                 .status(status)
                 .header("content-type", "application/json")
@@ -5616,7 +5771,7 @@ async fn try_fallback_upstream(
             );
         });
 
-        return Some(
+        return ForwardOutcome::Done(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/event-stream")
@@ -5635,8 +5790,10 @@ async fn try_fallback_upstream(
     let resp_body = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
+            // Mid-body failure after a received response: transport reached the
+            // upstream, so this is NOT a breaker signal — plain rotation.
             error!(req_id, error = %e, "fallback: failed to read unified endpoint response body");
-            return None;
+            return ROTATE;
         }
     };
 
@@ -5649,7 +5806,7 @@ async fn try_fallback_upstream(
             upstream = ep.name,
             "fallback: unified endpoint translated response"
         );
-        Some(
+        ForwardOutcome::Done(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
@@ -5664,7 +5821,7 @@ async fn try_fallback_upstream(
             upstream = ep.name,
             "fallback: unified endpoint forwarded response"
         );
-        Some(
+        ForwardOutcome::Done(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
@@ -8382,6 +8539,9 @@ async fn forward_openai_compat_anthropic(
             if let Ok(mut m) = state.upstream_transport_errors.lock() {
                 *m.entry(kind).or_insert(0) += 1;
             }
+            // Feed the per-endpoint circuit breaker: enough consecutive
+            // failures and this endpoint leaves the routing pool entirely.
+            state.record_transport_failure(endpoint_idx).await;
             // Transport-level send failure (ETIMEDOUT/reset/closed/DNS). Mark it
             // `transient`; rotation policy is round-gated and owned by the retry
             // loop (it knows `retry_round`), so `push_skip` stays false here —
@@ -8397,6 +8557,9 @@ async fn forward_openai_compat_anthropic(
 
     let status = resp.status();
     ep.requests.fetch_add(1, Ordering::Relaxed);
+    // Any HTTP response (even 429/5xx) proves the transport path is alive —
+    // clear the circuit-breaker counter.
+    state.record_transport_success(endpoint_idx).await;
     state
         .update_rate_info_for(rate_info, endpoint_name, resp.headers())
         .await;
@@ -8856,10 +9019,9 @@ async fn openai_chat_handler(
         let mut saw_529 = false;
         let mut saw_transient = false;
         for _attempt in 0..n {
-            // Pick the next endpoint and dispatch by protocol: Anthropic
-            // endpoints resolve to a `(ForwardOutcome, EndpointIdx)` pair;
-            // OpenAI endpoints handle their `Option<Response>` inline by
-            // `return`/`continue`-ing.
+            // Pick the next endpoint and dispatch by protocol. Both forwards
+            // return a `ForwardOutcome` so the shared round-gated policy in
+            // `apply_round_outcome` covers both.
             let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) =
                 match state.pick_endpoint(affinity, &model, &skip).await {
                     Some(i) => {
@@ -8889,7 +9051,7 @@ async fn openai_chat_handler(
                             Protocol::OpenAI => {
                                 // The endpoint is OpenAI-native — forward the
                                 // original request body without translation.
-                                match try_fallback_upstream(
+                                let out = try_fallback_upstream(
                                     &state,
                                     &body_bytes,
                                     &req_id,
@@ -8898,14 +9060,8 @@ async fn openai_chat_handler(
                                     i,
                                     false,
                                 )
-                                .await
-                                {
-                                    Some(resp) => return resp,
-                                    None => {
-                                        skip.push(i);
-                                        continue;
-                                    }
-                                }
+                                .await;
+                                (out, i)
                             }
                         }
                     }
@@ -9283,6 +9439,7 @@ async fn main() {
         robin: AtomicUsize::new(0),
         routing_strategy,
         cooldown,
+        transport_cooldown: TRANSPORT_UNHEALTHY_COOLDOWN,
         state_path,
         proxy_key: config.proxy_key.clone(),
         allowed_ips,
@@ -9818,6 +9975,7 @@ token = "sk-ant-test"
             robin: AtomicUsize::new(0),
             routing_strategy: RoutingStrategy::default(),
             cooldown: Duration::from_secs(60),
+            transport_cooldown: TRANSPORT_UNHEALTHY_COOLDOWN,
             state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
             proxy_key: None,
             allowed_ips: vec![],
@@ -13155,11 +13313,21 @@ token = "sk-ant-test"
         test_app_with_strategy(upstream_url, proxy_key, RoutingStrategy::default())
     }
 
-    /// Raw-TCP upstream that RSTs its FIRST connection (→ a reqwest transport
-    /// error, i.e. a `transient` `ForwardOutcome`) then serves a valid Anthropic
-    /// 200 on every later connection. Returns `(base_url, per_connection_hits)`.
-    /// Used to simulate a sub-second egress blip that recovers.
-    async fn spawn_blip_upstream() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    /// Minimal valid Anthropic messages response, served by the raw-TCP mocks.
+    const ANTHROPIC_OK_BODY: &[u8] = br#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"model":"test","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+
+    /// Minimal valid OpenAI chat-completion response, for `Protocol::OpenAI`
+    /// endpoint mocks (`try_fallback_upstream` translates it back to Anthropic).
+    const OPENAI_OK_BODY: &[u8] = br#"{"id":"chatcmpl-1","object":"chat.completion","model":"test","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+
+    /// Raw-TCP upstream that RSTs its first `dead_first` connections (each → a
+    /// reqwest transport error, i.e. a `transient` `ForwardOutcome`) then serves
+    /// `body` as an HTTP 200 on every later connection. Returns
+    /// `(base_url, per_connection_hits)`. `usize::MAX` = dead forever.
+    async fn spawn_flaky_upstream(
+        dead_first: usize,
+        body: &'static [u8],
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13170,13 +13338,12 @@ token = "sk-ant-test"
         tokio::spawn(async move {
             loop {
                 let (mut s, _) = listener.accept().await.unwrap();
-                if h.fetch_add(1, Ordering::SeqCst) == 0 {
-                    drop(s); // first connection: reset before responding → transport error
+                if h.fetch_add(1, Ordering::SeqCst) < dead_first {
+                    drop(s); // reset before responding → transport error
                     continue;
                 }
                 let mut buf = [0u8; 4096];
                 let _ = s.read(&mut buf).await; // drain the request before responding
-                let body = br#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"model":"test","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
                 let head = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     body.len()
@@ -13187,6 +13354,12 @@ token = "sk-ant-test"
             }
         });
         (format!("http://{addr}"), hits)
+    }
+
+    /// Raw-TCP upstream that RSTs its FIRST connection then serves a valid
+    /// Anthropic 200 on every later connection — a sub-second egress blip.
+    async fn spawn_blip_upstream() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        spawn_flaky_upstream(1, ANTHROPIC_OK_BODY).await
     }
 
     // ── Task 2: round-gated transient backoff-retry ─────────────────────
@@ -13310,6 +13483,291 @@ token = "sk-ant-test"
         assert!(
             resp.headers().get("retry-after").is_some(),
             "503 exhaustion should carry Retry-After so the client times its backoff"
+        );
+    }
+
+    // ── #70: transport circuit-breaker for persistently-dead endpoints ──
+
+    /// A persistently-dead endpoint must leave the routing pool after
+    /// TRANSPORT_FAILURE_THRESHOLD consecutive transport failures, and the
+    /// session must migrate ONCE to a healthy endpoint instead of paying the
+    /// affinity tax (two connect stalls) on every request. The dead endpoint
+    /// sits at priority 0 so routing MUST pick it until the breaker opens —
+    /// affinity cannot dodge it — making the hit counters deterministic.
+    #[tokio::test]
+    async fn dead_endpoint_circuit_breaks_and_session_migrates_once() {
+        use std::sync::atomic::Ordering;
+        let (dead_url, dead_hits) = spawn_flaky_upstream(usize::MAX, ANTHROPIC_OK_BODY).await;
+        let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+        let dead = mk_endpoint_at("dead", "sk-ant-api-aaa", &dead_url); // priority 0
+        let mut ok = mk_endpoint_at("ok", "sk-ant-api-bbb", &ok_url);
+        ok.priority = 1;
+        let state = test_state_with(vec![dead, ok]);
+        let probe = state.clone();
+        let addr = serve(build_router(state)).await;
+
+        let client = reqwest::Client::new();
+        for i in 0..4 {
+            let resp = client
+                .post(format!("http://{addr}/v1/messages"))
+                .header("content-type", "application/json")
+                .header("x-client-id", "sticky")
+                .header("x-session-id", "sticky")
+                .body(
+                    r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::OK,
+                "request {i} must succeed via the healthy endpoint"
+            );
+        }
+
+        // req1: round 0 + round 1 fail (2 hits); req2: round 0 fails (3rd hit,
+        // breaker opens). req3/req4 must NOT touch the dead endpoint at all.
+        let (d, o) = (
+            dead_hits.load(Ordering::SeqCst),
+            ok_hits.load(Ordering::SeqCst),
+        );
+        assert_eq!(
+            d, 3,
+            "dead endpoint must stop being dialed once the breaker opens (dead_hits={d})"
+        );
+        assert_eq!(
+            o, 4,
+            "every request must be served by the healthy endpoint exactly once (ok_hits={o})"
+        );
+
+        // Breaker is transport state, NOT rate-limit state.
+        let info = probe.endpoints[0].rate_info.read().await;
+        assert!(
+            info.transport_unhealthy_until.is_some(),
+            "breaker must be open on the dead endpoint"
+        );
+        assert!(
+            info.hard_limited_until.is_none(),
+            "transport breaker must stay independent of the 429 hard-limit path"
+        );
+    }
+
+    /// A recovered endpoint re-enters the pool after the cooldown window, and a
+    /// successful forward clears the failure counter and the breaker.
+    #[tokio::test]
+    async fn circuit_broken_endpoint_reenters_after_cooldown() {
+        use std::sync::atomic::Ordering;
+        // Dead for exactly 3 connections (the breaker threshold), then healthy.
+        let (flaky_url, flaky_hits) = spawn_flaky_upstream(3, ANTHROPIC_OK_BODY).await;
+        let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+        let flaky = mk_endpoint_at("flaky", "sk-ant-api-aaa", &flaky_url); // priority 0
+        let mut ok = mk_endpoint_at("ok", "sk-ant-api-bbb", &ok_url);
+        ok.priority = 1;
+        let state = Arc::new(AppState {
+            endpoints: vec![flaky, ok],
+            transport_cooldown: Duration::from_millis(500),
+            ..test_state_base()
+        });
+        let probe = state.clone();
+        let addr = serve(build_router(state)).await;
+
+        let client = reqwest::Client::new();
+        let send = |i: u32| {
+            let client = client.clone();
+            async move {
+                let resp = client
+                    .post(format!("http://{addr}/v1/messages"))
+                    .header("content-type", "application/json")
+                    .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    resp.status(),
+                    reqwest::StatusCode::OK,
+                    "request {i} must succeed"
+                );
+            }
+        };
+
+        // req1 (2 failures) + req2 (3rd failure → breaker opens) + req3 (skips
+        // the broken endpoint entirely).
+        for i in 1..=3 {
+            send(i).await;
+        }
+        assert_eq!(flaky_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(ok_hits.load(Ordering::SeqCst), 3);
+
+        // Let the cooldown elapse; the endpoint (now healthy) must re-enter at
+        // its priority-0 slot and serve the next request itself.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        send(4).await;
+        assert_eq!(
+            flaky_hits.load(Ordering::SeqCst),
+            4,
+            "recovered endpoint must re-enter the pool after the cooldown"
+        );
+        assert_eq!(
+            ok_hits.load(Ordering::SeqCst),
+            3,
+            "the fallback endpoint must NOT serve once the recovered endpoint is back"
+        );
+
+        // The successful forward must clear the breaker and the counter.
+        let info = probe.endpoints[0].rate_info.read().await;
+        assert_eq!(
+            info.consecutive_transport_failures, 0,
+            "failure counter must auto-clear on a successful forward"
+        );
+        assert!(
+            info.transport_unhealthy_until.is_none(),
+            "breaker must close on a successful forward"
+        );
+    }
+
+    /// The consecutive-failure counter starts a fresh era once the cooldown has
+    /// elapsed: an expired breaker's failures must not carry over, so re-opening
+    /// takes a full threshold of NEW evidence.
+    #[tokio::test]
+    async fn transport_failure_counter_era_resets_after_cooldown() {
+        let state = Arc::new(AppState {
+            endpoints: vec![mk_endpoint("a", "sk-ant-api-aaa")],
+            transport_cooldown: Duration::ZERO, // breaker expires immediately
+            ..test_state_base()
+        });
+        for _ in 0..TRANSPORT_FAILURE_THRESHOLD {
+            state.record_transport_failure(0).await;
+        }
+        {
+            let info = state.endpoints[0].rate_info.read().await;
+            assert_eq!(
+                info.consecutive_transport_failures,
+                TRANSPORT_FAILURE_THRESHOLD
+            );
+            assert!(
+                info.transport_unhealthy_until.is_some(),
+                "breaker must open at the threshold"
+            );
+        }
+        // Cooldown (zero) has elapsed → the next failure is the FIRST of a new
+        // era, not the fourth of the old one.
+        state.record_transport_failure(0).await;
+        let info = state.endpoints[0].rate_info.read().await;
+        assert_eq!(
+            info.consecutive_transport_failures, 1,
+            "counter must reset to a fresh era after the cooldown elapses"
+        );
+        assert!(
+            info.transport_unhealthy_until.is_none(),
+            "one post-cooldown failure must not re-open the breaker"
+        );
+    }
+
+    /// A successful forward clears transport state only — it must not clobber
+    /// the (independent) 429 hard-limit path.
+    #[tokio::test]
+    async fn transport_success_clears_failures_and_leaves_hard_limit_alone() {
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-aaa")]);
+        state.record_transport_failure(0).await;
+        state.record_transport_failure(0).await;
+        {
+            let mut info = state.endpoints[0].rate_info.write().await;
+            info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+        }
+        state.record_transport_success(0).await;
+        let info = state.endpoints[0].rate_info.read().await;
+        assert_eq!(info.consecutive_transport_failures, 0);
+        assert!(info.transport_unhealthy_until.is_none());
+        assert!(
+            info.hard_limited_until.is_some(),
+            "clearing transport health must not clear the 429 hard limit"
+        );
+    }
+
+    /// Both protocol branches of `routing_candidates` must exclude a
+    /// transport-unhealthy endpoint while the breaker is open, and re-admit it
+    /// once the window has passed.
+    #[tokio::test]
+    async fn pick_endpoint_excludes_transport_unhealthy_endpoints() {
+        let anthropic = mk_endpoint("anth", "sk-ant-api-aaa");
+        let openai = make_endpoint("gw", Protocol::OpenAI);
+        let state = test_state_with(vec![anthropic, openai]);
+        for ep in &state.endpoints {
+            let mut info = ep.rate_info.write().await;
+            info.transport_unhealthy_until = Some(Instant::now() + Duration::from_secs(60));
+        }
+        assert!(
+            state.pick_endpoint(None, "", &[]).await.is_none(),
+            "both anthropic and openai endpoints must be excluded while unhealthy"
+        );
+        // Close the OpenAI endpoint's breaker → it must become pickable again.
+        {
+            let mut info = state.endpoints[1].rate_info.write().await;
+            info.transport_unhealthy_until = None;
+        }
+        assert_eq!(
+            state.pick_endpoint(None, "", &[]).await,
+            Some(1),
+            "a recovered endpoint must be pickable while the other stays excluded"
+        );
+    }
+
+    /// The #69 KNOWN GAP: a transport-dead `Protocol::OpenAI` endpoint used to
+    /// be swallowed to a bare `None` — no transient classification, so the
+    /// client got a misleading 429. It must exhaust as a retryable 503 exactly
+    /// like the Anthropic path.
+    #[tokio::test]
+    async fn proxy_returns_503_when_openai_endpoint_unreachable() {
+        let url = spawn_dead_upstream().await;
+        let mut gw = make_endpoint("gw", Protocol::OpenAI);
+        gw.base_url = url;
+        let state = test_state_with(vec![gw]);
+        let addr = serve(build_router(state)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "a transport-dead OpenAI endpoint must exhaust as a retryable 503, not 429"
+        );
+        assert!(
+            resp.headers().get("retry-after").is_some(),
+            "transient exhaustion must carry Retry-After"
+        );
+    }
+
+    /// The OpenAI branch must also get #69's round-gated in-place retry: a
+    /// single-blip OpenAI endpoint recovers to a 200 instead of failing the
+    /// round (previously: swallowed to `None` → skip → premature 429).
+    #[tokio::test]
+    async fn openai_endpoint_rides_out_transient_blip() {
+        let (url, _hits) = spawn_flaky_upstream(1, OPENAI_OK_BODY).await;
+        let mut gw = make_endpoint("gw", Protocol::OpenAI);
+        gw.base_url = url;
+        let state = test_state_with(vec![gw]);
+        let addr = serve(build_router(state)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "an OpenAI endpoint blip must be retried in place, not fail the request"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["type"], "message",
+            "response must be translated back to Anthropic format"
         );
     }
 
@@ -21818,7 +22276,7 @@ listen = "127.0.0.1:8082"
     // ── Unified endpoint: fallback retry semantics ─────────────────
 
     #[tokio::test]
-    async fn try_fallback_upstream_returns_none_on_429() {
+    async fn try_fallback_upstream_rotates_on_429() {
         // Mock upstream returns 429
         let app = Router::new().fallback(any(|| async {
             (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response()
@@ -21846,13 +22304,20 @@ listen = "127.0.0.1:8082"
         )
         .await;
         assert!(
-            result.is_none(),
-            "429 must return None for retry, not Response"
+            matches!(
+                result,
+                ForwardOutcome::Retry {
+                    push_skip: true,
+                    transient: false,
+                    ..
+                }
+            ),
+            "429 must rotate (skip) — an HTTP error is not a transport failure"
         );
     }
 
     #[tokio::test]
-    async fn try_fallback_upstream_returns_none_on_500() {
+    async fn try_fallback_upstream_rotates_on_500() {
         let app = Router::new().fallback(any(|| async {
             (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
         }));
@@ -21878,7 +22343,57 @@ listen = "127.0.0.1:8082"
             false,
         )
         .await;
-        assert!(result.is_none(), "500 must return None for retry");
+        assert!(
+            matches!(
+                result,
+                ForwardOutcome::Retry {
+                    push_skip: true,
+                    transient: false,
+                    ..
+                }
+            ),
+            "500 must rotate (skip) — an HTTP error is not a transport failure"
+        );
+    }
+
+    /// Transport send failures on the OpenAI branch must be classified
+    /// `transient` (round-gated retry) AND feed the circuit breaker — the #69
+    /// gap where they were swallowed to a bare `None` with no health signal.
+    #[tokio::test]
+    async fn try_fallback_upstream_transport_error_is_transient_and_counted() {
+        let url = spawn_dead_upstream().await;
+        let mut state = test_state_with(vec![]);
+        let mut ep = make_endpoint("dead-gw", Protocol::OpenAI);
+        ep.base_url = url;
+        Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+        let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+        let result = try_fallback_upstream(
+            &state,
+            body,
+            "req-1",
+            "client-1",
+            "claude-opus-4-7",
+            0,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                ForwardOutcome::Retry {
+                    push_skip: false,
+                    transient: true,
+                    ..
+                }
+            ),
+            "a transport send failure must be transient (round-gated), not a plain skip"
+        );
+        let info = state.endpoints[0].rate_info.read().await;
+        assert_eq!(
+            info.consecutive_transport_failures, 1,
+            "the transport failure must feed the per-endpoint circuit breaker"
+        );
     }
     // ── Unified endpoint: cross-protocol handler routing ───────────
 
