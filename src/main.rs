@@ -526,10 +526,12 @@ struct AppState {
     /// Priority penalty added to an endpoint's effective priority while it serves
     /// via overage. Default: 10.
     overage_penalty: u32,
-    /// Count of upstream transport send-failures, keyed by kind
-    /// (`timeout`/`connect`/`other`). Surfaces a flaky egress on the dashboard
-    /// (`anthropic_upstream_transport_errors_total`) before it becomes client
-    /// errors. Process-scoped; not persisted or Redis-synced.
+    /// Per-tick DELTA accumulator of upstream transport send-failures, keyed
+    /// by kind (`timeout`/`connect`/`other`). Surfaces a flaky egress on the
+    /// dashboard (`anthropic_upstream_transport_errors_total`) before it
+    /// becomes client errors. Drained into the shared Redis hash each sync
+    /// tick (`flush_transport_errors`); without Redis it simply accumulates
+    /// and feeds `/metrics` directly. Not persisted across restarts.
     upstream_transport_errors: Mutex<HashMap<&'static str, u64>>,
     /// Current sum of reserved in-flight request-body bytes (admission control).
     inflight_body_bytes: AtomicU64,
@@ -3169,6 +3171,22 @@ impl AppState {
         }
     }
 
+    /// Lock the transport-error accumulator, recovering — and clearing — a
+    /// poisoned lock. The map is a plain counter store: a panicking holder
+    /// cannot leave it logically inconsistent, only stale by one increment.
+    /// Clearing the poison matters because the other lock sites (the two
+    /// increment paths and the local `/metrics` fallback) use `if let Ok` /
+    /// `.map()` and would otherwise silently skip forever after one panic.
+    fn lock_transport_errors(&self) -> std::sync::MutexGuard<'_, HashMap<&'static str, u64>> {
+        match self.upstream_transport_errors.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                self.upstream_transport_errors.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Flush this replica's accumulated transport-error deltas into the shared
     /// Redis hash (`TRANSPORT_ERRORS_KEY`) so the fleet-wide count is visible
     /// cluster-wide. `upstream_transport_errors` is a DELTA accumulator: it is
@@ -3177,7 +3195,8 @@ impl AppState {
     /// ticks). On Redis failure the drained deltas are returned to the local
     /// map — they retry next tick and stay visible via the local metrics
     /// fallback rather than being lost. No-op without Redis, so single-instance
-    /// deployments keep accumulating locally.
+    /// deployments keep accumulating locally; on an idle tick the TTL is still
+    /// refreshed so the fleet-wide hash never expires under healthy traffic.
     async fn flush_transport_errors(&self) {
         let redis = match &self.redis {
             Some(r) => r,
@@ -3186,16 +3205,26 @@ impl AppState {
 
         // Drain the accumulator atomically: take the deltas AND reset to empty
         // under one lock, so any increment arriving mid-flush belongs to the
-        // NEXT tick's delta and cannot be double-flushed. Recover a poisoned
-        // lock — a stale count must not wedge the flush loop forever.
+        // NEXT tick's delta and cannot be double-flushed.
         let deltas: Vec<(&'static str, u64)> = {
-            let mut m = match self.upstream_transport_errors.lock() {
-                Ok(m) => m,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut m = self.lock_transport_errors();
             m.drain().filter(|(_, n)| *n > 0).collect()
         };
         if deltas.is_empty() {
+            // No new errors this tick — still refresh the TTL. The hash must
+            // only expire once the whole fleet has been down for the TTL
+            // window; skipping this would wipe the fleet-wide counter after
+            // 48h of perfectly healthy, error-free traffic. EXPIRE on a
+            // not-yet-existing key is a no-op, so this is safe pre-first-error.
+            let mut conn = redis.clone();
+            let result: redis::RedisResult<()> = redis::cmd("EXPIRE")
+                .arg(TRANSPORT_ERRORS_KEY)
+                .arg(TRANSPORT_ERRORS_TTL_SECS)
+                .query_async(&mut conn)
+                .await;
+            if let Err(e) = result {
+                warn!(error = %e, "redis EXPIRE failed for transport-errors TTL refresh");
+            }
             return;
         }
 
@@ -3227,10 +3256,11 @@ impl AppState {
             // budget would wrongly throttle a client.) The deltas also stay
             // visible via the local metrics fallback until Redis heals.
             warn!(error = %e, "redis HINCRBY failed for transport errors; re-queuing deltas locally");
-            if let Ok(mut m) = self.upstream_transport_errors.lock() {
-                for (kind, n) in deltas {
-                    *m.entry(kind).or_insert(0) += n;
-                }
+            // Poison-recovering lock: an `if let Ok` here would silently DROP
+            // every drained delta if the mutex got poisoned mid-cycle.
+            let mut m = self.lock_transport_errors();
+            for (kind, n) in deltas {
+                *m.entry(kind).or_insert(0) += n;
             }
         }
     }
@@ -13334,6 +13364,42 @@ token = "sk-ant-test"
             "local accumulator must be retained without redis"
         );
         assert_eq!(m.get("connect"), Some(&1));
+    }
+
+    /// A panicked lock-holder must not wedge the accumulator: recovery clears
+    /// the poison so the drain, the re-queue-on-redis-failure path, and every
+    /// `if let Ok` increment/metrics site keep working afterwards.
+    #[tokio::test]
+    async fn transport_errors_lock_recovers_and_clears_poison() {
+        let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-aaa")]);
+        // Poison the mutex by panicking while holding the guard.
+        {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let _g = state.upstream_transport_errors.lock().unwrap();
+                panic!("poison the transport-error mutex");
+            })
+            .join()
+            .unwrap_err();
+        }
+        assert!(state.upstream_transport_errors.is_poisoned());
+        {
+            let mut m = state.lock_transport_errors();
+            *m.entry("timeout").or_insert(0) += 3;
+        }
+        assert!(
+            !state.upstream_transport_errors.is_poisoned(),
+            "recovery must clear the poison, not just bypass it"
+        );
+        // Plain `lock()` sites (increments, metrics fallback) work again.
+        assert_eq!(
+            state
+                .upstream_transport_errors
+                .lock()
+                .unwrap()
+                .get("timeout"),
+            Some(&3)
+        );
     }
 
     /// AC3 (aggregate exposed): when the sync task has cached a fleet-wide
