@@ -162,7 +162,7 @@ token = "sk-ant-api03-..."
 | `redis_url` | `String?` | `None` | Redis/Valkey URL for distributed state |
 | `endpoints[].name` | `String` | — | Display name for the endpoint |
 | `endpoints[].protocol` | `String` | `"anthropic"` | `"anthropic"` (default) or `"openai"` |
-| `endpoints[].base_url` | `String?` | `api.anthropic.com` | Base URL; required and must be `https://` for `openai` |
+| `endpoints[].base_url` | `String?` | `https://api.anthropic.com` | Base URL; required and must be `https://` for `openai` |
 | `endpoints[].token` | `String` | — | API key, OAuth token, or `"passthrough"` |
 | `endpoints[].models` | `[String]` | `[]` | Model allowlist (empty = all) |
 | `endpoints[].priority` | `u32` | `0` | Priority tier (lower tried first) |
@@ -308,7 +308,7 @@ All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
       "priority": 100,
       "passthrough": false,
       "requests_total": 87,
-      "utilization": 0.0,
+      "utilization": null,
       "token_usage": {
         "input_tokens": 210000,
         "output_tokens": 15000,
@@ -329,7 +329,7 @@ All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
     "alice": { "daily_limit": 5000000, "used_today": 1915000, "remaining": 3085000 }
   },
   "aggregate": {
-    "total_headroom_requests": 84000,
+    "total_headroom_requests": null,
     "consumers": {
       "alice": { "share": 0.65, "requests_per_minute": 4.2 }
     }

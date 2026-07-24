@@ -69,7 +69,7 @@ cargo test --test dependency_test
 
 #### Routing Tests
 ```bash
-cargo test pick_account
+cargo test pick_endpoint
 ```
 
 #### Time & Utilization Tests
@@ -257,19 +257,29 @@ async fn test_handler() {
 #[tokio::test]
 async fn test_routing() {
     let state = test_state_with(vec![
-        make_account("a", "sk-ant-api-a"),
-        make_account("b", "sk-ant-api-b"),
+        mk_endpoint("high", "sk-ant-api-high"),
+        mk_endpoint("low", "sk-ant-api-low"),
     ]);
 
-    // Set utilization
+    // high=0.8 (headroom 0.2), low=0.2 (headroom 0.8) → ~80% should go to "low"
     {
-        let mut info = state.accounts[0].rate_info.write().await;
+        let mut info = state.endpoints[0].rate_info.write().await;
         info.utilization = Some(0.8);
     }
+    {
+        let mut info = state.endpoints[1].rate_info.write().await;
+        info.utilization = Some(0.2);
+    }
 
-    // Test routing behavior
-    let idx = state.pick_account(None, "").await.unwrap();
-    assert_eq!(idx, 1); // Should pick account b
+    // Routing is headroom-proportional weighted bucket hashing — assert the
+    // traffic share, not a single deterministic pick
+    let mut counts = [0u32; 2];
+    for _ in 0..1000 {
+        let idx = state.pick_endpoint(None, "", &[]).await.unwrap();
+        counts[idx] += 1;
+    }
+    let low_pct = counts[1] as f64 / 1000.0;
+    assert!((0.75..=0.85).contains(&low_pct));
 }
 ```
 
