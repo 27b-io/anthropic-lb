@@ -40,7 +40,7 @@ Operational notes that affect the code:
 
 ## Architecture
 
-Single-file Rust binary (`src/main.rs`, ~12000 lines) with inline tests. No library crate — everything lives in one file with section markers.
+Single Rust binary: all implementation in `src/main.rs` (~9800 lines) with section markers; tests live in `src/tests.rs`, wired in as `#[path = "tests.rs"] mod tests;` (extracted from inline in LAB-367/#93). No library crate.
 
 ### Core Data Flow
 
@@ -59,7 +59,7 @@ Request → IP allowlist check → proxy_key auth → pre_request_gate(operator 
 | **Auto-cache** (`inject_cache_breakpoints`) | Injects up to 3 prompt cache breakpoints (last tool, system, last user message) unless cache_control already present |
 | **Handlers** | Four axum handlers: `proxy_handler` (main Anthropic proxy), `stats_handler` (`/_stats` JSON), `metrics_handler` (`/metrics` Prometheus), `openai_chat_handler` (OpenAI→Anthropic format translation) |
 | **OpenAI compatibility** (`translate_*`, `StreamContext`) | Translates `/v1/chat/completions` requests/responses between OpenAI and Anthropic formats, including streaming SSE |
-| **Tests** (`mod tests`) | Inline at bottom — unit + integration tests using mock upstream servers |
+| **Tests** (`mod tests` → `src/tests.rs`) | Unit + integration tests using mock upstream servers |
 
 ### Endpoint Selection (`pick_endpoint`)
 

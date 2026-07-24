@@ -13134,18 +13134,16 @@ fn request_wants_stream_true_only_for_explicit_stream_true() {
 }
 
 #[test]
-fn nonstreaming_client_has_no_read_timeout_but_streaming_client_does() {
+fn upstream_client_builder_composes_with_and_without_read_timeout() {
     // Structural guard: both clients build from the shared knob chain; only the
     // streaming client layers read_timeout on top. reqwest doesn't expose its
-    // config, so assert the builders construct successfully and are distinct —
-    // the load-bearing difference is pinned by the builder call sites in main().
-    let streaming = upstream_client_builder()
+    // config, so all this can assert is that both builders construct — the
+    // load-bearing read_timeout split is pinned by the call sites in main().
+    let _streaming = upstream_client_builder()
         .read_timeout(Duration::from_secs(180))
         .build()
         .expect("streaming client builds");
-    let nonstreaming = upstream_client_builder()
+    let _nonstreaming = upstream_client_builder()
         .build()
         .expect("non-streaming client builds");
-    // Client is Arc-backed; two builds are distinct pools.
-    assert!(!std::ptr::eq(&streaming, &nonstreaming));
 }
