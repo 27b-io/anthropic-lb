@@ -508,6 +508,15 @@ impl Endpoint {
 
 struct AppState {
     client: Client,
+    /// Upstream client for NON-streaming requests (`"stream"` false/absent).
+    /// A non-streaming `/v1/messages` emits ZERO response bytes until
+    /// generation completes, so `client`'s read_timeout — tuned for SSE
+    /// inter-chunk silence — kills any generation longer than 180s as
+    /// "operation timed out" (LAB-718 GEO judge wedge, 2026-07-24: ~20k-token
+    /// structured-output calls died 18×/hour across 9 accounts and the SDK
+    /// retried for hours). No read_timeout here; the 900s total budget is the
+    /// only cap, and the h2 keep-alive PING still evicts dead connections.
+    client_nonstreaming: Client,
     /// Unified routing endpoints — the sole endpoint pool.
     endpoints: Vec<Endpoint>,
     robin: AtomicUsize,
@@ -4880,6 +4889,34 @@ fn exhaustion_response(last_saw_transient: bool, last_saw_529: bool) -> Response
 /// detached 'static task that must re-borrow the endpoint from a cloned
 /// Arc<AppState> — a borrowed &Endpoint cannot cross the spawn boundary,
 /// so the task captures the Copy `endpoint_idx` and re-indexes.
+/// Shared knob chain for both upstream clients — `client` layers the SSE-tuned
+/// `read_timeout` on top; `client_nonstreaming` takes it as-is (LAB-718).
+fn upstream_client_builder() -> reqwest::ClientBuilder {
+    Client::builder()
+        .timeout(Duration::from_secs(900))
+        // 4s (was 10): a blackholed connect fails fast so the transient
+        // backoff-retry recovers in seconds. pool_idle_timeout stays 300s —
+        // it keeps conns warm across Claude Code think-pauses.
+        .connect_timeout(Duration::from_secs(4))
+        .tcp_keepalive(Duration::from_secs(30))
+        .http2_keep_alive_interval(Duration::from_secs(20))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_while_idle(true)
+        .pool_idle_timeout(Duration::from_secs(300))
+}
+
+/// True when the request body asks for SSE (`"stream": true`). Absent flag or
+/// an unparseable body counts as non-streaming — Anthropic's default. Parsing
+/// the body again here (it was already parsed for fingerprints/cache
+/// injection) costs microseconds against a multi-second LLM call and keeps
+/// the wide `forward_anthropic` signature unchanged.
+fn request_wants_stream(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+        .unwrap_or(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_anthropic(
     state: &Arc<AppState>,
@@ -4911,7 +4948,15 @@ async fn forward_anthropic(
             .unwrap_or("/")
     );
 
-    let mut upstream_req = state.client.request(parts.method.clone(), &url);
+    // Non-streaming requests get the client WITHOUT the SSE-tuned read_timeout:
+    // their only response bytes arrive when generation completes, so a
+    // read_timeout is a de-facto 180s cap on generation time (LAB-718).
+    let http_client = if request_wants_stream(body_bytes) {
+        &state.client
+    } else {
+        &state.client_nonstreaming
+    };
+    let mut upstream_req = http_client.request(parts.method.clone(), &url);
 
     // Forward headers
     let mut headers = parts.headers.clone();
@@ -5605,8 +5650,13 @@ async fn try_fallback_upstream(
 
     let url = format!("{}/v1/chat/completions", ep.base_url);
 
-    let mut resp = match state
-        .client
+    // Same non-streaming read_timeout exemption as forward_anthropic (LAB-718).
+    let http_client = if is_streaming {
+        &state.client
+    } else {
+        &state.client_nonstreaming
+    };
+    let mut resp = match http_client
         .post(&url)
         .header("authorization", format!("Bearer {}", ep.token))
         .header("content-type", "application/json")
@@ -8598,8 +8648,13 @@ async fn forward_openai_compat_anthropic(
         "openai-compat: upstream request"
     );
 
-    let upstream_req = state
-        .client
+    // Same non-streaming read_timeout exemption as forward_anthropic (LAB-718).
+    let http_client = if is_streaming {
+        &state.client
+    } else {
+        &state.client_nonstreaming
+    };
+    let upstream_req = http_client
         .request(reqwest::Method::POST, &url)
         .headers(headers)
         .body(body_str);
@@ -9500,20 +9555,17 @@ async fn main() {
         // handshake on every burst. read_timeout is set at 180s so Opus's
         // extended-thinking pauses (which can exceed 90s of inter-chunk
         // silence on deep reasoning) don't trip a false-positive interruption.
-        client: Client::builder()
-            .timeout(Duration::from_secs(900))
+        client: upstream_client_builder()
             .read_timeout(Duration::from_secs(180))
-            // 4s (was 10): a blackholed connect fails fast so the transient
-            // backoff-retry recovers in seconds. pool_idle_timeout stays 300s —
-            // it keeps conns warm across Claude Code think-pauses (see above).
-            .connect_timeout(Duration::from_secs(4))
-            .tcp_keepalive(Duration::from_secs(30))
-            .http2_keep_alive_interval(Duration::from_secs(20))
-            .http2_keep_alive_timeout(Duration::from_secs(10))
-            .http2_keep_alive_while_idle(true)
-            .pool_idle_timeout(Duration::from_secs(300))
             .build()
             .expect("failed to build HTTP client"),
+        // Same knobs MINUS read_timeout: a non-streaming response has no
+        // inter-chunk cadence to police — the only bytes arrive when
+        // generation finishes, so a read_timeout is a hard cap on generation
+        // time (LAB-718). The 900s total budget still bounds the request.
+        client_nonstreaming: upstream_client_builder()
+            .build()
+            .expect("failed to build non-streaming HTTP client"),
         endpoints,
         robin: AtomicUsize::new(0),
         routing_strategy,

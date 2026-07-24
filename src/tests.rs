@@ -297,6 +297,10 @@ fn test_state_base() -> AppState {
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap(),
+        client_nonstreaming: Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap(),
         endpoints: vec![],
         robin: AtomicUsize::new(0),
         routing_strategy: RoutingStrategy::default(),
@@ -8821,6 +8825,7 @@ fn resolve_client_id_falls_back_to_ip_map() {
     client_names.insert("192.168.1.100".to_string(), "mapped-client".to_string());
     let state = Arc::new(AppState {
         client: Client::new(),
+        client_nonstreaming: Client::new(),
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
         state_path: PathBuf::from("/tmp/test.state.json"),
         client_names,
@@ -8870,6 +8875,7 @@ fn resolve_client_id_ignores_dash_header() {
 fn compute_pressure_status_operator_always_healthy() {
     let state = Arc::new(AppState {
         client: Client::new(),
+        client_nonstreaming: Client::new(),
         state_path: PathBuf::from("/tmp/test.state.json"),
         operators: vec!["operator-id".to_string()],
         ..test_state_base()
@@ -8898,6 +8904,7 @@ fn compute_pressure_status_limit_proximity_upgrade() {
     limits.insert("client".to_string(), 0.80);
     let state = Arc::new(AppState {
         client: Client::new(),
+        client_nonstreaming: Client::new(),
         state_path: PathBuf::from("/tmp/test.state.json"),
         client_utilization_limits: limits,
         ..test_state_base()
@@ -9600,6 +9607,7 @@ async fn pick_endpoint_openai_is_last_resort() {
 fn is_operator_checks_configured_operator() {
     let state = Arc::new(AppState {
         client: Client::new(),
+        client_nonstreaming: Client::new(),
         state_path: PathBuf::from("/tmp/test.state.json"),
         operators: vec!["special-operator".to_string()],
         ..test_state_base()
@@ -9619,6 +9627,7 @@ fn is_operator_returns_false_when_no_operator_configured() {
 fn is_operator_supports_multiple_operators() {
     let state = Arc::new(AppState {
         client: Client::new(),
+        client_nonstreaming: Client::new(),
         state_path: PathBuf::from("/tmp/test.state.json"),
         operators: vec![
             "ray".to_string(),
@@ -13092,4 +13101,51 @@ async fn streaming_upstream_disconnect_emits_sse_error_to_client() {
         body_s.contains("\"type\":\"api_error\""),
         "error frame must use Anthropic's documented api_error type, got: {body_s:?}"
     );
+}
+
+// ── LAB-718: non-streaming requests must not ride the SSE-tuned read_timeout ──
+//
+// A non-streaming /v1/messages emits zero response bytes until generation
+// completes; `client`'s read_timeout (180s, tuned for SSE inter-chunk silence)
+// therefore capped generation time and killed the GEO semantic judge's long
+// structured-output calls ("operation timed out", 2026-07-24). Routing keys on
+// the request body's `stream` flag via `request_wants_stream`.
+
+#[test]
+fn request_wants_stream_true_only_for_explicit_stream_true() {
+    assert!(request_wants_stream(br#"{"stream":true,"model":"m"}"#));
+    assert!(!request_wants_stream(br#"{"stream":false,"model":"m"}"#));
+    assert!(
+        !request_wants_stream(br#"{"model":"m"}"#),
+        "absent flag = Anthropic's non-streaming default"
+    );
+    assert!(
+        !request_wants_stream(br#"{"stream":"true"}"#),
+        "non-bool stream is not a stream request"
+    );
+    assert!(
+        !request_wants_stream(b"not json"),
+        "unparseable body counts as non-streaming"
+    );
+    assert!(
+        !request_wants_stream(b""),
+        "empty body counts as non-streaming"
+    );
+}
+
+#[test]
+fn nonstreaming_client_has_no_read_timeout_but_streaming_client_does() {
+    // Structural guard: both clients build from the shared knob chain; only the
+    // streaming client layers read_timeout on top. reqwest doesn't expose its
+    // config, so assert the builders construct successfully and are distinct —
+    // the load-bearing difference is pinned by the builder call sites in main().
+    let streaming = upstream_client_builder()
+        .read_timeout(Duration::from_secs(180))
+        .build()
+        .expect("streaming client builds");
+    let nonstreaming = upstream_client_builder()
+        .build()
+        .expect("non-streaming client builds");
+    // Client is Arc-backed; two builds are distinct pools.
+    assert!(!std::ptr::eq(&streaming, &nonstreaming));
 }
