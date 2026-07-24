@@ -2956,7 +2956,7 @@ fn translate_response_basic() {
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 10, "output_tokens": 5}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, false);
     assert_eq!(result["id"], "chatcmpl-msg_abc123");
     assert_eq!(result["object"], "chat.completion");
     assert_eq!(result["choices"][0]["message"]["role"], "assistant");
@@ -2973,7 +2973,7 @@ fn translate_response_usage_mapping() {
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 25, "output_tokens": 15}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, false);
     assert_eq!(result["usage"]["prompt_tokens"], 25);
     assert_eq!(result["usage"]["completion_tokens"], 15);
     assert_eq!(result["usage"]["total_tokens"], 40);
@@ -3015,6 +3015,8 @@ fn strip_json_fences_with_whitespace() {
 
 #[test]
 fn translate_response_strips_markdown_fences() {
+    // Fence stripping is gated on the request having asked for
+    // response_format: json_object (json_mode = true).
     let resp = serde_json::json!({
         "id": "msg_fenced",
         "content": [{"type": "text", "text": "```json\n{\"skipSearch\": true}\n```"}],
@@ -3022,11 +3024,38 @@ fn translate_response_strips_markdown_fences() {
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 10, "output_tokens": 5}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, true);
     assert_eq!(
         result["choices"][0]["message"]["content"],
         r#"{"skipSearch": true}"#
     );
+}
+
+#[test]
+fn translate_response_preserves_fences_without_json_mode() {
+    // A normal chat reply that IS a fenced code block must pass through
+    // verbatim — fences, language tag, and surrounding whitespace intact.
+    let text = "```python\nprint(\"hi\")\n```";
+    let resp = serde_json::json!({
+        "id": "msg_code",
+        "content": [{"type": "text", "text": text}],
+        "model": "claude-sonnet-4-6",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    });
+    let result = translate_anthropic_to_openai(&resp, false);
+    assert_eq!(result["choices"][0]["message"]["content"], text);
+}
+
+#[test]
+fn wants_json_object_detection() {
+    assert!(wants_json_object(&serde_json::json!({
+        "response_format": {"type": "json_object"}
+    })));
+    assert!(!wants_json_object(&serde_json::json!({
+        "response_format": {"type": "text"}
+    })));
+    assert!(!wants_json_object(&serde_json::json!({})));
 }
 
 #[test]
@@ -3041,7 +3070,7 @@ fn translate_response_tool_use_blocks() {
         "stop_reason": "tool_use",
         "usage": {"input_tokens": 20, "output_tokens": 15}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, false);
     assert_eq!(result["choices"][0]["finish_reason"], "tool_calls");
     assert!(result["choices"][0]["message"]["content"].is_null());
     let tcs = result["choices"][0]["message"]["tool_calls"]
@@ -3069,7 +3098,7 @@ fn translate_response_mixed_text_and_tool_use() {
         "stop_reason": "tool_use",
         "usage": {"input_tokens": 10, "output_tokens": 10}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, false);
     assert_eq!(result["choices"][0]["message"]["content"], "Let me check.");
     let tcs = result["choices"][0]["message"]["tool_calls"]
         .as_array()
@@ -4575,6 +4604,72 @@ async fn openai_chat_non_streaming() {
     assert_eq!(body["usage"]["prompt_tokens"], 10);
     assert_eq!(body["usage"]["completion_tokens"], 5);
     assert_eq!(body["usage"]["total_tokens"], 15);
+}
+
+/// Mock whose reply IS a fenced code block — exercises the json_mode gate
+/// end-to-end (GH #95 / LAB-711).
+async fn mock_anthropic_fenced_handler(_req: Request<Body>) -> Response {
+    axum::Json(serde_json::json!({
+        "id": "msg_fenced",
+        "type": "message",
+        "content": [{"type": "text", "text": "```json\n{\"a\": 1}\n```"}],
+        "model": "claude-sonnet-4-6",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    }))
+    .into_response()
+}
+
+#[tokio::test]
+async fn openai_chat_fence_strip_gated_on_response_format() {
+    let mock_app = Router::new().fallback(any(mock_anthropic_fenced_handler));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let (app, _state) = test_openai_app(&format!("http://{}", mock_addr), None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let client = Client::new();
+
+    // Without response_format: fenced content passes through verbatim.
+    let resp = client
+        .post(format!("http://{}/v1/chat/completions", addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "```json\n{\"a\": 1}\n```",
+        "non-JSON-mode reply must not be mutated"
+    );
+
+    // With response_format json_object: fences stripped.
+    let resp = client
+        .post(format!("http://{}/v1/chat/completions", addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_object"}}"#)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"], r#"{"a": 1}"#,
+        "JSON-mode reply must have fences stripped"
+    );
 }
 
 #[tokio::test]

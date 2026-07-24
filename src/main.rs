@@ -7564,10 +7564,22 @@ async fn metrics_handler(
 
 // ── OpenAI compatibility ─────────────────────────────────────────────
 
+/// True when an OpenAI-format request asked for `response_format: json_object`.
+/// Single predicate shared by the request-side system nudge and the
+/// response-side fence strip so the two can never disagree on what JSON mode is.
+fn wants_json_object(body: &serde_json::Value) -> bool {
+    body.get("response_format")
+        .and_then(|rf| rf.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("json_object")
+}
+
 /// Strip markdown JSON fences from LLM output.
 /// Claude sometimes wraps JSON in ```json ... ``` even when told not to.
 /// Clients using response_format: json_object (e.g. Vercel AI SDK's generateObject)
 /// need raw JSON or their parse step blows up.
+/// Only applied when the request asked for JSON mode — a normal chat reply
+/// that legitimately is a fenced code block must pass through verbatim.
 fn strip_json_fences(s: &str) -> String {
     let trimmed = s.trim();
     if let Some(rest) = trimmed.strip_prefix("```") {
@@ -7768,12 +7780,10 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
     }
 
     // response_format: inject JSON mode instruction into system prompt
-    if let Some(rf) = body.get("response_format") {
-        if rf.get("type").and_then(|t| t.as_str()) == Some("json_object") {
-            system_parts.push(
-                "You must respond with valid JSON only. No markdown, no code fences, no explanation — just raw JSON.".to_string(),
-            );
-        }
+    if wants_json_object(body) {
+        system_parts.push(
+            "You must respond with valid JSON only. No markdown, no code fences, no explanation — just raw JSON.".to_string(),
+        );
     }
 
     if !system_parts.is_empty() {
@@ -7864,7 +7874,7 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
     serde_json::Value::Object(out)
 }
 
-fn translate_anthropic_to_openai(body: &serde_json::Value) -> serde_json::Value {
+fn translate_anthropic_to_openai(body: &serde_json::Value, json_mode: bool) -> serde_json::Value {
     let id = body
         .get("id")
         .and_then(|v| v.as_str())
@@ -7876,7 +7886,8 @@ fn translate_anthropic_to_openai(body: &serde_json::Value) -> serde_json::Value 
 
     let blocks = body.get("content").and_then(|c| c.as_array());
 
-    // Concatenate text content blocks, strip markdown JSON fences
+    // Concatenate text content blocks; strip markdown JSON fences only when
+    // the request asked for response_format: json_object.
     let content = blocks
         .map(|blocks| {
             let raw = blocks
@@ -7885,7 +7896,11 @@ fn translate_anthropic_to_openai(body: &serde_json::Value) -> serde_json::Value 
                 .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
                 .collect::<Vec<_>>()
                 .join("");
-            strip_json_fences(&raw)
+            if json_mode {
+                strip_json_fences(&raw)
+            } else {
+                raw
+            }
         })
         .unwrap_or_default();
 
@@ -8690,6 +8705,7 @@ async fn forward_openai_compat_anthropic(
     session_id: &str,
     model: &str,
     is_streaming: bool,
+    json_mode: bool,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
     let token = ep.token.as_str();
@@ -9069,7 +9085,7 @@ async fn forward_openai_compat_anthropic(
         }
     };
 
-    let openai_resp = translate_anthropic_to_openai(&anthropic_resp);
+    let openai_resp = translate_anthropic_to_openai(&anthropic_resp, json_mode);
 
     // Extract and record token usage from non-streaming response
     let usage = TokenUsage::from_response_body(&anthropic_resp);
@@ -9181,6 +9197,7 @@ async fn openai_chat_handler(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let json_mode = wants_json_object(&openai_body);
     let model = openai_body
         .get("model")
         .and_then(|m| m.as_str())
@@ -9258,6 +9275,7 @@ async fn openai_chat_handler(
                                     &session_id,
                                     &model,
                                     is_streaming,
+                                    json_mode,
                                     request_start,
                                 )
                                 .await;
