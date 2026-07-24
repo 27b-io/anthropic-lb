@@ -54,7 +54,7 @@ Routes requests across multiple Anthropic accounts using dynamic capacity-based 
 | **Client identification** | Via `X-Client-ID` header or IP-based mapping |
 | **Streaming** | SSE/streaming responses flow through with usage extraction |
 | **State persistence** | Utilization + reset times + status survive restarts |
-| **Upstream routing** | Forward to OpenAI-compatible APIs via `/upstream/<name>/...` |
+| **OpenAI-compatible endpoints** | Route to OpenAI-format APIs as first-class endpoints (`protocol = "openai"`) |
 | **~6 MB binary** | Zero runtime dependencies |
 
 ---
@@ -83,7 +83,6 @@ cargo build --release
 
 ```toml
 listen = "127.0.0.1:8082"
-upstream = "https://api.anthropic.com"
 rate_limit_cooldown_secs = 60
 probe_interval_secs = 300
 
@@ -130,12 +129,13 @@ probe_interval_secs = 300
 # "10.0.0.5" = "alice-desktop"
 # "10.0.0.6" = "bob-laptop"
 
-[[accounts]]
+[[endpoints]]
 name = "primary"
 token = "sk-ant-oat01-..."
+# protocol = "anthropic"   # default; "openai" for OpenAI-compatible upstreams
 # models = ["claude-sonnet-4-6", "claude-opus-*"]
 
-[[accounts]]
+[[endpoints]]
 name = "secondary"
 token = "sk-ant-api03-..."
 ```
@@ -145,7 +145,6 @@ token = "sk-ant-api03-..."
 | Field | Type | Default | Description |
 |:------|:-----|:--------|:------------|
 | `listen` | `String` | — | Bind address (e.g. `"127.0.0.1:8082"`) |
-| `upstream` | `String` | — | Anthropic API base URL |
 | `rate_limit_cooldown_secs` | `u64` | `60` | Seconds to cool down after 429 |
 | `probe_interval_secs` | `u64` | `300` | Seconds between utilization probes (0 = disabled) |
 | `proxy_key` | `String?` | `None` | Shared secret for proxy access |
@@ -160,9 +159,13 @@ token = "sk-ant-api03-..."
 | `strategy` | `String` | `dynamic-capacity-v1` | Routing strategy (see note below) |
 | `emergency_threshold` | `f64` | `0.88` | Utilization threshold for emergency brake |
 | `redis_url` | `String?` | `None` | Redis/Valkey URL for distributed state |
-| `accounts[].name` | `String` | — | Display name for the account |
-| `accounts[].token` | `String` | — | API key or `"passthrough"` |
-| `accounts[].models` | `[String]` | `[]` | Model allowlist (empty = all) |
+| `endpoints[].name` | `String` | — | Display name for the endpoint |
+| `endpoints[].protocol` | `String` | `"anthropic"` | `"anthropic"` (default) or `"openai"` |
+| `endpoints[].base_url` | `String?` | `api.anthropic.com` | Base URL; required and must be `https://` for `openai` |
+| `endpoints[].token` | `String` | — | API key, OAuth token, or `"passthrough"` |
+| `endpoints[].models` | `[String]` | `[]` | Model allowlist (empty = all) |
+| `endpoints[].priority` | `u32` | `0` | Priority tier (lower tried first) |
+| `endpoints[].fable_included` | `bool` | `true` | Plan includes Fable band; set `false` for Pro / standard Team |
 
 > [!NOTE]
 > **Strategy normalization**: Both `"dynamic-capacity"` and `"dynamic-capacity-v1"` are accepted in config, but the runtime normalizes to `"dynamic-capacity-v1"` in logs and `/_stats` output. Similarly, `"sticky-weighted"` normalizes to `"sticky-weighted-v2"`.
@@ -183,17 +186,17 @@ token = "sk-ant-api03-..."
 Restrict accounts to specific models with the `models` field:
 
 ```toml
-[[accounts]]
+[[endpoints]]
 name = "opus-only"
 token = "sk-ant-oat01-..."
 models = ["claude-opus-*"]  # Wildcard prefix match
 
-[[accounts]]
+[[endpoints]]
 name = "sonnet-only"
 token = "sk-ant-api03-..."
 models = ["claude-sonnet-4-6"]  # Exact match
 
-[[accounts]]
+[[endpoints]]
 name = "general"
 token = "sk-ant-oat01-..."
 # Empty models = serves all models
@@ -267,7 +270,6 @@ IP check runs first, then proxy key. Both apply to all endpoints including `/_st
 |:------|:-------|:------------|
 | `/*` | Any | Proxied to upstream Anthropic API |
 | `/v1/chat/completions` | POST | OpenAI-compatible → Anthropic translation |
-| `/upstream/{name}/*` | Any | Forwarded to named OpenAI-compatible upstream |
 | `/_stats` | GET | JSON stats (utilization, tokens, budgets) |
 | `/metrics` | GET | Prometheus-format metrics |
 
@@ -278,9 +280,11 @@ All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
 
 ```json
 {
-  "accounts": [
+  "endpoints": [
     {
       "name": "primary",
+      "protocol": "anthropic",
+      "priority": 0,
       "passthrough": false,
       "requests_total": 1042,
       "utilization": 0.25,
@@ -288,7 +292,7 @@ All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
       "remaining_requests": 950,
       "remaining_tokens": 4800000,
       "hard_limited_remaining_secs": null,
-      "burn_rate": { "1m": 12.5, "5m": 10.2, "15m": 8.7 },
+      "burn_rate": { "last_5m": 12.5, "last_1h": 10.2, "last_6h": 8.7 },
       "headroom_requests": 42000,
       "token_usage": {
         "input_tokens": 2450000,
@@ -296,13 +300,20 @@ All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
         "cache_creation_input_tokens": 50000,
         "cache_read_input_tokens": 1200000
       }
-    }
-  ],
-  "upstreams": [
+    },
     {
       "name": "portkey",
-      "base_url": "https://portkey.example.com/v1",
-      "requests_total": 87
+      "protocol": "openai",
+      "priority": 100,
+      "passthrough": false,
+      "requests_total": 87,
+      "utilization": 0.0,
+      "token_usage": {
+        "input_tokens": 210000,
+        "output_tokens": 15000,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0
+      }
     }
   ],
   "client_usage": {
@@ -314,12 +325,12 @@ All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
     }
   },
   "client_budgets": {
-    "alice": { "limit": 5000000, "used": 1915000, "remaining": 3085000 }
+    "alice": { "daily_limit": 5000000, "used_today": 1915000, "remaining": 3085000 }
   },
   "aggregate": {
     "total_headroom_requests": 84000,
     "consumers": {
-      "alice": { "share": 0.65, "rpm": 4.2 }
+      "alice": { "share": 0.65, "requests_per_minute": 4.2 }
     }
   },
   "cluster": {
@@ -339,16 +350,18 @@ All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
 
 ## OpenAI-Compatible Upstreams
 
-Route requests to non-Anthropic APIs (OpenRouter, Portkey, local models) via named upstreams:
+Route to non-Anthropic, OpenAI-compatible APIs (OpenRouter, Portkey, local models) by adding an endpoint with `protocol = "openai"`. There is no separate upstream pool and no `/upstream/<name>/` route — an OpenAI endpoint is a first-class member of the unified `[[endpoints]]` pool, selected by the same headroom routing as any other endpoint.
 
 ```toml
-[[upstreams]]
+[[endpoints]]
 name = "openrouter"
-base_url = "https://openrouter.ai/api"
-api_key = "sk-or-..."
+protocol = "openai"
+base_url = "https://openrouter.ai/api"   # required for openai; must be https://
+token = "sk-or-..."
+priority = 100   # tried only after Anthropic tiers are exhausted
 ```
 
-Requests to `/upstream/openrouter/v1/chat/completions` are forwarded to `https://openrouter.ai/api/v1/chat/completions` with the API key injected as `Authorization: Bearer`.
+The configured `token` is injected as `Authorization: Bearer`, and the request is forwarded to `base_url` with automatic Anthropic↔OpenAI translation (any proxied path) or direct passthrough (`POST /v1/chat/completions`). Routing by `priority` is how an OpenAI endpoint replaces the old `fallback_upstream`: give it a high `priority` so free Anthropic capacity drains first.
 
 ---
 
@@ -361,7 +374,7 @@ Requests to `/upstream/openrouter/v1/chat/completions` are forwarded to `https:/
    a. Operator? → bypass all checks
    b. Check per-client daily token budget (429 if exceeded)
    c. Check per-client utilization limit (429 if all accounts above limit)
-   d. Emergency brake (503 if all accounts above emergency_threshold)
+   d. Emergency brake (429 if all accounts above emergency_threshold)
 4. Extract model from request body
 5. Filter accounts by model allowlist
 6. Compute time-adjusted utilization per claim window (5h, 7d per model)

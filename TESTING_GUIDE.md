@@ -225,7 +225,7 @@ cargo test --release
 ```rust
 let config_content = r#"
 listen = "127.0.0.1:8082"
-upstream = "https://api.anthropic.com"
+strategy = "dynamic-capacity-v1"
 "#;
 let result: Result<toml::Value, _> = toml::from_str(&config_content);
 assert!(result.is_ok());
