@@ -4587,7 +4587,7 @@ async fn openai_chat_streaming() {
     });
 
     let mock_url = format!("http://{}", mock_addr);
-    let (app, _state) = test_openai_app(&mock_url, None);
+    let (app, state) = test_openai_app(&mock_url, None);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -4652,6 +4652,84 @@ async fn openai_chat_streaming() {
     // Last data chunk: finish_reason
     let last = chunks.last().unwrap();
     assert_eq!(last["choices"][0]["finish_reason"], "stop");
+
+    // LAB-717: usage is scanned incrementally (no raw_sse buffering) and
+    // recorded by the detached finalize task after the stream closes — poll
+    // briefly for it to land. The mock stream carries input=10 / output=5.
+    assert_eq!(
+        poll_streamed_usage(&state).await,
+        (10, 5),
+        "streamed usage must be recorded from the incremental scan"
+    );
+}
+
+/// Poll endpoint token counters until streamed usage lands (the finalize
+/// task is detached, so recording races the client seeing end-of-stream).
+async fn poll_streamed_usage(state: &Arc<AppState>) -> (u64, u64) {
+    let mut recorded = (0, 0);
+    for _ in 0..40 {
+        let input: u64 = state
+            .endpoints
+            .iter()
+            .map(|e| e.input_tokens.load(Ordering::Relaxed))
+            .sum();
+        let output: u64 = state
+            .endpoints
+            .iter()
+            .map(|e| e.output_tokens.load(Ordering::Relaxed))
+            .sum();
+        recorded = (input, output);
+        if input > 0 && output > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    recorded
+}
+
+/// LAB-717: native-path (/v1/messages) streaming — the passthrough stream is
+/// scanned incrementally and usage recorded without buffering the response.
+#[tokio::test]
+async fn anthropic_streaming_records_usage() {
+    let mock_app = Router::new().fallback(any(mock_anthropic_streaming_handler));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let (app, state) = test_app(&format!("http://{}", mock_addr), None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let resp = Client::new()
+        .post(format!("http://{}/v1/messages", addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6","stream":true,"messages":[{"role":"user","content":"hi"}],"max_tokens":100}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("message_stop"),
+        "stream should pass through untouched, got: {body:?}"
+    );
+
+    assert_eq!(
+        poll_streamed_usage(&state).await,
+        (10, 5),
+        "streamed usage must be recorded from the incremental scan"
+    );
 }
 
 #[tokio::test]
@@ -5036,6 +5114,86 @@ data: {\"type\":\"message_stop\"}\n\n";
 fn usage_from_empty_sse() {
     let usage = TokenUsage::from_sse_text("");
     assert!(usage.is_empty());
+}
+
+/// LAB-717: the incremental scanner must produce the same usage regardless of
+/// how the stream is fragmented into chunks — including splits mid-line,
+/// mid-JSON, and down to one byte per push.
+#[test]
+fn sse_scanner_chunk_boundaries_do_not_affect_usage() {
+    let sse: &[u8] = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":150,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":5}}}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"mentions message_delta harmlessly\"}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":75}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+    // Every chunk size from pathological (1 byte) to whole-stream.
+    for chunk_size in [1, 3, 7, 64, sse.len()] {
+        let mut scanner = SseUsageScanner::default();
+        for chunk in sse.chunks(chunk_size) {
+            scanner.push(chunk);
+        }
+        scanner.finish();
+        assert_eq!(scanner.usage.input_tokens, 150, "chunk_size={chunk_size}");
+        assert_eq!(scanner.usage.output_tokens, 75, "chunk_size={chunk_size}");
+        assert_eq!(scanner.usage.cache_creation_input_tokens, 10);
+        assert_eq!(scanner.usage.cache_read_input_tokens, 5);
+        assert_eq!(scanner.bytes_seen, sse.len());
+        assert_eq!(scanner.event_count, 4);
+    }
+}
+
+/// LAB-717: the trailing line is scanned even when the stream ends without a
+/// final newline (finish() flushes the carry).
+#[test]
+fn sse_scanner_flushes_unterminated_final_line() {
+    let mut scanner = SseUsageScanner::default();
+    scanner.push(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}");
+    scanner.finish();
+    assert_eq!(scanner.usage.output_tokens, 42);
+}
+
+/// LAB-717: a single line larger than SSE_SCAN_MAX_LINE must not grow the
+/// carry without bound — it is discarded up to its newline, and scanning
+/// resumes cleanly on the following lines.
+#[test]
+fn sse_scanner_discards_oversized_line_and_recovers() {
+    let mut scanner = SseUsageScanner::default();
+    // Oversized junk line delivered across several pushes, no newline yet.
+    let junk = vec![b'x'; SSE_SCAN_MAX_LINE / 2 + 1];
+    scanner.push(&junk);
+    scanner.push(&junk); // crosses the cap → carry dropped, skip mode
+    assert!(
+        scanner.carry.is_empty(),
+        "carry must not hold oversized line"
+    );
+    scanner.push(b"more of the same line\n"); // newline ends the skipped line
+    scanner.push(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n");
+    scanner.finish();
+    assert_eq!(scanner.usage.output_tokens, 9);
+}
+
+/// LAB-717: diagnostic metadata for stream_end_no_usage is bounded — full
+/// event count, but only the first five event types retained.
+#[test]
+fn sse_scanner_event_preview_bounded_to_five() {
+    let mut scanner = SseUsageScanner::default();
+    for i in 0..7 {
+        scanner.push(format!("event: ev{i}\ndata: {{}}\n\n").as_bytes());
+    }
+    scanner.finish();
+    assert_eq!(scanner.event_count, 7);
+    assert_eq!(
+        scanner.event_preview,
+        vec!["ev0", "ev1", "ev2", "ev3", "ev4"]
+    );
+    assert!(scanner.usage.is_empty());
 }
 
 #[tokio::test]
