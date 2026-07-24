@@ -3764,10 +3764,11 @@ impl TokenUsage {
     }
 }
 
-/// Cap on the partial-line carry held between chunks by `SseUsageScanner`.
-/// Usage-bearing lines (`message_start` / `message_delta`) are well under
-/// 1 KiB; anything larger is content we don't need, and a malformed upstream
-/// must not be able to grow the carry without bound (LAB-717).
+/// Cap on any single SSE line `SseUsageScanner` will hold or scan — applied
+/// uniformly whether the line completes within one chunk or is carried across
+/// chunks. Usage-bearing lines (`message_start` / `message_delta`) are well
+/// under 1 KiB; anything larger is content we don't need, and a malformed
+/// upstream must not be able to grow scanner memory without bound (LAB-717).
 const SSE_SCAN_MAX_LINE: usize = 64 * 1024;
 
 /// Incremental SSE token-usage extractor: O(1) memory per in-flight stream.
@@ -3801,6 +3802,11 @@ impl SseUsageScanner {
             if self.skipping_oversized_line {
                 // `head` is the tail of a discarded oversized line.
                 self.skipping_oversized_line = false;
+            } else if self.carry.len() + head.len() > SSE_SCAN_MAX_LINE {
+                // Line exceeds the cap even though it terminated within this
+                // chunk — discard it like the cross-chunk case, and release
+                // the backing allocation rather than retaining its capacity.
+                self.carry = Vec::new();
             } else if self.carry.is_empty() {
                 self.scan_line(head);
             } else {
@@ -9000,8 +9006,9 @@ async fn forward_openai_compat_anthropic(
                 client_gone = true;
             }
 
-            // Record token usage scanned from the raw upstream SSE. The
-            // detached task only holds a cloned Arc<AppState>; re-index it.
+            // Record usage scanned incrementally from the upstream SSE
+            // (LAB-717). The detached task only holds a cloned
+            // Arc<AppState>; re-index it.
             let ep = &state_clone.endpoints[endpoint_idx];
             finalize_stream(
                 &state_clone,

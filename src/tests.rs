@@ -5179,6 +5179,35 @@ fn sse_scanner_discards_oversized_line_and_recovers() {
     assert_eq!(scanner.usage.output_tokens, 9);
 }
 
+/// LAB-717: the cap applies uniformly when the oversized line terminates
+/// within a single push — both when it completes a cross-chunk carry and
+/// when it arrives whole — and the carry allocation must not retain the
+/// oversized capacity afterwards.
+#[test]
+fn sse_scanner_caps_oversized_line_completed_in_one_push() {
+    // Whole oversized line (with newline) in one push.
+    let mut scanner = SseUsageScanner::default();
+    let mut blob = vec![b'x'; SSE_SCAN_MAX_LINE + 1];
+    blob.push(b'\n');
+    scanner.push(&blob);
+    scanner.push(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n");
+    scanner.finish();
+    assert_eq!(scanner.usage.output_tokens, 7);
+    assert!(scanner.carry.capacity() <= SSE_SCAN_MAX_LINE);
+
+    // Carry just under the cap, then a chunk whose newline completes the
+    // combined oversized line.
+    let mut scanner = SseUsageScanner::default();
+    scanner.push(&vec![b'x'; SSE_SCAN_MAX_LINE]); // fills carry to the cap
+    scanner.push(b"y\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":8}}\n");
+    scanner.finish();
+    assert_eq!(scanner.usage.output_tokens, 8);
+    assert!(
+        scanner.carry.capacity() <= SSE_SCAN_MAX_LINE,
+        "oversized merge must not balloon the retained carry allocation"
+    );
+}
+
 /// LAB-717: diagnostic metadata for stream_end_no_usage is bounded — full
 /// event count, but only the first five event types retained.
 #[test]
