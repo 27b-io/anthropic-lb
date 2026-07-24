@@ -3745,6 +3745,23 @@ impl TokenUsage {
         }
     }
 
+    /// Parse usage from an OpenAI-format response body (non-streaming JSON).
+    /// OpenAI reports `prompt_tokens`/`completion_tokens`; there is no
+    /// Anthropic-style cache-token split, so those fields stay 0.
+    fn from_openai_response_body(body: &serde_json::Value) -> Self {
+        Self {
+            input_tokens: body
+                .pointer("/usage/prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            output_tokens: body
+                .pointer("/usage/completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            ..Self::default()
+        }
+    }
+
     /// Parse usage from SSE chunks (accumulated from streaming response).
     /// Looks for message_start (input_tokens, cache tokens) and message_delta (output_tokens).
     fn from_sse_text(text: &str) -> Self {
@@ -5541,8 +5558,12 @@ async fn proxy_handler(
                                     &body_bytes,
                                     &req_id,
                                     &client_id,
+                                    &client_ip,
+                                    &agent_id,
+                                    &session_id,
                                     &model,
                                     i,
+                                    request_start,
                                     true,
                                 )
                                 .await;
@@ -5595,16 +5616,23 @@ async fn proxy_handler(
 /// per-endpoint circuit breaker; upstream 429/5xx rotate immediately. Other
 /// 4xx (e.g. 400, 401) are `Done` — retry won't help on client-side errors.
 ///
-/// Only increments the endpoint's request counter; it does not call
-/// `record_usage` (OpenAI-compat responses don't carry the same usage signal we
-/// extract for Anthropic).
+/// Non-streaming responses are accounted via `finalize_non_stream`: OpenAI
+/// bodies carry `usage.prompt_tokens`/`completion_tokens`, mapped to
+/// input/output tokens so per-client token + budget enforcement sees this
+/// spend (LAB-712). Streaming responses still record nothing — the SSE
+/// translator does not yet extract incremental usage (rides with LAB-717).
+#[allow(clippy::too_many_arguments)]
 async fn try_fallback_upstream(
     state: &AppState,
     body_bytes: &[u8],
     req_id: &str,
     client_id: &str,
+    client_ip: &std::net::IpAddr,
+    agent_id: &str,
+    session_id: &str,
     model: &str,
     endpoint_idx: usize,
+    request_start: std::time::Instant,
     translate: bool, // true = Anthropic↔OpenAI translation needed
 ) -> ForwardOutcome {
     // Non-transient rotation: skip this endpoint and try the next candidate.
@@ -5917,9 +5945,30 @@ async fn try_fallback_upstream(
         }
     };
 
+    // OpenAI non-streaming bodies carry usage.prompt_tokens/completion_tokens —
+    // record them like the Anthropic path so per-client token + budget
+    // enforcement (`pre_request_gate`) sees OpenAI-endpoint spend (LAB-712).
+    let openai_resp: serde_json::Value =
+        serde_json::from_slice(&resp_body).unwrap_or(serde_json::json!({}));
+    let usage = TokenUsage::from_openai_response_body(&openai_resp);
+    finalize_non_stream(
+        state,
+        ep,
+        req_id,
+        client_id,
+        model,
+        &ep.name,
+        &client_ip.to_string(),
+        agent_id,
+        session_id,
+        status.as_u16(),
+        &usage,
+        request_start.elapsed().as_millis() as u64,
+        !translate, // openai_compat marks the client surface: translate=false ⇒ OpenAI-format caller
+    )
+    .await;
+
     if translate {
-        let openai_resp: serde_json::Value =
-            serde_json::from_slice(&resp_body).unwrap_or(serde_json::json!({}));
         let anthropic_resp = translate_openai_response_to_anthropic(&openai_resp);
         info!(
             req_id,
@@ -9190,8 +9239,12 @@ async fn openai_chat_handler(
                                     &body_bytes,
                                     &req_id,
                                     &client_id,
+                                    &client_ip,
+                                    &agent_id,
+                                    &session_id,
                                     &model,
                                     i,
+                                    request_start,
                                     false,
                                 )
                                 .await;
