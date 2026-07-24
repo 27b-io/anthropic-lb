@@ -44,9 +44,9 @@ Routes requests across multiple Anthropic accounts using dynamic capacity-based 
 | **5xx retry** | Automatic retry on 500/502/503/504/529 (picks different account) |
 | **Token tracking** | Per-account and per-client input/output/cache token counters |
 | **Client budgets** | Daily per-client token budgets with automatic reset |
-| **Utilization limits** | Per-client utilization ceiling — 429 when all accounts exceed limit |
+| **Utilization limits** | Per-client utilization ceiling — 429 when all Anthropic endpoints exceed limit |
 | **Operator bypass** | Designated client bypasses all budget, utilization, and emergency checks |
-| **Emergency brake** | Auto-block all non-operator traffic when all accounts exceed threshold |
+| **Emergency brake** | Auto-block all non-operator traffic when all Anthropic endpoints exceed threshold |
 | **Distributed state** | Optional Redis/Valkey backend for cross-replica budget + hard-limit sync |
 | **Auto-cache** | Injects prompt caching beta header automatically |
 | **Shadow logging** | Optional JSONL file with request metadata, tokens, latency |
@@ -108,7 +108,7 @@ probe_interval_secs = 300
 # "bob" = 1000000      # 1M tokens/day
 
 # Per-client utilization limits (optional, 0.0–1.0)
-# Client gets 429 when ALL model-compatible accounts exceed their limit.
+# Client gets 429 when ALL model-compatible Anthropic endpoints exceed their limit.
 # [client_utilization_limits]
 # "gastown" = 0.85
 # "openclaw" = 0.95
@@ -116,8 +116,9 @@ probe_interval_secs = 300
 # Operators — bypass all budget, utilization, and emergency checks
 # operators = ["ray", "openclaw", "claude"]
 
-# Emergency brake — auto-block non-operator traffic when all accounts
-# exceed this threshold. Default: 0.88
+# Emergency brake — auto-block non-operator traffic when all Anthropic
+# endpoints exceed this threshold (OpenAI endpoints carry no rate-limit
+# data and are excluded). Default: 0.88
 # emergency_threshold = 0.88
 
 # Redis/Valkey for distributed state across replicas (optional)
@@ -350,7 +351,7 @@ All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
 
 ## OpenAI-Compatible Upstreams
 
-Route to non-Anthropic, OpenAI-compatible APIs (OpenRouter, Portkey, local models) by adding an endpoint with `protocol = "openai"`. There is no separate upstream pool and no `/upstream/<name>/` route — an OpenAI endpoint is a first-class member of the unified `[[endpoints]]` pool, selected by the same headroom routing as any other endpoint.
+Route to non-Anthropic, OpenAI-compatible APIs (OpenRouter, Portkey, local models) by adding an endpoint with `protocol = "openai"`. There is no separate upstream pool and no `/upstream/<name>/` route — an OpenAI endpoint is a first-class member of the unified `[[endpoints]]` pool. Because these endpoints carry no Anthropic rate-limit data, they are not selected by headroom: each enters routing as a fixed-weight candidate at its configured `priority` (the transport circuit breaker still applies).
 
 ```toml
 [[endpoints]]
@@ -373,8 +374,8 @@ The configured `token` is injected as `Authorization: Bearer`, and the request i
 3. Pre-request gate:
    a. Operator? → bypass all checks
    b. Check per-client daily token budget (429 if exceeded)
-   c. Check per-client utilization limit (429 if all accounts above limit)
-   d. Emergency brake (429 if all accounts above emergency_threshold)
+   c. Check per-client utilization limit (429 if all Anthropic endpoints above limit)
+   d. Emergency brake (429 if all Anthropic endpoints above emergency_threshold)
 4. Extract model from request body
 5. Filter accounts by model allowlist
 6. Compute time-adjusted utilization per claim window (5h, 7d per model)
