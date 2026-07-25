@@ -7613,6 +7613,11 @@ struct StreamContext {
     tool_call_index: i64,
     in_tool_use: bool,
     current_tool_id: String,
+    /// Request asked for `response_format: json_object`.
+    json_mode: bool,
+    /// Text content buffered while `json_mode` is set, flushed fence-stripped
+    /// at end-of-message so streaming content matches the non-streaming strip.
+    text_buffer: String,
 }
 
 impl Default for StreamContext {
@@ -7624,7 +7629,24 @@ impl Default for StreamContext {
             tool_call_index: -1,
             in_tool_use: false,
             current_tool_id: String::new(),
+            json_mode: false,
+            text_buffer: String::new(),
         }
+    }
+}
+
+impl StreamContext {
+    /// In JSON mode, drain the buffered text and strip fences over the whole
+    /// message — the streaming equivalent of the non-streaming strip, applied
+    /// once so fences split across deltas are handled. Returns None when not in
+    /// JSON mode, the buffer is empty, or the strip yields nothing.
+    fn take_stripped_json_content(&mut self) -> Option<String> {
+        if !self.json_mode || self.text_buffer.is_empty() {
+            return None;
+        }
+        let stripped = strip_json_fences(&self.text_buffer);
+        self.text_buffer.clear();
+        (!stripped.is_empty()).then_some(stripped)
     }
 }
 
@@ -8069,6 +8091,14 @@ fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
                 if text.is_empty() {
                     return None;
                 }
+                if ctx.json_mode {
+                    // Buffer JSON-mode text; fences are stripped once over the
+                    // whole message at message_delta (they may be split across
+                    // deltas). Partial JSON is unparseable, so deferring the
+                    // emit costs the client nothing.
+                    ctx.text_buffer.push_str(text);
+                    return None;
+                }
                 Some(make_openai_chunk(
                     ctx,
                     serde_json::json!({"content": text}),
@@ -8087,13 +8117,35 @@ fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
                 .pointer("/delta/stop_reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("end_turn");
-            Some(make_openai_chunk(
+            let finish = make_openai_chunk(
                 ctx,
                 serde_json::json!({}),
                 Some(map_stop_reason(stop_reason)),
-            ))
+            );
+            // Flush buffered JSON-mode content (fence-stripped) as its own chunk
+            // before the finish chunk, preserving OpenAI content→finish order.
+            match ctx.take_stripped_json_content() {
+                Some(content) => {
+                    let content_chunk =
+                        make_openai_chunk(ctx, serde_json::json!({ "content": content }), None);
+                    Some(format!("{content_chunk}{finish}"))
+                }
+                None => Some(finish),
+            }
         }
-        "message_stop" => Some("data: [DONE]\n\n".to_string()),
+        "message_stop" => {
+            // Safety net: if message_delta never arrived (abnormal upstream),
+            // flush buffered JSON-mode content before closing so it is never
+            // silently dropped.
+            match ctx.take_stripped_json_content() {
+                Some(content) => {
+                    let content_chunk =
+                        make_openai_chunk(ctx, serde_json::json!({ "content": content }), None);
+                    Some(format!("{content_chunk}data: [DONE]\n\n"))
+                }
+                None => Some("data: [DONE]\n\n".to_string()),
+            }
+        }
         _ => None, // ping
     }
 }
@@ -8938,7 +8990,10 @@ async fn forward_openai_compat_anthropic(
         tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
             let mut scanner = SseUsageScanner::default();
-            let mut ctx = StreamContext::default();
+            let mut ctx = StreamContext {
+                json_mode,
+                ..StreamContext::default()
+            };
             let mut sent_done = false;
 
             let mut client_gone = false;
