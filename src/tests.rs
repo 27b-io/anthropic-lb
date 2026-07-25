@@ -3301,7 +3301,7 @@ fn translate_anthropic_request_basic() {
         "stream": true
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     assert_eq!(result["model"], "claude-sonnet-4-6");
     assert_eq!(result["max_tokens"], 1024);
     assert_eq!(result["temperature"], 0.7);
@@ -3347,7 +3347,7 @@ fn translate_anthropic_request_tool_use() {
         "max_tokens": 1024
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     let msgs = result["messages"].as_array().unwrap();
 
     // Assistant with tool_calls
@@ -3382,7 +3382,7 @@ fn translate_anthropic_request_tools() {
         "tool_choice": {"type": "auto"}
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     let tools = result["tools"].as_array().unwrap();
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["function"]["name"], "get_weather");
@@ -3412,7 +3412,7 @@ fn translate_anthropic_request_tool_result_array_content() {
         "max_tokens": 1024
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     let msgs = result["messages"].as_array().unwrap();
     assert_eq!(msgs[0]["role"], "tool");
     assert_eq!(msgs[0]["content"], "Result line 1Result line 2");
@@ -3437,7 +3437,7 @@ fn translate_anthropic_request_image_blocks() {
         "max_tokens": 1024
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     let content = result["messages"][0]["content"].as_array().unwrap();
     assert_eq!(
         content[0],
@@ -3469,7 +3469,7 @@ fn translate_anthropic_request_text_only_array_stays_string() {
         "max_tokens": 1024
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     assert_eq!(result["messages"][0]["content"], "part one part two");
 }
 
@@ -3491,7 +3491,7 @@ fn translate_anthropic_request_image_beside_tool_result_survives() {
         "max_tokens": 1024
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     let msgs = result["messages"].as_array().unwrap();
     assert_eq!(msgs[0]["role"], "tool");
     assert_eq!(msgs[0]["content"], "done");
@@ -3553,8 +3553,48 @@ fn translate_anthropic_request_stop_sequences() {
         "stop_sequences": ["END", "STOP"]
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     assert_eq!(result["stop"], serde_json::json!(["END", "STOP"]));
+}
+
+#[test]
+fn translate_anthropic_request_unsupported_image_source_fails_loudly() {
+    // An image source type this translator can't represent (e.g. Anthropic's
+    // `file` source) must fail the whole request, not silently drop the image
+    // while keeping the surrounding text.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Describe this"},
+                {"type": "image", "source": {"type": "file", "file_id": "file_abc"}}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    let err = translate_anthropic_request_to_openai(&body).unwrap_err();
+    assert!(
+        err.contains("file"),
+        "error should name the unsupported source type: {err}"
+    );
+}
+
+#[test]
+fn translate_anthropic_request_malformed_image_source_fails_loudly() {
+    // A structurally invalid image source (missing required fields) must also
+    // fail loudly rather than being silently dropped.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png"}}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    assert!(translate_anthropic_request_to_openai(&body).is_err());
 }
 
 #[test]
