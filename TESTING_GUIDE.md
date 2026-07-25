@@ -27,11 +27,13 @@
 ## Quick Start
 
 To run all tests:
+
 ```bash
 cargo test
 ```
 
 To run a specific test:
+
 ```bash
 cargo test test_minimal_valid_config
 ```
@@ -163,6 +165,7 @@ cargo llvm-cov --open
 ## Test Structure
 
 ### Unit Tests
+
 - **Location**: `src/main.rs` in `#[cfg(test)]` module
 - **Purpose**: Test individual functions and algorithms
 
@@ -174,6 +177,7 @@ fn ewma_single_update() {
 ```
 
 ### Integration Tests
+
 - **Location**: `tests/` directory
 - **Purpose**: Test configuration parsing and file operations
 
@@ -185,6 +189,7 @@ fn test_minimal_valid_config() {
 ```
 
 ### Async Tests
+
 - **Marker**: `#[tokio::test]` instead of `#[test]`
 - **Purpose**: Test async functions with tokio runtime
 
@@ -292,6 +297,7 @@ async fn test_routing() {
 ## Performance Testing
 
 For benchmarking (requires nightly Rust):
+
 ```bash
 # Run benchmarks
 cargo +nightly bench
@@ -301,6 +307,7 @@ cargo +nightly bench bench_name
 ```
 
 Alternative with criterion (add to `Cargo.toml`):
+
 ```bash
 cargo bench
 ```

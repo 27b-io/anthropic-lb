@@ -184,7 +184,7 @@ token = "sk-ant-api03-..."
 
 ### Model Routing
 
-Restrict accounts to specific models with the `models` field:
+Restrict endpoints to specific models with the `models` field:
 
 ```toml
 [[endpoints]]
