@@ -3352,6 +3352,56 @@ fn stream_nonstream_content_parity_default_mode() {
     assert_eq!(stream_default, nonstream_default);
 }
 
+#[test]
+fn json_mode_stream_buffers_deltas_then_flushes_content_before_finish() {
+    let mut ctx = StreamContext {
+        json_mode: true,
+        ..Default::default()
+    };
+
+    let start = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}";
+    translate_sse_event(start, &mut ctx);
+
+    // The complete fenced JSON reply spans two deltas. Neither partial delta
+    // may be forwarded, because fence removal is applied to the whole reply.
+    for text in ["```json\n{\"first\":", "true}\n```"] {
+        let payload = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        });
+        let event = format!("event: content_block_delta\ndata: {payload}");
+        assert!(translate_sse_event(&event, &mut ctx).is_none());
+    }
+
+    let finish = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}";
+    let output = translate_sse_event(finish, &mut ctx).unwrap();
+    let frames: Vec<_> = output
+        .split("\n\n")
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .map(|frame| serde_json::from_str::<serde_json::Value>(frame).unwrap())
+        .collect();
+
+    // The buffered, fence-stripped content is emitted exactly once and always
+    // precedes the OpenAI finish chunk.
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        frames[0]["choices"][0]["delta"]["content"],
+        r#"{"first":true}"#
+    );
+    assert!(frames[0]["choices"][0]["finish_reason"].is_null());
+    assert_eq!(frames[1]["choices"][0]["delta"], serde_json::json!({}));
+    assert_eq!(frames[1]["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        translate_sse_event(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}",
+            &mut ctx
+        )
+        .as_deref(),
+        Some("data: [DONE]\n\n")
+    );
+}
+
 // ── Reverse translation: Anthropic → OpenAI ──────────────────────
 
 #[test]

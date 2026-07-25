@@ -276,6 +276,18 @@ IP check runs first, then proxy key. Both apply to all endpoints including `/_st
 
 All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
 
+### OpenAI JSON-mode compatibility
+
+> [!IMPORTANT]
+> **Breaking change:** `/v1/chat/completions` now strips surrounding Markdown
+> fences only when the request explicitly sets
+> `response_format: {"type":"json_object"}`. Previously, non-streaming
+> responses were stripped unconditionally, which could alter a legitimate
+> fenced code-block response. To preserve the prior raw-JSON normalization,
+> send `response_format: {"type":"json_object"}`; otherwise consume the
+> model content verbatim. Streaming and non-streaming responses now follow the
+> same rule.
+
 <details>
 <summary><strong>Example <code>/_stats</code> response</strong></summary>
 
