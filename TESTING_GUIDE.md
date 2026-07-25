@@ -1,5 +1,29 @@
 # Testing Guide for anthropic-lb
 
+> Commands and patterns for running, filtering, and debugging the test suite.
+
+---
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Test Organization](#test-organization)
+- [Test Categories](#test-categories)
+- [Running Tests in CI/CD](#running-tests-in-cicd)
+- [Coverage Analysis](#coverage-analysis)
+- [Debugging Tests](#debugging-tests)
+- [Test Structure](#test-structure)
+- [Common Test Patterns](#common-test-patterns)
+- [Troubleshooting](#troubleshooting)
+- [Performance Testing](#performance-testing)
+- [Test Best Practices](#test-best-practices)
+- [Example Test Session](#example-test-session)
+- [Continuous Integration](#continuous-integration)
+- [Test Documentation](#test-documentation)
+- [Support](#support)
+
+---
+
 ## Quick Start
 
 To run all tests:
@@ -7,27 +31,27 @@ To run all tests:
 cargo test
 ```
 
-To run tests with output visible:
-```bash
-cargo test -- --nocapture
-```
-
 To run a specific test:
 ```bash
 cargo test test_minimal_valid_config
 ```
 
+> [!TIP]
+> Add `-- --nocapture` to any `cargo test` invocation to see `println!`/`dbg!` output from passing tests, not just failures.
+
+---
+
 ## Test Organization
 
-### 1. Unit Tests in src/main.rs
-These tests are embedded in the main source file within a `#[cfg(test)]` module.
+| # | Location | Purpose | Run only these |
+|:-:|:---------|:--------|:----------------|
+| 1 | `src/main.rs` — `#[cfg(test)]` module | Unit tests: individual functions and algorithms | `cargo test --lib` |
+| 2 | `tests/config_test.rs` | TOML configuration parsing and validation | `cargo test --test config_test` |
+| 3 | `tests/dependency_test.rs` | `Cargo.lock` integrity and dependency management | `cargo test --test dependency_test` |
 
-Run only the library tests:
-```bash
-cargo test --lib
-```
+<details>
+<summary><strong>Running specific test modules</strong></summary>
 
-Run specific test modules:
 ```bash
 # EWMA tests
 cargo test --lib ewma
@@ -40,84 +64,39 @@ cargo test --lib pick
 
 # IP allowlist tests
 cargo test --lib ip_allow
-```
 
-### 2. Configuration Tests (tests/config_test.rs)
-Tests for TOML configuration parsing and validation.
-
-Run configuration tests:
-```bash
-cargo test --test config_test
-```
-
-Run specific config test:
-```bash
+# One specific config test
 cargo test --test config_test test_minimal_valid_config
 ```
 
-### 3. Dependency Tests (tests/dependency_test.rs)
-Tests for Cargo.lock integrity and dependency management.
+</details>
 
-Run dependency tests:
-```bash
-cargo test --test dependency_test
-```
+---
 
 ## Test Categories
 
 ### By Functionality
 
-#### Routing Tests
-```bash
-cargo test pick_endpoint
-```
-
-#### Time & Utilization Tests
-```bash
-cargo test time_adjusted
-cargo test effective_util
-```
-
-#### Configuration Tests
-```bash
-cargo test --test config_test
-```
-
-#### Client Identity Tests
-```bash
-cargo test resolve_client_id
-cargo test is_operator
-```
-
-#### Budget & Limits Tests
-```bash
-cargo test budget
-cargo test emergency
-cargo test utilization_limit
-```
+| Category | Command |
+|:---------|:--------|
+| Routing | `cargo test pick_endpoint` |
+| Time & utilization | `cargo test time_adjusted`, `cargo test effective_util` |
+| Configuration | `cargo test --test config_test` |
+| Client identity | `cargo test resolve_client_id`, `cargo test is_operator` |
+| Budget & limits | `cargo test budget`, `cargo test emergency`, `cargo test utilization_limit` |
 
 ### By Test Type
 
-#### All Unit Tests
-```bash
-cargo test --lib
-```
+| Type | Command |
+|:---------|:--------|
+| All unit tests | `cargo test --lib` |
+| All integration tests | `cargo test --test '*'` |
+| HTTP handler tests | `cargo test proxy_`, `cargo test openai_`, `cargo test upstream_` |
 
-#### All Integration Tests
-```bash
-cargo test --test '*'
-```
-
-#### HTTP Handler Tests
-```bash
-cargo test proxy_
-cargo test openai_
-cargo test upstream_
-```
+---
 
 ## Running Tests in CI/CD
 
-For continuous integration:
 ```bash
 # Run all tests with one thread (more stable for CI)
 cargo test -- --test-threads=1
@@ -129,11 +108,15 @@ cargo test -- --nocapture --test-threads=1
 cargo test -- --nocapture --show-output --test-threads=1
 ```
 
+---
+
 ## Coverage Analysis
 
-To generate a test coverage report (requires cargo-tarpaulin):
+<details>
+<summary><strong>tarpaulin</strong> (requires <code>cargo-tarpaulin</code>)</summary>
+
 ```bash
-# Install tarpaulin
+# Install
 cargo install cargo-tarpaulin
 
 # Generate HTML coverage report
@@ -145,9 +128,13 @@ cargo tarpaulin --out Html --line --ignore-tests
 # View report (opens report/index.html in browser)
 ```
 
-Alternative with llvm-cov:
+</details>
+
+<details>
+<summary><strong>llvm-cov (alternative)</strong></summary>
+
 ```bash
-# Install llvm-cov
+# Install
 cargo install cargo-llvm-cov
 
 # Generate coverage
@@ -157,71 +144,64 @@ cargo llvm-cov --html
 cargo llvm-cov --open
 ```
 
+</details>
+
+---
+
 ## Debugging Tests
 
-### Run a Single Test with Output
-```bash
-cargo test test_name -- --nocapture
-```
+| Goal | Command |
+|:-----|:--------|
+| Single test with output | `cargo test test_name -- --nocapture` |
+| Match a name pattern | `cargo test ewma -- --nocapture` |
+| Show execution time | `cargo test -- --nocapture --test-threads=1 --show-output` |
+| Run `#[ignore]`d tests | `cargo test -- --ignored` |
+| Release mode (faster) | `cargo test --release` |
 
-### Run Tests Matching a Pattern
-```bash
-cargo test ewma -- --nocapture
-```
-
-### Show Test Execution Time
-```bash
-cargo test -- --nocapture --test-threads=1 --show-output
-```
-
-### Run Ignored Tests
-```bash
-cargo test -- --ignored
-```
-
-### Run in Release Mode (faster)
-```bash
-cargo test --release
-```
+---
 
 ## Test Structure
 
 ### Unit Tests
-- **Location**: src/main.rs in `#[cfg(test)]` module
+- **Location**: `src/main.rs` in `#[cfg(test)]` module
 - **Purpose**: Test individual functions and algorithms
-- **Example**:
-  ```rust
-  #[test]
-  fn ewma_single_update() {
-      // Test code
-  }
-  ```
+
+```rust
+#[test]
+fn ewma_single_update() {
+    // Test code
+}
+```
 
 ### Integration Tests
-- **Location**: tests/ directory
+- **Location**: `tests/` directory
 - **Purpose**: Test configuration parsing and file operations
-- **Example**:
-  ```rust
-  #[test]
-  fn test_minimal_valid_config() {
-      // Test code
-  }
-  ```
+
+```rust
+#[test]
+fn test_minimal_valid_config() {
+    // Test code
+}
+```
 
 ### Async Tests
 - **Marker**: `#[tokio::test]` instead of `#[test]`
 - **Purpose**: Test async functions with tokio runtime
-- **Example**:
-  ```rust
-  #[tokio::test]
-  async fn pick_prefers_lowest_utilization() {
-      // Async test code
-  }
-  ```
+
+```rust
+#[tokio::test]
+async fn pick_prefers_lowest_utilization() {
+    // Async test code
+}
+```
+
+---
 
 ## Common Test Patterns
 
-### Testing Configuration Parsing
+<details>
+<summary><strong>Testing configuration parsing</strong></summary>
+
 ```rust
 let config_content = r#"
 listen = "127.0.0.1:8082"
@@ -231,7 +211,11 @@ let result: Result<toml::Value, _> = toml::from_str(&config_content);
 assert!(result.is_ok());
 ```
 
-### Testing HTTP Handlers
+</details>
+
+<details>
+<summary><strong>Testing HTTP handlers</strong></summary>
+
 ```rust
 #[tokio::test]
 async fn test_handler() {
@@ -252,7 +236,11 @@ async fn test_handler() {
 }
 ```
 
-### Testing Algorithm Behavior
+</details>
+
+<details>
+<summary><strong>Testing algorithm behavior</strong></summary>
+
 ```rust
 #[tokio::test]
 async fn test_routing() {
@@ -283,27 +271,23 @@ async fn test_routing() {
 }
 ```
 
+</details>
+
+---
+
 ## Troubleshooting
 
-### Tests Fail with "Connection Refused"
-- Check if tests are trying to bind to already-used ports
-- Tests use random ports, so this should be rare
-- Ensure no other instances are running
+| Symptom | Check |
+|:--------|:------|
+| Tests fail with "Connection Refused" | Tests bind random ports, so collisions should be rare — confirm no other instance is already running |
+| Tests fail with "File Not Found" | Some tests expect files like `config.toml.example` to exist — run tests from the project root, and confirm the test uses temp files correctly |
+| Async tests hang | Check for deadlocks in `RwLock`/`Mutex` usage; isolate with `--test-threads=1` |
+| Tests pass locally but fail in CI | Look for timing-sensitive tests, tests depending on specific system state, or missing CI dependencies |
 
-### Tests Fail with "File Not Found"
-- Some tests expect files like `config.toml.example` to exist
-- Run tests from the project root directory
-- Check that test uses temporary files correctly
+> [!IMPORTANT]
+> Run tests from the project root — several integration tests resolve paths (like `config.toml.example`) relative to it.
 
-### Async Tests Hang
-- Ensure tokio runtime is properly initialized
-- Check for deadlocks in RwLock/Mutex usage
-- Use `--test-threads=1` to isolate hanging test
-
-### Tests Pass Locally but Fail in CI
-- Check for timing-sensitive tests
-- Ensure tests don't depend on specific system state
-- Verify all dependencies are available in CI environment
+---
 
 ## Performance Testing
 
@@ -316,10 +300,12 @@ cargo +nightly bench
 cargo +nightly bench bench_name
 ```
 
-Alternative with criterion (add to Cargo.toml):
+Alternative with criterion (add to `Cargo.toml`):
 ```bash
 cargo bench
 ```
+
+---
 
 ## Test Best Practices
 
@@ -330,6 +316,8 @@ cargo bench
 5. **Coverage**: Test both success and failure paths
 6. **Edge Cases**: Test boundary conditions (0, 1.0, empty, null)
 7. **Documentation**: Comment complex test logic
+
+---
 
 ## Example Test Session
 
@@ -350,6 +338,8 @@ cargo tarpaulin --out Html
 open tarpaulin-report.html
 ```
 
+---
+
 ## Continuous Integration
 
 Example GitHub Actions workflow:
@@ -369,18 +359,26 @@ jobs:
       - run: cargo test --release --verbose
 ```
 
+---
+
 ## Test Documentation
 
 For detailed test documentation, see:
-- `TEST_SUMMARY.md` - Comprehensive test coverage summary
-- `tests/config_test.rs` - Configuration test examples
-- `tests/dependency_test.rs` - Dependency test examples
-- `src/main.rs` (#[cfg(test)] module) - Unit test examples
+
+| Resource | Description |
+|:---------|:-------------|
+| [`TEST_SUMMARY.md`](TEST_SUMMARY.md) | Comprehensive test coverage summary |
+| `tests/config_test.rs` | Configuration test examples |
+| `tests/dependency_test.rs` | Dependency test examples |
+| `src/main.rs` (`#[cfg(test)]` module) | Unit test examples |
+
+---
 
 ## Support
 
 For issues or questions about tests:
-1. Check test output with `--nocapture` flag
-2. Review TEST_SUMMARY.md for test descriptions
+
+1. Check test output with the `--nocapture` flag
+2. Review `TEST_SUMMARY.md` for test descriptions
 3. Examine test source code for examples
-4. Check Cargo.toml for test dependencies
+4. Check `Cargo.toml` for test dependencies
