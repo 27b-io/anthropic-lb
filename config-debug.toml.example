@@ -3,13 +3,12 @@
 # Run:   cargo build && ./target/debug/anthropic-lb config-debug.toml
 # Tail:  tail -f debug.log
 listen = "127.0.0.1:8083"
-upstream = "https://api.anthropic.com"
 auto_cache = true
 debug_log = "debug.log"
 
-# Single account for clean signal
+# Single endpoint for clean signal
 # Copy this file to config-debug.toml and set your token below.
 # config-debug.toml is gitignored and will not be committed.
-[[accounts]]
+[[endpoints]]
 name = "debug"
 token = "YOUR_TOKEN_HERE"
