@@ -3402,6 +3402,39 @@ fn json_mode_stream_buffers_deltas_then_flushes_content_before_finish() {
     );
 }
 
+#[test]
+fn json_mode_stream_message_stop_safety_net_flushes_buffer() {
+    // Abnormal upstream: message_stop arrives without a preceding
+    // message_delta. The buffered JSON-mode content must still be flushed
+    // (fence-stripped) ahead of [DONE], never silently dropped.
+    let mut ctx = StreamContext {
+        json_mode: true,
+        ..Default::default()
+    };
+    let payload = serde_json::json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "```json\n{\"ok\":true}\n```"},
+    });
+    assert!(translate_sse_event(
+        &format!("event: content_block_delta\ndata: {payload}"),
+        &mut ctx
+    )
+    .is_none());
+
+    let output = translate_sse_event(
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}",
+        &mut ctx,
+    )
+    .unwrap();
+    let mut frames = output
+        .split("\n\n")
+        .filter_map(|f| f.strip_prefix("data: "));
+    let content: serde_json::Value = serde_json::from_str(frames.next().unwrap()).unwrap();
+    assert_eq!(content["choices"][0]["delta"]["content"], r#"{"ok":true}"#);
+    assert_eq!(frames.next(), Some("[DONE]"));
+}
+
 // ── Reverse translation: Anthropic → OpenAI ──────────────────────
 
 #[test]
