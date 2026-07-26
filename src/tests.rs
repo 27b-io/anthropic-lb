@@ -13530,8 +13530,12 @@ async fn try_fallback_upstream_rotates_on_429() {
         body,
         "req-1",
         "client-1",
+        &"127.0.0.1".parse().unwrap(),
+        "-",
+        "-",
         "claude-opus-4-7",
         0,
+        Instant::now(),
         false,
     )
     .await;
@@ -13570,8 +13574,12 @@ async fn try_fallback_upstream_rotates_on_500() {
         body,
         "req-1",
         "client-1",
+        &"127.0.0.1".parse().unwrap(),
+        "-",
+        "-",
         "claude-opus-4-7",
         0,
+        Instant::now(),
         false,
     )
     .await;
@@ -13605,8 +13613,12 @@ async fn try_fallback_upstream_transport_error_is_transient_and_counted() {
         body,
         "req-1",
         "client-1",
+        &"127.0.0.1".parse().unwrap(),
+        "-",
+        "-",
         "claude-opus-4-7",
         0,
+        Instant::now(),
         false,
     )
     .await;
@@ -13625,6 +13637,81 @@ async fn try_fallback_upstream_transport_error_is_transient_and_counted() {
     assert_eq!(
         info.consecutive_transport_failures, 1,
         "the transport failure must feed the per-endpoint circuit breaker"
+    );
+}
+
+/// LAB-712: a non-streaming response from a `Protocol::OpenAI` endpoint must
+/// record its `usage.prompt_tokens`/`completion_tokens` into per-client
+/// token + budget accounting. Previously this path only bumped `ep.requests`,
+/// leaving `pre_request_gate` budget enforcement blind to OpenAI-endpoint spend.
+#[tokio::test]
+async fn try_fallback_upstream_records_usage_and_budget() {
+    // Mock OpenAI upstream: non-streaming chat completion with usage.
+    let app = Router::new().fallback(any(|| async {
+        axum::Json(serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "claude-opus-4-7",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 60, "completion_tokens": 50, "total_tokens": 110}
+        }))
+        .into_response()
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut budgets = HashMap::new();
+    budgets.insert("client-1".to_string(), 100u64);
+    let mut ep = make_endpoint("gw", Protocol::OpenAI);
+    ep.base_url = format!("http://{}", addr);
+    let state = Arc::new(AppState {
+        endpoints: vec![ep],
+        client_budgets: budgets,
+        ..test_state_base()
+    });
+
+    assert!(state.check_budget("client-1").await.is_ok());
+
+    let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+    let result = try_fallback_upstream(
+        &state,
+        body,
+        "req-1",
+        "client-1",
+        &"127.0.0.1".parse().unwrap(),
+        "-",
+        "-",
+        "claude-opus-4-7",
+        0,
+        Instant::now(),
+        true,
+    )
+    .await;
+    assert!(matches!(result, ForwardOutcome::Done(_)));
+
+    // Endpoint + per-client token counters advance by the reported usage.
+    assert_eq!(state.endpoints[0].input_tokens.load(Ordering::Relaxed), 60);
+    assert_eq!(state.endpoints[0].output_tokens.load(Ordering::Relaxed), 50);
+    {
+        let map = state.client_usage.lock().unwrap();
+        assert_eq!(map.get("client-1").unwrap(), &[60, 50, 0, 0]);
+    }
+
+    // Budget sees the spend: 110 tokens against a 100-token budget → gate closes.
+    {
+        let map = state.budget_usage.lock().unwrap();
+        assert_eq!(map.get("client-1").unwrap().1, 110);
+    }
+    assert!(
+        state.check_budget("client-1").await.is_err(),
+        "pre_request_gate budget check must see OpenAI-endpoint spend"
     );
 }
 // ── Unified endpoint: cross-protocol handler routing ───────────
