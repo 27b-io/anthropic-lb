@@ -3807,6 +3807,30 @@ fn translate_anthropic_request_malformed_image_source_fails_loudly() {
 }
 
 #[test]
+fn translate_anthropic_request_unsupported_block_type_fails_loudly() {
+    // A content block type this translator can't represent (e.g. `document`)
+    // must fail the whole request, not be silently dropped from the message.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Summarize this"},
+                {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": "JVBERi0="
+                }}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    let err = translate_anthropic_request_to_openai(&body).unwrap_err();
+    assert!(
+        err.contains("document"),
+        "error should name the unsupported block type: {err}"
+    );
+}
+
+#[test]
 fn translate_openai_response_basic() {
     let body = serde_json::json!({
         "id": "chatcmpl-abc123",

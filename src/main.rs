@@ -8291,7 +8291,8 @@ fn anthropic_image_block_to_openai(block: &serde_json::Value) -> Result<serde_js
 /// Anthropic user content blocks → OpenAI content: a plain string when text-only
 /// (the common case, and what OpenAI-compat upstreams handle most reliably), a
 /// content-part array when image blocks are present so images survive translation.
-/// Err propagates from an unrepresentable image rather than dropping it silently.
+/// Err on an unrepresentable image or an unsupported block type (e.g. `document`)
+/// rather than dropping content silently.
 fn anthropic_user_blocks_to_openai_content(
     blocks: &[&serde_json::Value],
 ) -> Result<serde_json::Value, String> {
@@ -8308,7 +8309,12 @@ fn anthropic_user_blocks_to_openai_content(
                 parts.push(anthropic_image_block_to_openai(b)?);
                 has_image = true;
             }
-            _ => {}
+            Some(other) => {
+                return Err(format!(
+                    "content block type \"{other}\" is not supported by the OpenAI-compat translator"
+                ));
+            }
+            None => {}
         }
     }
     Ok(if has_image {
