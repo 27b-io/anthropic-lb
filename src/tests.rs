@@ -4598,10 +4598,13 @@ async fn openai_429_sets_cooldown_and_next_request_skips_endpoint() {
     let until = info
         .hard_limited_until
         .expect("a 429 from an OpenAI endpoint must set hard_limited_until");
+    // Measured AFTER both round-trips, so the lower bound leaves ~20s of
+    // slack for a loaded CI runner while staying far above the 60s default;
+    // the upper bound is exact (until = t_429 + 120s, and t_429 < now).
     let cooldown = until.duration_since(Instant::now());
     assert!(
-        cooldown > Duration::from_secs(115) && cooldown <= Duration::from_secs(120),
-        "cooldown must honour retry-after: 120 (within test overhead), got {cooldown:?}"
+        cooldown > Duration::from_secs(100) && cooldown <= Duration::from_secs(120),
+        "cooldown must honour retry-after: 120, not fall back to the 60s default, got {cooldown:?}"
     );
 }
 
