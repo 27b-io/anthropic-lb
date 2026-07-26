@@ -2584,6 +2584,56 @@ fn translate_request_multi_system_concat() {
 }
 
 #[test]
+fn translate_request_system_array_content() {
+    // OpenAI permits system content as an array of text parts — must not be dropped
+    let req = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "You are "},
+                {"type": "text", "text": "helpful"}
+            ]},
+            {"role": "user", "content": "Hello"}
+        ],
+        "max_tokens": 100
+    });
+    let result = translate_openai_to_anthropic(&req);
+    assert_eq!(result["system"], "You are helpful");
+    assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn translate_request_image_url_to_image_block() {
+    // OpenAI image_url parts must become Anthropic image blocks, not pass through raw
+    let req = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "What is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
+            ]}
+        ],
+        "max_tokens": 100
+    });
+    let result = translate_openai_to_anthropic(&req);
+    let content = result["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(
+        content[0],
+        serde_json::json!({"type": "text", "text": "What is this?"})
+    );
+    // data: URL → base64 source
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "base64");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    assert_eq!(content[1]["source"]["data"], "iVBORw0KGgo=");
+    // plain URL → url source
+    assert_eq!(content[2]["type"], "image");
+    assert_eq!(content[2]["source"]["type"], "url");
+    assert_eq!(content[2]["source"]["url"], "https://example.com/cat.jpg");
+}
+
+#[test]
 fn translate_request_no_system() {
     let req = serde_json::json!({
         "model": "claude-sonnet-4-6",
@@ -3460,7 +3510,7 @@ fn translate_anthropic_request_basic() {
         "stream": true
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     assert_eq!(result["model"], "claude-sonnet-4-6");
     assert_eq!(result["max_tokens"], 1024);
     assert_eq!(result["temperature"], 0.7);
@@ -3506,7 +3556,7 @@ fn translate_anthropic_request_tool_use() {
         "max_tokens": 1024
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     let msgs = result["messages"].as_array().unwrap();
 
     // Assistant with tool_calls
@@ -3541,7 +3591,7 @@ fn translate_anthropic_request_tools() {
         "tool_choice": {"type": "auto"}
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     let tools = result["tools"].as_array().unwrap();
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["function"]["name"], "get_weather");
@@ -3571,10 +3621,100 @@ fn translate_anthropic_request_tool_result_array_content() {
         "max_tokens": 1024
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     let msgs = result["messages"].as_array().unwrap();
     assert_eq!(msgs[0]["role"], "tool");
     assert_eq!(msgs[0]["content"], "Result line 1Result line 2");
+}
+
+#[test]
+fn translate_anthropic_request_image_blocks() {
+    // Anthropic image blocks must become OpenAI image_url parts, not be filtered out
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Describe this"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": "abc123"
+                }},
+                {"type": "image", "source": {
+                    "type": "url", "url": "https://example.com/dog.png"
+                }}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    let content = result["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(
+        content[0],
+        serde_json::json!({"type": "text", "text": "Describe this"})
+    );
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "data:image/jpeg;base64,abc123"
+    );
+    assert_eq!(content[2]["type"], "image_url");
+    assert_eq!(
+        content[2]["image_url"]["url"],
+        "https://example.com/dog.png"
+    );
+}
+
+#[test]
+fn translate_anthropic_request_text_only_array_stays_string() {
+    // Text-only block arrays keep the plain-string content form (no behavior change)
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "part one "},
+                {"type": "text", "text": "part two"}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    assert_eq!(result["messages"][0]["content"], "part one part two");
+}
+
+#[test]
+fn translate_anthropic_request_image_beside_tool_result_survives() {
+    // Images sharing a user message with tool_results must survive into the
+    // leftover user message, not be text-filtered away
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_789", "content": "done"},
+                {"type": "text", "text": "And this image:"},
+                {"type": "image", "source": {
+                    "type": "url", "url": "https://example.com/chart.png"
+                }}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    let msgs = result["messages"].as_array().unwrap();
+    assert_eq!(msgs[0]["role"], "tool");
+    assert_eq!(msgs[0]["content"], "done");
+    assert_eq!(msgs[1]["role"], "user");
+    let content = msgs[1]["content"].as_array().unwrap();
+    assert_eq!(
+        content[0],
+        serde_json::json!({"type": "text", "text": "And this image:"})
+    );
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "https://example.com/chart.png"
+    );
 }
 
 #[test]
@@ -3622,8 +3762,72 @@ fn translate_anthropic_request_stop_sequences() {
         "stop_sequences": ["END", "STOP"]
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     assert_eq!(result["stop"], serde_json::json!(["END", "STOP"]));
+}
+
+#[test]
+fn translate_anthropic_request_unsupported_image_source_fails_loudly() {
+    // An image source type this translator can't represent (e.g. Anthropic's
+    // `file` source) must fail the whole request, not silently drop the image
+    // while keeping the surrounding text.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Describe this"},
+                {"type": "image", "source": {"type": "file", "file_id": "file_abc"}}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    let err = translate_anthropic_request_to_openai(&body).unwrap_err();
+    assert!(
+        err.contains("file"),
+        "error should name the unsupported source type: {err}"
+    );
+}
+
+#[test]
+fn translate_anthropic_request_malformed_image_source_fails_loudly() {
+    // A structurally invalid image source (missing required fields) must also
+    // fail loudly rather than being silently dropped.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png"}}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    assert!(translate_anthropic_request_to_openai(&body).is_err());
+}
+
+#[test]
+fn translate_anthropic_request_unsupported_block_type_fails_loudly() {
+    // A content block type this translator can't represent (e.g. `document`)
+    // must fail the whole request, not be silently dropped from the message.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Summarize this"},
+                {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": "JVBERi0="
+                }}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    let err = translate_anthropic_request_to_openai(&body).unwrap_err();
+    assert!(
+        err.contains("document"),
+        "error should name the unsupported block type: {err}"
+    );
 }
 
 #[test]
