@@ -3745,49 +3745,15 @@ impl TokenUsage {
         }
     }
 
-    /// Parse usage from SSE chunks (accumulated from streaming response).
-    /// Looks for message_start (input_tokens, cache tokens) and message_delta (output_tokens).
+    /// Parse usage from a complete SSE transcript. Test convenience wrapper —
+    /// production streaming paths feed chunks through `SseUsageScanner`
+    /// incrementally instead of buffering the stream.
+    #[cfg(test)]
     fn from_sse_text(text: &str) -> Self {
-        let mut usage = Self::default();
-        for line in text.lines() {
-            let line = line.trim();
-            if !line.starts_with("data: ") {
-                continue;
-            }
-            let data = &line[6..];
-            let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
-                continue;
-            };
-            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            match event_type {
-                "message_start" => {
-                    if let Some(msg_usage) = event.get("message").and_then(|m| m.get("usage")) {
-                        usage.input_tokens = msg_usage
-                            .get("input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        usage.cache_creation_input_tokens = msg_usage
-                            .get("cache_creation_input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        usage.cache_read_input_tokens = msg_usage
-                            .get("cache_read_input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                    }
-                }
-                "message_delta" => {
-                    if let Some(delta_usage) = event.get("usage") {
-                        usage.output_tokens = delta_usage
-                            .get("output_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                    }
-                }
-                _ => {}
-            }
-        }
-        usage
+        let mut scanner = SseUsageScanner::default();
+        scanner.push(text.as_bytes());
+        scanner.finish();
+        scanner.usage
     }
 
     fn is_empty(&self) -> bool {
@@ -3795,6 +3761,130 @@ impl TokenUsage {
             && self.output_tokens == 0
             && self.cache_creation_input_tokens == 0
             && self.cache_read_input_tokens == 0
+    }
+}
+
+/// Cap on any single SSE line `SseUsageScanner` will hold or scan — applied
+/// uniformly whether the line completes within one chunk or is carried across
+/// chunks. Usage-bearing lines (`message_start` / `message_delta`) are well
+/// under 1 KiB; anything larger is content we don't need, and a malformed
+/// upstream must not be able to grow scanner memory without bound (LAB-717).
+const SSE_SCAN_MAX_LINE: usize = 64 * 1024;
+
+/// Incremental SSE token-usage extractor: O(1) memory per in-flight stream.
+///
+/// Replaces the old whole-stream `sse_buf` / `raw_sse` accumulation (LAB-717):
+/// each upstream chunk is line-scanned as it passes through, keeping only a
+/// capped partial-line carry, the running `TokenUsage` (last `message_start` /
+/// `message_delta` wins, matching the old post-hoc parse), and bounded event
+/// metadata for the `stream_end_no_usage` diagnostic.
+#[derive(Default)]
+struct SseUsageScanner {
+    usage: TokenUsage,
+    /// Bytes of the current line seen so far, awaiting its `\n`.
+    carry: Vec<u8>,
+    /// Set when a line overflows `SSE_SCAN_MAX_LINE`; the rest of that line
+    /// is discarded up to the next newline.
+    skipping_oversized_line: bool,
+    /// First five `event:` types, for the `stream_end_no_usage` preview.
+    event_preview: Vec<String>,
+    event_count: usize,
+    bytes_seen: usize,
+}
+
+impl SseUsageScanner {
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes_seen = self.bytes_seen.saturating_add(chunk.len());
+        let mut rest = chunk;
+        while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
+            let (head, tail) = rest.split_at(nl);
+            rest = &tail[1..];
+            if self.skipping_oversized_line {
+                // `head` is the tail of a discarded oversized line.
+                self.skipping_oversized_line = false;
+            } else if self.carry.len() + head.len() > SSE_SCAN_MAX_LINE {
+                // Line exceeds the cap even though it terminated within this
+                // chunk — discard it like the cross-chunk case, and release
+                // the backing allocation rather than retaining its capacity.
+                self.carry = Vec::new();
+            } else if self.carry.is_empty() {
+                self.scan_line(head);
+            } else {
+                self.carry.extend_from_slice(head);
+                let line = std::mem::take(&mut self.carry);
+                self.scan_line(&line);
+                self.carry = line;
+                self.carry.clear(); // reuse the allocation, drop the contents
+            }
+        }
+        if rest.is_empty() || self.skipping_oversized_line {
+            return;
+        }
+        self.carry.extend_from_slice(rest);
+        if self.carry.len() > SSE_SCAN_MAX_LINE {
+            self.carry = Vec::new();
+            self.skipping_oversized_line = true;
+        }
+    }
+
+    /// Flush the trailing unterminated line (a stream may not end with `\n`).
+    fn finish(&mut self) {
+        if !self.carry.is_empty() {
+            let line = std::mem::take(&mut self.carry);
+            self.scan_line(&line);
+        }
+    }
+
+    fn scan_line(&mut self, raw: &[u8]) {
+        let line = String::from_utf8_lossy(raw);
+        let line = line.trim();
+        if let Some(ev) = line.strip_prefix("event:") {
+            self.event_count += 1;
+            if self.event_preview.len() < 5 {
+                self.event_preview.push(ev.trim_start().to_string());
+            }
+            return;
+        }
+        let Some(data) = line.strip_prefix("data: ") else {
+            return;
+        };
+        // Cheap pre-filter: only usage-bearing event types are worth a JSON
+        // parse, and their type string must appear literally in the payload.
+        // False positives (a content delta mentioning "message_start") fall
+        // through to the type match below and are ignored, same as before.
+        if !data.contains("message_start") && !data.contains("message_delta") {
+            return;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+            return;
+        };
+        match event.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "message_start" => {
+                if let Some(msg_usage) = event.get("message").and_then(|m| m.get("usage")) {
+                    self.usage.input_tokens = msg_usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    self.usage.cache_creation_input_tokens = msg_usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    self.usage.cache_read_input_tokens = msg_usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                }
+            }
+            "message_delta" => {
+                if let Some(delta_usage) = event.get("usage") {
+                    self.usage.output_tokens = delta_usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -3962,18 +4052,18 @@ async fn finalize_stream(
     agent: &str,
     session: &str,
     status_code: u16,
-    sse_buf: &[u8],
+    mut scanner: SseUsageScanner,
     request_start: std::time::Instant,
     client_disconnected: bool,
     upstream_error: bool,
     openai_compat: bool,
 ) {
-    let text = String::from_utf8_lossy(sse_buf);
-    let usage = TokenUsage::from_sse_text(&text);
+    scanner.finish();
+    let usage = &scanner.usage;
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
     if !usage.is_empty() {
-        state.record_usage(ep, client_id, &usage).await;
-        log_usage(req_id, client_id, model, acct_name, &usage);
+        state.record_usage(ep, client_id, usage).await;
+        log_usage(req_id, client_id, model, acct_name, usage);
     } else {
         let reason = if upstream_error {
             "upstream_error"
@@ -3983,17 +4073,7 @@ async fn finalize_stream(
             "no_usage_event"
         };
         // Log structural metadata only — SSE payloads contain user content.
-        let sse_text = String::from_utf8_lossy(sse_buf);
-        let sse_event_types: Vec<&str> = sse_text
-            .lines()
-            .filter_map(|l| {
-                l.strip_prefix("event: ")
-                    .or_else(|| l.strip_prefix("event:"))
-            })
-            .collect();
-        let total_events = sse_event_types.len();
-        let truncated = total_events > 5;
-        let preview: Vec<&str> = sse_event_types.into_iter().take(5).collect();
+        let truncated = scanner.event_count > 5;
         warn!(
             req_id,
             client_id,
@@ -4001,9 +4081,9 @@ async fn finalize_stream(
             account = acct_name,
             reason,
             elapsed_ms,
-            sse_bytes = sse_buf.len(),
-            sse_event_count = total_events,
-            sse_events = ?preview,
+            sse_bytes = scanner.bytes_seen,
+            sse_event_count = scanner.event_count,
+            sse_events = ?scanner.event_preview,
             truncated,
             "stream_end_no_usage"
         );
@@ -5184,13 +5264,13 @@ async fn forward_anthropic(
         let status_code = status.as_u16();
 
         tokio::spawn(async move {
-            let mut sse_buf = Vec::new();
+            let mut scanner = SseUsageScanner::default();
             let mut client_disconnected = false;
             let mut upstream_error = false;
             loop {
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {
-                        sse_buf.extend_from_slice(&chunk);
+                        scanner.push(&chunk);
                         if tx.send(Ok(chunk)).await.is_err() {
                             client_disconnected = true;
                             break;
@@ -5213,8 +5293,8 @@ async fn forward_anthropic(
                     }
                 }
             }
-            // Parse accumulated SSE data for usage. The detached task only
-            // holds a cloned Arc<AppState>; re-index it to recover &Endpoint.
+            // Record scanned usage. The detached task only holds a cloned
+            // Arc<AppState>; re-index it to recover &Endpoint.
             let ep = &state_clone.endpoints[endpoint_idx];
             finalize_stream(
                 &state_clone,
@@ -5227,7 +5307,7 @@ async fn forward_anthropic(
                 &agent_clone,
                 &session_clone,
                 status_code,
-                &sse_buf,
+                scanner,
                 request_start,
                 client_disconnected,
                 upstream_error,
@@ -7515,10 +7595,22 @@ async fn metrics_handler(
 
 // ── OpenAI compatibility ─────────────────────────────────────────────
 
+/// True when an OpenAI-format request asked for `response_format: json_object`.
+/// Single predicate shared by the request-side system nudge and the
+/// response-side fence strip so the two can never disagree on what JSON mode is.
+fn wants_json_object(body: &serde_json::Value) -> bool {
+    body.get("response_format")
+        .and_then(|rf| rf.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("json_object")
+}
+
 /// Strip markdown JSON fences from LLM output.
 /// Claude sometimes wraps JSON in ```json ... ``` even when told not to.
 /// Clients using response_format: json_object (e.g. Vercel AI SDK's generateObject)
 /// need raw JSON or their parse step blows up.
+/// Only applied when the request asked for JSON mode — a normal chat reply
+/// that legitimately is a fenced code block must pass through verbatim.
 fn strip_json_fences(s: &str) -> String {
     let trimmed = s.trim();
     if let Some(rest) = trimmed.strip_prefix("```") {
@@ -7552,6 +7644,11 @@ struct StreamContext {
     tool_call_index: i64,
     in_tool_use: bool,
     current_tool_id: String,
+    /// Request asked for `response_format: json_object`.
+    json_mode: bool,
+    /// Text content buffered while `json_mode` is set, flushed fence-stripped
+    /// at end-of-message so streaming content matches the non-streaming strip.
+    text_buffer: String,
 }
 
 impl Default for StreamContext {
@@ -7563,7 +7660,24 @@ impl Default for StreamContext {
             tool_call_index: -1,
             in_tool_use: false,
             current_tool_id: String::new(),
+            json_mode: false,
+            text_buffer: String::new(),
         }
+    }
+}
+
+impl StreamContext {
+    /// In JSON mode, drain the buffered text and strip fences over the whole
+    /// message — the streaming equivalent of the non-streaming strip, applied
+    /// once so fences split across deltas are handled. Returns None when not in
+    /// JSON mode, the buffer is empty, or the strip yields nothing.
+    fn take_stripped_json_content(&mut self) -> Option<String> {
+        if !self.json_mode || self.text_buffer.is_empty() {
+            return None;
+        }
+        let stripped = strip_json_fences(&self.text_buffer);
+        self.text_buffer.clear();
+        (!stripped.is_empty()).then_some(stripped)
     }
 }
 
@@ -7773,12 +7887,10 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
     }
 
     // response_format: inject JSON mode instruction into system prompt
-    if let Some(rf) = body.get("response_format") {
-        if rf.get("type").and_then(|t| t.as_str()) == Some("json_object") {
-            system_parts.push(
-                "You must respond with valid JSON only. No markdown, no code fences, no explanation — just raw JSON.".to_string(),
-            );
-        }
+    if wants_json_object(body) {
+        system_parts.push(
+            "You must respond with valid JSON only. No markdown, no code fences, no explanation — just raw JSON.".to_string(),
+        );
     }
 
     if !system_parts.is_empty() {
@@ -7869,7 +7981,7 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
     serde_json::Value::Object(out)
 }
 
-fn translate_anthropic_to_openai(body: &serde_json::Value) -> serde_json::Value {
+fn translate_anthropic_to_openai(body: &serde_json::Value, json_mode: bool) -> serde_json::Value {
     let id = body
         .get("id")
         .and_then(|v| v.as_str())
@@ -7881,7 +7993,8 @@ fn translate_anthropic_to_openai(body: &serde_json::Value) -> serde_json::Value 
 
     let blocks = body.get("content").and_then(|c| c.as_array());
 
-    // Concatenate text content blocks, strip markdown JSON fences
+    // Concatenate text content blocks; strip markdown JSON fences only when
+    // the request asked for response_format: json_object.
     let content = blocks
         .map(|blocks| {
             let raw = blocks
@@ -7890,7 +8003,11 @@ fn translate_anthropic_to_openai(body: &serde_json::Value) -> serde_json::Value 
                 .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
                 .collect::<Vec<_>>()
                 .join("");
-            strip_json_fences(&raw)
+            if json_mode {
+                strip_json_fences(&raw)
+            } else {
+                raw
+            }
         })
         .unwrap_or_default();
 
@@ -8059,6 +8176,14 @@ fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
                 if text.is_empty() {
                     return None;
                 }
+                if ctx.json_mode {
+                    // Buffer JSON-mode text; fences are stripped once over the
+                    // whole message at message_delta (they may be split across
+                    // deltas). Partial JSON is unparseable, so deferring the
+                    // emit costs the client nothing.
+                    ctx.text_buffer.push_str(text);
+                    return None;
+                }
                 Some(make_openai_chunk(
                     ctx,
                     serde_json::json!({"content": text}),
@@ -8077,13 +8202,35 @@ fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
                 .pointer("/delta/stop_reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("end_turn");
-            Some(make_openai_chunk(
+            let finish = make_openai_chunk(
                 ctx,
                 serde_json::json!({}),
                 Some(map_stop_reason(stop_reason)),
-            ))
+            );
+            // Flush buffered JSON-mode content (fence-stripped) as its own chunk
+            // before the finish chunk, preserving OpenAI content→finish order.
+            match ctx.take_stripped_json_content() {
+                Some(content) => {
+                    let content_chunk =
+                        make_openai_chunk(ctx, serde_json::json!({ "content": content }), None);
+                    Some(format!("{content_chunk}{finish}"))
+                }
+                None => Some(finish),
+            }
         }
-        "message_stop" => Some("data: [DONE]\n\n".to_string()),
+        "message_stop" => {
+            // Safety net: if message_delta never arrived (abnormal upstream),
+            // flush buffered JSON-mode content before closing so it is never
+            // silently dropped.
+            match ctx.take_stripped_json_content() {
+                Some(content) => {
+                    let content_chunk =
+                        make_openai_chunk(ctx, serde_json::json!({ "content": content }), None);
+                    Some(format!("{content_chunk}data: [DONE]\n\n"))
+                }
+                None => Some("data: [DONE]\n\n".to_string()),
+            }
+        }
         _ => None, // ping
     }
 }
@@ -8778,6 +8925,7 @@ async fn forward_openai_compat_anthropic(
     session_id: &str,
     model: &str,
     is_streaming: bool,
+    json_mode: bool,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
     let token = ep.token.as_str();
@@ -9009,8 +9157,11 @@ async fn forward_openai_compat_anthropic(
 
         tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
-            let mut raw_sse: Vec<u8> = Vec::new();
-            let mut ctx = StreamContext::default();
+            let mut scanner = SseUsageScanner::default();
+            let mut ctx = StreamContext {
+                json_mode,
+                ..StreamContext::default()
+            };
             let mut sent_done = false;
 
             let mut client_gone = false;
@@ -9019,8 +9170,8 @@ async fn forward_openai_compat_anthropic(
             loop {
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {
+                        scanner.push(&chunk);
                         buffer.extend_from_slice(&chunk);
-                        raw_sse.extend_from_slice(&chunk);
 
                         while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
                             let event = String::from_utf8_lossy(&buffer[..pos]).into_owned();
@@ -9094,8 +9245,9 @@ async fn forward_openai_compat_anthropic(
                 client_gone = true;
             }
 
-            // Extract and record token usage from accumulated SSE data. The
-            // detached task only holds a cloned Arc<AppState>; re-index it.
+            // Record usage scanned incrementally from the upstream SSE
+            // (LAB-717). The detached task only holds a cloned
+            // Arc<AppState>; re-index it.
             let ep = &state_clone.endpoints[endpoint_idx];
             finalize_stream(
                 &state_clone,
@@ -9108,7 +9260,7 @@ async fn forward_openai_compat_anthropic(
                 &agent_clone,
                 &session_clone,
                 status_code,
-                &raw_sse,
+                scanner,
                 request_start,
                 client_gone,
                 upstream_error,
@@ -9156,7 +9308,7 @@ async fn forward_openai_compat_anthropic(
         }
     };
 
-    let openai_resp = translate_anthropic_to_openai(&anthropic_resp);
+    let openai_resp = translate_anthropic_to_openai(&anthropic_resp, json_mode);
 
     // Extract and record token usage from non-streaming response
     let usage = TokenUsage::from_response_body(&anthropic_resp);
@@ -9268,6 +9420,7 @@ async fn openai_chat_handler(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let json_mode = wants_json_object(&openai_body);
     let model = openai_body
         .get("model")
         .and_then(|m| m.as_str())
@@ -9345,6 +9498,7 @@ async fn openai_chat_handler(
                                     &session_id,
                                     &model,
                                     is_streaming,
+                                    json_mode,
                                     request_start,
                                 )
                                 .await;

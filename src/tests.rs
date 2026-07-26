@@ -3006,7 +3006,7 @@ fn translate_response_basic() {
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 10, "output_tokens": 5}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, false);
     assert_eq!(result["id"], "chatcmpl-msg_abc123");
     assert_eq!(result["object"], "chat.completion");
     assert_eq!(result["choices"][0]["message"]["role"], "assistant");
@@ -3023,7 +3023,7 @@ fn translate_response_usage_mapping() {
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 25, "output_tokens": 15}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, false);
     assert_eq!(result["usage"]["prompt_tokens"], 25);
     assert_eq!(result["usage"]["completion_tokens"], 15);
     assert_eq!(result["usage"]["total_tokens"], 40);
@@ -3065,6 +3065,8 @@ fn strip_json_fences_with_whitespace() {
 
 #[test]
 fn translate_response_strips_markdown_fences() {
+    // Fence stripping is gated on the request having asked for
+    // response_format: json_object (json_mode = true).
     let resp = serde_json::json!({
         "id": "msg_fenced",
         "content": [{"type": "text", "text": "```json\n{\"skipSearch\": true}\n```"}],
@@ -3072,11 +3074,38 @@ fn translate_response_strips_markdown_fences() {
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 10, "output_tokens": 5}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, true);
     assert_eq!(
         result["choices"][0]["message"]["content"],
         r#"{"skipSearch": true}"#
     );
+}
+
+#[test]
+fn translate_response_preserves_fences_without_json_mode() {
+    // A normal chat reply that IS a fenced code block must pass through
+    // verbatim — fences, language tag, and surrounding whitespace intact.
+    let text = "```python\nprint(\"hi\")\n```";
+    let resp = serde_json::json!({
+        "id": "msg_code",
+        "content": [{"type": "text", "text": text}],
+        "model": "claude-sonnet-4-6",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    });
+    let result = translate_anthropic_to_openai(&resp, false);
+    assert_eq!(result["choices"][0]["message"]["content"], text);
+}
+
+#[test]
+fn wants_json_object_detection() {
+    assert!(wants_json_object(&serde_json::json!({
+        "response_format": {"type": "json_object"}
+    })));
+    assert!(!wants_json_object(&serde_json::json!({
+        "response_format": {"type": "text"}
+    })));
+    assert!(!wants_json_object(&serde_json::json!({})));
 }
 
 #[test]
@@ -3091,7 +3120,7 @@ fn translate_response_tool_use_blocks() {
         "stop_reason": "tool_use",
         "usage": {"input_tokens": 20, "output_tokens": 15}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, false);
     assert_eq!(result["choices"][0]["finish_reason"], "tool_calls");
     assert!(result["choices"][0]["message"]["content"].is_null());
     let tcs = result["choices"][0]["message"]["tool_calls"]
@@ -3119,7 +3148,7 @@ fn translate_response_mixed_text_and_tool_use() {
         "stop_reason": "tool_use",
         "usage": {"input_tokens": 10, "output_tokens": 10}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, false);
     assert_eq!(result["choices"][0]["message"]["content"], "Let me check.");
     let tcs = result["choices"][0]["message"]["tool_calls"]
         .as_array()
@@ -3274,6 +3303,186 @@ fn translate_sse_multiple_tool_calls() {
         chunk["choices"][0]["delta"]["tool_calls"][0]["id"],
         "toolu_2"
     );
+}
+
+// ── Regression: streaming ↔ non-streaming content parity (LAB-711) ──
+// A fenced reply must yield identical assembled content whether the client
+// used stream:true or stream:false, in both default and json_object modes.
+// Fences can be split across SSE deltas, so the streaming path buffers text
+// and strips the whole message once — the same strip the non-streaming path
+// applies. See GH #95 / codex-sol review.
+
+/// Reconstruct the OpenAI `content` a client would assemble from an Anthropic
+/// text reply delivered as `text_deltas` SSE frames.
+fn reconstruct_stream_content(text_deltas: &[&str], json_mode: bool) -> String {
+    let mut ctx = StreamContext {
+        json_mode,
+        ..Default::default()
+    };
+    let mut events: Vec<String> = vec![
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\"}}".to_string(),
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}".to_string(),
+    ];
+    for d in text_deltas {
+        let payload = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": d},
+        });
+        events.push(format!("event: content_block_delta\ndata: {payload}"));
+    }
+    events.push(
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}"
+            .to_string(),
+    );
+    events.push("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}".to_string());
+    events.push("event: message_stop\ndata: {\"type\":\"message_stop\"}".to_string());
+
+    let mut content = String::new();
+    for ev in &events {
+        let Some(out) = translate_sse_event(ev, &mut ctx) else {
+            continue;
+        };
+        // One translation may carry multiple `data:` frames (buffered content
+        // flushed together with the finish chunk).
+        for frame in out.split("\n\n") {
+            let Some(json) = frame.trim().strip_prefix("data: ") else {
+                continue;
+            };
+            if json == "[DONE]" {
+                continue;
+            }
+            let chunk: serde_json::Value = serde_json::from_str(json).unwrap();
+            if let Some(c) = chunk["choices"][0]["delta"]["content"].as_str() {
+                content.push_str(c);
+            }
+        }
+    }
+    content
+}
+
+/// Non-streaming assembled content for the same reply text.
+fn nonstream_content(full_text: &str, json_mode: bool) -> String {
+    let resp = serde_json::json!({
+        "id": "msg_x",
+        "content": [{"type": "text", "text": full_text}],
+        "model": "claude-sonnet-4-6",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    });
+    translate_anthropic_to_openai(&resp, json_mode)["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn stream_nonstream_content_parity_json_mode() {
+    // Fence deliberately split across three SSE deltas.
+    let deltas = ["```jso", "n\n{\"ok\":true}\n``", "`"];
+    let full: String = deltas.concat();
+    assert_eq!(full, "```json\n{\"ok\":true}\n```");
+
+    let stream_json = reconstruct_stream_content(&deltas, true);
+    let nonstream_json = nonstream_content(&full, true);
+    // Both transports strip the fence down to raw JSON, and agree.
+    assert_eq!(stream_json, r#"{"ok":true}"#);
+    assert_eq!(stream_json, nonstream_json);
+}
+
+#[test]
+fn stream_nonstream_content_parity_default_mode() {
+    // Same reply, default (non-JSON) mode: fences preserved on both transports.
+    let deltas = ["```jso", "n\n{\"ok\":true}\n``", "`"];
+    let full: String = deltas.concat();
+
+    let stream_default = reconstruct_stream_content(&deltas, false);
+    let nonstream_default = nonstream_content(&full, false);
+    assert_eq!(stream_default, full);
+    assert_eq!(stream_default, nonstream_default);
+}
+
+#[test]
+fn json_mode_stream_buffers_deltas_then_flushes_content_before_finish() {
+    let mut ctx = StreamContext {
+        json_mode: true,
+        ..Default::default()
+    };
+
+    let start = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}";
+    translate_sse_event(start, &mut ctx);
+
+    // The complete fenced JSON reply spans two deltas. Neither partial delta
+    // may be forwarded, because fence removal is applied to the whole reply.
+    for text in ["```json\n{\"first\":", "true}\n```"] {
+        let payload = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        });
+        let event = format!("event: content_block_delta\ndata: {payload}");
+        assert!(translate_sse_event(&event, &mut ctx).is_none());
+    }
+
+    let finish = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}";
+    let output = translate_sse_event(finish, &mut ctx).unwrap();
+    let frames: Vec<_> = output
+        .split("\n\n")
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .map(|frame| serde_json::from_str::<serde_json::Value>(frame).unwrap())
+        .collect();
+
+    // The buffered, fence-stripped content is emitted exactly once and always
+    // precedes the OpenAI finish chunk.
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        frames[0]["choices"][0]["delta"]["content"],
+        r#"{"first":true}"#
+    );
+    assert!(frames[0]["choices"][0]["finish_reason"].is_null());
+    assert_eq!(frames[1]["choices"][0]["delta"], serde_json::json!({}));
+    assert_eq!(frames[1]["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        translate_sse_event(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}",
+            &mut ctx
+        )
+        .as_deref(),
+        Some("data: [DONE]\n\n")
+    );
+}
+
+#[test]
+fn json_mode_stream_message_stop_safety_net_flushes_buffer() {
+    // Abnormal upstream: message_stop arrives without a preceding
+    // message_delta. The buffered JSON-mode content must still be flushed
+    // (fence-stripped) ahead of [DONE], never silently dropped.
+    let mut ctx = StreamContext {
+        json_mode: true,
+        ..Default::default()
+    };
+    let payload = serde_json::json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "```json\n{\"ok\":true}\n```"},
+    });
+    assert!(translate_sse_event(
+        &format!("event: content_block_delta\ndata: {payload}"),
+        &mut ctx
+    )
+    .is_none());
+
+    let output = translate_sse_event(
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}",
+        &mut ctx,
+    )
+    .unwrap();
+    let mut frames = output
+        .split("\n\n")
+        .filter_map(|f| f.strip_prefix("data: "));
+    let content: serde_json::Value = serde_json::from_str(frames.next().unwrap()).unwrap();
+    assert_eq!(content["choices"][0]["delta"]["content"], r#"{"ok":true}"#);
+    assert_eq!(frames.next(), Some("[DONE]"));
 }
 
 // ── Reverse translation: Anthropic → OpenAI ──────────────────────
@@ -4757,6 +4966,183 @@ async fn openai_chat_non_streaming() {
     assert_eq!(body["usage"]["total_tokens"], 15);
 }
 
+/// Mock whose reply IS a fenced code block — exercises the json_mode gate
+/// end-to-end (GH #95 / LAB-711).
+async fn mock_anthropic_fenced_handler(_req: Request<Body>) -> Response {
+    axum::Json(serde_json::json!({
+        "id": "msg_fenced",
+        "type": "message",
+        "content": [{"type": "text", "text": "```json\n{\"a\": 1}\n```"}],
+        "model": "claude-sonnet-4-6",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    }))
+    .into_response()
+}
+
+#[tokio::test]
+async fn openai_chat_fence_strip_gated_on_response_format() {
+    let mock_app = Router::new().fallback(any(mock_anthropic_fenced_handler));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let (app, _state) = test_openai_app(&format!("http://{}", mock_addr), None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let client = Client::new();
+
+    // Without response_format: fenced content passes through verbatim.
+    let resp = client
+        .post(format!("http://{}/v1/chat/completions", addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "```json\n{\"a\": 1}\n```",
+        "non-JSON-mode reply must not be mutated"
+    );
+
+    // With response_format json_object: fences stripped.
+    let resp = client
+        .post(format!("http://{}/v1/chat/completions", addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_object"}}"#)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"], r#"{"a": 1}"#,
+        "JSON-mode reply must have fences stripped"
+    );
+}
+
+/// Streaming mock whose reply IS a fenced code block, split across three text
+/// deltas so a fence spans SSE frame boundaries. Same reply as
+/// `mock_anthropic_fenced_handler` for a direct stream/non-stream comparison.
+async fn mock_anthropic_streaming_fenced_handler(req: Request<Body>) -> Response {
+    let has_auth =
+        req.headers().contains_key("x-api-key") || req.headers().contains_key("authorization");
+    if !has_auth {
+        return (StatusCode::UNAUTHORIZED, "missing auth").into_response();
+    }
+    let deltas = ["```js", "on\n{\"a\": 1}", "\n```"];
+    let mut body = String::from(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fenced_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    );
+    for d in deltas {
+        let payload = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": d},
+        });
+        body.push_str(&format!("event: content_block_delta\ndata: {payload}\n\n"));
+    }
+    body.push_str(
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    );
+    body.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n");
+    body.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// End-to-end: the streaming path must honour the same json_mode gate as
+/// non-streaming, so a fenced reply yields identical assembled content across
+/// transports (GH #95 / LAB-711 — closes the handler-plumbing gap that unit
+/// tests on translate_sse_event alone cannot cover).
+#[tokio::test]
+async fn openai_chat_streaming_fence_strip_gated_on_response_format() {
+    let mock_app = Router::new().fallback(any(mock_anthropic_streaming_fenced_handler));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let (app, _state) = test_openai_app(&format!("http://{}", mock_addr), None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let client = Client::new();
+
+    // Assemble the `content` a client would see from an SSE response body.
+    fn assemble(body: &str) -> String {
+        let mut content = String::new();
+        for line in body.lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data == "[DONE]" {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+                    content.push_str(c);
+                }
+            }
+        }
+        content
+    }
+
+    // stream:true without response_format → fenced content passes verbatim.
+    let resp = client
+        .post(format!("http://{}/v1/chat/completions", addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi"}],"stream":true}"#)
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert_eq!(
+        assemble(&body),
+        "```json\n{\"a\": 1}\n```",
+        "streaming non-JSON-mode must not mutate content"
+    );
+
+    // stream:true with response_format json_object → fences stripped, matching
+    // the non-streaming json_object result exactly.
+    let resp = client
+        .post(format!("http://{}/v1/chat/completions", addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi"}],"stream":true,"response_format":{"type":"json_object"}}"#)
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert_eq!(
+        assemble(&body),
+        r#"{"a": 1}"#,
+        "streaming JSON-mode must strip fences, matching non-streaming"
+    );
+}
+
 #[tokio::test]
 async fn openai_chat_streaming() {
     let mock_app = Router::new().fallback(any(mock_anthropic_streaming_handler));
@@ -4767,7 +5153,7 @@ async fn openai_chat_streaming() {
     });
 
     let mock_url = format!("http://{}", mock_addr);
-    let (app, _state) = test_openai_app(&mock_url, None);
+    let (app, state) = test_openai_app(&mock_url, None);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -4832,6 +5218,84 @@ async fn openai_chat_streaming() {
     // Last data chunk: finish_reason
     let last = chunks.last().unwrap();
     assert_eq!(last["choices"][0]["finish_reason"], "stop");
+
+    // LAB-717: usage is scanned incrementally (no raw_sse buffering) and
+    // recorded by the detached finalize task after the stream closes — poll
+    // briefly for it to land. The mock stream carries input=10 / output=5.
+    assert_eq!(
+        poll_streamed_usage(&state).await,
+        (10, 5),
+        "streamed usage must be recorded from the incremental scan"
+    );
+}
+
+/// Poll endpoint token counters until streamed usage lands (the finalize
+/// task is detached, so recording races the client seeing end-of-stream).
+async fn poll_streamed_usage(state: &Arc<AppState>) -> (u64, u64) {
+    let mut recorded = (0, 0);
+    for _ in 0..40 {
+        let input: u64 = state
+            .endpoints
+            .iter()
+            .map(|e| e.input_tokens.load(Ordering::Relaxed))
+            .sum();
+        let output: u64 = state
+            .endpoints
+            .iter()
+            .map(|e| e.output_tokens.load(Ordering::Relaxed))
+            .sum();
+        recorded = (input, output);
+        if input > 0 && output > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    recorded
+}
+
+/// LAB-717: native-path (/v1/messages) streaming — the passthrough stream is
+/// scanned incrementally and usage recorded without buffering the response.
+#[tokio::test]
+async fn anthropic_streaming_records_usage() {
+    let mock_app = Router::new().fallback(any(mock_anthropic_streaming_handler));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let (app, state) = test_app(&format!("http://{}", mock_addr), None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let resp = Client::new()
+        .post(format!("http://{}/v1/messages", addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6","stream":true,"messages":[{"role":"user","content":"hi"}],"max_tokens":100}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("message_stop"),
+        "stream should pass through untouched, got: {body:?}"
+    );
+
+    assert_eq!(
+        poll_streamed_usage(&state).await,
+        (10, 5),
+        "streamed usage must be recorded from the incremental scan"
+    );
 }
 
 #[tokio::test]
@@ -5216,6 +5680,115 @@ data: {\"type\":\"message_stop\"}\n\n";
 fn usage_from_empty_sse() {
     let usage = TokenUsage::from_sse_text("");
     assert!(usage.is_empty());
+}
+
+/// LAB-717: the incremental scanner must produce the same usage regardless of
+/// how the stream is fragmented into chunks — including splits mid-line,
+/// mid-JSON, and down to one byte per push.
+#[test]
+fn sse_scanner_chunk_boundaries_do_not_affect_usage() {
+    let sse: &[u8] = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":150,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":5}}}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"mentions message_delta harmlessly\"}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":75}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+    // Every chunk size from pathological (1 byte) to whole-stream.
+    for chunk_size in [1, 3, 7, 64, sse.len()] {
+        let mut scanner = SseUsageScanner::default();
+        for chunk in sse.chunks(chunk_size) {
+            scanner.push(chunk);
+        }
+        scanner.finish();
+        assert_eq!(scanner.usage.input_tokens, 150, "chunk_size={chunk_size}");
+        assert_eq!(scanner.usage.output_tokens, 75, "chunk_size={chunk_size}");
+        assert_eq!(scanner.usage.cache_creation_input_tokens, 10);
+        assert_eq!(scanner.usage.cache_read_input_tokens, 5);
+        assert_eq!(scanner.bytes_seen, sse.len());
+        assert_eq!(scanner.event_count, 4);
+    }
+}
+
+/// LAB-717: the trailing line is scanned even when the stream ends without a
+/// final newline (finish() flushes the carry).
+#[test]
+fn sse_scanner_flushes_unterminated_final_line() {
+    let mut scanner = SseUsageScanner::default();
+    scanner.push(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}");
+    scanner.finish();
+    assert_eq!(scanner.usage.output_tokens, 42);
+}
+
+/// LAB-717: a single line larger than SSE_SCAN_MAX_LINE must not grow the
+/// carry without bound — it is discarded up to its newline, and scanning
+/// resumes cleanly on the following lines.
+#[test]
+fn sse_scanner_discards_oversized_line_and_recovers() {
+    let mut scanner = SseUsageScanner::default();
+    // Oversized junk line delivered across several pushes, no newline yet.
+    let junk = vec![b'x'; SSE_SCAN_MAX_LINE / 2 + 1];
+    scanner.push(&junk);
+    scanner.push(&junk); // crosses the cap → carry dropped, skip mode
+    assert!(
+        scanner.carry.is_empty(),
+        "carry must not hold oversized line"
+    );
+    scanner.push(b"more of the same line\n"); // newline ends the skipped line
+    scanner.push(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n");
+    scanner.finish();
+    assert_eq!(scanner.usage.output_tokens, 9);
+}
+
+/// LAB-717: the cap applies uniformly when the oversized line terminates
+/// within a single push — both when it completes a cross-chunk carry and
+/// when it arrives whole — and the carry allocation must not retain the
+/// oversized capacity afterwards.
+#[test]
+fn sse_scanner_caps_oversized_line_completed_in_one_push() {
+    // Whole oversized line (with newline) in one push.
+    let mut scanner = SseUsageScanner::default();
+    let mut blob = vec![b'x'; SSE_SCAN_MAX_LINE + 1];
+    blob.push(b'\n');
+    scanner.push(&blob);
+    scanner.push(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n");
+    scanner.finish();
+    assert_eq!(scanner.usage.output_tokens, 7);
+    assert!(scanner.carry.capacity() <= SSE_SCAN_MAX_LINE);
+
+    // Carry just under the cap, then a chunk whose newline completes the
+    // combined oversized line.
+    let mut scanner = SseUsageScanner::default();
+    scanner.push(&vec![b'x'; SSE_SCAN_MAX_LINE]); // fills carry to the cap
+    scanner.push(b"y\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":8}}\n");
+    scanner.finish();
+    assert_eq!(scanner.usage.output_tokens, 8);
+    assert!(
+        scanner.carry.capacity() <= SSE_SCAN_MAX_LINE,
+        "oversized merge must not balloon the retained carry allocation"
+    );
+}
+
+/// LAB-717: diagnostic metadata for stream_end_no_usage is bounded — full
+/// event count, but only the first five event types retained.
+#[test]
+fn sse_scanner_event_preview_bounded_to_five() {
+    let mut scanner = SseUsageScanner::default();
+    for i in 0..7 {
+        scanner.push(format!("event: ev{i}\ndata: {{}}\n\n").as_bytes());
+    }
+    scanner.finish();
+    assert_eq!(scanner.event_count, 7);
+    assert_eq!(
+        scanner.event_preview,
+        vec!["ev0", "ev1", "ev2", "ev3", "ev4"]
+    );
+    assert!(scanner.usage.is_empty());
 }
 
 #[tokio::test]
