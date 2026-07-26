@@ -6059,8 +6059,22 @@ async fn try_fallback_upstream(
     // OpenAI non-streaming bodies carry usage.prompt_tokens/completion_tokens —
     // record them like the Anthropic path so per-client token + budget
     // enforcement (`pre_request_gate`) sees OpenAI-endpoint spend (LAB-712).
-    let openai_resp: serde_json::Value =
-        serde_json::from_slice(&resp_body).unwrap_or(serde_json::json!({}));
+    let openai_resp: serde_json::Value = match serde_json::from_slice(&resp_body) {
+        Ok(v) => v,
+        Err(e) => {
+            // Still serve the response (passthrough forwards the raw bytes),
+            // but the malformed body means usage records as zero — say so.
+            warn!(
+                req_id,
+                client_id,
+                model,
+                upstream = ep.name,
+                error = %e,
+                "fallback: unified endpoint response body is not valid JSON; usage not recorded"
+            );
+            serde_json::json!({})
+        }
+    };
     let usage = TokenUsage::from_openai_response_body(&openai_resp);
     finalize_non_stream(
         state,
