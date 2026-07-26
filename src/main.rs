@@ -4978,6 +4978,24 @@ fn exhaustion_response(last_saw_transient: bool, last_saw_529: bool) -> Response
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
 }
 
+/// 400 in Anthropic's error envelope when an Anthropic request can't be
+/// faithfully translated for an OpenAI-compat fallback endpoint (e.g. an
+/// image source type the translator doesn't support). The caller's request
+/// was Anthropic Messages API shaped, so the error response matches that,
+/// regardless of which protocol the fallback endpoint speaks.
+fn untranslatable_request_response(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [("content-type", "application/json")],
+        serde_json::json!({
+            "type": "error",
+            "error": { "type": "invalid_request_error", "message": message }
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
 /// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
 /// passes the picked endpoint and its pool index (used for `skip` and usage
 /// accounting).
@@ -5747,7 +5765,20 @@ async fn try_fallback_upstream(
 
     // Build request body
     let request_body = if translate {
-        let openai_body = translate_anthropic_request_to_openai(&parsed);
+        let openai_body = match translate_anthropic_request_to_openai(&parsed) {
+            Ok(v) => v,
+            Err(msg) => {
+                warn!(
+                    req_id,
+                    upstream = ep.name,
+                    error = %msg,
+                    "fallback: request not representable in OpenAI format"
+                );
+                // Terminal, not a retry: the request itself is the problem, so
+                // rotating to another endpoint would just fail the same way.
+                return ForwardOutcome::Done(untranslatable_request_response(&msg));
+            }
+        };
         match serde_json::to_vec(&openai_body) {
             Ok(b) => b,
             Err(_) => return ROTATE,
@@ -7613,10 +7644,22 @@ async fn metrics_handler(
 
 // ── OpenAI compatibility ─────────────────────────────────────────────
 
+/// True when an OpenAI-format request asked for `response_format: json_object`.
+/// Single predicate shared by the request-side system nudge and the
+/// response-side fence strip so the two can never disagree on what JSON mode is.
+fn wants_json_object(body: &serde_json::Value) -> bool {
+    body.get("response_format")
+        .and_then(|rf| rf.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("json_object")
+}
+
 /// Strip markdown JSON fences from LLM output.
 /// Claude sometimes wraps JSON in ```json ... ``` even when told not to.
 /// Clients using response_format: json_object (e.g. Vercel AI SDK's generateObject)
 /// need raw JSON or their parse step blows up.
+/// Only applied when the request asked for JSON mode — a normal chat reply
+/// that legitimately is a fenced code block must pass through verbatim.
 fn strip_json_fences(s: &str) -> String {
     let trimmed = s.trim();
     if let Some(rest) = trimmed.strip_prefix("```") {
@@ -7650,6 +7693,11 @@ struct StreamContext {
     tool_call_index: i64,
     in_tool_use: bool,
     current_tool_id: String,
+    /// Request asked for `response_format: json_object`.
+    json_mode: bool,
+    /// Text content buffered while `json_mode` is set, flushed fence-stripped
+    /// at end-of-message so streaming content matches the non-streaming strip.
+    text_buffer: String,
 }
 
 impl Default for StreamContext {
@@ -7661,7 +7709,24 @@ impl Default for StreamContext {
             tool_call_index: -1,
             in_tool_use: false,
             current_tool_id: String::new(),
+            json_mode: false,
+            text_buffer: String::new(),
         }
+    }
+}
+
+impl StreamContext {
+    /// In JSON mode, drain the buffered text and strip fences over the whole
+    /// message — the streaming equivalent of the non-streaming strip, applied
+    /// once so fences split across deltas are handled. Returns None when not in
+    /// JSON mode, the buffer is empty, or the strip yields nothing.
+    fn take_stripped_json_content(&mut self) -> Option<String> {
+        if !self.json_mode || self.text_buffer.is_empty() {
+            return None;
+        }
+        let stripped = strip_json_fences(&self.text_buffer);
+        self.text_buffer.clear();
+        (!stripped.is_empty()).then_some(stripped)
     }
 }
 
@@ -7684,6 +7749,24 @@ fn make_openai_chunk(
     format!("data: {}\n\n", chunk)
 }
 
+/// OpenAI `image_url` part → Anthropic `image` block. `data:` URLs unpack into a
+/// base64 source; anything else (including malformed data URLs) becomes a url
+/// source so upstream rejects it with a real error instead of us dropping it.
+fn openai_image_part_to_anthropic(url: &str) -> serde_json::Value {
+    if let Some(rest) = url.strip_prefix("data:") {
+        if let Some((media_type, data)) = rest.split_once(";base64,") {
+            return serde_json::json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": data},
+            });
+        }
+    }
+    serde_json::json!({
+        "type": "image",
+        "source": {"type": "url", "url": url},
+    })
+}
+
 fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value {
     let mut out = serde_json::Map::new();
 
@@ -7700,8 +7783,22 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
         for msg in msgs {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
             if role == "system" {
-                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                    system_parts.push(content.to_string());
+                // content can be a string or an array of text parts
+                let content_val = msg.get("content");
+                let content_str = content_val
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        content_val?.as_array().map(|parts| {
+                            parts
+                                .iter()
+                                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("")
+                        })
+                    });
+                if let Some(s) = content_str {
+                    system_parts.push(s);
                 }
             } else if role == "tool" {
                 // OpenAI tool result → Anthropic user message with tool_result block
@@ -7802,14 +7899,36 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
                 }
                 messages.push(serde_json::json!({"role": "assistant", "content": blocks}));
             } else {
-                // Standard message — strip "name" field, keep role + content
+                // Standard message — strip "name" field, keep role + content.
+                // Array content: translate OpenAI image_url parts to Anthropic
+                // image blocks (untranslated they 400 the whole request upstream).
                 let mut clean = serde_json::Map::new();
                 clean.insert(
                     "role".to_string(),
                     serde_json::Value::String(role.to_string()),
                 );
                 if let Some(content) = msg.get("content") {
-                    clean.insert("content".to_string(), content.clone());
+                    let translated = if let Some(parts) = content.as_array() {
+                        serde_json::Value::Array(
+                            parts
+                                .iter()
+                                .map(|p| {
+                                    if p.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+                                        let url = p
+                                            .pointer("/image_url/url")
+                                            .and_then(|u| u.as_str())
+                                            .unwrap_or("");
+                                        openai_image_part_to_anthropic(url)
+                                    } else {
+                                        p.clone()
+                                    }
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        content.clone()
+                    };
+                    clean.insert("content".to_string(), translated);
                 }
                 messages.push(serde_json::Value::Object(clean));
             }
@@ -7817,12 +7936,10 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
     }
 
     // response_format: inject JSON mode instruction into system prompt
-    if let Some(rf) = body.get("response_format") {
-        if rf.get("type").and_then(|t| t.as_str()) == Some("json_object") {
-            system_parts.push(
-                "You must respond with valid JSON only. No markdown, no code fences, no explanation — just raw JSON.".to_string(),
-            );
-        }
+    if wants_json_object(body) {
+        system_parts.push(
+            "You must respond with valid JSON only. No markdown, no code fences, no explanation — just raw JSON.".to_string(),
+        );
     }
 
     if !system_parts.is_empty() {
@@ -7913,7 +8030,7 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
     serde_json::Value::Object(out)
 }
 
-fn translate_anthropic_to_openai(body: &serde_json::Value) -> serde_json::Value {
+fn translate_anthropic_to_openai(body: &serde_json::Value, json_mode: bool) -> serde_json::Value {
     let id = body
         .get("id")
         .and_then(|v| v.as_str())
@@ -7925,7 +8042,8 @@ fn translate_anthropic_to_openai(body: &serde_json::Value) -> serde_json::Value 
 
     let blocks = body.get("content").and_then(|c| c.as_array());
 
-    // Concatenate text content blocks, strip markdown JSON fences
+    // Concatenate text content blocks; strip markdown JSON fences only when
+    // the request asked for response_format: json_object.
     let content = blocks
         .map(|blocks| {
             let raw = blocks
@@ -7934,7 +8052,11 @@ fn translate_anthropic_to_openai(body: &serde_json::Value) -> serde_json::Value 
                 .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
                 .collect::<Vec<_>>()
                 .join("");
-            strip_json_fences(&raw)
+            if json_mode {
+                strip_json_fences(&raw)
+            } else {
+                raw
+            }
         })
         .unwrap_or_default();
 
@@ -8103,6 +8225,14 @@ fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
                 if text.is_empty() {
                     return None;
                 }
+                if ctx.json_mode {
+                    // Buffer JSON-mode text; fences are stripped once over the
+                    // whole message at message_delta (they may be split across
+                    // deltas). Partial JSON is unparseable, so deferring the
+                    // emit costs the client nothing.
+                    ctx.text_buffer.push_str(text);
+                    return None;
+                }
                 Some(make_openai_chunk(
                     ctx,
                     serde_json::json!({"content": text}),
@@ -8121,13 +8251,35 @@ fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
                 .pointer("/delta/stop_reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("end_turn");
-            Some(make_openai_chunk(
+            let finish = make_openai_chunk(
                 ctx,
                 serde_json::json!({}),
                 Some(map_stop_reason(stop_reason)),
-            ))
+            );
+            // Flush buffered JSON-mode content (fence-stripped) as its own chunk
+            // before the finish chunk, preserving OpenAI content→finish order.
+            match ctx.take_stripped_json_content() {
+                Some(content) => {
+                    let content_chunk =
+                        make_openai_chunk(ctx, serde_json::json!({ "content": content }), None);
+                    Some(format!("{content_chunk}{finish}"))
+                }
+                None => Some(finish),
+            }
         }
-        "message_stop" => Some("data: [DONE]\n\n".to_string()),
+        "message_stop" => {
+            // Safety net: if message_delta never arrived (abnormal upstream),
+            // flush buffered JSON-mode content before closing so it is never
+            // silently dropped.
+            match ctx.take_stripped_json_content() {
+                Some(content) => {
+                    let content_chunk =
+                        make_openai_chunk(ctx, serde_json::json!({ "content": content }), None);
+                    Some(format!("{content_chunk}data: [DONE]\n\n"))
+                }
+                None => Some("data: [DONE]\n\n".to_string()),
+            }
+        }
         _ => None, // ping
     }
 }
@@ -8146,7 +8298,92 @@ fn reverse_map_stop_reason(reason: &str) -> &'static str {
 
 /// Translate an Anthropic Messages API request body to OpenAI Chat Completions format.
 /// Reverse of `translate_openai_to_anthropic`.
-fn translate_anthropic_request_to_openai(body: &serde_json::Value) -> serde_json::Value {
+/// Anthropic `image` block → OpenAI `image_url` part. Base64 sources repack as a
+/// `data:` URL. Err when the source can't be represented faithfully — missing
+/// fields, or a source type this translator doesn't handle (e.g. Anthropic's
+/// `file` source) — so the caller fails the request loudly instead of silently
+/// dropping the image.
+fn anthropic_image_block_to_openai(block: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let source = block
+        .get("source")
+        .ok_or("image block missing \"source\"")?;
+    let source_type = source
+        .get("type")
+        .and_then(|t| t.as_str())
+        .ok_or("image source missing \"type\"")?;
+    let url = match source_type {
+        "url" => source
+            .get("url")
+            .and_then(|u| u.as_str())
+            .ok_or("image url source missing \"url\"")?
+            .to_string(),
+        "base64" => {
+            let media_type = source
+                .get("media_type")
+                .and_then(|m| m.as_str())
+                .ok_or("image base64 source missing \"media_type\"")?;
+            let data = source
+                .get("data")
+                .and_then(|d| d.as_str())
+                .ok_or("image base64 source missing \"data\"")?;
+            format!("data:{};base64,{}", media_type, data)
+        }
+        other => {
+            return Err(format!(
+                "image source type \"{other}\" is not supported by the OpenAI-compat translator"
+            ));
+        }
+    };
+    Ok(serde_json::json!({"type": "image_url", "image_url": {"url": url}}))
+}
+
+/// Anthropic user content blocks → OpenAI content: a plain string when text-only
+/// (the common case, and what OpenAI-compat upstreams handle most reliably), a
+/// content-part array when image blocks are present so images survive translation.
+/// Err on an unrepresentable image or an unsupported block type (e.g. `document`)
+/// rather than dropping content silently.
+fn anthropic_user_blocks_to_openai_content(
+    blocks: &[&serde_json::Value],
+) -> Result<serde_json::Value, String> {
+    let mut parts: Vec<serde_json::Value> = Vec::new();
+    let mut has_image = false;
+    for b in blocks {
+        match b.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                    parts.push(serde_json::json!({"type": "text", "text": t}));
+                }
+            }
+            Some("image") => {
+                parts.push(anthropic_image_block_to_openai(b)?);
+                has_image = true;
+            }
+            Some(other) => {
+                return Err(format!(
+                    "content block type \"{other}\" is not supported by the OpenAI-compat translator"
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(if has_image {
+        serde_json::Value::Array(parts)
+    } else {
+        let text: String = parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        serde_json::Value::String(text)
+    })
+}
+
+/// Err (with a client-facing message) when a message contains an image this
+/// translator can't represent faithfully — the caller must surface a real
+/// error instead of silently forwarding a request with the image dropped.
+fn translate_anthropic_request_to_openai(
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let mut out = serde_json::Map::new();
 
     if let Some(model) = body.get("model") {
@@ -8277,33 +8514,37 @@ fn translate_anthropic_request_to_openai(body: &serde_json::Value) -> serde_json
                             }));
                         }
 
-                        // Also emit any non-tool_result text blocks as a user message
-                        let text_blocks: Vec<&str> = blocks
+                        // Also emit any non-tool_result blocks (text + images) as a user message
+                        let leftover: Vec<&serde_json::Value> = blocks
                             .iter()
-                            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .filter(|b| {
+                                b.get("type").and_then(|t| t.as_str()) != Some("tool_result")
+                            })
                             .collect();
-                        if !text_blocks.is_empty() {
+                        let user_content = anthropic_user_blocks_to_openai_content(&leftover)?;
+                        let non_empty = match &user_content {
+                            serde_json::Value::String(s) => !s.is_empty(),
+                            serde_json::Value::Array(a) => !a.is_empty(),
+                            _ => false,
+                        };
+                        if non_empty {
                             messages.push(serde_json::json!({
                                 "role": "user",
-                                "content": text_blocks.join(""),
+                                "content": user_content,
                             }));
                         }
                         continue;
                     }
                 }
-                // Plain user message — pass through content as-is
+                // Plain user message — string passes through; block arrays keep
+                // text AND images (images previously filtered out silently)
                 if let Some(c) = content {
                     if let Some(s) = c.as_str() {
                         messages.push(serde_json::json!({"role": "user", "content": s}));
                     } else if let Some(arr) = c.as_array() {
-                        let text: String = arr
-                            .iter()
-                            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("");
-                        messages.push(serde_json::json!({"role": "user", "content": text}));
+                        let block_refs: Vec<&serde_json::Value> = arr.iter().collect();
+                        let user_content = anthropic_user_blocks_to_openai_content(&block_refs)?;
+                        messages.push(serde_json::json!({"role": "user", "content": user_content}));
                     }
                 }
             }
@@ -8367,7 +8608,7 @@ fn translate_anthropic_request_to_openai(body: &serde_json::Value) -> serde_json
         }
     }
 
-    serde_json::Value::Object(out)
+    Ok(serde_json::Value::Object(out))
 }
 
 /// Translate an OpenAI Chat Completions response to Anthropic Messages API format.
@@ -8739,6 +8980,7 @@ async fn forward_openai_compat_anthropic(
     session_id: &str,
     model: &str,
     is_streaming: bool,
+    json_mode: bool,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
     let token = ep.token.as_str();
@@ -8971,7 +9213,10 @@ async fn forward_openai_compat_anthropic(
         tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
             let mut scanner = SseUsageScanner::default();
-            let mut ctx = StreamContext::default();
+            let mut ctx = StreamContext {
+                json_mode,
+                ..StreamContext::default()
+            };
             let mut sent_done = false;
 
             let mut client_gone = false;
@@ -9118,7 +9363,7 @@ async fn forward_openai_compat_anthropic(
         }
     };
 
-    let openai_resp = translate_anthropic_to_openai(&anthropic_resp);
+    let openai_resp = translate_anthropic_to_openai(&anthropic_resp, json_mode);
 
     // Extract and record token usage from non-streaming response
     let usage = TokenUsage::from_response_body(&anthropic_resp);
@@ -9230,6 +9475,7 @@ async fn openai_chat_handler(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let json_mode = wants_json_object(&openai_body);
     let model = openai_body
         .get("model")
         .and_then(|m| m.as_str())
@@ -9307,6 +9553,7 @@ async fn openai_chat_handler(
                                     &session_id,
                                     &model,
                                     is_streaming,
+                                    json_mode,
                                     request_start,
                                 )
                                 .await;

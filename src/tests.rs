@@ -2584,6 +2584,56 @@ fn translate_request_multi_system_concat() {
 }
 
 #[test]
+fn translate_request_system_array_content() {
+    // OpenAI permits system content as an array of text parts — must not be dropped
+    let req = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "You are "},
+                {"type": "text", "text": "helpful"}
+            ]},
+            {"role": "user", "content": "Hello"}
+        ],
+        "max_tokens": 100
+    });
+    let result = translate_openai_to_anthropic(&req);
+    assert_eq!(result["system"], "You are helpful");
+    assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn translate_request_image_url_to_image_block() {
+    // OpenAI image_url parts must become Anthropic image blocks, not pass through raw
+    let req = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "What is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
+            ]}
+        ],
+        "max_tokens": 100
+    });
+    let result = translate_openai_to_anthropic(&req);
+    let content = result["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(
+        content[0],
+        serde_json::json!({"type": "text", "text": "What is this?"})
+    );
+    // data: URL → base64 source
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "base64");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    assert_eq!(content[1]["source"]["data"], "iVBORw0KGgo=");
+    // plain URL → url source
+    assert_eq!(content[2]["type"], "image");
+    assert_eq!(content[2]["source"]["type"], "url");
+    assert_eq!(content[2]["source"]["url"], "https://example.com/cat.jpg");
+}
+
+#[test]
 fn translate_request_no_system() {
     let req = serde_json::json!({
         "model": "claude-sonnet-4-6",
@@ -2956,7 +3006,7 @@ fn translate_response_basic() {
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 10, "output_tokens": 5}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, false);
     assert_eq!(result["id"], "chatcmpl-msg_abc123");
     assert_eq!(result["object"], "chat.completion");
     assert_eq!(result["choices"][0]["message"]["role"], "assistant");
@@ -2973,7 +3023,7 @@ fn translate_response_usage_mapping() {
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 25, "output_tokens": 15}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, false);
     assert_eq!(result["usage"]["prompt_tokens"], 25);
     assert_eq!(result["usage"]["completion_tokens"], 15);
     assert_eq!(result["usage"]["total_tokens"], 40);
@@ -3015,6 +3065,8 @@ fn strip_json_fences_with_whitespace() {
 
 #[test]
 fn translate_response_strips_markdown_fences() {
+    // Fence stripping is gated on the request having asked for
+    // response_format: json_object (json_mode = true).
     let resp = serde_json::json!({
         "id": "msg_fenced",
         "content": [{"type": "text", "text": "```json\n{\"skipSearch\": true}\n```"}],
@@ -3022,11 +3074,38 @@ fn translate_response_strips_markdown_fences() {
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 10, "output_tokens": 5}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, true);
     assert_eq!(
         result["choices"][0]["message"]["content"],
         r#"{"skipSearch": true}"#
     );
+}
+
+#[test]
+fn translate_response_preserves_fences_without_json_mode() {
+    // A normal chat reply that IS a fenced code block must pass through
+    // verbatim — fences, language tag, and surrounding whitespace intact.
+    let text = "```python\nprint(\"hi\")\n```";
+    let resp = serde_json::json!({
+        "id": "msg_code",
+        "content": [{"type": "text", "text": text}],
+        "model": "claude-sonnet-4-6",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    });
+    let result = translate_anthropic_to_openai(&resp, false);
+    assert_eq!(result["choices"][0]["message"]["content"], text);
+}
+
+#[test]
+fn wants_json_object_detection() {
+    assert!(wants_json_object(&serde_json::json!({
+        "response_format": {"type": "json_object"}
+    })));
+    assert!(!wants_json_object(&serde_json::json!({
+        "response_format": {"type": "text"}
+    })));
+    assert!(!wants_json_object(&serde_json::json!({})));
 }
 
 #[test]
@@ -3041,7 +3120,7 @@ fn translate_response_tool_use_blocks() {
         "stop_reason": "tool_use",
         "usage": {"input_tokens": 20, "output_tokens": 15}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, false);
     assert_eq!(result["choices"][0]["finish_reason"], "tool_calls");
     assert!(result["choices"][0]["message"]["content"].is_null());
     let tcs = result["choices"][0]["message"]["tool_calls"]
@@ -3069,7 +3148,7 @@ fn translate_response_mixed_text_and_tool_use() {
         "stop_reason": "tool_use",
         "usage": {"input_tokens": 10, "output_tokens": 10}
     });
-    let result = translate_anthropic_to_openai(&resp);
+    let result = translate_anthropic_to_openai(&resp, false);
     assert_eq!(result["choices"][0]["message"]["content"], "Let me check.");
     let tcs = result["choices"][0]["message"]["tool_calls"]
         .as_array()
@@ -3226,6 +3305,186 @@ fn translate_sse_multiple_tool_calls() {
     );
 }
 
+// ── Regression: streaming ↔ non-streaming content parity (LAB-711) ──
+// A fenced reply must yield identical assembled content whether the client
+// used stream:true or stream:false, in both default and json_object modes.
+// Fences can be split across SSE deltas, so the streaming path buffers text
+// and strips the whole message once — the same strip the non-streaming path
+// applies. See GH #95 / codex-sol review.
+
+/// Reconstruct the OpenAI `content` a client would assemble from an Anthropic
+/// text reply delivered as `text_deltas` SSE frames.
+fn reconstruct_stream_content(text_deltas: &[&str], json_mode: bool) -> String {
+    let mut ctx = StreamContext {
+        json_mode,
+        ..Default::default()
+    };
+    let mut events: Vec<String> = vec![
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\"}}".to_string(),
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}".to_string(),
+    ];
+    for d in text_deltas {
+        let payload = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": d},
+        });
+        events.push(format!("event: content_block_delta\ndata: {payload}"));
+    }
+    events.push(
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}"
+            .to_string(),
+    );
+    events.push("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}".to_string());
+    events.push("event: message_stop\ndata: {\"type\":\"message_stop\"}".to_string());
+
+    let mut content = String::new();
+    for ev in &events {
+        let Some(out) = translate_sse_event(ev, &mut ctx) else {
+            continue;
+        };
+        // One translation may carry multiple `data:` frames (buffered content
+        // flushed together with the finish chunk).
+        for frame in out.split("\n\n") {
+            let Some(json) = frame.trim().strip_prefix("data: ") else {
+                continue;
+            };
+            if json == "[DONE]" {
+                continue;
+            }
+            let chunk: serde_json::Value = serde_json::from_str(json).unwrap();
+            if let Some(c) = chunk["choices"][0]["delta"]["content"].as_str() {
+                content.push_str(c);
+            }
+        }
+    }
+    content
+}
+
+/// Non-streaming assembled content for the same reply text.
+fn nonstream_content(full_text: &str, json_mode: bool) -> String {
+    let resp = serde_json::json!({
+        "id": "msg_x",
+        "content": [{"type": "text", "text": full_text}],
+        "model": "claude-sonnet-4-6",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    });
+    translate_anthropic_to_openai(&resp, json_mode)["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn stream_nonstream_content_parity_json_mode() {
+    // Fence deliberately split across three SSE deltas.
+    let deltas = ["```jso", "n\n{\"ok\":true}\n``", "`"];
+    let full: String = deltas.concat();
+    assert_eq!(full, "```json\n{\"ok\":true}\n```");
+
+    let stream_json = reconstruct_stream_content(&deltas, true);
+    let nonstream_json = nonstream_content(&full, true);
+    // Both transports strip the fence down to raw JSON, and agree.
+    assert_eq!(stream_json, r#"{"ok":true}"#);
+    assert_eq!(stream_json, nonstream_json);
+}
+
+#[test]
+fn stream_nonstream_content_parity_default_mode() {
+    // Same reply, default (non-JSON) mode: fences preserved on both transports.
+    let deltas = ["```jso", "n\n{\"ok\":true}\n``", "`"];
+    let full: String = deltas.concat();
+
+    let stream_default = reconstruct_stream_content(&deltas, false);
+    let nonstream_default = nonstream_content(&full, false);
+    assert_eq!(stream_default, full);
+    assert_eq!(stream_default, nonstream_default);
+}
+
+#[test]
+fn json_mode_stream_buffers_deltas_then_flushes_content_before_finish() {
+    let mut ctx = StreamContext {
+        json_mode: true,
+        ..Default::default()
+    };
+
+    let start = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}";
+    translate_sse_event(start, &mut ctx);
+
+    // The complete fenced JSON reply spans two deltas. Neither partial delta
+    // may be forwarded, because fence removal is applied to the whole reply.
+    for text in ["```json\n{\"first\":", "true}\n```"] {
+        let payload = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        });
+        let event = format!("event: content_block_delta\ndata: {payload}");
+        assert!(translate_sse_event(&event, &mut ctx).is_none());
+    }
+
+    let finish = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}";
+    let output = translate_sse_event(finish, &mut ctx).unwrap();
+    let frames: Vec<_> = output
+        .split("\n\n")
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .map(|frame| serde_json::from_str::<serde_json::Value>(frame).unwrap())
+        .collect();
+
+    // The buffered, fence-stripped content is emitted exactly once and always
+    // precedes the OpenAI finish chunk.
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        frames[0]["choices"][0]["delta"]["content"],
+        r#"{"first":true}"#
+    );
+    assert!(frames[0]["choices"][0]["finish_reason"].is_null());
+    assert_eq!(frames[1]["choices"][0]["delta"], serde_json::json!({}));
+    assert_eq!(frames[1]["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        translate_sse_event(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}",
+            &mut ctx
+        )
+        .as_deref(),
+        Some("data: [DONE]\n\n")
+    );
+}
+
+#[test]
+fn json_mode_stream_message_stop_safety_net_flushes_buffer() {
+    // Abnormal upstream: message_stop arrives without a preceding
+    // message_delta. The buffered JSON-mode content must still be flushed
+    // (fence-stripped) ahead of [DONE], never silently dropped.
+    let mut ctx = StreamContext {
+        json_mode: true,
+        ..Default::default()
+    };
+    let payload = serde_json::json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "```json\n{\"ok\":true}\n```"},
+    });
+    assert!(translate_sse_event(
+        &format!("event: content_block_delta\ndata: {payload}"),
+        &mut ctx
+    )
+    .is_none());
+
+    let output = translate_sse_event(
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}",
+        &mut ctx,
+    )
+    .unwrap();
+    let mut frames = output
+        .split("\n\n")
+        .filter_map(|f| f.strip_prefix("data: "));
+    let content: serde_json::Value = serde_json::from_str(frames.next().unwrap()).unwrap();
+    assert_eq!(content["choices"][0]["delta"]["content"], r#"{"ok":true}"#);
+    assert_eq!(frames.next(), Some("[DONE]"));
+}
+
 // ── Reverse translation: Anthropic → OpenAI ──────────────────────
 
 #[test]
@@ -3251,7 +3510,7 @@ fn translate_anthropic_request_basic() {
         "stream": true
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     assert_eq!(result["model"], "claude-sonnet-4-6");
     assert_eq!(result["max_tokens"], 1024);
     assert_eq!(result["temperature"], 0.7);
@@ -3297,7 +3556,7 @@ fn translate_anthropic_request_tool_use() {
         "max_tokens": 1024
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     let msgs = result["messages"].as_array().unwrap();
 
     // Assistant with tool_calls
@@ -3332,7 +3591,7 @@ fn translate_anthropic_request_tools() {
         "tool_choice": {"type": "auto"}
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     let tools = result["tools"].as_array().unwrap();
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["function"]["name"], "get_weather");
@@ -3362,10 +3621,100 @@ fn translate_anthropic_request_tool_result_array_content() {
         "max_tokens": 1024
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     let msgs = result["messages"].as_array().unwrap();
     assert_eq!(msgs[0]["role"], "tool");
     assert_eq!(msgs[0]["content"], "Result line 1Result line 2");
+}
+
+#[test]
+fn translate_anthropic_request_image_blocks() {
+    // Anthropic image blocks must become OpenAI image_url parts, not be filtered out
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Describe this"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": "abc123"
+                }},
+                {"type": "image", "source": {
+                    "type": "url", "url": "https://example.com/dog.png"
+                }}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    let content = result["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(
+        content[0],
+        serde_json::json!({"type": "text", "text": "Describe this"})
+    );
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "data:image/jpeg;base64,abc123"
+    );
+    assert_eq!(content[2]["type"], "image_url");
+    assert_eq!(
+        content[2]["image_url"]["url"],
+        "https://example.com/dog.png"
+    );
+}
+
+#[test]
+fn translate_anthropic_request_text_only_array_stays_string() {
+    // Text-only block arrays keep the plain-string content form (no behavior change)
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "part one "},
+                {"type": "text", "text": "part two"}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    assert_eq!(result["messages"][0]["content"], "part one part two");
+}
+
+#[test]
+fn translate_anthropic_request_image_beside_tool_result_survives() {
+    // Images sharing a user message with tool_results must survive into the
+    // leftover user message, not be text-filtered away
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_789", "content": "done"},
+                {"type": "text", "text": "And this image:"},
+                {"type": "image", "source": {
+                    "type": "url", "url": "https://example.com/chart.png"
+                }}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    let msgs = result["messages"].as_array().unwrap();
+    assert_eq!(msgs[0]["role"], "tool");
+    assert_eq!(msgs[0]["content"], "done");
+    assert_eq!(msgs[1]["role"], "user");
+    let content = msgs[1]["content"].as_array().unwrap();
+    assert_eq!(
+        content[0],
+        serde_json::json!({"type": "text", "text": "And this image:"})
+    );
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "https://example.com/chart.png"
+    );
 }
 
 #[test]
@@ -3413,8 +3762,72 @@ fn translate_anthropic_request_stop_sequences() {
         "stop_sequences": ["END", "STOP"]
     });
 
-    let result = translate_anthropic_request_to_openai(&body);
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
     assert_eq!(result["stop"], serde_json::json!(["END", "STOP"]));
+}
+
+#[test]
+fn translate_anthropic_request_unsupported_image_source_fails_loudly() {
+    // An image source type this translator can't represent (e.g. Anthropic's
+    // `file` source) must fail the whole request, not silently drop the image
+    // while keeping the surrounding text.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Describe this"},
+                {"type": "image", "source": {"type": "file", "file_id": "file_abc"}}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    let err = translate_anthropic_request_to_openai(&body).unwrap_err();
+    assert!(
+        err.contains("file"),
+        "error should name the unsupported source type: {err}"
+    );
+}
+
+#[test]
+fn translate_anthropic_request_malformed_image_source_fails_loudly() {
+    // A structurally invalid image source (missing required fields) must also
+    // fail loudly rather than being silently dropped.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png"}}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    assert!(translate_anthropic_request_to_openai(&body).is_err());
+}
+
+#[test]
+fn translate_anthropic_request_unsupported_block_type_fails_loudly() {
+    // A content block type this translator can't represent (e.g. `document`)
+    // must fail the whole request, not be silently dropped from the message.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Summarize this"},
+                {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": "JVBERi0="
+                }}
+            ]}
+        ],
+        "max_tokens": 1024
+    });
+
+    let err = translate_anthropic_request_to_openai(&body).unwrap_err();
+    assert!(
+        err.contains("document"),
+        "error should name the unsupported block type: {err}"
+    );
 }
 
 #[test]
@@ -4575,6 +4988,183 @@ async fn openai_chat_non_streaming() {
     assert_eq!(body["usage"]["prompt_tokens"], 10);
     assert_eq!(body["usage"]["completion_tokens"], 5);
     assert_eq!(body["usage"]["total_tokens"], 15);
+}
+
+/// Mock whose reply IS a fenced code block — exercises the json_mode gate
+/// end-to-end (GH #95 / LAB-711).
+async fn mock_anthropic_fenced_handler(_req: Request<Body>) -> Response {
+    axum::Json(serde_json::json!({
+        "id": "msg_fenced",
+        "type": "message",
+        "content": [{"type": "text", "text": "```json\n{\"a\": 1}\n```"}],
+        "model": "claude-sonnet-4-6",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    }))
+    .into_response()
+}
+
+#[tokio::test]
+async fn openai_chat_fence_strip_gated_on_response_format() {
+    let mock_app = Router::new().fallback(any(mock_anthropic_fenced_handler));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let (app, _state) = test_openai_app(&format!("http://{}", mock_addr), None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let client = Client::new();
+
+    // Without response_format: fenced content passes through verbatim.
+    let resp = client
+        .post(format!("http://{}/v1/chat/completions", addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "```json\n{\"a\": 1}\n```",
+        "non-JSON-mode reply must not be mutated"
+    );
+
+    // With response_format json_object: fences stripped.
+    let resp = client
+        .post(format!("http://{}/v1/chat/completions", addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_object"}}"#)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"], r#"{"a": 1}"#,
+        "JSON-mode reply must have fences stripped"
+    );
+}
+
+/// Streaming mock whose reply IS a fenced code block, split across three text
+/// deltas so a fence spans SSE frame boundaries. Same reply as
+/// `mock_anthropic_fenced_handler` for a direct stream/non-stream comparison.
+async fn mock_anthropic_streaming_fenced_handler(req: Request<Body>) -> Response {
+    let has_auth =
+        req.headers().contains_key("x-api-key") || req.headers().contains_key("authorization");
+    if !has_auth {
+        return (StatusCode::UNAUTHORIZED, "missing auth").into_response();
+    }
+    let deltas = ["```js", "on\n{\"a\": 1}", "\n```"];
+    let mut body = String::from(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fenced_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    );
+    for d in deltas {
+        let payload = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": d},
+        });
+        body.push_str(&format!("event: content_block_delta\ndata: {payload}\n\n"));
+    }
+    body.push_str(
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    );
+    body.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n");
+    body.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// End-to-end: the streaming path must honour the same json_mode gate as
+/// non-streaming, so a fenced reply yields identical assembled content across
+/// transports (GH #95 / LAB-711 — closes the handler-plumbing gap that unit
+/// tests on translate_sse_event alone cannot cover).
+#[tokio::test]
+async fn openai_chat_streaming_fence_strip_gated_on_response_format() {
+    let mock_app = Router::new().fallback(any(mock_anthropic_streaming_fenced_handler));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let (app, _state) = test_openai_app(&format!("http://{}", mock_addr), None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let client = Client::new();
+
+    // Assemble the `content` a client would see from an SSE response body.
+    fn assemble(body: &str) -> String {
+        let mut content = String::new();
+        for line in body.lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data == "[DONE]" {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+                    content.push_str(c);
+                }
+            }
+        }
+        content
+    }
+
+    // stream:true without response_format → fenced content passes verbatim.
+    let resp = client
+        .post(format!("http://{}/v1/chat/completions", addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi"}],"stream":true}"#)
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert_eq!(
+        assemble(&body),
+        "```json\n{\"a\": 1}\n```",
+        "streaming non-JSON-mode must not mutate content"
+    );
+
+    // stream:true with response_format json_object → fences stripped, matching
+    // the non-streaming json_object result exactly.
+    let resp = client
+        .post(format!("http://{}/v1/chat/completions", addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi"}],"stream":true,"response_format":{"type":"json_object"}}"#)
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert_eq!(
+        assemble(&body),
+        r#"{"a": 1}"#,
+        "streaming JSON-mode must strip fences, matching non-streaming"
+    );
 }
 
 #[tokio::test]
