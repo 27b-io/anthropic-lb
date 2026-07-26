@@ -2170,13 +2170,24 @@ impl AppState {
             }
             match ep.protocol {
                 Protocol::OpenAI => {
-                    // OpenAI endpoints carry no rate-limit data, but they DO
-                    // carry transport health — a circuit-broken endpoint leaves
-                    // the pool the same way an Anthropic one does. If the whole
-                    // pool is circuit-broken this fails closed (429), matching
-                    // the hard-limited precedent; the cooldown bounds the window.
+                    // OpenAI endpoints carry no utilization data, but they DO
+                    // carry 429 hard-limit state and transport health — an
+                    // endpoint that told us to back off, or is circuit-broken,
+                    // leaves the pool the same way an Anthropic one does. If
+                    // the whole pool is excluded this fails closed (429); the
+                    // cooldown bounds the window.
                     {
                         let info = ep.rate_info.read().await;
+                        if let Some(until) = info.hard_limited_until {
+                            if now < until {
+                                trace!(
+                                    endpoint = ep.name,
+                                    hard_limited_secs = until.duration_since(now).as_secs(),
+                                    "pick: skipping hard-limited endpoint"
+                                );
+                                continue;
+                            }
+                        }
                         if let Some(until) = info.transport_unhealthy_until {
                             if now < until {
                                 trace!(
@@ -4817,14 +4828,15 @@ fn describe_reqwest_error(e: &reqwest::Error) -> String {
 
 /// Classify an upstream Anthropic response status into a retry decision.
 ///
-/// Shared by both `forward_anthropic` and `forward_openai_compat_anthropic`,
-/// whose retry-classification logic is byte-identical. For 429 / 529 / other
-/// 5xx it records hard-limit state, persists, and logs exactly as the prior
-/// inline blocks did, returning `Err(ForwardOutcome::Retry { .. })`. For any
-/// non-retry status (2xx success or 4xx client error) it returns
-/// `Ok(resp)` — handing the response back so the caller can continue.
+/// Shared by `forward_anthropic`, `forward_openai_compat_anthropic`, and
+/// `try_fallback_upstream`, so retry classification cannot drift between
+/// protocols. For 429 / 529 / other 5xx it records hard-limit state,
+/// persists, and logs exactly as the prior inline blocks did, returning
+/// `Err(ForwardOutcome::Retry { .. })`. For any non-retry status (2xx
+/// success or 4xx client error) it returns `Ok(resp)` — handing the
+/// response back so the caller can continue.
 async fn classify_retry_status(
-    state: &Arc<AppState>,
+    state: &AppState,
     status: StatusCode,
     rate_info: &RwLock<RateLimitInfo>,
     endpoint_name: &str,
@@ -5795,7 +5807,7 @@ async fn try_fallback_upstream(
     } else {
         &state.client_nonstreaming
     };
-    let mut resp = match http_client
+    let resp = match http_client
         .post(&url)
         .header("authorization", format!("Bearer {}", ep.token))
         .header("content-type", "application/json")
@@ -5839,23 +5851,23 @@ async fn try_fallback_upstream(
     state.record_transport_success(endpoint_idx).await;
 
     let status = resp.status();
+
+    // Classify 429 / 529 / other 5xx via the shared helper so OpenAI
+    // endpoints get the same policy as the Anthropic paths: a 429 marks the
+    // endpoint hard-limited (honouring retry-after) so `pick_endpoint` skips
+    // it for the cooldown window, and a 529 flags the long-base BEBO backoff.
+    // Previously this was a bare rotate — every subsequent request re-hammered
+    // the still-rate-limited endpoint before rotating (GH #97).
+    let mut resp = match classify_retry_status(state, status, &ep.rate_info, &ep.name, resp).await {
+        Ok(resp) => resp,
+        Err(outcome) => return outcome,
+    };
+
     if !status.is_success() {
         let err_body = resp
             .text()
             .await
             .unwrap_or_else(|_| "upstream error".to_string());
-        // Retry-eligible: 429 or 5xx → rotate so the retry loop advances
-        // to the next candidate.
-        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            warn!(
-                req_id,
-                upstream = ep.name,
-                status = status.as_u16(),
-                body = %err_body,
-                "fallback: unified endpoint returned retry-eligible error, advancing"
-            );
-            return ROTATE;
-        }
         warn!(
             req_id,
             upstream = ep.name,
