@@ -4186,6 +4186,13 @@ const SESSIONS_STATS_TOP_N: usize = 50;
 /// string is client-controlled; overflow buckets into `_other`).
 const MAX_PROMPT_TOO_LONG_MODELS: usize = 32;
 
+/// `le` boundaries (tokens) for the live session-size distribution on
+/// `/metrics`. Dense around the 200k window edge — that's where sessions
+/// start 400ing — sparse elsewhere; `+Inf` is implicit.
+const SESSION_TOKENS_BUCKETS: [u64; 10] = [
+    10_000, 25_000, 50_000, 100_000, 150_000, 175_000, 200_000, 300_000, 500_000, 1_000_000,
+];
+
 /// Default model context window (tokens). Every current Claude model ships
 /// with a 200k window unless the 1M beta is active on the request.
 const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
@@ -4414,6 +4421,36 @@ impl AppState {
         rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         rows.truncate(SESSIONS_STATS_TOP_N);
         rows.into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// Snapshot the live session registry as a cumulative `le` histogram over
+    /// `last_prompt_tokens` (LAB-957): per-boundary cumulative counts with a
+    /// trailing `+Inf`, plus the token sum. Fixed cardinality regardless of
+    /// session count — per-session Prometheus labels stay ruled out. Counts
+    /// sum cleanly across replicas (each pod holds a disjoint registry).
+    fn session_tokens_histogram(&self, now: u64) -> ([u64; SESSION_TOKENS_BUCKETS.len() + 1], u64) {
+        let mut cumulative = [0u64; SESSION_TOKENS_BUCKETS.len() + 1];
+        let mut sum = 0u64;
+        match self.sessions.lock() {
+            Ok(map) => {
+                for e in map.values() {
+                    if now.saturating_sub(e.last_seen) > self.session_registry_ttl_secs {
+                        continue;
+                    }
+                    sum += e.last_prompt_tokens;
+                    for (i, le) in SESSION_TOKENS_BUCKETS.iter().enumerate() {
+                        if e.last_prompt_tokens <= *le {
+                            cumulative[i] += 1;
+                        }
+                    }
+                    cumulative[SESSION_TOKENS_BUCKETS.len()] += 1; // +Inf
+                }
+            }
+            // All-zero output with no trace would read as "no sessions";
+            // a poisoned registry lock deserves a diagnostic.
+            Err(_) => warn!("session_tokens_histogram: sessions registry lock poisoned"),
+        }
+        (cumulative, sum)
     }
 }
 
@@ -7370,6 +7407,7 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
+    let (session_buckets, session_tokens_sum) = state.session_tokens_histogram(now_epoch);
 
     // ── Phase 2: Serialize (sync — no locks held) ──────────────────
 
@@ -8181,6 +8219,56 @@ async fn metrics_handler(
             *n,
         );
     }
+
+    // Live session-size distribution (LAB-957). A snapshot of the session
+    // registry, not an observation stream: values rise AND fall as sessions
+    // grow and expire, so this is declared `gauge` — chart instant values,
+    // never rate(). Cumulative `le` buckets keep Grafana heatmaps and
+    // histogram_quantile() working, and sum across replicas.
+    prom_header(
+        &mut buf,
+        "anthropic_session_tokens_bucket",
+        "gauge",
+        "Live sessions with last-prompt tokens <= le (cumulative snapshot; instant values, do not rate())",
+    );
+    for (i, le) in SESSION_TOKENS_BUCKETS.iter().enumerate() {
+        prom_gauge(
+            &mut buf,
+            "anthropic_session_tokens_bucket",
+            &[("le", &le.to_string())],
+            session_buckets[i] as f64,
+        );
+    }
+    prom_gauge(
+        &mut buf,
+        "anthropic_session_tokens_bucket",
+        &[("le", "+Inf")],
+        session_buckets[SESSION_TOKENS_BUCKETS.len()] as f64,
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_session_tokens_sum",
+        "gauge",
+        "Sum of last-prompt tokens across live sessions",
+    );
+    prom_gauge(
+        &mut buf,
+        "anthropic_session_tokens_sum",
+        &[],
+        session_tokens_sum as f64,
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_session_tokens_count",
+        "gauge",
+        "Number of live sessions",
+    );
+    prom_gauge(
+        &mut buf,
+        "anthropic_session_tokens_count",
+        &[],
+        session_buckets[SESSION_TOKENS_BUCKETS.len()] as f64,
+    );
 
     // In-flight request-body memory admission (P1-01): current reserved bytes,
     // the configured ceiling, and the load-shed counter — together these let an
