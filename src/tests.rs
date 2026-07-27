@@ -364,6 +364,16 @@ fn test_state_with_soft_limit(endpoints: Vec<Endpoint>, soft_limit: f64) -> Arc<
     state
 }
 
+/// `test_state_with(vec![])` with a session-registry cap override (0 = off).
+/// Registry unit tests don't route, so no endpoints are needed.
+fn test_state_with_session_max(max: usize) -> Arc<AppState> {
+    let mut state = test_state_with(vec![]);
+    Arc::get_mut(&mut state)
+        .expect("test fixture should be uniquely owned")
+        .session_registry_max = max;
+    state
+}
+
 /// Spawn a mock upstream that returns a canned response with rate-limit headers.
 async fn spawn_mock_upstream() -> (String, tokio::task::JoinHandle<()>) {
     let app = Router::new().fallback(any(mock_upstream_handler));
@@ -14151,10 +14161,7 @@ fn upstream_client_builder_composes_with_and_without_read_timeout() {
 
 #[test]
 fn session_registry_populates_updates_and_caps() {
-    let state = Arc::new(AppState {
-        session_registry_max: 3,
-        ..test_state_base()
-    });
+    let state = test_state_with_session_max(3);
     let rctx = ("cli", "agent-1", "sess-1");
     for (i, key) in ["k1", "k2", "k3"].iter().enumerate() {
         state.record_session(
@@ -14219,10 +14226,7 @@ fn session_registry_evicts_by_ttl() {
 
 #[test]
 fn session_registry_disabled_when_max_zero() {
-    let state = Arc::new(AppState {
-        session_registry_max: 0,
-        ..test_state_base()
-    });
+    let state = test_state_with_session_max(0);
     state.record_session("k", ("c", "-", "-"), "m", "a", 1, 200_000, 1);
     assert!(state.sessions.lock().unwrap().is_empty());
 }
@@ -14340,26 +14344,22 @@ fn prompt_too_long_counter_bounds_model_cardinality() {
 /// Canned Anthropic context-window-overflow 400, byte-for-byte.
 const PROMPT_TOO_LONG_BODY: &[u8] = br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213462 tokens > 200000 maximum"}}"#;
 
-/// Raw-TCP upstream that answers every request with the canned 400.
+/// Upstream that answers every request with the canned 400 — the shared
+/// canned-status helper with `bad_first = MAX` (never recovers). `bad_head`
+/// is a raw pre-formatted response, so the JSON body rides along in it; the
+/// content-length is computed here and the leak is one string per test run.
 async fn spawn_prompt_too_long_upstream() -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        loop {
-            let (mut s, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 65536];
-            let _ = s.read(&mut buf).await;
-            let head = format!(
-                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                PROMPT_TOO_LONG_BODY.len()
-            );
-            let _ = s.write_all(head.as_bytes()).await;
-            let _ = s.write_all(PROMPT_TOO_LONG_BODY).await;
-            let _ = s.flush().await;
-        }
-    });
-    format!("http://{addr}")
+    let raw: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            PROMPT_TOO_LONG_BODY.len(),
+            std::str::from_utf8(PROMPT_TOO_LONG_BODY).unwrap(),
+        )
+        .into_boxed_str(),
+    );
+    spawn_status_then_ok_upstream(usize::MAX, raw, ANTHROPIC_OK_BODY)
+        .await
+        .0
 }
 
 #[tokio::test]
