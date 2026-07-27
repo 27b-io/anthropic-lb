@@ -4509,6 +4509,137 @@ async fn openai_endpoint_rides_out_transient_blip() {
     );
 }
 
+// ── GH #97: OpenAI-endpoint 429 hard-limit cooldown + 529 BEBO ───────
+
+/// Raw-TCP upstream that serves `bad_head` (a complete pre-formatted HTTP
+/// response head with an empty body) for its first `bad_first` connections,
+/// then `ok_body` as a 200 on every later connection. Returns
+/// `(base_url, per_connection_hits)`. `usize::MAX` = bad forever.
+async fn spawn_status_then_ok_upstream(
+    bad_first: usize,
+    bad_head: &'static str,
+    ok_body: &'static [u8],
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await; // drain the request before responding
+            if h.fetch_add(1, Ordering::SeqCst) < bad_first {
+                let _ = s.write_all(bad_head.as_bytes()).await;
+            } else {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    ok_body.len()
+                );
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(ok_body).await;
+            }
+            let _ = s.flush().await;
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// GH #97 regression: a 429 from a `Protocol::OpenAI` endpoint must set a
+/// hard-limit cooldown (honouring `retry-after`) so a SUBSEQUENT request
+/// skips it at `pick_endpoint` instead of re-hammering an upstream that
+/// told us to back off. Previously the 429 only rotated within the current
+/// request's retry loop — every new request re-attempted the endpoint.
+#[tokio::test]
+async fn openai_429_sets_cooldown_and_next_request_skips_endpoint() {
+    use std::sync::atomic::Ordering;
+    const HEAD_429: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 120\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    let (limited_url, limited_hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_429, OPENAI_OK_BODY).await;
+    let (healthy_url, healthy_hits) = spawn_flaky_upstream(0, OPENAI_OK_BODY).await;
+
+    let mut limited = make_endpoint("limited", Protocol::OpenAI);
+    limited.base_url = limited_url;
+    let mut healthy = make_endpoint("healthy", Protocol::OpenAI);
+    healthy.base_url = healthy_url;
+    // Priority forces routing to prefer `limited` until it leaves the pool —
+    // deterministic without depending on affinity hashing.
+    healthy.priority = 1;
+    let state = test_state_with(vec![limited, healthy]);
+    let addr = serve(build_router(state.clone())).await;
+
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "both requests must succeed via the healthy endpoint"
+        );
+    }
+
+    assert_eq!(
+        limited_hits.load(Ordering::SeqCst),
+        1,
+        "the second request must skip the hard-limited endpoint, not re-hammer it"
+    );
+    assert!(healthy_hits.load(Ordering::SeqCst) >= 2);
+
+    let info = state.endpoints[0].rate_info.read().await;
+    let until = info
+        .hard_limited_until
+        .expect("a 429 from an OpenAI endpoint must set hard_limited_until");
+    // Measured AFTER both round-trips, so the lower bound leaves ~20s of
+    // slack for a loaded CI runner while staying far above the 60s default;
+    // the upper bound is exact (until = t_429 + 120s, and t_429 < now).
+    let cooldown = until.duration_since(Instant::now());
+    assert!(
+        cooldown > Duration::from_secs(100) && cooldown <= Duration::from_secs(120),
+        "cooldown must honour retry-after: 120, not fall back to the 60s default, got {cooldown:?}"
+    );
+}
+
+/// GH #97: a 529 from an OpenAI endpoint must flag `saw_529` so the retry
+/// loop BEBO-retries the pool (long base) instead of exhausting straight to
+/// a 429 — aligned with the Anthropic path via `classify_retry_status`.
+#[tokio::test]
+async fn openai_529_triggers_bebo_backoff_retry() {
+    use std::sync::atomic::Ordering;
+    const HEAD_529: &str =
+        "HTTP/1.1 529 Overloaded\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    let (url, hits) = spawn_status_then_ok_upstream(1, HEAD_529, OPENAI_OK_BODY).await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = url;
+    let state = test_state_with(vec![gw]);
+    let addr = serve(build_router(state)).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a 529 that recovers must be BEBO-retried to a 200, not exhausted to a 429"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "exactly one 529 then one successful retry"
+    );
+}
+
 // ── P1-01: in-flight request-body memory admission ──────────────────
 
 /// Reservation accounting: reserve adds, over-budget sheds (None), drop releases.
