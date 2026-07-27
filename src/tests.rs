@@ -14560,6 +14560,55 @@ fn session_registry_disabled_when_max_zero() {
 }
 
 #[test]
+fn session_tokens_histogram_cumulative_buckets_and_ttl() {
+    let state = test_state_with(vec![]);
+    let rctx = ("c", "-", "-");
+    // One session per interesting band: below the first boundary, exactly ON
+    // a boundary (le is inclusive), in the 200k danger zone, and over-window.
+    state.record_session("tiny", rctx, "m", "a", 9_000, 200_000, 100);
+    state.record_session("edge", rctx, "m", "a", 175_000, 200_000, 100);
+    state.record_session("hot", rctx, "m", "a", 190_000, 200_000, 100);
+    state.record_session("over", rctx, "m", "a", 324_667, 200_000, 100);
+    // Expired entry must not count.
+    state.record_session("stale", rctx, "m", "a", 50_000, 200_000, 100);
+    state
+        .sessions
+        .lock()
+        .unwrap()
+        .get_mut("stale")
+        .unwrap()
+        .last_seen = 0;
+
+    // now=1900: live entries are exactly at the TTL horizon (1800s, inclusive);
+    // stale (last_seen=0, age 1900) is past it.
+    let (cum, sum) = state.session_tokens_histogram(1_900);
+    let le = |bound: u64| {
+        cum[SESSION_TOKENS_BUCKETS
+            .iter()
+            .position(|b| *b == bound)
+            .unwrap()]
+    };
+    assert_eq!(le(10_000), 1, "tiny only");
+    assert_eq!(
+        le(150_000),
+        1,
+        "nothing between 10k and 150k (stale expired)"
+    );
+    assert_eq!(le(175_000), 2, "boundary value is inclusive");
+    assert_eq!(le(200_000), 3);
+    assert_eq!(le(300_000), 3, "over-window session past 300k");
+    assert_eq!(le(1_000_000), 4);
+    assert_eq!(cum[SESSION_TOKENS_BUCKETS.len()], 4, "+Inf == live count");
+    assert_eq!(sum, 9_000 + 175_000 + 190_000 + 324_667);
+
+    // Empty registry: all zeros, not an error.
+    let empty = test_state_with(vec![]);
+    let (cum, sum) = empty.session_tokens_histogram(100);
+    assert!(cum.iter().all(|c| *c == 0));
+    assert_eq!(sum, 0);
+}
+
+#[test]
 fn sessions_snapshot_sorts_by_pct_desc_and_caps_top_n() {
     let state = test_state_with(vec![]);
     let rctx = ("c", "-", "-");
