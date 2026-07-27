@@ -4760,7 +4760,8 @@ async fn model_unsupported_filters_routing_until_expiry() {
 }
 
 /// The learn map is bounded: past UNSUPPORTED_MODEL_MAX distinct pairs, new
-/// learns are dropped — model strings are client-supplied input.
+/// learns are dropped — model strings are client-supplied input. An EXISTING
+/// pair must still refresh its TTL at capacity (refresh doesn't grow the map).
 #[test]
 fn model_unsupported_map_is_bounded() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a")]);
@@ -4771,6 +4772,30 @@ fn model_unsupported_map_is_bounded() {
         state.unsupported_models.lock().unwrap().len(),
         UNSUPPORTED_MODEL_MAX
     );
+
+    // Shorten one live entry's TTL, then re-note it with the map still full:
+    // the refresh must land (expiry back to ~full TTL), not be dropped.
+    let key = (0usize, "model-0".to_string());
+    {
+        let mut map = state.unsupported_models.lock().unwrap();
+        map.insert(key.clone(), Instant::now() + Duration::from_secs(1));
+    }
+    state.note_model_unsupported("a", 0, "model-0");
+    {
+        let map = state.unsupported_models.lock().unwrap();
+        assert_eq!(
+            map.len(),
+            UNSUPPORTED_MODEL_MAX,
+            "refresh must not grow the map"
+        );
+        let expiry = map
+            .get(&key)
+            .expect("existing pair must survive a refresh at capacity");
+        assert!(
+            *expiry > Instant::now() + Duration::from_secs(60),
+            "TTL must be refreshed for an existing pair even at capacity"
+        );
+    }
 }
 
 /// LAB-941 native path: an account 404-rejecting the model rotates to the
@@ -4816,29 +4841,43 @@ async fn model_unsupported_rotates_and_next_request_skips_account() {
 
 /// When NO account serves the model (nonexistent model), the upstream's own
 /// 404 must surface — not a synthetic 429 that invites the client to retry a
-/// permanently-failing request.
+/// permanently-failing request. A SECOND request then hits the warm negative
+/// cache (the pool empties before any forward runs, nothing is stashed) and
+/// must still get a 404, synthesized, without touching the upstream again.
 #[tokio::test]
 async fn model_unsupported_everywhere_returns_upstream_404_not_429() {
-    let (url, _hits) = spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
+    use std::sync::atomic::Ordering;
+    let (url, hits) = spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
     let state = test_state_with(vec![mk_endpoint_at("only", "sk-ant-api-o", &url)]);
     let addr = serve(build_router(state)).await;
 
-    let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/messages"))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"claude-nope-1","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
-        .send()
-        .await
-        .unwrap();
+    let client = reqwest::Client::new();
+    for pass in [
+        "cold cache (real upstream 404)",
+        "warm cache (synthesized 404)",
+    ] {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-nope-1","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{pass}: model unsupported everywhere must return 404, not 429"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("not_found_error") && body.contains("claude-nope-1"),
+            "{pass}: error body must carry the model rejection, got: {body}"
+        );
+    }
     assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::NOT_FOUND,
-        "pool exhausted purely by model rejections must return the real 404"
-    );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("not_found_error"),
-        "upstream error body must pass through, got: {body}"
+        hits.load(Ordering::SeqCst),
+        1,
+        "the warm-cache request must not touch the upstream at all"
     );
 }
 
