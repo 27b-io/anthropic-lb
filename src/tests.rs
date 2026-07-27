@@ -4881,6 +4881,65 @@ async fn model_unsupported_everywhere_returns_upstream_404_not_429() {
     );
 }
 
+/// Same all-reject scenario through `/v1/chat/completions`: the warm-cache
+/// synthesized 404 must carry the OpenAI error shape — `type` is
+/// `invalid_request_error` (an OpenAI type, not Anthropic's
+/// `not_found_error`) with the specific cause in `code = model_not_found`.
+#[tokio::test]
+async fn model_unsupported_everywhere_openai_handler_returns_openai_shaped_404() {
+    use std::sync::atomic::Ordering;
+    let (url, hits) = spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
+    let state = test_state_with(vec![mk_endpoint_at("only", "sk-ant-api-o", &url)]);
+    let addr = serve(build_router(state)).await;
+
+    let client = reqwest::Client::new();
+    // Cold pass populates the cache from the upstream rejection.
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-nope-1","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // Warm pass: pool empties via the cache, response is synthesized.
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-nope-1","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "warm cache through the OpenAI handler must return 404, not 429"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body.pointer("/error/type").and_then(|v| v.as_str()),
+        Some("invalid_request_error"),
+        "synthesized OpenAI envelope must use an OpenAI error type, got: {body}"
+    );
+    assert_eq!(
+        body.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("model_not_found"),
+        "synthesized OpenAI envelope must carry code=model_not_found, got: {body}"
+    );
+    assert!(
+        body.pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m.contains("claude-nope-1")),
+        "message must name the rejected model, got: {body}"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the warm-cache request must not touch the upstream at all"
+    );
+}
+
 /// LAB-941 incident shape (observed live 2026-07-27): an OpenAI-protocol
 /// gateway without the requested model returns 400 "Invalid model name"; the
 /// LB must rotate to an account that serves it and route the NEXT request

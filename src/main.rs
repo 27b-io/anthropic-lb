@@ -5447,10 +5447,13 @@ fn exhaustion_response(last_saw_transient: bool, last_saw_529: bool) -> Response
 /// protocol would be wrong for the other handler's clients (LAB-941).
 fn model_unsupported_response(model: &str, openai_shape: bool) -> Response {
     let body = if openai_shape {
+        // OpenAI's canonical model-not-found envelope: type is
+        // invalid_request_error (an OpenAI type — not Anthropic's
+        // not_found_error), with the specific cause in `code`.
         serde_json::json!({
             "error": {
                 "message": format!("model: {model}"),
-                "type": "not_found_error",
+                "type": "invalid_request_error",
                 "param": null,
                 "code": "model_not_found"
             }
