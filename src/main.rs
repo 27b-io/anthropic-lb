@@ -608,6 +608,14 @@ struct AppState {
     /// Upstream "prompt is too long" 400s by model (LAB-916). Exposed as
     /// `anthropic_prompt_too_long_total`; bounded via `_other` overflow.
     prompt_too_long: Mutex<HashMap<String, u64>>,
+    /// (endpoint idx, model) pairs an upstream rejected as unsupported — a
+    /// gateway without the model, or a plan without access (LAB-941).
+    /// `routing_candidates` skips these until the entry expires; because
+    /// session affinity is a stateless hash over the candidate list, the
+    /// filter also re-buckets pinned sessions away from the endpoint. Sync
+    /// mutex, never held across `.await`; bounded by UNSUPPORTED_MODEL_MAX
+    /// + TTL eviction. Per-replica: a fresh replica re-learns in one attempt.
+    unsupported_models: Mutex<HashMap<(usize, String), Instant>>,
 }
 
 /// RAII reservation against `AppState::inflight_body_bytes`. Holding it keeps the
@@ -1584,6 +1592,20 @@ const TRANSPORT_FAILURE_THRESHOLD: u32 = 3;
 /// ponytail: constant, add a config knob if operators ever need to tune it.
 const TRANSPORT_UNHEALTHY_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// How long a learned "(endpoint, model) unsupported" verdict keeps that
+/// endpoint out of the model's routing pool (LAB-941). An account's model set
+/// changes only on plan/gateway updates, so a long hold is safe; the TTL is
+/// the self-heal path when it does change (no restart needed). The cost of an
+/// expiry is one wasted upstream attempt to re-learn the rejection.
+/// ponytail: constant, add a config knob if operators ever need to tune it.
+const UNSUPPORTED_MODEL_TTL: Duration = Duration::from_secs(900);
+
+/// Bound on distinct learned (endpoint, model) rejections. Model names are
+/// client-supplied, so without a cap a client spraying junk model names could
+/// grow the map without limit. When full, new learns are dropped (that only
+/// costs the pre-LAB-941 behaviour) and TTL expiry drains the map.
+const UNSUPPORTED_MODEL_MAX: usize = 256;
+
 /// Sentinel value written to `alb:hard:{account}` when a replica has observed
 /// recovery from a hard rate limit. Other replicas interpret this as an
 /// instruction to proactively clear their local `hard_limited_until`, which
@@ -2176,15 +2198,95 @@ impl AppState {
         &self.endpoints[ep].name
     }
 
+    /// Record that `endpoint_idx` cannot serve `model` — the upstream itself
+    /// said so (LAB-941). Routing skips the pair for UNSUPPORTED_MODEL_TTL.
+    fn note_model_unsupported(&self, endpoint_name: &str, endpoint_idx: usize, model: &str) {
+        if model.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let Ok(mut map) = self.unsupported_models.lock() else {
+            return;
+        };
+        map.retain(|_, expiry| *expiry > now);
+        // Capacity gates NEW pairs only — refreshing an existing pair's TTL
+        // doesn't grow the map and must not starve under sustained rejections.
+        let key = (endpoint_idx, model.to_string());
+        if !map.contains_key(&key) && map.len() >= UNSUPPORTED_MODEL_MAX {
+            return;
+        }
+        warn!(
+            account = endpoint_name,
+            model,
+            cooldown_secs = UNSUPPORTED_MODEL_TTL.as_secs(),
+            "model unsupported on account, routing away"
+        );
+        map.insert(key, now + UNSUPPORTED_MODEL_TTL);
+    }
+
+    /// Endpoint indices currently marked unsupported for `model`. One lock +
+    /// full scan per pick — the map is capped at UNSUPPORTED_MODEL_MAX and
+    /// empty in the common case.
+    fn unsupported_endpoints_for(&self, model: &str) -> Vec<usize> {
+        if model.is_empty() {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        match self.unsupported_models.lock() {
+            Ok(map) => map
+                .iter()
+                .filter(|((_, m), expiry)| m == model && **expiry > now)
+                .map(|((idx, _), _)| *idx)
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// True when EVERY endpoint whose config allows `model` carries a live
+    /// unsupported-model entry — the pool cannot serve the model at all,
+    /// regardless of capacity. Used at exhaustion: on a warm negative cache
+    /// the candidate pool empties before any forward attempt runs, so there
+    /// is no stashed upstream 404 — this check lets the handler synthesize
+    /// one instead of degrading to a retryable 429 (LAB-941 follow-up).
+    /// Endpoints excluded by their config `models` allowlist never serve the
+    /// model and don't count; false when no endpoint could ever serve it
+    /// (config-only exclusion keeps its pre-existing 429 semantics).
+    fn model_unsupported_everywhere(&self, model: &str) -> bool {
+        if model.is_empty() {
+            return false;
+        }
+        let unsupported = self.unsupported_endpoints_for(model);
+        let mut eligible = 0usize;
+        for (i, ep) in self.endpoints.iter().enumerate() {
+            if !ep.serves_model(model) {
+                continue;
+            }
+            eligible += 1;
+            if !unsupported.contains(&i) {
+                return false;
+            }
+        }
+        eligible > 0
+    }
+
     async fn routing_candidates(&self, model: &str, skip: &[EndpointIdx]) -> Vec<RoutingCandidate> {
         let now = Instant::now();
         let now_epoch = Self::now_epoch();
+        let unsupported = self.unsupported_endpoints_for(model);
         let mut candidates: Vec<RoutingCandidate> = Vec::new();
         for (i, ep) in self.endpoints.iter().enumerate() {
             if skip.contains(&i) {
                 continue;
             }
             if !ep.serves_model(model) {
+                continue;
+            }
+            if unsupported.contains(&i) {
+                trace!(
+                    endpoint = ep.name,
+                    model,
+                    "pick: skipping, model unsupported on endpoint"
+                );
                 continue;
             }
             match ep.protocol {
@@ -5071,13 +5173,49 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 ///     (ETIMEDOUT/reset/closed/DNS) — the loop treats these with round-gated
 ///     rotation (retry the affinity/cache-warm endpoint in place on round 0,
 ///     rotate only on later rounds) and a transient-aware exhaustion status.
+///   - `RetryModelUnsupported(resp)`: the endpoint rejected the request's
+///     MODEL, not the request itself (LAB-941). The forward path has already
+///     negative-cached the (endpoint, model) pair; the loop rotates like a
+///     429 while stashing the upstream's error response, so a model no OTHER
+///     endpoint can serve still surfaces the real error — a nonexistent-model
+///     404 must not morph into a synthetic 429 that invites retries.
 enum ForwardOutcome {
     Done(Response),
+    RetryModelUnsupported(Response),
     Retry {
         saw_529: bool,
         push_skip: bool,
         transient: bool,
     },
+}
+
+/// True when an upstream error body says this ACCOUNT cannot serve the
+/// requested model — distinct from a malformed request (LAB-941). Matched
+/// conservatively against observed wire formats:
+///   - Anthropic: 404 `{"type":"error","error":{"type":"not_found_error",
+///     "message":"model: <id>"}}` — also what subscription accounts return
+///     for models outside their plan.
+///   - LiteLLM-style gateways: 400 `{"error":{"message":"... Invalid model
+///     name passed in model=<id> ..."}}` (observed live from insight-gateway,
+///     2026-07-27).
+///   - OpenAI: `{"error":{"code":"model_not_found", ...}}`.
+fn is_model_unsupported_error(status: StatusCode, body: &serde_json::Value) -> bool {
+    if status != StatusCode::NOT_FOUND && status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let Some(err) = body.get("error") else {
+        return false;
+    };
+    let msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    if err.get("type").and_then(|v| v.as_str()) == Some("not_found_error")
+        && msg.starts_with("model:")
+    {
+        return true;
+    }
+    if err.get("code").and_then(|v| v.as_str()) == Some("model_not_found") {
+        return true;
+    }
+    msg.to_ascii_lowercase().contains("invalid model name")
 }
 
 /// Surface the real cause of a `reqwest::Error`. The Display form only shows
@@ -5211,9 +5349,18 @@ fn apply_round_outcome(
     skip: &mut Vec<EndpointIdx>,
     saw_529: &mut bool,
     saw_transient: &mut bool,
+    model_unsupported_resp: &mut Option<Response>,
 ) -> RetryStep {
     match outcome {
         ForwardOutcome::Done(resp) => RetryStep::Return(resp),
+        // Model rejected by this endpoint: rotate immediately (another
+        // account may serve it) but keep the upstream's error in hand for
+        // the case where none does (LAB-941).
+        ForwardOutcome::RetryModelUnsupported(resp) => {
+            *model_unsupported_resp = Some(resp);
+            skip.push(picked_idx);
+            RetryStep::NextAttempt
+        }
         ForwardOutcome::Retry {
             saw_529: s,
             push_skip,
@@ -5288,6 +5435,41 @@ fn exhaustion_response(last_saw_transient: bool, last_saw_529: bool) -> Response
     }
     warn!("all endpoints exhausted (rate-limited)");
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
+}
+
+/// Synthesized model-unsupported 404 for the warm negative-cache path: every
+/// eligible endpoint is already cached as rejecting `model`, so the pool
+/// empties before any forward attempt runs and there is no upstream response
+/// to stash. Mirrors Anthropic's canonical not-found envelope (`"model: <id>"`
+/// is the wire format accounts actually return); `openai_shape` emits the
+/// OpenAI error shape for the compat handler instead. Cannot echo cached
+/// upstream bytes: the cache stores no bodies, and a body cached from one
+/// protocol would be wrong for the other handler's clients (LAB-941).
+fn model_unsupported_response(model: &str, openai_shape: bool) -> Response {
+    let body = if openai_shape {
+        // OpenAI's canonical model-not-found envelope: type is
+        // invalid_request_error (an OpenAI type — not Anthropic's
+        // not_found_error), with the specific cause in `code`.
+        serde_json::json!({
+            "error": {
+                "message": format!("model: {model}"),
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "model_not_found"
+            }
+        })
+    } else {
+        serde_json::json!({
+            "type": "error",
+            "error": { "type": "not_found_error", "message": format!("model: {model}") }
+        })
+    };
+    (
+        StatusCode::NOT_FOUND,
+        [("content-type", "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// 400 in Anthropic's error envelope when an Anthropic request can't be
@@ -5721,6 +5903,19 @@ async fn forward_anthropic(
                     state.note_prompt_too_long(req_id, model, session_key, msg);
                 }
             }
+            // Model unsupported on THIS account (e.g. outside its plan):
+            // negative-cache the pair and rotate — another account may serve
+            // it. Forwarding the 404 as-is wedges affinity-pinned clients
+            // into a permanent retry loop against this account (LAB-941).
+            if is_model_unsupported_error(status, &parsed) {
+                state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                let response = builder
+                    .body(Body::from(resp_body_bytes))
+                    .unwrap_or_else(|_| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+                    });
+                return ForwardOutcome::RetryModelUnsupported(response);
+            }
         }
         finalize_non_stream(
             state,
@@ -5935,6 +6130,9 @@ async fn proxy_handler(
     let n = state.endpoints.len();
     let mut last_saw_529 = false;
     let mut last_saw_transient = false;
+    // Upstream error from the most recent model-unsupported rejection —
+    // returned verbatim if the pool exhausts on nothing but rejections.
+    let mut model_unsupported_resp: Option<Response> = None;
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
             let delay = round_backoff_delay(retry_round, last_saw_529);
@@ -6014,6 +6212,7 @@ async fn proxy_handler(
                 &mut skip,
                 &mut saw_529,
                 &mut saw_transient,
+                &mut model_unsupported_resp,
             ) {
                 RetryStep::Return(resp) => return resp,
                 RetryStep::NextAttempt => continue,
@@ -6027,6 +6226,24 @@ async fn proxy_handler(
         }
     }
 
+    // A pool exhausted purely by model rejections (no 529/transient in the
+    // final round) returns the upstream's own error — truthful when the model
+    // exists nowhere. Overload/transient exhaustion keeps its retryable
+    // status; the negative cache already routes follow-up requests away from
+    // the rejecting endpoints (LAB-941).
+    if !last_saw_529 && !last_saw_transient {
+        if let Some(resp) = model_unsupported_resp {
+            return resp;
+        }
+        // Warm-cache path: every eligible endpoint was filtered by the
+        // negative cache BEFORE any forward ran, so nothing was stashed.
+        // Synthesize the same truthful 404 the first request returned —
+        // a 429 here would invite retries of a permanently-failing model.
+        if state.model_unsupported_everywhere(&model) {
+            warn!(model, "model unsupported on all eligible endpoints");
+            return model_unsupported_response(&model, false);
+        }
+    }
     exhaustion_response(last_saw_transient, last_saw_529)
 }
 
@@ -6193,36 +6410,46 @@ async fn try_fallback_upstream(
             body = %err_body,
             "fallback: unified endpoint returned error"
         );
-        if translate {
+        // Gateway rejected the MODEL (e.g. LiteLLM "Invalid model name"):
+        // negative-cache the pair and rotate instead of handing the client a
+        // misleading "your request is invalid" 400 — the model is fine, this
+        // endpoint just doesn't serve it (LAB-941, observed 2026-07-27 when a
+        // 529 storm drained the Anthropic pool into insight-gateway).
+        let model_unsupported = serde_json::from_str::<serde_json::Value>(&err_body)
+            .map(|v| is_model_unsupported_error(status, &v))
+            .unwrap_or(false);
+        let response = if translate {
             // Return error in Anthropic format
-            return ForwardOutcome::Done(
-                Response::builder()
-                    .status(status)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "type": "error",
-                            "error": {
-                                "type": "api_error",
-                                "message": err_body,
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap_or_else(|_| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
-                    }),
-            );
-        }
-        return ForwardOutcome::Done(
+            Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": err_body,
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
+                })
+        } else {
             Response::builder()
                 .status(status)
                 .header("content-type", "application/json")
                 .body(Body::from(err_body))
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
-                }),
-        );
+                })
+        };
+        if model_unsupported {
+            state.note_model_unsupported(&ep.name, endpoint_idx, model);
+            return ForwardOutcome::RetryModelUnsupported(response);
+        }
+        return ForwardOutcome::Done(response);
     }
 
     // Streaming response
@@ -9533,6 +9760,7 @@ async fn forward_openai_compat_anthropic(
 
         // Translate Anthropic error to OpenAI error format so clients
         // (LiteLLM, etc.) can parse the actual error message.
+        let mut model_unsupported = false;
         let openai_error =
             if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&error_body) {
                 // Count + trace context-window overflows here too (LAB-916) —
@@ -9542,6 +9770,8 @@ async fn forward_openai_compat_anthropic(
                         state.note_prompt_too_long(req_id, model, session_key, msg);
                     }
                 }
+                // Same model-rejection detection as the native path (LAB-941).
+                model_unsupported = is_model_unsupported_error(status, &parsed);
                 // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
                 let msg = parsed
                     .pointer("/error/message")
@@ -9581,6 +9811,10 @@ async fn forward_openai_compat_anthropic(
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
+        if model_unsupported {
+            state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+            return ForwardOutcome::RetryModelUnsupported(response);
+        }
         return ForwardOutcome::Done(response);
     }
 
@@ -9907,6 +10141,9 @@ async fn openai_chat_handler(
     let n = state.endpoints.len();
     let mut last_saw_529 = false;
     let mut last_saw_transient = false;
+    // Upstream error from the most recent model-unsupported rejection —
+    // returned verbatim if the pool exhausts on nothing but rejections.
+    let mut model_unsupported_resp: Option<Response> = None;
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
             let delay = round_backoff_delay(retry_round, last_saw_529);
@@ -9989,6 +10226,7 @@ async fn openai_chat_handler(
                 &mut skip,
                 &mut saw_529,
                 &mut saw_transient,
+                &mut model_unsupported_resp,
             ) {
                 RetryStep::Return(resp) => return resp,
                 RetryStep::NextAttempt => continue,
@@ -10002,6 +10240,17 @@ async fn openai_chat_handler(
         }
     }
 
+    // Same model-rejection exhaustion rule as `proxy_handler` (LAB-941),
+    // in the OpenAI error shape this handler's clients parse.
+    if !last_saw_529 && !last_saw_transient {
+        if let Some(resp) = model_unsupported_resp {
+            return resp;
+        }
+        if state.model_unsupported_everywhere(&model) {
+            warn!(model, "model unsupported on all eligible endpoints");
+            return model_unsupported_response(&model, true);
+        }
+    }
     exhaustion_response(last_saw_transient, last_saw_529)
 }
 
@@ -10395,6 +10644,7 @@ async fn main() {
             .session_registry_ttl_secs
             .unwrap_or(DEFAULT_SESSION_REGISTRY_TTL_SECS),
         prompt_too_long: Mutex::new(HashMap::new()),
+        unsupported_models: Mutex::new(HashMap::new()),
     });
 
     if state.auto_cache {
