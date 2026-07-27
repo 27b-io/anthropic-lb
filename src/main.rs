@@ -4431,19 +4431,24 @@ impl AppState {
     fn session_tokens_histogram(&self, now: u64) -> ([u64; SESSION_TOKENS_BUCKETS.len() + 1], u64) {
         let mut cumulative = [0u64; SESSION_TOKENS_BUCKETS.len() + 1];
         let mut sum = 0u64;
-        if let Ok(map) = self.sessions.lock() {
-            for e in map.values() {
-                if now.saturating_sub(e.last_seen) > self.session_registry_ttl_secs {
-                    continue;
-                }
-                sum += e.last_prompt_tokens;
-                for (i, le) in SESSION_TOKENS_BUCKETS.iter().enumerate() {
-                    if e.last_prompt_tokens <= *le {
-                        cumulative[i] += 1;
+        match self.sessions.lock() {
+            Ok(map) => {
+                for e in map.values() {
+                    if now.saturating_sub(e.last_seen) > self.session_registry_ttl_secs {
+                        continue;
                     }
+                    sum += e.last_prompt_tokens;
+                    for (i, le) in SESSION_TOKENS_BUCKETS.iter().enumerate() {
+                        if e.last_prompt_tokens <= *le {
+                            cumulative[i] += 1;
+                        }
+                    }
+                    cumulative[SESSION_TOKENS_BUCKETS.len()] += 1; // +Inf
                 }
-                cumulative[SESSION_TOKENS_BUCKETS.len()] += 1; // +Inf
             }
+            // All-zero output with no trace would read as "no sessions";
+            // a poisoned registry lock deserves a diagnostic.
+            Err(_) => warn!("session_tokens_histogram: sessions registry lock poisoned"),
         }
         (cumulative, sum)
     }
@@ -8222,9 +8227,9 @@ async fn metrics_handler(
     // histogram_quantile() working, and sum across replicas.
     prom_header(
         &mut buf,
-        "anthropic_session_tokens",
+        "anthropic_session_tokens_bucket",
         "gauge",
-        "Live sessions by last-prompt token size (snapshot gauge histogram; instant values, do not rate())",
+        "Live sessions with last-prompt tokens <= le (cumulative snapshot; instant values, do not rate())",
     );
     for (i, le) in SESSION_TOKENS_BUCKETS.iter().enumerate() {
         prom_gauge(
@@ -8240,11 +8245,23 @@ async fn metrics_handler(
         &[("le", "+Inf")],
         session_buckets[SESSION_TOKENS_BUCKETS.len()] as f64,
     );
+    prom_header(
+        &mut buf,
+        "anthropic_session_tokens_sum",
+        "gauge",
+        "Sum of last-prompt tokens across live sessions",
+    );
     prom_gauge(
         &mut buf,
         "anthropic_session_tokens_sum",
         &[],
         session_tokens_sum as f64,
+    );
+    prom_header(
+        &mut buf,
+        "anthropic_session_tokens_count",
+        "gauge",
+        "Number of live sessions",
     );
     prom_gauge(
         &mut buf,
