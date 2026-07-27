@@ -167,6 +167,8 @@ token = "sk-ant-api03-..."
 | `endpoints[].models` | `[String]` | `[]` | Model allowlist (empty = all) |
 | `endpoints[].priority` | `u32` | `0` | Priority tier (lower tried first) |
 | `endpoints[].fable_included` | `bool` | `true` | Plan includes Fable band; set `false` for Pro / standard Team |
+| `session_registry_max` | `usize` | `1000` | Max live-session entries tracked for `/_stats` `sessions` (0 = disabled) |
+| `session_registry_ttl_secs` | `u64` | `1800` | Seconds after a session's last request before its entry is evicted |
 
 > [!NOTE]
 > **Strategy normalization**: Both `"dynamic-capacity"` and `"dynamic-capacity-v1"` are accepted in config, but the runtime normalizes to `"dynamic-capacity-v1"` in logs and `/_stats` output. Similarly, `"sticky-weighted"` normalizes to `"sticky-weighted-v2"`.
@@ -271,10 +273,39 @@ IP check runs first, then proxy key. Both apply to all endpoints including `/_st
 |:------|:-------|:------------|
 | `/*` | Any | Proxied to upstream Anthropic API |
 | `/v1/chat/completions` | POST | OpenAI-compatible → Anthropic translation |
-| `/_stats` | GET | JSON stats (utilization, tokens, budgets) |
+| `/_stats` | GET | JSON stats (utilization, tokens, budgets, live sessions) |
 | `/metrics` | GET | Prometheus-format metrics |
 
 All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
+
+### Session context-window visibility
+
+`/_stats` includes a `sessions` array — the live sessions seen by this
+replica (Anthropic-protocol traffic), sorted by context-window occupancy
+descending, capped to the top 50. A "session" is one affinity routing pin,
+so fan-out subagents sharing a coarse session id appear as distinct entries.
+Each entry:
+
+| Field | Meaning |
+|:------|:--------|
+| `session` | Redacted session label — hash of the affinity key (also appears in `prompt too long` WARN logs for joining) |
+| `client_id` | Resolved client id (operators masked as `_operator`) |
+| `agent` / `session_prefix` | First 8 chars of the `x-agent-id` / session-id headers as sent |
+| `model` / `endpoint` | Model and the endpoint the session is currently pinned to |
+| `last_prompt_tokens` | `input + cache_read + cache_creation` from the last successful response — the prompt's window occupancy |
+| `context_window` | Model context window: 200k, or 1M when the request carries the `context-1m` beta |
+| `context_window_pct` | Occupancy percent — sessions near/over 100 are about to hit `prompt is too long` |
+| `requests` / `last_seen` | Request count and epoch of last activity |
+
+The registry is in-memory, per-replica, bounded (`session_registry_max`) and
+TTL-evicted (`session_registry_ttl_secs`); raw IPs and session ids never
+leave the process. Routing does not read it.
+
+Upstream `400 invalid_request_error` responses matching *"prompt is too
+long"* are additionally counted as `anthropic_prompt_too_long_total{model}`
+on `/metrics` and logged as a structured WARN with the redacted session
+label plus the observed-vs-max token counts parsed from the error message.
+The 400 itself is forwarded to the client unchanged.
 
 ### OpenAI JSON-mode compatibility
 
@@ -346,6 +377,21 @@ All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
       "alice": { "share": 0.65, "requests_per_minute": 4.2 }
     }
   },
+  "sessions": [
+    {
+      "session": "9f2c4a1b8e3d5f07",
+      "client_id": "alice",
+      "agent": "d3adbeef",
+      "session_prefix": "a1b2c3d4",
+      "model": "claude-sonnet-4-5",
+      "endpoint": "primary",
+      "last_prompt_tokens": 187000,
+      "context_window": 200000,
+      "context_window_pct": 93.5,
+      "requests": 42,
+      "last_seen": 1753600000
+    }
+  ],
   "cluster": {
     "redis_connected": true,
     "replicas_seen": 3,

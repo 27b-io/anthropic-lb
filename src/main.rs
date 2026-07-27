@@ -92,6 +92,13 @@ struct Config {
     /// handful of hung uploads could pin the `max_inflight_body_mb` budget
     /// indefinitely. Default: 60. Set to 0 to disable.
     body_read_timeout_secs: Option<u64>,
+    /// Max entries in the live session registry (context-window visibility on
+    /// `/_stats`). Registry keys are affinity routing keys, so fan-out agents
+    /// each get an entry. Default: 1000. Set to 0 to disable the registry.
+    session_registry_max: Option<usize>,
+    /// Seconds after a session's last request before its registry entry is
+    /// evicted. Default: 1800 (30 min).
+    session_registry_ttl_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -589,6 +596,18 @@ struct AppState {
     /// Count of requests shed because the body was not fully received within
     /// `body_read_timeout`. Exposed as `anthropic_body_read_timeout_total`.
     body_read_timeout_total: AtomicU64,
+    /// Live session registry: affinity routing key → last-seen context-window
+    /// occupancy (LAB-916). Visibility only — routing never reads it. Sync
+    /// mutex, never held across `.await`; bounded by `session_registry_max`
+    /// + TTL eviction.
+    sessions: Mutex<HashMap<String, SessionEntry>>,
+    /// Session registry entry cap. 0 disables the registry.
+    session_registry_max: usize,
+    /// Seconds since last request before a session entry is evicted.
+    session_registry_ttl_secs: u64,
+    /// Upstream "prompt is too long" 400s by model (LAB-916). Exposed as
+    /// `anthropic_prompt_too_long_total`; bounded via `_other` overflow.
+    prompt_too_long: Mutex<HashMap<String, u64>>,
 }
 
 /// RAII reservation against `AppState::inflight_body_bytes`. Holding it keeps the
@@ -4045,6 +4064,257 @@ impl RequestContext {
     }
 }
 
+// ── Session registry: context-window visibility (LAB-916) ──────────
+//
+// The affinity "pin" is recomputed per request and never stored, so before
+// this section there was no way to see which live sessions are close to
+// their model's context window — only the resulting upstream "prompt is too
+// long" 400s, which were forwarded without a trace. The registry is
+// visibility state ONLY: it is written after responses and read by
+// `/_stats`; routing never consults it.
+
+/// Default cap on live session registry entries.
+const DEFAULT_SESSION_REGISTRY_MAX: usize = 1000;
+/// Default seconds after a session's last request before eviction.
+const DEFAULT_SESSION_REGISTRY_TTL_SECS: u64 = 1800;
+/// Max sessions returned in the `/_stats` `sessions` array (highest
+/// context-window % first).
+const SESSIONS_STATS_TOP_N: usize = 50;
+/// Cap on distinct model labels in the prompt-too-long counter map (the model
+/// string is client-controlled; overflow buckets into `_other`).
+const MAX_PROMPT_TOO_LONG_MODELS: usize = 32;
+
+/// Default model context window (tokens). Every current Claude model ships
+/// with a 200k window unless the 1M beta is active on the request.
+const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
+/// Context window when the request carries the `context-1m` beta flag.
+const CONTEXT_WINDOW_1M: u64 = 1_000_000;
+
+/// Live per-session state, keyed by the affinity routing key — the same key
+/// `pick_endpoint` pins on, so "session" here has exactly the granularity of
+/// a routing pin (fan-out subagents that share a coarse session-id but carry
+/// distinct content fingerprints appear as distinct entries).
+struct SessionEntry {
+    client_id: String,
+    agent_id: String,
+    session_id: String,
+    model: String,
+    /// Endpoint the session's last request was served by (its current pin).
+    endpoint: String,
+    /// `input + cache_read + cache_creation` from the last successful
+    /// `Usage` — the prompt's occupancy of the model context window.
+    last_prompt_tokens: u64,
+    context_window: u64,
+    requests: u64,
+    last_seen: u64,
+}
+
+/// Redacted session label: hash of the affinity key, safe for `/_stats` and
+/// logs (the raw key embeds the client IP and session id).
+fn session_label(affinity_key: &str) -> String {
+    format!("{:016x}", stable_affinity_hash(affinity_key))
+}
+
+/// True when any `anthropic-beta` header value activates the 1M context
+/// window (flag shape: `context-1m-YYYY-MM-DD`; values may be comma-joined).
+fn request_has_1m_beta(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|flag| flag.trim().starts_with("context-1m"))
+}
+
+/// Model → context window size. All known Claude models are 200k unless the
+/// request carries the `context-1m` beta. Unknown model families fall back to
+/// 200k with a once-per-model warning so a new family can't silently skew
+/// the `/_stats` context-window % view.
+fn context_window_for(model: &str, has_1m_beta: bool) -> u64 {
+    if has_1m_beta {
+        return CONTEXT_WINDOW_1M;
+    }
+    if !model.is_empty() && !model.starts_with("claude") {
+        static WARNED: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        if let Ok(mut warned) = WARNED.get_or_init(Default::default).lock() {
+            // Bounded like the client maps: model is client-controlled input.
+            if warned.len() < MAX_PROMPT_TOO_LONG_MODELS && warned.insert(model.to_string()) {
+                warn!(model, "unknown model family, assuming 200k context window");
+            }
+        }
+    }
+    DEFAULT_CONTEXT_WINDOW
+}
+
+/// Context-window occupancy as a percentage, one decimal. Can exceed 100
+/// (that's the signal: the next request will 400).
+fn window_pct(tokens: u64, window: u64) -> f64 {
+    if window == 0 {
+        return 0.0;
+    }
+    (tokens as f64 / window as f64 * 1000.0).round() / 10.0
+}
+
+/// If `body` is the Anthropic "prompt is too long" 400 shape, return its
+/// message. `{"type":"error","error":{"type":"invalid_request_error",
+/// "message":"prompt is too long: 213462 tokens > 200000 maximum"}}`
+fn prompt_too_long_message(body: &serde_json::Value) -> Option<&str> {
+    let err = body.get("error")?;
+    if err.get("type")?.as_str()? != "invalid_request_error" {
+        return None;
+    }
+    let msg = err.get("message")?.as_str()?;
+    msg.contains("prompt is too long").then_some(msg)
+}
+
+/// Parse `(observed, max)` token counts from a prompt-too-long message —
+/// the first two integers in the text ("… 213462 tokens > 200000 maximum").
+fn parse_prompt_too_long(msg: &str) -> Option<(u64, u64)> {
+    let mut nums = msg
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u64>().ok());
+    Some((nums.next()?, nums.next()?))
+}
+
+impl AppState {
+    /// Record a completed request into the session registry. Sync-locked,
+    /// never held across `.await` (AC7); TTL prune + oldest-eviction run only
+    /// on NEW-key inserts, so steady-state traffic is a single map update.
+    #[allow(clippy::too_many_arguments)]
+    fn record_session(
+        &self,
+        affinity_key: &str,
+        rctx: (&str, &str, &str),
+        model: &str,
+        endpoint: &str,
+        prompt_tokens: u64,
+        context_window: u64,
+        now: u64,
+    ) {
+        if self.session_registry_max == 0 {
+            return;
+        }
+        let (client_id, agent_id, session_id) = rctx;
+        let Ok(mut map) = self.sessions.lock() else {
+            return;
+        };
+        if !map.contains_key(affinity_key) {
+            let ttl = self.session_registry_ttl_secs;
+            map.retain(|_, e| now.saturating_sub(e.last_seen) <= ttl);
+            if map.len() >= self.session_registry_max {
+                // ponytail: O(n) min-scan eviction on new-key insert past the
+                // cap; fine at the 1000-entry default, index by last_seen if
+                // the cap ever needs to grow orders of magnitude.
+                if let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, e)| e.last_seen)
+                    .map(|(k, _)| k.clone())
+                {
+                    map.remove(&oldest);
+                }
+            }
+        }
+        let entry = map
+            .entry(affinity_key.to_owned())
+            .or_insert_with(|| SessionEntry {
+                client_id: client_id.to_owned(),
+                agent_id: agent_id.to_owned(),
+                session_id: session_id.to_owned(),
+                model: String::new(),
+                endpoint: String::new(),
+                last_prompt_tokens: 0,
+                context_window: DEFAULT_CONTEXT_WINDOW,
+                requests: 0,
+                last_seen: 0,
+            });
+        model.clone_into(&mut entry.model);
+        endpoint.clone_into(&mut entry.endpoint);
+        entry.last_prompt_tokens = prompt_tokens;
+        entry.context_window = context_window;
+        entry.requests += 1;
+        entry.last_seen = now;
+    }
+
+    /// Count + log an upstream "prompt is too long" 400. The response itself
+    /// is forwarded to the client unchanged by the caller; this is the
+    /// operator-side trace that previously didn't exist.
+    fn note_prompt_too_long(
+        &self,
+        req_id: &str,
+        model: &str,
+        affinity_key: Option<&str>,
+        message: &str,
+    ) {
+        if let Ok(mut counts) = self.prompt_too_long.lock() {
+            let label = if counts.len() < MAX_PROMPT_TOO_LONG_MODELS || counts.contains_key(model) {
+                model
+            } else {
+                "_other"
+            };
+            *counts.entry(label.to_owned()).or_insert(0) += 1;
+        }
+        let (observed, max) = parse_prompt_too_long(message)
+            .map(|(o, m)| (Some(o), Some(m)))
+            .unwrap_or((None, None));
+        warn!(
+            req_id,
+            model,
+            session = affinity_key.map(session_label).as_deref().unwrap_or("-"),
+            observed_tokens = observed,
+            max_tokens = max,
+            "prompt too long"
+        );
+    }
+
+    /// Snapshot the session registry for `/_stats`: TTL-filtered, sorted by
+    /// context-window % desc, capped to `SESSIONS_STATS_TOP_N`. Raw IPs and
+    /// session ids never leave the registry — the label is a hash of the
+    /// affinity key and agent/session ids are truncated to 8 chars.
+    fn sessions_snapshot(&self, now: u64) -> Vec<serde_json::Value> {
+        let mut rows: Vec<(f64, serde_json::Value)> = self
+            .sessions
+            .lock()
+            .map(|map| {
+                map.iter()
+                    .filter(|(_, e)| {
+                        now.saturating_sub(e.last_seen) <= self.session_registry_ttl_secs
+                    })
+                    .map(|(key, e)| {
+                        let pct = window_pct(e.last_prompt_tokens, e.context_window);
+                        let client_id = if self.is_operator(&e.client_id) {
+                            "_operator"
+                        } else {
+                            &e.client_id
+                        };
+                        let truncate8 = |s: &str| -> String { s.chars().take(8).collect() };
+                        (
+                            pct,
+                            serde_json::json!({
+                                "session": session_label(key),
+                                "client_id": client_id,
+                                "agent": truncate8(&e.agent_id),
+                                "session_prefix": truncate8(&e.session_id),
+                                "model": e.model,
+                                "endpoint": e.endpoint,
+                                "last_prompt_tokens": e.last_prompt_tokens,
+                                "context_window": e.context_window,
+                                "context_window_pct": pct,
+                                "requests": e.requests,
+                                "last_seen": e.last_seen,
+                            }),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        rows.truncate(SESSIONS_STATS_TOP_N);
+        rows.into_iter().map(|(_, v)| v).collect()
+    }
+}
+
 fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &TokenUsage) {
     // INFO (temporarily): surfaces per-request cache_read vs cache_write so we can
     // join it to the `fingerprint` line by req_id and learn whether fan-out agents
@@ -4085,6 +4355,8 @@ async fn finalize_stream(
     client_disconnected: bool,
     upstream_error: bool,
     openai_compat: bool,
+    session_key: Option<&str>,
+    context_window: u64,
 ) {
     scanner.finish();
     let usage = &scanner.usage;
@@ -4092,6 +4364,19 @@ async fn finalize_stream(
     if !usage.is_empty() {
         state.record_usage(ep, client_id, usage).await;
         log_usage(req_id, client_id, model, acct_name, usage);
+        if let Some(key) = session_key {
+            state.record_session(
+                key,
+                (client_id, agent, session),
+                model,
+                acct_name,
+                usage.input_tokens
+                    + usage.cache_read_input_tokens
+                    + usage.cache_creation_input_tokens,
+                context_window,
+                AppState::now_epoch(),
+            );
+        }
     } else {
         let reason = if upstream_error {
             "upstream_error"
@@ -4155,10 +4440,25 @@ async fn finalize_non_stream(
     usage: &TokenUsage,
     latency_ms: u64,
     openai_compat: bool,
+    session_key: Option<&str>,
+    context_window: u64,
 ) {
     if !usage.is_empty() {
         state.record_usage(ep, client_id, usage).await;
         log_usage(req_id, client_id, model, acct_name, usage);
+        if let Some(key) = session_key {
+            state.record_session(
+                key,
+                (client_id, agent, session),
+                model,
+                acct_name,
+                usage.input_tokens
+                    + usage.cache_read_input_tokens
+                    + usage.cache_creation_input_tokens,
+                context_window,
+                AppState::now_epoch(),
+            );
+        }
     }
     let mut log = serde_json::json!({
         "ts": AppState::now_epoch(),
@@ -5059,8 +5359,13 @@ async fn forward_anthropic(
     agent_id: &str,
     session_id: &str,
     model: &str,
+    session_key: Option<&str>,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
+    // Context window for the session registry: 200k, or 1M when the request
+    // carries the `context-1m` beta (per-request, so a mixed client is
+    // tracked at the window each request actually ran under).
+    let context_window = context_window_for(model, request_has_1m_beta(&parts.headers));
     let token = ep.token.as_str();
     let passthrough = ep.passthrough;
     let endpoint_name = ep.name.as_str();
@@ -5290,6 +5595,7 @@ async fn forward_anthropic(
         let agent_clone = agent_id.to_owned();
         let session_clone = session_id.to_owned();
         let req_id_clone = req_id.to_owned();
+        let session_key_clone = session_key.map(str::to_owned);
         let status_code = status.as_u16();
 
         tokio::spawn(async move {
@@ -5341,6 +5647,8 @@ async fn forward_anthropic(
                 client_disconnected,
                 upstream_error,
                 false,
+                session_key_clone.as_deref(),
+                context_window,
             )
             .await;
         });
@@ -5406,6 +5714,13 @@ async fn forward_anthropic(
         let mut usage = TokenUsage::default();
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&resp_body_bytes) {
             usage = TokenUsage::from_response_body(&parsed);
+            // Count + trace upstream context-window overflows (LAB-916). The
+            // 400 itself is forwarded below byte-for-byte, as before.
+            if status.as_u16() == 400 {
+                if let Some(msg) = prompt_too_long_message(&parsed) {
+                    state.note_prompt_too_long(req_id, model, session_key, msg);
+                }
+            }
         }
         finalize_non_stream(
             state,
@@ -5421,6 +5736,8 @@ async fn forward_anthropic(
             &usage,
             latency_ms,
             false,
+            session_key,
+            context_window,
         )
         .await;
         let response = builder
@@ -5657,6 +5974,7 @@ async fn proxy_handler(
                                     &agent_id,
                                     &session_id,
                                     &model,
+                                    affinity,
                                     request_start,
                                 )
                                 .await;
@@ -6102,6 +6420,10 @@ async fn try_fallback_upstream(
         &usage,
         request_start.elapsed().as_millis() as u64,
         !translate, // openai_compat marks the client surface: translate=false ⇒ OpenAI-format caller
+        // OpenAI-protocol endpoints don't consume Anthropic context windows —
+        // the session registry (LAB-916) tracks Anthropic-bound traffic only.
+        None,
+        0,
     )
     .await;
 
@@ -6448,6 +6770,10 @@ async fn stats_handler(
         "client_budgets": budgets,
         "aggregate": aggregate,
         "strategy": state.routing_strategy.as_str(),
+        // Live sessions by context-window occupancy, hottest first (LAB-916).
+        // Session labels are hashes of the affinity key; raw IPs/session ids
+        // never leave the process.
+        "sessions": state.sessions_snapshot(now_epoch),
     });
     if let Some(cluster_info) = cluster {
         response["cluster"] = cluster_info;
@@ -6811,6 +7137,12 @@ async fn metrics_handler(
         .map(|g| g.clone())
         .unwrap_or_default();
     let cluster_info = state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
+    let prompt_too_long: Vec<(String, u64)> = state
+        .prompt_too_long
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
 
     // ── Phase 2: Serialize (sync — no locks held) ──────────────────
 
@@ -7602,6 +7934,24 @@ async fn metrics_handler(
             "anthropic_upstream_transport_errors_total",
             &[("kind", kind.as_str())],
             n,
+        );
+    }
+
+    // Upstream context-window overflows (LAB-916). Per-replica, in-memory —
+    // sessions themselves stay on `/_stats` (per-session Prometheus labels
+    // would be a cardinality anti-pattern).
+    prom_header(
+        &mut buf,
+        "anthropic_prompt_too_long_total",
+        "counter",
+        "Upstream 'prompt is too long' 400 responses by model",
+    );
+    for (model, n) in &prompt_too_long {
+        prom_counter(
+            &mut buf,
+            "anthropic_prompt_too_long_total",
+            &[("model", model.as_str())],
+            *n,
         );
     }
 
@@ -9005,10 +9355,15 @@ async fn forward_openai_compat_anthropic(
     agent_id: &str,
     session_id: &str,
     model: &str,
+    session_key: Option<&str>,
     is_streaming: bool,
     json_mode: bool,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
+    // Session registry window (LAB-916). OpenAI-compat callers can't send the
+    // `context-1m` beta through translation, but check anyway — the header is
+    // forwarded when present.
+    let context_window = context_window_for(model, request_has_1m_beta(&parts.headers));
     let token = ep.token.as_str();
     let passthrough = ep.passthrough;
     let endpoint_name = ep.name.as_str();
@@ -9180,6 +9535,13 @@ async fn forward_openai_compat_anthropic(
         // (LiteLLM, etc.) can parse the actual error message.
         let openai_error =
             if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&error_body) {
+                // Count + trace context-window overflows here too (LAB-916) —
+                // this path consumes the same Anthropic windows as the native one.
+                if status.as_u16() == 400 {
+                    if let Some(msg) = prompt_too_long_message(&parsed) {
+                        state.note_prompt_too_long(req_id, model, session_key, msg);
+                    }
+                }
                 // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
                 let msg = parsed
                     .pointer("/error/message")
@@ -9234,6 +9596,7 @@ async fn forward_openai_compat_anthropic(
         let agent_clone = agent_id.to_owned();
         let session_clone = session_id.to_owned();
         let req_id_clone = req_id.to_owned();
+        let session_key_clone = session_key.map(str::to_owned);
         let status_code = status.as_u16();
 
         tokio::spawn(async move {
@@ -9346,6 +9709,8 @@ async fn forward_openai_compat_anthropic(
                 client_gone,
                 upstream_error,
                 true,
+                session_key_clone.as_deref(),
+                context_window,
             )
             .await;
         });
@@ -9407,6 +9772,8 @@ async fn forward_openai_compat_anthropic(
         &usage,
         request_start.elapsed().as_millis() as u64,
         true,
+        session_key,
+        context_window,
     )
     .await;
 
@@ -9578,6 +9945,7 @@ async fn openai_chat_handler(
                                     &agent_id,
                                     &session_id,
                                     &model,
+                                    affinity,
                                     is_streaming,
                                     json_mode,
                                     request_start,
@@ -10019,6 +10387,14 @@ async fn main() {
                 .unwrap_or(DEFAULT_BODY_READ_TIMEOUT_SECS),
         ),
         body_read_timeout_total: AtomicU64::new(0),
+        sessions: Mutex::new(HashMap::new()),
+        session_registry_max: config
+            .session_registry_max
+            .unwrap_or(DEFAULT_SESSION_REGISTRY_MAX),
+        session_registry_ttl_secs: config
+            .session_registry_ttl_secs
+            .unwrap_or(DEFAULT_SESSION_REGISTRY_TTL_SECS),
+        prompt_too_long: Mutex::new(HashMap::new()),
     });
 
     if state.auto_cache {
