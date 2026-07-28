@@ -14972,7 +14972,6 @@ fn test_response_cache(
         &TEST_MASTER_KEY,
         Duration::from_secs(3600),
         Duration::from_millis(op_timeout_ms),
-        64,
     )
     .unwrap()
 }
@@ -15027,19 +15026,19 @@ fn response_cache_key_differs_on_nested_structure() {
     .unwrap();
     let (fpa, fpsa) = content_fingerprints(&a);
     let (fpb, fpsb) = content_fingerprints(&b);
-    let ka = response_cache_key("m", &a, &headers, "c", &fpa, &fpsa);
-    let kb = response_cache_key("m", &b, &headers, "c", &fpb, &fpsb);
+    let ka = response_cache_key("m", &a, &headers, None, "c", &fpa, &fpsa);
+    let kb = response_cache_key("m", &b, &headers, None, "c", &fpb, &fpsb);
     assert_ne!(ka, kb, "structural difference must change the key");
 
     // Model and beta headers are key material too.
-    let ka2 = response_cache_key("m2", &a, &headers, "c", &fpa, &fpsa);
+    let ka2 = response_cache_key("m2", &a, &headers, None, "c", &fpa, &fpsa);
     assert_ne!(ka, ka2, "model must change the key");
     let mut beta_headers = hyper::HeaderMap::new();
     beta_headers.insert(
         "anthropic-beta",
         HeaderValue::from_static("context-1m-2025"),
     );
-    let ka3 = response_cache_key("m", &a, &beta_headers, "c", &fpa, &fpsa);
+    let ka3 = response_cache_key("m", &a, &beta_headers, None, "c", &fpa, &fpsa);
     assert_ne!(ka, ka3, "anthropic-beta must change the key");
 
     // Key format: hex digest only, never content (AC5).
@@ -15053,8 +15052,8 @@ fn response_cache_key_isolates_clients() {
     let headers = hyper::HeaderMap::new();
     let body: serde_json::Value = serde_json::from_str(CACHE_TEST_BODY).unwrap();
     let (fp, fps) = content_fingerprints(&body);
-    let ka = response_cache_key("test", &body, &headers, "client-a", &fp, &fps);
-    let kb = response_cache_key("test", &body, &headers, "client-b", &fp, &fps);
+    let ka = response_cache_key("test", &body, &headers, None, "client-a", &fp, &fps);
+    let kb = response_cache_key("test", &body, &headers, None, "client-b", &fp, &fps);
     assert_ne!(ka, kb);
 }
 
@@ -15082,7 +15081,6 @@ fn response_cache_rejects_unknown_client_sentinel() {
         &TEST_MASTER_KEY,
         Duration::from_secs(60),
         Duration::from_millis(100),
-        64,
     )
     .err()
     .expect("\"-\" must be rejected");
@@ -15334,7 +15332,6 @@ async fn response_cache_backend_sees_only_ciphertext() {
         &[9u8; 32],
         Duration::from_secs(3600),
         Duration::from_millis(500),
-        64,
     )
     .unwrap();
     assert!(
@@ -15356,7 +15353,6 @@ async fn response_cache_backend_sees_only_ciphertext() {
         &TEST_MASTER_KEY,
         Duration::from_secs(3600),
         Duration::from_millis(500),
-        64,
     )
     .unwrap();
     assert!(
@@ -15472,10 +15468,8 @@ async fn response_cache_redis_backend_fails_open_when_down() {
         master_key: "ab".repeat(32),
         ttl_secs: Some(60),
         op_timeout_ms: Some(200),
-        l1_capacity: None,
         redis_url: Some("redis://127.0.0.1:1".to_string()),
         api_key: None,
-        api_url: None,
     };
     let rc = tokio::time::timeout(Duration::from_secs(10), ResponseCache::from_config(&cfg))
         .await
@@ -15488,9 +15482,10 @@ async fn response_cache_redis_backend_fails_open_when_down() {
     assert!(rc.errors.load(Ordering::Relaxed) >= 1);
 }
 
-// AC11 (SaaS): CachekitIO backend constructs through the same config path,
-// and its SSRF guard holds — loopback api_url is rejected even though the
-// operator asked for a custom host (no new exfil surface, AC14 talking point).
+// AC11 (SaaS): CachekitIO backend constructs through the same config path
+// (fixed at cachekit's default HTTPS endpoint — there is deliberately no
+// api_url knob), and the SDK's SSRF guard holds: loopback/private hosts are
+// rejected even when a caller asks for a custom host (AC14 talking point).
 #[tokio::test]
 async fn response_cache_cachekitio_backend_constructs_and_blocks_loopback() {
     let cfg = ResponseCacheConfig {
@@ -15499,20 +15494,20 @@ async fn response_cache_cachekitio_backend_constructs_and_blocks_loopback() {
         master_key: "ab".repeat(32),
         ttl_secs: Some(60),
         op_timeout_ms: Some(200),
-        l1_capacity: None,
         redis_url: None,
         api_key: Some("ck_test_dummy".to_string()),
-        api_url: None,
     };
     assert!(ResponseCache::from_config(&cfg).await.unwrap().is_some());
 
-    let loopback = ResponseCacheConfig {
-        api_url: Some("https://127.0.0.1:9".to_string()),
-        ..cfg.clone()
-    };
+    // The guard the config path relies on, exercised directly.
     assert!(
-        ResponseCache::from_config(&loopback).await.is_err(),
-        "loopback api_url must be rejected by the SSRF guard"
+        cachekit::backend::cachekitio::CachekitIO::builder()
+            .api_key("ck_test_dummy")
+            .api_url("https://127.0.0.1:9")
+            .allow_custom_host(true)
+            .build()
+            .is_err(),
+        "loopback api_url must be rejected by cachekit's SSRF guard"
     );
 }
 
@@ -15526,10 +15521,8 @@ async fn response_cache_config_validation() {
         master_key: "ab".repeat(32),
         ttl_secs: None,
         op_timeout_ms: None,
-        l1_capacity: None,
         redis_url: None,
         api_key: None,
-        api_url: None,
     };
     assert!(
         ResponseCache::from_config(&base).await.is_err(),
@@ -15574,6 +15567,7 @@ async fn response_cache_cachekitio_live_round_trip() {
         "live",
         &serde_json::from_str::<serde_json::Value>(CACHE_TEST_BODY).unwrap(),
         &hyper::HeaderMap::new(),
+        None,
         "live-test",
         "fp",
         "fps",
@@ -15590,4 +15584,146 @@ async fn response_cache_cachekitio_live_round_trip() {
         .await
         .expect("live read-back failed");
     assert_eq!(got.body, entry.body);
+}
+
+// Panel fix (bug-hunter MAJ): anthropic-version and the URI query string are
+// key material — an SDK upgrade mid-TTL must miss, not replay the old shape.
+#[test]
+fn response_cache_key_varies_on_version_and_query() {
+    let body: serde_json::Value = serde_json::from_str(CACHE_TEST_BODY).unwrap();
+    let (fp, fps) = content_fingerprints(&body);
+    let plain = hyper::HeaderMap::new();
+    let mut versioned = hyper::HeaderMap::new();
+    versioned.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    let base = response_cache_key("m", &body, &plain, None, "c", &fp, &fps);
+    assert_ne!(
+        base,
+        response_cache_key("m", &body, &versioned, None, "c", &fp, &fps),
+        "anthropic-version must change the key"
+    );
+    assert_ne!(
+        base,
+        response_cache_key("m", &body, &plain, Some("beta=true"), "c", &fp, &fps),
+        "URI query must change the key"
+    );
+}
+
+// Panel fix (craftsman MAJ): an upstream answering a stream:false request
+// with text/event-stream must pass through untouched — never collected,
+// never cached as a bogus non-streaming entry.
+#[tokio::test]
+async fn response_cache_skips_non_json_content_type() {
+    let sse_body: &[u8] = b"event: message_start\ndata: {}\n\n";
+    let (url, hits) = {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                h.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    sse_body.len()
+                );
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(sse_body).await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    };
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let rc = test_response_cache(backend.clone(), &["geo"], 500);
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
+        response_cache: Some(rc),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state.clone())).await;
+    for _ in 0..2 {
+        let resp = post_messages(addr, "geo", CACHE_TEST_BODY).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert!(resp.headers().get("x-alb-cache").is_none());
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), sse_body);
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "SSE responses must never be served from cache"
+    );
+    assert!(
+        backend.writes.lock().unwrap().is_empty(),
+        "non-JSON content-type must never be written to the cache"
+    );
+    assert_eq!(
+        state
+            .response_cache
+            .as_ref()
+            .unwrap()
+            .stores
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+// Panel fix (bug-hunter MAJ): bodies over MAX_BODY_BYTES are not stored —
+// bounds backend value growth and worst-case L1 memory. The response itself
+// is returned intact.
+#[tokio::test]
+async fn response_cache_skips_oversized_bodies() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let rc = test_response_cache(backend.clone(), &["geo"], 500);
+    let state = Arc::new(AppState {
+        response_cache: Some(rc),
+        ..test_state_base()
+    });
+    let big = vec![b'x'; ResponseCache::MAX_BODY_BYTES + 1];
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(big.clone()))
+        .unwrap();
+    let out = maybe_cache_store(&state, Some(&"a".repeat(64)), "geo", "rid", resp).await;
+    assert_eq!(out.status(), StatusCode::OK);
+    let out_bytes = axum::body::to_bytes(out.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        out_bytes.len(),
+        big.len(),
+        "oversized body must be returned intact"
+    );
+    assert!(backend.writes.lock().unwrap().is_empty());
+    assert_eq!(
+        state
+            .response_cache
+            .as_ref()
+            .unwrap()
+            .stores
+            .load(Ordering::Relaxed),
+        0
+    );
+
+    // At the cap boundary it IS stored.
+    let ok_body = vec![b'y'; 1024];
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(ok_body))
+        .unwrap();
+    let _ = maybe_cache_store(&state, Some(&"b".repeat(64)), "geo", "rid", resp).await;
+    assert_eq!(
+        state
+            .response_cache
+            .as_ref()
+            .unwrap()
+            .stores
+            .load(Ordering::Relaxed),
+        1
+    );
 }

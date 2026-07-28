@@ -128,17 +128,14 @@ struct ResponseCacheConfig {
     /// Per-operation budget in ms before the cache fails open and the
     /// request proceeds upstream (AC10). Default: 250.
     op_timeout_ms: Option<u64>,
-    /// Per-client in-process L1 capacity, in entries (ciphertext-at-rest,
-    /// same zero-knowledge guarantee as the backend). Default: 256.
-    l1_capacity: Option<usize>,
     /// Connection URL for backend = "redis" (redis:// or rediss://).
     redis_url: Option<String>,
-    /// API key for backend = "cachekitio".
+    /// API key for backend = "cachekitio". The API URL is fixed at
+    /// cachekit's default (api.cachekit.io) — deliberately no override knob:
+    /// an operator egress-URL switch on a proxy with an open SSRF audit
+    /// finding is negative-value optionality until a real self-hosted
+    /// deployment exists.
     api_key: Option<String>,
-    /// API URL override for backend = "cachekitio". Setting a non-default
-    /// URL implies allow_custom_host; cachekit's validator still enforces
-    /// HTTPS and blocks private/loopback IPs (SSRF guard).
-    api_url: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -990,12 +987,17 @@ struct CachedResponse {
 /// writes ciphertext to both L1 and the backend).
 struct ResponseCache {
     clients: HashMap<String, cachekit::CacheKit>,
-    ttl: Duration,
     op_timeout: Duration,
     hits: AtomicU64,
     misses: AtomicU64,
     errors: AtomicU64,
     stores: AtomicU64,
+}
+
+/// First 16 hex chars of a cache-key digest — the ONLY form a cache key may
+/// take in any diagnostic output (AC5).
+fn key_digest_prefix(key: &str) -> &str {
+    &key[..key.len().min(16)]
 }
 
 /// Decode a hex master key, enforcing the 32-byte SecureCache minimum.
@@ -1019,21 +1021,25 @@ fn decode_hex_key(s: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Derive the response-cache storage key (AC6): hex Blake2s-256 over
-/// (model ␟ canonical body JSON ␟ sorted anthropic-beta values ␟ client_id
-/// ␟ fp ␟ fps). The full-body digest is what carries correctness — two
-/// requests differing anywhere, including a nested structural position,
-/// serialize differently (`preserve_order` keeps the client's key order) and
-/// get different keys. The 48-bit SipHash content fingerprints are folded in
-/// to reuse the existing canonical machinery, but are deliberately not
-/// trusted alone: 48 bits over prompt content is collision territory, and a
-/// key collision here would serve someone the wrong completion. client_id in
-/// the material separates keys per client on top of the per-tenant
-/// encryption (AC7). The emitted key is a digest only — no prompt content
-/// ever appears in a storage key or diagnostic line (AC5).
+/// (model ␟ canonical body JSON ␟ sorted anthropic-beta values ␟
+/// anthropic-version ␟ URI query ␟ client_id ␟ fp ␟ fps). The full-body
+/// digest is what carries correctness — two requests differing anywhere,
+/// including a nested structural position, serialize differently
+/// (`preserve_order` keeps the client's key order) and get different keys.
+/// anthropic-version and the query string are keyed because they change the
+/// RESPONSE schema for an identical body (an SDK upgrade mid-TTL must miss,
+/// not replay the old shape). The 48-bit SipHash content fingerprints are
+/// folded in to reuse the existing canonical machinery (per AC6), but are
+/// deliberately not trusted alone: 48 bits over prompt content is collision
+/// territory, and a key collision here would serve someone the wrong
+/// completion. client_id in the material separates keys per client on top
+/// of the per-tenant encryption (AC7). The emitted key is a digest only —
+/// no prompt content ever appears in a storage key or diagnostic line (AC5).
 fn response_cache_key(
     model: &str,
     body: &serde_json::Value,
     headers: &hyper::HeaderMap,
+    query: Option<&str>,
     client_id: &str,
     fp: &str,
     fps: &str,
@@ -1045,9 +1051,22 @@ fn response_cache_key(
         .filter_map(|v| v.to_str().ok())
         .collect();
     betas.sort_unstable();
+    let version = headers
+        .get("anthropic-version")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let canonical = serde_json::to_string(body).unwrap_or_default();
     let mut h = Blake2s256::new();
-    for part in [model, &canonical, &betas.join(","), client_id, fp, fps] {
+    for part in [
+        model,
+        &canonical,
+        &betas.join(","),
+        version,
+        query.unwrap_or(""),
+        client_id,
+        fp,
+        fps,
+    ] {
         h.update(part.as_bytes());
         h.update([0x1f]);
     }
@@ -1065,7 +1084,13 @@ impl ResponseCache {
     const NAMESPACE: &'static str = "alb-resp";
     const DEFAULT_TTL_SECS: u64 = 3600;
     const DEFAULT_OP_TIMEOUT_MS: u64 = 250;
-    const DEFAULT_L1_CAPACITY: usize = 256;
+    /// Per-client in-process L1 entries (ciphertext at rest). Together with
+    /// `MAX_BODY_BYTES` this bounds worst-case L1 memory per client.
+    const L1_CAPACITY: usize = 64;
+    /// Bodies larger than this are not cached (the entry would also bump
+    /// into cachekit's 5 MiB payload ceiling once encrypted + encoded).
+    /// Bounds both backend value growth and worst-case L1 memory.
+    const MAX_BODY_BYTES: usize = 1024 * 1024;
 
     /// Build from config. `Ok(None)` when the allow-list is empty (inert,
     /// AC2). Config errors — bad key, missing backend params — are `Err`:
@@ -1087,14 +1112,17 @@ impl ResponseCache {
                     .url(url)
                     .build()
                     .map_err(|e| format!("response_cache redis backend: {e}"))?;
-                // fred's connection task detaches when the handle drops. A
-                // failed initial connect is NOT fatal: ops fail open until
-                // connectivity returns. (cachekit-rs 0.5.0 exposes no
-                // auto-reconnect on this builder — flagged upstream.)
+                // fred's connection task detaches when the handle drops.
+                // KNOWN LIMITATION (cachekit-rs 0.5.0, flagged upstream):
+                // auto-reconnect is pub(crate) and unreachable from this
+                // builder, so after a failed initial connect OR any later
+                // Redis outage the client does NOT recover — every cache op
+                // errors (fail-open, bounded by op_timeout per op) until the
+                // process restarts. Watch anthropic_response_cache_errors_total.
                 match b.connect().await {
                     Ok(_handle) => info!("response cache redis backend connected"),
                     Err(e) => {
-                        warn!(error = %e, "response cache redis connect failed — cache will fail open")
+                        warn!(error = %e, "response cache redis connect failed — cache disabled until restart (fail-open)")
                     }
                 }
                 std::sync::Arc::new(b)
@@ -1104,16 +1132,9 @@ impl ResponseCache {
                     .api_key
                     .as_deref()
                     .ok_or("response_cache.api_key is required for backend = \"cachekitio\"")?;
-                let mut builder =
-                    cachekit::backend::cachekitio::CachekitIO::builder().api_key(api_key);
-                if let Some(url) = &cfg.api_url {
-                    // Operator-supplied override (same trust level as
-                    // endpoints[].base_url). cachekit's validator still
-                    // enforces HTTPS and rejects private/loopback IPs.
-                    builder = builder.api_url(url).allow_custom_host(true);
-                }
                 std::sync::Arc::new(
-                    builder
+                    cachekit::backend::cachekitio::CachekitIO::builder()
+                        .api_key(api_key)
                         .build()
                         .map_err(|e| format!("response_cache cachekitio backend: {e}"))?,
                 )
@@ -1130,7 +1151,6 @@ impl ResponseCache {
             &master_key,
             Duration::from_secs(cfg.ttl_secs.unwrap_or(Self::DEFAULT_TTL_SECS)),
             Duration::from_millis(cfg.op_timeout_ms.unwrap_or(Self::DEFAULT_OP_TIMEOUT_MS)),
-            cfg.l1_capacity.unwrap_or(Self::DEFAULT_L1_CAPACITY),
         )
         .map(Some)
     }
@@ -1144,7 +1164,6 @@ impl ResponseCache {
         master_key: &[u8],
         ttl: Duration,
         op_timeout: Duration,
-        l1_capacity: usize,
     ) -> Result<Self, String> {
         let mut map = HashMap::new();
         for client_id in clients {
@@ -1154,11 +1173,13 @@ impl ResponseCache {
                         .into(),
                 );
             }
+            // The builder's default_ttl is the SINGLE source of entry
+            // lifetime — writes use plain `set()` so the two can't drift.
             let ck = cachekit::CacheKit::builder()
                 .backend(backend.clone())
                 .default_ttl(ttl)
                 .namespace(Self::NAMESPACE)
-                .l1_capacity(l1_capacity)
+                .l1_capacity(Self::L1_CAPACITY)
                 .encryption_from_bytes(master_key, client_id)
                 .map_err(|e| format!("response_cache encryption init for \"{client_id}\": {e}"))?
                 .build()
@@ -1167,18 +1188,12 @@ impl ResponseCache {
         }
         Ok(Self {
             clients: map,
-            ttl,
             op_timeout,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             stores: AtomicU64::new(0),
         })
-    }
-
-    /// Whether this client_id may use the cache (AC2).
-    fn is_opted_in(&self, client_id: &str) -> bool {
-        self.clients.contains_key(client_id)
     }
 
     /// Read an entry. Every failure mode — no encryption handle, backend
@@ -1199,13 +1214,13 @@ impl ResponseCache {
             }
             Ok(Err(e)) => {
                 self.errors.fetch_add(1, Ordering::Relaxed);
-                warn!(key_digest = &key[..key.len().min(16)], error = %e, "response cache read failed — proceeding upstream");
+                warn!(key_digest = key_digest_prefix(key), error = %e, "response cache read failed — proceeding upstream");
                 None
             }
             Err(_) => {
                 self.errors.fetch_add(1, Ordering::Relaxed);
                 warn!(
-                    key_digest = &key[..key.len().min(16)],
+                    key_digest = key_digest_prefix(key),
                     timeout_ms = self.op_timeout.as_millis() as u64,
                     "response cache read timed out — proceeding upstream"
                 );
@@ -1220,19 +1235,19 @@ impl ResponseCache {
         let Some(cache) = self.clients.get(client_id) else {
             return;
         };
-        let op = async { cache.secure()?.set_with_ttl(key, entry, self.ttl).await };
+        let op = async { cache.secure()?.set(key, entry).await };
         match tokio::time::timeout(self.op_timeout, op).await {
             Ok(Ok(())) => {
                 self.stores.fetch_add(1, Ordering::Relaxed);
             }
             Ok(Err(e)) => {
                 self.errors.fetch_add(1, Ordering::Relaxed);
-                warn!(key_digest = &key[..key.len().min(16)], error = %e, "response cache write failed — skipped");
+                warn!(key_digest = key_digest_prefix(key), error = %e, "response cache write failed — skipped");
             }
             Err(_) => {
                 self.errors.fetch_add(1, Ordering::Relaxed);
                 warn!(
-                    key_digest = &key[..key.len().min(16)],
+                    key_digest = key_digest_prefix(key),
                     timeout_ms = self.op_timeout.as_millis() as u64,
                     "response cache write timed out — skipped"
                 );
@@ -1242,15 +1257,28 @@ impl ResponseCache {
 }
 
 /// Build the client-facing response for a cache hit. Only ever called for
-/// entries written from 2xx responses (AC3).
+/// entries written from 2xx responses (AC3). The entry came through AEAD
+/// decryption, so an invalid stored status means OUR bug — surface a loud
+/// 500, never a fabricated 200.
 fn cached_hit_response(entry: CachedResponse) -> Response {
+    let Ok(status) = StatusCode::from_u16(entry.status) else {
+        error!(
+            status = entry.status,
+            "cached entry carries an invalid status code — refusing to serve"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cached response rebuild error",
+        )
+            .into_response();
+    };
     let content_type = if entry.content_type.is_empty() {
         "application/json"
     } else {
         entry.content_type.as_str()
     };
     Response::builder()
-        .status(StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK))
+        .status(status)
         .header("content-type", content_type)
         .header("x-alb-cache", "hit")
         .body(Body::from(entry.body))
@@ -5908,7 +5936,16 @@ fn upstream_client_builder() -> reqwest::ClientBuilder {
 fn request_wants_stream(body: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
-        .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+        .map(|v| body_wants_stream(&v))
+        .unwrap_or(false)
+}
+
+/// The streaming predicate on an already-parsed body. Single definition
+/// shared by `request_wants_stream` and the response-cache gate so the two
+/// can never disagree on what "streaming" means.
+fn body_wants_stream(body: &serde_json::Value) -> bool {
+    body.get("stream")
+        .and_then(|s| s.as_bool())
         .unwrap_or(false)
 }
 
@@ -6349,6 +6386,24 @@ async fn maybe_cache_store(
     if !resp.status().is_success() {
         return resp;
     }
+    // Only JSON bodies are cacheable. The request was non-streaming, so the
+    // forward path buffered the body — but that is an invariant of TODAY's
+    // upstreams, not a law: an upstream answering a `stream:false` request
+    // with `text/event-stream` must pass through untouched (never collected,
+    // never cached as a bogus non-streaming entry).
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    if !content_type.starts_with("application/json") {
+        debug!(
+            req_id,
+            content_type, "response cache: non-JSON content-type — not cached"
+        );
+        return resp;
+    }
     let (parts, body) = resp.into_parts();
     let bytes = match http_body_util::BodyExt::collect(body).await {
         Ok(collected) => collected.to_bytes(),
@@ -6363,12 +6418,16 @@ async fn maybe_cache_store(
                 .into_response();
         }
     };
-    let content_type = parts
-        .headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
+    if bytes.len() > ResponseCache::MAX_BODY_BYTES {
+        // Deliberate policy skip, not a failure: bounds backend value growth
+        // and worst-case L1 memory (L1_CAPACITY × MAX_BODY_BYTES per client).
+        debug!(
+            req_id,
+            body_bytes = bytes.len(),
+            "response cache: body exceeds size cap — not cached"
+        );
+        return Response::from_parts(parts, Body::from(bytes));
+    }
     rc.store(
         client_id,
         key,
@@ -6473,19 +6532,18 @@ async fn proxy_handler(
             // path, and non-streaming (AC8; same predicate as
             // `request_wants_stream`, evaluated on the parsed body).
             let cache_key = match &state.response_cache {
+                // The per-client map doubles as the opt-in allow-list (AC2).
                 Some(rc)
-                    if rc.is_opted_in(&client_id)
+                    if rc.clients.contains_key(&client_id)
                         && parts.method == hyper::Method::POST
                         && parts.uri.path() == "/v1/messages"
-                        && !parsed
-                            .get("stream")
-                            .and_then(|s| s.as_bool())
-                            .unwrap_or(false) =>
+                        && !body_wants_stream(&parsed) =>
                 {
                     Some(response_cache_key(
                         &model,
                         &parsed,
                         &parts.headers,
+                        parts.uri.query(),
                         &client_id,
                         &fp,
                         &fps,
@@ -6605,7 +6663,7 @@ async fn proxy_handler(
                 info!(
                     req_id,
                     client_id = %client_id,
-                    key_digest = &key[..key.len().min(16)],
+                    key_digest = key_digest_prefix(key),
                     "response cache hit"
                 );
                 return cached_hit_response(entry);
@@ -11165,7 +11223,7 @@ async fn main() {
                 info!(
                     clients = rc.clients.len(),
                     backend = %cfg.backend,
-                    ttl_secs = rc.ttl.as_secs(),
+                    ttl_secs = cfg.ttl_secs.unwrap_or(ResponseCache::DEFAULT_TTL_SECS),
                     "response cache enabled"
                 );
                 Some(rc)

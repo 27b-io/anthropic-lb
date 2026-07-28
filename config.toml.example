@@ -56,6 +56,9 @@ probe_interval_secs = 300
 # backend only ever holds ciphertext. Omit the section (or leave clients
 # empty) to disable entirely. NOTE: an opted-in client replaying an identical
 # temperature > 0 request gets the SAME answer back, by design.
+# SECURITY: x-client-id is client-asserted, so allow-listed clients must
+# mutually trust each other — presenting an opted-in client's ID reads its
+# cached responses. One trust domain per allow-list.
 # [response_cache]
 # clients = ["geo-pipeline"]           # allow-list of client IDs; empty = inert
 # backend = "redis"                    # "redis" or "cachekitio"

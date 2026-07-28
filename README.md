@@ -551,7 +551,8 @@ master_key = "…64 hex chars…"
 
 **What is cached:** the full response body (status + content-type + JSON body)
 of **2xx, non-streaming** `/v1/messages` responses. Streaming (`"stream": true`)
-requests always bypass the cache. Error responses are never cached.
+requests always bypass the cache, as do non-JSON responses and bodies over
+1 MiB. Error responses are never cached.
 
 **Where it lands, and what the backend can read:** entries are encrypted
 **client-side** (in the proxy process) with AES-256-GCM before touching any
@@ -571,6 +572,17 @@ request. Every cache operation is bounded by `op_timeout_ms`; on any error the
 request proceeds upstream exactly as if the cache did not exist. Hit / miss /
 store / error counters are exposed on `/metrics`
 (`anthropic_response_cache_*_total{surface="messages"}`).
+
+> [!WARNING]
+> **Allow-listed clients must mutually trust each other.** Client identity is
+> the client-asserted `x-client-id` header — the proxy's identity model is
+> trust-based (see [Security](#security)). Per-client encryption keys are
+> derived from that asserted identity, so any authenticated caller who
+> *presents* an opted-in client's ID can read that client's cached responses
+> (prompt content included). This is a *read* capability on top of the
+> pre-existing impersonation surface (budget-burning). Only opt in clients
+> that already share a trust domain, and treat the allow-list as one
+> confidentiality boundary, not N.
 
 > [!WARNING]
 > **Non-determinism caveat — opting in is consent to replay.** Sampling
