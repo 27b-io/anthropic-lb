@@ -339,6 +339,7 @@ fn test_state_base() -> AppState {
         session_registry_ttl_secs: DEFAULT_SESSION_REGISTRY_TTL_SECS,
         prompt_too_long: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
+        response_cache: None,
     }
 }
 
@@ -14853,4 +14854,740 @@ async fn stats_sessions_block_lists_and_redacts() {
         "raw session id must not leak"
     );
     assert!(!text.contains("127.0.0.1"), "raw client IP must not leak");
+}
+
+// ── LAB-933: opt-in encrypted response cache on /v1/messages ────────
+
+/// In-memory `cachekit::backend::Backend` that records every byte handed to
+/// it, so tests can assert on EXACTLY what the storage layer sees (AC4:
+/// ciphertext only, digest keys only).
+#[derive(Default)]
+struct RecordingBackend {
+    store: std::sync::Mutex<HashMap<String, Vec<u8>>>,
+    writes: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+}
+
+#[async_trait::async_trait]
+impl cachekit::backend::Backend for RecordingBackend {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, cachekit::BackendError> {
+        Ok(self.store.lock().unwrap().get(key).cloned())
+    }
+    async fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), cachekit::BackendError> {
+        self.writes
+            .lock()
+            .unwrap()
+            .push((key.to_string(), value.clone()));
+        self.store.lock().unwrap().insert(key.to_string(), value);
+        Ok(())
+    }
+    async fn delete(&self, key: &str) -> Result<bool, cachekit::BackendError> {
+        Ok(self.store.lock().unwrap().remove(key).is_some())
+    }
+    async fn exists(&self, key: &str) -> Result<bool, cachekit::BackendError> {
+        Ok(self.store.lock().unwrap().contains_key(key))
+    }
+    async fn health(&self) -> Result<cachekit::backend::HealthStatus, cachekit::BackendError> {
+        Ok(cachekit::backend::HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
+            backend_type: "recording".into(),
+            details: HashMap::new(),
+        })
+    }
+}
+
+/// Backend where every operation fails — the "Redis is down" shape (AC10).
+struct ErroringBackend;
+
+#[async_trait::async_trait]
+impl cachekit::backend::Backend for ErroringBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, cachekit::BackendError> {
+        Err(cachekit::BackendError::transient("backend down"))
+    }
+    async fn set(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), cachekit::BackendError> {
+        Err(cachekit::BackendError::transient("backend down"))
+    }
+    async fn delete(&self, _key: &str) -> Result<bool, cachekit::BackendError> {
+        Err(cachekit::BackendError::transient("backend down"))
+    }
+    async fn exists(&self, _key: &str) -> Result<bool, cachekit::BackendError> {
+        Err(cachekit::BackendError::transient("backend down"))
+    }
+    async fn health(&self) -> Result<cachekit::backend::HealthStatus, cachekit::BackendError> {
+        Err(cachekit::BackendError::transient("backend down"))
+    }
+}
+
+/// Backend where every operation hangs well past any op timeout (AC10).
+struct SlowBackend;
+
+#[async_trait::async_trait]
+impl cachekit::backend::Backend for SlowBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, cachekit::BackendError> {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(None)
+    }
+    async fn set(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), cachekit::BackendError> {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(())
+    }
+    async fn delete(&self, _key: &str) -> Result<bool, cachekit::BackendError> {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(false)
+    }
+    async fn exists(&self, _key: &str) -> Result<bool, cachekit::BackendError> {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(false)
+    }
+    async fn health(&self) -> Result<cachekit::backend::HealthStatus, cachekit::BackendError> {
+        Err(cachekit::BackendError::timeout("slow"))
+    }
+}
+
+const TEST_MASTER_KEY: [u8; 32] = [7u8; 32];
+
+fn test_response_cache(
+    backend: cachekit::SharedBackend,
+    clients: &[&str],
+    op_timeout_ms: u64,
+) -> ResponseCache {
+    ResponseCache::from_parts(
+        backend,
+        &clients.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &TEST_MASTER_KEY,
+        Duration::from_secs(3600),
+        Duration::from_millis(op_timeout_ms),
+        64,
+    )
+    .unwrap()
+}
+
+/// Full app against a counting upstream, with the response cache installed
+/// for `clients`. Returns (addr, upstream_hits, state).
+async fn serve_cache_app(
+    backend: cachekit::SharedBackend,
+    clients: &[&str],
+) -> (
+    SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    Arc<AppState>,
+) {
+    let (url, hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let rc = test_response_cache(backend, clients, 500);
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
+        response_cache: Some(rc),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state.clone())).await;
+    (addr, hits, state)
+}
+
+const CACHE_TEST_BODY: &str =
+    r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+
+async fn post_messages(addr: SocketAddr, client_id: &str, body: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-client-id", client_id)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap()
+}
+
+// AC6: the key is a full-body canonical digest — same raw text in a
+// different structural position must produce a different key.
+#[test]
+fn response_cache_key_differs_on_nested_structure() {
+    let headers = hyper::HeaderMap::new();
+    let a: serde_json::Value = serde_json::from_str(
+        r#"{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}"#,
+    )
+    .unwrap();
+    let b: serde_json::Value = serde_json::from_str(
+        r#"{"messages":[{"role":"user","content":[{"type":"text","text":"ab"}]}]}"#,
+    )
+    .unwrap();
+    let (fpa, fpsa) = content_fingerprints(&a);
+    let (fpb, fpsb) = content_fingerprints(&b);
+    let ka = response_cache_key("m", &a, &headers, "c", &fpa, &fpsa);
+    let kb = response_cache_key("m", &b, &headers, "c", &fpb, &fpsb);
+    assert_ne!(ka, kb, "structural difference must change the key");
+
+    // Model and beta headers are key material too.
+    let ka2 = response_cache_key("m2", &a, &headers, "c", &fpa, &fpsa);
+    assert_ne!(ka, ka2, "model must change the key");
+    let mut beta_headers = hyper::HeaderMap::new();
+    beta_headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("context-1m-2025"),
+    );
+    let ka3 = response_cache_key("m", &a, &beta_headers, "c", &fpa, &fpsa);
+    assert_ne!(ka, ka3, "anthropic-beta must change the key");
+
+    // Key format: hex digest only, never content (AC5).
+    assert_eq!(ka.len(), 64);
+    assert!(ka.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+// AC7 (unit half): identical bodies, different clients → different keys.
+#[test]
+fn response_cache_key_isolates_clients() {
+    let headers = hyper::HeaderMap::new();
+    let body: serde_json::Value = serde_json::from_str(CACHE_TEST_BODY).unwrap();
+    let (fp, fps) = content_fingerprints(&body);
+    let ka = response_cache_key("test", &body, &headers, "client-a", &fp, &fps);
+    let kb = response_cache_key("test", &body, &headers, "client-b", &fp, &fps);
+    assert_ne!(ka, kb);
+}
+
+#[test]
+fn response_cache_master_key_validation() {
+    assert!(decode_hex_key(&"ab".repeat(32)).is_ok());
+    assert!(decode_hex_key("deadbeef").is_err(), "short key must fail");
+    assert!(
+        decode_hex_key(&"a".repeat(63)).is_err(),
+        "odd length must fail"
+    );
+    assert!(
+        decode_hex_key(&"zz".repeat(32)).is_err(),
+        "non-hex must fail"
+    );
+    assert!(decode_hex_key("").is_err());
+}
+
+#[test]
+fn response_cache_rejects_unknown_client_sentinel() {
+    let backend: cachekit::SharedBackend = std::sync::Arc::new(RecordingBackend::default());
+    let err = ResponseCache::from_parts(
+        backend,
+        &["-".to_string()],
+        &TEST_MASTER_KEY,
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        64,
+    )
+    .err()
+    .expect("\"-\" must be rejected");
+    assert!(err.contains("sentinel"), "got: {err}");
+}
+
+// AC1: with no cache configured, repeat requests hit the upstream every time
+// and no cache artifacts appear on the response.
+#[tokio::test]
+async fn response_cache_absent_config_is_inert() {
+    let (url, hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)]);
+    let addr = serve(build_router(state)).await;
+    for _ in 0..2 {
+        let resp = post_messages(addr, "someone", CACHE_TEST_BODY).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert!(resp.headers().get("x-alb-cache").is_none());
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "both requests must reach upstream"
+    );
+}
+
+// AC2: a client NOT on the allow-list never reads or writes the cache even
+// when the cache is configured for someone else.
+#[tokio::test]
+async fn response_cache_ignores_non_opted_client() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let (addr, hits, state) = serve_cache_app(backend.clone(), &["opted-in"]).await;
+    for _ in 0..2 {
+        let resp = post_messages(addr, "not-opted-in", CACHE_TEST_BODY).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert!(resp.headers().get("x-alb-cache").is_none());
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert!(
+        backend.writes.lock().unwrap().is_empty(),
+        "no cache writes for non-opted client"
+    );
+    let rc = state.response_cache.as_ref().unwrap();
+    assert_eq!(rc.hits.load(Ordering::Relaxed), 0);
+    assert_eq!(rc.misses.load(Ordering::Relaxed), 0);
+}
+
+// AC9 + AC3 write side: an opted-in replay is served from cache — exactly one
+// upstream call, no second budget/usage recording, hit counted, marker header.
+#[tokio::test]
+async fn response_cache_hit_replays_without_upstream_or_budget() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let (addr, hits, state) = serve_cache_app(backend.clone(), &["geo"]).await;
+
+    let first = post_messages(addr, "geo", CACHE_TEST_BODY).await;
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    assert!(first.headers().get("x-alb-cache").is_none());
+    let first_body = first.bytes().await.unwrap();
+
+    let budget_after_first = state.budget_usage.lock().unwrap().clone();
+    let usage_after_first = state.client_usage.lock().unwrap().clone();
+    let upstream_requests_after_first = state.endpoints[0].requests.load(Ordering::Relaxed);
+
+    let second = post_messages(addr, "geo", CACHE_TEST_BODY).await;
+    assert_eq!(second.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        second
+            .headers()
+            .get("x-alb-cache")
+            .map(|v| v.to_str().unwrap()),
+        Some("hit")
+    );
+    let second_body = second.bytes().await.unwrap();
+    assert_eq!(first_body, second_body, "replay must be the original body");
+
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "second request must not reach upstream"
+    );
+    assert_eq!(
+        *state.budget_usage.lock().unwrap(),
+        budget_after_first,
+        "a cache hit must not decrement the daily budget"
+    );
+    assert_eq!(
+        *state.client_usage.lock().unwrap(),
+        usage_after_first,
+        "a cache hit must not record token usage"
+    );
+    assert_eq!(
+        state.endpoints[0].requests.load(Ordering::Relaxed),
+        upstream_requests_after_first,
+        "a cache hit must not consume endpoint headroom accounting"
+    );
+
+    let rc = state.response_cache.as_ref().unwrap();
+    assert_eq!(rc.hits.load(Ordering::Relaxed), 1);
+    assert_eq!(rc.misses.load(Ordering::Relaxed), 1);
+    assert_eq!(rc.stores.load(Ordering::Relaxed), 1);
+}
+
+// AC7 (integration half): a second opted-in client with a byte-identical
+// body must MISS — entries are never shared across clients.
+#[tokio::test]
+async fn response_cache_cross_client_read_misses() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let (addr, hits, _state) = serve_cache_app(backend.clone(), &["client-a", "client-b"]).await;
+
+    let r = post_messages(addr, "client-a", CACHE_TEST_BODY).await;
+    assert_eq!(r.status(), reqwest::StatusCode::OK);
+    let r = post_messages(addr, "client-b", CACHE_TEST_BODY).await;
+    assert_eq!(r.status(), reqwest::StatusCode::OK);
+    assert!(
+        r.headers().get("x-alb-cache").is_none(),
+        "cross-client must not hit"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "client-b must reach upstream"
+    );
+
+    // Each client still hits their OWN entry.
+    let r = post_messages(addr, "client-b", CACHE_TEST_BODY).await;
+    assert_eq!(
+        r.headers().get("x-alb-cache").map(|v| v.to_str().unwrap()),
+        Some("hit")
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+// AC8: streaming requests bypass the cache entirely, even for opted-in clients.
+#[tokio::test]
+async fn response_cache_streaming_bypasses() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let (addr, hits, state) = serve_cache_app(backend.clone(), &["geo"]).await;
+    let streaming_body = r#"{"model":"test","max_tokens":1,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    for _ in 0..2 {
+        let resp = post_messages(addr, "geo", streaming_body).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert!(resp.headers().get("x-alb-cache").is_none());
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert!(backend.writes.lock().unwrap().is_empty());
+    let rc = state.response_cache.as_ref().unwrap();
+    assert_eq!(
+        rc.misses.load(Ordering::Relaxed) + rc.hits.load(Ordering::Relaxed),
+        0
+    );
+}
+
+// AC3: non-2xx responses are never written to the cache.
+#[tokio::test]
+async fn response_cache_never_stores_non_2xx() {
+    // Upstream that always 500s.
+    let (url, _hits) = {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let body = br#"{"type":"error","error":{"type":"api_error","message":"boom"}}"#;
+                let head = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(body).await;
+            }
+        });
+        (format!("http://{addr}"), ())
+    };
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let rc = test_response_cache(backend.clone(), &["geo"], 500);
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
+        response_cache: Some(rc),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state.clone())).await;
+    let resp = post_messages(addr, "geo", CACHE_TEST_BODY).await;
+    // The LB rotates/retries on upstream 5xx, so a permanently-500ing pool
+    // surfaces as an exhaustion status — the invariant under test is only
+    // that NOTHING non-2xx is ever written to the cache.
+    assert!(!resp.status().is_success());
+    assert!(
+        backend.writes.lock().unwrap().is_empty(),
+        "5xx must never be written to the cache"
+    );
+    assert_eq!(
+        state
+            .response_cache
+            .as_ref()
+            .unwrap()
+            .stores
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+// AC4: nothing handed to the backend may contain the prompt or completion
+// plaintext; keys are digests; a wrong-key read fails closed (returns
+// nothing) rather than returning plaintext.
+#[tokio::test]
+async fn response_cache_backend_sees_only_ciphertext() {
+    let marker = b"XKCD-CORRECT-HORSE-BATTERY-STAPLE";
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let rc = test_response_cache(backend.clone(), &["geo"], 500);
+    let entry = CachedResponse {
+        status: 200,
+        content_type: "application/json".into(),
+        body: format!(
+            r#"{{"content":[{{"type":"text","text":"{}"}}]}}"#,
+            String::from_utf8_lossy(marker)
+        )
+        .into_bytes(),
+    };
+    let key = "a".repeat(64);
+    rc.store("geo", &key, &entry).await;
+    assert_eq!(rc.stores.load(Ordering::Relaxed), 1, "store must succeed");
+
+    let writes = backend.writes.lock().unwrap().clone();
+    assert!(!writes.is_empty());
+    for (k, v) in &writes {
+        assert!(
+            !v.windows(marker.len()).any(|w| w == marker),
+            "plaintext marker leaked into backend value"
+        );
+        assert!(
+            !k.as_bytes().windows(marker.len()).any(|w| w == marker),
+            "plaintext marker leaked into backend key"
+        );
+    }
+
+    // Right key decrypts.
+    let got = rc
+        .lookup("geo", &key)
+        .await
+        .expect("right-key read must hit");
+    assert_eq!(got.body, entry.body);
+
+    // Wrong master key over the SAME stored bytes: must fail closed.
+    let rc_wrong = ResponseCache::from_parts(
+        backend.clone(),
+        &["geo".to_string()],
+        &[9u8; 32],
+        Duration::from_secs(3600),
+        Duration::from_millis(500),
+        64,
+    )
+    .unwrap();
+    assert!(
+        rc_wrong.lookup("geo", &key).await.is_none(),
+        "wrong-key read must not return plaintext"
+    );
+    assert_eq!(
+        rc_wrong.errors.load(Ordering::Relaxed),
+        1,
+        "wrong-key read counts as error"
+    );
+
+    // Cross-tenant decrypt must also fail: same master key, different
+    // client_id (tenant) — HKDF gives it a different derived key. Reads go
+    // through client-b's cache handle but target client-a's stored bytes.
+    let rc_other = ResponseCache::from_parts(
+        backend.clone(),
+        &["other-client".to_string()],
+        &TEST_MASTER_KEY,
+        Duration::from_secs(3600),
+        Duration::from_millis(500),
+        64,
+    )
+    .unwrap();
+    assert!(
+        rc_other.lookup("other-client", &key).await.is_none(),
+        "cross-tenant read must not decrypt"
+    );
+}
+
+// AC10: a dead backend degrades to normal proxying, never an error response.
+#[tokio::test]
+async fn response_cache_fails_open_on_backend_error() {
+    let backend = std::sync::Arc::new(ErroringBackend);
+    let (addr, hits, state) = serve_cache_app(backend, &["geo"]).await;
+    for _ in 0..2 {
+        let resp = post_messages(addr, "geo", CACHE_TEST_BODY).await;
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "must fail open to upstream"
+        );
+        assert!(resp.headers().get("x-alb-cache").is_none());
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    let rc = state.response_cache.as_ref().unwrap();
+    assert!(
+        rc.errors.load(Ordering::Relaxed) >= 2,
+        "read+write errors must be counted"
+    );
+}
+
+// AC10: a HUNG backend is bounded by op_timeout — the request still
+// completes promptly with a normal proxied response.
+#[tokio::test]
+async fn response_cache_fails_open_on_slow_backend() {
+    let backend = std::sync::Arc::new(SlowBackend);
+    let (url, hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let rc = test_response_cache(backend, &["geo"], 50);
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
+        response_cache: Some(rc),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state.clone())).await;
+    let started = std::time::Instant::now();
+    let resp = post_messages(addr, "geo", CACHE_TEST_BODY).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "hung backend must be bounded by op_timeout, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(
+        state
+            .response_cache
+            .as_ref()
+            .unwrap()
+            .errors
+            .load(Ordering::Relaxed)
+            >= 2
+    );
+}
+
+// AC12: hit/miss/store/error counters are exposed on /metrics.
+#[tokio::test]
+async fn response_cache_metrics_exposed() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let (addr, _hits, _state) = serve_cache_app(backend, &["geo"]).await;
+    post_messages(addr, "geo", CACHE_TEST_BODY).await; // miss + store
+    post_messages(addr, "geo", CACHE_TEST_BODY).await; // hit
+    let text = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains(r#"anthropic_response_cache_hits_total{surface="messages"} 1"#),
+        "{text}"
+    );
+    assert!(text.contains(r#"anthropic_response_cache_misses_total{surface="messages"} 1"#));
+    assert!(text.contains(r#"anthropic_response_cache_stores_total{surface="messages"} 1"#));
+    assert!(text.contains(r#"anthropic_response_cache_errors_total{surface="messages"} 0"#));
+}
+
+// Metrics stay silent when the cache is not configured (no phantom series).
+#[tokio::test]
+async fn response_cache_metrics_absent_without_config() {
+    let (url, _hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)]);
+    let addr = serve(build_router(state)).await;
+    let text = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!text.contains("anthropic_response_cache"));
+}
+
+// AC11 (redis): the real fred-backed RedisBackend against a dead port —
+// construction succeeds (connectivity is a runtime concern), operations
+// fail open within the timeout budget.
+#[tokio::test]
+async fn response_cache_redis_backend_fails_open_when_down() {
+    let cfg = ResponseCacheConfig {
+        clients: vec!["geo".to_string()],
+        backend: "redis".to_string(),
+        master_key: "ab".repeat(32),
+        ttl_secs: Some(60),
+        op_timeout_ms: Some(200),
+        l1_capacity: None,
+        redis_url: Some("redis://127.0.0.1:1".to_string()),
+        api_key: None,
+        api_url: None,
+    };
+    let rc = tokio::time::timeout(Duration::from_secs(10), ResponseCache::from_config(&cfg))
+        .await
+        .expect("from_config must not hang on a dead redis")
+        .expect("dead redis must not be a config error")
+        .expect("allow-list is non-empty");
+    let started = std::time::Instant::now();
+    assert!(rc.lookup("geo", &"a".repeat(64)).await.is_none());
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(rc.errors.load(Ordering::Relaxed) >= 1);
+}
+
+// AC11 (SaaS): CachekitIO backend constructs through the same config path,
+// and its SSRF guard holds — loopback api_url is rejected even though the
+// operator asked for a custom host (no new exfil surface, AC14 talking point).
+#[tokio::test]
+async fn response_cache_cachekitio_backend_constructs_and_blocks_loopback() {
+    let cfg = ResponseCacheConfig {
+        clients: vec!["geo".to_string()],
+        backend: "cachekitio".to_string(),
+        master_key: "ab".repeat(32),
+        ttl_secs: Some(60),
+        op_timeout_ms: Some(200),
+        l1_capacity: None,
+        redis_url: None,
+        api_key: Some("ck_test_dummy".to_string()),
+        api_url: None,
+    };
+    assert!(ResponseCache::from_config(&cfg).await.unwrap().is_some());
+
+    let loopback = ResponseCacheConfig {
+        api_url: Some("https://127.0.0.1:9".to_string()),
+        ..cfg.clone()
+    };
+    assert!(
+        ResponseCache::from_config(&loopback).await.is_err(),
+        "loopback api_url must be rejected by the SSRF guard"
+    );
+}
+
+// Config-shape checks: unknown backend and missing per-backend params fail
+// startup loudly; an empty allow-list is inert (AC2).
+#[tokio::test]
+async fn response_cache_config_validation() {
+    let base = ResponseCacheConfig {
+        clients: vec!["geo".to_string()],
+        backend: "redis".to_string(),
+        master_key: "ab".repeat(32),
+        ttl_secs: None,
+        op_timeout_ms: None,
+        l1_capacity: None,
+        redis_url: None,
+        api_key: None,
+        api_url: None,
+    };
+    assert!(
+        ResponseCache::from_config(&base).await.is_err(),
+        "backend=redis without redis_url must fail"
+    );
+    let bad_backend = ResponseCacheConfig {
+        backend: "memcached".to_string(),
+        ..base.clone()
+    };
+    assert!(ResponseCache::from_config(&bad_backend).await.is_err());
+    let no_key = ResponseCacheConfig {
+        backend: "cachekitio".to_string(),
+        ..base.clone()
+    };
+    assert!(
+        ResponseCache::from_config(&no_key).await.is_err(),
+        "backend=cachekitio without api_key must fail"
+    );
+    let inert = ResponseCacheConfig {
+        clients: vec![],
+        ..base
+    };
+    assert!(ResponseCache::from_config(&inert).await.unwrap().is_none());
+}
+
+// AC11 (SaaS, live): full round-trip against the real api.cachekit.io.
+// Requires CACHEKIT_API_KEY with write access; deliberately #[ignore]d so CI
+// stays hermetic — run locally with `cargo test -- --ignored` to exercise.
+#[tokio::test]
+#[ignore = "requires CACHEKIT_API_KEY and network access to api.cachekit.io"]
+async fn response_cache_cachekitio_live_round_trip() {
+    let api_key = match std::env::var("CACHEKIT_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => panic!("set CACHEKIT_API_KEY to run this test"),
+    };
+    let backend = cachekit::backend::cachekitio::CachekitIO::builder()
+        .api_key(api_key)
+        .build()
+        .unwrap();
+    let rc = test_response_cache(std::sync::Arc::new(backend), &["live-test"], 5_000);
+    let key = response_cache_key(
+        "live",
+        &serde_json::from_str::<serde_json::Value>(CACHE_TEST_BODY).unwrap(),
+        &hyper::HeaderMap::new(),
+        "live-test",
+        "fp",
+        "fps",
+    );
+    let entry = CachedResponse {
+        status: 200,
+        content_type: "application/json".into(),
+        body: b"{\"live\":true}".to_vec(),
+    };
+    rc.store("live-test", &key, &entry).await;
+    assert_eq!(rc.stores.load(Ordering::Relaxed), 1, "live store failed");
+    let got = rc
+        .lookup("live-test", &key)
+        .await
+        .expect("live read-back failed");
+    assert_eq!(got.body, entry.body);
 }

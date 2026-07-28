@@ -514,6 +514,74 @@ When Redis is connected, `/_stats` includes a `cluster` section with replica cou
 
 ---
 
+## Response Cache (opt-in, encrypted)
+
+An **opt-in** response cache for non-streaming `POST /v1/messages`. When an
+allow-listed client replays a byte-identical request, the previous response is
+served from cache — **the upstream call is skipped entirely, so a hit burns
+zero 5h/7d rate-limit headroom and does not count against the client's daily
+token budget**. That is the point: eval reruns, pipeline replays, and retries
+after client-side timeouts stop costing quota.
+
+**Default-off.** Without a `[response_cache]` section — or with an empty
+`clients` list — behavior is byte-identical to a build without the feature.
+Clients not on the allow-list never touch the cache.
+
+```toml
+[response_cache]
+# Only these client IDs (x-client-id header / client_names mapping) use the cache.
+clients = ["geo-pipeline"]
+
+# Backend: "cachekitio" (cachekit.io SaaS) or "redis" (local Redis/Valkey).
+backend = "redis"
+redis_url = "redis://10.0.0.5:6379/1"
+# backend = "cachekitio"
+# api_key = "ck_live_..."
+
+# Hex-encoded 32-byte master key for client-side encryption (MANDATORY —
+# there is no plaintext mode). Generate: openssl rand -hex 32
+master_key = "…64 hex chars…"
+
+# Entry TTL. Default: 3600 (1 hour).
+# ttl_secs = 3600
+
+# Per-operation budget before the cache fails open. Default: 250.
+# op_timeout_ms = 250
+```
+
+**What is cached:** the full response body (status + content-type + JSON body)
+of **2xx, non-streaming** `/v1/messages` responses. Streaming (`"stream": true`)
+requests always bypass the cache. Error responses are never cached.
+
+**Where it lands, and what the backend can read:** entries are encrypted
+**client-side** (in the proxy process) with AES-256-GCM before touching any
+storage layer — the in-process L1, local Redis, or cachekit.io only ever hold
+**ciphertext**. Per-client keys are derived from `master_key` via HKDF with the
+client ID as tenant, so two clients sending identical prompts get separate,
+mutually-undecryptable entries. Cache keys are content digests (Blake2s-256 of
+model + canonical body + beta headers + client ID) — no prompt text appears in
+keys, logs, or metrics.
+
+**How a hit looks:** identical response body, plus an `x-alb-cache: hit`
+header. Upstream per-request headers (request IDs, rate-limit snapshots) are
+not replayed — they described the original exchange.
+
+**Fail-open:** a slow, dead, or misconfigured cache backend never blocks a
+request. Every cache operation is bounded by `op_timeout_ms`; on any error the
+request proceeds upstream exactly as if the cache did not exist. Hit / miss /
+store / error counters are exposed on `/metrics`
+(`anthropic_response_cache_*_total{surface="messages"}`).
+
+> [!WARNING]
+> **Non-determinism caveat — opting in is consent to replay.** Sampling
+> parameters (`temperature`, `top_p`, `top_k`) are part of the cache key but do
+> **not** disable caching: an opted-in client replaying an identical
+> `temperature > 0` request within the TTL gets the **same** answer back, not a
+> fresh sample. If your workload needs fresh samples per call, do not opt that
+> client in (or vary the request, e.g. a nonce field in metadata).
+
+---
+
 ## Deployment
 
 ```bash

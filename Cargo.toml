@@ -24,6 +24,16 @@ http-body-util = "0.1"
 ipnet = "2.11.0"
 tokio-stream = "0.1"
 redis = { version = "1.0.3", features = ["tokio-comp", "connection-manager", "tls-rustls", "tokio-rustls-comp"] }
+# LAB-933 response cache. NOTE: the crate is `cachekit-rs` (lib name `cachekit`,
+# github.com/cachekit-io/cachekit-rs) — the crate published as plain `cachekit`
+# on crates.io is an UNRELATED eviction-primitives library. Do not "fix" this.
+# Default features (cachekitio SaaS backend, encryption, L1) + the fred-backed
+# redis backend so both AC11 backends are selectable at runtime.
+cachekit-rs = { version = "0.5", features = ["redis"] }
+# Same versions cachekit-rs already pins — zero marginal dependency weight.
+blake2 = "0.10"
+serde_bytes = "0.11"
 
 [dev-dependencies]
 tempfile = "3.25.0"
+async-trait = "0.1"
