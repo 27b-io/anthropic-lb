@@ -16091,14 +16091,12 @@ fn dropped_beta_flag_counter_is_bounded() {
 #[tokio::test]
 async fn dropped_beta_flag_appears_in_metrics() {
     let (upstream_url, _handle) = spawn_mock_upstream().await;
-    let mut state = test_state_with(vec![mk_endpoint_at(
+    // test_state_base already carries the default allow-list.
+    let state = test_state_with(vec![mk_endpoint_at(
         "acct-a",
         "sk-ant-oat01-test-aaa",
         &upstream_url,
     )]);
-    Arc::get_mut(&mut state)
-        .expect("test fixture should be uniquely owned")
-        .allowed_client_betas = default_betas();
     let addr = serve(build_router(state)).await;
 
     let resp = reqwest::Client::new()
@@ -16124,4 +16122,77 @@ async fn dropped_beta_flag_appears_in_metrics() {
             .contains("anthropic_beta_flag_dropped_total{flag=\"totally-unknown-2026-07-30\"} 1"),
         "metrics must report the dropped flag"
     );
+}
+
+/// Panel follow-up (LAB-1191): a client flag that IS one of the required
+/// OAUTH_BETA_FLAGS is always forwarded (the merge re-adds it), so it must
+/// never be reported as dropped — even under a custom allow-list that
+/// omits it. A false drop here would make the diagnostics lie.
+#[test]
+fn oauth_beta_filter_never_reports_required_flags_as_dropped() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("oauth-2025-04-20,claude-code-20250219"),
+    );
+    // Custom allow-list omitting the OAuth flags entirely.
+    let restrictive = vec!["context-1m*".to_string()];
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &restrictive);
+    assert!(
+        dropped.is_empty(),
+        "required OAuth flags are always sent — reporting them dropped is a lie: {dropped:?}"
+    );
+    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    for flag in OAUTH_BETA_FLAGS {
+        assert!(sent.contains(flag));
+    }
+}
+
+/// Panel follow-up (LAB-1191): dropped-flag keys are length-bounded before
+/// logging/counting — a multi-kilobyte client "flag" must not be pinned
+/// verbatim into every /metrics scrape.
+#[test]
+fn dropped_beta_flag_keys_are_length_bounded() {
+    let state = test_state_with(vec![]);
+    let huge = "x".repeat(5000);
+    state.record_dropped_beta_flags("t", &[huge]);
+    let map = state.beta_flags_dropped.lock().unwrap();
+    let key = map.keys().next().unwrap();
+    assert!(
+        key.len() <= MAX_DROPPED_BETA_FLAG_LEN,
+        "key must be truncated, got {} bytes",
+        key.len()
+    );
+}
+
+/// Panel follow-up (LAB-1191 AC-5): on the OpenAI-compat surface an upstream
+/// 3xx must surface as a 502 in the OPENAI error shape — those clients'
+/// parsers cannot read an Anthropic error envelope.
+#[tokio::test]
+async fn upstream_redirect_becomes_openai_shaped_502_on_chat_completions() {
+    use std::sync::atomic::Ordering;
+    let (target_url, target_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let redirecting = spawn_redirecting_upstream(target_url).await;
+
+    let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-oat01-aaa", &redirecting)]);
+    let addr = serve(build_router(state)).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.get("error").and_then(|e| e.get("message")).is_some(),
+        "OpenAI-surface 502 must be OpenAI-shaped: {body}"
+    );
+    assert!(
+        body.get("type").is_none(),
+        "must not be the Anthropic error envelope: {body}"
+    );
+    assert_eq!(target_hits.load(Ordering::SeqCst), 0);
 }

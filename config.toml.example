@@ -54,13 +54,15 @@ probe_interval_secs = 300
 # ("*" = suffix wildcard). Anything not listed is dropped (logged +
 # anthropic_beta_flag_dropped_total metric) — otherwise any caller could
 # activate arbitrary beta features against the operator's accounts. Omit to
-# use the built-in default (the flags Claude Code sends + context-1m*).
+# use the built-in default (the flag families Claude Code sends + context-1m*).
+# NOTE: a configured list REPLACES the default — it does not extend it. To
+# allow one extra flag, copy the defaults below and add yours:
 # allowed_client_betas = [
 #   "oauth-2025-04-20",
 #   "claude-code-20250219",
-#   "interleaved-thinking-2025-05-14",
-#   "fine-grained-tool-streaming-2025-05-14",
-#   "prompt-caching-2024-07-31",
+#   "interleaved-thinking-*",
+#   "fine-grained-tool-streaming-*",
+#   "prompt-caching-*",
 #   "context-1m*",
 # ]
 

@@ -108,11 +108,12 @@ struct Config {
     expose_upstream_ratelimit_headers: Option<bool>,
     /// Client-supplied `anthropic-beta` flags forwarded upstream on OAuth
     /// endpoints ("*" suffix wildcards, like `endpoints[].models`). Absent =
-    /// built-in default (`DEFAULT_CLIENT_BETA_ALLOWLIST`). Flags not on the
-    /// list are dropped, logged, and counted
-    /// (`anthropic_beta_flag_dropped_total`) — otherwise any caller could
-    /// activate arbitrary beta features against the operator's accounts
-    /// (LAB-1191).
+    /// built-in default (`DEFAULT_CLIENT_BETA_ALLOWLIST`); a configured
+    /// value REPLACES that default (it does not extend it), so include the
+    /// defaults alongside any addition. Flags not on the list are dropped,
+    /// logged, and counted (`anthropic_beta_flag_dropped_total`) — otherwise
+    /// any caller could activate arbitrary beta features against the
+    /// operator's accounts (LAB-1191).
     allowed_client_betas: Option<Vec<String>>,
 }
 
@@ -557,13 +558,7 @@ impl Endpoint {
         if self.models.is_empty() || model.is_empty() {
             return true;
         }
-        self.models.iter().any(|pattern| {
-            if let Some(prefix) = pattern.strip_suffix('*') {
-                model.starts_with(prefix)
-            } else {
-                model == pattern
-            }
-        })
+        self.models.iter().any(|p| suffix_wildcard_match(p, model))
     }
 }
 
@@ -1712,15 +1707,15 @@ impl AppState {
             "anthropic-dangerous-direct-browser-access",
             HeaderValue::from_static("true"),
         );
-        // Probe headers carry only OAUTH_BETA_FLAGS (always allow-listed), so
-        // nothing can be dropped here.
-        let dropped = inject_account_auth(
+        // Probe headers carry only OAUTH_BETA_FLAGS, which the filter never
+        // drops (they are unconditionally re-added), so the returned drop
+        // list is provably empty — nothing to record.
+        let _ = inject_account_auth(
             &mut headers,
             &ep.token,
             ep.passthrough,
             &self.allowed_client_betas,
         );
-        self.record_dropped_beta_flags("probe", &dropped);
 
         let req = self.client.post(&url).headers(headers).json(&body);
 
@@ -2082,15 +2077,18 @@ const OAUTH_BETA_FLAGS: &[&str] = &["oauth-2025-04-20", "claude-code-20250219"];
 /// Default `anthropic-beta` flags a client may forward upstream on OAuth
 /// endpoints (LAB-1191 / audit finding 5). Contains the flags the LB itself
 /// depends on (`OAUTH_BETA_FLAGS`, the `context-1m*` flag the context-window
-/// accounting reads) plus the flags Claude Code sends on every request —
-/// dropping those would degrade the proxy's primary traffic. Extend via
-/// `allowed_client_betas` in config; "*" is a suffix wildcard.
+/// accounting reads) plus the flag FAMILIES Claude Code sends on every
+/// request, wildcarded on their date suffix so a Claude Code auto-update
+/// that bumps a date can't silently degrade the proxy's primary traffic.
+/// A configured `allowed_client_betas` REPLACES this list (it does not
+/// extend it) — copy these entries alongside any addition; "*" is a suffix
+/// wildcard.
 const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     "oauth-2025-04-20",
     "claude-code-20250219",
-    "interleaved-thinking-2025-05-14",
-    "fine-grained-tool-streaming-2025-05-14",
-    "prompt-caching-2024-07-31",
+    "interleaved-thinking-*",
+    "fine-grained-tool-streaming-*",
+    "prompt-caching-*",
     "context-1m*",
 ];
 
@@ -2098,15 +2096,25 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
 /// client-controlled input. Past the cap, drops count under `_other`.
 const MAX_DROPPED_BETA_FLAGS: usize = 50;
 
-/// Same "*" suffix-wildcard semantics as `Endpoint::serves_model`.
+/// Length bound for a single flag key in `beta_flags_dropped` and its warn
+/// log — the value is client-controlled, and 50 multi-kilobyte keys replayed
+/// into every `/metrics` scrape is the cardinality decision's spirit broken
+/// by size instead of count.
+const MAX_DROPPED_BETA_FLAG_LEN: usize = 64;
+
+/// "*" suffix-wildcard match, shared by the model allowlist
+/// (`Endpoint::serves_model`) and the beta-flag allowlist
+/// (`beta_flag_allowed`) so the two can never drift.
+fn suffix_wildcard_match(pattern: &str, value: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        value.starts_with(prefix)
+    } else {
+        value == pattern
+    }
+}
+
 fn beta_flag_allowed(allowed: &[String], flag: &str) -> bool {
-    allowed.iter().any(|pattern| {
-        if let Some(prefix) = pattern.strip_suffix('*') {
-            flag.starts_with(prefix)
-        } else {
-            flag == pattern
-        }
-    })
+    allowed.iter().any(|p| suffix_wildcard_match(p, flag))
 }
 
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
@@ -4112,23 +4120,37 @@ impl AppState {
     /// vanished must be diagnosable from the logs and
     /// `anthropic_beta_flag_dropped_total{flag}`). Flag names are
     /// client-controlled, so the counter map is capped at
-    /// `MAX_DROPPED_BETA_FLAGS` distinct flags; overflow counts as `_other`.
+    /// `MAX_DROPPED_BETA_FLAGS` distinct flags (overflow counts as `_other`)
+    /// and each key is truncated to `MAX_DROPPED_BETA_FLAG_LEN` bytes —
+    /// count-capped but length-unbounded keys would still bloat every
+    /// `/metrics` scrape.
     fn record_dropped_beta_flags(&self, client_id: &str, dropped: &[String]) {
         if dropped.is_empty() {
             return;
         }
+        let truncated: Vec<&str> = dropped
+            .iter()
+            .map(|f| {
+                let mut end = f.len().min(MAX_DROPPED_BETA_FLAG_LEN);
+                while !f.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &f[..end]
+            })
+            .collect();
         warn!(
             client_id,
-            flags = %dropped.join(","),
+            flags = %truncated.join(","),
             "dropped client anthropic-beta flags not on the allow-list \
-             (extend allowed_client_betas in config to permit them)"
+             (a configured allowed_client_betas REPLACES the default list — \
+             include the defaults plus the flags to permit)"
         );
         let Ok(mut map) = self.beta_flags_dropped.lock() else {
             return;
         };
-        for flag in dropped {
+        for flag in truncated {
             if map.contains_key(flag) || map.len() < MAX_DROPPED_BETA_FLAGS {
-                *map.entry(flag.clone()).or_insert(0) += 1;
+                *map.entry(flag.to_string()).or_insert(0) += 1;
             } else {
                 *map.entry("_other".to_string()).or_insert(0) += 1;
             }
@@ -4548,7 +4570,11 @@ fn inject_account_auth(
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            if beta_flag_allowed(allowed_betas, flag) {
+            // OAUTH_BETA_FLAGS are unconditionally (re-)added below, so a
+            // client flag in that set is never actually dropped — reporting
+            // it as such (e.g. under a custom allowlist omitting them) would
+            // make the drop diagnostics lie.
+            if beta_flag_allowed(allowed_betas, flag) || OAUTH_BETA_FLAGS.contains(&flag) {
                 if !flags.iter().any(|f| f == flag) {
                     flags.push(flag.to_string());
                 }
@@ -5803,12 +5829,19 @@ fn describe_reqwest_error(e: &reqwest::Error) -> String {
 /// `Err(ForwardOutcome::Retry { .. })`. For any non-retry status (2xx
 /// success or 4xx client error) it returns `Ok(resp)` — handing the
 /// response back so the caller can continue.
+///
+/// `openai_error_shape` picks the error-body format for the terminal 3xx
+/// arm: callers whose downstream parses OpenAI errors (`/v1/chat/completions`
+/// passthrough) get `{"error":{...}}`, Anthropic-surface callers get
+/// `{"type":"error",...}` — matching how every other error arm on those
+/// paths translates per surface.
 async fn classify_retry_status(
     state: &AppState,
     status: StatusCode,
     rate_info: &RwLock<RateLimitInfo>,
     endpoint_name: &str,
     resp: reqwest::Response,
+    openai_error_shape: bool,
 ) -> Result<reqwest::Response, ForwardOutcome> {
     // 3xx → deliberate 502. The upstream client follows no redirects
     // (`Policy::none()`), because following one would re-send the account
@@ -5829,16 +5862,25 @@ async fn classify_retry_status(
             location,
             "upstream returned a redirect — refusing to follow with credentials attached"
         );
-        let body = serde_json::json!({
-            "type": "error",
-            "error": {
-                "type": "api_error",
-                "message": format!(
-                    "upstream returned {} redirect; refusing to follow with credentials",
-                    status.as_u16()
-                ),
-            }
-        })
+        let message = format!(
+            "upstream returned {} redirect; refusing to follow with credentials",
+            status.as_u16()
+        );
+        let body = if openai_error_shape {
+            serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "api_error",
+                    "param": null,
+                    "code": null
+                }
+            })
+        } else {
+            serde_json::json!({
+                "type": "error",
+                "error": { "type": "api_error", "message": message }
+            })
+        }
         .to_string();
         return Err(ForwardOutcome::Done(
             Response::builder()
@@ -6061,22 +6103,15 @@ fn untranslatable_request_response(message: &str) -> Response {
         .into_response()
 }
 
-/// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
-/// passes the picked endpoint and its pool index (used for `skip` and usage
-/// accounting).
-/// `ep` is the endpoint to forward to; `endpoint_idx` is its index in
-/// `state.endpoints`. Both are required: the streaming path spawns a
-/// detached 'static task that must re-borrow the endpoint from a cloned
-/// Arc<AppState> — a borrowed &Endpoint cannot cross the spawn boundary,
-/// so the task captures the Copy `endpoint_idx` and re-indexes.
-/// Copy the allow-listed upstream response headers onto `builder`. This is
-/// the ONLY place upstream headers are reflected to callers — everything not
-/// listed here stays behind the proxy (LAB-1191 / 2026-06-02 audit finding 3:
-/// the old copy-everything loop leaked `anthropic-ratelimit-*` — the pooled
-/// capacity of every account — plus `set-cookie` and org-identifying headers).
-/// `expose_ratelimit` (config `expose_upstream_ratelimit_headers`, trusted
-/// networks only) restores the `anthropic-ratelimit-*` passthrough for
-/// tooling that reads it.
+/// Copy the allow-listed upstream response headers onto `builder`. Everything
+/// not listed here stays behind the proxy (LAB-1191 / 2026-06-02 audit
+/// finding 3: the old copy-everything loop leaked `anthropic-ratelimit-*` —
+/// the pooled capacity of every account — plus `set-cookie` and
+/// org-identifying headers). `expose_ratelimit` (config
+/// `expose_upstream_ratelimit_headers`, trusted networks only) restores the
+/// `anthropic-ratelimit-*` passthrough for tooling that reads it. One other
+/// site reflects upstream headers: `forward_anthropic`'s body-read-failure
+/// 502 arm copies `anthropic-ratelimit-*` behind the same flag.
 fn reflect_upstream_headers(
     mut builder: axum::http::response::Builder,
     headers: &reqwest::header::HeaderMap,
@@ -6145,6 +6180,14 @@ fn body_wants_stream(body: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
+/// passes the picked endpoint and its pool index (used for `skip` and usage
+/// accounting).
+/// `ep` is the endpoint to forward to; `endpoint_idx` is its index in
+/// `state.endpoints`. Both are required: the streaming path spawns a
+/// detached 'static task that must re-borrow the endpoint from a cloned
+/// Arc<AppState> — a borrowed &Endpoint cannot cross the spawn boundary,
+/// so the task captures the Copy `endpoint_idx` and re-indexes.
 #[allow(clippy::too_many_arguments)]
 async fn forward_anthropic(
     state: &Arc<AppState>,
@@ -6309,11 +6352,11 @@ async fn forward_anthropic(
     state.update_burn_rate(&ep.burn_rate, client_id);
 
     // Classify 429 / 529 / other 5xx into a retry decision (shared helper).
-    let mut resp = match classify_retry_status(state, status, rate_info, endpoint_name, resp).await
-    {
-        Ok(resp) => resp,
-        Err(outcome) => return outcome,
-    };
+    let mut resp =
+        match classify_retry_status(state, status, rate_info, endpoint_name, resp, false).await {
+            Ok(resp) => resp,
+            Err(outcome) => return outcome,
+        };
 
     // Clear hard limit and burst counter only on a genuine 2xx success.
     // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
@@ -7152,10 +7195,14 @@ async fn try_fallback_upstream(
     // it for the cooldown window, and a 529 flags the long-base BEBO backoff.
     // Previously this was a bare rotate — every subsequent request re-hammered
     // the still-rate-limited endpoint before rotating (GH #97).
-    let mut resp = match classify_retry_status(state, status, &ep.rate_info, &ep.name, resp).await {
-        Ok(resp) => resp,
-        Err(outcome) => return outcome,
-    };
+    // Downstream parses OpenAI errors on the passthrough path
+    // (translate = false); Anthropic errors when translating back.
+    let mut resp =
+        match classify_retry_status(state, status, &ep.rate_info, &ep.name, resp, !translate).await
+        {
+            Ok(resp) => resp,
+            Err(outcome) => return outcome,
+        };
 
     if !status.is_success() {
         let err_body = resp
@@ -10560,11 +10607,11 @@ async fn forward_openai_compat_anthropic(
     state.update_burn_rate(&ep.burn_rate, client_id);
 
     // Classify 429 / 529 / other 5xx into a retry decision (shared helper).
-    let mut resp = match classify_retry_status(state, status, rate_info, endpoint_name, resp).await
-    {
-        Ok(resp) => resp,
-        Err(outcome) => return outcome,
-    };
+    let mut resp =
+        match classify_retry_status(state, status, rate_info, endpoint_name, resp, true).await {
+            Ok(resp) => resp,
+            Err(outcome) => return outcome,
+        };
 
     // Clear hard limit and burst counter only on a genuine 2xx success.
     // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
