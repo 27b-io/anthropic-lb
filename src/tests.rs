@@ -15520,6 +15520,16 @@ async fn response_cache_cachekitio_backend_constructs_and_blocks_loopback() {
         "loopback api_url must be rejected by cachekit's SSRF guard"
     );
 
+    // RFC1918 private hosts fail too — internal targets stay unreachable.
+    let private = ResponseCacheConfig {
+        api_url: Some("https://10.0.0.1:443".to_string()),
+        ..cfg.clone()
+    };
+    assert!(
+        ResponseCache::from_config(&private).await.is_err(),
+        "private-address api_url must be rejected by cachekit's SSRF guard"
+    );
+
     // Plain HTTP fails too.
     let http = ResponseCacheConfig {
         api_url: Some("http://api.dev.cachekit.io".to_string()),
