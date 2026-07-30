@@ -976,6 +976,26 @@ struct CachedResponse {
     body: Vec<u8>,
 }
 
+/// Which endpoint a response-cache entry belongs to (LAB-929). Folded into
+/// the cache key itself (not just the metric label) so a client that sends
+/// byte-identical bodies to `/v1/messages` and `/v1/messages/count_tokens`
+/// (a common pattern — count before you send) can never have one surface's
+/// cached entry served back for the other.
+#[derive(Clone, Copy)]
+enum CacheSurface {
+    Messages,
+    CountTokens,
+}
+
+impl CacheSurface {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::CountTokens => "count_tokens",
+        }
+    }
+}
+
 /// Runtime handle for the response cache: one shared backend, one
 /// `cachekit::CacheKit` per allow-listed client with `tenant_id =
 /// client_id`. HKDF-SHA256 then derives a distinct AES-256-GCM key per
@@ -992,6 +1012,13 @@ struct ResponseCache {
     misses: AtomicU64,
     errors: AtomicU64,
     stores: AtomicU64,
+    // LAB-929: count_tokens gets its own series (AC4) rather than sharing
+    // the /v1/messages counters above — a HashMap<&str, _> would be more
+    // machinery than two fixed, permanent surfaces warrant.
+    count_tokens_hits: AtomicU64,
+    count_tokens_misses: AtomicU64,
+    count_tokens_errors: AtomicU64,
+    count_tokens_stores: AtomicU64,
 }
 
 /// First 16 hex chars of a cache-key digest — the ONLY form a cache key may
@@ -1022,9 +1049,9 @@ fn decode_hex_key(s: &str) -> Result<Vec<u8>, String> {
 
 /// Derive the response-cache storage key (AC6): hex Blake2s-256 over
 /// (model ␟ canonical body JSON ␟ sorted anthropic-beta values ␟
-/// anthropic-version ␟ URI query ␟ client_id ␟ fp ␟ fps). The full-body
-/// digest is what carries correctness — two requests differing anywhere,
-/// including a nested structural position, serialize differently
+/// anthropic-version ␟ URI query ␟ client_id ␟ fp ␟ fps ␟ surface). The
+/// full-body digest is what carries correctness — two requests differing
+/// anywhere, including a nested structural position, serialize differently
 /// (`preserve_order` keeps the client's key order) and get different keys.
 /// anthropic-version and the query string are keyed because they change the
 /// RESPONSE schema for an identical body (an SDK upgrade mid-TTL must miss,
@@ -1033,8 +1060,13 @@ fn decode_hex_key(s: &str) -> Result<Vec<u8>, String> {
 /// deliberately not trusted alone: 48 bits over prompt content is collision
 /// territory, and a key collision here would serve someone the wrong
 /// completion. client_id in the material separates keys per client on top
-/// of the per-tenant encryption (AC7). The emitted key is a digest only —
-/// no prompt content ever appears in a storage key or diagnostic line (AC5).
+/// of the per-tenant encryption (AC7). `surface` (LAB-929) separates
+/// `/v1/messages` from `/v1/messages/count_tokens` so an identical body
+/// posted to both endpoints never cross-serves — a count vs. a completion
+/// are not interchangeable, no matter how the key material lines up
+/// otherwise. The emitted key is a digest only — no prompt content ever
+/// appears in a storage key or diagnostic line (AC5).
+#[allow(clippy::too_many_arguments)]
 fn response_cache_key(
     model: &str,
     body: &serde_json::Value,
@@ -1043,6 +1075,7 @@ fn response_cache_key(
     client_id: &str,
     fp: &str,
     fps: &str,
+    surface: &str,
 ) -> String {
     use blake2::{Blake2s256, Digest};
     let mut betas: Vec<&str> = headers
@@ -1066,6 +1099,7 @@ fn response_cache_key(
         client_id,
         fp,
         fps,
+        surface,
     ] {
         h.update(part.as_bytes());
         h.update([0x1f]);
@@ -1193,32 +1227,69 @@ impl ResponseCache {
             misses: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             stores: AtomicU64::new(0),
+            count_tokens_hits: AtomicU64::new(0),
+            count_tokens_misses: AtomicU64::new(0),
+            count_tokens_errors: AtomicU64::new(0),
+            count_tokens_stores: AtomicU64::new(0),
         })
+    }
+
+    fn hits_for(&self, surface: CacheSurface) -> &AtomicU64 {
+        match surface {
+            CacheSurface::Messages => &self.hits,
+            CacheSurface::CountTokens => &self.count_tokens_hits,
+        }
+    }
+
+    fn misses_for(&self, surface: CacheSurface) -> &AtomicU64 {
+        match surface {
+            CacheSurface::Messages => &self.misses,
+            CacheSurface::CountTokens => &self.count_tokens_misses,
+        }
+    }
+
+    fn errors_for(&self, surface: CacheSurface) -> &AtomicU64 {
+        match surface {
+            CacheSurface::Messages => &self.errors,
+            CacheSurface::CountTokens => &self.count_tokens_errors,
+        }
+    }
+
+    fn stores_for(&self, surface: CacheSurface) -> &AtomicU64 {
+        match surface {
+            CacheSurface::Messages => &self.stores,
+            CacheSurface::CountTokens => &self.count_tokens_stores,
+        }
     }
 
     /// Read an entry. Every failure mode — no encryption handle, backend
     /// error, decrypt error, timeout — degrades to `None` and the request
     /// proceeds upstream (AC10). Diagnostics carry the key digest only,
     /// never content (AC5).
-    async fn lookup(&self, client_id: &str, key: &str) -> Option<CachedResponse> {
+    async fn lookup(
+        &self,
+        client_id: &str,
+        key: &str,
+        surface: CacheSurface,
+    ) -> Option<CachedResponse> {
         let cache = self.clients.get(client_id)?;
         let op = async { cache.secure()?.get::<CachedResponse>(key).await };
         match tokio::time::timeout(self.op_timeout, op).await {
             Ok(Ok(Some(entry))) => {
-                self.hits.fetch_add(1, Ordering::Relaxed);
+                self.hits_for(surface).fetch_add(1, Ordering::Relaxed);
                 Some(entry)
             }
             Ok(Ok(None)) => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
+                self.misses_for(surface).fetch_add(1, Ordering::Relaxed);
                 None
             }
             Ok(Err(e)) => {
-                self.errors.fetch_add(1, Ordering::Relaxed);
+                self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
                 warn!(key_digest = key_digest_prefix(key), error = %e, "response cache read failed — proceeding upstream");
                 None
             }
             Err(_) => {
-                self.errors.fetch_add(1, Ordering::Relaxed);
+                self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
                 warn!(
                     key_digest = key_digest_prefix(key),
                     timeout_ms = self.op_timeout.as_millis() as u64,
@@ -1231,21 +1302,27 @@ impl ResponseCache {
 
     /// Write an entry. Failures are counted and logged (digest only) but
     /// never affect the client response (AC10).
-    async fn store(&self, client_id: &str, key: &str, entry: &CachedResponse) {
+    async fn store(
+        &self,
+        client_id: &str,
+        key: &str,
+        entry: &CachedResponse,
+        surface: CacheSurface,
+    ) {
         let Some(cache) = self.clients.get(client_id) else {
             return;
         };
         let op = async { cache.secure()?.set(key, entry).await };
         match tokio::time::timeout(self.op_timeout, op).await {
             Ok(Ok(())) => {
-                self.stores.fetch_add(1, Ordering::Relaxed);
+                self.stores_for(surface).fetch_add(1, Ordering::Relaxed);
             }
             Ok(Err(e)) => {
-                self.errors.fetch_add(1, Ordering::Relaxed);
+                self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
                 warn!(key_digest = key_digest_prefix(key), error = %e, "response cache write failed — skipped");
             }
             Err(_) => {
-                self.errors.fetch_add(1, Ordering::Relaxed);
+                self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
                 warn!(
                     key_digest = key_digest_prefix(key),
                     timeout_ms = self.op_timeout.as_millis() as u64,
@@ -6375,12 +6452,12 @@ async fn forward_anthropic(
 /// client response is returned unchanged either way.
 async fn maybe_cache_store(
     state: &AppState,
-    cache_key: Option<&str>,
+    cache_key: Option<(&str, CacheSurface)>,
     client_id: &str,
     req_id: &str,
     resp: Response,
 ) -> Response {
-    let (Some(rc), Some(key)) = (&state.response_cache, cache_key) else {
+    let (Some(rc), Some((key, surface))) = (&state.response_cache, cache_key) else {
         return resp;
     };
     if !resp.status().is_success() {
@@ -6436,6 +6513,7 @@ async fn maybe_cache_store(
             content_type,
             body: bytes.to_vec(),
         },
+        surface,
     )
     .await;
     Response::from_parts(parts, Body::from(bytes))
@@ -6525,29 +6603,42 @@ async fn proxy_handler(
             // (below) to reflect the breakpoints actually forwarded upstream.
             let (fp, fps) = content_fingerprints(&parsed);
 
-            // LAB-933: derive the response-cache key on the PRE-injection
-            // body — the request exactly as the client sent it — so the
-            // deterministic auto-cache/OAuth mutations below never affect
-            // cache identity. Gated here on opt-in (AC2), the /v1/messages
-            // path, and non-streaming (AC8; same predicate as
-            // `request_wants_stream`, evaluated on the parsed body).
+            // LAB-933/LAB-929: derive the response-cache key on the
+            // PRE-injection body — the request exactly as the client sent
+            // it — so the deterministic auto-cache/OAuth mutations below
+            // never affect cache identity. Gated here on opt-in (AC2), the
+            // /v1/messages or /v1/messages/count_tokens path, and
+            // non-streaming (AC8; same predicate as `request_wants_stream`,
+            // evaluated on the parsed body). `surface` travels with the key
+            // so both endpoints share one allow-list and one key scheme
+            // (LAB-929 AC2/AC3) while staying unable to cross-serve.
             let cache_key = match &state.response_cache {
                 // The per-client map doubles as the opt-in allow-list (AC2).
                 Some(rc)
                     if rc.clients.contains_key(&client_id)
                         && parts.method == hyper::Method::POST
-                        && parts.uri.path() == "/v1/messages"
                         && !body_wants_stream(&parsed) =>
                 {
-                    Some(response_cache_key(
-                        &model,
-                        &parsed,
-                        &parts.headers,
-                        parts.uri.query(),
-                        &client_id,
-                        &fp,
-                        &fps,
-                    ))
+                    let surface = match parts.uri.path() {
+                        "/v1/messages" => Some(CacheSurface::Messages),
+                        "/v1/messages/count_tokens" => Some(CacheSurface::CountTokens),
+                        _ => None,
+                    };
+                    surface.map(|surface| {
+                        (
+                            response_cache_key(
+                                &model,
+                                &parsed,
+                                &parts.headers,
+                                parts.uri.query(),
+                                &client_id,
+                                &fp,
+                                &fps,
+                                surface.label(),
+                            ),
+                            surface,
+                        )
+                    })
                 }
                 _ => None,
             };
@@ -6657,9 +6748,9 @@ async fn proxy_handler(
     // opted-in clients; a hit then never touches an upstream — no rate-limit
     // headroom burned, no budget decrement, no usage recorded (AC9). Only
     // the hit counter and a digest-only log line observe it (AC5).
-    if let Some(key) = cache_key.as_deref() {
+    if let Some((key, surface)) = cache_key.as_ref().map(|(k, s)| (k.as_str(), *s)) {
         if let Some(rc) = &state.response_cache {
-            if let Some(entry) = rc.lookup(&client_id, key).await {
+            if let Some(entry) = rc.lookup(&client_id, key, surface).await {
                 info!(
                     req_id,
                     client_id = %client_id,
@@ -6764,7 +6855,7 @@ async fn proxy_handler(
                 RetryStep::Return(resp) => {
                     return maybe_cache_store(
                         &state,
-                        cache_key.as_deref(),
+                        cache_key.as_ref().map(|(k, s)| (k.as_str(), *s)),
                         &client_id,
                         &req_id,
                         resp,
@@ -8841,40 +8932,56 @@ async fn metrics_handler(
         state.body_read_timeout_total.load(Ordering::Relaxed),
     );
 
-    // LAB-933 response cache counters (AC12). Emitted only when the cache is
-    // configured; the `surface` label leaves room for the LAB-929
-    // count_tokens cache to join the same series without a rename.
+    // LAB-933/LAB-929 response cache counters (AC12 / LAB-929 AC4). Emitted
+    // only when the cache is configured; `messages` and `count_tokens` are
+    // separate series on the same metric names, distinguished by the
+    // `surface` label.
     if let Some(rc) = &state.response_cache {
-        let series: [(&str, &AtomicU64, &str); 4] = [
+        let headers: [(&str, &str); 4] = [
             (
                 "anthropic_response_cache_hits_total",
-                &rc.hits,
                 "Requests served from the response cache (no upstream call, no headroom burned)",
             ),
             (
                 "anthropic_response_cache_misses_total",
-                &rc.misses,
                 "Opted-in cacheable requests that proceeded upstream on a cache miss",
             ),
             (
                 "anthropic_response_cache_stores_total",
-                &rc.stores,
                 "2xx responses written to the response cache",
             ),
             (
                 "anthropic_response_cache_errors_total",
-                &rc.errors,
                 "Response cache operations that failed or timed out (request failed open)",
             ),
         ];
-        for (name, counter, help) in series {
+        for (name, help) in headers {
             prom_header(&mut buf, name, "counter", help);
-            prom_counter(
-                &mut buf,
-                name,
-                &[("surface", "messages")],
-                counter.load(Ordering::Relaxed),
-            );
+        }
+        for surface in [CacheSurface::Messages, CacheSurface::CountTokens] {
+            let series: [(&str, &AtomicU64); 4] = [
+                ("anthropic_response_cache_hits_total", rc.hits_for(surface)),
+                (
+                    "anthropic_response_cache_misses_total",
+                    rc.misses_for(surface),
+                ),
+                (
+                    "anthropic_response_cache_stores_total",
+                    rc.stores_for(surface),
+                ),
+                (
+                    "anthropic_response_cache_errors_total",
+                    rc.errors_for(surface),
+                ),
+            ];
+            for (name, counter) in series {
+                prom_counter(
+                    &mut buf,
+                    name,
+                    &[("surface", surface.label())],
+                    counter.load(Ordering::Relaxed),
+                );
+            }
         }
     }
 
