@@ -50,6 +50,28 @@ probe_interval_secs = 300
 # Omit for single-instance deployments (local-only state).
 # redis_url = "redis://10.0.0.5:6379"
 
+# Opt-in encrypted response cache on non-streaming /v1/messages (see README
+# "Response Cache"). A hit skips the upstream call — zero rate-limit headroom
+# burned. Entries are AES-256-GCM encrypted in-process before storage; the
+# backend only ever holds ciphertext. Omit the section (or leave clients
+# empty) to disable entirely. NOTE: an opted-in client replaying an identical
+# temperature > 0 request gets the SAME answer back, by design.
+# SECURITY: x-client-id is client-asserted, so allow-listed clients must
+# mutually trust each other — presenting an opted-in client's ID reads its
+# cached responses. One trust domain per allow-list.
+# SECRETS: master_key / api_key are placeholders — NEVER commit real values.
+# Like proxy_key and endpoint tokens, the rendered config file IS the secret
+# vehicle: deployments template it from the secret store at pod start (see
+# README "Deployment"); this example file must only ever hold placeholders.
+# [response_cache]
+# clients = ["geo-pipeline"]           # allow-list of client IDs; empty = inert
+# backend = "redis"                    # "redis" or "cachekitio"
+# redis_url = "redis://10.0.0.5:6379/1"
+# # api_key = "<from secret store>"    # for backend = "cachekitio"
+# master_key = "<from secret store: openssl rand -hex 32>" # mandatory; 32+ bytes hex
+# # ttl_secs = 3600                    # default 1h
+# # op_timeout_ms = 250                # fail-open budget per cache op
+
 # "passthrough" = forward caller's auth headers as-is (for OpenClaw managed tokens)
 # Any other value = inject as the endpoint's own token
 # OAuth tokens (sk-ant-oat*) are injected as Authorization: Bearer

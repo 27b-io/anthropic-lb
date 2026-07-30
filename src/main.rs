@@ -99,6 +99,43 @@ struct Config {
     /// Seconds after a session's last request before its registry entry is
     /// evicted. Default: 1800 (30 min).
     session_registry_ttl_secs: Option<u64>,
+    /// Opt-in encrypted response cache on `/v1/messages` (LAB-933).
+    /// Absent, or present with an empty `clients` list = feature entirely inert.
+    response_cache: Option<ResponseCacheConfig>,
+}
+
+/// `[response_cache]` — opt-in, client-side-encrypted response cache on
+/// non-streaming `/v1/messages` (LAB-933). Cached bodies contain prompt
+/// content, so SecureCache (AES-256-GCM, encrypted before any layer — L1
+/// included) is mandatory: there is no plaintext-storage configuration.
+#[derive(Deserialize, Clone)]
+struct ResponseCacheConfig {
+    /// Client IDs allowed to read/write the cache. Empty = inert (AC2).
+    /// May not contain "-" (the unknown-client sentinel) — that would opt in
+    /// every unidentified caller.
+    #[serde(default)]
+    clients: Vec<String>,
+    /// Cache backend: "cachekitio" (SaaS, rides the existing reqwest/rustls
+    /// stack) or "redis" (local Redis/Valkey via cachekit's fred client).
+    backend: String,
+    /// Hex-encoded master key for client-side encryption; must decode to at
+    /// least 32 bytes. Per-client keys are derived from it via HKDF-SHA256
+    /// with the client_id as tenant, so clients are cryptographically
+    /// isolated from each other (AC7), not just key-string separated.
+    master_key: String,
+    /// Entry TTL in seconds. Default: 3600 (1 h).
+    ttl_secs: Option<u64>,
+    /// Per-operation budget in ms before the cache fails open and the
+    /// request proceeds upstream (AC10). Default: 250.
+    op_timeout_ms: Option<u64>,
+    /// Connection URL for backend = "redis" (redis:// or rediss://).
+    redis_url: Option<String>,
+    /// API key for backend = "cachekitio". The API URL is fixed at
+    /// cachekit's default (api.cachekit.io) — deliberately no override knob:
+    /// an operator egress-URL switch on a proxy with an open SSRF audit
+    /// finding is negative-value optionality until a real self-hosted
+    /// deployment exists.
+    api_key: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -616,6 +653,10 @@ struct AppState {
     /// mutex, never held across `.await`; bounded by UNSUPPORTED_MODEL_MAX
     /// + TTL eviction. Per-replica: a fresh replica re-learns in one attempt.
     unsupported_models: Mutex<HashMap<(usize, String), Instant>>,
+    /// Opt-in encrypted response cache on non-streaming /v1/messages
+    /// (LAB-933). None = feature off — the no-config case is byte-identical
+    /// to pre-cache behaviour (AC1).
+    response_cache: Option<ResponseCache>,
 }
 
 /// RAII reservation against `AppState::inflight_body_bytes`. Holding it keeps the
@@ -912,6 +953,342 @@ fn content_fingerprints(body: &serde_json::Value) -> (String, String) {
         format!("{:012x}", fp & 0xFFFF_FFFF_FFFF),
         format!("{:012x}", fps & 0xFFFF_FFFF_FFFF),
     )
+}
+
+// ── Response cache (LAB-933) ────────────────────────────────────────
+//
+// Opt-in, client-side-encrypted response cache on non-streaming
+// /v1/messages. The prize is headroom, not latency: a hit skips the
+// upstream call entirely, so replayed traffic (eval reruns, pipeline
+// replays, post-timeout retries) burns zero 5h/7d rate-limit budget.
+// Everything below fails OPEN — a sick cache degrades to a miss/skipped
+// write and the request proceeds upstream exactly as today.
+
+/// A cached /v1/messages response: status + content-type + body, nothing
+/// else. Upstream per-request headers (request ids, rate-limit snapshots,
+/// x-budget-status) describe the ORIGINAL exchange and are deliberately not
+/// replayed; a hit instead carries `x-alb-cache: hit`.
+#[derive(Serialize, Deserialize)]
+struct CachedResponse {
+    status: u16,
+    content_type: String,
+    #[serde(with = "serde_bytes")]
+    body: Vec<u8>,
+}
+
+/// Runtime handle for the response cache: one shared backend, one
+/// `cachekit::CacheKit` per allow-listed client with `tenant_id =
+/// client_id`. HKDF-SHA256 then derives a distinct AES-256-GCM key per
+/// client, so cross-client isolation (AC7) is cryptographic — even a key
+/// collision could not decrypt another client's entry. The map doubles as
+/// the opt-in allow-list: no entry, no cache (AC2). All values are
+/// encrypted before any storage layer sees them, in-process L1 included
+/// (verified against cachekit-rs 0.5.0 `SecureCache::set_with_ttl`, which
+/// writes ciphertext to both L1 and the backend).
+struct ResponseCache {
+    clients: HashMap<String, cachekit::CacheKit>,
+    op_timeout: Duration,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    errors: AtomicU64,
+    stores: AtomicU64,
+}
+
+/// First 16 hex chars of a cache-key digest — the ONLY form a cache key may
+/// take in any diagnostic output (AC5).
+fn key_digest_prefix(key: &str) -> &str {
+    &key[..key.len().min(16)]
+}
+
+/// Decode a hex master key, enforcing the 32-byte SecureCache minimum.
+fn decode_hex_key(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.trim();
+    if !s.is_ascii() || !s.len().is_multiple_of(2) {
+        return Err("response_cache.master_key must be an even-length hex string".into());
+    }
+    let bytes = (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .map_err(|_| "response_cache.master_key contains non-hex characters".to_string())?;
+    if bytes.len() < 32 {
+        return Err(format!(
+            "response_cache.master_key must decode to at least 32 bytes, got {}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Derive the response-cache storage key (AC6): hex Blake2s-256 over
+/// (model ␟ canonical body JSON ␟ sorted anthropic-beta values ␟
+/// anthropic-version ␟ URI query ␟ client_id ␟ fp ␟ fps). The full-body
+/// digest is what carries correctness — two requests differing anywhere,
+/// including a nested structural position, serialize differently
+/// (`preserve_order` keeps the client's key order) and get different keys.
+/// anthropic-version and the query string are keyed because they change the
+/// RESPONSE schema for an identical body (an SDK upgrade mid-TTL must miss,
+/// not replay the old shape). The 48-bit SipHash content fingerprints are
+/// folded in to reuse the existing canonical machinery (per AC6), but are
+/// deliberately not trusted alone: 48 bits over prompt content is collision
+/// territory, and a key collision here would serve someone the wrong
+/// completion. client_id in the material separates keys per client on top
+/// of the per-tenant encryption (AC7). The emitted key is a digest only —
+/// no prompt content ever appears in a storage key or diagnostic line (AC5).
+fn response_cache_key(
+    model: &str,
+    body: &serde_json::Value,
+    headers: &hyper::HeaderMap,
+    query: Option<&str>,
+    client_id: &str,
+    fp: &str,
+    fps: &str,
+) -> String {
+    use blake2::{Blake2s256, Digest};
+    let mut betas: Vec<&str> = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    betas.sort_unstable();
+    let version = headers
+        .get("anthropic-version")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let canonical = serde_json::to_string(body).unwrap_or_default();
+    let mut h = Blake2s256::new();
+    for part in [
+        model,
+        &canonical,
+        &betas.join(","),
+        version,
+        query.unwrap_or(""),
+        client_id,
+        fp,
+        fps,
+    ] {
+        h.update(part.as_bytes());
+        h.update([0x1f]);
+    }
+    let digest = h.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+impl ResponseCache {
+    /// Storage-key namespace: entries land as `alb-resp:<digest>`.
+    const NAMESPACE: &'static str = "alb-resp";
+    const DEFAULT_TTL_SECS: u64 = 3600;
+    const DEFAULT_OP_TIMEOUT_MS: u64 = 250;
+    /// Per-client in-process L1 entries (ciphertext at rest). Together with
+    /// `MAX_BODY_BYTES` this bounds worst-case L1 memory per client.
+    const L1_CAPACITY: usize = 64;
+    /// Bodies larger than this are not cached (the entry would also bump
+    /// into cachekit's 5 MiB payload ceiling once encrypted + encoded).
+    /// Bounds both backend value growth and worst-case L1 memory.
+    const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+    /// Build from config. `Ok(None)` when the allow-list is empty (inert,
+    /// AC2). Config errors — bad key, missing backend params — are `Err`:
+    /// startup fails loudly rather than running with a silently-disabled
+    /// cache. Backend REACHABILITY is not required at startup: connection
+    /// failures are logged and every later operation fails open (AC10).
+    async fn from_config(cfg: &ResponseCacheConfig) -> Result<Option<Self>, String> {
+        if cfg.clients.is_empty() {
+            return Ok(None);
+        }
+        let master_key = decode_hex_key(&cfg.master_key)?;
+        let backend: cachekit::SharedBackend = match cfg.backend.as_str() {
+            "redis" => {
+                let url = cfg
+                    .redis_url
+                    .as_deref()
+                    .ok_or("response_cache.redis_url is required for backend = \"redis\"")?;
+                let b = cachekit::backend::redis::RedisBackend::builder()
+                    .url(url)
+                    .build()
+                    .map_err(|e| format!("response_cache redis backend: {e}"))?;
+                // fred's connection task detaches when the handle drops.
+                // KNOWN LIMITATION (cachekit-rs 0.5.0, flagged upstream):
+                // auto-reconnect is pub(crate) and unreachable from this
+                // builder, so after a failed initial connect OR any later
+                // Redis outage the client does NOT recover — every cache op
+                // errors (fail-open, bounded by op_timeout per op) until the
+                // process restarts. Watch anthropic_response_cache_errors_total.
+                match b.connect().await {
+                    Ok(_handle) => info!("response cache redis backend connected"),
+                    Err(e) => {
+                        warn!(error = %e, "response cache redis connect failed — cache disabled until restart (fail-open)")
+                    }
+                }
+                std::sync::Arc::new(b)
+            }
+            "cachekitio" => {
+                let api_key = cfg
+                    .api_key
+                    .as_deref()
+                    .ok_or("response_cache.api_key is required for backend = \"cachekitio\"")?;
+                std::sync::Arc::new(
+                    cachekit::backend::cachekitio::CachekitIO::builder()
+                        .api_key(api_key)
+                        .build()
+                        .map_err(|e| format!("response_cache cachekitio backend: {e}"))?,
+                )
+            }
+            other => {
+                return Err(format!(
+                    "response_cache.backend must be \"cachekitio\" or \"redis\", got \"{other}\""
+                ))
+            }
+        };
+        Self::from_parts(
+            backend,
+            &cfg.clients,
+            &master_key,
+            Duration::from_secs(cfg.ttl_secs.unwrap_or(Self::DEFAULT_TTL_SECS)),
+            Duration::from_millis(cfg.op_timeout_ms.unwrap_or(Self::DEFAULT_OP_TIMEOUT_MS)),
+        )
+        .map(Some)
+    }
+
+    /// Assemble per-client caches over a shared backend. Split out from
+    /// `from_config` so tests can inject mock backends through the same
+    /// construction path production uses.
+    fn from_parts(
+        backend: cachekit::SharedBackend,
+        clients: &[String],
+        master_key: &[u8],
+        ttl: Duration,
+        op_timeout: Duration,
+    ) -> Result<Self, String> {
+        let mut map = HashMap::new();
+        for client_id in clients {
+            if client_id == "-" {
+                return Err(
+                    "response_cache.clients cannot contain \"-\" (the unknown-client sentinel — it would opt in every unidentified caller)"
+                        .into(),
+                );
+            }
+            // The builder's default_ttl is the SINGLE source of entry
+            // lifetime — writes use plain `set()` so the two can't drift.
+            let ck = cachekit::CacheKit::builder()
+                .backend(backend.clone())
+                .default_ttl(ttl)
+                .namespace(Self::NAMESPACE)
+                .l1_capacity(Self::L1_CAPACITY)
+                .encryption_from_bytes(master_key, client_id)
+                .map_err(|e| format!("response_cache encryption init for \"{client_id}\": {e}"))?
+                .build()
+                .map_err(|e| format!("response_cache init for \"{client_id}\": {e}"))?;
+            map.insert(client_id.clone(), ck);
+        }
+        Ok(Self {
+            clients: map,
+            op_timeout,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            stores: AtomicU64::new(0),
+        })
+    }
+
+    /// Read an entry. Every failure mode — no encryption handle, backend
+    /// error, decrypt error, timeout — degrades to `None` and the request
+    /// proceeds upstream (AC10). Diagnostics carry the key digest only,
+    /// never content (AC5).
+    async fn lookup(&self, client_id: &str, key: &str) -> Option<CachedResponse> {
+        let cache = self.clients.get(client_id)?;
+        let op = async { cache.secure()?.get::<CachedResponse>(key).await };
+        match tokio::time::timeout(self.op_timeout, op).await {
+            Ok(Ok(Some(entry))) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(entry)
+            }
+            Ok(Ok(None)) => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            Ok(Err(e)) => {
+                self.errors.fetch_add(1, Ordering::Relaxed);
+                warn!(key_digest = key_digest_prefix(key), error = %e, "response cache read failed — proceeding upstream");
+                None
+            }
+            Err(_) => {
+                self.errors.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    key_digest = key_digest_prefix(key),
+                    timeout_ms = self.op_timeout.as_millis() as u64,
+                    "response cache read timed out — proceeding upstream"
+                );
+                None
+            }
+        }
+    }
+
+    /// Write an entry. Failures are counted and logged (digest only) but
+    /// never affect the client response (AC10).
+    async fn store(&self, client_id: &str, key: &str, entry: &CachedResponse) {
+        let Some(cache) = self.clients.get(client_id) else {
+            return;
+        };
+        let op = async { cache.secure()?.set(key, entry).await };
+        match tokio::time::timeout(self.op_timeout, op).await {
+            Ok(Ok(())) => {
+                self.stores.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Err(e)) => {
+                self.errors.fetch_add(1, Ordering::Relaxed);
+                warn!(key_digest = key_digest_prefix(key), error = %e, "response cache write failed — skipped");
+            }
+            Err(_) => {
+                self.errors.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    key_digest = key_digest_prefix(key),
+                    timeout_ms = self.op_timeout.as_millis() as u64,
+                    "response cache write timed out — skipped"
+                );
+            }
+        }
+    }
+}
+
+/// Build the client-facing response for a cache hit. Only ever called for
+/// entries written from 2xx responses (AC3). The entry came through AEAD
+/// decryption, so an invalid stored status means OUR bug — surface a loud
+/// 500, never a fabricated 200.
+fn cached_hit_response(entry: CachedResponse) -> Response {
+    let Ok(status) = StatusCode::from_u16(entry.status) else {
+        error!(
+            status = entry.status,
+            "cached entry carries an invalid status code — refusing to serve"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cached response rebuild error",
+        )
+            .into_response();
+    };
+    let content_type = if entry.content_type.is_empty() {
+        "application/json"
+    } else {
+        entry.content_type.as_str()
+    };
+    Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .header("x-alb-cache", "hit")
+        .body(Body::from(entry.body))
+        .unwrap_or_else(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cached response rebuild error",
+            )
+                .into_response()
+        })
 }
 
 /// Parsed IP allow entry — either a single IP or a CIDR range.
@@ -5559,7 +5936,16 @@ fn upstream_client_builder() -> reqwest::ClientBuilder {
 fn request_wants_stream(body: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
-        .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+        .map(|v| body_wants_stream(&v))
+        .unwrap_or(false)
+}
+
+/// The streaming predicate on an already-parsed body. Single definition
+/// shared by `request_wants_stream` and the response-cache gate so the two
+/// can never disagree on what "streaming" means.
+fn body_wants_stream(body: &serde_json::Value) -> bool {
+    body.get("stream")
+        .and_then(|s| s.as_bool())
         .unwrap_or(false)
 }
 
@@ -5981,6 +6367,80 @@ async fn forward_anthropic(
     }
 }
 
+/// LAB-933 write path. Pass-through unless a cache key was derived for this
+/// request (opted-in client, non-streaming /v1/messages — AC1/AC2/AC8) AND
+/// the response is 2xx (AC3: 4xx/5xx are never written). The body is already
+/// fully buffered for non-streaming requests, so `collect()` is a cheap
+/// re-assembly, not a wait. A cache-write failure fails open (AC10): the
+/// client response is returned unchanged either way.
+async fn maybe_cache_store(
+    state: &AppState,
+    cache_key: Option<&str>,
+    client_id: &str,
+    req_id: &str,
+    resp: Response,
+) -> Response {
+    let (Some(rc), Some(key)) = (&state.response_cache, cache_key) else {
+        return resp;
+    };
+    if !resp.status().is_success() {
+        return resp;
+    }
+    // Only JSON bodies are cacheable. The request was non-streaming, so the
+    // forward path buffered the body — but that is an invariant of TODAY's
+    // upstreams, not a law: an upstream answering a `stream:false` request
+    // with `text/event-stream` must pass through untouched (never collected,
+    // never cached as a bogus non-streaming entry).
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    if !content_type.starts_with("application/json") {
+        debug!(
+            req_id,
+            content_type, "response cache: non-JSON content-type — not cached"
+        );
+        return resp;
+    }
+    let (parts, body) = resp.into_parts();
+    let bytes = match http_body_util::BodyExt::collect(body).await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            // The buffered body failed to re-assemble — nothing valid to
+            // return OR cache. Surface it; never fabricate a success.
+            error!(req_id, error = %e, "response body collect failed during cache store");
+            return (
+                StatusCode::BAD_GATEWAY,
+                "response body collect failed during cache store",
+            )
+                .into_response();
+        }
+    };
+    if bytes.len() > ResponseCache::MAX_BODY_BYTES {
+        // Deliberate policy skip, not a failure: bounds backend value growth
+        // and worst-case L1 memory (L1_CAPACITY × MAX_BODY_BYTES per client).
+        debug!(
+            req_id,
+            body_bytes = bytes.len(),
+            "response cache: body exceeds size cap — not cached"
+        );
+        return Response::from_parts(parts, Body::from(bytes));
+    }
+    rc.store(
+        client_id,
+        key,
+        &CachedResponse {
+            status: parts.status.as_u16(),
+            content_type,
+            body: bytes.to_vec(),
+        },
+    )
+    .await;
+    Response::from_parts(parts, Body::from(bytes))
+}
+
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -6046,7 +6506,7 @@ async fn proxy_handler(
     };
 
     // Parse body once for model extraction and optional cache injection
-    let (body_bytes, oauth_body_bytes, model, fp) =
+    let (body_bytes, oauth_body_bytes, model, fp, cache_key) =
         if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             let model = parsed
                 .get("model")
@@ -6064,6 +6524,33 @@ async fn proxy_handler(
             // double as the affinity discriminator; bps is computed POST-injection
             // (below) to reflect the breakpoints actually forwarded upstream.
             let (fp, fps) = content_fingerprints(&parsed);
+
+            // LAB-933: derive the response-cache key on the PRE-injection
+            // body — the request exactly as the client sent it — so the
+            // deterministic auto-cache/OAuth mutations below never affect
+            // cache identity. Gated here on opt-in (AC2), the /v1/messages
+            // path, and non-streaming (AC8; same predicate as
+            // `request_wants_stream`, evaluated on the parsed body).
+            let cache_key = match &state.response_cache {
+                // The per-client map doubles as the opt-in allow-list (AC2).
+                Some(rc)
+                    if rc.clients.contains_key(&client_id)
+                        && parts.method == hyper::Method::POST
+                        && parts.uri.path() == "/v1/messages"
+                        && !body_wants_stream(&parsed) =>
+                {
+                    Some(response_cache_key(
+                        &model,
+                        &parsed,
+                        &parts.headers,
+                        parts.uri.query(),
+                        &client_id,
+                        &fp,
+                        &fps,
+                    ))
+                }
+                _ => None,
+            };
 
             // Debug: dump cache_control structures found in request body
             if tracing::enabled!(tracing::Level::DEBUG) {
@@ -6137,10 +6624,11 @@ async fn proxy_handler(
                 bytes::Bytes::from(oauth_bytes),
                 model,
                 Some(fp),
+                cache_key,
             )
         } else {
             let clone = body_bytes.clone();
-            (body_bytes, clone, String::new(), None)
+            (body_bytes, clone, String::new(), None, None)
         };
 
     // Build the affinity key now that fp is known. fp is the finest routing
@@ -6162,6 +6650,25 @@ async fn proxy_handler(
     // splitting the gate for a few microseconds on an almost-never code path.
     if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
         return resp;
+    }
+
+    // LAB-933: serve an opted-in replay from the encrypted response cache.
+    // Placed AFTER the gate so budget/emergency policy still applies to
+    // opted-in clients; a hit then never touches an upstream — no rate-limit
+    // headroom burned, no budget decrement, no usage recorded (AC9). Only
+    // the hit counter and a digest-only log line observe it (AC5).
+    if let Some(key) = cache_key.as_deref() {
+        if let Some(rc) = &state.response_cache {
+            if let Some(entry) = rc.lookup(&client_id, key).await {
+                info!(
+                    req_id,
+                    client_id = %client_id,
+                    key_digest = key_digest_prefix(key),
+                    "response cache hit"
+                );
+                return cached_hit_response(entry);
+            }
+        }
     }
 
     let n = state.endpoints.len();
@@ -6251,7 +6758,19 @@ async fn proxy_handler(
                 &mut saw_transient,
                 &mut model_unsupported_resp,
             ) {
-                RetryStep::Return(resp) => return resp,
+                // LAB-933: the single success seam — every proxied response
+                // (Anthropic or translated OpenAI) exits proxy_handler here,
+                // so the cache write lives in exactly one place.
+                RetryStep::Return(resp) => {
+                    return maybe_cache_store(
+                        &state,
+                        cache_key.as_deref(),
+                        &client_id,
+                        &req_id,
+                        resp,
+                    )
+                    .await
+                }
                 RetryStep::NextAttempt => continue,
                 RetryStep::EndRound => break,
             }
@@ -8321,6 +8840,43 @@ async fn metrics_handler(
         &[],
         state.body_read_timeout_total.load(Ordering::Relaxed),
     );
+
+    // LAB-933 response cache counters (AC12). Emitted only when the cache is
+    // configured; the `surface` label leaves room for the LAB-929
+    // count_tokens cache to join the same series without a rename.
+    if let Some(rc) = &state.response_cache {
+        let series: [(&str, &AtomicU64, &str); 4] = [
+            (
+                "anthropic_response_cache_hits_total",
+                &rc.hits,
+                "Requests served from the response cache (no upstream call, no headroom burned)",
+            ),
+            (
+                "anthropic_response_cache_misses_total",
+                &rc.misses,
+                "Opted-in cacheable requests that proceeded upstream on a cache miss",
+            ),
+            (
+                "anthropic_response_cache_stores_total",
+                &rc.stores,
+                "2xx responses written to the response cache",
+            ),
+            (
+                "anthropic_response_cache_errors_total",
+                &rc.errors,
+                "Response cache operations that failed or timed out (request failed open)",
+            ),
+        ];
+        for (name, counter, help) in series {
+            prom_header(&mut buf, name, "counter", help);
+            prom_counter(
+                &mut buf,
+                name,
+                &[("surface", "messages")],
+                counter.load(Ordering::Relaxed),
+            );
+        }
+    }
 
     (
         StatusCode::OK,
@@ -10658,6 +11214,29 @@ async fn main() {
         None
     };
 
+    // LAB-933: opt-in encrypted response cache. Invalid CONFIG fails startup
+    // — an operator who configured a cache must not silently run without
+    // one. An unreachable BACKEND does not: operations fail open per-request.
+    let response_cache = match config.response_cache {
+        Some(ref cfg) => match ResponseCache::from_config(cfg).await {
+            Ok(Some(rc)) => {
+                info!(
+                    clients = rc.clients.len(),
+                    backend = %cfg.backend,
+                    ttl_secs = cfg.ttl_secs.unwrap_or(ResponseCache::DEFAULT_TTL_SECS),
+                    "response cache enabled"
+                );
+                Some(rc)
+            }
+            Ok(None) => {
+                info!("response_cache configured with an empty client allow-list — inert");
+                None
+            }
+            Err(msg) => panic!("response_cache config error: {msg}"),
+        },
+        None => None,
+    };
+
     let state = Arc::new(AppState {
         // Liveness knobs are load-bearing against Anthropic's Cloudflare edge:
         // h2 PING (while_idle) evicts half-closed pooled streams before they're
@@ -10733,6 +11312,7 @@ async fn main() {
             .unwrap_or(DEFAULT_SESSION_REGISTRY_TTL_SECS),
         prompt_too_long: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
+        response_cache,
     });
 
     if state.auto_cache {
