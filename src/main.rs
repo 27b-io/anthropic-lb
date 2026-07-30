@@ -102,6 +102,18 @@ struct Config {
     /// Opt-in encrypted response cache on `/v1/messages` (LAB-933).
     /// Absent, or present with an empty `clients` list = feature entirely inert.
     response_cache: Option<ResponseCacheConfig>,
+    /// Reflect upstream `anthropic-ratelimit-*` response headers to callers.
+    /// They reveal the pooled capacity of every account behind the proxy, so
+    /// this is trusted-network-only. Default: false (LAB-1191).
+    expose_upstream_ratelimit_headers: Option<bool>,
+    /// Client-supplied `anthropic-beta` flags forwarded upstream on OAuth
+    /// endpoints ("*" suffix wildcards, like `endpoints[].models`). Absent =
+    /// built-in default (`DEFAULT_CLIENT_BETA_ALLOWLIST`). Flags not on the
+    /// list are dropped, logged, and counted
+    /// (`anthropic_beta_flag_dropped_total`) — otherwise any caller could
+    /// activate arbitrary beta features against the operator's accounts
+    /// (LAB-1191).
+    allowed_client_betas: Option<Vec<String>>,
 }
 
 /// `[response_cache]` — opt-in, client-side-encrypted response cache on
@@ -162,6 +174,11 @@ struct EndpointConfig {
     /// demoting its priority by `overage_penalty` so included (Max) capacity
     /// drains first. Non-Fable routing is unaffected. Default: true.
     fable_included: Option<bool>,
+    /// Opt-in: allow a `protocol = "anthropic"` endpoint whose `base_url`
+    /// host is not `api.anthropic.com` (e.g. a staging mirror). Without it,
+    /// startup fails — a typo'd or tampered base_url would otherwise send the
+    /// account's OAuth/API token to an arbitrary HTTPS host. Default: false.
+    allow_nonstandard_host: Option<bool>,
 }
 
 /// Wire format on config / state: "anthropic" | "openai".
@@ -633,6 +650,17 @@ struct AppState {
     /// Count of requests shed because the body was not fully received within
     /// `body_read_timeout`. Exposed as `anthropic_body_read_timeout_total`.
     body_read_timeout_total: AtomicU64,
+    /// Reflect upstream `anthropic-ratelimit-*` headers to callers (see
+    /// `Config::expose_upstream_ratelimit_headers`). Default: false.
+    expose_upstream_ratelimit_headers: bool,
+    /// `anthropic-beta` flags a client may forward upstream on OAuth
+    /// endpoints ("*" suffix wildcards). Flags outside the list are dropped.
+    allowed_client_betas: Vec<String>,
+    /// Dropped client beta flags → drop count, for
+    /// `anthropic_beta_flag_dropped_total{flag}`. Flag names are
+    /// client-controlled input, so the map is bounded
+    /// (`MAX_DROPPED_BETA_FLAGS`); overflow lands in the `_other` bucket.
+    beta_flags_dropped: Mutex<HashMap<String, u64>>,
     /// Live session registry: affinity routing key → last-seen context-window
     /// occupancy (LAB-916). Visibility only — routing never reads it. Sync
     /// mutex, never held across `.await`; bounded by `session_registry_max`
@@ -1684,7 +1712,15 @@ impl AppState {
             "anthropic-dangerous-direct-browser-access",
             HeaderValue::from_static("true"),
         );
-        inject_account_auth(&mut headers, &ep.token, ep.passthrough);
+        // Probe headers carry only OAUTH_BETA_FLAGS (always allow-listed), so
+        // nothing can be dropped here.
+        let dropped = inject_account_auth(
+            &mut headers,
+            &ep.token,
+            ep.passthrough,
+            &self.allowed_client_betas,
+        );
+        self.record_dropped_beta_flags("probe", &dropped);
 
         let req = self.client.post(&url).headers(headers).json(&body);
 
@@ -2042,6 +2078,36 @@ const DEFAULT_MAX_INFLIGHT_BODY_BYTES: u64 = 128 * 1024 * 1024;
 /// Required OAuth beta flags. Both needed: oauth-2025-04-20 for OAuth auth,
 /// claude-code-20250219 for Claude Code API access quota routing.
 const OAUTH_BETA_FLAGS: &[&str] = &["oauth-2025-04-20", "claude-code-20250219"];
+
+/// Default `anthropic-beta` flags a client may forward upstream on OAuth
+/// endpoints (LAB-1191 / audit finding 5). Contains the flags the LB itself
+/// depends on (`OAUTH_BETA_FLAGS`, the `context-1m*` flag the context-window
+/// accounting reads) plus the flags Claude Code sends on every request —
+/// dropping those would degrade the proxy's primary traffic. Extend via
+/// `allowed_client_betas` in config; "*" is a suffix wildcard.
+const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
+    "oauth-2025-04-20",
+    "claude-code-20250219",
+    "interleaved-thinking-2025-05-14",
+    "fine-grained-tool-streaming-2025-05-14",
+    "prompt-caching-2024-07-31",
+    "context-1m*",
+];
+
+/// Cardinality bound for `beta_flags_dropped` — flag names are
+/// client-controlled input. Past the cap, drops count under `_other`.
+const MAX_DROPPED_BETA_FLAGS: usize = 50;
+
+/// Same "*" suffix-wildcard semantics as `Endpoint::serves_model`.
+fn beta_flag_allowed(allowed: &[String], flag: &str) -> bool {
+    allowed.iter().any(|pattern| {
+        if let Some(prefix) = pattern.strip_suffix('*') {
+            flag.starts_with(prefix)
+        } else {
+            flag == pattern
+        }
+    })
+}
 
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
 /// weight is below 50% of the alternative, stickiness is broken immediately.
@@ -4041,6 +4107,34 @@ impl AppState {
         }
     }
 
+    /// Log + count client `anthropic-beta` flags dropped by the allow-list
+    /// (AC-12: silent stripping is not acceptable — a caller whose feature
+    /// vanished must be diagnosable from the logs and
+    /// `anthropic_beta_flag_dropped_total{flag}`). Flag names are
+    /// client-controlled, so the counter map is capped at
+    /// `MAX_DROPPED_BETA_FLAGS` distinct flags; overflow counts as `_other`.
+    fn record_dropped_beta_flags(&self, client_id: &str, dropped: &[String]) {
+        if dropped.is_empty() {
+            return;
+        }
+        warn!(
+            client_id,
+            flags = %dropped.join(","),
+            "dropped client anthropic-beta flags not on the allow-list \
+             (extend allowed_client_betas in config to permit them)"
+        );
+        let Ok(mut map) = self.beta_flags_dropped.lock() else {
+            return;
+        };
+        for flag in dropped {
+            if map.contains_key(flag) || map.len() < MAX_DROPPED_BETA_FLAGS {
+                *map.entry(flag.clone()).or_insert(0) += 1;
+            } else {
+                *map.entry("_other".to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
     /// Flush this replica's accumulated transport-error deltas into the shared
     /// Redis hash (`TRANSPORT_ERRORS_KEY`) so the fleet-wide count is visible
     /// cluster-wide. `upstream_transport_errors` is a DELTA accumulator: it is
@@ -4415,14 +4509,23 @@ impl SseUsageScanner {
 }
 
 /// Inject account authentication headers. Handles API keys, OAuth tokens,
-/// and passthrough mode. For OAuth, merges required beta flags with any
-/// existing flags from the client.
-fn inject_account_auth(headers: &mut axum::http::HeaderMap, token: &str, passthrough: bool) {
+/// and passthrough mode. For OAuth, merges required beta flags with the
+/// client flags that survive the `allowed_betas` allow-list; the flags it
+/// dropped are returned so the caller can log and count them (LAB-1191 /
+/// audit finding 5 — an unfiltered merge let any caller activate arbitrary
+/// beta features against the operator's account).
+fn inject_account_auth(
+    headers: &mut axum::http::HeaderMap,
+    token: &str,
+    passthrough: bool,
+    allowed_betas: &[String],
+) -> Vec<String> {
     if passthrough {
-        return;
+        return Vec::new();
     }
     headers.remove("authorization");
     headers.remove("x-api-key");
+    let mut dropped: Vec<String> = Vec::new();
     if token.starts_with("sk-ant-api") {
         headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
     } else if token.starts_with("sk-ant-oat") {
@@ -4434,16 +4537,25 @@ fn inject_account_auth(headers: &mut axum::http::HeaderMap, token: &str, passthr
             "anthropic-dangerous-direct-browser-access",
             HeaderValue::from_static("true"),
         );
-        // Merge required OAuth beta flags with any existing client flags
+        // Merge required OAuth beta flags with the allow-listed client flags.
         // Use get_all to handle multiple anthropic-beta headers
-        let mut flags: Vec<String> = headers
+        let mut flags: Vec<String> = Vec::new();
+        for flag in headers
             .get_all("anthropic-beta")
             .iter()
             .filter_map(|v| v.to_str().ok())
             .flat_map(|s| s.split(','))
-            .map(|s| s.trim().to_string())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
-            .collect();
+        {
+            if beta_flag_allowed(allowed_betas, flag) {
+                if !flags.iter().any(|f| f == flag) {
+                    flags.push(flag.to_string());
+                }
+            } else if !dropped.iter().any(|f| f == flag) {
+                dropped.push(flag.to_string());
+            }
+        }
         for flag in OAUTH_BETA_FLAGS {
             if !flags.iter().any(|f| f == flag) {
                 flags.push(flag.to_string());
@@ -4456,6 +4568,7 @@ fn inject_account_auth(headers: &mut axum::http::HeaderMap, token: &str, passthr
     } else {
         headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
     }
+    dropped
 }
 
 /// Client identity extracted from request headers.
@@ -5655,6 +5768,9 @@ fn describe_reqwest_error(e: &reqwest::Error) -> String {
     if e.is_request() {
         kinds.push("request");
     }
+    // With `Policy::none()` on the upstream clients a redirect is a normal
+    // 3xx *response* (handled in `classify_retry_status`), so this kind can
+    // no longer fire there — kept because this describer is generic.
     if e.is_redirect() {
         kinds.push("redirect");
     }
@@ -5694,6 +5810,47 @@ async fn classify_retry_status(
     endpoint_name: &str,
     resp: reqwest::Response,
 ) -> Result<reqwest::Response, ForwardOutcome> {
+    // 3xx → deliberate 502. The upstream client follows no redirects
+    // (`Policy::none()`), because following one would re-send the account
+    // credential to the Location host. A redirect from a configured endpoint
+    // is anomalous (misconfig or tampering), so it terminates the request
+    // with a distinct log rather than rotating — retrying other accounts
+    // against a redirecting upstream would just spray more credentialed
+    // requests at it (LAB-1191 / 2026-06-02 audit finding 2).
+    if status.is_redirection() {
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        warn!(
+            account = endpoint_name,
+            status = status.as_u16(),
+            location,
+            "upstream returned a redirect — refusing to follow with credentials attached"
+        );
+        let body = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": format!(
+                    "upstream returned {} redirect; refusing to follow with credentials",
+                    status.as_u16()
+                ),
+            }
+        })
+        .to_string();
+        return Err(ForwardOutcome::Done(
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap_or_else(|_| {
+                    (StatusCode::BAD_GATEWAY, "upstream redirect refused").into_response()
+                }),
+        ));
+    }
+
     // 429 → mark hard-limited and try next account
     if status == StatusCode::TOO_MANY_REQUESTS {
         state
@@ -5912,10 +6069,49 @@ fn untranslatable_request_response(message: &str) -> Response {
 /// detached 'static task that must re-borrow the endpoint from a cloned
 /// Arc<AppState> — a borrowed &Endpoint cannot cross the spawn boundary,
 /// so the task captures the Copy `endpoint_idx` and re-indexes.
+/// Copy the allow-listed upstream response headers onto `builder`. This is
+/// the ONLY place upstream headers are reflected to callers — everything not
+/// listed here stays behind the proxy (LAB-1191 / 2026-06-02 audit finding 3:
+/// the old copy-everything loop leaked `anthropic-ratelimit-*` — the pooled
+/// capacity of every account — plus `set-cookie` and org-identifying headers).
+/// `expose_ratelimit` (config `expose_upstream_ratelimit_headers`, trusted
+/// networks only) restores the `anthropic-ratelimit-*` passthrough for
+/// tooling that reads it.
+fn reflect_upstream_headers(
+    mut builder: axum::http::response::Builder,
+    headers: &reqwest::header::HeaderMap,
+    expose_ratelimit: bool,
+) -> axum::http::response::Builder {
+    // What SDKs need to function: body framing (content-type/length),
+    // SSE cache hint, the Anthropic request id for error reports, and
+    // retry-after on forwarded 4xx.
+    const ALLOWED: &[&str] = &[
+        "content-type",
+        "content-length",
+        "cache-control",
+        "request-id",
+        "retry-after",
+    ];
+    for (k, v) in headers.iter() {
+        let name = k.as_str();
+        if ALLOWED.contains(&name) || (expose_ratelimit && name.starts_with("anthropic-ratelimit-"))
+        {
+            builder = builder.header(k, v);
+        }
+    }
+    builder
+}
+
 /// Shared knob chain for both upstream clients — `client` layers the SSE-tuned
 /// `read_timeout` on top; `client_nonstreaming` takes it as-is (LAB-718).
 fn upstream_client_builder() -> reqwest::ClientBuilder {
     Client::builder()
+        // Never follow redirects: every upstream request carries an account
+        // credential (Authorization / x-api-key), and reqwest re-sends it to
+        // the redirect target. A 3xx surfaces as a response and is turned
+        // into a deliberate 502 by `classify_retry_status` (LAB-1191 /
+        // 2026-06-02 audit finding 2).
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(900))
         // 4s (was 10): a blackholed connect fails fast so the transient
         // backoff-retry recovers in seconds. pool_idle_timeout stays 300s —
@@ -6007,7 +6203,13 @@ async fn forward_anthropic(
     }
 
     // Auth: passthrough keeps caller's headers, otherwise inject account token
-    inject_account_auth(&mut headers, token, passthrough);
+    let dropped = inject_account_auth(
+        &mut headers,
+        token,
+        passthrough,
+        &state.allowed_client_betas,
+    );
+    state.record_dropped_beta_flags(client_id, &dropped);
 
     // Debug: log outbound auth method and key headers
     if tracing::enabled!(tracing::Level::DEBUG) {
@@ -6169,16 +6371,14 @@ async fn forward_anthropic(
     let resp_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = resp.headers().clone();
 
-    let mut builder = Response::builder().status(resp_status);
-    for (k, v) in resp_headers.iter() {
-        if k == "transfer-encoding" {
-            continue;
-        }
-        builder = builder.header(k, v);
-    }
+    let builder = reflect_upstream_headers(
+        Response::builder().status(resp_status),
+        &resp_headers,
+        state.expose_upstream_ratelimit_headers,
+    );
 
     // Inject budget status header
-    builder = builder.header("x-budget-status", budget_status);
+    let builder = builder.header("x-budget-status", budget_status);
 
     // Detect streaming from content-type
     let is_streaming = resp_headers
@@ -6298,17 +6498,20 @@ async fn forward_anthropic(
                     }
                 })
                 .to_string();
-                // Forward the upstream's rate-limit headers + budget status so the
-                // client's limit tracking stays consistent with the success arms.
+                // Forward the upstream's rate-limit headers (behind the same
+                // trusted-network flag as the success arms) + budget status so
+                // the client's limit tracking stays consistent.
                 // Deliberately NOT content-length: the upstream's value describes
                 // the truncated body it promised, not our short JSON frame.
                 let mut err_builder = Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
                     .header("content-type", "application/json")
                     .header("x-budget-status", budget_status);
-                for (k, v) in resp_headers.iter() {
-                    if k.as_str().starts_with("anthropic-ratelimit-") {
-                        err_builder = err_builder.header(k, v);
+                if state.expose_upstream_ratelimit_headers {
+                    for (k, v) in resp_headers.iter() {
+                        if k.as_str().starts_with("anthropic-ratelimit-") {
+                            err_builder = err_builder.header(k, v);
+                        }
                     }
                 }
                 return ForwardOutcome::Done(err_builder.body(Body::from(body)).unwrap_or_else(
@@ -7926,6 +8129,12 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
+    let beta_flags_dropped: Vec<(String, u64)> = state
+        .beta_flags_dropped
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
     let (session_buckets, session_tokens_sum) = state.session_tokens_histogram(now_epoch);
 
     // ── Phase 2: Serialize (sync — no locks held) ──────────────────
@@ -8735,6 +8944,23 @@ async fn metrics_handler(
             &mut buf,
             "anthropic_prompt_too_long_total",
             &[("model", model.as_str())],
+            *n,
+        );
+    }
+
+    // Client anthropic-beta flags dropped by the allow-list (LAB-1191).
+    // Per-replica, in-memory; bounded via `_other` overflow.
+    prom_header(
+        &mut buf,
+        "anthropic_beta_flag_dropped_total",
+        "counter",
+        "Client anthropic-beta flags dropped by the allow-list",
+    );
+    for (flag, n) in &beta_flags_dropped {
+        prom_counter(
+            &mut buf,
+            "anthropic_beta_flag_dropped_total",
+            &[("flag", flag.as_str())],
             *n,
         );
     }
@@ -10255,7 +10481,13 @@ async fn forward_openai_compat_anthropic(
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
 
     // Auth injection
-    inject_account_auth(&mut headers, token, passthrough);
+    let dropped = inject_account_auth(
+        &mut headers,
+        token,
+        passthrough,
+        &state.allowed_client_betas,
+    );
+    state.record_dropped_beta_flags(client_id, &dropped);
 
     // Use OAuth variant (with CC system prompt) for OAuth tokens
     let req_body = if token.starts_with("sk-ant-oat") {
@@ -10901,8 +11133,9 @@ async fn openai_chat_handler(
 // ── Main ────────────────────────────────────────────────────────────
 
 /// Validate endpoint configuration. Returns the first hard error encountered.
-/// Soft warnings (non-canonical anthropic host, priority collision with an
-/// openai endpoint) are emitted as `warn!` and do not return an error.
+/// A non-canonical host on an anthropic endpoint is a hard error unless the
+/// endpoint opts in via `allow_nonstandard_host` (then it degrades to the
+/// `warn!`). Priority collision with an openai endpoint stays a soft warning.
 fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
     for ep in endpoints {
         if let Some(url) = ep.base_url.as_deref() {
@@ -10931,6 +11164,19 @@ fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
                         .ok()
                         .and_then(|u| u.host_str().map(str::to_string));
                     if host.as_deref() != Some("api.anthropic.com") {
+                        // This endpoint's token is forwarded to that host on
+                        // every request — a typo here is credential exfil, so
+                        // it must be an explicit opt-in, not a scrolled-past
+                        // warning (LAB-1191 / 2026-06-02 audit finding 1).
+                        if ep.allow_nonstandard_host != Some(true) {
+                            return Err(format!(
+                                "endpoint '{}': base_url host '{}' is not api.anthropic.com — \
+                                 the endpoint token would be sent to a non-Anthropic host. \
+                                 Set allow_nonstandard_host = true on this endpoint if intentional",
+                                ep.name,
+                                host.as_deref().unwrap_or("<unparseable>")
+                            ));
+                        }
                         warn!(
                             endpoint = ep.name,
                             base_url = url,
@@ -11310,6 +11556,16 @@ async fn main() {
         session_registry_ttl_secs: config
             .session_registry_ttl_secs
             .unwrap_or(DEFAULT_SESSION_REGISTRY_TTL_SECS),
+        expose_upstream_ratelimit_headers: config
+            .expose_upstream_ratelimit_headers
+            .unwrap_or(false),
+        allowed_client_betas: config.allowed_client_betas.clone().unwrap_or_else(|| {
+            DEFAULT_CLIENT_BETA_ALLOWLIST
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        }),
+        beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache,

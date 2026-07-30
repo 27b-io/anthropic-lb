@@ -160,6 +160,8 @@ token = "sk-ant-api03-..."
 | `strategy` | `String` | `dynamic-capacity-v1` | Routing strategy (see note below) |
 | `emergency_threshold` | `f64` | `0.88` | Utilization threshold for emergency brake |
 | `redis_url` | `String?` | `None` | Redis/Valkey URL for distributed state |
+| `expose_upstream_ratelimit_headers` | `bool` | `false` | Reflect upstream `anthropic-ratelimit-*` headers to callers — they reveal the pooled capacity of every account, so enable on trusted networks only |
+| `allowed_client_betas` | `[String]?` | built-in list | Client `anthropic-beta` flags forwarded upstream on OAuth endpoints (`*` suffix wildcard); unlisted flags are dropped, logged, and counted (`anthropic_beta_flag_dropped_total`) so a caller can't activate arbitrary beta features against the operator's accounts |
 | `endpoints[].name` | `String` | — | Display name for the endpoint |
 | `endpoints[].protocol` | `String` | `"anthropic"` | `"anthropic"` (default) or `"openai"` |
 | `endpoints[].base_url` | `String?` | `https://api.anthropic.com` | Base URL; required and must be `https://` for `openai` |
@@ -167,6 +169,7 @@ token = "sk-ant-api03-..."
 | `endpoints[].models` | `[String]` | `[]` | Model allowlist (empty = all) |
 | `endpoints[].priority` | `u32` | `0` | Priority tier (lower tried first) |
 | `endpoints[].fable_included` | `bool` | `true` | Plan includes Fable band; set `false` for Pro / standard Team |
+| `endpoints[].allow_nonstandard_host` | `bool` | `false` | Allow an `anthropic` endpoint whose `base_url` host isn't `api.anthropic.com` — without it startup fails, because the endpoint token would be sent to that host |
 | `session_registry_max` | `usize` | `1000` | Max live-session entries tracked for `/_stats` `sessions` (0 = disabled) |
 | `session_registry_ttl_secs` | `u64` | `1800` | Seconds after a session's last request before its entry is evicted |
 
@@ -256,6 +259,31 @@ Three layers, all optional — use what fits:
 | **Proxy key** | `proxy_key = "secret"` | Requires `x-api-key` header match (401) |
 
 IP check runs first, then proxy key. Both apply to all endpoints including `/_stats`.
+
+### Credential-path hardening (LAB-1191)
+
+The proxy forwards operator OAuth/API tokens upstream, so the paths a request
+can steer are locked down by default:
+
+- **Endpoint hosts are pinned.** An `anthropic`-protocol endpoint whose
+  `base_url` host isn't `api.anthropic.com` fails startup validation —
+  a typo'd or tampered URL would ship the account token to that host.
+  Deliberate mirrors opt in per endpoint with `allow_nonstandard_host = true`.
+- **Redirects are never followed.** The upstream HTTP client uses
+  `redirect::Policy::none()`; a `3xx` from an upstream surfaces to the caller
+  as a `502` with a distinct log line instead of re-sending credentials to
+  the `Location` target.
+- **Response headers are allow-listed.** Only `content-type`,
+  `content-length`, `cache-control`, `request-id`, and `retry-after` are
+  reflected to callers (plus the proxy's own `x-budget-status`).
+  `anthropic-ratelimit-*` (the pooled capacity of every account),
+  `set-cookie`, and org-identifying headers are stripped;
+  `expose_upstream_ratelimit_headers = true` restores the ratelimit
+  passthrough for trusted networks.
+- **Client beta flags are allow-listed.** On OAuth endpoints, client
+  `anthropic-beta` values outside `allowed_client_betas` are dropped before
+  forwarding, logged at `warn`, and counted in
+  `anthropic_beta_flag_dropped_total{flag}`.
 
 > [!WARNING]
 > With no `proxy_key` and no `allowed_ips`, the proxy is **open to all**. This is fine on a private network (VPN) or localhost, but never expose an open proxy to the internet.

@@ -45,6 +45,25 @@ probe_interval_secs = 300
 # connections could pin the budget indefinitely. Default: 60. Set to 0 to disable.
 # body_read_timeout_secs = 60
 
+# Reflect upstream anthropic-ratelimit-* response headers to callers. They
+# reveal the pooled capacity of every account behind the proxy, so the default
+# strips them; enable only on a trusted network where tooling reads them.
+# expose_upstream_ratelimit_headers = false
+
+# Client-supplied anthropic-beta flags forwarded upstream on OAuth endpoints
+# ("*" = suffix wildcard). Anything not listed is dropped (logged +
+# anthropic_beta_flag_dropped_total metric) — otherwise any caller could
+# activate arbitrary beta features against the operator's accounts. Omit to
+# use the built-in default (the flags Claude Code sends + context-1m*).
+# allowed_client_betas = [
+#   "oauth-2025-04-20",
+#   "claude-code-20250219",
+#   "interleaved-thinking-2025-05-14",
+#   "fine-grained-tool-streaming-2025-05-14",
+#   "prompt-caching-2024-07-31",
+#   "context-1m*",
+# ]
+
 # Redis/Valkey URL for distributed state (multi-replica coordination).
 # When set, budget enforcement and hard-limit propagation use Redis for cross-replica sync.
 # Omit for single-instance deployments (local-only state).
@@ -101,3 +120,13 @@ token = "sk-ant-oat01-YOUR_TOKEN_HERE"
 #base_url = "https://portkey.example.dev/v1"
 #token = "your-api-key"
 #priority = 100
+
+# An anthropic-protocol endpoint whose base_url host is NOT api.anthropic.com
+# is rejected at startup — the endpoint token would be sent to that host on
+# every request, so a typo'd or tampered base_url is credential exfiltration.
+# A deliberate mirror needs the explicit opt-in:
+#[[endpoints]]
+#name = "staging-mirror"
+#base_url = "https://staging.anthropic.example"
+#token = "sk-ant-api-staging"
+#allow_nonstandard_host = true
