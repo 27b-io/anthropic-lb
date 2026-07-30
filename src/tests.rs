@@ -16196,3 +16196,68 @@ async fn upstream_redirect_becomes_openai_shaped_502_on_chat_completions() {
     );
     assert_eq!(target_hits.load(Ordering::SeqCst), 0);
 }
+
+/// PR #116 review (Kody + CodeRabbit): the 1M-context accounting must read
+/// the FILTERED outbound headers. If a custom allow-list strips
+/// `context-1m`, the upstream runs the request at 200k — recording the
+/// session at 1M would inflate /_stats occupancy.
+#[test]
+fn stripped_context_1m_flag_is_invisible_to_accounting() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("context-1m-2025-08-07"),
+    );
+    // Custom allow-list that omits context-1m*.
+    let restrictive = vec!["oauth-2025-04-20".to_string()];
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &restrictive);
+    assert_eq!(dropped, vec!["context-1m-2025-08-07".to_string()]);
+    assert!(
+        !request_has_1m_beta(&headers),
+        "post-filter headers must not carry the stripped 1M flag"
+    );
+}
+
+/// Same defect end-to-end: with a restrictive allow-list, a request carrying
+/// the 1M beta must be registered in the session registry at the 200k window
+/// the upstream actually ran under — not at 1M.
+#[tokio::test]
+async fn session_registry_window_matches_filtered_beta() {
+    // Raw-TCP mock: its canned body carries `usage`, which session
+    // registration requires (the axum mock's body has none).
+    let (upstream_url, _hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let mut state = test_state_with(vec![mk_endpoint_at(
+        "acct-a",
+        "sk-ant-oat01-test-aaa",
+        &upstream_url,
+    )]);
+    Arc::get_mut(&mut state)
+        .expect("test fixture should be uniquely owned")
+        .allowed_client_betas = vec!["oauth-2025-04-20".to_string()];
+    let sessions_state = state.clone();
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-session-id", "sess-1m-strip")
+        .header("anthropic-beta", "context-1m-2025-08-07")
+        .body(r#"{"model":"claude-sonnet-4-6","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let windows: Vec<u64> = sessions_state
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .map(|s| s.context_window)
+        .collect();
+    assert_eq!(
+        windows,
+        vec![DEFAULT_CONTEXT_WINDOW],
+        "session must be tracked at the window the upstream ran (flag was stripped)"
+    );
+}

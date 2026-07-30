@@ -4138,22 +4138,38 @@ impl AppState {
                 &f[..end]
             })
             .collect();
-        warn!(
-            client_id,
-            flags = %truncated.join(","),
-            "dropped client anthropic-beta flags not on the allow-list \
-             (a configured allowed_client_betas REPLACES the default list — \
-             include the defaults plus the flags to permit)"
-        );
         let Ok(mut map) = self.beta_flags_dropped.lock() else {
             return;
         };
-        for flag in truncated {
-            if map.contains_key(flag) || map.len() < MAX_DROPPED_BETA_FLAGS {
+        // Loud line only on a flag's FIRST sighting — a misconfigured client
+        // sends the same unlisted flag at request rate, and the counter
+        // already carries the volume. Repeats log at debug for correlation.
+        let mut first_seen: Vec<&str> = Vec::new();
+        for flag in &truncated {
+            if map.contains_key(*flag) || map.len() < MAX_DROPPED_BETA_FLAGS {
+                if !map.contains_key(*flag) {
+                    first_seen.push(flag);
+                }
                 *map.entry(flag.to_string()).or_insert(0) += 1;
             } else {
                 *map.entry("_other".to_string()).or_insert(0) += 1;
             }
+        }
+        drop(map);
+        if !first_seen.is_empty() {
+            warn!(
+                client_id,
+                flags = %first_seen.join(","),
+                "dropped client anthropic-beta flags not on the allow-list \
+                 (a configured allowed_client_betas REPLACES the default list — \
+                 include the defaults plus the flags to permit)"
+            );
+        } else {
+            debug!(
+                client_id,
+                flags = %truncated.join(","),
+                "dropped client anthropic-beta flags (previously reported)"
+            );
         }
     }
 
@@ -6206,10 +6222,6 @@ async fn forward_anthropic(
     session_key: Option<&str>,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
-    // Context window for the session registry: 200k, or 1M when the request
-    // carries the `context-1m` beta (per-request, so a mixed client is
-    // tracked at the window each request actually ran under).
-    let context_window = context_window_for(model, request_has_1m_beta(&parts.headers));
     let token = ep.token.as_str();
     let passthrough = ep.passthrough;
     let endpoint_name = ep.name.as_str();
@@ -6253,6 +6265,14 @@ async fn forward_anthropic(
         &state.allowed_client_betas,
     );
     state.record_dropped_beta_flags(client_id, &dropped);
+
+    // Context window for the session registry: 200k, or 1M when the request
+    // carries the `context-1m` beta (per-request, so a mixed client is
+    // tracked at the window each request actually ran under). Read from the
+    // FILTERED outbound headers, not the client's raw ones — if the beta
+    // allow-list stripped `context-1m`, the upstream runs this request at
+    // 200k and the accounting must agree (PR #116 review).
+    let context_window = context_window_for(model, request_has_1m_beta(&headers));
 
     // Debug: log outbound auth method and key headers
     if tracing::enabled!(tracing::Level::DEBUG) {
@@ -10504,10 +10524,6 @@ async fn forward_openai_compat_anthropic(
     json_mode: bool,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
-    // Session registry window (LAB-916). OpenAI-compat callers can't send the
-    // `context-1m` beta through translation, but check anyway — the header is
-    // forwarded when present.
-    let context_window = context_window_for(model, request_has_1m_beta(&parts.headers));
     let token = ep.token.as_str();
     let passthrough = ep.passthrough;
     let endpoint_name = ep.name.as_str();
@@ -10535,6 +10551,13 @@ async fn forward_openai_compat_anthropic(
         &state.allowed_client_betas,
     );
     state.record_dropped_beta_flags(client_id, &dropped);
+
+    // Session registry window (LAB-916). OpenAI-compat callers can't send the
+    // `context-1m` beta through translation, but check anyway — the header is
+    // forwarded when present. Read from the FILTERED outbound headers so the
+    // accounting matches what the upstream actually ran under (PR #116
+    // review), same as forward_anthropic.
+    let context_window = context_window_for(model, request_has_1m_beta(&headers));
 
     // Use OAuth variant (with CC system prompt) for OAuth tokens
     let req_body = if token.starts_with("sk-ant-oat") {
