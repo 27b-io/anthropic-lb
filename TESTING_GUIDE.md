@@ -75,6 +75,42 @@ cargo test --test config_test test_minimal_valid_config
 
 ---
 
+## Redis Integration Tests
+
+The `redis_integration` module (`src/tests.rs`) exercises the cross-replica
+coordination layer — budget INCRBY/EXPIRE, hard-limit propagation, the Lua
+CAS recovery sentinel, the `sync_from_redis` MGET merge, `SCAN` pagination,
+pipelined `HINCRBY`, and the `SET NX EX` probe lock — against a **real
+Redis/Valkey backend**.
+
+They are opt-in via `ALB_TEST_REDIS_URL` (plain `redis://host:port`, no db
+suffix, no auth):
+
+```bash
+# Start a throwaway backend (never point this at a Redis holding real data —
+# the tests FLUSHDB the logical DBs they use)
+redis-server --port 16379 --save '' --appendonly no --daemonize yes \
+  --pidfile /tmp/alb-test-redis.pid
+
+ALB_TEST_REDIS_URL=redis://127.0.0.1:16379 cargo test redis_integration
+
+kill "$(cat /tmp/alb-test-redis.pid)"
+```
+
+> [!IMPORTANT]
+> When `ALB_TEST_REDIS_URL` is unset the tests print a `SKIP` notice and
+> return. When it is set but the backend is unreachable they **panic** —
+> CI (which runs a Valkey service container, see `.github/workflows/ci.yml`)
+> can never skip them silently.
+
+Each test owns a dedicated logical DB (`SELECT 1`–`12`) because the
+coordination keys (`alb:transport_errors`, `alb:heartbeat:*`) are hardcoded
+in production code and cannot be prefixed per-test. Failure-path tests route
+the connection through an in-test killable TCP proxy to simulate the backend
+dying mid-run.
+
+---
+
 ## Test Categories
 
 ### By Functionality

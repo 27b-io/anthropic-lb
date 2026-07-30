@@ -15727,3 +15727,871 @@ async fn response_cache_skips_oversized_bodies() {
         1
     );
 }
+
+// ── Real-Redis integration tests (LAB-931) ──────────────────────────
+//
+// Behavioural coverage for the cross-replica coordination layer against a
+// REAL Redis/Valkey backend. These pin the semantics of every coordination
+// call site — INCRBY/EXPIRE budgets, SET EX hard-limit propagation, the Lua
+// CAS recovery sentinel, the three-phase MGET merge in sync_from_redis,
+// SCAN pagination in cluster_info, pipelined HINCRBY transport-error
+// flushing, and the SET NX EX probe lock — exactly as they behave today,
+// so the redis→fred migration has a baseline to rewrite against.
+//
+// Opt-in by design: set `ALB_TEST_REDIS_URL` (plain `redis://host:port`,
+// no db suffix, no auth) to run them. When unset, every test prints a SKIP
+// notice and returns — never a silent pass against nothing. When the env
+// var IS set and the backend is unreachable, the tests PANIC, so CI (which
+// always sets it — see .github/workflows/ci.yml) can never skip silently.
+//
+// Isolation: each test owns a dedicated logical DB (the `/N` suffix in the
+// connection URL) and flushes it on connect, because the coordination keys
+// (`alb:hard:*`, `alb:transport_errors`, `alb:heartbeat:*`) are hardcoded
+// in production code and cannot be prefixed per-test. Never point
+// ALB_TEST_REDIS_URL at a Redis holding data you care about.
+mod redis_integration {
+    use super::*;
+    use redis::AsyncCommands;
+
+    const TEST_REDIS_ENV: &str = "ALB_TEST_REDIS_URL";
+
+    /// Connect to the opt-in test backend, selecting logical DB `db` and
+    /// flushing it. Returns None (with a SKIP notice) when the env var is
+    /// unset; panics when it is set but the backend is unreachable.
+    /// `db` must be unique per test — logical DBs are the isolation unit.
+    async fn redis_test_conn(db: u8) -> Option<redis::aio::ConnectionManager> {
+        let base = match std::env::var(TEST_REDIS_ENV) {
+            Ok(u) => u,
+            Err(_) => {
+                eprintln!(
+                    "SKIP (redis integration): {TEST_REDIS_ENV} not set — no backend to test against"
+                );
+                return None;
+            }
+        };
+        Some(connect_and_flush(&format!("{}/{db}", base.trim_end_matches('/'))).await)
+    }
+
+    async fn connect_and_flush(url: &str) -> redis::aio::ConnectionManager {
+        let client = redis::Client::open(url)
+            .unwrap_or_else(|e| panic!("{TEST_REDIS_ENV}: invalid url {url}: {e}"));
+        // Short timeouts + a single retry: the failure-path tests kill the
+        // backend mid-run and must observe errors in milliseconds, not after
+        // the production-scale reconnect backoff.
+        let cfg = redis::aio::ConnectionManagerConfig::new()
+            .set_response_timeout(Some(Duration::from_secs(1)))
+            .set_connection_timeout(Some(Duration::from_secs(2)))
+            .set_number_of_retries(1);
+        let mut conn = client
+            .get_connection_manager_with_config(cfg)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{TEST_REDIS_ENV} set but backend unreachable at {url}: {e}")
+            });
+        let flushed: redis::RedisResult<()> = redis::cmd("FLUSHDB").query_async(&mut conn).await;
+        flushed.unwrap_or_else(|e| panic!("FLUSHDB failed on {url}: {e}"));
+        conn
+    }
+
+    /// TCP forwarder in front of the real backend that can be killed
+    /// mid-test to simulate Redis dying while connections are established.
+    /// Killing aborts every live relay and drops the listener, so both
+    /// in-flight commands and subsequent reconnect attempts fail.
+    async fn spawn_killable_proxy(target: String) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut relays: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = &mut kill_rx => break,
+                    accepted = listener.accept() => {
+                        let Ok((mut inbound, _)) = accepted else { break };
+                        let target = target.clone();
+                        relays.push(tokio::spawn(async move {
+                            if let Ok(mut outbound) =
+                                tokio::net::TcpStream::connect(&target).await
+                            {
+                                let _ =
+                                    tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
+                                        .await;
+                            }
+                        }));
+                    }
+                }
+            }
+            for relay in relays {
+                relay.abort();
+            }
+            // Listener drops here → further connects are refused.
+        });
+        (format!("127.0.0.1:{}", addr.port()), kill_tx)
+    }
+
+    /// Connection to the test backend routed through a killable proxy.
+    /// Same skip/panic contract as `redis_test_conn`.
+    async fn proxied_conn(
+        db: u8,
+    ) -> Option<(
+        redis::aio::ConnectionManager,
+        tokio::sync::oneshot::Sender<()>,
+    )> {
+        let base = match std::env::var(TEST_REDIS_ENV) {
+            Ok(u) => u,
+            Err(_) => {
+                eprintln!(
+                    "SKIP (redis integration): {TEST_REDIS_ENV} not set — no backend to test against"
+                );
+                return None;
+            }
+        };
+        let target = base
+            .trim_start_matches("redis://")
+            .trim_end_matches('/')
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let (proxy_addr, kill) = spawn_killable_proxy(target).await;
+        let conn = connect_and_flush(&format!("redis://{proxy_addr}/{db}")).await;
+        Some((conn, kill))
+    }
+
+    async fn kill_proxy(kill: tokio::sync::oneshot::Sender<()>) {
+        let _ = kill.send(());
+        // Give the aborts a beat to drop sockets before asserting failures.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    fn state_with_redis(
+        endpoints: Vec<Endpoint>,
+        conn: redis::aio::ConnectionManager,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            endpoints,
+            redis: Some(conn),
+            ..test_state_base()
+        })
+    }
+
+    /// Poll until `check` passes — for asserting on fire-and-forget
+    /// tokio::spawn writes (sentinel CAS, weight publish).
+    async fn eventually<F, Fut>(what: &str, mut check: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..100 {
+            if check().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn remote_rate_info(updated_at: u64, utilization: f64) -> RedisRateInfo {
+        RedisRateInfo {
+            utilization: Some(utilization),
+            utilization_5h: Some(utilization),
+            utilization_7d: None,
+            reset_5h: None,
+            reset_7d: None,
+            status_5h: Some("allowed".into()),
+            status_7d: None,
+            claims_7d: HashMap::new(),
+            representative_claim: None,
+            remaining_requests: Some(11),
+            remaining_tokens: Some(22),
+            limit_requests: None,
+            limit_tokens: None,
+            overage_in_use: false,
+            overage_status: None,
+            overage_utilization: None,
+            overage_reset: None,
+            updated_at,
+        }
+    }
+
+    /// Mock upstream that counts requests — observable side effect for the
+    /// probe-lock tests (probe fired vs probe suppressed).
+    async fn spawn_counting_upstream() -> (String, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let hits = counter.clone();
+        let app = Router::new().fallback(any(move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                axum::Json(serde_json::json!({"id": "msg_probe", "type": "message"}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), counter)
+    }
+
+    /// AC2 phase 1: the hard-limit MGET merge against real keys — a remote
+    /// future epoch is applied, "most recent wins" holds in both directions,
+    /// the clear sentinel clears, and an absent key (MGET None) touches
+    /// nothing. Pairs with the pure `classify_hard_limit_*` unit tests.
+    #[tokio::test]
+    async fn sync_from_redis_merges_hard_limits_with_real_backend() {
+        let Some(mut conn) = redis_test_conn(1).await else {
+            return;
+        };
+        let state = state_with_redis(
+            vec![
+                make_endpoint("hl-apply", Protocol::Anthropic),
+                make_endpoint("hl-clear", Protocol::Anthropic),
+                make_endpoint("hl-remote-older", Protocol::Anthropic),
+                make_endpoint("hl-remote-newer", Protocol::Anthropic),
+                make_endpoint("hl-absent", Protocol::Anthropic),
+            ],
+            conn.clone(),
+        );
+
+        let now_epoch = AppState::now_epoch();
+        let now = Instant::now();
+        state.endpoints[1]
+            .rate_info
+            .write()
+            .await
+            .hard_limited_until = Some(now + Duration::from_secs(500));
+        state.endpoints[2]
+            .rate_info
+            .write()
+            .await
+            .hard_limited_until = Some(now + Duration::from_secs(600));
+        state.endpoints[3]
+            .rate_info
+            .write()
+            .await
+            .hard_limited_until = Some(now + Duration::from_secs(60));
+
+        let _: () = conn
+            .set("alb:hard:hl-apply", now_epoch + 120)
+            .await
+            .unwrap();
+        let _: () = conn
+            .set("alb:hard:hl-clear", HARD_LIMIT_CLEARED_SENTINEL)
+            .await
+            .unwrap();
+        let _: () = conn
+            .set("alb:hard:hl-remote-older", now_epoch + 60)
+            .await
+            .unwrap();
+        let _: () = conn
+            .set("alb:hard:hl-remote-newer", now_epoch + 600)
+            .await
+            .unwrap();
+
+        state.sync_from_redis().await;
+
+        let after = Instant::now();
+        let until = state.endpoints[0]
+            .rate_info
+            .read()
+            .await
+            .hard_limited_until
+            .expect("remote future epoch must apply a hard limit");
+        let secs = until.saturating_duration_since(after).as_secs();
+        assert!(
+            (60..=121).contains(&secs),
+            "hl-apply should be limited ~120s, got {secs}s"
+        );
+
+        assert!(
+            state.endpoints[1]
+                .rate_info
+                .read()
+                .await
+                .hard_limited_until
+                .is_none(),
+            "clear sentinel must clear the local hard limit"
+        );
+
+        let until = state.endpoints[2]
+            .rate_info
+            .read()
+            .await
+            .hard_limited_until
+            .expect("local hard limit must survive an older remote");
+        let secs = until.saturating_duration_since(after).as_secs();
+        assert!(
+            secs > 400,
+            "older remote (+60s) must not shorten the newer local limit (+600s), got {secs}s"
+        );
+
+        let until = state.endpoints[3]
+            .rate_info
+            .read()
+            .await
+            .hard_limited_until
+            .expect("newer remote must extend the local hard limit");
+        let secs = until.saturating_duration_since(after).as_secs();
+        assert!(
+            (400..=601).contains(&secs),
+            "newer remote (+600s) must override the older local limit (+60s), got {secs}s"
+        );
+
+        assert!(
+            state.endpoints[4]
+                .rate_info
+                .read()
+                .await
+                .hard_limited_until
+                .is_none(),
+            "absent key (MGET None) must not fabricate a hard limit"
+        );
+    }
+
+    /// AC2 phase 2: the rate-info merge's "most recent wins" comparison in
+    /// both directions, plus the absent-key case, against real MGET replies.
+    #[tokio::test]
+    async fn sync_from_redis_rate_info_most_recent_wins_both_directions() {
+        let Some(mut conn) = redis_test_conn(2).await else {
+            return;
+        };
+        let state = state_with_redis(
+            vec![
+                make_endpoint("ri-remote-newer", Protocol::Anthropic),
+                make_endpoint("ri-remote-older", Protocol::Anthropic),
+                make_endpoint("ri-absent", Protocol::Anthropic),
+            ],
+            conn.clone(),
+        );
+        let now_epoch = AppState::now_epoch();
+
+        {
+            let mut info = state.endpoints[0].rate_info.write().await;
+            info.utilization = Some(0.10);
+            info.last_updated_epoch = Some(now_epoch - 300);
+        }
+        {
+            let mut info = state.endpoints[1].rate_info.write().await;
+            info.utilization = Some(0.20);
+            info.remaining_tokens = Some(777);
+            info.last_updated_epoch = Some(now_epoch);
+        }
+        {
+            let mut info = state.endpoints[2].rate_info.write().await;
+            info.utilization = Some(0.30);
+        }
+
+        let newer = serde_json::to_string(&remote_rate_info(now_epoch, 0.90)).unwrap();
+        let older = serde_json::to_string(&remote_rate_info(now_epoch - 600, 0.80)).unwrap();
+        let _: () = conn.set("alb:rate:ri-remote-newer", newer).await.unwrap();
+        let _: () = conn.set("alb:rate:ri-remote-older", older).await.unwrap();
+
+        state.sync_from_redis().await;
+
+        {
+            let info = state.endpoints[0].rate_info.read().await;
+            assert_eq!(info.utilization, Some(0.90), "newer remote must be applied");
+            assert_eq!(info.remaining_tokens, Some(22));
+            assert_eq!(
+                info.last_updated_epoch,
+                Some(now_epoch),
+                "local epoch must follow the remote updated_at"
+            );
+        }
+        {
+            let info = state.endpoints[1].rate_info.read().await;
+            assert_eq!(info.utilization, Some(0.20), "older remote must be ignored");
+            assert_eq!(info.remaining_tokens, Some(777));
+        }
+        assert_eq!(
+            state.endpoints[2].rate_info.read().await.utilization,
+            Some(0.30),
+            "absent key must not touch local rate info"
+        );
+    }
+
+    /// AC2 phase 3: published routing weights land in the gauge atomics;
+    /// a two-field CSV (older publisher) leaves the gate untouched;
+    /// malformed and absent values touch nothing.
+    #[tokio::test]
+    async fn sync_from_redis_applies_published_routing_weights() {
+        let Some(mut conn) = redis_test_conn(3).await else {
+            return;
+        };
+        let state = state_with_redis(
+            vec![
+                make_endpoint("w-full", Protocol::Anthropic),
+                make_endpoint("w-nogate", Protocol::Anthropic),
+                make_endpoint("w-bad", Protocol::Anthropic),
+                make_endpoint("w-absent", Protocol::Anthropic),
+            ],
+            conn.clone(),
+        );
+        for ep in &state.endpoints {
+            ep.last_routing_weight
+                .store(7.0f64.to_bits(), Ordering::Relaxed);
+            ep.last_routing_share
+                .store(7.0f64.to_bits(), Ordering::Relaxed);
+            ep.last_effective_gate
+                .store(7.0f64.to_bits(), Ordering::Relaxed);
+        }
+        let _: () = conn.set("alb:weight:w-full", "0.5,0.25,0.9").await.unwrap();
+        let _: () = conn.set("alb:weight:w-nogate", "0.5,0.25").await.unwrap();
+        let _: () = conn
+            .set("alb:weight:w-bad", "not,numbers,here")
+            .await
+            .unwrap();
+
+        state.sync_from_redis().await;
+
+        let read = |a: &AtomicU64| f64::from_bits(a.load(Ordering::Relaxed));
+        assert_eq!(read(&state.endpoints[0].last_routing_weight), 0.5);
+        assert_eq!(read(&state.endpoints[0].last_routing_share), 0.25);
+        assert_eq!(read(&state.endpoints[0].last_effective_gate), 0.9);
+
+        assert_eq!(read(&state.endpoints[1].last_routing_weight), 0.5);
+        assert_eq!(
+            read(&state.endpoints[1].last_effective_gate),
+            7.0,
+            "two-field CSV (older publisher) must leave the gate untouched"
+        );
+
+        for idx in [2, 3] {
+            assert_eq!(
+                read(&state.endpoints[idx].last_routing_weight),
+                7.0,
+                "malformed/absent weight value must touch nothing (endpoint {idx})"
+            );
+        }
+    }
+
+    /// AC3: the Lua CAS in signal_hard_limit_recovery. Contract: write the
+    /// clear sentinel when the key is absent or holds an expired epoch;
+    /// never clobber a live (future-epoch) hard limit that a concurrent
+    /// mark_hard_limited already wrote. The read side of the sentinel is
+    /// covered by the pure `classify_hard_limit_*` tests.
+    #[tokio::test]
+    async fn recovery_sentinel_cas_clears_stale_but_not_live_hard_limits() {
+        let Some(mut conn) = redis_test_conn(4).await else {
+            return;
+        };
+        let state = state_with_redis(vec![], conn.clone());
+        let key = "alb:hard:cas-ep";
+
+        // Absent key → sentinel written, with the sentinel TTL.
+        state.signal_hard_limit_recovery("cas-ep").await;
+        eventually("sentinel write on absent key", || {
+            let mut c = conn.clone();
+            async move {
+                c.get::<_, Option<u64>>(key).await.unwrap() == Some(HARD_LIMIT_CLEARED_SENTINEL)
+            }
+        })
+        .await;
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            (1..=HARD_LIMIT_SENTINEL_TTL_SECS as i64).contains(&ttl),
+            "sentinel must carry its TTL, got {ttl}"
+        );
+
+        // Expired epoch → CAS overwrites with the sentinel.
+        let _: () = conn.set(key, AppState::now_epoch() - 5).await.unwrap();
+        state.signal_hard_limit_recovery("cas-ep").await;
+        eventually("sentinel overwrite of expired epoch", || {
+            let mut c = conn.clone();
+            async move {
+                c.get::<_, Option<u64>>(key).await.unwrap() == Some(HARD_LIMIT_CLEARED_SENTINEL)
+            }
+        })
+        .await;
+
+        // Live future epoch (a concurrent mark_hard_limited won the race) →
+        // the CAS must refuse, preserving the newer hard limit.
+        let live = AppState::now_epoch() + 300;
+        let _: () = conn.set(key, live).await.unwrap();
+        state.signal_hard_limit_recovery("cas-ep").await;
+        // The write is fire-and-forget; give the spawned task time to land
+        // before asserting nothing changed.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            conn.get::<_, Option<u64>>(key).await.unwrap(),
+            Some(live),
+            "CAS must not clobber a live hard limit written concurrently"
+        );
+    }
+
+    /// AC4: INCRBY accumulates across replicas, EXPIRE is set, the shared
+    /// counter enforces budgets cluster-wide, and per-day keys make
+    /// yesterday's spend invisible today.
+    #[tokio::test]
+    async fn budget_incrby_accumulates_across_replicas_with_expiry() {
+        let Some(mut conn) = redis_test_conn(5).await else {
+            return;
+        };
+        let budgets: HashMap<String, u64> = [("budget-cli".to_string(), 1000u64)].into();
+        let replica_a = Arc::new(AppState {
+            client_budgets: budgets.clone(),
+            redis: Some(conn.clone()),
+            ..test_state_base()
+        });
+        let replica_b = Arc::new(AppState {
+            client_budgets: budgets,
+            redis: Some(conn.clone()),
+            ..test_state_base()
+        });
+
+        replica_a.record_budget_usage("budget-cli", 100).await;
+        replica_b.record_budget_usage("budget-cli", 250).await;
+
+        let today = AppState::now_epoch() / 86400;
+        let key = format!("alb:budget:budget-cli:{today}");
+        assert_eq!(
+            conn.get::<_, Option<u64>>(&key).await.unwrap(),
+            Some(350),
+            "INCRBY must accumulate across replicas"
+        );
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            (1..=172_800).contains(&ttl),
+            "budget key must carry an EXPIRE, got {ttl}"
+        );
+
+        // Cross-replica enforcement: a replica with a lower limit and NO
+        // local usage of its own sees the shared counter and refuses.
+        let enforcing = Arc::new(AppState {
+            client_budgets: [("budget-cli".to_string(), 300u64)].into(),
+            redis: Some(conn.clone()),
+            ..test_state_base()
+        });
+        assert_eq!(
+            enforcing.check_budget("budget-cli").await,
+            Err(0),
+            "shared counter (350) must gate a 300 limit on a replica that recorded nothing"
+        );
+        assert!(
+            replica_a.check_budget("budget-cli").await.is_ok(),
+            "350 used of 1000 must pass"
+        );
+
+        // Day rollover: yesterday's counter lives under a different key and
+        // must not gate today (complements budget_day_rollover_resets_counter).
+        let _: () = conn
+            .set(format!("alb:budget:roll-cli:{}", today - 1), 999_999u64)
+            .await
+            .unwrap();
+        let roll = Arc::new(AppState {
+            client_budgets: [("roll-cli".to_string(), 100u64)].into(),
+            redis: Some(conn.clone()),
+            ..test_state_base()
+        });
+        assert!(
+            roll.check_budget("roll-cli").await.is_ok(),
+            "yesterday's counter must not gate today"
+        );
+    }
+
+    /// AC4 failure path: INCRBY against a poisoned (non-integer) key fails;
+    /// record_budget_usage must DELETE the key — unblocking future INCRBYs —
+    /// while local state keeps enforcing for as long as the redis read path
+    /// errors.
+    #[tokio::test]
+    async fn budget_incrby_failure_deletes_key_and_local_fallback_enforces() {
+        let Some(mut conn) = redis_test_conn(6).await else {
+            return;
+        };
+        let state = Arc::new(AppState {
+            client_budgets: [("poison-cli".to_string(), 100u64)].into(),
+            redis: Some(conn.clone()),
+            ..test_state_base()
+        });
+        let today = AppState::now_epoch() / 86400;
+        let key = format!("alb:budget:poison-cli:{today}");
+        let _: () = conn.set(&key, "not-a-number").await.unwrap();
+
+        // While the redis value is unreadable, GET errors at the type layer
+        // and check_budget falls back to local state — which enforces.
+        state
+            .budget_usage
+            .lock()
+            .unwrap()
+            .insert("poison-cli".to_string(), (today, 150));
+        assert_eq!(
+            state.check_budget("poison-cli").await,
+            Err(0),
+            "local fallback must enforce while the redis value is unreadable"
+        );
+
+        // INCRBY fails on the poisoned key → key deleted, local still updated.
+        state.record_budget_usage("poison-cli", 10).await;
+        assert!(
+            !conn.exists::<_, bool>(&key).await.unwrap(),
+            "failed INCRBY must delete the poisoned key"
+        );
+        assert_eq!(
+            state
+                .budget_usage
+                .lock()
+                .unwrap()
+                .get("poison-cli")
+                .unwrap()
+                .1,
+            160,
+            "local accumulator must survive the redis failure"
+        );
+
+        // With the poison gone, the next INCRBY starts clean.
+        state.record_budget_usage("poison-cli", 5).await;
+        assert_eq!(conn.get::<_, Option<u64>>(&key).await.unwrap(), Some(5));
+
+        // Current contract, pinned deliberately: with redis reachable and the
+        // key rebuilt (5 < 100), the shared counter is authoritative and
+        // check_budget passes even though local memory says 165. The local
+        // count only gates when the redis read path errors.
+        assert!(state.check_budget("poison-cli").await.is_ok());
+    }
+
+    /// AC5: cluster_info's SCAN loop across multiple cursor pages. 500
+    /// heartbeat keys against COUNT 100 forces several SCAN round-trips on a
+    /// real backend — a pagination bug (e.g. stopping after the first page)
+    /// undercounts. Budget MGET aggregation is asserted in the same pass.
+    #[tokio::test]
+    async fn cluster_info_counts_heartbeats_across_multiple_scan_pages() {
+        let Some(mut conn) = redis_test_conn(7).await else {
+            return;
+        };
+        let mut pipe = redis::pipe();
+        for i in 0..500 {
+            pipe.cmd("SET")
+                .arg(format!("alb:heartbeat:{i}"))
+                .arg(1u8)
+                .ignore();
+        }
+        let _: () = pipe.query_async(&mut conn).await.unwrap();
+
+        let today = AppState::now_epoch() / 86400;
+        let _: () = conn
+            .set(format!("alb:budget:scan-cli:{today}"), 42u64)
+            .await
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            client_budgets: [("scan-cli".to_string(), 1000u64)].into(),
+            redis: Some(conn.clone()),
+            ..test_state_base()
+        });
+        let info = state.cluster_info().await.expect("cluster_info with redis");
+        assert_eq!(
+            info["replicas_seen"], 500,
+            "SCAN must count all heartbeat keys across cursor pages"
+        );
+        assert_eq!(info["redis_connected"], true);
+        assert_eq!(info["budget_usage"]["scan-cli"]["used"], 42);
+        assert_eq!(info["budget_usage"]["scan-cli"]["limit"], 1000);
+    }
+
+    /// AC5: pipelined HINCRBY folds deltas from multiple replicas into the
+    /// shared hash, drains the local accumulators, and both the write and
+    /// the idle tick refresh the TTL.
+    #[tokio::test]
+    async fn flush_transport_errors_hincrby_accumulates_across_replicas() {
+        let Some(mut conn) = redis_test_conn(8).await else {
+            return;
+        };
+        let replica_a = state_with_redis(vec![], conn.clone());
+        let replica_b = state_with_redis(vec![], conn.clone());
+        {
+            let mut m = replica_a.lock_transport_errors();
+            m.insert("connect", 3);
+        }
+        {
+            let mut m = replica_b.lock_transport_errors();
+            m.insert("connect", 2);
+            m.insert("timeout", 5);
+        }
+        replica_a.flush_transport_errors().await;
+        replica_b.flush_transport_errors().await;
+
+        let map: HashMap<String, u64> = conn.hgetall(TRANSPORT_ERRORS_KEY).await.unwrap();
+        assert_eq!(
+            map.get("connect"),
+            Some(&5),
+            "HINCRBY must fold deltas from both replicas"
+        );
+        assert_eq!(map.get("timeout"), Some(&5));
+        assert!(
+            replica_a.lock_transport_errors().is_empty(),
+            "flush must drain the local accumulator"
+        );
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(TRANSPORT_ERRORS_KEY)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            (1..=TRANSPORT_ERRORS_TTL_SECS as i64).contains(&ttl),
+            "flush must set the hash TTL, got {ttl}"
+        );
+
+        // An idle tick (no deltas) must still refresh the TTL so the
+        // fleet-wide hash never expires under healthy traffic.
+        let _: bool = conn.persist(TRANSPORT_ERRORS_KEY).await.unwrap();
+        replica_a.flush_transport_errors().await;
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(TRANSPORT_ERRORS_KEY)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(ttl > 0, "idle flush must refresh the TTL, got {ttl}");
+    }
+
+    /// AC5: HINCRBY failure re-queues the drained deltas locally
+    /// (documented at-least-once behaviour) instead of dropping the error
+    /// signal.
+    #[tokio::test]
+    async fn flush_transport_errors_requeues_deltas_when_redis_dies() {
+        let Some((conn, kill)) = proxied_conn(9).await else {
+            return;
+        };
+        let state = state_with_redis(vec![], conn);
+        {
+            let mut m = state.lock_transport_errors();
+            m.insert("reset", 4);
+        }
+        kill_proxy(kill).await;
+        state.flush_transport_errors().await;
+        assert_eq!(
+            state.lock_transport_errors().get("reset"),
+            Some(&4),
+            "failed flush must re-queue drained deltas for the next tick"
+        );
+    }
+
+    /// AC6: the SET NX EX probe lock grants one replica per endpoint+model
+    /// per interval; a second replica's probe is suppressed while the lock
+    /// is held, and a different model probes under its own lock.
+    #[tokio::test]
+    async fn probe_lock_grants_one_replica_per_endpoint_model() {
+        let Some(mut conn) = redis_test_conn(10).await else {
+            return;
+        };
+        let (mock_url, hits) = spawn_counting_upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let mk_replica = |file: &str, conn: redis::aio::ConnectionManager| {
+            Arc::new(AppState {
+                endpoints: vec![mk_endpoint_at("probe-ep", "sk-test", &mock_url)],
+                redis: Some(conn),
+                state_path: dir.path().join(file),
+                ..test_state_base()
+            })
+        };
+        let replica_a = mk_replica("a.json", conn.clone());
+        let replica_b = mk_replica("b.json", conn.clone());
+
+        replica_a.probe_endpoint(0, "claude-sonnet-4-5").await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "first replica must win the lock and probe"
+        );
+
+        replica_b.probe_endpoint(0, "claude-sonnet-4-5").await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "second replica must be suppressed by the held lock"
+        );
+        assert!(
+            conn.exists::<_, bool>("alb:probe:probe-ep:claude-sonnet-4-5")
+                .await
+                .unwrap(),
+            "probe lock key must exist while held"
+        );
+
+        replica_b.probe_endpoint(0, "claude-opus-4-6").await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a different model is a different lock and must probe"
+        );
+    }
+
+    /// AC6: fail-open contract — with Redis down the lock SET errors and the
+    /// probe proceeds anyway (a dead coordinator must not stop probing).
+    #[tokio::test]
+    async fn probe_lock_fails_open_when_redis_is_down() {
+        let Some((conn, kill)) = proxied_conn(11).await else {
+            return;
+        };
+        let (mock_url, hits) = spawn_counting_upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("failopen-ep", "sk-test", &mock_url)],
+            redis: Some(conn),
+            state_path: dir.path().join("s.json"),
+            ..test_state_base()
+        });
+        kill_proxy(kill).await;
+        state.probe_endpoint(0, "claude-sonnet-4-5").await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "redis down must fail open: probe anyway"
+        );
+    }
+
+    /// AC7: killing the backend mid-run degrades every coordination path to
+    /// local-only — no panics, budgets enforced from local state, cluster
+    /// info reports the outage. The `*_without_redis` tests cover the
+    /// cold-start absence case; this covers loss of an established backend.
+    #[tokio::test]
+    async fn backend_death_mid_run_degrades_to_local_only() {
+        let Some((conn, kill)) = proxied_conn(12).await else {
+            return;
+        };
+        let state = Arc::new(AppState {
+            endpoints: vec![make_endpoint("degrade-ep", Protocol::Anthropic)],
+            client_budgets: [("degrade-cli".to_string(), 100u64)].into(),
+            redis: Some(conn),
+            ..test_state_base()
+        });
+
+        // Healthy first: the shared counter works through the proxy.
+        state.record_budget_usage("degrade-cli", 50).await;
+        assert!(state.check_budget("degrade-cli").await.is_ok());
+
+        kill_proxy(kill).await;
+
+        // Budget: INCRBY and the follow-up DEL both fail; the local
+        // accumulator still advances (50+60=110) and check_budget falls back
+        // to it, refusing over-limit spend with redis dead.
+        state.record_budget_usage("degrade-cli", 60).await;
+        assert_eq!(
+            state.check_budget("degrade-cli").await,
+            Err(0),
+            "local fallback must enforce the budget with redis dead"
+        );
+
+        // The periodic sync tick and its sub-steps must not panic or hang.
+        state.sync_from_redis().await;
+        state.publish_routing_weights().await;
+        state.signal_hard_limit_recovery("degrade-ep").await;
+
+        let info = state
+            .cluster_info()
+            .await
+            .expect("cluster_info must still report with redis dead");
+        assert_eq!(
+            info["redis_connected"], false,
+            "cluster_info must surface the outage"
+        );
+    }
+}

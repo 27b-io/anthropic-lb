@@ -57,6 +57,21 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    services:
+      # Real backend for the redis_integration suite (LAB-931). Setting
+      # ALB_TEST_REDIS_URL below makes those tests PANIC (not skip) if the
+      # backend is unreachable — CI can never silently pass without it.
+      valkey:
+        image: valkey/valkey:8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      ALB_TEST_REDIS_URL: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
