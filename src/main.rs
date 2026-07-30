@@ -4164,10 +4164,19 @@ impl AppState {
                  (a configured allowed_client_betas REPLACES the default list — \
                  include the defaults plus the flags to permit)"
             );
-        } else {
+        }
+        // The repeat subset gets its own debug line even when the same call
+        // also carried a first sighting — every dropped flag leaves a log
+        // trace on every request it was dropped from (AC-12).
+        let repeats: Vec<&str> = truncated
+            .iter()
+            .filter(|f| !first_seen.contains(f))
+            .copied()
+            .collect();
+        if !repeats.is_empty() {
             debug!(
                 client_id,
-                flags = %truncated.join(","),
+                flags = %repeats.join(","),
                 "dropped client anthropic-beta flags (previously reported)"
             );
         }
