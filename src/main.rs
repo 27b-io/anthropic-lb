@@ -130,12 +130,16 @@ struct ResponseCacheConfig {
     op_timeout_ms: Option<u64>,
     /// Connection URL for backend = "redis" (redis:// or rediss://).
     redis_url: Option<String>,
-    /// API key for backend = "cachekitio". The API URL is fixed at
-    /// cachekit's default (api.cachekit.io) — deliberately no override knob:
-    /// an operator egress-URL switch on a proxy with an open SSRF audit
-    /// finding is negative-value optionality until a real self-hosted
-    /// deployment exists.
+    /// API key for backend = "cachekitio".
     api_key: Option<String>,
+    /// API URL override for backend = "cachekitio". Default:
+    /// https://api.cachekit.io. This knob was cut in the LAB-933 review as
+    /// YAGNI and reinstated for a named need: the first rollout targets the
+    /// cachekit DEV environment, which lives on a different hostname.
+    /// Operator config, same trust as endpoints[].base_url; cachekit's own
+    /// validator still enforces HTTPS and rejects private/loopback IPs
+    /// (SSRF guard — pinned by a test).
+    api_url: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -1132,9 +1136,18 @@ impl ResponseCache {
                     .api_key
                     .as_deref()
                     .ok_or("response_cache.api_key is required for backend = \"cachekitio\"")?;
+                let mut builder =
+                    cachekit::backend::cachekitio::CachekitIO::builder().api_key(api_key);
+                if let Some(url) = &cfg.api_url {
+                    // allow_custom_host is required for hosts outside
+                    // cachekit's built-in allow-list (api.cachekit.io /
+                    // api.staging.cachekit.io) — e.g. the dev environment.
+                    // The validator still enforces HTTPS and blocks
+                    // private/loopback IPs regardless.
+                    builder = builder.api_url(url).allow_custom_host(true);
+                }
                 std::sync::Arc::new(
-                    cachekit::backend::cachekitio::CachekitIO::builder()
-                        .api_key(api_key)
+                    builder
                         .build()
                         .map_err(|e| format!("response_cache cachekitio backend: {e}"))?,
                 )

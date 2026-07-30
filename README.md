@@ -537,6 +537,7 @@ backend = "redis"
 redis_url = "redis://10.0.0.5:6379/1"
 # backend = "cachekitio"
 # api_key = "ck_live_..."
+# api_url = "https://api.dev.cachekit.io"  # optional; default https://api.cachekit.io. HTTPS enforced, private/loopback IPs rejected at startup.
 
 # Hex-encoded 32-byte master key for client-side encryption (MANDATORY —
 # there is no plaintext mode). Generate: openssl rand -hex 32
