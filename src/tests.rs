@@ -15745,30 +15745,45 @@ async fn response_cache_skips_oversized_bodies() {
 // always sets it — see .github/workflows/ci.yml) can never skip silently.
 //
 // Isolation: each test owns a dedicated logical DB (the `/N` suffix in the
-// connection URL) and flushes it on connect, because the coordination keys
-// (`alb:hard:*`, `alb:transport_errors`, `alb:heartbeat:*`) are hardcoded
-// in production code and cannot be prefixed per-test. Never point
-// ALB_TEST_REDIS_URL at a Redis holding data you care about.
+// connection URL) and flushes it on connect, because ALL `alb:*`
+// coordination keys (hard/rate/weight/budget/probe/heartbeat/
+// transport_errors) are hardcoded in production code and cannot be
+// prefixed per-test. Never point ALB_TEST_REDIS_URL at a Redis holding
+// data you care about.
 mod redis_integration {
     use super::*;
     use redis::AsyncCommands;
 
     const TEST_REDIS_ENV: &str = "ALB_TEST_REDIS_URL";
 
+    /// Resolve the opt-in backend URL. None (with a SKIP notice) when the
+    /// env var is unset locally; PANICS when unset in CI (`CI` env present),
+    /// so no workflow — current or future — can green with this suite
+    /// silently skipped.
+    fn test_redis_url() -> Option<String> {
+        match std::env::var(TEST_REDIS_ENV) {
+            Ok(u) => Some(u),
+            Err(_) if std::env::var("CI").is_ok() => {
+                panic!(
+                    "CI run without {TEST_REDIS_ENV}: the redis_integration suite would \
+                     silently skip — wire a Redis/Valkey service into this workflow"
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "SKIP (redis integration): {TEST_REDIS_ENV} not set — no backend to test against"
+                );
+                None
+            }
+        }
+    }
+
     /// Connect to the opt-in test backend, selecting logical DB `db` and
     /// flushing it. Returns None (with a SKIP notice) when the env var is
     /// unset; panics when it is set but the backend is unreachable.
     /// `db` must be unique per test — logical DBs are the isolation unit.
     async fn redis_test_conn(db: u8) -> Option<redis::aio::ConnectionManager> {
-        let base = match std::env::var(TEST_REDIS_ENV) {
-            Ok(u) => u,
-            Err(_) => {
-                eprintln!(
-                    "SKIP (redis integration): {TEST_REDIS_ENV} not set — no backend to test against"
-                );
-                return None;
-            }
-        };
+        let base = test_redis_url()?;
         Some(connect_and_flush(&format!("{}/{db}", base.trim_end_matches('/'))).await)
     }
 
@@ -15837,15 +15852,7 @@ mod redis_integration {
         redis::aio::ConnectionManager,
         tokio::sync::oneshot::Sender<()>,
     )> {
-        let base = match std::env::var(TEST_REDIS_ENV) {
-            Ok(u) => u,
-            Err(_) => {
-                eprintln!(
-                    "SKIP (redis integration): {TEST_REDIS_ENV} not set — no backend to test against"
-                );
-                return None;
-            }
-        };
+        let base = test_redis_url()?;
         let target = base
             .trim_start_matches("redis://")
             .trim_end_matches('/')
@@ -15864,6 +15871,17 @@ mod redis_integration {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    /// Budget keys embed `now_epoch / 86400`, recomputed independently by
+    /// the test and each production call site — a UTC-midnight rollover
+    /// between the two computations splits the key and fails spuriously.
+    /// Park until the day is young enough that the test finishes inside it.
+    async fn avoid_utc_midnight() {
+        let into_day = AppState::now_epoch() % 86_400;
+        if into_day > 86_390 {
+            tokio::time::sleep(Duration::from_secs(86_400 - into_day + 1)).await;
+        }
+    }
+
     fn state_with_redis(
         endpoints: Vec<Endpoint>,
         conn: redis::aio::ConnectionManager,
@@ -15876,7 +15894,7 @@ mod redis_integration {
     }
 
     /// Poll until `check` passes — for asserting on fire-and-forget
-    /// tokio::spawn writes (sentinel CAS, weight publish).
+    /// tokio::spawn writes (the sentinel CAS).
     async fn eventually<F, Fut>(what: &str, mut check: F)
     where
         F: FnMut() -> Fut,
@@ -16000,7 +16018,7 @@ mod redis_integration {
             .expect("remote future epoch must apply a hard limit");
         let secs = until.saturating_duration_since(after).as_secs();
         assert!(
-            (60..=121).contains(&secs),
+            (115..=121).contains(&secs),
             "hl-apply should be limited ~120s, got {secs}s"
         );
 
@@ -16022,7 +16040,7 @@ mod redis_integration {
             .expect("local hard limit must survive an older remote");
         let secs = until.saturating_duration_since(after).as_secs();
         assert!(
-            secs > 400,
+            (595..=601).contains(&secs),
             "older remote (+60s) must not shorten the newer local limit (+600s), got {secs}s"
         );
 
@@ -16034,7 +16052,7 @@ mod redis_integration {
             .expect("newer remote must extend the local hard limit");
         let secs = until.saturating_duration_since(after).as_secs();
         assert!(
-            (400..=601).contains(&secs),
+            (595..=601).contains(&secs),
             "newer remote (+600s) must override the older local limit (+60s), got {secs}s"
         );
 
@@ -16194,8 +16212,9 @@ mod redis_integration {
             .await
             .unwrap();
         assert!(
-            (1..=HARD_LIMIT_SENTINEL_TTL_SECS as i64).contains(&ttl),
-            "sentinel must carry its TTL, got {ttl}"
+            (HARD_LIMIT_SENTINEL_TTL_SECS as i64 - 5..=HARD_LIMIT_SENTINEL_TTL_SECS as i64)
+                .contains(&ttl),
+            "sentinel must carry its full TTL (~{HARD_LIMIT_SENTINEL_TTL_SECS}s), got {ttl}"
         );
 
         // Expired epoch → CAS overwrites with the sentinel.
@@ -16232,6 +16251,7 @@ mod redis_integration {
         let Some(mut conn) = redis_test_conn(5).await else {
             return;
         };
+        avoid_utc_midnight().await;
         let budgets: HashMap<String, u64> = [("budget-cli".to_string(), 1000u64)].into();
         let replica_a = Arc::new(AppState {
             client_budgets: budgets.clone(),
@@ -16260,8 +16280,8 @@ mod redis_integration {
             .await
             .unwrap();
         assert!(
-            (1..=172_800).contains(&ttl),
-            "budget key must carry an EXPIRE, got {ttl}"
+            (172_700..=172_800).contains(&ttl),
+            "budget key must carry its full 48h EXPIRE, got {ttl}"
         );
 
         // Cross-replica enforcement: a replica with a lower limit and NO
@@ -16307,6 +16327,7 @@ mod redis_integration {
         let Some(mut conn) = redis_test_conn(6).await else {
             return;
         };
+        avoid_utc_midnight().await;
         let state = Arc::new(AppState {
             client_budgets: [("poison-cli".to_string(), 100u64)].into(),
             redis: Some(conn.clone()),
@@ -16355,7 +16376,10 @@ mod redis_integration {
         // key rebuilt (5 < 100), the shared counter is authoritative and
         // check_budget passes even though local memory says 165. The local
         // count only gates when the redis read path errors.
-        assert!(state.check_budget("poison-cli").await.is_ok());
+        assert!(
+            state.check_budget("poison-cli").await.is_ok(),
+            "deliberate pin: a reachable redis counter (5) is authoritative over larger local state (165)"
+        );
     }
 
     /// AC5: cluster_info's SCAN loop across multiple cursor pages. 500
@@ -16367,6 +16391,7 @@ mod redis_integration {
         let Some(mut conn) = redis_test_conn(7).await else {
             return;
         };
+        avoid_utc_midnight().await;
         let mut pipe = redis::pipe();
         for i in 0..500 {
             pipe.cmd("SET")
@@ -16436,8 +16461,9 @@ mod redis_integration {
             .await
             .unwrap();
         assert!(
-            (1..=TRANSPORT_ERRORS_TTL_SECS as i64).contains(&ttl),
-            "flush must set the hash TTL, got {ttl}"
+            (TRANSPORT_ERRORS_TTL_SECS as i64 - 100..=TRANSPORT_ERRORS_TTL_SECS as i64)
+                .contains(&ttl),
+            "flush must set the full hash TTL (~{TRANSPORT_ERRORS_TTL_SECS}s), got {ttl}"
         );
 
         // An idle tick (no deltas) must still refresh the TTL so the
@@ -16449,7 +16475,11 @@ mod redis_integration {
             .query_async(&mut conn)
             .await
             .unwrap();
-        assert!(ttl > 0, "idle flush must refresh the TTL, got {ttl}");
+        assert!(
+            (TRANSPORT_ERRORS_TTL_SECS as i64 - 100..=TRANSPORT_ERRORS_TTL_SECS as i64)
+                .contains(&ttl),
+            "idle flush must refresh the full TTL (~{TRANSPORT_ERRORS_TTL_SECS}s), got {ttl}"
+        );
     }
 
     /// AC5: HINCRBY failure re-queues the drained deltas locally
@@ -16540,6 +16570,12 @@ mod redis_integration {
             ..test_state_base()
         });
         kill_proxy(kill).await;
+        // Prove the backend is actually dead before probing — otherwise a
+        // silently-regressed kill_proxy would make hits==1 pass via the
+        // lock-acquired path instead of the fail-open path.
+        let mut dead = state.redis.clone().unwrap();
+        let ping: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut dead).await;
+        assert!(ping.is_err(), "proxy kill must sever the redis connection");
         state.probe_endpoint(0, "claude-sonnet-4-5").await;
         assert_eq!(
             hits.load(Ordering::SeqCst),
@@ -16557,6 +16593,7 @@ mod redis_integration {
         let Some((conn, kill)) = proxied_conn(12).await else {
             return;
         };
+        avoid_utc_midnight().await;
         let state = Arc::new(AppState {
             endpoints: vec![make_endpoint("degrade-ep", Protocol::Anthropic)],
             client_budgets: [("degrade-cli".to_string(), 100u64)].into(),
@@ -16580,7 +16617,10 @@ mod redis_integration {
             "local fallback must enforce the budget with redis dead"
         );
 
-        // The periodic sync tick and its sub-steps must not panic or hang.
+        // The periodic sync tick and the publish wrappers must return
+        // without hanging. (Their redis writes are fire-and-forget
+        // tokio::spawn tasks whose failures are swallowed by design — this
+        // asserts the synchronous paths, not the spawned writes.)
         state.sync_from_redis().await;
         state.publish_routing_weights().await;
         state.signal_hard_limit_recovery("degrade-ep").await;

@@ -103,11 +103,10 @@ kill "$(cat /tmp/alb-test-redis.pid)"
 > CI (which runs a Valkey service container, see `.github/workflows/ci.yml`)
 > can never skip them silently.
 
-Each test owns a dedicated logical DB (`SELECT 1`–`12`) because the
-coordination keys (`alb:transport_errors`, `alb:heartbeat:*`) are hardcoded
-in production code and cannot be prefixed per-test. Failure-path tests route
-the connection through an in-test killable TCP proxy to simulate the backend
-dying mid-run.
+Each test owns a dedicated logical DB (`SELECT 1`–`12`) because all `alb:*`
+coordination keys are hardcoded in production code and cannot be prefixed
+per-test. Failure-path tests route the connection through an in-test
+killable TCP proxy to simulate the backend dying mid-run.
 
 ---
 

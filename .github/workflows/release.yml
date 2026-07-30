@@ -16,6 +16,22 @@ jobs:
   validate:
     name: Validate
     runs-on: ubuntu-latest
+    services:
+      # Real backend for the redis_integration suite (LAB-931) — same block
+      # as ci.yml. With ALB_TEST_REDIS_URL set, those tests PANIC (not skip)
+      # if the backend is unreachable, so the release gate can never pass
+      # with the suite silently skipped.
+      valkey:
+        image: valkey/valkey:8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      ALB_TEST_REDIS_URL: redis://127.0.0.1:6379
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
