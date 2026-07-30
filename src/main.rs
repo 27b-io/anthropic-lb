@@ -8935,51 +8935,42 @@ async fn metrics_handler(
     // LAB-933/LAB-929 response cache counters (AC12 / LAB-929 AC4). Emitted
     // only when the cache is configured; `messages` and `count_tokens` are
     // separate series on the same metric names, distinguished by the
-    // `surface` label.
+    // `surface` label. Looped metric-major (header, then both surfaces'
+    // samples, then the next metric) so each family's samples stay
+    // contiguous — the exposition format requires all samples of one metric
+    // grouped together, and OpenMetrics-strict scrapers reject interleaving.
     if let Some(rc) = &state.response_cache {
-        let headers: [(&str, &str); 4] = [
+        type SurfaceCounter = fn(&ResponseCache, CacheSurface) -> &AtomicU64;
+        let series: [(&str, &str, SurfaceCounter); 4] = [
             (
                 "anthropic_response_cache_hits_total",
                 "Requests served from the response cache (no upstream call, no headroom burned)",
+                ResponseCache::hits_for,
             ),
             (
                 "anthropic_response_cache_misses_total",
                 "Opted-in cacheable requests that proceeded upstream on a cache miss",
+                ResponseCache::misses_for,
             ),
             (
                 "anthropic_response_cache_stores_total",
                 "2xx responses written to the response cache",
+                ResponseCache::stores_for,
             ),
             (
                 "anthropic_response_cache_errors_total",
                 "Response cache operations that failed or timed out (request failed open)",
+                ResponseCache::errors_for,
             ),
         ];
-        for (name, help) in headers {
+        for (name, help, counter_for) in series {
             prom_header(&mut buf, name, "counter", help);
-        }
-        for surface in [CacheSurface::Messages, CacheSurface::CountTokens] {
-            let series: [(&str, &AtomicU64); 4] = [
-                ("anthropic_response_cache_hits_total", rc.hits_for(surface)),
-                (
-                    "anthropic_response_cache_misses_total",
-                    rc.misses_for(surface),
-                ),
-                (
-                    "anthropic_response_cache_stores_total",
-                    rc.stores_for(surface),
-                ),
-                (
-                    "anthropic_response_cache_errors_total",
-                    rc.errors_for(surface),
-                ),
-            ];
-            for (name, counter) in series {
+            for surface in [CacheSurface::Messages, CacheSurface::CountTokens] {
                 prom_counter(
                     &mut buf,
                     name,
                     &[("surface", surface.label())],
-                    counter.load(Ordering::Relaxed),
+                    counter_for(rc, surface).load(Ordering::Relaxed),
                 );
             }
         }

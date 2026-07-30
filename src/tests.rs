@@ -15588,6 +15588,22 @@ async fn response_cache_count_tokens_metrics_exposed() {
     assert!(text.contains(r#"anthropic_response_cache_hits_total{surface="messages"} 0"#));
     assert!(text.contains(r#"anthropic_response_cache_misses_total{surface="messages"} 1"#));
     assert!(text.contains(r#"anthropic_response_cache_stores_total{surface="messages"} 1"#));
+
+    // Panel fix: the exposition format requires all samples of one metric
+    // grouped together (no other metric's lines interleaved) — assert both
+    // surfaces' `hits_total` samples are adjacent, not separated by
+    // misses/stores/errors lines from the metric-major/surface-minor loop.
+    let hits_lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("anthropic_response_cache_hits_total"))
+        .collect();
+    let all_lines: Vec<&str> = text.lines().collect();
+    let first_idx = all_lines.iter().position(|l| *l == hits_lines[0]).unwrap();
+    assert_eq!(
+        all_lines[first_idx + 1],
+        hits_lines[1],
+        "hits_total samples for both surfaces must be contiguous, not interleaved with other metrics"
+    );
 }
 
 // LAB-929 AC5: a dead cache backend fails open on the count_tokens path too
