@@ -15011,6 +15011,17 @@ async fn post_messages(addr: SocketAddr, client_id: &str, body: &str) -> reqwest
         .unwrap()
 }
 
+async fn post_count_tokens(addr: SocketAddr, client_id: &str, body: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages/count_tokens"))
+        .header("content-type", "application/json")
+        .header("x-client-id", client_id)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap()
+}
+
 // AC6: the key is a full-body canonical digest — same raw text in a
 // different structural position must produce a different key.
 #[test]
@@ -15026,19 +15037,19 @@ fn response_cache_key_differs_on_nested_structure() {
     .unwrap();
     let (fpa, fpsa) = content_fingerprints(&a);
     let (fpb, fpsb) = content_fingerprints(&b);
-    let ka = response_cache_key("m", &a, &headers, None, "c", &fpa, &fpsa);
-    let kb = response_cache_key("m", &b, &headers, None, "c", &fpb, &fpsb);
+    let ka = response_cache_key("m", &a, &headers, None, "c", &fpa, &fpsa, "messages");
+    let kb = response_cache_key("m", &b, &headers, None, "c", &fpb, &fpsb, "messages");
     assert_ne!(ka, kb, "structural difference must change the key");
 
     // Model and beta headers are key material too.
-    let ka2 = response_cache_key("m2", &a, &headers, None, "c", &fpa, &fpsa);
+    let ka2 = response_cache_key("m2", &a, &headers, None, "c", &fpa, &fpsa, "messages");
     assert_ne!(ka, ka2, "model must change the key");
     let mut beta_headers = hyper::HeaderMap::new();
     beta_headers.insert(
         "anthropic-beta",
         HeaderValue::from_static("context-1m-2025"),
     );
-    let ka3 = response_cache_key("m", &a, &beta_headers, None, "c", &fpa, &fpsa);
+    let ka3 = response_cache_key("m", &a, &beta_headers, None, "c", &fpa, &fpsa, "messages");
     assert_ne!(ka, ka3, "anthropic-beta must change the key");
 
     // Key format: hex digest only, never content (AC5).
@@ -15052,9 +15063,36 @@ fn response_cache_key_isolates_clients() {
     let headers = hyper::HeaderMap::new();
     let body: serde_json::Value = serde_json::from_str(CACHE_TEST_BODY).unwrap();
     let (fp, fps) = content_fingerprints(&body);
-    let ka = response_cache_key("test", &body, &headers, None, "client-a", &fp, &fps);
-    let kb = response_cache_key("test", &body, &headers, None, "client-b", &fp, &fps);
+    let ka = response_cache_key(
+        "test", &body, &headers, None, "client-a", &fp, &fps, "messages",
+    );
+    let kb = response_cache_key(
+        "test", &body, &headers, None, "client-b", &fp, &fps, "messages",
+    );
     assert_ne!(ka, kb);
+}
+
+// LAB-929 AC2/AC7: identical body posted to /v1/messages vs
+// /v1/messages/count_tokens must NOT collide — a client that counts before
+// sending (same model+messages to both endpoints) must never have one
+// surface's cached entry served back as the other's.
+#[test]
+fn response_cache_key_isolates_surface() {
+    let headers = hyper::HeaderMap::new();
+    let body: serde_json::Value = serde_json::from_str(CACHE_TEST_BODY).unwrap();
+    let (fp, fps) = content_fingerprints(&body);
+    let k_messages = response_cache_key("test", &body, &headers, None, "c", &fp, &fps, "messages");
+    let k_count_tokens = response_cache_key(
+        "test",
+        &body,
+        &headers,
+        None,
+        "c",
+        &fp,
+        &fps,
+        "count_tokens",
+    );
+    assert_ne!(k_messages, k_count_tokens);
 }
 
 #[test]
@@ -15302,7 +15340,7 @@ async fn response_cache_backend_sees_only_ciphertext() {
         .into_bytes(),
     };
     let key = "a".repeat(64);
-    rc.store("geo", &key, &entry).await;
+    rc.store("geo", &key, &entry, CacheSurface::Messages).await;
     assert_eq!(rc.stores.load(Ordering::Relaxed), 1, "store must succeed");
 
     let writes = backend.writes.lock().unwrap().clone();
@@ -15320,7 +15358,7 @@ async fn response_cache_backend_sees_only_ciphertext() {
 
     // Right key decrypts.
     let got = rc
-        .lookup("geo", &key)
+        .lookup("geo", &key, CacheSurface::Messages)
         .await
         .expect("right-key read must hit");
     assert_eq!(got.body, entry.body);
@@ -15335,7 +15373,10 @@ async fn response_cache_backend_sees_only_ciphertext() {
     )
     .unwrap();
     assert!(
-        rc_wrong.lookup("geo", &key).await.is_none(),
+        rc_wrong
+            .lookup("geo", &key, CacheSurface::Messages)
+            .await
+            .is_none(),
         "wrong-key read must not return plaintext"
     );
     assert_eq!(
@@ -15356,7 +15397,10 @@ async fn response_cache_backend_sees_only_ciphertext() {
     )
     .unwrap();
     assert!(
-        rc_other.lookup("other-client", &key).await.is_none(),
+        rc_other
+            .lookup("other-client", &key, CacheSurface::Messages)
+            .await
+            .is_none(),
         "cross-tenant read must not decrypt"
     );
 }
@@ -15440,6 +15484,146 @@ async fn response_cache_metrics_exposed() {
     assert!(text.contains(r#"anthropic_response_cache_errors_total{surface="messages"} 0"#));
 }
 
+// LAB-929 AC2: replaying an identical /v1/messages/count_tokens request is
+// served from cache (one upstream call); a differing body forwards again.
+#[tokio::test]
+async fn response_cache_count_tokens_hit_replays_without_upstream() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let (addr, hits, state) = serve_cache_app(backend, &["geo"]).await;
+
+    let first = post_count_tokens(addr, "geo", CACHE_TEST_BODY).await;
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    assert!(first.headers().get("x-alb-cache").is_none());
+
+    let second = post_count_tokens(addr, "geo", CACHE_TEST_BODY).await;
+    assert_eq!(second.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        second
+            .headers()
+            .get("x-alb-cache")
+            .map(|v| v.to_str().unwrap()),
+        Some("hit")
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "identical replay must not reach upstream"
+    );
+
+    // A differing body (different max_tokens) is a genuine miss.
+    let differing =
+        r#"{"model":"test","max_tokens":2,"messages":[{"role":"user","content":"hi"}]}"#;
+    let third = post_count_tokens(addr, "geo", differing).await;
+    assert_eq!(third.status(), reqwest::StatusCode::OK);
+    assert!(third.headers().get("x-alb-cache").is_none());
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "a differing body must forward upstream again"
+    );
+
+    let rc = state.response_cache.as_ref().unwrap();
+    assert_eq!(rc.count_tokens_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(rc.count_tokens_misses.load(Ordering::Relaxed), 2);
+    assert_eq!(rc.count_tokens_stores.load(Ordering::Relaxed), 2);
+    // The /v1/messages series must stay untouched by count_tokens traffic.
+    assert_eq!(rc.hits.load(Ordering::Relaxed), 0);
+    assert_eq!(rc.misses.load(Ordering::Relaxed), 0);
+}
+
+// LAB-929 AC2/AC7: a client that sends the SAME body to /v1/messages and
+// /v1/messages/count_tokens (a common pattern — count before you send) must
+// never have one surface's cached entry served back as the other's.
+#[tokio::test]
+async fn response_cache_messages_and_count_tokens_do_not_cross_serve() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let (addr, hits, state) = serve_cache_app(backend, &["geo"]).await;
+
+    let ct = post_count_tokens(addr, "geo", CACHE_TEST_BODY).await;
+    assert_eq!(ct.status(), reqwest::StatusCode::OK);
+    assert!(ct.headers().get("x-alb-cache").is_none());
+
+    // Byte-identical body to /v1/messages must still miss — not read back
+    // the count_tokens entry.
+    let msg = post_messages(addr, "geo", CACHE_TEST_BODY).await;
+    assert_eq!(msg.status(), reqwest::StatusCode::OK);
+    assert!(
+        msg.headers().get("x-alb-cache").is_none(),
+        "a /v1/messages request must never be served from the count_tokens entry"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "both surfaces must independently reach upstream"
+    );
+
+    let rc = state.response_cache.as_ref().unwrap();
+    assert_eq!(rc.count_tokens_stores.load(Ordering::Relaxed), 1);
+    assert_eq!(rc.stores.load(Ordering::Relaxed), 1);
+}
+
+// LAB-929 AC4: count_tokens and messages hits/misses/stores/errors are
+// separable series on /metrics via the `surface` label, sharing metric names.
+#[tokio::test]
+async fn response_cache_count_tokens_metrics_exposed() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let (addr, _hits, _state) = serve_cache_app(backend, &["geo"]).await;
+    post_count_tokens(addr, "geo", CACHE_TEST_BODY).await; // miss + store
+    post_count_tokens(addr, "geo", CACHE_TEST_BODY).await; // hit
+    post_messages(addr, "geo", CACHE_TEST_BODY).await; // separate surface: miss + store
+    let text = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains(r#"anthropic_response_cache_hits_total{surface="count_tokens"} 1"#),
+        "{text}"
+    );
+    assert!(text.contains(r#"anthropic_response_cache_misses_total{surface="count_tokens"} 1"#));
+    assert!(text.contains(r#"anthropic_response_cache_stores_total{surface="count_tokens"} 1"#));
+    assert!(text.contains(r#"anthropic_response_cache_hits_total{surface="messages"} 0"#));
+    assert!(text.contains(r#"anthropic_response_cache_misses_total{surface="messages"} 1"#));
+    assert!(text.contains(r#"anthropic_response_cache_stores_total{surface="messages"} 1"#));
+
+    // Panel fix: the exposition format requires all samples of one metric
+    // grouped together (no other metric's lines interleaved) — assert both
+    // surfaces' `hits_total` samples are adjacent, not separated by
+    // misses/stores/errors lines from the metric-major/surface-minor loop.
+    let hits_lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("anthropic_response_cache_hits_total"))
+        .collect();
+    let all_lines: Vec<&str> = text.lines().collect();
+    let first_idx = all_lines.iter().position(|l| *l == hits_lines[0]).unwrap();
+    assert_eq!(
+        all_lines[first_idx + 1],
+        hits_lines[1],
+        "hits_total samples for both surfaces must be contiguous, not interleaved with other metrics"
+    );
+}
+
+// LAB-929 AC5: a dead cache backend fails open on the count_tokens path too
+// — inherited from ResponseCache, no new failure handling.
+#[tokio::test]
+async fn response_cache_count_tokens_fails_open_on_backend_error() {
+    let backend = std::sync::Arc::new(ErroringBackend);
+    let (addr, hits, state) = serve_cache_app(backend, &["geo"]).await;
+    let resp = post_count_tokens(addr, "geo", CACHE_TEST_BODY).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "must fail open to upstream"
+    );
+    assert!(resp.headers().get("x-alb-cache").is_none());
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let rc = state.response_cache.as_ref().unwrap();
+    assert!(rc.count_tokens_errors.load(Ordering::Relaxed) >= 2);
+}
+
 // Metrics stay silent when the cache is not configured (no phantom series).
 #[tokio::test]
 async fn response_cache_metrics_absent_without_config() {
@@ -15470,6 +15654,7 @@ async fn response_cache_redis_backend_fails_open_when_down() {
         op_timeout_ms: Some(200),
         redis_url: Some("redis://127.0.0.1:1".to_string()),
         api_key: None,
+        api_url: None,
     };
     let rc = tokio::time::timeout(Duration::from_secs(10), ResponseCache::from_config(&cfg))
         .await
@@ -15477,15 +15662,20 @@ async fn response_cache_redis_backend_fails_open_when_down() {
         .expect("dead redis must not be a config error")
         .expect("allow-list is non-empty");
     let started = std::time::Instant::now();
-    assert!(rc.lookup("geo", &"a".repeat(64)).await.is_none());
+    assert!(rc
+        .lookup("geo", &"a".repeat(64), CacheSurface::Messages)
+        .await
+        .is_none());
     assert!(started.elapsed() < Duration::from_secs(5));
     assert!(rc.errors.load(Ordering::Relaxed) >= 1);
 }
 
-// AC11 (SaaS): CachekitIO backend constructs through the same config path
-// (fixed at cachekit's default HTTPS endpoint — there is deliberately no
-// api_url knob), and the SDK's SSRF guard holds: loopback/private hosts are
-// rejected even when a caller asks for a custom host (AC14 talking point).
+// AC11 (SaaS): CachekitIO backend constructs through the same config path,
+// with and without an api_url override (the override exists for the dev
+// environment, which is not on cachekit's built-in host allow-list), and the
+// SDK's SSRF guard holds through OUR config path: loopback/private hosts are
+// rejected at startup even though the override sets allow_custom_host
+// (AC14 talking point).
 #[tokio::test]
 async fn response_cache_cachekitio_backend_constructs_and_blocks_loopback() {
     let cfg = ResponseCacheConfig {
@@ -15496,18 +15686,45 @@ async fn response_cache_cachekitio_backend_constructs_and_blocks_loopback() {
         op_timeout_ms: Some(200),
         redis_url: None,
         api_key: Some("ck_test_dummy".to_string()),
+        api_url: None,
     };
     assert!(ResponseCache::from_config(&cfg).await.unwrap().is_some());
 
-    // The guard the config path relies on, exercised directly.
+    // Custom public host (the dev-environment shape) constructs.
+    let dev = ResponseCacheConfig {
+        api_url: Some("https://api.dev.cachekit.io".to_string()),
+        ..cfg.clone()
+    };
+    assert!(ResponseCache::from_config(&dev).await.unwrap().is_some());
+
+    // Loopback/private hosts fail startup loudly — through the config path.
+    let loopback = ResponseCacheConfig {
+        api_url: Some("https://127.0.0.1:9".to_string()),
+        ..cfg.clone()
+    };
     assert!(
-        cachekit::backend::cachekitio::CachekitIO::builder()
-            .api_key("ck_test_dummy")
-            .api_url("https://127.0.0.1:9")
-            .allow_custom_host(true)
-            .build()
-            .is_err(),
+        ResponseCache::from_config(&loopback).await.is_err(),
         "loopback api_url must be rejected by cachekit's SSRF guard"
+    );
+
+    // RFC1918 private hosts fail too — internal targets stay unreachable.
+    let private = ResponseCacheConfig {
+        api_url: Some("https://10.0.0.1:443".to_string()),
+        ..cfg.clone()
+    };
+    assert!(
+        ResponseCache::from_config(&private).await.is_err(),
+        "private-address api_url must be rejected by cachekit's SSRF guard"
+    );
+
+    // Plain HTTP fails too.
+    let http = ResponseCacheConfig {
+        api_url: Some("http://api.dev.cachekit.io".to_string()),
+        ..cfg
+    };
+    assert!(
+        ResponseCache::from_config(&http).await.is_err(),
+        "non-HTTPS api_url must be rejected"
     );
 }
 
@@ -15523,6 +15740,7 @@ async fn response_cache_config_validation() {
         op_timeout_ms: None,
         redis_url: None,
         api_key: None,
+        api_url: None,
     };
     assert!(
         ResponseCache::from_config(&base).await.is_err(),
@@ -15571,16 +15789,18 @@ async fn response_cache_cachekitio_live_round_trip() {
         "live-test",
         "fp",
         "fps",
+        "messages",
     );
     let entry = CachedResponse {
         status: 200,
         content_type: "application/json".into(),
         body: b"{\"live\":true}".to_vec(),
     };
-    rc.store("live-test", &key, &entry).await;
+    rc.store("live-test", &key, &entry, CacheSurface::Messages)
+        .await;
     assert_eq!(rc.stores.load(Ordering::Relaxed), 1, "live store failed");
     let got = rc
-        .lookup("live-test", &key)
+        .lookup("live-test", &key, CacheSurface::Messages)
         .await
         .expect("live read-back failed");
     assert_eq!(got.body, entry.body);
@@ -15595,15 +15815,24 @@ fn response_cache_key_varies_on_version_and_query() {
     let plain = hyper::HeaderMap::new();
     let mut versioned = hyper::HeaderMap::new();
     versioned.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-    let base = response_cache_key("m", &body, &plain, None, "c", &fp, &fps);
+    let base = response_cache_key("m", &body, &plain, None, "c", &fp, &fps, "messages");
     assert_ne!(
         base,
-        response_cache_key("m", &body, &versioned, None, "c", &fp, &fps),
+        response_cache_key("m", &body, &versioned, None, "c", &fp, &fps, "messages"),
         "anthropic-version must change the key"
     );
     assert_ne!(
         base,
-        response_cache_key("m", &body, &plain, Some("beta=true"), "c", &fp, &fps),
+        response_cache_key(
+            "m",
+            &body,
+            &plain,
+            Some("beta=true"),
+            "c",
+            &fp,
+            &fps,
+            "messages"
+        ),
         "URI query must change the key"
     );
 }
@@ -15688,7 +15917,15 @@ async fn response_cache_skips_oversized_bodies() {
         .header("content-type", "application/json")
         .body(Body::from(big.clone()))
         .unwrap();
-    let out = maybe_cache_store(&state, Some(&"a".repeat(64)), "geo", "rid", resp).await;
+    let key_a = "a".repeat(64);
+    let out = maybe_cache_store(
+        &state,
+        Some((key_a.as_str(), CacheSurface::Messages)),
+        "geo",
+        "rid",
+        resp,
+    )
+    .await;
     assert_eq!(out.status(), StatusCode::OK);
     let out_bytes = axum::body::to_bytes(out.into_body(), usize::MAX)
         .await
@@ -15716,7 +15953,15 @@ async fn response_cache_skips_oversized_bodies() {
         .header("content-type", "application/json")
         .body(Body::from(ok_body))
         .unwrap();
-    let _ = maybe_cache_store(&state, Some(&"b".repeat(64)), "geo", "rid", resp).await;
+    let key_b = "b".repeat(64);
+    let _ = maybe_cache_store(
+        &state,
+        Some((key_b.as_str(), CacheSurface::Messages)),
+        "geo",
+        "rid",
+        resp,
+    )
+    .await;
     assert_eq!(
         state
             .response_cache
