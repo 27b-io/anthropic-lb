@@ -2101,6 +2101,11 @@ const TRANSPORT_ERRORS_KEY: &str = "alb:transport_errors";
 /// orphaned key lingering forever after a permanent teardown.
 const TRANSPORT_ERRORS_TTL_SECS: u64 = 172_800;
 
+/// Expiry on `alb:budget:{client}:{day}` keys, refreshed on every INCRBY.
+/// 48h: a daily counter only needs to survive its own day plus enough slack
+/// for stats/aggregation to read yesterday; after two days it is garbage.
+const BUDGET_TTL_SECS: i64 = 172_800;
+
 /// Maximum request body size (25 MiB). Kept deliberately below Anthropic's own
 /// 32 MB Messages API request limit so multi-image/PDF payloads upstream would
 /// accept still pass. Aggregate concurrent-body memory is NOT this × N — that
@@ -5222,7 +5227,8 @@ impl AppState {
             let result: redis::RedisResult<u64> = conn.incr(&key, tokens).await;
             match result {
                 Ok(_) => {
-                    let expire_result: redis::RedisResult<bool> = conn.expire(&key, 172800).await;
+                    let expire_result: redis::RedisResult<bool> =
+                        conn.expire(&key, BUDGET_TTL_SECS).await;
                     if let Err(e) = expire_result {
                         tracing::warn!(error = %e, "redis EXPIRE failed for budget key");
                     }
