@@ -10125,6 +10125,20 @@ fn resolve_client_id_ignores_dash_header() {
 }
 
 #[test]
+fn resolve_client_id_ignores_reserved_operator_header() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let ip: IpAddr = "192.168.1.100".parse().unwrap();
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("x-client-id", HeaderValue::from_static("_operator"));
+
+    let resolved = state.resolve_client_id(&ip, &headers);
+    assert_eq!(
+        resolved, "-",
+        "a self-asserted _operator identity must not merge into the operator bucket"
+    );
+}
+
+#[test]
 fn compute_pressure_status_operator_always_healthy() {
     let state = Arc::new(AppState {
         client: Client::new(),
@@ -16282,7 +16296,7 @@ async fn native_surface_denies_restricted_client_sending_unparseable_body() {
 /// Untruncated it would be retained for the process lifetime and re-serialized
 /// into `/metrics` on every scrape.
 #[test]
-fn denied_model_label_and_body_are_truncated() {
+fn denied_model_label_is_truncated() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     let huge = "z".repeat(100_000);
     state.note_model_denied("limited", &huge);
@@ -16292,6 +16306,26 @@ fn denied_model_label_and_body_are_truncated() {
         label.chars().count() <= MAX_LABEL_CHARS + 1,
         "label not truncated: {} chars",
         label.chars().count()
+    );
+}
+
+/// The other half of the same guarantee: the 403 body echoes the denied model
+/// through `truncate_label`, so an oversized model field must not be reflected
+/// back untruncated.
+#[tokio::test]
+async fn denied_model_response_body_is_truncated() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    let huge = "z".repeat(100_000);
+    let err = state
+        .pre_request_gate("limited", &huge)
+        .await
+        .expect_err("oversized model must be denied");
+    let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).chars().count() < 1_000,
+        "403 body must not echo the untruncated model"
     );
 }
 
@@ -16498,6 +16532,13 @@ fn validate_clients_rejects_bad_names_and_empty_keys() {
         ("[[clients]]\nname = \"\"\nkey = \"k1\"\n", "name"),
         ("[[clients]]\nname = \"   \"\nkey = \"k1\"\n", "name"),
         ("[[clients]]\nname = \"-\"\nkey = \"k1\"\n", "sentinel"),
+        // Reserved: /_stats and /metrics rewrite operator identities to the
+        // literal "_operator", so a real tenant with that name would silently
+        // merge with the aggregated operator bucket.
+        (
+            "[[clients]]\nname = \"_operator\"\nkey = \"k1\"\n",
+            "_operator",
+        ),
         ("[[clients]]\nname = \"geo\"\nkey = \"\"\n", "key"),
         // Untrimmed: stored verbatim, so it would become a client_id matching
         // no client_budgets / operators / response_cache.clients key.
@@ -16768,6 +16809,24 @@ async fn all_four_auth_sites_reject_an_unknown_key() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // The bearer branch is reachable only on this surface — cover its reject
+    // path too: wrong key, bare scheme, and a valid key without the scheme.
+    for auth in ["Bearer key-wrong", "Bearer", "key-geo"] {
+        let resp = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .header("authorization", auth)
+            .body(r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "'{auth}' must not authenticate"
+        );
+    }
 }
 
 /// AC-11: the denial counter reaches /metrics under its documented name.

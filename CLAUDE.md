@@ -128,7 +128,7 @@ Routing consequences (`constraining_7d_claims`):
 | `clients[].name` | string | required | Identity the credential resolves to — becomes `client_id`, overriding `x-client-id` and `client_names` entirely |
 | `clients[].key` | string | required | Per-client secret (`x-api-key`; also `Authorization: Bearer` on `/v1/chat/completions`). Constant-time compared |
 | `clients[].models` | string[]? | [] (all) | Models this client may request; same exact + `*`-suffix matcher as `endpoints[].models`. Violation = 403 |
-| `proxy_key` | string? | none | **Legacy** single shared secret for `x-api-key` auth. Mutually exclusive with `[[clients]]` — both = startup panic |
+| `proxy_key` | string? | none | **Legacy** single shared secret for `x-api-key` auth. Mutually exclusive with `[[clients]]` — configuring both is rejected at startup |
 | `allowed_ips` | string[]? | none (allow all) | IP/CIDR allowlist |
 | `auto_cache` | bool? | true | Auto-inject prompt cache breakpoints |
 | `shadow_log` | string? | none | Path for JSONL audit trail |

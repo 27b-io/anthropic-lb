@@ -334,7 +334,9 @@ IP check runs first, then the credential check. Both apply to every route includ
 | `/_stats` | GET | JSON stats (utilization, tokens, budgets, live sessions) |
 | `/metrics` | GET | Prometheus-format metrics |
 
-All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
+All endpoints are gated by `[[clients]]` (or legacy `proxy_key`) and
+`allowed_ips` when configured. Any valid client credential grants access to
+`/_stats` and `/metrics` — they are not operator-scoped (see Known Limitations).
 
 ### Session context-window visibility
 

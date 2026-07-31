@@ -1656,7 +1656,10 @@ impl AppState {
         );
         if let Some(id) = headers.get("x-client-id").and_then(|v| v.to_str().ok()) {
             let id = id.trim();
-            if !id.is_empty() && id != "-" {
+            // "_operator" is the reserved operator-aggregation label on
+            // /_stats and /metrics — a self-asserted claim to it would merge
+            // this caller's usage into the hidden operator bucket.
+            if !id.is_empty() && id != "-" && id != "_operator" {
                 return id.to_string();
             }
         }
@@ -11391,6 +11394,12 @@ fn validate_clients(config: &Config) -> Result<(), String> {
         if c.name == "-" {
             return Err(
                 "client: name must not be \"-\" (the unknown-client sentinel — budget enforcement skips it)"
+                    .to_string(),
+            );
+        }
+        if c.name == "_operator" {
+            return Err(
+                "client: name must not be \"_operator\" (the reserved operator-aggregation label on /_stats and /metrics)"
                     .to_string(),
             );
         }
