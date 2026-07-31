@@ -10,23 +10,15 @@ rate_limit_cooldown_secs = 60
 probe_interval_secs = 300
 
 # ── Authentication ────────────────────────────────────────────────────
+# Full explanation: README "Authentication". Two mutually exclusive modes;
+# configuring both, or neither, is covered there.
 #
-# Two mutually exclusive modes. Configuring BOTH fails startup — see README
-# "Authentication".
-#
-# 1. [[clients]] (recommended): each caller gets its OWN key, and the matched
-#    entry's `name` becomes the request's client_id. The x-client-id header and
-#    the client_names IP map are then IGNORED — identity cannot be asserted by
-#    the caller. That makes client_budgets, client_utilization_limits,
-#    operators, the per-client model allow-list and the response-cache tenant
-#    all unspoofable, because every one of them keys on client_id.
-#
-#    Keys are compared in constant time. Generate one per client:
-#      openssl rand -hex 32
-#    SECRETS: like proxy_key and the endpoint tokens below, these are rendered
-#    from the secret store at deploy time — this example file holds only
-#    placeholders.
-#
+# [[clients]] — per-caller key; the matched entry's `name` becomes client_id,
+# so x-client-id and the client_names IP map are IGNORED. Generate keys with
+# `openssl rand -hex 32`; like proxy_key and the endpoint tokens below they are
+# rendered from the secret store at deploy time — placeholders only here.
+# Incompatible with `token = "passthrough"` endpoints (rejected at startup:
+# passthrough would forward these keys upstream).
 # [[clients]]
 # name = "geo-pipeline"
 # key = "<from secret store: openssl rand -hex 32>"
@@ -35,17 +27,10 @@ probe_interval_secs = 300
 # [[clients]]
 # name = "radar"
 # key = "<from secret store: openssl rand -hex 32>"
-#
-# 2. proxy_key (LEGACY): one shared secret for everyone, sent as x-api-key. It
-#    authenticates but does NOT identify — every caller presents the same string,
-#    so client_id still comes from the (client-asserted) x-client-id header and
-#    a per-client model allow-list would be defeated by editing one header.
-#    Migrate to [[clients]].
+
+# proxy_key — LEGACY single shared secret. Authenticates but does not identify.
+# Mutually exclusive with [[clients]]; omitting both leaves the proxy OPEN.
 # proxy_key = "your-secret-key-here"
-#
-# Omitting BOTH leaves the proxy open to anyone who can reach it — only do so
-# on a trusted private network, and note that allowed_ips below is likewise
-# unset-permissive.
 
 # IP allowlist: only accept connections from these IPs/CIDRs.
 # Supports individual IPs and CIDR ranges. Omit or leave empty to allow all.

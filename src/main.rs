@@ -424,6 +424,24 @@ const MAX_TRACKED_CLIENTS: usize = 10_000;
 /// Cap on distinct (client, model) labels in the allowlist-denial counter.
 /// The model half is caller-controlled; overflow buckets into `_other`.
 const MAX_MODEL_DENIED_LABELS: usize = 64;
+
+/// Max chars retained from a caller-controlled string used as a metric label
+/// or echoed in an error body. The model field is bounded only by the request
+/// body cap, so an untruncated copy would be retained for the process lifetime
+/// and re-serialized on every `/metrics` scrape.
+const MAX_LABEL_CHARS: usize = 64;
+
+/// Truncate a caller-controlled string to `MAX_LABEL_CHARS`, marking that it
+/// was cut so an operator does not read a clipped value as the literal input.
+/// Char-based, not byte-based: slicing a UTF-8 string mid-codepoint panics.
+fn truncate_label(s: &str) -> String {
+    if s.chars().count() <= MAX_LABEL_CHARS {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(MAX_LABEL_CHARS).collect();
+    out.push('…');
+    out
+}
 const TAU_6H: f64 = 21600.0;
 
 /// Per-account burn rate tracker: requests per minute at three time scales.
@@ -1529,11 +1547,19 @@ impl AppState {
 
     /// Constant-time lookup of a presented credential in the client table.
     ///
-    /// Scans the ENTIRE table with no early exit: `break`ing on the first hit
-    /// would leak, by response time, *which* client matched — and on a miss,
-    /// how far down the table a near-miss got. `ct_eq` itself is what stops the
-    /// per-byte prefix leak that `==` has (audit finding 4). Note `ct_eq`
-    /// short-circuits on unequal lengths; credential length is not a secret.
+    /// What this actually guarantees, precisely — do not read more into it:
+    /// `ct_eq` removes the per-byte prefix oracle that `==` has, which is the
+    /// leak that matters (it is what lets an attacker recover a key byte by
+    /// byte). Audit finding 4, closed.
+    ///
+    /// The full-table scan removes the coarse "how far down the table did we
+    /// get" signal. It does NOT make the whole function constant-time: the
+    /// `hit = Some(c)` store is a data-dependent branch the optimizer may
+    /// emit as one, and `ct_eq` short-circuits on unequal lengths. Both
+    /// residuals are a handful of instructions against milliseconds of network
+    /// and TLS jitter, and key length is not a secret — so neither is
+    /// exploitable remotely. Want the stronger property? Accumulate with
+    /// `subtle::Choice`; don't assume this already does.
     fn match_client(&self, presented: &str) -> Option<&ClientConfig> {
         let mut hit: Option<&ClientConfig> = None;
         for c in &self.clients {
@@ -1546,34 +1572,67 @@ impl AppState {
 
     /// Whether `client_id` may request `model` (LAB-1083).
     ///
-    /// Unknown client, or a client with an empty list, allows everything —
-    /// mirroring `Endpoint::serves_model`. "Unknown client" is only reachable
-    /// on the legacy path: with `[[clients]]` configured, `client_id` is always
-    /// a principal name, so there is no gap to slip through.
+    /// Unknown client, or a client with an empty list, allows everything.
+    /// "Unknown client" is only reachable on the legacy path: with
+    /// `[[clients]]` configured, `client_id` is always a principal name.
+    ///
+    /// FAILS CLOSED on an empty `model`, and this is the one place where the
+    /// shared matcher's semantics are deliberately NOT inherited. An empty
+    /// model means the caller's model is UNKNOWN to us — the body did not
+    /// parse as JSON, or it carries no top-level `model` (the batches API
+    /// nests it under `requests[].params.model`, and `proxy_handler` is the
+    /// catch-all route). For `Endpoint::serves_model` "unknown" rightly means
+    /// "don't narrow the routing pool"; for a policy gate it must mean
+    /// "deny", or a restricted client reaches any model by sending a body we
+    /// cannot read.
     fn client_allows_model(&self, client_id: &str, model: &str) -> bool {
         match self.clients.iter().find(|c| c.name == client_id) {
-            Some(c) => model_matches(&c.models, model),
+            Some(c) if c.models.is_empty() => true,
+            Some(c) => !model.is_empty() && model_matches(&c.models, model),
             None => true,
         }
     }
 
-    /// Count + log a model-allowlist denial. Model labels are bounded by
-    /// `_other` overflow (the model string is caller-controlled).
+    /// Count + log a model-allowlist denial.
+    ///
+    /// The model string is caller-controlled and bounded only by the request
+    /// body cap, so it is truncated BEFORE becoming a map key: an untruncated
+    /// label would be retained for the process lifetime and re-serialized into
+    /// the `/metrics` body on every scrape. Label COUNT is separately bounded
+    /// by `_other` overflow.
+    ///
+    /// Logs at `warn` the first time a (client, model) pair is denied and at
+    /// `debug` thereafter — a client hammering a denied model must not be able
+    /// to drive unbounded warn-level log volume. The counter still records
+    /// every denial. Mirrors the once-per-model pattern used for
+    /// unsupported-model warnings.
     fn note_model_denied(&self, client_id: &str, model: &str) {
+        let model = truncate_label(model);
+        let mut first_time = true;
         if let Ok(mut counts) = self.model_denied.lock() {
-            let key = (client_id.to_owned(), model.to_owned());
+            let key = (client_id.to_owned(), model.clone());
             let label = if counts.len() < MAX_MODEL_DENIED_LABELS || counts.contains_key(&key) {
                 key
             } else {
                 (client_id.to_owned(), "_other".to_owned())
             };
-            *counts.entry(label).or_insert(0) += 1;
+            let entry = counts.entry(label).or_insert(0);
+            first_time = *entry == 0;
+            *entry += 1;
         }
-        warn!(
-            client_id = %client_id,
-            model = %model,
-            "rejected: model not in client allow-list"
-        );
+        if first_time {
+            warn!(
+                client_id = %client_id,
+                model = %model,
+                "rejected: model not in client allow-list"
+            );
+        } else {
+            debug!(
+                client_id = %client_id,
+                model = %model,
+                "rejected: model not in client allow-list"
+            );
+        }
     }
 
     /// Resolve client identity: x-client-id header → IP map fallback → "-"
@@ -1583,7 +1642,18 @@ impl AppState {
     /// ONLY reached when no `[[clients]]` table is configured. Under
     /// `[[clients]]`, identity comes from the verified credential
     /// (`RequestContext::from_request`) and this client-asserted path is dead.
+    ///
+    /// The `debug_assert` is the choke point for that invariant. Nothing in the
+    /// type system stops a future handler from calling
+    /// `RequestContext::from_request(.., None)` and silently reinstating
+    /// header-asserted identity; this makes that mistake fail loudly in tests
+    /// and debug builds instead of quietly becoming an identity bypass.
     fn resolve_client_id(&self, ip: &IpAddr, headers: &hyper::HeaderMap) -> String {
+        debug_assert!(
+            self.clients.is_empty(),
+            "resolve_client_id reached with [[clients]] configured — a caller \
+             skipped the authenticated principal and identity is now spoofable"
+        );
         if let Some(id) = headers.get("x-client-id").and_then(|v| v.to_str().ok()) {
             let id = id.trim();
             if !id.is_empty() && id != "-" {
@@ -5541,11 +5611,19 @@ impl AppState {
         //    openai_chat_handler, so one placement covers both surfaces.
         if !self.client_allows_model(client_id, model) {
             self.note_model_denied(client_id, model);
-            return Err((
-                StatusCode::FORBIDDEN,
-                format!("client '{client_id}' is not permitted to use model '{model}'"),
-            )
-                .into_response());
+            // `model` is caller-controlled and echoed back — truncate it here
+            // too, so a 25 MB model field cannot become a 25 MB error body.
+            let body = if model.is_empty() {
+                format!(
+                    "client '{client_id}' has a model allow-list, but no model could be read from the request"
+                )
+            } else {
+                format!(
+                    "client '{client_id}' is not permitted to use model '{}'",
+                    truncate_label(model)
+                )
+            };
+            return Err((StatusCode::FORBIDDEN, body).into_response());
         }
 
         // 1. Daily token budget (existing)
@@ -11221,64 +11299,6 @@ async fn openai_chat_handler(
 /// Validate endpoint configuration. Returns the first hard error encountered.
 /// Soft warnings (non-canonical anthropic host, priority collision with an
 /// openai endpoint) are emitted as `warn!` and do not return an error.
-/// Startup validation for the `[[clients]]` registry (LAB-1083).
-///
-/// Every rule here exists because its violation fails SILENTLY at runtime
-/// rather than loudly: a duplicate key resolves to whichever entry the scan
-/// saw last, a duplicate or empty name silently merges two callers' budgets and
-/// cache tenancy, and a `[response_cache].clients` typo makes the cache inert
-/// for that client with no signal at all. Cheap to catch at boot; expensive to
-/// notice in production.
-fn validate_clients(
-    clients: &[ClientConfig],
-    response_cache: Option<&ResponseCacheConfig>,
-) -> Result<(), String> {
-    let mut seen_names: Vec<&str> = Vec::with_capacity(clients.len());
-    let mut seen_keys: Vec<&str> = Vec::with_capacity(clients.len());
-    for c in clients {
-        if c.name.trim().is_empty() {
-            return Err("client: name must not be empty".to_string());
-        }
-        if c.name == "-" {
-            return Err(
-                "client: name must not be \"-\" (the unknown-client sentinel — budget enforcement skips it)"
-                    .to_string(),
-            );
-        }
-        if c.key.is_empty() {
-            return Err(format!("client '{}': key must not be empty", c.name));
-        }
-        if seen_names.contains(&c.name.as_str()) {
-            return Err(format!("client '{}': duplicate name", c.name));
-        }
-        // Names, not keys, in the error — never log a credential.
-        if seen_keys.contains(&c.key.as_str()) {
-            return Err(format!(
-                "client '{}': duplicate key (already used by another client)",
-                c.name
-            ));
-        }
-        seen_names.push(&c.name);
-        seen_keys.push(&c.key);
-    }
-
-    // AC-6: one client registry, not two. Only enforceable when [[clients]] is
-    // configured — on the legacy path client ids are header-derived and there
-    // is no registry to check against.
-    if !clients.is_empty() {
-        if let Some(rc) = response_cache {
-            for name in &rc.clients {
-                if !seen_names.contains(&name.as_str()) {
-                    return Err(format!(
-                        "response_cache.clients: \"{name}\" names no configured [[clients]] entry"
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
     for ep in endpoints {
         if let Some(url) = ep.base_url.as_deref() {
@@ -11338,6 +11358,111 @@ fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
             anthropic = ?anthropic_at_lowest,
             "openai endpoint(s) share the lowest priority tier with anthropic endpoint(s) — paid OpenAI capacity will compete with free Anthropic capacity"
         );
+    }
+    Ok(())
+}
+
+/// Startup validation for the `[[clients]]` registry (LAB-1083).
+///
+/// Every rule here exists because its violation fails SILENTLY at runtime
+/// rather than loudly: a duplicate key resolves to whichever entry the scan
+/// saw last, a duplicate or empty name silently merges two callers' budgets and
+/// cache tenancy, and a `[response_cache].clients` typo makes the cache inert
+/// for that client with no signal at all. Cheap to catch at boot; expensive to
+/// notice in production.
+fn validate_clients(config: &Config) -> Result<(), String> {
+    let clients = &config.clients;
+    let mut seen_names: Vec<&str> = Vec::with_capacity(clients.len());
+    let mut seen_keys: Vec<&str> = Vec::with_capacity(clients.len());
+    for c in clients {
+        if c.name.trim().is_empty() {
+            return Err("client: name must not be empty".to_string());
+        }
+        // Stored untrimmed, so " geo" would become a client_id that matches no
+        // `client_budgets` / `operators` / `[response_cache].clients` key —
+        // silently unenforced budget and cache tenancy. `resolve_client_id`
+        // trims its header input; this path has nothing to trim it later.
+        if c.name != c.name.trim() {
+            return Err(format!(
+                "client '{}': name must not have leading or trailing whitespace",
+                c.name
+            ));
+        }
+        if c.name == "-" {
+            return Err(
+                "client: name must not be \"-\" (the unknown-client sentinel — budget enforcement skips it)"
+                    .to_string(),
+            );
+        }
+        if c.key.is_empty() {
+            return Err(format!("client '{}': key must not be empty", c.name));
+        }
+        if seen_names.contains(&c.name.as_str()) {
+            return Err(format!("client '{}': duplicate name", c.name));
+        }
+        // Names, not keys, in the error — never log a credential.
+        if seen_keys.contains(&c.key.as_str()) {
+            return Err(format!(
+                "client '{}': duplicate key (already used by another client)",
+                c.name
+            ));
+        }
+        seen_names.push(&c.name);
+        seen_keys.push(&c.key);
+    }
+
+    // One client registry, not five. Every one of these config surfaces keys on
+    // a client name, and every one of them fails SILENTLY on a typo — in the
+    // dangerous direction: `check_budget` and `check_utilization_limit` both
+    // return Ok(()) for an unknown client, so a mistyped budget means UNLIMITED
+    // spend against the operator's accounts with no log line and no metric; a
+    // mistyped `operators` entry silently gates the caller it was meant to
+    // exempt; a mistyped `response_cache.clients` entry silently makes the
+    // cache inert. Only enforceable when [[clients]] is configured — on the
+    // legacy path client ids are header-derived and there is no registry to
+    // check against.
+    if clients.is_empty() {
+        return Ok(());
+    }
+
+    // `token = "passthrough"` forwards the caller's auth headers to the
+    // upstream UNTOUCHED (`inject_account_auth` returns before the
+    // header-strip). Under [[clients]] the caller's `x-api-key` is its PROXY
+    // credential, not an upstream one — so the two modes together would
+    // transmit every client key verbatim to that endpoint's `base_url`. They
+    // are contradictory by construction: passthrough means "the caller brings
+    // its own upstream credential", [[clients]] means "that header is mine".
+    // Reject rather than half-handle, exactly as with proxy_key above.
+    if let Some(ep) = config.endpoints.iter().find(|e| e.token == "passthrough") {
+        return Err(format!(
+            "endpoint '{}': token = \"passthrough\" is incompatible with [[clients]] — passthrough forwards the caller's auth headers upstream, which would leak client keys to {}",
+            ep.name,
+            ep.base_url.as_deref().unwrap_or("https://api.anthropic.com")
+        ));
+    }
+
+    let known = |name: &str| seen_names.contains(&name);
+    for (surface, name) in std::iter::empty()
+        .chain(config.client_budgets.keys().map(|k| ("client_budgets", k)))
+        .chain(
+            config
+                .client_utilization_limits
+                .keys()
+                .map(|k| ("client_utilization_limits", k)),
+        )
+        .chain(config.operators.iter().map(|k| ("operators", k)))
+        .chain(
+            config
+                .response_cache
+                .iter()
+                .flat_map(|rc| rc.clients.iter().map(|k| ("response_cache.clients", k))),
+        )
+    {
+        if !known(name) {
+            return Err(format!(
+                "{surface}: \"{name}\" names no configured [[clients]] entry"
+            ));
+        }
     }
     Ok(())
 }
@@ -11403,7 +11528,7 @@ async fn main() {
     if let Err(msg) = validate_endpoints(&config.endpoints) {
         panic!("{msg}");
     }
-    if let Err(msg) = validate_clients(&config.clients, config.response_cache.as_ref()) {
+    if let Err(msg) = validate_clients(&config) {
         panic!("config: {msg}");
     }
 

@@ -16168,20 +16168,29 @@ fn open_proxy_authenticates_every_request() {
 
 // ── AC-7 / AC-8: the allow-list and its shared matcher ──
 
+/// `serves_model` delegates to `model_matches`, so asserting the two agree
+/// would be `A == A`. Pin the concrete wildcard semantics instead — including
+/// the empty-model ALLOW, which is correct for routing (don't narrow the pool
+/// on an unknown model) and is deliberately NOT what the client allow-list
+/// does.
 #[test]
-fn model_matches_is_the_matcher_behind_serves_model() {
+fn endpoint_model_matcher_semantics() {
     let mut ep = mk_endpoint("a", "sk-ant-api-x");
     ep.models = vec![
         "claude-haiku-*".to_string(),
         "claude-sonnet-4-6".to_string(),
     ];
-    for model in ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-5", ""] {
-        assert_eq!(
-            ep.serves_model(model),
-            model_matches(&ep.models, model),
-            "serves_model and model_matches disagree on '{model}'"
-        );
-    }
+    assert!(ep.serves_model("claude-haiku-4-5"), "wildcard hit");
+    assert!(ep.serves_model("claude-sonnet-4-6"), "exact hit");
+    assert!(!ep.serves_model("claude-opus-5"), "miss");
+    assert!(
+        !ep.serves_model("claude-sonnet-4-6-x"),
+        "exact is not a prefix"
+    );
+    assert!(ep.serves_model(""), "unknown model must not narrow routing");
+
+    ep.models.clear();
+    assert!(ep.serves_model("claude-opus-5"), "empty list = all models");
 }
 
 #[test]
@@ -16203,14 +16212,103 @@ fn client_allow_list_hit_miss_wildcard_and_empty() {
     assert!(state.client_allows_model("unlimited", "claude-opus-5"));
     // unknown client (legacy path only) = all models
     assert!(state.client_allows_model("-", "claude-opus-5"));
-    // an empty model (e.g. an unparseable body) is not a denial
-    assert!(state.client_allows_model("limited", ""));
+}
+
+/// The allow-list must FAIL CLOSED on an unreadable model.
+///
+/// `proxy_handler` sets `model = ""` whenever the body does not parse as JSON,
+/// and only ever reads a TOP-LEVEL `model` key — so a request to a route that
+/// nests it (`/v1/messages/batches` puts it under `requests[].params.model`),
+/// or any body the parser rejects, arrives at the gate with no model. If that
+/// allowed, a client restricted to haiku would reach opus by sending a body we
+/// cannot read. The endpoint matcher's empty-allows-all is right for routing
+/// and wrong here; this test is the line between them.
+#[test]
+fn client_allow_list_denies_an_unreadable_model() {
+    let state = state_with_clients(vec![
+        mk_client("limited", "k1", &["claude-haiku-*"]),
+        mk_client("unlimited", "k2", &[]),
+    ]);
+    assert!(
+        !state.client_allows_model("limited", ""),
+        "a client WITH an allow-list must be denied when the model is unknown"
+    );
+    assert!(
+        state.client_allows_model("unlimited", ""),
+        "a client with no allow-list is unaffected — nothing to enforce"
+    );
+}
+
+#[tokio::test]
+async fn gate_denies_unreadable_model_for_restricted_client() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    let err = state
+        .pre_request_gate("limited", "")
+        .await
+        .expect_err("unknown model must be denied for a restricted client");
+    assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("no model could be read"),
+        "body should explain the empty-model denial, got: {text}"
+    );
+}
+
+/// End-to-end proof of the same thing: an unparseable body must not smuggle a
+/// restricted client past its allow-list.
+#[tokio::test]
+async fn native_surface_denies_restricted_client_sending_unparseable_body() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = authed_app(
+        &mock_url,
+        vec![mk_client("limited", "key-limited", &["claude-haiku-*"])],
+    );
+    let addr = serve(app).await;
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "key-limited")
+        .body("this is not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+/// The model string is caller-controlled and bounded only by the body cap.
+/// Untruncated it would be retained for the process lifetime and re-serialized
+/// into `/metrics` on every scrape.
+#[test]
+fn denied_model_label_and_body_are_truncated() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    let huge = "z".repeat(100_000);
+    state.note_model_denied("limited", &huge);
+    let counts = state.model_denied.lock().unwrap();
+    let (_, label) = counts.keys().next().unwrap();
+    assert!(
+        label.chars().count() <= MAX_LABEL_CHARS + 1,
+        "label not truncated: {} chars",
+        label.chars().count()
+    );
+}
+
+/// Truncation is char-based: slicing a multi-byte string on a byte boundary
+/// would panic.
+#[test]
+fn truncate_label_handles_multibyte_without_panicking() {
+    let s = "é".repeat(200);
+    let out = truncate_label(&s);
+    assert!(out.chars().count() <= MAX_LABEL_CHARS + 1);
+    assert_eq!(truncate_label("short"), "short");
 }
 
 // ── AC-9 / AC-10: enforcement in pre_request_gate ──
 
 #[tokio::test]
-async fn gate_denies_model_outside_client_allow_list_with_403() {
+async fn gate_denies_model_outside_client_allow_list_with_403_naming_both() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     let err = state
         .pre_request_gate("limited", "claude-opus-5")
@@ -16221,15 +16319,6 @@ async fn gate_denies_model_outside_client_allow_list_with_403() {
         StatusCode::FORBIDDEN,
         "policy denial is 403, not 429 — 429 means 'retry later', which this never becomes"
     );
-}
-
-#[tokio::test]
-async fn gate_403_body_names_the_client_and_the_model() {
-    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
-    let err = state
-        .pre_request_gate("limited", "claude-opus-5")
-        .await
-        .unwrap_err();
     let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
         .await
         .unwrap();
@@ -16374,14 +16463,28 @@ key = "key-radar"
     );
 }
 
+/// Build a `Config` from a TOML fragment. Goes through the real deserializer,
+/// so these tests also pin the config surface, and it beats hand-writing
+/// ~30-field `Config` / 7-field `ResponseCacheConfig` literals per case.
+fn cfg(fragment: &str) -> Config {
+    toml::from_str(&format!("listen = \"127.0.0.1:0\"\n{fragment}"))
+        .unwrap_or_else(|e| panic!("test config parse error: {e}\n---\n{fragment}"))
+}
+
+const RC_BLOCK: &str = "\n[response_cache]\nbackend = \"redis\"\nredis_url = \"redis://localhost\"\nmaster_key = \"0000000000000000000000000000000000000000000000000000000000000000\"\n";
+
 #[test]
 fn validate_clients_rejects_duplicate_names_and_keys() {
-    let dup_name = vec![mk_client("geo", "k1", &[]), mk_client("geo", "k2", &[])];
-    let err = validate_clients(&dup_name, None).unwrap_err();
+    let err = validate_clients(&cfg(
+        "[[clients]]\nname = \"geo\"\nkey = \"k1\"\n\n[[clients]]\nname = \"geo\"\nkey = \"k2\"\n",
+    ))
+    .unwrap_err();
     assert!(err.contains("duplicate name"), "{err}");
 
-    let dup_key = vec![mk_client("geo", "k1", &[]), mk_client("radar", "k1", &[])];
-    let err = validate_clients(&dup_key, None).unwrap_err();
+    let err = validate_clients(&cfg(
+        "[[clients]]\nname = \"geo\"\nkey = \"k1\"\n\n[[clients]]\nname = \"radar\"\nkey = \"k1\"\n",
+    ))
+    .unwrap_err();
     assert!(err.contains("duplicate key"), "{err}");
     assert!(
         !err.contains("k1"),
@@ -16390,78 +16493,113 @@ fn validate_clients_rejects_duplicate_names_and_keys() {
 }
 
 #[test]
-fn validate_clients_rejects_empty_and_sentinel_names_and_empty_keys() {
-    assert!(validate_clients(&[mk_client("", "k1", &[])], None)
-        .unwrap_err()
-        .contains("name"));
-    assert!(validate_clients(&[mk_client("   ", "k1", &[])], None)
-        .unwrap_err()
-        .contains("name"));
-    assert!(validate_clients(&[mk_client("-", "k1", &[])], None)
-        .unwrap_err()
-        .contains("sentinel"));
-    assert!(validate_clients(&[mk_client("geo", "", &[])], None)
-        .unwrap_err()
-        .contains("key"));
+fn validate_clients_rejects_bad_names_and_empty_keys() {
+    for (fragment, needle) in [
+        ("[[clients]]\nname = \"\"\nkey = \"k1\"\n", "name"),
+        ("[[clients]]\nname = \"   \"\nkey = \"k1\"\n", "name"),
+        ("[[clients]]\nname = \"-\"\nkey = \"k1\"\n", "sentinel"),
+        ("[[clients]]\nname = \"geo\"\nkey = \"\"\n", "key"),
+        // Untrimmed: stored verbatim, so it would become a client_id matching
+        // no client_budgets / operators / response_cache.clients key.
+        ("[[clients]]\nname = \" geo\"\nkey = \"k1\"\n", "whitespace"),
+        ("[[clients]]\nname = \"geo \"\nkey = \"k1\"\n", "whitespace"),
+    ] {
+        let err = validate_clients(&cfg(fragment)).unwrap_err();
+        assert!(err.contains(needle), "expected '{needle}' in: {err}");
+    }
 }
 
 #[test]
 fn validate_clients_accepts_a_well_formed_table() {
-    let clients = vec![
-        mk_client("geo", "k1", &["claude-haiku-*"]),
-        mk_client("radar", "k2", &[]),
-    ];
-    assert!(validate_clients(&clients, None).is_ok());
+    assert!(validate_clients(&cfg(
+        "[[clients]]\nname = \"geo\"\nkey = \"k1\"\nmodels = [\"claude-haiku-*\"]\n\n[[clients]]\nname = \"radar\"\nkey = \"k2\"\n",
+    ))
+    .is_ok());
 }
 
-/// AC-6 — one client registry. A `[response_cache].clients` typo used to
-/// silently make the cache inert for that client; now it fails startup.
+/// One client registry, not five. Each of these config surfaces keys on a
+/// client name and each fails SILENTLY on a typo — a mistyped budget means
+/// UNLIMITED spend (`check_budget` returns Ok for an unknown client), a
+/// mistyped operator silently gates the caller it meant to exempt, a mistyped
+/// cache client silently disables the cache.
 #[test]
-fn validate_clients_rejects_response_cache_client_that_names_no_client() {
-    let clients = vec![mk_client("geo", "k1", &[])];
-    let rc = ResponseCacheConfig {
-        clients: vec!["geo-pipeline".to_string()],
-        backend: "redis".to_string(),
-        master_key: "00".repeat(32),
-        ttl_secs: None,
-        op_timeout_ms: None,
-        redis_url: Some("redis://localhost".to_string()),
-        api_key: None,
-    };
-    let err = validate_clients(&clients, Some(&rc)).unwrap_err();
-    assert!(err.contains("geo-pipeline"), "{err}");
-    assert!(err.contains("response_cache.clients"), "{err}");
+fn validate_clients_rejects_any_surface_naming_no_configured_client() {
+    // NOTE: top-level scalars/arrays must precede the first table header —
+    // a bare `operators = [...]` written after `[[clients]]` binds to that
+    // table instead and is silently dropped, making the test pass vacuously.
+    let base = "\n[[clients]]\nname = \"geo\"\nkey = \"k1\"\n";
+    for (fragment, surface) in [
+        (
+            format!("{base}\n[client_budgets]\ngeo-pipeline = 100\n"),
+            "client_budgets",
+        ),
+        (
+            format!("{base}\n[client_utilization_limits]\ngeo-pipeline = 0.5\n"),
+            "client_utilization_limits",
+        ),
+        (
+            format!("operators = [\"geo-pipeline\"]\n{base}"),
+            "operators",
+        ),
+        (
+            format!("{base}{RC_BLOCK}clients = [\"geo-pipeline\"]\n"),
+            "response_cache.clients",
+        ),
+    ] {
+        let err = validate_clients(&cfg(&fragment)).unwrap_err();
+        assert!(err.contains(surface), "expected '{surface}' in: {err}");
+        assert!(err.contains("geo-pipeline"), "must name the typo: {err}");
+    }
 }
 
 #[test]
-fn validate_clients_accepts_response_cache_client_that_names_a_client() {
-    let clients = vec![mk_client("geo", "k1", &[])];
-    let rc = ResponseCacheConfig {
-        clients: vec!["geo".to_string()],
-        backend: "redis".to_string(),
-        master_key: "00".repeat(32),
-        ttl_secs: None,
-        op_timeout_ms: None,
-        redis_url: Some("redis://localhost".to_string()),
-        api_key: None,
-    };
-    assert!(validate_clients(&clients, Some(&rc)).is_ok());
+fn validate_clients_accepts_every_surface_naming_a_configured_client() {
+    let fragment = format!(
+        "operators = [\"geo\"]\n\n[[clients]]\nname = \"geo\"\nkey = \"k1\"\n\n[client_budgets]\ngeo = 100\n\n[client_utilization_limits]\ngeo = 0.5\n{RC_BLOCK}clients = [\"geo\"]\n"
+    );
+    let parsed = cfg(&fragment);
+    // Guard against the vacuous-pass trap above: assert the fragment really
+    // populated all four surfaces before asserting validation accepts them.
+    assert_eq!(parsed.operators, vec!["geo".to_string()]);
+    assert!(parsed.client_budgets.contains_key("geo"));
+    assert!(parsed.client_utilization_limits.contains_key("geo"));
+    assert_eq!(
+        parsed.response_cache.as_ref().unwrap().clients,
+        vec!["geo".to_string()]
+    );
+    assert!(validate_clients(&parsed).is_ok());
 }
 
-/// On the legacy path there is no registry to check against, so the
-/// cross-check must not fire and break existing configs.
+/// On the legacy path there is no registry to check against, so none of the
+/// cross-checks may fire — existing configs must keep booting.
 #[test]
-fn validate_clients_skips_response_cache_crosscheck_without_a_client_table() {
-    let rc = ResponseCacheConfig {
-        clients: vec!["anything".to_string()],
-        backend: "redis".to_string(),
-        master_key: "00".repeat(32),
-        ttl_secs: None,
-        op_timeout_ms: None,
-        redis_url: Some("redis://localhost".to_string()),
-        api_key: None,
-    };
-    assert!(validate_clients(&[], Some(&rc)).is_ok());
+fn validate_clients_skips_all_crosschecks_without_a_client_table() {
+    let fragment = format!(
+        "operators = [\"anything\"]\n\n[client_budgets]\nanything = 100\n{RC_BLOCK}clients = [\"anything\"]\n"
+    );
+    assert!(validate_clients(&cfg(&fragment)).is_ok());
+}
+
+/// `passthrough` forwards the caller's auth headers upstream untouched. Under
+/// `[[clients]]` those headers carry the client's PROXY key, so the two modes
+/// together would transmit every client key to the upstream.
+#[test]
+fn validate_clients_rejects_passthrough_endpoint_alongside_clients() {
+    let err = validate_clients(&cfg(
+        "[[clients]]\nname = \"geo\"\nkey = \"k1\"\n\n[[endpoints]]\nname = \"managed\"\ntoken = \"passthrough\"\n",
+    ))
+    .unwrap_err();
+    assert!(err.contains("passthrough"), "{err}");
+    assert!(err.contains("managed"), "must name the endpoint: {err}");
+}
+
+/// …but passthrough on the legacy path is untouched.
+#[test]
+fn validate_clients_allows_passthrough_without_a_client_table() {
+    assert!(validate_clients(&cfg(
+        "[[endpoints]]\nname = \"managed\"\ntoken = \"passthrough\"\n",
+    ))
+    .is_ok());
 }
 
 // ── AC-4: the response-cache tenant follows the authenticated principal ──

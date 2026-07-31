@@ -257,7 +257,9 @@ Claude Code sends it as `x-api-key`; the proxy validates it and swaps in the rea
 > [!IMPORTANT]
 > With `[[clients]]` configured, **`x-client-id` and the `client_names` IP map are ignored entirely** — `client_id` comes from the verified credential. That is what makes per-client budgets, utilization ceilings, operator status, model allow-lists and response-cache tenancy enforceable rather than advisory: all five key on `client_id`.
 
-Keys are compared in constant time against the whole table. Duplicate names, duplicate keys, and a `[response_cache].clients` entry naming no configured client all fail at startup.
+Keys are compared in constant time against the whole table. Startup rejects anything that would otherwise fail silently at runtime: duplicate names, duplicate keys, a name with stray whitespace, and any `client_budgets` / `client_utilization_limits` / `operators` / `[response_cache].clients` entry naming no configured client. That last class matters — an unknown client passes the budget and utilization checks, so a one-character typo would mean *unlimited* spend with no log line and no metric.
+
+`[[clients]]` is also incompatible with `token = "passthrough"` endpoints, and that combination is rejected at startup. Passthrough forwards the caller's auth headers upstream untouched, but under `[[clients]]` those headers carry the caller's *proxy* credential — forwarding them would hand every client key to the upstream.
 
 ### Legacy shared secret (`proxy_key`)
 
@@ -267,7 +269,16 @@ proxy_key = "your-secret-key-here"
 
 One secret for everyone, sent as `x-api-key`. It authenticates but does **not** identify — every caller presents the same string, so `client_id` still comes from the client-asserted `X-Client-ID` header and a per-client model allow-list would be defeated by editing one header.
 
-**Migration:** replace `proxy_key` with one `[[clients]]` entry per caller, hand each its own key, then drop `proxy_key`. Setting both is rejected at startup with a named error rather than silently precedence-ordered, so a half-applied migration cannot leave the weaker scheme quietly in force. Do it in this order — add `[[clients]]`, cut over the callers, remove `proxy_key` — and no caller breaks mid-flight.
+**Migration is a flag day, not a rolling cutover.** Setting both `proxy_key` and `[[clients]]` is rejected at startup with a named error rather than silently precedence-ordered — a half-applied migration cannot leave the weaker scheme quietly in force, but it also means there is no window where both credentials are accepted. Plan for it:
+
+1. Mint one key per caller and stage it wherever each caller reads its credential from.
+2. In a single config change, delete `proxy_key` and add the `[[clients]]` table; restart.
+3. Flip every caller to its own key in the same maintenance window. Anything still sending the old shared secret gets a `401` from the moment the new config is live.
+
+Keep the previous config to hand: rolling back is the same single-step swap in reverse.
+
+> [!WARNING]
+> Under `[[clients]]`, `/_stats` and `/metrics` require a credential too. If a Prometheus scrape, an uptime check, or a Kubernetes `httpGet` probe hits this proxy unauthenticated today, it will start returning `401` — give those callers a key in the same change, or a failing probe becomes a restart loop.
 
 ### Client Identification
 
@@ -287,8 +298,7 @@ Per-client token usage and budget status appear in `/_stats`.
 
 A request for a model outside the list is rejected with **403** — a policy denial, distinct from the 429s that mean "capacity, try later" — and counted as `anthropic_client_model_denied_total{client,model}`. Operators bypass it, as they do every other gate check. The check sits in `pre_request_gate`, which both `/v1/messages` and `/v1/chat/completions` route through, so it covers both surfaces.
 
-> [!WARNING]
-> An allow-list is only as strong as the identity it keys on. Under the legacy `proxy_key` (or an open proxy) `client_id` is caller-asserted, so the allow-list is advisory at best — configure `[[clients]]` if you need it enforced.
+It **fails closed** on a model it cannot read. The proxy takes the model from the top-level `model` key of a JSON body; a body that does not parse, or a route that nests the model elsewhere (`/v1/messages/batches` puts it under `requests[].params.model`), yields no model — and a client that has an allow-list is then denied rather than waved through. Clients with no allow-list are unaffected.
 
 ---
 
