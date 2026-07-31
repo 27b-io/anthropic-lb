@@ -23,7 +23,12 @@ bytes = "1"
 http-body-util = "0.1"
 ipnet = "2.11.0"
 tokio-stream = "0.1"
-redis = { version = "1.0.3", features = ["tokio-comp", "connection-manager", "tls-rustls", "tokio-rustls-comp"] }
+# LAB-932: the coordination layer's Redis client. fred was already compiled in
+# via cachekit-rs's "redis" feature — this direct dep adds zero marginal weight
+# and lets the coordination layer share the fleet-standard client. Defaults
+# (i-std) cover keys/hashes/scan; i-scripts adds the Lua CAS; enable-rustls-ring
+# keeps rediss:// support on the ring TLS stack already in the tree.
+fred = { version = "9.4", features = ["i-scripts", "enable-rustls-ring"] }
 # LAB-933 response cache. NOTE: the crate is `cachekit-rs` (lib name `cachekit`,
 # github.com/cachekit-io/cachekit-rs) — the crate published as plain `cachekit`
 # on crates.io is an UNRELATED eviction-primitives library. Do not "fix" this.
@@ -37,3 +42,8 @@ serde_bytes = "0.11"
 [dev-dependencies]
 tempfile = "3.25.0"
 async-trait = "0.1"
+# Test-only, deliberately NOT the production client: the redis_integration
+# fixtures and assertions verify the fred-backed coordination layer through an
+# independent second client, so a systematic encoding/semantics bug in our fred
+# usage cannot self-certify. Never compiled into the release binary.
+redis = { version = "1.0.3", features = ["tokio-comp", "connection-manager"] }
