@@ -544,12 +544,15 @@ When Redis is connected, `/_stats` includes a `cluster` section with replica cou
 
 ## Response Cache (opt-in, encrypted)
 
-An **opt-in** response cache for non-streaming `POST /v1/messages`. When an
-allow-listed client replays a byte-identical request, the previous response is
-served from cache — **the upstream call is skipped entirely, so a hit burns
-zero 5h/7d rate-limit headroom and does not count against the client's daily
-token budget**. That is the point: eval reruns, pipeline replays, and retries
-after client-side timeouts stop costing quota.
+An **opt-in** response cache for non-streaming `POST /v1/messages` and
+`POST /v1/messages/count_tokens`. When an allow-listed client replays a
+byte-identical request, the previous response is served from cache — **the
+upstream call is skipped entirely, so a hit burns zero 5h/7d rate-limit
+headroom and does not count against the client's daily token budget**. That
+is the point: eval reruns, pipeline replays, and retries after client-side
+timeouts stop costing quota. The two endpoints share one allow-list and key
+scheme but never cross-serve — the cache key folds in which endpoint a
+request came in on, so a body sent to both never gets the wrong one back.
 
 **Default-off.** Without a `[response_cache]` section — or with an empty
 `clients` list — behavior is byte-identical to a build without the feature.
@@ -565,6 +568,7 @@ backend = "redis"
 redis_url = "redis://10.0.0.5:6379/1"
 # backend = "cachekitio"
 # api_key = "ck_live_..."
+# api_url = "https://api.dev.cachekit.io"  # optional; default https://api.cachekit.io. HTTPS enforced, private/loopback IPs rejected at startup.
 
 # Hex-encoded 32-byte master key for client-side encryption (MANDATORY —
 # there is no plaintext mode). Generate: openssl rand -hex 32
@@ -578,9 +582,9 @@ master_key = "…64 hex chars…"
 ```
 
 **What is cached:** the full response body (status + content-type + JSON body)
-of **2xx, non-streaming** `/v1/messages` responses. Streaming (`"stream": true`)
-requests always bypass the cache, as do non-JSON responses and bodies over
-1 MiB. Error responses are never cached.
+of **2xx, non-streaming** `/v1/messages` and `/v1/messages/count_tokens`
+responses. Streaming (`"stream": true`) requests always bypass the cache, as
+do non-JSON responses and bodies over 1 MiB. Error responses are never cached.
 
 **Where it lands, and what the backend can read:** entries are encrypted
 **client-side** (in the proxy process) with AES-256-GCM before touching any
@@ -588,8 +592,8 @@ storage layer — the in-process L1, local Redis, or cachekit.io only ever hold
 **ciphertext**. Per-client keys are derived from `master_key` via HKDF with the
 client ID as tenant, so two clients sending identical prompts get separate,
 mutually-undecryptable entries. Cache keys are content digests (Blake2s-256 of
-model + canonical body + beta headers + client ID) — no prompt text appears in
-keys, logs, or metrics.
+model + canonical body + beta headers + client ID + endpoint) — no prompt text
+appears in keys, logs, or metrics.
 
 **How a hit looks:** identical response body, plus an `x-alb-cache: hit`
 header. Upstream per-request headers (request IDs, rate-limit snapshots) are
@@ -598,8 +602,9 @@ not replayed — they described the original exchange.
 **Fail-open:** a slow, dead, or misconfigured cache backend never blocks a
 request. Every cache operation is bounded by `op_timeout_ms`; on any error the
 request proceeds upstream exactly as if the cache did not exist. Hit / miss /
-store / error counters are exposed on `/metrics`
-(`anthropic_response_cache_*_total{surface="messages"}`).
+store / error counters are exposed on `/metrics`, one series per endpoint
+(`anthropic_response_cache_*_total{surface="messages"}` and
+`{surface="count_tokens"}`).
 
 > [!WARNING]
 > **Allow-listed clients must mutually trust each other.** Client identity is

@@ -15121,6 +15121,17 @@ async fn post_messages(addr: SocketAddr, client_id: &str, body: &str) -> reqwest
         .unwrap()
 }
 
+async fn post_count_tokens(addr: SocketAddr, client_id: &str, body: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages/count_tokens"))
+        .header("content-type", "application/json")
+        .header("x-client-id", client_id)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap()
+}
+
 // AC6: the key is a full-body canonical digest — same raw text in a
 // different structural position must produce a different key.
 #[test]
@@ -15136,19 +15147,19 @@ fn response_cache_key_differs_on_nested_structure() {
     .unwrap();
     let (fpa, fpsa) = content_fingerprints(&a);
     let (fpb, fpsb) = content_fingerprints(&b);
-    let ka = response_cache_key("m", &a, &headers, None, "c", &fpa, &fpsa);
-    let kb = response_cache_key("m", &b, &headers, None, "c", &fpb, &fpsb);
+    let ka = response_cache_key("m", &a, &headers, None, "c", &fpa, &fpsa, "messages");
+    let kb = response_cache_key("m", &b, &headers, None, "c", &fpb, &fpsb, "messages");
     assert_ne!(ka, kb, "structural difference must change the key");
 
     // Model and beta headers are key material too.
-    let ka2 = response_cache_key("m2", &a, &headers, None, "c", &fpa, &fpsa);
+    let ka2 = response_cache_key("m2", &a, &headers, None, "c", &fpa, &fpsa, "messages");
     assert_ne!(ka, ka2, "model must change the key");
     let mut beta_headers = hyper::HeaderMap::new();
     beta_headers.insert(
         "anthropic-beta",
         HeaderValue::from_static("context-1m-2025"),
     );
-    let ka3 = response_cache_key("m", &a, &beta_headers, None, "c", &fpa, &fpsa);
+    let ka3 = response_cache_key("m", &a, &beta_headers, None, "c", &fpa, &fpsa, "messages");
     assert_ne!(ka, ka3, "anthropic-beta must change the key");
 
     // Key format: hex digest only, never content (AC5).
@@ -15162,9 +15173,36 @@ fn response_cache_key_isolates_clients() {
     let headers = hyper::HeaderMap::new();
     let body: serde_json::Value = serde_json::from_str(CACHE_TEST_BODY).unwrap();
     let (fp, fps) = content_fingerprints(&body);
-    let ka = response_cache_key("test", &body, &headers, None, "client-a", &fp, &fps);
-    let kb = response_cache_key("test", &body, &headers, None, "client-b", &fp, &fps);
+    let ka = response_cache_key(
+        "test", &body, &headers, None, "client-a", &fp, &fps, "messages",
+    );
+    let kb = response_cache_key(
+        "test", &body, &headers, None, "client-b", &fp, &fps, "messages",
+    );
     assert_ne!(ka, kb);
+}
+
+// LAB-929 AC2/AC7: identical body posted to /v1/messages vs
+// /v1/messages/count_tokens must NOT collide — a client that counts before
+// sending (same model+messages to both endpoints) must never have one
+// surface's cached entry served back as the other's.
+#[test]
+fn response_cache_key_isolates_surface() {
+    let headers = hyper::HeaderMap::new();
+    let body: serde_json::Value = serde_json::from_str(CACHE_TEST_BODY).unwrap();
+    let (fp, fps) = content_fingerprints(&body);
+    let k_messages = response_cache_key("test", &body, &headers, None, "c", &fp, &fps, "messages");
+    let k_count_tokens = response_cache_key(
+        "test",
+        &body,
+        &headers,
+        None,
+        "c",
+        &fp,
+        &fps,
+        "count_tokens",
+    );
+    assert_ne!(k_messages, k_count_tokens);
 }
 
 #[test]
@@ -15412,7 +15450,7 @@ async fn response_cache_backend_sees_only_ciphertext() {
         .into_bytes(),
     };
     let key = "a".repeat(64);
-    rc.store("geo", &key, &entry).await;
+    rc.store("geo", &key, &entry, CacheSurface::Messages).await;
     assert_eq!(rc.stores.load(Ordering::Relaxed), 1, "store must succeed");
 
     let writes = backend.writes.lock().unwrap().clone();
@@ -15430,7 +15468,7 @@ async fn response_cache_backend_sees_only_ciphertext() {
 
     // Right key decrypts.
     let got = rc
-        .lookup("geo", &key)
+        .lookup("geo", &key, CacheSurface::Messages)
         .await
         .expect("right-key read must hit");
     assert_eq!(got.body, entry.body);
@@ -15445,7 +15483,10 @@ async fn response_cache_backend_sees_only_ciphertext() {
     )
     .unwrap();
     assert!(
-        rc_wrong.lookup("geo", &key).await.is_none(),
+        rc_wrong
+            .lookup("geo", &key, CacheSurface::Messages)
+            .await
+            .is_none(),
         "wrong-key read must not return plaintext"
     );
     assert_eq!(
@@ -15466,7 +15507,10 @@ async fn response_cache_backend_sees_only_ciphertext() {
     )
     .unwrap();
     assert!(
-        rc_other.lookup("other-client", &key).await.is_none(),
+        rc_other
+            .lookup("other-client", &key, CacheSurface::Messages)
+            .await
+            .is_none(),
         "cross-tenant read must not decrypt"
     );
 }
@@ -15550,6 +15594,146 @@ async fn response_cache_metrics_exposed() {
     assert!(text.contains(r#"anthropic_response_cache_errors_total{surface="messages"} 0"#));
 }
 
+// LAB-929 AC2: replaying an identical /v1/messages/count_tokens request is
+// served from cache (one upstream call); a differing body forwards again.
+#[tokio::test]
+async fn response_cache_count_tokens_hit_replays_without_upstream() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let (addr, hits, state) = serve_cache_app(backend, &["geo"]).await;
+
+    let first = post_count_tokens(addr, "geo", CACHE_TEST_BODY).await;
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    assert!(first.headers().get("x-alb-cache").is_none());
+
+    let second = post_count_tokens(addr, "geo", CACHE_TEST_BODY).await;
+    assert_eq!(second.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        second
+            .headers()
+            .get("x-alb-cache")
+            .map(|v| v.to_str().unwrap()),
+        Some("hit")
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "identical replay must not reach upstream"
+    );
+
+    // A differing body (different max_tokens) is a genuine miss.
+    let differing =
+        r#"{"model":"test","max_tokens":2,"messages":[{"role":"user","content":"hi"}]}"#;
+    let third = post_count_tokens(addr, "geo", differing).await;
+    assert_eq!(third.status(), reqwest::StatusCode::OK);
+    assert!(third.headers().get("x-alb-cache").is_none());
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "a differing body must forward upstream again"
+    );
+
+    let rc = state.response_cache.as_ref().unwrap();
+    assert_eq!(rc.count_tokens_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(rc.count_tokens_misses.load(Ordering::Relaxed), 2);
+    assert_eq!(rc.count_tokens_stores.load(Ordering::Relaxed), 2);
+    // The /v1/messages series must stay untouched by count_tokens traffic.
+    assert_eq!(rc.hits.load(Ordering::Relaxed), 0);
+    assert_eq!(rc.misses.load(Ordering::Relaxed), 0);
+}
+
+// LAB-929 AC2/AC7: a client that sends the SAME body to /v1/messages and
+// /v1/messages/count_tokens (a common pattern — count before you send) must
+// never have one surface's cached entry served back as the other's.
+#[tokio::test]
+async fn response_cache_messages_and_count_tokens_do_not_cross_serve() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let (addr, hits, state) = serve_cache_app(backend, &["geo"]).await;
+
+    let ct = post_count_tokens(addr, "geo", CACHE_TEST_BODY).await;
+    assert_eq!(ct.status(), reqwest::StatusCode::OK);
+    assert!(ct.headers().get("x-alb-cache").is_none());
+
+    // Byte-identical body to /v1/messages must still miss — not read back
+    // the count_tokens entry.
+    let msg = post_messages(addr, "geo", CACHE_TEST_BODY).await;
+    assert_eq!(msg.status(), reqwest::StatusCode::OK);
+    assert!(
+        msg.headers().get("x-alb-cache").is_none(),
+        "a /v1/messages request must never be served from the count_tokens entry"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "both surfaces must independently reach upstream"
+    );
+
+    let rc = state.response_cache.as_ref().unwrap();
+    assert_eq!(rc.count_tokens_stores.load(Ordering::Relaxed), 1);
+    assert_eq!(rc.stores.load(Ordering::Relaxed), 1);
+}
+
+// LAB-929 AC4: count_tokens and messages hits/misses/stores/errors are
+// separable series on /metrics via the `surface` label, sharing metric names.
+#[tokio::test]
+async fn response_cache_count_tokens_metrics_exposed() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let (addr, _hits, _state) = serve_cache_app(backend, &["geo"]).await;
+    post_count_tokens(addr, "geo", CACHE_TEST_BODY).await; // miss + store
+    post_count_tokens(addr, "geo", CACHE_TEST_BODY).await; // hit
+    post_messages(addr, "geo", CACHE_TEST_BODY).await; // separate surface: miss + store
+    let text = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains(r#"anthropic_response_cache_hits_total{surface="count_tokens"} 1"#),
+        "{text}"
+    );
+    assert!(text.contains(r#"anthropic_response_cache_misses_total{surface="count_tokens"} 1"#));
+    assert!(text.contains(r#"anthropic_response_cache_stores_total{surface="count_tokens"} 1"#));
+    assert!(text.contains(r#"anthropic_response_cache_hits_total{surface="messages"} 0"#));
+    assert!(text.contains(r#"anthropic_response_cache_misses_total{surface="messages"} 1"#));
+    assert!(text.contains(r#"anthropic_response_cache_stores_total{surface="messages"} 1"#));
+
+    // Panel fix: the exposition format requires all samples of one metric
+    // grouped together (no other metric's lines interleaved) — assert both
+    // surfaces' `hits_total` samples are adjacent, not separated by
+    // misses/stores/errors lines from the metric-major/surface-minor loop.
+    let hits_lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("anthropic_response_cache_hits_total"))
+        .collect();
+    let all_lines: Vec<&str> = text.lines().collect();
+    let first_idx = all_lines.iter().position(|l| *l == hits_lines[0]).unwrap();
+    assert_eq!(
+        all_lines[first_idx + 1],
+        hits_lines[1],
+        "hits_total samples for both surfaces must be contiguous, not interleaved with other metrics"
+    );
+}
+
+// LAB-929 AC5: a dead cache backend fails open on the count_tokens path too
+// — inherited from ResponseCache, no new failure handling.
+#[tokio::test]
+async fn response_cache_count_tokens_fails_open_on_backend_error() {
+    let backend = std::sync::Arc::new(ErroringBackend);
+    let (addr, hits, state) = serve_cache_app(backend, &["geo"]).await;
+    let resp = post_count_tokens(addr, "geo", CACHE_TEST_BODY).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "must fail open to upstream"
+    );
+    assert!(resp.headers().get("x-alb-cache").is_none());
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let rc = state.response_cache.as_ref().unwrap();
+    assert!(rc.count_tokens_errors.load(Ordering::Relaxed) >= 2);
+}
+
 // Metrics stay silent when the cache is not configured (no phantom series).
 #[tokio::test]
 async fn response_cache_metrics_absent_without_config() {
@@ -15580,6 +15764,7 @@ async fn response_cache_redis_backend_fails_open_when_down() {
         op_timeout_ms: Some(200),
         redis_url: Some("redis://127.0.0.1:1".to_string()),
         api_key: None,
+        api_url: None,
     };
     let rc = tokio::time::timeout(Duration::from_secs(10), ResponseCache::from_config(&cfg))
         .await
@@ -15587,15 +15772,20 @@ async fn response_cache_redis_backend_fails_open_when_down() {
         .expect("dead redis must not be a config error")
         .expect("allow-list is non-empty");
     let started = std::time::Instant::now();
-    assert!(rc.lookup("geo", &"a".repeat(64)).await.is_none());
+    assert!(rc
+        .lookup("geo", &"a".repeat(64), CacheSurface::Messages)
+        .await
+        .is_none());
     assert!(started.elapsed() < Duration::from_secs(5));
     assert!(rc.errors.load(Ordering::Relaxed) >= 1);
 }
 
-// AC11 (SaaS): CachekitIO backend constructs through the same config path
-// (fixed at cachekit's default HTTPS endpoint — there is deliberately no
-// api_url knob), and the SDK's SSRF guard holds: loopback/private hosts are
-// rejected even when a caller asks for a custom host (AC14 talking point).
+// AC11 (SaaS): CachekitIO backend constructs through the same config path,
+// with and without an api_url override (the override exists for the dev
+// environment, which is not on cachekit's built-in host allow-list), and the
+// SDK's SSRF guard holds through OUR config path: loopback/private hosts are
+// rejected at startup even though the override sets allow_custom_host
+// (AC14 talking point).
 #[tokio::test]
 async fn response_cache_cachekitio_backend_constructs_and_blocks_loopback() {
     let cfg = ResponseCacheConfig {
@@ -15606,18 +15796,45 @@ async fn response_cache_cachekitio_backend_constructs_and_blocks_loopback() {
         op_timeout_ms: Some(200),
         redis_url: None,
         api_key: Some("ck_test_dummy".to_string()),
+        api_url: None,
     };
     assert!(ResponseCache::from_config(&cfg).await.unwrap().is_some());
 
-    // The guard the config path relies on, exercised directly.
+    // Custom public host (the dev-environment shape) constructs.
+    let dev = ResponseCacheConfig {
+        api_url: Some("https://api.dev.cachekit.io".to_string()),
+        ..cfg.clone()
+    };
+    assert!(ResponseCache::from_config(&dev).await.unwrap().is_some());
+
+    // Loopback/private hosts fail startup loudly — through the config path.
+    let loopback = ResponseCacheConfig {
+        api_url: Some("https://127.0.0.1:9".to_string()),
+        ..cfg.clone()
+    };
     assert!(
-        cachekit::backend::cachekitio::CachekitIO::builder()
-            .api_key("ck_test_dummy")
-            .api_url("https://127.0.0.1:9")
-            .allow_custom_host(true)
-            .build()
-            .is_err(),
+        ResponseCache::from_config(&loopback).await.is_err(),
         "loopback api_url must be rejected by cachekit's SSRF guard"
+    );
+
+    // RFC1918 private hosts fail too — internal targets stay unreachable.
+    let private = ResponseCacheConfig {
+        api_url: Some("https://10.0.0.1:443".to_string()),
+        ..cfg.clone()
+    };
+    assert!(
+        ResponseCache::from_config(&private).await.is_err(),
+        "private-address api_url must be rejected by cachekit's SSRF guard"
+    );
+
+    // Plain HTTP fails too.
+    let http = ResponseCacheConfig {
+        api_url: Some("http://api.dev.cachekit.io".to_string()),
+        ..cfg
+    };
+    assert!(
+        ResponseCache::from_config(&http).await.is_err(),
+        "non-HTTPS api_url must be rejected"
     );
 }
 
@@ -15633,6 +15850,7 @@ async fn response_cache_config_validation() {
         op_timeout_ms: None,
         redis_url: None,
         api_key: None,
+        api_url: None,
     };
     assert!(
         ResponseCache::from_config(&base).await.is_err(),
@@ -15681,16 +15899,18 @@ async fn response_cache_cachekitio_live_round_trip() {
         "live-test",
         "fp",
         "fps",
+        "messages",
     );
     let entry = CachedResponse {
         status: 200,
         content_type: "application/json".into(),
         body: b"{\"live\":true}".to_vec(),
     };
-    rc.store("live-test", &key, &entry).await;
+    rc.store("live-test", &key, &entry, CacheSurface::Messages)
+        .await;
     assert_eq!(rc.stores.load(Ordering::Relaxed), 1, "live store failed");
     let got = rc
-        .lookup("live-test", &key)
+        .lookup("live-test", &key, CacheSurface::Messages)
         .await
         .expect("live read-back failed");
     assert_eq!(got.body, entry.body);
@@ -15705,15 +15925,24 @@ fn response_cache_key_varies_on_version_and_query() {
     let plain = hyper::HeaderMap::new();
     let mut versioned = hyper::HeaderMap::new();
     versioned.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-    let base = response_cache_key("m", &body, &plain, None, "c", &fp, &fps);
+    let base = response_cache_key("m", &body, &plain, None, "c", &fp, &fps, "messages");
     assert_ne!(
         base,
-        response_cache_key("m", &body, &versioned, None, "c", &fp, &fps),
+        response_cache_key("m", &body, &versioned, None, "c", &fp, &fps, "messages"),
         "anthropic-version must change the key"
     );
     assert_ne!(
         base,
-        response_cache_key("m", &body, &plain, Some("beta=true"), "c", &fp, &fps),
+        response_cache_key(
+            "m",
+            &body,
+            &plain,
+            Some("beta=true"),
+            "c",
+            &fp,
+            &fps,
+            "messages"
+        ),
         "URI query must change the key"
     );
 }
@@ -15798,7 +16027,15 @@ async fn response_cache_skips_oversized_bodies() {
         .header("content-type", "application/json")
         .body(Body::from(big.clone()))
         .unwrap();
-    let out = maybe_cache_store(&state, Some(&"a".repeat(64)), "geo", "rid", resp).await;
+    let key_a = "a".repeat(64);
+    let out = maybe_cache_store(
+        &state,
+        Some((key_a.as_str(), CacheSurface::Messages)),
+        "geo",
+        "rid",
+        resp,
+    )
+    .await;
     assert_eq!(out.status(), StatusCode::OK);
     let out_bytes = axum::body::to_bytes(out.into_body(), usize::MAX)
         .await
@@ -15826,7 +16063,15 @@ async fn response_cache_skips_oversized_bodies() {
         .header("content-type", "application/json")
         .body(Body::from(ok_body))
         .unwrap();
-    let _ = maybe_cache_store(&state, Some(&"b".repeat(64)), "geo", "rid", resp).await;
+    let key_b = "b".repeat(64);
+    let _ = maybe_cache_store(
+        &state,
+        Some((key_b.as_str(), CacheSurface::Messages)),
+        "geo",
+        "rid",
+        resp,
+    )
+    .await;
     assert_eq!(
         state
             .response_cache
@@ -16260,4 +16505,927 @@ async fn session_registry_window_matches_filtered_beta() {
         vec![DEFAULT_CONTEXT_WINDOW],
         "session must be tracked at the window the upstream ran (flag was stripped)"
     );
+}
+// ── Real-Redis integration tests (LAB-931) ──────────────────────────
+//
+// Behavioural coverage for the cross-replica coordination layer against a
+// REAL Redis/Valkey backend. These pin the semantics of every coordination
+// call site — INCRBY/EXPIRE budgets, SET EX hard-limit propagation, the Lua
+// CAS recovery sentinel, the three-phase MGET merge in sync_from_redis,
+// SCAN pagination in cluster_info, pipelined HINCRBY transport-error
+// flushing, and the SET NX EX probe lock — exactly as they behave today,
+// so the redis→fred migration has a baseline to rewrite against.
+//
+// Opt-in by design: set `ALB_TEST_REDIS_URL` (plain `redis://host:port`,
+// no db suffix, no auth) to run them. When unset, every test prints a SKIP
+// notice and returns — never a silent pass against nothing. When the env
+// var IS set and the backend is unreachable, the tests PANIC, so CI (which
+// always sets it — see .github/workflows/ci.yml) can never skip silently.
+//
+// Isolation: each test owns a dedicated logical DB (the `/N` suffix in the
+// connection URL) and flushes it on connect, because ALL `alb:*`
+// coordination keys (hard/rate/weight/budget/probe/heartbeat/
+// transport_errors) are hardcoded in production code and cannot be
+// prefixed per-test. Never point ALB_TEST_REDIS_URL at a Redis holding
+// data you care about.
+mod redis_integration {
+    use super::*;
+    use redis::AsyncCommands;
+
+    const TEST_REDIS_ENV: &str = "ALB_TEST_REDIS_URL";
+
+    /// Resolve the opt-in backend URL. None (with a SKIP notice) when the
+    /// env var is unset locally; PANICS when unset in CI (`CI` env present),
+    /// so no workflow — current or future — can green with this suite
+    /// silently skipped. The documented shape (`redis://host:port` — no
+    /// auth, no db suffix) is validated here, once: the callers append
+    /// `/{db}` for isolation and parse `host:port` for the killable proxy,
+    /// both of which silently misbehave on a decorated URL.
+    fn test_redis_url() -> Option<String> {
+        match std::env::var(TEST_REDIS_ENV) {
+            Ok(u) => {
+                // Never interpolate the raw value into these messages: a
+                // rejected URL may carry credentials (redis://user:pass@…),
+                // and the panic lands in CI logs.
+                let host_port = u.strip_prefix("redis://").unwrap_or_else(|| {
+                    panic!("{TEST_REDIS_ENV} must be a plain redis:// url (value redacted)")
+                });
+                assert!(
+                    !host_port.contains('@') && !host_port.trim_end_matches('/').contains('/'),
+                    "{TEST_REDIS_ENV} must be redis://host:port — no auth, no db suffix \
+                     (value redacted)"
+                );
+                Some(u)
+            }
+            Err(_) if std::env::var("CI").is_ok() => {
+                panic!(
+                    "CI run without {TEST_REDIS_ENV}: the redis_integration suite would \
+                     silently skip — wire a Redis/Valkey service into this workflow"
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "SKIP (redis integration): {TEST_REDIS_ENV} not set — no backend to test against"
+                );
+                None
+            }
+        }
+    }
+
+    /// Connect to the opt-in test backend, selecting logical DB `db` and
+    /// flushing it. Returns None (with a SKIP notice) when the env var is
+    /// unset; panics when it is set but the backend is unreachable.
+    /// `db` must be unique per test — logical DBs are the isolation unit.
+    async fn redis_test_conn(db: u8) -> Option<redis::aio::ConnectionManager> {
+        let base = test_redis_url()?;
+        Some(connect_and_flush(&format!("{}/{db}", base.trim_end_matches('/'))).await)
+    }
+
+    async fn connect_and_flush(url: &str) -> redis::aio::ConnectionManager {
+        let client = redis::Client::open(url)
+            .unwrap_or_else(|e| panic!("{TEST_REDIS_ENV}: invalid url {url}: {e}"));
+        // Short timeouts + a single retry: the failure-path tests kill the
+        // backend mid-run and must observe errors in milliseconds, not after
+        // the production-scale reconnect backoff.
+        let cfg = redis::aio::ConnectionManagerConfig::new()
+            .set_response_timeout(Some(Duration::from_secs(1)))
+            .set_connection_timeout(Some(Duration::from_secs(2)))
+            .set_number_of_retries(1);
+        let mut conn = client
+            .get_connection_manager_with_config(cfg)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{TEST_REDIS_ENV} set but backend unreachable at {url}: {e}")
+            });
+        let flushed: redis::RedisResult<()> = redis::cmd("FLUSHDB").query_async(&mut conn).await;
+        flushed.unwrap_or_else(|e| panic!("FLUSHDB failed on {url}: {e}"));
+        conn
+    }
+
+    /// TCP forwarder in front of the real backend that can be killed
+    /// mid-test to simulate Redis dying while connections are established.
+    /// Killing aborts every live relay and drops the listener, so both
+    /// in-flight commands and subsequent reconnect attempts fail.
+    async fn spawn_killable_proxy(target: String) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut relays: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = &mut kill_rx => break,
+                    accepted = listener.accept() => {
+                        let Ok((mut inbound, _)) = accepted else { break };
+                        let target = target.clone();
+                        relays.push(tokio::spawn(async move {
+                            if let Ok(mut outbound) =
+                                tokio::net::TcpStream::connect(&target).await
+                            {
+                                let _ =
+                                    tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
+                                        .await;
+                            }
+                        }));
+                    }
+                }
+            }
+            for relay in relays {
+                relay.abort();
+            }
+            // Listener drops here → further connects are refused.
+        });
+        (format!("127.0.0.1:{}", addr.port()), kill_tx)
+    }
+
+    /// Connection to the test backend routed through a killable proxy.
+    /// Same skip/panic contract as `redis_test_conn`.
+    async fn proxied_conn(
+        db: u8,
+    ) -> Option<(
+        redis::aio::ConnectionManager,
+        tokio::sync::oneshot::Sender<()>,
+    )> {
+        let base = test_redis_url()?;
+        let target = base
+            .trim_start_matches("redis://")
+            .trim_end_matches('/')
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let (proxy_addr, kill) = spawn_killable_proxy(target).await;
+        let conn = connect_and_flush(&format!("redis://{proxy_addr}/{db}")).await;
+        Some((conn, kill))
+    }
+
+    async fn kill_proxy(kill: tokio::sync::oneshot::Sender<()>) {
+        let _ = kill.send(());
+        // Give the aborts a beat to drop sockets before asserting failures.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// Budget keys embed `now_epoch / 86400`, recomputed independently by
+    /// the test and each production call site — a UTC-midnight rollover
+    /// between the two computations splits the key and fails spuriously.
+    /// Park until the day is young enough that the test finishes inside it.
+    async fn avoid_utc_midnight() {
+        let into_day = AppState::now_epoch() % 86_400;
+        if into_day > 86_390 {
+            tokio::time::sleep(Duration::from_secs(86_400 - into_day + 1)).await;
+        }
+    }
+
+    fn state_with_redis(
+        endpoints: Vec<Endpoint>,
+        conn: redis::aio::ConnectionManager,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            endpoints,
+            redis: Some(conn),
+            ..test_state_base()
+        })
+    }
+
+    /// Poll until `check` passes — for asserting on fire-and-forget
+    /// tokio::spawn writes (the sentinel CAS).
+    async fn eventually<F, Fut>(what: &str, mut check: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..100 {
+            if check().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn remote_rate_info(updated_at: u64, utilization: f64) -> RedisRateInfo {
+        RedisRateInfo {
+            utilization: Some(utilization),
+            utilization_5h: Some(utilization),
+            utilization_7d: None,
+            reset_5h: None,
+            reset_7d: None,
+            status_5h: Some("allowed".into()),
+            status_7d: None,
+            claims_7d: HashMap::new(),
+            representative_claim: None,
+            remaining_requests: Some(11),
+            remaining_tokens: Some(22),
+            limit_requests: None,
+            limit_tokens: None,
+            overage_in_use: false,
+            overage_status: None,
+            overage_utilization: None,
+            overage_reset: None,
+            updated_at,
+        }
+    }
+
+    /// Mock upstream that counts requests — observable side effect for the
+    /// probe-lock tests (probe fired vs probe suppressed).
+    async fn spawn_counting_upstream() -> (String, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let hits = counter.clone();
+        let app = Router::new().fallback(any(move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                axum::Json(serde_json::json!({"id": "msg_probe", "type": "message"}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), counter)
+    }
+
+    /// AC2 phase 1: the hard-limit MGET merge against real keys — a remote
+    /// future epoch is applied, "most recent wins" holds in both directions,
+    /// the clear sentinel clears, and an absent key (MGET None) touches
+    /// nothing. Pairs with the pure `classify_hard_limit_*` unit tests.
+    #[tokio::test]
+    async fn sync_from_redis_merges_hard_limits_with_real_backend() {
+        let Some(mut conn) = redis_test_conn(1).await else {
+            return;
+        };
+        let state = state_with_redis(
+            vec![
+                make_endpoint("hl-apply", Protocol::Anthropic),
+                make_endpoint("hl-clear", Protocol::Anthropic),
+                make_endpoint("hl-remote-older", Protocol::Anthropic),
+                make_endpoint("hl-remote-newer", Protocol::Anthropic),
+                make_endpoint("hl-absent", Protocol::Anthropic),
+            ],
+            conn.clone(),
+        );
+
+        let now_epoch = AppState::now_epoch();
+        let now = Instant::now();
+        state.endpoints[1]
+            .rate_info
+            .write()
+            .await
+            .hard_limited_until = Some(now + Duration::from_secs(500));
+        state.endpoints[2]
+            .rate_info
+            .write()
+            .await
+            .hard_limited_until = Some(now + Duration::from_secs(600));
+        state.endpoints[3]
+            .rate_info
+            .write()
+            .await
+            .hard_limited_until = Some(now + Duration::from_secs(60));
+
+        let _: () = conn
+            .set("alb:hard:hl-apply", now_epoch + 120)
+            .await
+            .unwrap();
+        let _: () = conn
+            .set("alb:hard:hl-clear", HARD_LIMIT_CLEARED_SENTINEL)
+            .await
+            .unwrap();
+        let _: () = conn
+            .set("alb:hard:hl-remote-older", now_epoch + 60)
+            .await
+            .unwrap();
+        let _: () = conn
+            .set("alb:hard:hl-remote-newer", now_epoch + 600)
+            .await
+            .unwrap();
+
+        state.sync_from_redis().await;
+
+        let after = Instant::now();
+        let until = state.endpoints[0]
+            .rate_info
+            .read()
+            .await
+            .hard_limited_until
+            .expect("remote future epoch must apply a hard limit");
+        let secs = until.saturating_duration_since(after).as_secs();
+        assert!(
+            (115..=121).contains(&secs),
+            "hl-apply should be limited ~120s, got {secs}s"
+        );
+
+        assert!(
+            state.endpoints[1]
+                .rate_info
+                .read()
+                .await
+                .hard_limited_until
+                .is_none(),
+            "clear sentinel must clear the local hard limit"
+        );
+
+        let until = state.endpoints[2]
+            .rate_info
+            .read()
+            .await
+            .hard_limited_until
+            .expect("local hard limit must survive an older remote");
+        let secs = until.saturating_duration_since(after).as_secs();
+        assert!(
+            (595..=601).contains(&secs),
+            "older remote (+60s) must not shorten the newer local limit (+600s), got {secs}s"
+        );
+
+        let until = state.endpoints[3]
+            .rate_info
+            .read()
+            .await
+            .hard_limited_until
+            .expect("newer remote must extend the local hard limit");
+        let secs = until.saturating_duration_since(after).as_secs();
+        assert!(
+            (595..=601).contains(&secs),
+            "newer remote (+600s) must override the older local limit (+60s), got {secs}s"
+        );
+
+        assert!(
+            state.endpoints[4]
+                .rate_info
+                .read()
+                .await
+                .hard_limited_until
+                .is_none(),
+            "absent key (MGET None) must not fabricate a hard limit"
+        );
+    }
+
+    /// AC2 phase 2: the rate-info merge's "most recent wins" comparison in
+    /// both directions, plus the absent-key case, against real MGET replies.
+    #[tokio::test]
+    async fn sync_from_redis_rate_info_most_recent_wins_both_directions() {
+        let Some(mut conn) = redis_test_conn(2).await else {
+            return;
+        };
+        let state = state_with_redis(
+            vec![
+                make_endpoint("ri-remote-newer", Protocol::Anthropic),
+                make_endpoint("ri-remote-older", Protocol::Anthropic),
+                make_endpoint("ri-absent", Protocol::Anthropic),
+            ],
+            conn.clone(),
+        );
+        let now_epoch = AppState::now_epoch();
+
+        {
+            let mut info = state.endpoints[0].rate_info.write().await;
+            info.utilization = Some(0.10);
+            info.last_updated_epoch = Some(now_epoch - 300);
+        }
+        {
+            let mut info = state.endpoints[1].rate_info.write().await;
+            info.utilization = Some(0.20);
+            info.remaining_tokens = Some(777);
+            info.last_updated_epoch = Some(now_epoch);
+        }
+        {
+            let mut info = state.endpoints[2].rate_info.write().await;
+            info.utilization = Some(0.30);
+        }
+
+        let newer = serde_json::to_string(&remote_rate_info(now_epoch, 0.90)).unwrap();
+        let older = serde_json::to_string(&remote_rate_info(now_epoch - 600, 0.80)).unwrap();
+        let _: () = conn.set("alb:rate:ri-remote-newer", newer).await.unwrap();
+        let _: () = conn.set("alb:rate:ri-remote-older", older).await.unwrap();
+
+        state.sync_from_redis().await;
+
+        {
+            let info = state.endpoints[0].rate_info.read().await;
+            assert_eq!(info.utilization, Some(0.90), "newer remote must be applied");
+            assert_eq!(info.remaining_tokens, Some(22));
+            assert_eq!(
+                info.last_updated_epoch,
+                Some(now_epoch),
+                "local epoch must follow the remote updated_at"
+            );
+        }
+        {
+            let info = state.endpoints[1].rate_info.read().await;
+            assert_eq!(info.utilization, Some(0.20), "older remote must be ignored");
+            assert_eq!(info.remaining_tokens, Some(777));
+        }
+        assert_eq!(
+            state.endpoints[2].rate_info.read().await.utilization,
+            Some(0.30),
+            "absent key must not touch local rate info"
+        );
+    }
+
+    /// AC2 phase 3: published routing weights land in the gauge atomics;
+    /// a two-field CSV (older publisher) leaves the gate untouched;
+    /// malformed and absent values touch nothing.
+    #[tokio::test]
+    async fn sync_from_redis_applies_published_routing_weights() {
+        let Some(mut conn) = redis_test_conn(3).await else {
+            return;
+        };
+        let state = state_with_redis(
+            vec![
+                make_endpoint("w-full", Protocol::Anthropic),
+                make_endpoint("w-nogate", Protocol::Anthropic),
+                make_endpoint("w-bad", Protocol::Anthropic),
+                make_endpoint("w-absent", Protocol::Anthropic),
+            ],
+            conn.clone(),
+        );
+        for ep in &state.endpoints {
+            ep.last_routing_weight
+                .store(7.0f64.to_bits(), Ordering::Relaxed);
+            ep.last_routing_share
+                .store(7.0f64.to_bits(), Ordering::Relaxed);
+            ep.last_effective_gate
+                .store(7.0f64.to_bits(), Ordering::Relaxed);
+        }
+        let _: () = conn.set("alb:weight:w-full", "0.5,0.25,0.9").await.unwrap();
+        let _: () = conn.set("alb:weight:w-nogate", "0.5,0.25").await.unwrap();
+        let _: () = conn
+            .set("alb:weight:w-bad", "not,numbers,here")
+            .await
+            .unwrap();
+
+        state.sync_from_redis().await;
+
+        let read = |a: &AtomicU64| f64::from_bits(a.load(Ordering::Relaxed));
+        assert_eq!(read(&state.endpoints[0].last_routing_weight), 0.5);
+        assert_eq!(read(&state.endpoints[0].last_routing_share), 0.25);
+        assert_eq!(read(&state.endpoints[0].last_effective_gate), 0.9);
+
+        assert_eq!(read(&state.endpoints[1].last_routing_weight), 0.5);
+        assert_eq!(
+            read(&state.endpoints[1].last_effective_gate),
+            7.0,
+            "two-field CSV (older publisher) must leave the gate untouched"
+        );
+
+        for idx in [2, 3] {
+            assert_eq!(
+                read(&state.endpoints[idx].last_routing_weight),
+                7.0,
+                "malformed/absent weight value must touch nothing (endpoint {idx})"
+            );
+        }
+    }
+
+    /// AC3: the Lua CAS in signal_hard_limit_recovery. Contract: write the
+    /// clear sentinel when the key is absent or holds an expired epoch;
+    /// never clobber a live (future-epoch) hard limit that a concurrent
+    /// mark_hard_limited already wrote. The read side of the sentinel is
+    /// covered by the pure `classify_hard_limit_*` tests.
+    #[tokio::test]
+    async fn recovery_sentinel_cas_clears_stale_but_not_live_hard_limits() {
+        let Some(mut conn) = redis_test_conn(4).await else {
+            return;
+        };
+        let state = state_with_redis(vec![], conn.clone());
+        let key = "alb:hard:cas-ep";
+
+        // Absent key → sentinel written, with the sentinel TTL.
+        state.signal_hard_limit_recovery("cas-ep").await;
+        eventually("sentinel write on absent key", || {
+            let mut c = conn.clone();
+            async move {
+                c.get::<_, Option<u64>>(key).await.unwrap() == Some(HARD_LIMIT_CLEARED_SENTINEL)
+            }
+        })
+        .await;
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            (HARD_LIMIT_SENTINEL_TTL_SECS as i64 - 5..=HARD_LIMIT_SENTINEL_TTL_SECS as i64)
+                .contains(&ttl),
+            "sentinel must carry its full TTL (~{HARD_LIMIT_SENTINEL_TTL_SECS}s), got {ttl}"
+        );
+
+        // Expired epoch → CAS overwrites with the sentinel.
+        let _: () = conn.set(key, AppState::now_epoch() - 5).await.unwrap();
+        state.signal_hard_limit_recovery("cas-ep").await;
+        eventually("sentinel overwrite of expired epoch", || {
+            let mut c = conn.clone();
+            async move {
+                c.get::<_, Option<u64>>(key).await.unwrap() == Some(HARD_LIMIT_CLEARED_SENTINEL)
+            }
+        })
+        .await;
+
+        // Live future epoch (a concurrent mark_hard_limited won the race) →
+        // the CAS must refuse, preserving the newer hard limit.
+        let live = AppState::now_epoch() + 300;
+        let _: () = conn.set(key, live).await.unwrap();
+        state.signal_hard_limit_recovery("cas-ep").await;
+        // The write is fire-and-forget; give the spawned task time to land
+        // before asserting nothing changed.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            conn.get::<_, Option<u64>>(key).await.unwrap(),
+            Some(live),
+            "CAS must not clobber a live hard limit written concurrently"
+        );
+    }
+
+    /// AC4: INCRBY accumulates across replicas, EXPIRE is set, the shared
+    /// counter enforces budgets cluster-wide, and per-day keys make
+    /// yesterday's spend invisible today.
+    #[tokio::test]
+    async fn budget_incrby_accumulates_across_replicas_with_expiry() {
+        let Some(mut conn) = redis_test_conn(5).await else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let budgets: HashMap<String, u64> = [("budget-cli".to_string(), 1000u64)].into();
+        let replica_a = Arc::new(AppState {
+            client_budgets: budgets.clone(),
+            redis: Some(conn.clone()),
+            ..test_state_base()
+        });
+        let replica_b = Arc::new(AppState {
+            client_budgets: budgets,
+            redis: Some(conn.clone()),
+            ..test_state_base()
+        });
+
+        replica_a.record_budget_usage("budget-cli", 100).await;
+        replica_b.record_budget_usage("budget-cli", 250).await;
+
+        let today = AppState::now_epoch() / 86400;
+        let key = format!("alb:budget:budget-cli:{today}");
+        assert_eq!(
+            conn.get::<_, Option<u64>>(&key).await.unwrap(),
+            Some(350),
+            "INCRBY must accumulate across replicas"
+        );
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            (BUDGET_TTL_SECS - 100..=BUDGET_TTL_SECS).contains(&ttl),
+            "budget key must carry its full 48h EXPIRE (~{BUDGET_TTL_SECS}s), got {ttl}"
+        );
+
+        // Cross-replica enforcement: a replica with a lower limit and NO
+        // local usage of its own sees the shared counter and refuses.
+        let enforcing = Arc::new(AppState {
+            client_budgets: [("budget-cli".to_string(), 300u64)].into(),
+            redis: Some(conn.clone()),
+            ..test_state_base()
+        });
+        assert_eq!(
+            enforcing.check_budget("budget-cli").await,
+            Err(0),
+            "shared counter (350) must gate a 300 limit on a replica that recorded nothing"
+        );
+        assert!(
+            replica_a.check_budget("budget-cli").await.is_ok(),
+            "350 used of 1000 must pass"
+        );
+
+        // Day rollover: yesterday's counter lives under a different key and
+        // must not gate today (complements budget_day_rollover_resets_counter).
+        let _: () = conn
+            .set(format!("alb:budget:roll-cli:{}", today - 1), 999_999u64)
+            .await
+            .unwrap();
+        let roll = Arc::new(AppState {
+            client_budgets: [("roll-cli".to_string(), 100u64)].into(),
+            redis: Some(conn.clone()),
+            ..test_state_base()
+        });
+        assert!(
+            roll.check_budget("roll-cli").await.is_ok(),
+            "yesterday's counter must not gate today"
+        );
+    }
+
+    /// AC4 failure path: INCRBY against a poisoned (non-integer) key fails;
+    /// record_budget_usage must DELETE the key — unblocking future INCRBYs —
+    /// while local state keeps enforcing for as long as the redis read path
+    /// errors.
+    #[tokio::test]
+    async fn budget_incrby_failure_deletes_key_and_local_fallback_enforces() {
+        let Some(mut conn) = redis_test_conn(6).await else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let state = Arc::new(AppState {
+            client_budgets: [("poison-cli".to_string(), 100u64)].into(),
+            redis: Some(conn.clone()),
+            ..test_state_base()
+        });
+        let today = AppState::now_epoch() / 86400;
+        let key = format!("alb:budget:poison-cli:{today}");
+        let _: () = conn.set(&key, "not-a-number").await.unwrap();
+
+        // While the redis value is unreadable, GET errors at the type layer
+        // and check_budget falls back to local state — which enforces.
+        state
+            .budget_usage
+            .lock()
+            .unwrap()
+            .insert("poison-cli".to_string(), (today, 150));
+        assert_eq!(
+            state.check_budget("poison-cli").await,
+            Err(0),
+            "local fallback must enforce while the redis value is unreadable"
+        );
+
+        // INCRBY fails on the poisoned key → key deleted, local still updated.
+        state.record_budget_usage("poison-cli", 10).await;
+        assert!(
+            !conn.exists::<_, bool>(&key).await.unwrap(),
+            "failed INCRBY must delete the poisoned key"
+        );
+        assert_eq!(
+            state
+                .budget_usage
+                .lock()
+                .unwrap()
+                .get("poison-cli")
+                .unwrap()
+                .1,
+            160,
+            "local accumulator must survive the redis failure"
+        );
+
+        // With the poison gone, the next INCRBY starts clean.
+        state.record_budget_usage("poison-cli", 5).await;
+        assert_eq!(conn.get::<_, Option<u64>>(&key).await.unwrap(), Some(5));
+
+        // Current contract, pinned deliberately: with redis reachable and the
+        // key rebuilt (5 < 100), the shared counter is authoritative and
+        // check_budget passes even though local memory says 165. The local
+        // count only gates when the redis read path errors.
+        assert!(
+            state.check_budget("poison-cli").await.is_ok(),
+            "deliberate pin: a reachable redis counter (5) is authoritative over larger local state (165)"
+        );
+    }
+
+    /// AC5: cluster_info's SCAN loop across multiple cursor pages. 500
+    /// heartbeat keys against COUNT 100 forces several SCAN round-trips on a
+    /// real backend — a pagination bug (e.g. stopping after the first page)
+    /// undercounts. Budget MGET aggregation is asserted in the same pass.
+    #[tokio::test]
+    async fn cluster_info_counts_heartbeats_across_multiple_scan_pages() {
+        let Some(mut conn) = redis_test_conn(7).await else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let mut pipe = redis::pipe();
+        for i in 0..500 {
+            pipe.cmd("SET")
+                .arg(format!("alb:heartbeat:{i}"))
+                .arg(1u8)
+                .ignore();
+        }
+        let _: () = pipe.query_async(&mut conn).await.unwrap();
+
+        let today = AppState::now_epoch() / 86400;
+        let _: () = conn
+            .set(format!("alb:budget:scan-cli:{today}"), 42u64)
+            .await
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            client_budgets: [("scan-cli".to_string(), 1000u64)].into(),
+            redis: Some(conn.clone()),
+            ..test_state_base()
+        });
+        let info = state.cluster_info().await.expect("cluster_info with redis");
+        assert_eq!(
+            info["replicas_seen"], 500,
+            "SCAN must count all heartbeat keys across cursor pages"
+        );
+        assert_eq!(info["redis_connected"], true);
+        assert_eq!(info["budget_usage"]["scan-cli"]["used"], 42);
+        assert_eq!(info["budget_usage"]["scan-cli"]["limit"], 1000);
+    }
+
+    /// AC5: pipelined HINCRBY folds deltas from multiple replicas into the
+    /// shared hash, drains the local accumulators, and both the write and
+    /// the idle tick refresh the TTL.
+    #[tokio::test]
+    async fn flush_transport_errors_hincrby_accumulates_across_replicas() {
+        let Some(mut conn) = redis_test_conn(8).await else {
+            return;
+        };
+        let replica_a = state_with_redis(vec![], conn.clone());
+        let replica_b = state_with_redis(vec![], conn.clone());
+        {
+            let mut m = replica_a.lock_transport_errors();
+            m.insert("connect", 3);
+        }
+        {
+            let mut m = replica_b.lock_transport_errors();
+            m.insert("connect", 2);
+            m.insert("timeout", 5);
+        }
+        replica_a.flush_transport_errors().await;
+        replica_b.flush_transport_errors().await;
+
+        let map: HashMap<String, u64> = conn.hgetall(TRANSPORT_ERRORS_KEY).await.unwrap();
+        assert_eq!(
+            map.get("connect"),
+            Some(&5),
+            "HINCRBY must fold deltas from both replicas"
+        );
+        assert_eq!(map.get("timeout"), Some(&5));
+        assert!(
+            replica_a.lock_transport_errors().is_empty(),
+            "flush must drain the local accumulator"
+        );
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(TRANSPORT_ERRORS_KEY)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            (TRANSPORT_ERRORS_TTL_SECS as i64 - 100..=TRANSPORT_ERRORS_TTL_SECS as i64)
+                .contains(&ttl),
+            "flush must set the full hash TTL (~{TRANSPORT_ERRORS_TTL_SECS}s), got {ttl}"
+        );
+
+        // An idle tick (no deltas) must still refresh the TTL so the
+        // fleet-wide hash never expires under healthy traffic.
+        let _: bool = conn.persist(TRANSPORT_ERRORS_KEY).await.unwrap();
+        replica_a.flush_transport_errors().await;
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(TRANSPORT_ERRORS_KEY)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            (TRANSPORT_ERRORS_TTL_SECS as i64 - 100..=TRANSPORT_ERRORS_TTL_SECS as i64)
+                .contains(&ttl),
+            "idle flush must refresh the full TTL (~{TRANSPORT_ERRORS_TTL_SECS}s), got {ttl}"
+        );
+    }
+
+    /// AC5: HINCRBY failure re-queues the drained deltas locally
+    /// (documented at-least-once behaviour) instead of dropping the error
+    /// signal.
+    #[tokio::test]
+    async fn flush_transport_errors_requeues_deltas_when_redis_dies() {
+        let Some((conn, kill)) = proxied_conn(9).await else {
+            return;
+        };
+        let state = state_with_redis(vec![], conn);
+        {
+            let mut m = state.lock_transport_errors();
+            m.insert("reset", 4);
+        }
+        kill_proxy(kill).await;
+        state.flush_transport_errors().await;
+        assert_eq!(
+            state.lock_transport_errors().get("reset"),
+            Some(&4),
+            "failed flush must re-queue drained deltas for the next tick"
+        );
+    }
+
+    /// AC6: the SET NX EX probe lock grants one replica per endpoint+model
+    /// per interval; a second replica's probe is suppressed while the lock
+    /// is held, and a different model probes under its own lock.
+    #[tokio::test]
+    async fn probe_lock_grants_one_replica_per_endpoint_model() {
+        let Some(mut conn) = redis_test_conn(10).await else {
+            return;
+        };
+        let (mock_url, hits) = spawn_counting_upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let mk_replica = |file: &str, conn: redis::aio::ConnectionManager| {
+            Arc::new(AppState {
+                endpoints: vec![mk_endpoint_at("probe-ep", "sk-test", &mock_url)],
+                redis: Some(conn),
+                state_path: dir.path().join(file),
+                ..test_state_base()
+            })
+        };
+        let replica_a = mk_replica("a.json", conn.clone());
+        let replica_b = mk_replica("b.json", conn.clone());
+
+        replica_a.probe_endpoint(0, "claude-sonnet-4-5").await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "first replica must win the lock and probe"
+        );
+
+        replica_b.probe_endpoint(0, "claude-sonnet-4-5").await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "second replica must be suppressed by the held lock"
+        );
+        assert!(
+            conn.exists::<_, bool>("alb:probe:probe-ep:claude-sonnet-4-5")
+                .await
+                .unwrap(),
+            "probe lock key must exist while held"
+        );
+
+        replica_b.probe_endpoint(0, "claude-opus-4-6").await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a different model is a different lock and must probe"
+        );
+    }
+
+    /// AC6: fail-open contract — with Redis down the lock SET errors and the
+    /// probe proceeds anyway (a dead coordinator must not stop probing).
+    #[tokio::test]
+    async fn probe_lock_fails_open_when_redis_is_down() {
+        let Some((conn, kill)) = proxied_conn(11).await else {
+            return;
+        };
+        let (mock_url, hits) = spawn_counting_upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("failopen-ep", "sk-test", &mock_url)],
+            redis: Some(conn),
+            state_path: dir.path().join("s.json"),
+            ..test_state_base()
+        });
+        kill_proxy(kill).await;
+        // Prove the backend is actually dead before probing — otherwise a
+        // silently-regressed kill_proxy would make hits==1 pass via the
+        // lock-acquired path instead of the fail-open path.
+        let mut dead = state.redis.clone().unwrap();
+        let ping: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut dead).await;
+        assert!(ping.is_err(), "proxy kill must sever the redis connection");
+        state.probe_endpoint(0, "claude-sonnet-4-5").await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "redis down must fail open: probe anyway"
+        );
+    }
+
+    /// AC7: killing the backend mid-run degrades every coordination path to
+    /// local-only — no panics, budgets enforced from local state, cluster
+    /// info reports the outage. The `*_without_redis` tests cover the
+    /// cold-start absence case; this covers loss of an established backend.
+    #[tokio::test]
+    async fn backend_death_mid_run_degrades_to_local_only() {
+        let Some((conn, kill)) = proxied_conn(12).await else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let state = Arc::new(AppState {
+            endpoints: vec![make_endpoint("degrade-ep", Protocol::Anthropic)],
+            client_budgets: [("degrade-cli".to_string(), 100u64)].into(),
+            redis: Some(conn),
+            ..test_state_base()
+        });
+
+        // Healthy first: the shared counter works through the proxy.
+        state.record_budget_usage("degrade-cli", 50).await;
+        assert!(state.check_budget("degrade-cli").await.is_ok());
+
+        kill_proxy(kill).await;
+
+        // Budget: INCRBY and the follow-up DEL both fail; the local
+        // accumulator still advances (50+60=110) and check_budget falls back
+        // to it, refusing over-limit spend with redis dead.
+        state.record_budget_usage("degrade-cli", 60).await;
+        assert_eq!(
+            state.check_budget("degrade-cli").await,
+            Err(0),
+            "local fallback must enforce the budget with redis dead"
+        );
+
+        // The periodic sync tick and the publish wrappers must return
+        // without hanging. (Their redis writes are fire-and-forget
+        // tokio::spawn tasks whose failures are swallowed by design — this
+        // asserts the synchronous paths, not the spawned writes.)
+        state.sync_from_redis().await;
+        state.publish_routing_weights().await;
+        state.signal_hard_limit_recovery("degrade-ep").await;
+
+        let info = state
+            .cluster_info()
+            .await
+            .expect("cluster_info must still report with redis dead");
+        assert_eq!(
+            info["redis_connected"], false,
+            "cluster_info must surface the outage"
+        );
+    }
 }

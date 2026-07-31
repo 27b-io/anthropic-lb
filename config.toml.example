@@ -89,6 +89,7 @@ probe_interval_secs = 300
 # backend = "redis"                    # "redis" or "cachekitio"
 # redis_url = "redis://10.0.0.5:6379/1"
 # # api_key = "<from secret store>"    # for backend = "cachekitio"
+# # api_url = "https://api.dev.cachekit.io" # optional override (e.g. cachekit DEV env); default api.cachekit.io. HTTPS-only, private/loopback IPs rejected.
 # master_key = "<from secret store: openssl rand -hex 32>" # mandatory; 32+ bytes hex
 # # ttl_secs = 3600                    # default 1h
 # # op_timeout_ms = 250                # fail-open budget per cache op
