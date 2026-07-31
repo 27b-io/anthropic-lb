@@ -62,7 +62,7 @@ jobs:
       # ALB_TEST_REDIS_URL below makes those tests PANIC (not skip) if the
       # backend is unreachable — CI can never silently pass without it.
       valkey:
-        image: valkey/valkey:8
+        image: valkey/valkey@sha256:495e4fecdc98ee48a20b207726caa5ab6451e0fac3642a9be10d9e70b3068df6 # 8
         ports:
           - 6379:6379
         options: >-

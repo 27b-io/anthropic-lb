@@ -99,9 +99,12 @@ kill "$(cat /tmp/alb-test-redis.pid)"
 
 > [!IMPORTANT]
 > When `ALB_TEST_REDIS_URL` is unset the tests print a `SKIP` notice and
-> return. When it is set but the backend is unreachable they **panic** —
-> CI (which runs a Valkey service container, see `.github/workflows/ci.yml`)
-> can never skip them silently.
+> return — unless the `CI` env var is present, in which case they **panic**.
+> When the URL is set but the backend is unreachable they also **panic**.
+> Two workflows run the suite and must both keep providing the Valkey
+> service container + `ALB_TEST_REDIS_URL`: `.github/workflows/ci.yml`
+> (test job) and `.github/workflows/release.yml` (validate job). Neither
+> can ever skip the suite silently.
 
 Each test owns a dedicated logical DB (`SELECT 1`–`12`) because all `alb:*`
 coordination keys are hardcoded in production code and cannot be prefixed

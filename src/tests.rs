@@ -16004,10 +16004,22 @@ mod redis_integration {
     /// Resolve the opt-in backend URL. None (with a SKIP notice) when the
     /// env var is unset locally; PANICS when unset in CI (`CI` env present),
     /// so no workflow — current or future — can green with this suite
-    /// silently skipped.
+    /// silently skipped. The documented shape (`redis://host:port` — no
+    /// auth, no db suffix) is validated here, once: the callers append
+    /// `/{db}` for isolation and parse `host:port` for the killable proxy,
+    /// both of which silently misbehave on a decorated URL.
     fn test_redis_url() -> Option<String> {
         match std::env::var(TEST_REDIS_ENV) {
-            Ok(u) => Some(u),
+            Ok(u) => {
+                let host_port = u.strip_prefix("redis://").unwrap_or_else(|| {
+                    panic!("{TEST_REDIS_ENV} must be a plain redis:// url, got {u}")
+                });
+                assert!(
+                    !host_port.contains('@') && !host_port.trim_end_matches('/').contains('/'),
+                    "{TEST_REDIS_ENV} must be redis://host:port — no auth, no db suffix (got {u})"
+                );
+                Some(u)
+            }
             Err(_) if std::env::var("CI").is_ok() => {
                 panic!(
                     "CI run without {TEST_REDIS_ENV}: the redis_integration suite would \
@@ -16525,8 +16537,8 @@ mod redis_integration {
             .await
             .unwrap();
         assert!(
-            (172_700..=172_800).contains(&ttl),
-            "budget key must carry its full 48h EXPIRE, got {ttl}"
+            (BUDGET_TTL_SECS - 100..=BUDGET_TTL_SECS).contains(&ttl),
+            "budget key must carry its full 48h EXPIRE (~{BUDGET_TTL_SECS}s), got {ttl}"
         );
 
         // Cross-replica enforcement: a replica with a lower limit and NO
