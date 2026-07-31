@@ -15654,6 +15654,7 @@ async fn response_cache_redis_backend_fails_open_when_down() {
         op_timeout_ms: Some(200),
         redis_url: Some("redis://127.0.0.1:1".to_string()),
         api_key: None,
+        api_url: None,
     };
     let rc = tokio::time::timeout(Duration::from_secs(10), ResponseCache::from_config(&cfg))
         .await
@@ -15669,10 +15670,12 @@ async fn response_cache_redis_backend_fails_open_when_down() {
     assert!(rc.errors.load(Ordering::Relaxed) >= 1);
 }
 
-// AC11 (SaaS): CachekitIO backend constructs through the same config path
-// (fixed at cachekit's default HTTPS endpoint — there is deliberately no
-// api_url knob), and the SDK's SSRF guard holds: loopback/private hosts are
-// rejected even when a caller asks for a custom host (AC14 talking point).
+// AC11 (SaaS): CachekitIO backend constructs through the same config path,
+// with and without an api_url override (the override exists for the dev
+// environment, which is not on cachekit's built-in host allow-list), and the
+// SDK's SSRF guard holds through OUR config path: loopback/private hosts are
+// rejected at startup even though the override sets allow_custom_host
+// (AC14 talking point).
 #[tokio::test]
 async fn response_cache_cachekitio_backend_constructs_and_blocks_loopback() {
     let cfg = ResponseCacheConfig {
@@ -15683,18 +15686,45 @@ async fn response_cache_cachekitio_backend_constructs_and_blocks_loopback() {
         op_timeout_ms: Some(200),
         redis_url: None,
         api_key: Some("ck_test_dummy".to_string()),
+        api_url: None,
     };
     assert!(ResponseCache::from_config(&cfg).await.unwrap().is_some());
 
-    // The guard the config path relies on, exercised directly.
+    // Custom public host (the dev-environment shape) constructs.
+    let dev = ResponseCacheConfig {
+        api_url: Some("https://api.dev.cachekit.io".to_string()),
+        ..cfg.clone()
+    };
+    assert!(ResponseCache::from_config(&dev).await.unwrap().is_some());
+
+    // Loopback/private hosts fail startup loudly — through the config path.
+    let loopback = ResponseCacheConfig {
+        api_url: Some("https://127.0.0.1:9".to_string()),
+        ..cfg.clone()
+    };
     assert!(
-        cachekit::backend::cachekitio::CachekitIO::builder()
-            .api_key("ck_test_dummy")
-            .api_url("https://127.0.0.1:9")
-            .allow_custom_host(true)
-            .build()
-            .is_err(),
+        ResponseCache::from_config(&loopback).await.is_err(),
         "loopback api_url must be rejected by cachekit's SSRF guard"
+    );
+
+    // RFC1918 private hosts fail too — internal targets stay unreachable.
+    let private = ResponseCacheConfig {
+        api_url: Some("https://10.0.0.1:443".to_string()),
+        ..cfg.clone()
+    };
+    assert!(
+        ResponseCache::from_config(&private).await.is_err(),
+        "private-address api_url must be rejected by cachekit's SSRF guard"
+    );
+
+    // Plain HTTP fails too.
+    let http = ResponseCacheConfig {
+        api_url: Some("http://api.dev.cachekit.io".to_string()),
+        ..cfg
+    };
+    assert!(
+        ResponseCache::from_config(&http).await.is_err(),
+        "non-HTTPS api_url must be rejected"
     );
 }
 
@@ -15710,6 +15740,7 @@ async fn response_cache_config_validation() {
         op_timeout_ms: None,
         redis_url: None,
         api_key: None,
+        api_url: None,
     };
     assert!(
         ResponseCache::from_config(&base).await.is_err(),
