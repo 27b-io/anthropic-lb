@@ -9,16 +9,54 @@ strategy = "dynamic-capacity-v1"
 rate_limit_cooldown_secs = 60
 probe_interval_secs = 300
 
-# Proxy authentication: clients must send this as x-api-key to access the proxy.
-# Omit to leave proxy open (only do so on a trusted/private network).
+# ── Authentication ────────────────────────────────────────────────────
+#
+# Two mutually exclusive modes. Configuring BOTH fails startup — see README
+# "Authentication".
+#
+# 1. [[clients]] (recommended): each caller gets its OWN key, and the matched
+#    entry's `name` becomes the request's client_id. The x-client-id header and
+#    the client_names IP map are then IGNORED — identity cannot be asserted by
+#    the caller. That makes client_budgets, client_utilization_limits,
+#    operators, the per-client model allow-list and the response-cache tenant
+#    all unspoofable, because every one of them keys on client_id.
+#
+#    Keys are compared in constant time. Generate one per client:
+#      openssl rand -hex 32
+#    SECRETS: like proxy_key and the endpoint tokens below, these are rendered
+#    from the secret store at deploy time — this example file holds only
+#    placeholders.
+#
+# [[clients]]
+# name = "geo-pipeline"
+# key = "<from secret store: openssl rand -hex 32>"
+# models = ["claude-sonnet-*", "claude-haiku-*"]  # omit/empty = all models
+#
+# [[clients]]
+# name = "radar"
+# key = "<from secret store: openssl rand -hex 32>"
+#
+# 2. proxy_key (LEGACY): one shared secret for everyone, sent as x-api-key. It
+#    authenticates but does NOT identify — every caller presents the same string,
+#    so client_id still comes from the (client-asserted) x-client-id header and
+#    a per-client model allow-list would be defeated by editing one header.
+#    Migrate to [[clients]].
 # proxy_key = "your-secret-key-here"
+#
+# Omitting BOTH leaves the proxy open to anyone who can reach it — only do so
+# on a trusted private network, and note that allowed_ips below is likewise
+# unset-permissive.
 
 # IP allowlist: only accept connections from these IPs/CIDRs.
 # Supports individual IPs and CIDR ranges. Omit or leave empty to allow all.
+# NOTE: omitted = ALLOW ALL. This is not a default-deny.
 # allowed_ips = ["100.64.0.0/10", "10.0.0.0/8", "1.2.3.4"]
 
-# Operators: these client_ids are never throttled by utilization limits, budget limits,
-# or the emergency brake. Identity resolved via x-client-id header or client_names IP map.
+# Operators: these client_ids are never throttled by utilization limits, budget
+# limits, the emergency brake, or the per-client model allow-list.
+# Under [[clients]] these name authenticated principals. Without it, identity is
+# resolved via the x-client-id header or the client_names IP map — i.e. operator
+# status is then trust-based and forgeable.
 # operators = ["ray", "openclaw", "claude"]
 
 # Per-client utilization limits: clients are 429'd when ALL model-compatible endpoints
@@ -56,9 +94,14 @@ probe_interval_secs = 300
 # backend only ever holds ciphertext. Omit the section (or leave clients
 # empty) to disable entirely. NOTE: an opted-in client replaying an identical
 # temperature > 0 request gets the SAME answer back, by design.
-# SECURITY: x-client-id is client-asserted, so allow-listed clients must
-# mutually trust each other — presenting an opted-in client's ID reads its
-# cached responses. One trust domain per allow-list.
+# SECURITY: entries here name client IDs, and each client's cache is encrypted
+# under a key derived from that ID. Under [[clients]] the ID is an
+# authenticated principal, so that derivation is a real isolation boundary and
+# every name below must match a configured [[clients]] entry (a typo fails
+# startup rather than silently disabling the cache for that client). WITHOUT
+# [[clients]], client IDs are client-asserted: allow-listed clients must then
+# mutually trust each other, because presenting an opted-in client's ID reads
+# its cached responses. One trust domain per allow-list in that mode.
 # SECRETS: master_key / api_key are placeholders — NEVER commit real values.
 # Like proxy_key and endpoint tokens, the rendered config file IS the secret
 # vehicle: deployments template it from the secret store at pod start (see
