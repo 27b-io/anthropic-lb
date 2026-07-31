@@ -16011,12 +16011,16 @@ mod redis_integration {
     fn test_redis_url() -> Option<String> {
         match std::env::var(TEST_REDIS_ENV) {
             Ok(u) => {
+                // Never interpolate the raw value into these messages: a
+                // rejected URL may carry credentials (redis://user:pass@…),
+                // and the panic lands in CI logs.
                 let host_port = u.strip_prefix("redis://").unwrap_or_else(|| {
-                    panic!("{TEST_REDIS_ENV} must be a plain redis:// url, got {u}")
+                    panic!("{TEST_REDIS_ENV} must be a plain redis:// url (value redacted)")
                 });
                 assert!(
                     !host_port.contains('@') && !host_port.trim_end_matches('/').contains('/'),
-                    "{TEST_REDIS_ENV} must be redis://host:port — no auth, no db suffix (got {u})"
+                    "{TEST_REDIS_ENV} must be redis://host:port — no auth, no db suffix \
+                     (value redacted)"
                 );
                 Some(u)
             }
