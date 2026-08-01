@@ -16360,8 +16360,20 @@ fn oauth_beta_filter_keeps_claude_code_flag_set() {
     let bumped: Vec<String> = claude_code_flags
         .iter()
         .map(|flag| {
-            // Strip the trailing `-YYYY-MM-DD`, keeping the family.
-            let family = flag.rsplitn(4, '-').last().unwrap();
+            // Strip the trailing `-YYYY-MM-DD`, keeping the family. Validate
+            // the suffix shape first so a malformed inventory entry (e.g. a
+            // compact `-YYYYMMDD` date) fails naming the entry, instead of
+            // mis-stripping and surfacing as a baffling allowlist miss below.
+            let parts: Vec<&str> = flag.rsplitn(4, '-').collect();
+            assert_eq!(parts.len(), 4, "flag lacks a -YYYY-MM-DD suffix: {flag}");
+            assert!(
+                parts[..3]
+                    .iter()
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+                "flag suffix is not numeric YYYY-MM-DD: {flag}"
+            );
+            let family = parts[3];
+            assert_ne!(family, "", "empty family for {flag}");
             assert_ne!(family, *flag, "date-suffix strip failed for {flag}");
             format!("{family}-2099-12-31")
         })
@@ -16381,6 +16393,21 @@ fn oauth_beta_filter_keeps_claude_code_flag_set() {
         bumped_dropped.is_empty(),
         "a Claude Code date bump must stay allowed (suffix wildcard lost?): {bumped_dropped:?}"
     );
+    // `dropped` and the outbound header are separate outputs — an allowed
+    // flag silently discarded (neither forwarded nor reported) passes the
+    // assertion above. Check the header too, exact-token like the main set.
+    let bumped_sent = bumped_headers
+        .get("anthropic-beta")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let bumped_tokens: Vec<&str> = bumped_sent.split(',').map(str::trim).collect();
+    for flag in &bumped {
+        assert!(
+            bumped_tokens.contains(&flag.as_str()),
+            "bumped flag not forwarded as an exact token: {flag} (sent: {bumped_sent})"
+        );
+    }
 }
 
 /// AC-13: passthrough endpoints return early — caller headers untouched,
