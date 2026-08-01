@@ -16366,10 +16366,12 @@ fn oauth_beta_filter_keeps_claude_code_flag_set() {
             // mis-stripping and surfacing as a baffling allowlist miss below.
             let parts: Vec<&str> = flag.rsplitn(4, '-').collect();
             assert_eq!(parts.len(), 4, "flag lacks a -YYYY-MM-DD suffix: {flag}");
+            // rsplitn yields the components reversed: day, month, year.
             assert!(
                 parts[..3]
                     .iter()
-                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+                    .zip([2usize, 2, 4])
+                    .all(|(p, w)| p.len() == w && p.bytes().all(|b| b.is_ascii_digit())),
                 "flag suffix is not numeric YYYY-MM-DD: {flag}"
             );
             let family = parts[3];
