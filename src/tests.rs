@@ -16313,26 +16313,42 @@ fn oauth_beta_filter_keeps_claude_code_flag_set() {
         "afk-mode-2026-01-31",
         "structured-outputs-2025-12-15",
     ];
+    // Negative control: the point of the allow-list is that it still rejects.
+    // Without this, widening the default to "*" would keep the test green.
+    let unlisted = "evil-feature-2026-01-01";
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
         "anthropic-beta",
-        HeaderValue::from_str(&claude_code_flags.join(",")).unwrap(),
+        HeaderValue::from_str(&format!("{},{unlisted}", claude_code_flags.join(","))).unwrap(),
     );
     let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &default_betas());
-    assert!(
-        dropped.is_empty(),
-        "no Claude Code flag may be dropped by the default allow-list: {dropped:?}"
+    assert_eq!(
+        dropped,
+        vec![unlisted.to_string()],
+        "only the unlisted flag may be dropped"
     );
+    // Exact token membership, not substring: `sent.contains(flag)` also passes
+    // on a mangled or embedded token (e.g. "no-effort-2025-11-24" contains
+    // "effort-2025-11-24"), so it cannot tell a forwarded flag from a
+    // corrupted one.
     let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    let tokens: Vec<&str> = sent.split(',').map(str::trim).collect();
     for flag in claude_code_flags {
         assert!(
-            sent.contains(flag),
-            "Claude Code flag not forwarded: {flag}"
+            tokens.contains(&flag),
+            "Claude Code flag not forwarded as an exact token: {flag} (sent: {sent})"
         );
     }
     for flag in OAUTH_BETA_FLAGS {
-        assert!(sent.contains(flag), "required OAuth flag missing: {flag}");
+        assert!(
+            tokens.contains(flag),
+            "required OAuth flag missing: {flag} (sent: {sent})"
+        );
     }
+    assert!(
+        !tokens.contains(&unlisted),
+        "dropped flag must not be forwarded: {sent}"
+    );
 }
 
 /// AC-13: passthrough endpoints return early — caller headers untouched,
