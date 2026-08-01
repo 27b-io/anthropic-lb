@@ -16287,6 +16287,131 @@ fn oauth_beta_filter_keeps_default_allowed_flags() {
     );
 }
 
+/// Regression (2026-08-01 incident): the full `anthropic-beta` set Claude
+/// Code 2.1.220 sends must survive the default allow-list. The first cut of
+/// `DEFAULT_CLIENT_BETA_ALLOWLIST` listed only six entries and dropped these
+/// ten, which 400'd every Claude Code request through the proxy —
+/// `context-management` in particular has a body-side `context_management`
+/// object that the LB forwards verbatim, so dropping the header alone is a
+/// hard upstream rejection, not a silent feature downgrade.
+///
+/// This inventory came off `anthropic_beta_flag_dropped_total` on the live
+/// fleet. Date suffixes are deliberately concrete: the allow-list wildcards
+/// them, so a Claude Code date bump keeps passing while a genuinely new flag
+/// family still shows up as a drop.
+#[test]
+fn oauth_beta_filter_keeps_claude_code_flag_set() {
+    let claude_code_flags = [
+        "thinking-token-count-2026-05-13",
+        "context-management-2025-06-27",
+        "mid-conversation-system-2026-04-07",
+        "advisor-tool-2026-03-01",
+        "effort-2025-11-24",
+        "fallback-credit-2026-06-01",
+        "extended-cache-ttl-2025-04-11",
+        "redact-thinking-2026-02-12",
+        "afk-mode-2026-01-31",
+        "structured-outputs-2025-12-15",
+    ];
+    // Negative control: the point of the allow-list is that it still rejects.
+    // Without this, widening the default to "*" would keep the test green.
+    let unlisted = "evil-feature-2026-01-01";
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_str(&format!("{},{unlisted}", claude_code_flags.join(","))).unwrap(),
+    );
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &default_betas());
+    assert_eq!(
+        dropped,
+        vec![unlisted.to_string()],
+        "only the unlisted flag may be dropped"
+    );
+    // Exact token membership, not substring: `sent.contains(flag)` also passes
+    // on a mangled or embedded token (e.g. "no-effort-2025-11-24" contains
+    // "effort-2025-11-24"), so it cannot tell a forwarded flag from a
+    // corrupted one.
+    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    let tokens: Vec<&str> = sent.split(',').map(str::trim).collect();
+    for flag in claude_code_flags {
+        assert!(
+            tokens.contains(&flag),
+            "Claude Code flag not forwarded as an exact token: {flag} (sent: {sent})"
+        );
+    }
+    for flag in OAUTH_BETA_FLAGS {
+        assert!(
+            tokens.contains(flag),
+            "required OAuth flag missing: {flag} (sent: {sent})"
+        );
+    }
+    assert!(
+        !tokens.contains(&unlisted),
+        "dropped flag must not be forwarded: {sent}"
+    );
+
+    // A Claude Code date bump must keep passing — that is the entire reason
+    // these entries are wildcarded. Nothing above catches a de-wildcarded
+    // entry (`"context-management-*"` narrowed back to the concrete
+    // `"context-management-2025-06-27"` satisfies every assertion so far),
+    // and that edit re-breaks all primary traffic on Claude Code's next
+    // release. Rebuild each family with a different date, through the real
+    // filter path.
+    let bumped: Vec<String> = claude_code_flags
+        .iter()
+        .map(|flag| {
+            // Strip the trailing `-YYYY-MM-DD`, keeping the family. Validate
+            // the suffix shape first so a malformed inventory entry (e.g. a
+            // compact `-YYYYMMDD` date) fails naming the entry, instead of
+            // mis-stripping and surfacing as a baffling allowlist miss below.
+            let parts: Vec<&str> = flag.rsplitn(4, '-').collect();
+            assert_eq!(parts.len(), 4, "flag lacks a -YYYY-MM-DD suffix: {flag}");
+            // rsplitn yields the components reversed: day, month, year.
+            assert!(
+                parts[..3]
+                    .iter()
+                    .zip([2usize, 2, 4])
+                    .all(|(p, w)| p.len() == w && p.bytes().all(|b| b.is_ascii_digit())),
+                "flag suffix is not numeric YYYY-MM-DD: {flag}"
+            );
+            let family = parts[3];
+            assert_ne!(family, "", "empty family for {flag}");
+            assert_ne!(family, *flag, "date-suffix strip failed for {flag}");
+            format!("{family}-2099-12-31")
+        })
+        .collect();
+    let mut bumped_headers = axum::http::HeaderMap::new();
+    bumped_headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_str(&bumped.join(",")).unwrap(),
+    );
+    let bumped_dropped = inject_account_auth(
+        &mut bumped_headers,
+        "sk-ant-oat01-test",
+        false,
+        &default_betas(),
+    );
+    assert!(
+        bumped_dropped.is_empty(),
+        "a Claude Code date bump must stay allowed (suffix wildcard lost?): {bumped_dropped:?}"
+    );
+    // `dropped` and the outbound header are separate outputs — an allowed
+    // flag silently discarded (neither forwarded nor reported) passes the
+    // assertion above. Check the header too, exact-token like the main set.
+    let bumped_sent = bumped_headers
+        .get("anthropic-beta")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let bumped_tokens: Vec<&str> = bumped_sent.split(',').map(str::trim).collect();
+    for flag in &bumped {
+        assert!(
+            bumped_tokens.contains(&flag.as_str()),
+            "bumped flag not forwarded as an exact token: {flag} (sent: {bumped_sent})"
+        );
+    }
+}
+
 /// AC-13: passthrough endpoints return early — caller headers untouched,
 /// nothing dropped.
 #[test]

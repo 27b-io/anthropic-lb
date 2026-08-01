@@ -2185,6 +2185,25 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     "fine-grained-tool-streaming-*",
     "prompt-caching-*",
     "context-1m*",
+    // The rest of what Claude Code 2.1.x sends on every request (inventory
+    // taken from anthropic_beta_flag_dropped_total on the lab fleet,
+    // 2026-08-01). The first cut of this list under-enumerated them, which
+    // 400'd all primary traffic: several of these flags have a BODY-side
+    // counterpart the LB forwards verbatim (context-management →
+    // `context_management`, structured-outputs → `output_format`,
+    // extended-cache-ttl → `cache_control.ttl`), so stripping only the
+    // header leaves an incoherent request that upstream rejects outright
+    // rather than degrading to the non-beta behaviour.
+    "context-management-*",
+    "structured-outputs-*",
+    "extended-cache-ttl-*",
+    "effort-*",
+    "thinking-token-count-*",
+    "mid-conversation-system-*",
+    "advisor-tool-*",
+    "fallback-credit-*",
+    "redact-thinking-*",
+    "afk-mode-*",
 ];
 
 /// Cardinality bound for `beta_flags_dropped` — flag names are
