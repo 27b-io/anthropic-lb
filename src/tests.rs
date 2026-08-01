@@ -16287,6 +16287,54 @@ fn oauth_beta_filter_keeps_default_allowed_flags() {
     );
 }
 
+/// Regression (2026-08-01 incident): the full `anthropic-beta` set Claude
+/// Code 2.1.220 sends must survive the default allow-list. The first cut of
+/// `DEFAULT_CLIENT_BETA_ALLOWLIST` listed only six entries and dropped these
+/// ten, which 400'd every Claude Code request through the proxy —
+/// `context-management` in particular has a body-side `context_management`
+/// object that the LB forwards verbatim, so dropping the header alone is a
+/// hard upstream rejection, not a silent feature downgrade.
+///
+/// This inventory came off `anthropic_beta_flag_dropped_total` on the live
+/// fleet. Date suffixes are deliberately concrete: the allow-list wildcards
+/// them, so a Claude Code date bump keeps passing while a genuinely new flag
+/// family still shows up as a drop.
+#[test]
+fn oauth_beta_filter_keeps_claude_code_flag_set() {
+    let claude_code_flags = [
+        "thinking-token-count-2026-05-13",
+        "context-management-2025-06-27",
+        "mid-conversation-system-2026-04-07",
+        "advisor-tool-2026-03-01",
+        "effort-2025-11-24",
+        "fallback-credit-2026-06-01",
+        "extended-cache-ttl-2025-04-11",
+        "redact-thinking-2026-02-12",
+        "afk-mode-2026-01-31",
+        "structured-outputs-2025-12-15",
+    ];
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_str(&claude_code_flags.join(",")).unwrap(),
+    );
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &default_betas());
+    assert!(
+        dropped.is_empty(),
+        "no Claude Code flag may be dropped by the default allow-list: {dropped:?}"
+    );
+    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    for flag in claude_code_flags {
+        assert!(
+            sent.contains(flag),
+            "Claude Code flag not forwarded: {flag}"
+        );
+    }
+    for flag in OAUTH_BETA_FLAGS {
+        assert!(sent.contains(flag), "required OAuth flag missing: {flag}");
+    }
+}
+
 /// AC-13: passthrough endpoints return early — caller headers untouched,
 /// nothing dropped.
 #[test]
