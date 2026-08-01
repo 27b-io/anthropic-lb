@@ -16349,6 +16349,38 @@ fn oauth_beta_filter_keeps_claude_code_flag_set() {
         !tokens.contains(&unlisted),
         "dropped flag must not be forwarded: {sent}"
     );
+
+    // A Claude Code date bump must keep passing — that is the entire reason
+    // these entries are wildcarded. Nothing above catches a de-wildcarded
+    // entry (`"context-management-*"` narrowed back to the concrete
+    // `"context-management-2025-06-27"` satisfies every assertion so far),
+    // and that edit re-breaks all primary traffic on Claude Code's next
+    // release. Rebuild each family with a different date, through the real
+    // filter path.
+    let bumped: Vec<String> = claude_code_flags
+        .iter()
+        .map(|flag| {
+            // Strip the trailing `-YYYY-MM-DD`, keeping the family.
+            let family = flag.rsplitn(4, '-').last().unwrap();
+            assert_ne!(family, *flag, "date-suffix strip failed for {flag}");
+            format!("{family}-2099-12-31")
+        })
+        .collect();
+    let mut bumped_headers = axum::http::HeaderMap::new();
+    bumped_headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_str(&bumped.join(",")).unwrap(),
+    );
+    let bumped_dropped = inject_account_auth(
+        &mut bumped_headers,
+        "sk-ant-oat01-test",
+        false,
+        &default_betas(),
+    );
+    assert!(
+        bumped_dropped.is_empty(),
+        "a Claude Code date bump must stay allowed (suffix wildcard lost?): {bumped_dropped:?}"
+    );
 }
 
 /// AC-13: passthrough endpoints return early — caller headers untouched,
