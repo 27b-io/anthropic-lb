@@ -148,7 +148,9 @@ token = "sk-ant-test"
 }
 
 #[test]
-fn validate_endpoints_warns_on_non_anthropic_host() {
+fn validate_endpoints_rejects_non_anthropic_host() {
+    // LAB-1191 AC-1: a non-canonical host on an anthropic endpoint would send
+    // the account token to that host — hard startup error naming the endpoint.
     let endpoints = vec![EndpointConfig {
         name: "primary".to_string(),
         protocol: Protocol::Anthropic,
@@ -157,6 +159,65 @@ fn validate_endpoints_warns_on_non_anthropic_host() {
         models: vec![],
         priority: 0,
         fable_included: None,
+        allow_nonstandard_host: None,
+    }];
+    let err = validate_endpoints(&endpoints).unwrap_err();
+    assert!(
+        err.contains("primary"),
+        "error must name the endpoint: {err}"
+    );
+    assert!(
+        err.contains("allow_nonstandard_host"),
+        "error must name the opt-out: {err}"
+    );
+}
+
+#[test]
+fn validate_endpoints_allows_non_anthropic_host_with_opt_in() {
+    // LAB-1191 AC-2: explicit opt-in keeps the old warn-only behaviour.
+    let endpoints = vec![EndpointConfig {
+        name: "staging".to_string(),
+        protocol: Protocol::Anthropic,
+        base_url: Some("https://staging.anthropic.example".to_string()),
+        token: "sk-ant".to_string(),
+        models: vec![],
+        priority: 0,
+        fable_included: None,
+        allow_nonstandard_host: Some(true),
+    }];
+    assert!(validate_endpoints(&endpoints).is_ok());
+}
+
+#[test]
+fn validate_endpoints_rejects_lookalike_anthropic_host() {
+    // LAB-1191 AC-3: exact-host comparison — a canonical-prefix lookalike
+    // domain must NOT pass as canonical.
+    let endpoints = vec![EndpointConfig {
+        name: "evil".to_string(),
+        protocol: Protocol::Anthropic,
+        base_url: Some("https://api.anthropic.com.evil.example".to_string()),
+        token: "sk-ant".to_string(),
+        models: vec![],
+        priority: 0,
+        fable_included: None,
+        allow_nonstandard_host: None,
+    }];
+    let err = validate_endpoints(&endpoints).unwrap_err();
+    assert!(err.contains("evil"));
+}
+
+#[test]
+fn validate_endpoints_accepts_canonical_anthropic_host() {
+    // LAB-1191 AC-3: the canonical host boots without opt-in.
+    let endpoints = vec![EndpointConfig {
+        name: "primary".to_string(),
+        protocol: Protocol::Anthropic,
+        base_url: Some("https://api.anthropic.com".to_string()),
+        token: "sk-ant".to_string(),
+        models: vec![],
+        priority: 0,
+        fable_included: None,
+        allow_nonstandard_host: None,
     }];
     assert!(validate_endpoints(&endpoints).is_ok());
 }
@@ -171,6 +232,7 @@ fn validate_endpoints_rejects_http_base_url() {
         models: vec![],
         priority: 0,
         fable_included: None,
+        allow_nonstandard_host: None,
     }];
     let err = validate_endpoints(&endpoints).unwrap_err();
     assert!(err.contains("https"), "error must mention https: {err}");
@@ -187,6 +249,7 @@ fn validate_endpoints_requires_base_url_for_openai() {
         models: vec![],
         priority: 100,
         fable_included: None,
+        allow_nonstandard_host: None,
     }];
     let err = validate_endpoints(&endpoints).unwrap_err();
     assert!(err.contains("base_url"));
@@ -204,6 +267,7 @@ fn validate_endpoints_accepts_well_formed_mix() {
             models: vec![],
             priority: 0,
             fable_included: None,
+            allow_nonstandard_host: None,
         },
         EndpointConfig {
             name: "gateway".to_string(),
@@ -213,6 +277,7 @@ fn validate_endpoints_accepts_well_formed_mix() {
             models: vec![],
             priority: 100,
             fable_included: None,
+            allow_nonstandard_host: None,
         },
     ];
     assert!(validate_endpoints(&endpoints).is_ok());
@@ -293,11 +358,13 @@ fn make_endpoint(name: &str, protocol: Protocol) -> Endpoint {
 /// production's 0.90.
 fn test_state_base() -> AppState {
     AppState {
-        client: Client::builder()
+        // Production knob chain (incl. redirect Policy::none — LAB-1191) with
+        // a short test timeout layered on top.
+        client: upstream_client_builder()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap(),
-        client_nonstreaming: Client::builder()
+        client_nonstreaming: upstream_client_builder()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap(),
@@ -338,6 +405,12 @@ fn test_state_base() -> AppState {
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: DEFAULT_SESSION_REGISTRY_MAX,
         session_registry_ttl_secs: DEFAULT_SESSION_REGISTRY_TTL_SECS,
+        expose_upstream_ratelimit_headers: false,
+        allowed_client_betas: DEFAULT_CLIENT_BETA_ALLOWLIST
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
@@ -425,6 +498,18 @@ async fn mock_upstream_handler(req: Request<Body>) -> Response {
         "anthropic-ratelimit-unified-5h-reset",
         HeaderValue::from_str(&reset_epoch).unwrap(),
     );
+    // Headers a real upstream may attach that must NOT reach the caller by
+    // default (LAB-1191 finding 3) + one allow-listed header that must.
+    headers.insert(
+        "anthropic-ratelimit-unified-5h-status",
+        HeaderValue::from_static("allowed"),
+    );
+    headers.insert("set-cookie", HeaderValue::from_static("upstream=leak"));
+    headers.insert(
+        "anthropic-organization-id",
+        HeaderValue::from_static("org-secret"),
+    );
+    headers.insert("request-id", HeaderValue::from_static("req_mock_123"));
     resp
 }
 
@@ -2156,10 +2241,26 @@ async fn proxy_returns_502_when_upstream_body_read_fails() {
         }
     });
 
-    let (app, _state) = test_app(
-        &format!("http://{}", mock_addr),
-        Some("secret-key".to_string()),
-    );
+    // Ratelimit reflection is opt-in since LAB-1191; this test asserts the
+    // error-arm parity that the opt-in restores, so flip it on.
+    let mut state = test_state_with(vec![
+        mk_endpoint_at(
+            "acct-a",
+            "sk-ant-api-test-aaa",
+            &format!("http://{}", mock_addr),
+        ),
+        mk_endpoint_at(
+            "acct-b",
+            "sk-ant-api-test-bbb",
+            &format!("http://{}", mock_addr),
+        ),
+    ]);
+    {
+        let s = Arc::get_mut(&mut state).expect("test fixture should be uniquely owned");
+        s.proxy_key = Some("secret-key".to_string());
+        s.expose_upstream_ratelimit_headers = true;
+    }
+    let app = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -2186,15 +2287,16 @@ async fn proxy_returns_502_when_upstream_body_read_fails() {
         reqwest::StatusCode::BAD_GATEWAY,
         "truncated upstream body must become a 502, not a silent empty 200"
     );
-    // The 502 must still forward the upstream's rate-limit headers (and the
-    // budget status) so the client's limit tracking doesn't go blind on the
-    // error arm — parity with every success arm.
+    // With expose_upstream_ratelimit_headers = true, the 502 must still
+    // forward the upstream's rate-limit headers (and the budget status) so
+    // the client's limit tracking doesn't go blind on the error arm — parity
+    // with every success arm.
     assert_eq!(
         resp.headers()
             .get("anthropic-ratelimit-unified-5h-utilization")
             .and_then(|v| v.to_str().ok()),
         Some("0.42"),
-        "502 should forward upstream anthropic-ratelimit-* headers"
+        "502 should forward upstream anthropic-ratelimit-* headers when exposed"
     );
     assert!(
         resp.headers().contains_key("x-budget-status"),
@@ -13632,7 +13734,7 @@ async fn openai_compat_translates_upstream_raw_error() {
 fn inject_auth_api_key() {
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("authorization", HeaderValue::from_static("Bearer old"));
-    inject_account_auth(&mut headers, "sk-ant-api-test123", false);
+    inject_account_auth(&mut headers, "sk-ant-api-test123", false, &default_betas());
     assert_eq!(headers.get("x-api-key").unwrap(), "sk-ant-api-test123");
     assert!(headers.get("authorization").is_none());
 }
@@ -13640,7 +13742,7 @@ fn inject_auth_api_key() {
 #[test]
 fn inject_auth_oauth_token() {
     let mut headers = axum::http::HeaderMap::new();
-    inject_account_auth(&mut headers, "sk-ant-oat-test123", false);
+    inject_account_auth(&mut headers, "sk-ant-oat-test123", false, &default_betas());
     assert_eq!(
         headers.get("authorization").unwrap(),
         "Bearer sk-ant-oat-test123"
@@ -13658,17 +13760,25 @@ fn inject_auth_oauth_token() {
 
 #[test]
 fn inject_auth_oauth_merges_multi_value_beta() {
+    // Allow-listed flags split across TWO header values (LAB-1191: unlisted
+    // flags are dropped, so the merge is exercised with allowed ones).
     let mut headers = axum::http::HeaderMap::new();
-    headers.append("anthropic-beta", HeaderValue::from_static("existing-flag"));
-    headers.append("anthropic-beta", HeaderValue::from_static("another-flag"));
-    inject_account_auth(&mut headers, "sk-ant-oat-test123", false);
+    headers.append(
+        "anthropic-beta",
+        HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+    );
+    headers.append(
+        "anthropic-beta",
+        HeaderValue::from_static("fine-grained-tool-streaming-2025-05-14"),
+    );
+    inject_account_auth(&mut headers, "sk-ant-oat-test123", false, &default_betas());
     let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
     assert!(
-        beta.contains("existing-flag"),
+        beta.contains("interleaved-thinking-2025-05-14"),
         "should preserve first header"
     );
     assert!(
-        beta.contains("another-flag"),
+        beta.contains("fine-grained-tool-streaming-2025-05-14"),
         "should preserve second header"
     );
     assert!(beta.contains("oauth-2025-04-20"), "should add oauth flag");
@@ -13683,7 +13793,7 @@ fn inject_auth_passthrough_preserves_headers() {
         HeaderValue::from_static("Bearer user-token"),
     );
     headers.insert("x-api-key", HeaderValue::from_static("user-key"));
-    inject_account_auth(&mut headers, "passthrough", true);
+    inject_account_auth(&mut headers, "passthrough", true, &default_betas());
     assert_eq!(headers.get("authorization").unwrap(), "Bearer user-token");
     assert_eq!(headers.get("x-api-key").unwrap(), "user-key");
 }
@@ -16888,6 +16998,554 @@ async fn metrics_exposes_the_model_denial_counter() {
             "anthropic_client_model_denied_total{client=\"limited\",model=\"claude-opus-5\"} 1"
         ),
         "denial counter missing from /metrics:\n{body}"
+    );
+}
+// ── LAB-1191: token-exfil audit findings (redirects, header reflection,
+//    client beta flags) ────────────────────────────────────────────────
+
+/// Raw-TCP upstream that answers every request with a 302 to `target`.
+async fn spawn_redirecting_upstream(target: String) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let target = target.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {target}/v1/messages\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    format!("http://{}", addr)
+}
+
+/// AC-4/5/6: a 3xx from upstream must NOT be followed (the follow-up request
+/// would re-send the account credential to the Location host) and must
+/// surface as a deliberate 502, not a forwarded 302 or an endless retry.
+#[tokio::test]
+async fn upstream_redirect_not_followed_and_becomes_502() {
+    use std::sync::atomic::Ordering;
+    // The redirect target counts every connection it receives — with
+    // Policy::none() it must stay at zero.
+    let (target_url, target_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let redirecting = spawn_redirecting_upstream(target_url).await;
+
+    let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-api-aaa", &redirecting)]);
+    let addr = serve(build_router(state)).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "upstream 3xx must become a deliberate 502"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("redirect"), "502 body must say why: {body}");
+    assert_eq!(
+        target_hits.load(Ordering::SeqCst),
+        0,
+        "no request may follow the redirect with credentials attached"
+    );
+}
+
+/// AC-7/AC-10: by default the caller must not see the upstream's rate-limit
+/// capacity, cookies, or org identity — only the allow-listed headers.
+#[tokio::test]
+async fn upstream_headers_stripped_by_default() {
+    let (upstream_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = test_app(&upstream_url, None);
+    let addr = serve(app).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    for leaked in [
+        "anthropic-ratelimit-unified-5h-utilization",
+        "anthropic-ratelimit-unified-5h-status",
+        "set-cookie",
+        "anthropic-organization-id",
+    ] {
+        assert!(
+            !resp.headers().contains_key(leaked),
+            "{leaked} must not be reflected by default"
+        );
+    }
+    // Allow-listed headers still flow.
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("req_mock_123"),
+        "request-id is allow-listed for SDK error reports"
+    );
+    assert!(resp.headers().contains_key("x-budget-status"));
+}
+
+/// AC-8/AC-10: expose_upstream_ratelimit_headers = true restores the
+/// anthropic-ratelimit-* passthrough (trusted networks) — and ONLY that:
+/// cookies and org identity stay stripped.
+#[tokio::test]
+async fn upstream_ratelimit_headers_reflected_with_flag() {
+    let (upstream_url, _handle) = spawn_mock_upstream().await;
+    let mut state = test_state_with(vec![mk_endpoint_at(
+        "acct-a",
+        "sk-ant-api-test-aaa",
+        &upstream_url,
+    )]);
+    Arc::get_mut(&mut state)
+        .expect("test fixture should be uniquely owned")
+        .expose_upstream_ratelimit_headers = true;
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("anthropic-ratelimit-unified-5h-utilization")
+            .and_then(|v| v.to_str().ok()),
+        Some("0.25"),
+        "flag must restore anthropic-ratelimit-* passthrough"
+    );
+    assert!(
+        !resp.headers().contains_key("set-cookie"),
+        "set-cookie stays stripped even with the ratelimit flag on"
+    );
+    assert!(
+        !resp.headers().contains_key("anthropic-organization-id"),
+        "org identity stays stripped even with the ratelimit flag on"
+    );
+}
+
+fn default_betas() -> Vec<String> {
+    DEFAULT_CLIENT_BETA_ALLOWLIST
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// AC-11/AC-13: an unknown client beta flag is dropped from the forwarded
+/// header and reported back; the LB's own OAuth flags are still appended.
+#[test]
+fn oauth_beta_filter_drops_unknown_flags() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("evil-feature-2026-01-01,interleaved-thinking-2025-05-14"),
+    );
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &default_betas());
+    assert_eq!(dropped, vec!["evil-feature-2026-01-01".to_string()]);
+    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    assert!(
+        !sent.contains("evil-feature-2026-01-01"),
+        "unknown flag must not be forwarded: {sent}"
+    );
+    assert!(sent.contains("interleaved-thinking-2025-05-14"));
+    for flag in OAUTH_BETA_FLAGS {
+        assert!(sent.contains(flag), "required OAuth flag missing: {flag}");
+    }
+}
+
+/// AC-13: every default-allowed flag survives the filter, including the
+/// wildcard-matched 1M-context flag — and 1M detection still fires on the
+/// filtered header map.
+#[test]
+fn oauth_beta_filter_keeps_default_allowed_flags() {
+    let client_flags = [
+        "oauth-2025-04-20",
+        "claude-code-20250219",
+        "interleaved-thinking-2025-05-14",
+        "fine-grained-tool-streaming-2025-05-14",
+        "prompt-caching-2024-07-31",
+        "context-1m-2025-08-07",
+    ];
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_str(&client_flags.join(",")).unwrap(),
+    );
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &default_betas());
+    assert!(dropped.is_empty(), "nothing should be dropped: {dropped:?}");
+    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    for flag in client_flags {
+        assert!(sent.contains(flag), "allowed flag missing: {flag}");
+    }
+    assert!(
+        request_has_1m_beta(&headers),
+        "1M-context detection must still fire after filtering"
+    );
+}
+
+/// Regression (2026-08-01 incident): the full `anthropic-beta` set Claude
+/// Code 2.1.220 sends must survive the default allow-list. The first cut of
+/// `DEFAULT_CLIENT_BETA_ALLOWLIST` listed only six entries and dropped these
+/// ten, which 400'd every Claude Code request through the proxy —
+/// `context-management` in particular has a body-side `context_management`
+/// object that the LB forwards verbatim, so dropping the header alone is a
+/// hard upstream rejection, not a silent feature downgrade.
+///
+/// This inventory came off `anthropic_beta_flag_dropped_total` on the live
+/// fleet. Date suffixes are deliberately concrete: the allow-list wildcards
+/// them, so a Claude Code date bump keeps passing while a genuinely new flag
+/// family still shows up as a drop.
+#[test]
+fn oauth_beta_filter_keeps_claude_code_flag_set() {
+    let claude_code_flags = [
+        "thinking-token-count-2026-05-13",
+        "context-management-2025-06-27",
+        "mid-conversation-system-2026-04-07",
+        "advisor-tool-2026-03-01",
+        "effort-2025-11-24",
+        "fallback-credit-2026-06-01",
+        "extended-cache-ttl-2025-04-11",
+        "redact-thinking-2026-02-12",
+        "afk-mode-2026-01-31",
+        "structured-outputs-2025-12-15",
+    ];
+    // Negative control: the point of the allow-list is that it still rejects.
+    // Without this, widening the default to "*" would keep the test green.
+    let unlisted = "evil-feature-2026-01-01";
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_str(&format!("{},{unlisted}", claude_code_flags.join(","))).unwrap(),
+    );
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &default_betas());
+    assert_eq!(
+        dropped,
+        vec![unlisted.to_string()],
+        "only the unlisted flag may be dropped"
+    );
+    // Exact token membership, not substring: `sent.contains(flag)` also passes
+    // on a mangled or embedded token (e.g. "no-effort-2025-11-24" contains
+    // "effort-2025-11-24"), so it cannot tell a forwarded flag from a
+    // corrupted one.
+    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    let tokens: Vec<&str> = sent.split(',').map(str::trim).collect();
+    for flag in claude_code_flags {
+        assert!(
+            tokens.contains(&flag),
+            "Claude Code flag not forwarded as an exact token: {flag} (sent: {sent})"
+        );
+    }
+    for flag in OAUTH_BETA_FLAGS {
+        assert!(
+            tokens.contains(flag),
+            "required OAuth flag missing: {flag} (sent: {sent})"
+        );
+    }
+    assert!(
+        !tokens.contains(&unlisted),
+        "dropped flag must not be forwarded: {sent}"
+    );
+
+    // A Claude Code date bump must keep passing — that is the entire reason
+    // these entries are wildcarded. Nothing above catches a de-wildcarded
+    // entry (`"context-management-*"` narrowed back to the concrete
+    // `"context-management-2025-06-27"` satisfies every assertion so far),
+    // and that edit re-breaks all primary traffic on Claude Code's next
+    // release. Rebuild each family with a different date, through the real
+    // filter path.
+    let bumped: Vec<String> = claude_code_flags
+        .iter()
+        .map(|flag| {
+            // Strip the trailing `-YYYY-MM-DD`, keeping the family. Validate
+            // the suffix shape first so a malformed inventory entry (e.g. a
+            // compact `-YYYYMMDD` date) fails naming the entry, instead of
+            // mis-stripping and surfacing as a baffling allowlist miss below.
+            let parts: Vec<&str> = flag.rsplitn(4, '-').collect();
+            assert_eq!(parts.len(), 4, "flag lacks a -YYYY-MM-DD suffix: {flag}");
+            // rsplitn yields the components reversed: day, month, year.
+            assert!(
+                parts[..3]
+                    .iter()
+                    .zip([2usize, 2, 4])
+                    .all(|(p, w)| p.len() == w && p.bytes().all(|b| b.is_ascii_digit())),
+                "flag suffix is not numeric YYYY-MM-DD: {flag}"
+            );
+            let family = parts[3];
+            assert_ne!(family, "", "empty family for {flag}");
+            assert_ne!(family, *flag, "date-suffix strip failed for {flag}");
+            format!("{family}-2099-12-31")
+        })
+        .collect();
+    let mut bumped_headers = axum::http::HeaderMap::new();
+    bumped_headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_str(&bumped.join(",")).unwrap(),
+    );
+    let bumped_dropped = inject_account_auth(
+        &mut bumped_headers,
+        "sk-ant-oat01-test",
+        false,
+        &default_betas(),
+    );
+    assert!(
+        bumped_dropped.is_empty(),
+        "a Claude Code date bump must stay allowed (suffix wildcard lost?): {bumped_dropped:?}"
+    );
+    // `dropped` and the outbound header are separate outputs — an allowed
+    // flag silently discarded (neither forwarded nor reported) passes the
+    // assertion above. Check the header too, exact-token like the main set.
+    let bumped_sent = bumped_headers
+        .get("anthropic-beta")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let bumped_tokens: Vec<&str> = bumped_sent.split(',').map(str::trim).collect();
+    for flag in &bumped {
+        assert!(
+            bumped_tokens.contains(&flag.as_str()),
+            "bumped flag not forwarded as an exact token: {flag} (sent: {bumped_sent})"
+        );
+    }
+}
+
+/// AC-13: passthrough endpoints return early — caller headers untouched,
+/// nothing dropped.
+#[test]
+fn oauth_beta_filter_passthrough_unchanged() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("authorization", HeaderValue::from_static("Bearer caller"));
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("anything-goes-2026"),
+    );
+    let dropped = inject_account_auth(&mut headers, "passthrough", true, &default_betas());
+    assert!(dropped.is_empty());
+    assert_eq!(
+        headers.get("authorization").unwrap(),
+        "Bearer caller",
+        "passthrough must not touch caller auth"
+    );
+    assert_eq!(
+        headers.get("anthropic-beta").unwrap(),
+        "anything-goes-2026",
+        "passthrough must not filter caller betas"
+    );
+}
+
+/// AC-12: dropped flags land in the bounded counter map; past the cap they
+/// fold into `_other` instead of growing per-client-controlled cardinality.
+#[test]
+fn dropped_beta_flag_counter_is_bounded() {
+    let state = test_state_with(vec![]);
+    for i in 0..(MAX_DROPPED_BETA_FLAGS + 10) {
+        state.record_dropped_beta_flags("t", &[format!("flag-{i}")]);
+    }
+    let map = state.beta_flags_dropped.lock().unwrap();
+    assert_eq!(map.len(), MAX_DROPPED_BETA_FLAGS + 1, "cap + _other bucket");
+    assert_eq!(map.get("_other"), Some(&10u64));
+    drop(map);
+    // Existing keys keep counting past the cap.
+    state.record_dropped_beta_flags("t", &["flag-0".to_string()]);
+    assert_eq!(
+        state.beta_flags_dropped.lock().unwrap().get("flag-0"),
+        Some(&2u64)
+    );
+}
+
+/// AC-12/AC-13 end-to-end: a request carrying an unknown beta flag is served,
+/// the flag never reaches the upstream, and /metrics reports the drop.
+#[tokio::test]
+async fn dropped_beta_flag_appears_in_metrics() {
+    let (upstream_url, _handle) = spawn_mock_upstream().await;
+    // test_state_base already carries the default allow-list.
+    let state = test_state_with(vec![mk_endpoint_at(
+        "acct-a",
+        "sk-ant-oat01-test-aaa",
+        &upstream_url,
+    )]);
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("anthropic-beta", "totally-unknown-2026-07-30")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let metrics = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics
+            .contains("anthropic_beta_flag_dropped_total{flag=\"totally-unknown-2026-07-30\"} 1"),
+        "metrics must report the dropped flag"
+    );
+}
+
+/// Panel follow-up (LAB-1191): a client flag that IS one of the required
+/// OAUTH_BETA_FLAGS is always forwarded (the merge re-adds it), so it must
+/// never be reported as dropped — even under a custom allow-list that
+/// omits it. A false drop here would make the diagnostics lie.
+#[test]
+fn oauth_beta_filter_never_reports_required_flags_as_dropped() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("oauth-2025-04-20,claude-code-20250219"),
+    );
+    // Custom allow-list omitting the OAuth flags entirely.
+    let restrictive = vec!["context-1m*".to_string()];
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &restrictive);
+    assert!(
+        dropped.is_empty(),
+        "required OAuth flags are always sent — reporting them dropped is a lie: {dropped:?}"
+    );
+    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    for flag in OAUTH_BETA_FLAGS {
+        assert!(sent.contains(flag));
+    }
+}
+
+/// Panel follow-up (LAB-1191): dropped-flag keys are length-bounded before
+/// logging/counting — a multi-kilobyte client "flag" must not be pinned
+/// verbatim into every /metrics scrape.
+#[test]
+fn dropped_beta_flag_keys_are_length_bounded() {
+    let state = test_state_with(vec![]);
+    let huge = "x".repeat(5000);
+    state.record_dropped_beta_flags("t", &[huge]);
+    let map = state.beta_flags_dropped.lock().unwrap();
+    let key = map.keys().next().unwrap();
+    assert!(
+        key.len() <= MAX_DROPPED_BETA_FLAG_LEN,
+        "key must be truncated, got {} bytes",
+        key.len()
+    );
+}
+
+/// Panel follow-up (LAB-1191 AC-5): on the OpenAI-compat surface an upstream
+/// 3xx must surface as a 502 in the OPENAI error shape — those clients'
+/// parsers cannot read an Anthropic error envelope.
+#[tokio::test]
+async fn upstream_redirect_becomes_openai_shaped_502_on_chat_completions() {
+    use std::sync::atomic::Ordering;
+    let (target_url, target_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let redirecting = spawn_redirecting_upstream(target_url).await;
+
+    let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-oat01-aaa", &redirecting)]);
+    let addr = serve(build_router(state)).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.get("error").and_then(|e| e.get("message")).is_some(),
+        "OpenAI-surface 502 must be OpenAI-shaped: {body}"
+    );
+    assert!(
+        body.get("type").is_none(),
+        "must not be the Anthropic error envelope: {body}"
+    );
+    assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+}
+
+/// PR #116 review (Kody + CodeRabbit): the 1M-context accounting must read
+/// the FILTERED outbound headers. If a custom allow-list strips
+/// `context-1m`, the upstream runs the request at 200k — recording the
+/// session at 1M would inflate /_stats occupancy.
+#[test]
+fn stripped_context_1m_flag_is_invisible_to_accounting() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("context-1m-2025-08-07"),
+    );
+    // Custom allow-list that omits context-1m*.
+    let restrictive = vec!["oauth-2025-04-20".to_string()];
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &restrictive);
+    assert_eq!(dropped, vec!["context-1m-2025-08-07".to_string()]);
+    assert!(
+        !request_has_1m_beta(&headers),
+        "post-filter headers must not carry the stripped 1M flag"
+    );
+}
+
+/// Same defect end-to-end: with a restrictive allow-list, a request carrying
+/// the 1M beta must be registered in the session registry at the 200k window
+/// the upstream actually ran under — not at 1M.
+#[tokio::test]
+async fn session_registry_window_matches_filtered_beta() {
+    // Raw-TCP mock: its canned body carries `usage`, which session
+    // registration requires (the axum mock's body has none).
+    let (upstream_url, _hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let mut state = test_state_with(vec![mk_endpoint_at(
+        "acct-a",
+        "sk-ant-oat01-test-aaa",
+        &upstream_url,
+    )]);
+    Arc::get_mut(&mut state)
+        .expect("test fixture should be uniquely owned")
+        .allowed_client_betas = vec!["oauth-2025-04-20".to_string()];
+    let sessions_state = state.clone();
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-session-id", "sess-1m-strip")
+        .header("anthropic-beta", "context-1m-2025-08-07")
+        .body(r#"{"model":"claude-sonnet-4-6","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let windows: Vec<u64> = sessions_state
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .map(|s| s.context_window)
+        .collect();
+    assert_eq!(
+        windows,
+        vec![DEFAULT_CONTEXT_WINDOW],
+        "session must be tracked at the window the upstream ran (flag was stripped)"
     );
 }
 // ── Real-Redis integration tests (LAB-931) ──────────────────────────
