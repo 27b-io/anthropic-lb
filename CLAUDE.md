@@ -45,7 +45,7 @@ Single Rust binary: all implementation in `src/main.rs` (~9800 lines) with secti
 ### Core Data Flow
 
 ```text
-Request → IP allowlist check → authenticate([[clients]] key, else legacy proxy_key) → resolve client_id (authenticated principal, else x-client-id/IP map) → pre_request_gate(operator bypass → model allow-list → budget → utilization limit → emergency brake) → pick_endpoint(affinity, model, skip) → forward to endpoint → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
+Request → resolve_client_ip(peer, x-forwarded-for vs trusted_proxies) → IP allowlist check → failed-auth throttle check → authenticate([[clients]] key, else legacy proxy_key) → resolve client_id (authenticated principal, else x-client-id/IP map) → pre_request_gate(operator bypass → model allow-list → budget → utilization limit → emergency brake) → pick_endpoint(affinity, model, skip) → forward to endpoint → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
 ```
 
 ### Key Sections (in source order)
@@ -129,14 +129,18 @@ Routing consequences (`constraining_7d_claims`):
 | `clients[].key` | string | required | Per-client secret (`x-api-key`; also `Authorization: Bearer` on `/v1/chat/completions`). Constant-time compared |
 | `clients[].models` | string[]? | [] (all) | Models this client may request; same exact + `*`-suffix matcher as `endpoints[].models`. Violation = 403 |
 | `proxy_key` | string? | none | **Legacy** single shared secret for `x-api-key` auth. Mutually exclusive with `[[clients]]` — configuring both is rejected at startup |
+| `allow_unauthenticated` | bool? | false | LAB-1192 default-deny escape hatch: startup FAILS with no credentials unless this is explicitly true. Incompatible with configured credentials. Trusted-network-only; warns at boot and on each unauthenticated `/_stats`/`/metrics` access |
 | `allowed_ips` | string[]? | none (allow all) | IP/CIDR allowlist |
+| `trusted_proxies` | string[]? | none | LBs whose `x-forwarded-for` is honoured (LAB-1192). Peer in list ⇒ client IP = rightmost XFF entry not in list; otherwise peer address, header ignored. One resolution function (`resolve_client_ip`), called once per handler |
+| `auth_failure_limit` | u32? | 10 | Failed-auth attempts per client IP in the window before 429 + `retry-after` (pre-comparison). 0 disables. Counted in `anthropic_auth_failures_total{route}`; state bounded at 4096 IPs with oldest-window eviction |
+| `auth_failure_window_secs` | u64? | 300 | Failed-auth throttle window |
 | `auto_cache` | bool? | true | Auto-inject prompt cache breakpoints |
 | `shadow_log` | string? | none | Path for JSONL audit trail |
 | `soft_limit` | f64? | 0.90 | Utilization ceiling — endpoints above this are deprioritized within their tier; they are considered only when no healthy candidate is available and the tier degrades to its soft-limited members |
 | `client_names` | map? | {} | IP→client name mapping |
 | `client_budgets` | map? | {} | client_id→daily token limit |
 | `client_utilization_limits` | map? | {} | client_id→utilization ceiling (0.0–1.0) |
-| `operators` | string[]? | [] | Client IDs that bypass the model allow-list, budget, utilization, and emergency brake enforcement (does not bypass IP allowlist). Under `[[clients]]` these name authenticated principals; without it, operator status is trust-based and forgeable |
+| `operators` | string[]? | [] | Client IDs that bypass the model allow-list, budget, utilization, and emergency brake enforcement (does not bypass IP allowlist). Under `[[clients]]` these name authenticated principals AND are the only principals allowed to read `/_stats` + `/metrics` (LAB-1192: 401 unauthenticated / 403 non-operator); without `[[clients]]`, operator status is trust-based and forgeable |
 | `emergency_brake` | bool? | true | Enable/disable the emergency brake |
 | `emergency_threshold` | f64? | 0.88 | Utilization threshold for the emergency brake — applied only to `Protocol::Anthropic` endpoints; OpenAI endpoints (stub `RateLimitInfo`) are excluded so they cannot prevent the brake from firing |
 | `redis_url` | string? | none | Redis/Valkey URL for distributed state (`redis://` or `rediss://`) |
