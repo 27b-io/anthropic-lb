@@ -35,7 +35,8 @@ probe_interval_secs = 300
 # DEFAULT-DENY (LAB-1192): startup FAILS unless [[clients]], proxy_key, or this
 # flag is set. The flag is the ONE escape hatch — trusted-network-only
 # (NetworkPolicy / tailnet), never on a public ingress. It logs a warning at
-# boot and on every unauthenticated /_stats or /metrics access.
+# boot; unauthenticated /_stats and /metrics access also warns, rate-limited
+# to once per route per 5 minutes.
 # allow_unauthenticated = true
 
 # IP allowlist: only accept connections from these IPs/CIDRs.

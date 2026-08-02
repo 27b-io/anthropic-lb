@@ -129,10 +129,10 @@ Routing consequences (`constraining_7d_claims`):
 | `clients[].key` | string | required | Per-client secret (`x-api-key`; also `Authorization: Bearer` on `/v1/chat/completions`). Constant-time compared |
 | `clients[].models` | string[]? | [] (all) | Models this client may request; same exact + `*`-suffix matcher as `endpoints[].models`. Violation = 403 |
 | `proxy_key` | string? | none | **Legacy** single shared secret for `x-api-key` auth. Mutually exclusive with `[[clients]]` — configuring both is rejected at startup |
-| `allow_unauthenticated` | bool? | false | LAB-1192 default-deny escape hatch: startup FAILS with no credentials unless this is explicitly true. Incompatible with configured credentials. Trusted-network-only; warns at boot and on each unauthenticated `/_stats`/`/metrics` access |
+| `allow_unauthenticated` | bool? | false | LAB-1192 default-deny escape hatch: startup FAILS with no credentials unless this is explicitly true. Incompatible with configured credentials. Trusted-network-only; warns at boot, and unauthenticated `/_stats`/`/metrics` access warns at most once per route per 5 min (`OPEN_ADMIN_WARN_INTERVAL`) |
 | `allowed_ips` | string[]? | none (allow all) | IP/CIDR allowlist |
 | `trusted_proxies` | string[]? | none | LBs whose `x-forwarded-for` is honoured (LAB-1192). Peer in list ⇒ client IP = rightmost XFF entry not in list; otherwise peer address, header ignored. One resolution function (`resolve_client_ip`), called once per handler |
-| `auth_failure_limit` | u32? | 10 | Failed-auth attempts per client IP in the window before 429 + `retry-after` (pre-comparison). 0 disables. Counted in `anthropic_auth_failures_total{route}`; state bounded at 4096 IPs with oldest-window eviction |
+| `auth_failure_limit` | u32? | 10 | Failed-auth attempts per client IP in the window before 429 + `retry-after` (pre-comparison). 0 disables. Counted in `anthropic_auth_failures_total{route}`; state bounded at 4096 IPs; eviction purges expired windows first, then the least-established live entry (lowest count, oldest window as tie-breaker) so fresh-failure floods can't flush an active lockout |
 | `auth_failure_window_secs` | u64? | 300 | Failed-auth throttle window |
 | `auto_cache` | bool? | true | Auto-inject prompt cache breakpoints |
 | `shadow_log` | string? | none | Path for JSONL audit trail |

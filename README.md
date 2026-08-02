@@ -302,7 +302,7 @@ One secret for everyone, sent as `x-api-key`. It authenticates but does **not** 
 Keep the previous config to hand: rolling back is the same single-step swap in reverse.
 
 > [!WARNING]
-> Under `[[clients]]`, `/_stats` and `/metrics` require an **operator** credential (a client named in `operators`) — a plain client key gets `403`, no key gets `401`. If a Prometheus scrape, an uptime check, or a Kubernetes `httpGet` probe hits this proxy unauthenticated today, it will start failing — give those callers an operator key in the same change, or a failing probe becomes a restart loop. Under `allow_unauthenticated` both surfaces stay open (each access logs at `warn`).
+> Under `[[clients]]`, `/_stats` and `/metrics` require an **operator** credential (a client named in `operators`) — a plain client key gets `403`, no key gets `401`. If a Prometheus scrape, an uptime check, or a Kubernetes `httpGet` probe hits this proxy unauthenticated today, it will start failing — give those callers an operator key in the same change, or a failing probe becomes a restart loop. Under `allow_unauthenticated` both surfaces stay open (a `warn` fires at most once per route per 5 minutes so a scraper can't drown the log).
 
 ### Client Identification
 
@@ -348,7 +348,7 @@ IP check runs first, then the throttle, then the credential check. All apply to 
 
 ### Admin surfaces are operator-only (LAB-1192)
 
-`/_stats` disclosures are a reconnaissance report for anyone planning to spend the pool: raw `client_id`s, agent/session prefixes, models, **endpoint account names**, token counts, per-account utilisation and budgets. So under `[[clients]]` both `/_stats` and `/metrics` answer only to a client named in `operators` — unauthenticated gets `401`, a valid non-operator credential gets `403`. Under legacy `proxy_key` the (single) key holder is the operator by construction. Under `allow_unauthenticated` both surfaces serve, and every access logs at `warn` so the open posture stays visible.
+`/_stats` disclosures are a reconnaissance report for anyone planning to spend the pool: raw `client_id`s, agent/session prefixes, models, **endpoint account names**, token counts, per-account utilisation and budgets. So under `[[clients]]` both `/_stats` and `/metrics` answer only to a client named in `operators` — unauthenticated gets `401`, a valid non-operator credential gets `403`. Under legacy `proxy_key` the (single) key holder is the operator by construction. Under `allow_unauthenticated` both surfaces serve, and unauthenticated access logs at `warn` — rate-limited to once per route per 5 minutes, so the open posture stays visible without a per-scrape firehose.
 
 ### Real client IP behind a load balancer (LAB-1192)
 
@@ -359,7 +359,7 @@ Behind a GCLB/Cloudflare/ingress, the TCP peer is the LB — without XFF handlin
 
 ### Failed-auth throttling (LAB-1192)
 
-A static bearer credential on the public internet gets scanned. After `auth_failure_limit` failures from one client IP inside `auth_failure_window_secs`, further requests from that IP get `429` with `retry-after` **before any key comparison runs** — a locked-out guesser gets nothing back, not even timing, until the window expires. Failures are counted in `anthropic_auth_failures_total{route}` and logged with the resolved client IP. The throttle table is bounded (4096 IPs, oldest-window eviction), so the tracking structure itself cannot be flooded into an OOM.
+A static bearer credential on the public internet gets scanned. After `auth_failure_limit` failures from one client IP inside `auth_failure_window_secs`, further requests from that IP get `429` with `retry-after` **before any key comparison runs** — a locked-out guesser gets nothing back, not even timing, until the window expires. Failures are counted in `anthropic_auth_failures_total{route}` and logged with the resolved client IP. The throttle table is bounded (4096 IPs), so the tracking structure itself cannot be flooded into an OOM — and eviction is threat-aware: expired windows are purged first, then the least-established live entry (lowest failure count, oldest window as tie-breaker) is evicted, so a flood of fresh failures cannot flush an active lockout to reset it.
 
 ### Credential-path hardening (LAB-1191)
 
