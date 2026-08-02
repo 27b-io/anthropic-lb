@@ -19,6 +19,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, trace, warn};
@@ -33,8 +34,20 @@ struct Config {
     rate_limit_cooldown_secs: Option<u64>,
     /// Seconds between utilization probes per account (0 = disabled). Default: 300 (5 min)
     probe_interval_secs: Option<u64>,
-    /// Shared secret clients must send as x-api-key to access the proxy. None = open.
+    /// LEGACY single shared secret, sent as x-api-key. None = open.
+    /// Superseded by `[[clients]]`; configuring both is rejected at startup
+    /// (`reject_legacy_config_keys`) rather than silently precedence-ordered.
     proxy_key: Option<String>,
+    /// Per-client credentials (LAB-1083). When non-empty, EVERY authenticated
+    /// entry point requires a credential matching one of these keys, and the
+    /// matched entry's `name` becomes the request's `client_id` — the
+    /// `x-client-id` header and the `client_names` IP map are then ignored
+    /// entirely. That is the whole point: budgets, utilization ceilings,
+    /// operator bypass, the model allow-list and the response-cache tenant all
+    /// key on `client_id`, so making it unforgeable makes all five unforgeable
+    /// at once.
+    #[serde(default)]
+    clients: Vec<ClientConfig>,
     /// Source IP allowlist. Supports individual IPs and CIDR ranges. None/empty = allow all.
     allowed_ips: Option<Vec<String>>,
     /// Unified routing endpoints. Each entry is either Anthropic-native or
@@ -115,6 +128,39 @@ struct Config {
     /// any caller could activate arbitrary beta features against the
     /// operator's accounts (LAB-1191).
     allowed_client_betas: Option<Vec<String>>,
+}
+
+/// `[[clients]]` — one authenticated caller. The `key` IS the identity: it is
+/// what the caller presents, and `name` is what the proxy attributes the
+/// request to. No `x-client-id` header can override it.
+#[derive(Deserialize, Clone)]
+struct ClientConfig {
+    /// Identity this credential resolves to. Becomes `client_id`, so it is what
+    /// `client_budgets`, `client_utilization_limits`, `operators` and
+    /// `[response_cache].clients` must name.
+    name: String,
+    /// Shared secret this client presents as `x-api-key` (or, on the
+    /// OpenAI-compat surface, `Authorization: Bearer`). Compared in constant
+    /// time against the whole table.
+    key: String,
+    /// Models this client may request. Empty = all models, mirroring
+    /// `EndpointConfig.models` semantics. Same exact + `*`-suffix matcher.
+    #[serde(default)]
+    models: Vec<String>,
+}
+
+/// Hand-written, NOT derived: a derived `Debug` would print `key` verbatim into
+/// any log line, panic message or test assertion that formats this struct —
+/// which is precisely how credentials end up in a log aggregator. Same posture
+/// as `debug_header_value`'s redaction of sensitive headers.
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("name", &self.name)
+            .field("key", &"<redacted>")
+            .field("models", &self.models)
+            .finish()
+    }
 }
 
 /// `[response_cache]` — opt-in, client-side-encrypted response cache on
@@ -396,6 +442,28 @@ const TAU_1H: f64 = 3600.0;
 /// deployments have a handful of clients, far below this; the cap only bounds
 /// unknown/abusive header values — existing clients keep updating past it.
 const MAX_TRACKED_CLIENTS: usize = 10_000;
+
+/// Cap on distinct (client, model) labels in the allowlist-denial counter.
+/// The model half is caller-controlled; overflow buckets into `_other`.
+const MAX_MODEL_DENIED_LABELS: usize = 64;
+
+/// Max chars retained from a caller-controlled string used as a metric label
+/// or echoed in an error body. The model field is bounded only by the request
+/// body cap, so an untruncated copy would be retained for the process lifetime
+/// and re-serialized on every `/metrics` scrape.
+const MAX_LABEL_CHARS: usize = 64;
+
+/// Truncate a caller-controlled string to `MAX_LABEL_CHARS`, marking that it
+/// was cut so an operator does not read a clipped value as the literal input.
+/// Char-based, not byte-based: slicing a UTF-8 string mid-codepoint panics.
+fn truncate_label(s: &str) -> String {
+    if s.chars().count() <= MAX_LABEL_CHARS {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(MAX_LABEL_CHARS).collect();
+    out.push('…');
+    out
+}
 const TAU_6H: f64 = 21600.0;
 
 /// Per-account burn rate tracker: requests per minute at three time scales.
@@ -555,14 +623,28 @@ struct Endpoint {
     last_effective_gate: AtomicU64,
 }
 
+/// Exact match with `*`-suffix wildcards. Empty pattern list, or an empty
+/// model, allows everything.
+///
+/// The SINGLE list-level implementation behind both model allowlists: which
+/// models an *endpoint* may serve (`Endpoint::serves_model`) and which models
+/// a *client* may request (`AppState::client_allows_model`, LAB-1083). The
+/// per-pattern wildcard semantics live in `suffix_wildcard_match`, shared
+/// with the beta-flag allow-list (LAB-1191) — two matchers would be two sets
+/// of wildcard semantics to keep in sync, and the divergence would show up as
+/// a policy bypass rather than a test failure.
+fn model_matches(patterns: &[String], model: &str) -> bool {
+    if patterns.is_empty() || model.is_empty() {
+        return true;
+    }
+    patterns.iter().any(|p| suffix_wildcard_match(p, model))
+}
+
 impl Endpoint {
     /// Check if this endpoint can serve the given model. Empty allowlist = all.
     /// Identical to the historical `Account::serves_model` predicate.
     fn serves_model(&self, model: &str) -> bool {
-        if self.models.is_empty() || model.is_empty() {
-            return true;
-        }
-        self.models.iter().any(|p| suffix_wildcard_match(p, model))
+        model_matches(&self.models, model)
     }
 }
 
@@ -587,7 +669,13 @@ struct AppState {
     /// exercise breaker re-entry without a 30s sleep.
     transport_cooldown: Duration,
     state_path: PathBuf,
+    /// Legacy single shared secret. Mutually exclusive with `clients`.
     proxy_key: Option<String>,
+    /// Authenticated client registry (LAB-1083). Non-empty ⇒ every request
+    /// through an authenticated entry point carries a verified principal, and
+    /// `client_id` is that principal's name rather than a client-asserted
+    /// header. Empty ⇒ legacy `proxy_key` / open behaviour.
+    clients: Vec<ClientConfig>,
     allowed_ips: Vec<IpAllowEntry>,
     client_names: HashMap<String, String>,
     auto_cache: bool,
@@ -672,6 +760,12 @@ struct AppState {
     /// Upstream "prompt is too long" 400s by model (LAB-916). Exposed as
     /// `anthropic_prompt_too_long_total`; bounded via `_other` overflow.
     prompt_too_long: Mutex<HashMap<String, u64>>,
+    /// Per-client model-allowlist denials, keyed (client, model) (LAB-1083).
+    /// Exposed as `anthropic_client_model_denied_total`. `client` is an
+    /// authenticated principal so it is bounded by config, but `model` is
+    /// caller-controlled — bounded via the same `_other` overflow as
+    /// `prompt_too_long`.
+    model_denied: Mutex<HashMap<(String, String), u64>>,
     /// (endpoint idx, model) pairs an upstream rejected as unsupported — a
     /// gateway without the model, or a plan without access (LAB-941).
     /// `routing_candidates` skips these until the entry expires; because
@@ -1424,13 +1518,186 @@ impl AppState {
         self.allowed_ips.is_empty() || self.allowed_ips.iter().any(|e| e.contains(ip))
     }
 
+    /// Authenticate a request's credential (LAB-1083).
+    ///
+    /// Returns the authenticated principal when `[[clients]]` is configured,
+    /// `None` when it is not (legacy `proxy_key`, or an open proxy), and a 401
+    /// `Response` when a configured credential does not match.
+    ///
+    /// `allow_bearer` additionally accepts `Authorization: Bearer` — set only
+    /// on the OpenAI-compat surface, whose SDKs send nothing else. It is NOT
+    /// enabled on the native surface, where `Authorization` may legitimately
+    /// carry the caller's own upstream token in `passthrough` mode; widening
+    /// acceptance there would be a gratuitous auth surface on a ticket whose
+    /// whole purpose is to narrow one.
+    fn authenticate(
+        &self,
+        client_ip: &IpAddr,
+        headers: &hyper::HeaderMap,
+        allow_bearer: bool,
+    ) -> Result<Option<&ClientConfig>, Box<Response>> {
+        // Boxed Err, matching `reserve_request_body` — an inline `Response` is
+        // 128+ bytes on the hot success path (clippy::result_large_err).
+        let unauthorized = || -> Box<Response> {
+            warn!(client = %client_ip, "rejected: invalid or missing credential");
+            Box::new((StatusCode::UNAUTHORIZED, "unauthorized").into_response())
+        };
+        let from_header = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+        let from_bearer = if allow_bearer {
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| {
+                    // RFC 7235: auth scheme is case-insensitive
+                    if v.len() >= 7 && v[..7].eq_ignore_ascii_case("bearer ") {
+                        Some(&v[7..])
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        };
+
+        if !self.clients.is_empty() {
+            for presented in [from_header, from_bearer].into_iter().flatten() {
+                if let Some(c) = self.match_client(presented) {
+                    return Ok(Some(c));
+                }
+            }
+            return Err(unauthorized());
+        }
+
+        // Legacy: one shared secret, no principal. Byte-for-byte the same
+        // accept/reject decision as before LAB-1083 — only the comparison
+        // primitive changed (audit finding 4).
+        if let Some(ref key) = self.proxy_key {
+            let ok = [from_header, from_bearer]
+                .into_iter()
+                .flatten()
+                .any(|p| bool::from(key.as_bytes().ct_eq(p.as_bytes())));
+            if !ok {
+                return Err(unauthorized());
+            }
+        }
+        Ok(None)
+    }
+
+    /// Constant-time lookup of a presented credential in the client table.
+    ///
+    /// What this actually guarantees, precisely — do not read more into it:
+    /// `ct_eq` removes the per-byte prefix oracle that `==` has, which is the
+    /// leak that matters (it is what lets an attacker recover a key byte by
+    /// byte). Audit finding 4, closed.
+    ///
+    /// The full-table scan removes the coarse "how far down the table did we
+    /// get" signal. It does NOT make the whole function constant-time: the
+    /// `hit = Some(c)` store is a data-dependent branch the optimizer may
+    /// emit as one, and `ct_eq` short-circuits on unequal lengths. Both
+    /// residuals are a handful of instructions against milliseconds of network
+    /// and TLS jitter, and key length is not a secret — so neither is
+    /// exploitable remotely. Want the stronger property? Accumulate with
+    /// `subtle::Choice`; don't assume this already does.
+    fn match_client(&self, presented: &str) -> Option<&ClientConfig> {
+        let mut hit: Option<&ClientConfig> = None;
+        for c in &self.clients {
+            if bool::from(c.key.as_bytes().ct_eq(presented.as_bytes())) {
+                hit = Some(c);
+            }
+        }
+        hit
+    }
+
+    /// Whether `client_id` may request `model` (LAB-1083).
+    ///
+    /// Unknown client, or a client with an empty list, allows everything.
+    /// "Unknown client" is only reachable on the legacy path: with
+    /// `[[clients]]` configured, `client_id` is always a principal name.
+    ///
+    /// FAILS CLOSED on an empty `model`, and this is the one place where the
+    /// shared matcher's semantics are deliberately NOT inherited. An empty
+    /// model means the caller's model is UNKNOWN to us — the body did not
+    /// parse as JSON, or it carries no top-level `model` (the batches API
+    /// nests it under `requests[].params.model`, and `proxy_handler` is the
+    /// catch-all route). For `Endpoint::serves_model` "unknown" rightly means
+    /// "don't narrow the routing pool"; for a policy gate it must mean
+    /// "deny", or a restricted client reaches any model by sending a body we
+    /// cannot read.
+    fn client_allows_model(&self, client_id: &str, model: &str) -> bool {
+        match self.clients.iter().find(|c| c.name == client_id) {
+            Some(c) if c.models.is_empty() => true,
+            Some(c) => !model.is_empty() && model_matches(&c.models, model),
+            None => true,
+        }
+    }
+
+    /// Count + log a model-allowlist denial.
+    ///
+    /// The model string is caller-controlled and bounded only by the request
+    /// body cap, so it is truncated BEFORE becoming a map key: an untruncated
+    /// label would be retained for the process lifetime and re-serialized into
+    /// the `/metrics` body on every scrape. Label COUNT is separately bounded
+    /// by `_other` overflow.
+    ///
+    /// Logs at `warn` the first time a (client, model) pair is denied and at
+    /// `debug` thereafter — a client hammering a denied model must not be able
+    /// to drive unbounded warn-level log volume. The counter still records
+    /// every denial. Mirrors the once-per-model pattern used for
+    /// unsupported-model warnings.
+    fn note_model_denied(&self, client_id: &str, model: &str) {
+        let model = truncate_label(model);
+        let mut first_time = true;
+        if let Ok(mut counts) = self.model_denied.lock() {
+            let key = (client_id.to_owned(), model.clone());
+            let label = if counts.len() < MAX_MODEL_DENIED_LABELS || counts.contains_key(&key) {
+                key
+            } else {
+                (client_id.to_owned(), "_other".to_owned())
+            };
+            let entry = counts.entry(label).or_insert(0);
+            first_time = *entry == 0;
+            *entry += 1;
+        }
+        if first_time {
+            warn!(
+                client_id = %client_id,
+                model = %model,
+                "rejected: model not in client allow-list"
+            );
+        } else {
+            debug!(
+                client_id = %client_id,
+                model = %model,
+                "rejected: model not in client allow-list"
+            );
+        }
+    }
+
     /// Resolve client identity: x-client-id header → IP map fallback → "-"
     ///
     /// Header takes precedence to support multiple clients per IP.
+    ///
+    /// ONLY reached when no `[[clients]]` table is configured. Under
+    /// `[[clients]]`, identity comes from the verified credential
+    /// (`RequestContext::from_request`) and this client-asserted path is dead.
+    ///
+    /// The `debug_assert` is the choke point for that invariant. Nothing in the
+    /// type system stops a future handler from calling
+    /// `RequestContext::from_request(.., None)` and silently reinstating
+    /// header-asserted identity; this makes that mistake fail loudly in tests
+    /// and debug builds instead of quietly becoming an identity bypass.
     fn resolve_client_id(&self, ip: &IpAddr, headers: &hyper::HeaderMap) -> String {
+        debug_assert!(
+            self.clients.is_empty(),
+            "resolve_client_id reached with [[clients]] configured — a caller \
+             skipped the authenticated principal and identity is now spoofable"
+        );
         if let Some(id) = headers.get("x-client-id").and_then(|v| v.to_str().ok()) {
             let id = id.trim();
-            if !id.is_empty() && id != "-" {
+            // "_operator" is the reserved operator-aggregation label on
+            // /_stats and /metrics — a self-asserted claim to it would merge
+            // this caller's usage into the hidden operator bucket.
+            if !id.is_empty() && id != "-" && id != "_operator" {
                 return id.to_string();
             }
         }
@@ -4770,9 +5037,23 @@ fn affinity_routing_key(
 }
 
 impl RequestContext {
-    fn from_request(state: &AppState, client_ip: &IpAddr, headers: &axum::http::HeaderMap) -> Self {
+    /// `principal` is the authenticated client from `AppState::authenticate`.
+    /// When present it IS the identity — `x-client-id` and the `client_names`
+    /// IP map are not consulted at all. This one substitution is what makes
+    /// budgets, ceilings, operator bypass, the model allow-list and the
+    /// response-cache tenant unspoofable: every one of them keys on
+    /// `client_id`, and this is where `client_id` is born.
+    fn from_request(
+        state: &AppState,
+        client_ip: &IpAddr,
+        headers: &axum::http::HeaderMap,
+        principal: Option<&ClientConfig>,
+    ) -> Self {
         Self {
-            client_id: state.resolve_client_id(client_ip, headers),
+            client_id: match principal {
+                Some(c) => c.name.clone(),
+                None => state.resolve_client_id(client_ip, headers),
+            },
             client_ver: headers
                 .get("user-agent")
                 .and_then(|v| v.to_str().ok())
@@ -5528,6 +5809,28 @@ impl AppState {
     async fn pre_request_gate(&self, client_id: &str, model: &str) -> Result<(), Response> {
         if self.is_operator(client_id) {
             return Ok(()); // operator bypasses everything
+        }
+
+        // 0. Per-client model allow-list (LAB-1083). First because it is a
+        //    POLICY denial, not a capacity one: "you may not use this model"
+        //    must not be reported as 429 "try again later", which is what the
+        //    three checks below all mean. Reached from both proxy_handler and
+        //    openai_chat_handler, so one placement covers both surfaces.
+        if !self.client_allows_model(client_id, model) {
+            self.note_model_denied(client_id, model);
+            // `model` is caller-controlled and echoed back — truncate it here
+            // too, so a 25 MB model field cannot become a 25 MB error body.
+            let body = if model.is_empty() {
+                format!(
+                    "client '{client_id}' has a model allow-list, but no model could be read from the request"
+                )
+            } else {
+                format!(
+                    "client '{client_id}' is not permitted to use model '{}'",
+                    truncate_label(model)
+                )
+            };
+            return Err((StatusCode::FORBIDDEN, body).into_response());
         }
 
         // 1. Daily token budget (existing)
@@ -6846,14 +7149,11 @@ async fn proxy_handler(
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
 
-    // Proxy auth: validate x-api-key against proxy_key if configured
-    if let Some(ref key) = state.proxy_key {
-        let provided = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-        if provided != Some(key.as_str()) {
-            warn!(client = %client_ip, "rejected: invalid or missing proxy key");
-            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
-    }
+    // Proxy auth: x-api-key against the [[clients]] table, else legacy proxy_key.
+    let principal = match state.authenticate(&client_ip, req.headers(), false) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
 
     let (parts, body) = req.into_parts();
 
@@ -6864,7 +7164,7 @@ async fn proxy_handler(
     );
 
     // Extract client identification headers
-    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers);
+    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers, principal);
     let RequestContext {
         client_id,
         client_ver,
@@ -7788,11 +8088,8 @@ async fn stats_handler(
     if !state.is_ip_allowed(&client_addr.ip()) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
-    if let Some(ref key) = state.proxy_key {
-        let provided = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-        if provided != Some(key.as_str()) {
-            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
+    if let Err(resp) = state.authenticate(&client_addr.ip(), req.headers(), false) {
+        return *resp;
     }
 
     let now_epoch = AppState::now_epoch();
@@ -8262,11 +8559,8 @@ async fn metrics_handler(
     if !state.is_ip_allowed(&client_addr.ip()) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
-    if let Some(ref key) = state.proxy_key {
-        let provided = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-        if provided != Some(key.as_str()) {
-            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
+    if let Err(resp) = state.authenticate(&client_addr.ip(), req.headers(), false) {
+        return *resp;
     }
 
     let now_epoch = AppState::now_epoch();
@@ -8330,6 +8624,12 @@ async fn metrics_handler(
     let cluster_info = state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
     let prompt_too_long: Vec<(String, u64)> = state
         .prompt_too_long
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
+    let model_denied: Vec<((String, String), u64)> = state
+        .model_denied
         .lock()
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
@@ -9149,6 +9449,24 @@ async fn metrics_handler(
             &mut buf,
             "anthropic_prompt_too_long_total",
             &[("model", model.as_str())],
+            *n,
+        );
+    }
+
+    // Per-client model-allowlist denials (LAB-1083). A non-zero rate here is
+    // either a misconfigured caller or a caller reaching for capacity it was
+    // deliberately denied — both worth an alert.
+    prom_header(
+        &mut buf,
+        "anthropic_client_model_denied_total",
+        "counter",
+        "Requests rejected (403) by the per-client model allow-list",
+    );
+    for ((client, model), n) in &model_denied {
+        prom_counter(
+            &mut buf,
+            "anthropic_client_model_denied_total",
+            &[("client", client.as_str()), ("model", model.as_str())],
             *n,
         );
     }
@@ -11129,27 +11447,12 @@ async fn openai_chat_handler(
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
 
-    // Proxy auth: accept if either x-api-key or Authorization: Bearer matches
-    if let Some(ref key) = state.proxy_key {
-        let from_header = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-        let from_bearer = req
-            .headers()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                // RFC 7235: auth scheme is case-insensitive
-                if v.len() >= 7 && v[..7].eq_ignore_ascii_case("bearer ") {
-                    Some(&v[7..])
-                } else {
-                    None
-                }
-            });
-        let authorized = from_header == Some(key.as_str()) || from_bearer == Some(key.as_str());
-        if !authorized {
-            warn!(client = %client_ip, "rejected: invalid or missing proxy key");
-            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
-    }
+    // Proxy auth: accept the credential from either x-api-key or
+    // Authorization: Bearer — OpenAI SDKs send only the latter.
+    let principal = match state.authenticate(&client_ip, req.headers(), true) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
 
     let (parts, body) = req.into_parts();
 
@@ -11160,7 +11463,7 @@ async fn openai_chat_handler(
     );
 
     // Extract client identification headers
-    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers);
+    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers, principal);
     let affinity_key = rctx.affinity_key(&client_ip, None);
     let affinity = affinity_key.as_deref();
     let RequestContext {
@@ -11427,6 +11730,117 @@ fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
     Ok(())
 }
 
+/// Startup validation for the `[[clients]]` registry (LAB-1083).
+///
+/// Every rule here exists because its violation fails SILENTLY at runtime
+/// rather than loudly: a duplicate key resolves to whichever entry the scan
+/// saw last, a duplicate or empty name silently merges two callers' budgets and
+/// cache tenancy, and a `[response_cache].clients` typo makes the cache inert
+/// for that client with no signal at all. Cheap to catch at boot; expensive to
+/// notice in production.
+fn validate_clients(config: &Config) -> Result<(), String> {
+    let clients = &config.clients;
+    let mut seen_names: Vec<&str> = Vec::with_capacity(clients.len());
+    let mut seen_keys: Vec<&str> = Vec::with_capacity(clients.len());
+    for c in clients {
+        if c.name.trim().is_empty() {
+            return Err("client: name must not be empty".to_string());
+        }
+        // Stored untrimmed, so " geo" would become a client_id that matches no
+        // `client_budgets` / `operators` / `[response_cache].clients` key —
+        // silently unenforced budget and cache tenancy. `resolve_client_id`
+        // trims its header input; this path has nothing to trim it later.
+        if c.name != c.name.trim() {
+            return Err(format!(
+                "client '{}': name must not have leading or trailing whitespace",
+                c.name
+            ));
+        }
+        if c.name == "-" {
+            return Err(
+                "client: name must not be \"-\" (the unknown-client sentinel — budget enforcement skips it)"
+                    .to_string(),
+            );
+        }
+        if c.name == "_operator" {
+            return Err(
+                "client: name must not be \"_operator\" (the reserved operator-aggregation label on /_stats and /metrics)"
+                    .to_string(),
+            );
+        }
+        if c.key.is_empty() {
+            return Err(format!("client '{}': key must not be empty", c.name));
+        }
+        if seen_names.contains(&c.name.as_str()) {
+            return Err(format!("client '{}': duplicate name", c.name));
+        }
+        // Names, not keys, in the error — never log a credential.
+        if seen_keys.contains(&c.key.as_str()) {
+            return Err(format!(
+                "client '{}': duplicate key (already used by another client)",
+                c.name
+            ));
+        }
+        seen_names.push(&c.name);
+        seen_keys.push(&c.key);
+    }
+
+    // One client registry, not five. Every one of these config surfaces keys on
+    // a client name, and every one of them fails SILENTLY on a typo — in the
+    // dangerous direction: `check_budget` and `check_utilization_limit` both
+    // return Ok(()) for an unknown client, so a mistyped budget means UNLIMITED
+    // spend against the operator's accounts with no log line and no metric; a
+    // mistyped `operators` entry silently gates the caller it was meant to
+    // exempt; a mistyped `response_cache.clients` entry silently makes the
+    // cache inert. Only enforceable when [[clients]] is configured — on the
+    // legacy path client ids are header-derived and there is no registry to
+    // check against.
+    if clients.is_empty() {
+        return Ok(());
+    }
+
+    // `token = "passthrough"` forwards the caller's auth headers to the
+    // upstream UNTOUCHED (`inject_account_auth` returns before the
+    // header-strip). Under [[clients]] the caller's `x-api-key` is its PROXY
+    // credential, not an upstream one — so the two modes together would
+    // transmit every client key verbatim to that endpoint's `base_url`. They
+    // are contradictory by construction: passthrough means "the caller brings
+    // its own upstream credential", [[clients]] means "that header is mine".
+    // Reject rather than half-handle, exactly as with proxy_key above.
+    if let Some(ep) = config.endpoints.iter().find(|e| e.token == "passthrough") {
+        return Err(format!(
+            "endpoint '{}': token = \"passthrough\" is incompatible with [[clients]] — passthrough forwards the caller's auth headers upstream, which would leak client keys to {}",
+            ep.name,
+            ep.base_url.as_deref().unwrap_or("https://api.anthropic.com")
+        ));
+    }
+
+    let known = |name: &str| seen_names.contains(&name);
+    for (surface, name) in std::iter::empty()
+        .chain(config.client_budgets.keys().map(|k| ("client_budgets", k)))
+        .chain(
+            config
+                .client_utilization_limits
+                .keys()
+                .map(|k| ("client_utilization_limits", k)),
+        )
+        .chain(config.operators.iter().map(|k| ("operators", k)))
+        .chain(
+            config
+                .response_cache
+                .iter()
+                .flat_map(|rc| rc.clients.iter().map(|k| ("response_cache.clients", k))),
+        )
+    {
+        if !known(name) {
+            return Err(format!(
+                "{surface}: \"{name}\" names no configured [[clients]] entry"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Reject removed config keys with explicit errors. Run after the raw TOML
 /// has been parsed to a `toml::Value`, before strongly-typed deserialization.
 ///
@@ -11455,6 +11869,17 @@ fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
                 .to_string(),
         );
     }
+    // LAB-1083: `proxy_key` is the legacy single shared secret, `[[clients]]`
+    // its per-client replacement. Rejecting the combination rather than
+    // precedence-ordering it is deliberate — a silent winner between two
+    // authentication schemes is exactly the ambiguity that gets an operator's
+    // migration half-applied and the weaker one left in force.
+    if table.contains_key("proxy_key") && table.contains_key("clients") {
+        return Err(
+            "config: proxy_key and [[clients]] are mutually exclusive — [[clients]] supersedes it; remove proxy_key (see README §Authentication)"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -11476,6 +11901,9 @@ async fn main() {
         .unwrap_or_else(|e| panic!("config parse error: {e}"));
     if let Err(msg) = validate_endpoints(&config.endpoints) {
         panic!("{msg}");
+    }
+    if let Err(msg) = validate_clients(&config) {
+        panic!("config: {msg}");
     }
 
     // Set up tracing: stderr (info+) always, plus optional debug log file
@@ -11603,8 +12031,19 @@ async fn main() {
         })
         .collect();
 
-    if config.proxy_key.is_some() {
-        info!("proxy authentication enabled (x-api-key)");
+    if !config.clients.is_empty() {
+        let with_allowlist = config
+            .clients
+            .iter()
+            .filter(|c| !c.models.is_empty())
+            .count();
+        info!(
+            clients = config.clients.len(),
+            with_model_allowlist = with_allowlist,
+            "per-client authentication enabled — x-client-id is ignored, identity comes from the credential"
+        );
+    } else if config.proxy_key.is_some() {
+        warn!("legacy shared proxy_key in use — every caller shares one identity; migrate to [[clients]] (see README §Authentication)");
     } else {
         warn!("proxy authentication DISABLED — proxy is open to all");
     }
@@ -11725,6 +12164,7 @@ async fn main() {
         transport_cooldown: TRANSPORT_UNHEALTHY_COOLDOWN,
         state_path,
         proxy_key: config.proxy_key.clone(),
+        clients: config.clients.clone(),
         allowed_ips,
         client_names: config.client_names.clone(),
         auto_cache: config.auto_cache.unwrap_or(true),
@@ -11782,6 +12222,7 @@ async fn main() {
         }),
         beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
+        model_denied: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache,
     });
