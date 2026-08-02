@@ -148,7 +148,9 @@ token = "sk-ant-test"
 }
 
 #[test]
-fn validate_endpoints_warns_on_non_anthropic_host() {
+fn validate_endpoints_rejects_non_anthropic_host() {
+    // LAB-1191 AC-1: a non-canonical host on an anthropic endpoint would send
+    // the account token to that host — hard startup error naming the endpoint.
     let endpoints = vec![EndpointConfig {
         name: "primary".to_string(),
         protocol: Protocol::Anthropic,
@@ -157,6 +159,65 @@ fn validate_endpoints_warns_on_non_anthropic_host() {
         models: vec![],
         priority: 0,
         fable_included: None,
+        allow_nonstandard_host: None,
+    }];
+    let err = validate_endpoints(&endpoints).unwrap_err();
+    assert!(
+        err.contains("primary"),
+        "error must name the endpoint: {err}"
+    );
+    assert!(
+        err.contains("allow_nonstandard_host"),
+        "error must name the opt-out: {err}"
+    );
+}
+
+#[test]
+fn validate_endpoints_allows_non_anthropic_host_with_opt_in() {
+    // LAB-1191 AC-2: explicit opt-in keeps the old warn-only behaviour.
+    let endpoints = vec![EndpointConfig {
+        name: "staging".to_string(),
+        protocol: Protocol::Anthropic,
+        base_url: Some("https://staging.anthropic.example".to_string()),
+        token: "sk-ant".to_string(),
+        models: vec![],
+        priority: 0,
+        fable_included: None,
+        allow_nonstandard_host: Some(true),
+    }];
+    assert!(validate_endpoints(&endpoints).is_ok());
+}
+
+#[test]
+fn validate_endpoints_rejects_lookalike_anthropic_host() {
+    // LAB-1191 AC-3: exact-host comparison — a canonical-prefix lookalike
+    // domain must NOT pass as canonical.
+    let endpoints = vec![EndpointConfig {
+        name: "evil".to_string(),
+        protocol: Protocol::Anthropic,
+        base_url: Some("https://api.anthropic.com.evil.example".to_string()),
+        token: "sk-ant".to_string(),
+        models: vec![],
+        priority: 0,
+        fable_included: None,
+        allow_nonstandard_host: None,
+    }];
+    let err = validate_endpoints(&endpoints).unwrap_err();
+    assert!(err.contains("evil"));
+}
+
+#[test]
+fn validate_endpoints_accepts_canonical_anthropic_host() {
+    // LAB-1191 AC-3: the canonical host boots without opt-in.
+    let endpoints = vec![EndpointConfig {
+        name: "primary".to_string(),
+        protocol: Protocol::Anthropic,
+        base_url: Some("https://api.anthropic.com".to_string()),
+        token: "sk-ant".to_string(),
+        models: vec![],
+        priority: 0,
+        fable_included: None,
+        allow_nonstandard_host: None,
     }];
     assert!(validate_endpoints(&endpoints).is_ok());
 }
@@ -171,6 +232,7 @@ fn validate_endpoints_rejects_http_base_url() {
         models: vec![],
         priority: 0,
         fable_included: None,
+        allow_nonstandard_host: None,
     }];
     let err = validate_endpoints(&endpoints).unwrap_err();
     assert!(err.contains("https"), "error must mention https: {err}");
@@ -187,6 +249,7 @@ fn validate_endpoints_requires_base_url_for_openai() {
         models: vec![],
         priority: 100,
         fable_included: None,
+        allow_nonstandard_host: None,
     }];
     let err = validate_endpoints(&endpoints).unwrap_err();
     assert!(err.contains("base_url"));
@@ -204,6 +267,7 @@ fn validate_endpoints_accepts_well_formed_mix() {
             models: vec![],
             priority: 0,
             fable_included: None,
+            allow_nonstandard_host: None,
         },
         EndpointConfig {
             name: "gateway".to_string(),
@@ -213,6 +277,7 @@ fn validate_endpoints_accepts_well_formed_mix() {
             models: vec![],
             priority: 100,
             fable_included: None,
+            allow_nonstandard_host: None,
         },
     ];
     assert!(validate_endpoints(&endpoints).is_ok());
@@ -293,11 +358,13 @@ fn make_endpoint(name: &str, protocol: Protocol) -> Endpoint {
 /// production's 0.90.
 fn test_state_base() -> AppState {
     AppState {
-        client: Client::builder()
+        // Production knob chain (incl. redirect Policy::none — LAB-1191) with
+        // a short test timeout layered on top.
+        client: upstream_client_builder()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap(),
-        client_nonstreaming: Client::builder()
+        client_nonstreaming: upstream_client_builder()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap(),
@@ -308,6 +375,7 @@ fn test_state_base() -> AppState {
         transport_cooldown: TRANSPORT_UNHEALTHY_COOLDOWN,
         state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
         proxy_key: None,
+        clients: vec![],
         allowed_ips: vec![],
         client_names: HashMap::new(),
         auto_cache: true,
@@ -337,7 +405,14 @@ fn test_state_base() -> AppState {
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: DEFAULT_SESSION_REGISTRY_MAX,
         session_registry_ttl_secs: DEFAULT_SESSION_REGISTRY_TTL_SECS,
+        expose_upstream_ratelimit_headers: false,
+        allowed_client_betas: DEFAULT_CLIENT_BETA_ALLOWLIST
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
+        model_denied: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache: None,
     }
@@ -423,6 +498,18 @@ async fn mock_upstream_handler(req: Request<Body>) -> Response {
         "anthropic-ratelimit-unified-5h-reset",
         HeaderValue::from_str(&reset_epoch).unwrap(),
     );
+    // Headers a real upstream may attach that must NOT reach the caller by
+    // default (LAB-1191 finding 3) + one allow-listed header that must.
+    headers.insert(
+        "anthropic-ratelimit-unified-5h-status",
+        HeaderValue::from_static("allowed"),
+    );
+    headers.insert("set-cookie", HeaderValue::from_static("upstream=leak"));
+    headers.insert(
+        "anthropic-organization-id",
+        HeaderValue::from_static("org-secret"),
+    );
+    headers.insert("request-id", HeaderValue::from_static("req_mock_123"));
     resp
 }
 
@@ -2154,10 +2241,26 @@ async fn proxy_returns_502_when_upstream_body_read_fails() {
         }
     });
 
-    let (app, _state) = test_app(
-        &format!("http://{}", mock_addr),
-        Some("secret-key".to_string()),
-    );
+    // Ratelimit reflection is opt-in since LAB-1191; this test asserts the
+    // error-arm parity that the opt-in restores, so flip it on.
+    let mut state = test_state_with(vec![
+        mk_endpoint_at(
+            "acct-a",
+            "sk-ant-api-test-aaa",
+            &format!("http://{}", mock_addr),
+        ),
+        mk_endpoint_at(
+            "acct-b",
+            "sk-ant-api-test-bbb",
+            &format!("http://{}", mock_addr),
+        ),
+    ]);
+    {
+        let s = Arc::get_mut(&mut state).expect("test fixture should be uniquely owned");
+        s.proxy_key = Some("secret-key".to_string());
+        s.expose_upstream_ratelimit_headers = true;
+    }
+    let app = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -2184,15 +2287,16 @@ async fn proxy_returns_502_when_upstream_body_read_fails() {
         reqwest::StatusCode::BAD_GATEWAY,
         "truncated upstream body must become a 502, not a silent empty 200"
     );
-    // The 502 must still forward the upstream's rate-limit headers (and the
-    // budget status) so the client's limit tracking doesn't go blind on the
-    // error arm — parity with every success arm.
+    // With expose_upstream_ratelimit_headers = true, the 502 must still
+    // forward the upstream's rate-limit headers (and the budget status) so
+    // the client's limit tracking doesn't go blind on the error arm — parity
+    // with every success arm.
     assert_eq!(
         resp.headers()
             .get("anthropic-ratelimit-unified-5h-utilization")
             .and_then(|v| v.to_str().ok()),
         Some("0.42"),
-        "502 should forward upstream anthropic-ratelimit-* headers"
+        "502 should forward upstream anthropic-ratelimit-* headers when exposed"
     );
     assert!(
         resp.headers().contains_key("x-budget-status"),
@@ -10123,6 +10227,20 @@ fn resolve_client_id_ignores_dash_header() {
 }
 
 #[test]
+fn resolve_client_id_ignores_reserved_operator_header() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let ip: IpAddr = "192.168.1.100".parse().unwrap();
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("x-client-id", HeaderValue::from_static("_operator"));
+
+    let resolved = state.resolve_client_id(&ip, &headers);
+    assert_eq!(
+        resolved, "-",
+        "a self-asserted _operator identity must not merge into the operator bucket"
+    );
+}
+
+#[test]
 fn compute_pressure_status_operator_always_healthy() {
     let state = Arc::new(AppState {
         client: Client::new(),
@@ -13616,7 +13734,7 @@ async fn openai_compat_translates_upstream_raw_error() {
 fn inject_auth_api_key() {
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("authorization", HeaderValue::from_static("Bearer old"));
-    inject_account_auth(&mut headers, "sk-ant-api-test123", false);
+    inject_account_auth(&mut headers, "sk-ant-api-test123", false, &default_betas());
     assert_eq!(headers.get("x-api-key").unwrap(), "sk-ant-api-test123");
     assert!(headers.get("authorization").is_none());
 }
@@ -13624,7 +13742,7 @@ fn inject_auth_api_key() {
 #[test]
 fn inject_auth_oauth_token() {
     let mut headers = axum::http::HeaderMap::new();
-    inject_account_auth(&mut headers, "sk-ant-oat-test123", false);
+    inject_account_auth(&mut headers, "sk-ant-oat-test123", false, &default_betas());
     assert_eq!(
         headers.get("authorization").unwrap(),
         "Bearer sk-ant-oat-test123"
@@ -13642,17 +13760,25 @@ fn inject_auth_oauth_token() {
 
 #[test]
 fn inject_auth_oauth_merges_multi_value_beta() {
+    // Allow-listed flags split across TWO header values (LAB-1191: unlisted
+    // flags are dropped, so the merge is exercised with allowed ones).
     let mut headers = axum::http::HeaderMap::new();
-    headers.append("anthropic-beta", HeaderValue::from_static("existing-flag"));
-    headers.append("anthropic-beta", HeaderValue::from_static("another-flag"));
-    inject_account_auth(&mut headers, "sk-ant-oat-test123", false);
+    headers.append(
+        "anthropic-beta",
+        HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+    );
+    headers.append(
+        "anthropic-beta",
+        HeaderValue::from_static("fine-grained-tool-streaming-2025-05-14"),
+    );
+    inject_account_auth(&mut headers, "sk-ant-oat-test123", false, &default_betas());
     let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
     assert!(
-        beta.contains("existing-flag"),
+        beta.contains("interleaved-thinking-2025-05-14"),
         "should preserve first header"
     );
     assert!(
-        beta.contains("another-flag"),
+        beta.contains("fine-grained-tool-streaming-2025-05-14"),
         "should preserve second header"
     );
     assert!(beta.contains("oauth-2025-04-20"), "should add oauth flag");
@@ -13667,7 +13793,7 @@ fn inject_auth_passthrough_preserves_headers() {
         HeaderValue::from_static("Bearer user-token"),
     );
     headers.insert("x-api-key", HeaderValue::from_static("user-key"));
-    inject_account_auth(&mut headers, "passthrough", true);
+    inject_account_auth(&mut headers, "passthrough", true, &default_betas());
     assert_eq!(headers.get("authorization").unwrap(), "Bearer user-token");
     assert_eq!(headers.get("x-api-key").unwrap(), "user-key");
 }
@@ -13679,7 +13805,7 @@ fn request_context_trims_whitespace_headers() {
     headers.insert("x-agent-id", HeaderValue::from_static("  "));
     headers.insert("x-session-id", HeaderValue::from_static(" \t "));
     let ip: IpAddr = "127.0.0.1".parse().unwrap();
-    let rctx = RequestContext::from_request(&state, &ip, &headers);
+    let rctx = RequestContext::from_request(&state, &ip, &headers, None);
     assert_eq!(rctx.agent_id, "-", "whitespace-only agent_id should be -");
     assert_eq!(
         rctx.session_id, "-",
@@ -15973,6 +16099,1455 @@ async fn response_cache_skips_oversized_bodies() {
     );
 }
 
+// ── LAB-1083: per-client authenticated identity + model allow-lists ──
+//
+// The property under test throughout: with `[[clients]]` configured, a
+// caller's identity is what its CREDENTIAL says, never what its headers say.
+// Every per-client decision in the proxy keys on `client_id`, so these tests
+// mostly prove one thing from several angles — that `client_id` cannot be
+// asserted by the caller once a client table exists.
+
+fn mk_client(name: &str, key: &str, models: &[&str]) -> ClientConfig {
+    ClientConfig {
+        name: name.to_string(),
+        key: key.to_string(),
+        models: models.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn state_with_clients(clients: Vec<ClientConfig>) -> Arc<AppState> {
+    Arc::new(AppState {
+        clients,
+        ..test_state_base()
+    })
+}
+
+fn hdrs(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
+    let mut h = hyper::HeaderMap::new();
+    for (k, v) in pairs {
+        h.insert(
+            hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            HeaderValue::from_str(v).unwrap(),
+        );
+    }
+    h
+}
+
+const TEST_IP: &str = "10.0.0.7";
+
+fn test_ip() -> IpAddr {
+    TEST_IP.parse().unwrap()
+}
+
+// ── AC-1: distinct key → distinct identity, with no x-client-id ──
+
+#[test]
+fn distinct_client_keys_resolve_to_distinct_identities() {
+    let state = state_with_clients(vec![
+        mk_client("geo", "key-geo", &[]),
+        mk_client("radar", "key-radar", &[]),
+    ]);
+    let ip = test_ip();
+
+    for (key, expected) in [("key-geo", "geo"), ("key-radar", "radar")] {
+        let headers = hdrs(&[("x-api-key", key)]);
+        let principal = state
+            .authenticate(&ip, &headers, false)
+            .expect("configured key must authenticate")
+            .expect("a [[clients]] match must yield a principal");
+        assert_eq!(principal.name, expected);
+        // And the identity the rest of the proxy sees follows it — with NO
+        // x-client-id header present on either request.
+        let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
+        assert_eq!(rctx.client_id, expected);
+    }
+}
+
+// ── AC-2: unknown / missing credential → 401 ──
+
+#[test]
+fn unknown_client_key_is_rejected() {
+    let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
+    let resp = state
+        .authenticate(&test_ip(), &hdrs(&[("x-api-key", "key-wrong")]), false)
+        .expect_err("unknown key must not authenticate");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn missing_credential_is_rejected_when_clients_configured() {
+    let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
+    let resp = state
+        .authenticate(&test_ip(), &hyper::HeaderMap::new(), false)
+        .expect_err("absent credential must not authenticate");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A near-miss must not authenticate. Guards the constant-time comparison
+/// against a length- or prefix-tolerant rewrite.
+#[test]
+fn client_key_match_is_exact_not_prefix() {
+    let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
+    for wrong in ["key-ge", "key-geo ", "key-geox", "", "KEY-GEO"] {
+        assert!(
+            state
+                .authenticate(&test_ip(), &hdrs(&[("x-api-key", wrong)]), false)
+                .is_err(),
+            "'{wrong}' must not authenticate as 'key-geo'"
+        );
+    }
+}
+
+// ── AC-2: bearer accepted on the OpenAI-compat surface only ──
+
+#[test]
+fn bearer_credential_accepted_only_where_enabled() {
+    let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
+    let ip = test_ip();
+    let headers = hdrs(&[("authorization", "Bearer key-geo")]);
+
+    let principal = state
+        .authenticate(&ip, &headers, true)
+        .expect("bearer must authenticate where enabled")
+        .expect("principal");
+    assert_eq!(principal.name, "geo");
+
+    // The native surface may carry the caller's OWN upstream token in
+    // `Authorization` (passthrough endpoints), so bearer is not accepted there.
+    assert!(state.authenticate(&ip, &headers, false).is_err());
+}
+
+#[test]
+fn bearer_scheme_match_is_case_insensitive() {
+    let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
+    let headers = hdrs(&[("authorization", "bEaReR key-geo")]);
+    assert_eq!(
+        state
+            .authenticate(&test_ip(), &headers, true)
+            .unwrap()
+            .unwrap()
+            .name,
+        "geo"
+    );
+}
+
+// ── AC-4: the credential wins over a spoofed x-client-id ──
+
+#[test]
+fn spoofed_x_client_id_is_ignored_under_clients_table() {
+    let state = state_with_clients(vec![
+        mk_client("alpha", "key-alpha", &[]),
+        mk_client("bravo", "key-bravo", &[]),
+    ]);
+    let ip = test_ip();
+    let headers = hdrs(&[("x-api-key", "key-alpha"), ("x-client-id", "bravo")]);
+
+    let principal = state.authenticate(&ip, &headers, false).unwrap().unwrap();
+    assert_eq!(principal.name, "alpha");
+
+    let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
+    assert_eq!(
+        rctx.client_id, "alpha",
+        "authenticated principal must win over the x-client-id header"
+    );
+}
+
+/// The `client_names` IP map is the other client-influenced identity source.
+/// It must also lose to the credential.
+#[test]
+fn client_names_ip_map_is_ignored_under_clients_table() {
+    let mut client_names = HashMap::new();
+    client_names.insert(TEST_IP.to_string(), "from-ip-map".to_string());
+    let state = Arc::new(AppState {
+        clients: vec![mk_client("alpha", "key-alpha", &[])],
+        client_names,
+        ..test_state_base()
+    });
+    let ip = test_ip();
+    let headers = hdrs(&[("x-api-key", "key-alpha")]);
+    let principal = state.authenticate(&ip, &headers, false).unwrap().unwrap();
+    let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
+    assert_eq!(rctx.client_id, "alpha");
+}
+
+// ── AC-5: legacy proxy_key path unchanged ──
+
+#[test]
+fn legacy_proxy_key_still_authenticates_and_yields_no_principal() {
+    let state = Arc::new(AppState {
+        proxy_key: Some("shared-secret".to_string()),
+        ..test_state_base()
+    });
+    let ip = test_ip();
+
+    let principal = state
+        .authenticate(&ip, &hdrs(&[("x-api-key", "shared-secret")]), false)
+        .expect("correct legacy key must authenticate");
+    assert!(
+        principal.is_none(),
+        "legacy path has no principal — identity stays header/IP-derived"
+    );
+
+    assert!(state
+        .authenticate(&ip, &hdrs(&[("x-api-key", "nope")]), false)
+        .is_err());
+    assert!(state
+        .authenticate(&ip, &hyper::HeaderMap::new(), false)
+        .is_err());
+}
+
+#[test]
+fn legacy_proxy_key_leaves_x_client_id_resolution_intact() {
+    let state = Arc::new(AppState {
+        proxy_key: Some("shared-secret".to_string()),
+        ..test_state_base()
+    });
+    let ip = test_ip();
+    let headers = hdrs(&[("x-api-key", "shared-secret"), ("x-client-id", "gastown")]);
+    let principal = state.authenticate(&ip, &headers, false).unwrap();
+    let rctx = RequestContext::from_request(&state, &ip, &headers, principal);
+    assert_eq!(
+        rctx.client_id, "gastown",
+        "without [[clients]], x-client-id remains the identity source"
+    );
+}
+
+#[test]
+fn open_proxy_authenticates_every_request() {
+    let state = test_state_with(vec![]);
+    assert!(state
+        .authenticate(&test_ip(), &hyper::HeaderMap::new(), false)
+        .unwrap()
+        .is_none());
+}
+
+// ── AC-7 / AC-8: the allow-list and its shared matcher ──
+
+/// `serves_model` delegates to `model_matches`, so asserting the two agree
+/// would be `A == A`. Pin the concrete wildcard semantics instead — including
+/// the empty-model ALLOW, which is correct for routing (don't narrow the pool
+/// on an unknown model) and is deliberately NOT what the client allow-list
+/// does.
+#[test]
+fn endpoint_model_matcher_semantics() {
+    let mut ep = mk_endpoint("a", "sk-ant-api-x");
+    ep.models = vec![
+        "claude-haiku-*".to_string(),
+        "claude-sonnet-4-6".to_string(),
+    ];
+    assert!(ep.serves_model("claude-haiku-4-5"), "wildcard hit");
+    assert!(ep.serves_model("claude-sonnet-4-6"), "exact hit");
+    assert!(!ep.serves_model("claude-opus-5"), "miss");
+    assert!(
+        !ep.serves_model("claude-sonnet-4-6-x"),
+        "exact is not a prefix"
+    );
+    assert!(ep.serves_model(""), "unknown model must not narrow routing");
+
+    ep.models.clear();
+    assert!(ep.serves_model("claude-opus-5"), "empty list = all models");
+}
+
+#[test]
+fn client_allow_list_hit_miss_wildcard_and_empty() {
+    let state = state_with_clients(vec![
+        mk_client("limited", "k1", &["claude-haiku-*", "claude-sonnet-4-6"]),
+        mk_client("unlimited", "k2", &[]),
+    ]);
+
+    // exact hit
+    assert!(state.client_allows_model("limited", "claude-sonnet-4-6"));
+    // wildcard hit
+    assert!(state.client_allows_model("limited", "claude-haiku-4-5"));
+    // miss
+    assert!(!state.client_allows_model("limited", "claude-opus-5"));
+    // a near-miss on the exact pattern is still a miss
+    assert!(!state.client_allows_model("limited", "claude-sonnet-4-6-extra"));
+    // empty list = all models
+    assert!(state.client_allows_model("unlimited", "claude-opus-5"));
+    // unknown client (legacy path only) = all models
+    assert!(state.client_allows_model("-", "claude-opus-5"));
+}
+
+/// The allow-list must FAIL CLOSED on an unreadable model.
+///
+/// `proxy_handler` sets `model = ""` whenever the body does not parse as JSON,
+/// and only ever reads a TOP-LEVEL `model` key — so a request to a route that
+/// nests it (`/v1/messages/batches` puts it under `requests[].params.model`),
+/// or any body the parser rejects, arrives at the gate with no model. If that
+/// allowed, a client restricted to haiku would reach opus by sending a body we
+/// cannot read. The endpoint matcher's empty-allows-all is right for routing
+/// and wrong here; this test is the line between them.
+#[test]
+fn client_allow_list_denies_an_unreadable_model() {
+    let state = state_with_clients(vec![
+        mk_client("limited", "k1", &["claude-haiku-*"]),
+        mk_client("unlimited", "k2", &[]),
+    ]);
+    assert!(
+        !state.client_allows_model("limited", ""),
+        "a client WITH an allow-list must be denied when the model is unknown"
+    );
+    assert!(
+        state.client_allows_model("unlimited", ""),
+        "a client with no allow-list is unaffected — nothing to enforce"
+    );
+}
+
+#[tokio::test]
+async fn gate_denies_unreadable_model_for_restricted_client() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    let err = state
+        .pre_request_gate("limited", "")
+        .await
+        .expect_err("unknown model must be denied for a restricted client");
+    assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("no model could be read"),
+        "body should explain the empty-model denial, got: {text}"
+    );
+}
+
+/// End-to-end proof of the same thing: an unparseable body must not smuggle a
+/// restricted client past its allow-list.
+#[tokio::test]
+async fn native_surface_denies_restricted_client_sending_unparseable_body() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = authed_app(
+        &mock_url,
+        vec![mk_client("limited", "key-limited", &["claude-haiku-*"])],
+    );
+    let addr = serve(app).await;
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "key-limited")
+        .body("this is not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+/// The model string is caller-controlled and bounded only by the body cap.
+/// Untruncated it would be retained for the process lifetime and re-serialized
+/// into `/metrics` on every scrape.
+#[test]
+fn denied_model_label_is_truncated() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    let huge = "z".repeat(100_000);
+    state.note_model_denied("limited", &huge);
+    let counts = state.model_denied.lock().unwrap();
+    let (_, label) = counts.keys().next().unwrap();
+    assert!(
+        label.chars().count() <= MAX_LABEL_CHARS + 1,
+        "label not truncated: {} chars",
+        label.chars().count()
+    );
+}
+
+/// The other half of the same guarantee: the 403 body echoes the denied model
+/// through `truncate_label`, so an oversized model field must not be reflected
+/// back untruncated.
+#[tokio::test]
+async fn denied_model_response_body_is_truncated() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    let huge = "z".repeat(100_000);
+    let err = state
+        .pre_request_gate("limited", &huge)
+        .await
+        .expect_err("oversized model must be denied");
+    let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).chars().count() < 1_000,
+        "403 body must not echo the untruncated model"
+    );
+}
+
+/// Truncation is char-based: slicing a multi-byte string on a byte boundary
+/// would panic.
+#[test]
+fn truncate_label_handles_multibyte_without_panicking() {
+    let s = "é".repeat(200);
+    let out = truncate_label(&s);
+    assert!(out.chars().count() <= MAX_LABEL_CHARS + 1);
+    assert_eq!(truncate_label("short"), "short");
+}
+
+// ── AC-9 / AC-10: enforcement in pre_request_gate ──
+
+#[tokio::test]
+async fn gate_denies_model_outside_client_allow_list_with_403_naming_both() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    let err = state
+        .pre_request_gate("limited", "claude-opus-5")
+        .await
+        .expect_err("opus must be denied");
+    assert_eq!(
+        err.status(),
+        StatusCode::FORBIDDEN,
+        "policy denial is 403, not 429 — 429 means 'retry later', which this never becomes"
+    );
+    let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("limited"),
+        "body must name the client: {text}"
+    );
+    assert!(
+        text.contains("claude-opus-5"),
+        "body must name the model: {text}"
+    );
+}
+
+#[tokio::test]
+async fn gate_allows_model_inside_client_allow_list() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    assert!(state
+        .pre_request_gate("limited", "claude-haiku-4-5")
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn gate_allow_list_bypassed_by_operators() {
+    let state = Arc::new(AppState {
+        clients: vec![mk_client("limited", "k1", &["claude-haiku-*"])],
+        operators: vec!["limited".to_string()],
+        ..test_state_base()
+    });
+    assert!(
+        state
+            .pre_request_gate("limited", "claude-opus-5")
+            .await
+            .is_ok(),
+        "operators bypass the allow-list like every other gate check"
+    );
+}
+
+// ── AC-11: denial counter + bounded model cardinality ──
+
+#[tokio::test]
+async fn model_denial_increments_counter_per_client_and_model() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    for _ in 0..3 {
+        assert!(state
+            .pre_request_gate("limited", "claude-opus-5")
+            .await
+            .is_err());
+    }
+    assert!(state
+        .pre_request_gate("limited", "claude-fable-5")
+        .await
+        .is_err());
+
+    let counts = state.model_denied.lock().unwrap();
+    assert_eq!(
+        counts.get(&("limited".to_string(), "claude-opus-5".to_string())),
+        Some(&3)
+    );
+    assert_eq!(
+        counts.get(&("limited".to_string(), "claude-fable-5".to_string())),
+        Some(&1)
+    );
+}
+
+/// The model label is caller-controlled — unbounded growth here would be a
+/// metrics-cardinality DoS.
+#[test]
+fn model_denial_labels_are_bounded_by_other_overflow() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    for i in 0..(MAX_MODEL_DENIED_LABELS + 25) {
+        state.note_model_denied("limited", &format!("junk-model-{i}"));
+    }
+    let counts = state.model_denied.lock().unwrap();
+    assert!(
+        counts.len() <= MAX_MODEL_DENIED_LABELS + 1,
+        "label map grew unbounded: {} entries",
+        counts.len()
+    );
+    assert_eq!(
+        counts.get(&("limited".to_string(), "_other".to_string())),
+        Some(&25),
+        "overflow must land in the _other bucket, not be dropped"
+    );
+}
+
+// ── AC-5 / AC-6: startup validation ──
+
+#[test]
+fn config_rejects_proxy_key_and_clients_together() {
+    let toml_str = r#"
+listen = "0.0.0.0:8080"
+proxy_key = "legacy"
+
+[[clients]]
+name = "geo"
+key = "key-geo"
+"#;
+    let value: toml::Value = toml::from_str(toml_str).unwrap();
+    let err = reject_legacy_config_keys(&value).unwrap_err();
+    assert!(
+        err.contains("proxy_key"),
+        "error must name proxy_key: {err}"
+    );
+    assert!(err.contains("clients"), "error must name clients: {err}");
+}
+
+#[test]
+fn config_accepts_proxy_key_alone_and_clients_alone() {
+    for toml_str in [
+        "listen = \"0.0.0.0:8080\"\nproxy_key = \"legacy\"\n",
+        "listen = \"0.0.0.0:8080\"\n\n[[clients]]\nname = \"geo\"\nkey = \"key-geo\"\n",
+    ] {
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        assert!(reject_legacy_config_keys(&value).is_ok());
+    }
+}
+
+#[test]
+fn config_parses_clients_table_with_model_allow_list() {
+    let toml_str = r#"
+listen = "0.0.0.0:8080"
+
+[[clients]]
+name = "geo"
+key = "key-geo"
+models = ["claude-haiku-*", "claude-sonnet-4-6"]
+
+[[clients]]
+name = "radar"
+key = "key-radar"
+"#;
+    let cfg: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(cfg.clients.len(), 2);
+    assert_eq!(cfg.clients[0].name, "geo");
+    assert_eq!(cfg.clients[0].key, "key-geo");
+    assert_eq!(cfg.clients[0].models.len(), 2);
+    assert!(
+        cfg.clients[1].models.is_empty(),
+        "omitted models must default to empty (= all allowed)"
+    );
+}
+
+/// Build a `Config` from a TOML fragment. Goes through the real deserializer,
+/// so these tests also pin the config surface, and it beats hand-writing
+/// ~30-field `Config` / 7-field `ResponseCacheConfig` literals per case.
+fn cfg(fragment: &str) -> Config {
+    toml::from_str(&format!("listen = \"127.0.0.1:0\"\n{fragment}"))
+        .unwrap_or_else(|e| panic!("test config parse error: {e}\n---\n{fragment}"))
+}
+
+const RC_BLOCK: &str = "\n[response_cache]\nbackend = \"redis\"\nredis_url = \"redis://localhost\"\nmaster_key = \"0000000000000000000000000000000000000000000000000000000000000000\"\n";
+
+#[test]
+fn validate_clients_rejects_duplicate_names_and_keys() {
+    let err = validate_clients(&cfg(
+        "[[clients]]\nname = \"geo\"\nkey = \"k1\"\n\n[[clients]]\nname = \"geo\"\nkey = \"k2\"\n",
+    ))
+    .unwrap_err();
+    assert!(err.contains("duplicate name"), "{err}");
+
+    let err = validate_clients(&cfg(
+        "[[clients]]\nname = \"geo\"\nkey = \"k1\"\n\n[[clients]]\nname = \"radar\"\nkey = \"k1\"\n",
+    ))
+    .unwrap_err();
+    assert!(err.contains("duplicate key"), "{err}");
+    assert!(
+        !err.contains("k1"),
+        "the error must not echo the credential: {err}"
+    );
+}
+
+#[test]
+fn validate_clients_rejects_bad_names_and_empty_keys() {
+    for (fragment, needle) in [
+        ("[[clients]]\nname = \"\"\nkey = \"k1\"\n", "name"),
+        ("[[clients]]\nname = \"   \"\nkey = \"k1\"\n", "name"),
+        ("[[clients]]\nname = \"-\"\nkey = \"k1\"\n", "sentinel"),
+        // Reserved: /_stats and /metrics rewrite operator identities to the
+        // literal "_operator", so a real tenant with that name would silently
+        // merge with the aggregated operator bucket.
+        (
+            "[[clients]]\nname = \"_operator\"\nkey = \"k1\"\n",
+            "_operator",
+        ),
+        ("[[clients]]\nname = \"geo\"\nkey = \"\"\n", "key"),
+        // Untrimmed: stored verbatim, so it would become a client_id matching
+        // no client_budgets / operators / response_cache.clients key.
+        ("[[clients]]\nname = \" geo\"\nkey = \"k1\"\n", "whitespace"),
+        ("[[clients]]\nname = \"geo \"\nkey = \"k1\"\n", "whitespace"),
+    ] {
+        let err = validate_clients(&cfg(fragment)).unwrap_err();
+        assert!(err.contains(needle), "expected '{needle}' in: {err}");
+    }
+}
+
+#[test]
+fn validate_clients_accepts_a_well_formed_table() {
+    assert!(validate_clients(&cfg(
+        "[[clients]]\nname = \"geo\"\nkey = \"k1\"\nmodels = [\"claude-haiku-*\"]\n\n[[clients]]\nname = \"radar\"\nkey = \"k2\"\n",
+    ))
+    .is_ok());
+}
+
+/// One client registry, not five. Each of these config surfaces keys on a
+/// client name and each fails SILENTLY on a typo — a mistyped budget means
+/// UNLIMITED spend (`check_budget` returns Ok for an unknown client), a
+/// mistyped operator silently gates the caller it meant to exempt, a mistyped
+/// cache client silently disables the cache.
+#[test]
+fn validate_clients_rejects_any_surface_naming_no_configured_client() {
+    // NOTE: top-level scalars/arrays must precede the first table header —
+    // a bare `operators = [...]` written after `[[clients]]` binds to that
+    // table instead and is silently dropped, making the test pass vacuously.
+    let base = "\n[[clients]]\nname = \"geo\"\nkey = \"k1\"\n";
+    for (fragment, surface) in [
+        (
+            format!("{base}\n[client_budgets]\ngeo-pipeline = 100\n"),
+            "client_budgets",
+        ),
+        (
+            format!("{base}\n[client_utilization_limits]\ngeo-pipeline = 0.5\n"),
+            "client_utilization_limits",
+        ),
+        (
+            format!("operators = [\"geo-pipeline\"]\n{base}"),
+            "operators",
+        ),
+        (
+            format!("{base}{RC_BLOCK}clients = [\"geo-pipeline\"]\n"),
+            "response_cache.clients",
+        ),
+    ] {
+        let err = validate_clients(&cfg(&fragment)).unwrap_err();
+        assert!(err.contains(surface), "expected '{surface}' in: {err}");
+        assert!(err.contains("geo-pipeline"), "must name the typo: {err}");
+    }
+}
+
+#[test]
+fn validate_clients_accepts_every_surface_naming_a_configured_client() {
+    let fragment = format!(
+        "operators = [\"geo\"]\n\n[[clients]]\nname = \"geo\"\nkey = \"k1\"\n\n[client_budgets]\ngeo = 100\n\n[client_utilization_limits]\ngeo = 0.5\n{RC_BLOCK}clients = [\"geo\"]\n"
+    );
+    let parsed = cfg(&fragment);
+    // Guard against the vacuous-pass trap above: assert the fragment really
+    // populated all four surfaces before asserting validation accepts them.
+    assert_eq!(parsed.operators, vec!["geo".to_string()]);
+    assert!(parsed.client_budgets.contains_key("geo"));
+    assert!(parsed.client_utilization_limits.contains_key("geo"));
+    assert_eq!(
+        parsed.response_cache.as_ref().unwrap().clients,
+        vec!["geo".to_string()]
+    );
+    assert!(validate_clients(&parsed).is_ok());
+}
+
+/// On the legacy path there is no registry to check against, so none of the
+/// cross-checks may fire — existing configs must keep booting.
+#[test]
+fn validate_clients_skips_all_crosschecks_without_a_client_table() {
+    let fragment = format!(
+        "operators = [\"anything\"]\n\n[client_budgets]\nanything = 100\n{RC_BLOCK}clients = [\"anything\"]\n"
+    );
+    assert!(validate_clients(&cfg(&fragment)).is_ok());
+}
+
+/// `passthrough` forwards the caller's auth headers upstream untouched. Under
+/// `[[clients]]` those headers carry the client's PROXY key, so the two modes
+/// together would transmit every client key to the upstream.
+#[test]
+fn validate_clients_rejects_passthrough_endpoint_alongside_clients() {
+    let err = validate_clients(&cfg(
+        "[[clients]]\nname = \"geo\"\nkey = \"k1\"\n\n[[endpoints]]\nname = \"managed\"\ntoken = \"passthrough\"\n",
+    ))
+    .unwrap_err();
+    assert!(err.contains("passthrough"), "{err}");
+    assert!(err.contains("managed"), "must name the endpoint: {err}");
+}
+
+/// …but passthrough on the legacy path is untouched.
+#[test]
+fn validate_clients_allows_passthrough_without_a_client_table() {
+    assert!(validate_clients(&cfg(
+        "[[endpoints]]\nname = \"managed\"\ntoken = \"passthrough\"\n",
+    ))
+    .is_ok());
+}
+
+// ── AC-4: the response-cache tenant follows the authenticated principal ──
+
+/// #113 derives the cache's per-client encryption key from `client_id`. This
+/// asserts the tenant a spoofing caller would land in is its OWN, not the one
+/// it named — i.e. the cross-tenant read that ticket accepted is now closed.
+#[test]
+fn response_cache_tenant_follows_the_authenticated_principal() {
+    let state = state_with_clients(vec![
+        mk_client("alpha", "key-alpha", &[]),
+        mk_client("bravo", "key-bravo", &[]),
+    ]);
+    let ip = test_ip();
+    let headers = hdrs(&[("x-api-key", "key-alpha"), ("x-client-id", "bravo")]);
+    let principal = state.authenticate(&ip, &headers, false).unwrap().unwrap();
+    let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
+
+    // The cache is keyed by this exact string (`rc.clients.get(&client_id)`),
+    // and the HKDF tenant is derived from it.
+    assert_eq!(rctx.client_id, "alpha");
+    assert_ne!(rctx.client_id, "bravo");
+}
+
+// ── Integration: both surfaces, through the real router ──
+
+fn authed_app(upstream_url: &str, clients: Vec<ClientConfig>) -> (Router, Arc<AppState>) {
+    let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
+    acct.base_url = upstream_url.to_string();
+    let state = Arc::new(AppState {
+        endpoints: vec![acct],
+        clients,
+        ..test_state_base()
+    });
+    (build_router(state.clone()), state)
+}
+
+/// Native surface: the request authenticates as `limited` while claiming to be
+/// `unlimited`. It must be gated as `limited` — 403 — not waved through.
+#[tokio::test]
+async fn native_surface_gates_spoofing_client_by_its_real_identity() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = authed_app(
+        &mock_url,
+        vec![
+            mk_client("limited", "key-limited", &["claude-haiku-*"]),
+            mk_client("unlimited", "key-unlimited", &[]),
+        ],
+    );
+    let addr = serve(app).await;
+    let client = Client::new();
+
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "key-limited")
+        .header("x-client-id", "unlimited")
+        .body(r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(resp.text().await.unwrap().contains("limited"));
+
+    // Same credential, a model it IS allowed: unaffected.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "key-limited")
+        .body(r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    assert_eq!(
+        state
+            .model_denied
+            .lock()
+            .unwrap()
+            .get(&("limited".to_string(), "claude-opus-5".to_string())),
+        Some(&1)
+    );
+}
+
+/// OpenAI-compat surface: same gate, reached through the other handler —
+/// `pre_request_gate` is called from both, so one placement covers both.
+#[tokio::test]
+async fn openai_surface_enforces_the_same_allow_list() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = authed_app(
+        &mock_url,
+        vec![mk_client("limited", "key-limited", &["claude-haiku-*"])],
+    );
+    let addr = serve(app).await;
+    let client = Client::new();
+
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer key-limited")
+        .header("x-client-id", "someone-else")
+        .body(r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer key-limited")
+        .body(r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+/// AC-2: no site left on the old single-key path.
+#[tokio::test]
+async fn all_four_auth_sites_reject_an_unknown_key() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = authed_app(&mock_url, vec![mk_client("geo", "key-geo", &[])]);
+    let addr = serve(app).await;
+    let client = Client::new();
+
+    for path in ["/_stats", "/metrics"] {
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .header("x-api-key", "key-wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{path} accepted an unknown key"
+        );
+        // …and the right one still works.
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .header("x-api-key", "key-geo")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{path}");
+    }
+
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "key-wrong")
+        .body(r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "key-wrong")
+        .body(r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // The bearer branch is reachable only on this surface — cover its reject
+    // path too: wrong key, bare scheme, and a valid key without the scheme.
+    for auth in ["Bearer key-wrong", "Bearer", "key-geo"] {
+        let resp = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .header("authorization", auth)
+            .body(r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "'{auth}' must not authenticate"
+        );
+    }
+}
+
+/// AC-11: the denial counter reaches /metrics under its documented name.
+#[tokio::test]
+async fn metrics_exposes_the_model_denial_counter() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = authed_app(
+        &mock_url,
+        vec![mk_client("limited", "key-limited", &["claude-haiku-*"])],
+    );
+    assert!(state
+        .pre_request_gate("limited", "claude-opus-5")
+        .await
+        .is_err());
+
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .header("x-api-key", "key-limited")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains(
+            "anthropic_client_model_denied_total{client=\"limited\",model=\"claude-opus-5\"} 1"
+        ),
+        "denial counter missing from /metrics:\n{body}"
+    );
+}
+// ── LAB-1191: token-exfil audit findings (redirects, header reflection,
+//    client beta flags) ────────────────────────────────────────────────
+
+/// Raw-TCP upstream that answers every request with a 302 to `target`.
+async fn spawn_redirecting_upstream(target: String) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let target = target.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {target}/v1/messages\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    format!("http://{}", addr)
+}
+
+/// AC-4/5/6: a 3xx from upstream must NOT be followed (the follow-up request
+/// would re-send the account credential to the Location host) and must
+/// surface as a deliberate 502, not a forwarded 302 or an endless retry.
+#[tokio::test]
+async fn upstream_redirect_not_followed_and_becomes_502() {
+    use std::sync::atomic::Ordering;
+    // The redirect target counts every connection it receives — with
+    // Policy::none() it must stay at zero.
+    let (target_url, target_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let redirecting = spawn_redirecting_upstream(target_url).await;
+
+    let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-api-aaa", &redirecting)]);
+    let addr = serve(build_router(state)).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "upstream 3xx must become a deliberate 502"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("redirect"), "502 body must say why: {body}");
+    assert_eq!(
+        target_hits.load(Ordering::SeqCst),
+        0,
+        "no request may follow the redirect with credentials attached"
+    );
+}
+
+/// AC-7/AC-10: by default the caller must not see the upstream's rate-limit
+/// capacity, cookies, or org identity — only the allow-listed headers.
+#[tokio::test]
+async fn upstream_headers_stripped_by_default() {
+    let (upstream_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = test_app(&upstream_url, None);
+    let addr = serve(app).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    for leaked in [
+        "anthropic-ratelimit-unified-5h-utilization",
+        "anthropic-ratelimit-unified-5h-status",
+        "set-cookie",
+        "anthropic-organization-id",
+    ] {
+        assert!(
+            !resp.headers().contains_key(leaked),
+            "{leaked} must not be reflected by default"
+        );
+    }
+    // Allow-listed headers still flow.
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("req_mock_123"),
+        "request-id is allow-listed for SDK error reports"
+    );
+    assert!(resp.headers().contains_key("x-budget-status"));
+}
+
+/// AC-8/AC-10: expose_upstream_ratelimit_headers = true restores the
+/// anthropic-ratelimit-* passthrough (trusted networks) — and ONLY that:
+/// cookies and org identity stay stripped.
+#[tokio::test]
+async fn upstream_ratelimit_headers_reflected_with_flag() {
+    let (upstream_url, _handle) = spawn_mock_upstream().await;
+    let mut state = test_state_with(vec![mk_endpoint_at(
+        "acct-a",
+        "sk-ant-api-test-aaa",
+        &upstream_url,
+    )]);
+    Arc::get_mut(&mut state)
+        .expect("test fixture should be uniquely owned")
+        .expose_upstream_ratelimit_headers = true;
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("anthropic-ratelimit-unified-5h-utilization")
+            .and_then(|v| v.to_str().ok()),
+        Some("0.25"),
+        "flag must restore anthropic-ratelimit-* passthrough"
+    );
+    assert!(
+        !resp.headers().contains_key("set-cookie"),
+        "set-cookie stays stripped even with the ratelimit flag on"
+    );
+    assert!(
+        !resp.headers().contains_key("anthropic-organization-id"),
+        "org identity stays stripped even with the ratelimit flag on"
+    );
+}
+
+fn default_betas() -> Vec<String> {
+    DEFAULT_CLIENT_BETA_ALLOWLIST
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// AC-11/AC-13: an unknown client beta flag is dropped from the forwarded
+/// header and reported back; the LB's own OAuth flags are still appended.
+#[test]
+fn oauth_beta_filter_drops_unknown_flags() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("evil-feature-2026-01-01,interleaved-thinking-2025-05-14"),
+    );
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &default_betas());
+    assert_eq!(dropped, vec!["evil-feature-2026-01-01".to_string()]);
+    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    assert!(
+        !sent.contains("evil-feature-2026-01-01"),
+        "unknown flag must not be forwarded: {sent}"
+    );
+    assert!(sent.contains("interleaved-thinking-2025-05-14"));
+    for flag in OAUTH_BETA_FLAGS {
+        assert!(sent.contains(flag), "required OAuth flag missing: {flag}");
+    }
+}
+
+/// AC-13: every default-allowed flag survives the filter, including the
+/// wildcard-matched 1M-context flag — and 1M detection still fires on the
+/// filtered header map.
+#[test]
+fn oauth_beta_filter_keeps_default_allowed_flags() {
+    let client_flags = [
+        "oauth-2025-04-20",
+        "claude-code-20250219",
+        "interleaved-thinking-2025-05-14",
+        "fine-grained-tool-streaming-2025-05-14",
+        "prompt-caching-2024-07-31",
+        "context-1m-2025-08-07",
+    ];
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_str(&client_flags.join(",")).unwrap(),
+    );
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &default_betas());
+    assert!(dropped.is_empty(), "nothing should be dropped: {dropped:?}");
+    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    for flag in client_flags {
+        assert!(sent.contains(flag), "allowed flag missing: {flag}");
+    }
+    assert!(
+        request_has_1m_beta(&headers),
+        "1M-context detection must still fire after filtering"
+    );
+}
+
+/// Regression (2026-08-01 incident): the full `anthropic-beta` set Claude
+/// Code 2.1.220 sends must survive the default allow-list. The first cut of
+/// `DEFAULT_CLIENT_BETA_ALLOWLIST` listed only six entries and dropped these
+/// ten, which 400'd every Claude Code request through the proxy —
+/// `context-management` in particular has a body-side `context_management`
+/// object that the LB forwards verbatim, so dropping the header alone is a
+/// hard upstream rejection, not a silent feature downgrade.
+///
+/// This inventory came off `anthropic_beta_flag_dropped_total` on the live
+/// fleet. Date suffixes are deliberately concrete: the allow-list wildcards
+/// them, so a Claude Code date bump keeps passing while a genuinely new flag
+/// family still shows up as a drop.
+#[test]
+fn oauth_beta_filter_keeps_claude_code_flag_set() {
+    let claude_code_flags = [
+        "thinking-token-count-2026-05-13",
+        "context-management-2025-06-27",
+        "mid-conversation-system-2026-04-07",
+        "advisor-tool-2026-03-01",
+        "effort-2025-11-24",
+        "fallback-credit-2026-06-01",
+        "extended-cache-ttl-2025-04-11",
+        "redact-thinking-2026-02-12",
+        "afk-mode-2026-01-31",
+        "structured-outputs-2025-12-15",
+    ];
+    // Negative control: the point of the allow-list is that it still rejects.
+    // Without this, widening the default to "*" would keep the test green.
+    let unlisted = "evil-feature-2026-01-01";
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_str(&format!("{},{unlisted}", claude_code_flags.join(","))).unwrap(),
+    );
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &default_betas());
+    assert_eq!(
+        dropped,
+        vec![unlisted.to_string()],
+        "only the unlisted flag may be dropped"
+    );
+    // Exact token membership, not substring: `sent.contains(flag)` also passes
+    // on a mangled or embedded token (e.g. "no-effort-2025-11-24" contains
+    // "effort-2025-11-24"), so it cannot tell a forwarded flag from a
+    // corrupted one.
+    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    let tokens: Vec<&str> = sent.split(',').map(str::trim).collect();
+    for flag in claude_code_flags {
+        assert!(
+            tokens.contains(&flag),
+            "Claude Code flag not forwarded as an exact token: {flag} (sent: {sent})"
+        );
+    }
+    for flag in OAUTH_BETA_FLAGS {
+        assert!(
+            tokens.contains(flag),
+            "required OAuth flag missing: {flag} (sent: {sent})"
+        );
+    }
+    assert!(
+        !tokens.contains(&unlisted),
+        "dropped flag must not be forwarded: {sent}"
+    );
+
+    // A Claude Code date bump must keep passing — that is the entire reason
+    // these entries are wildcarded. Nothing above catches a de-wildcarded
+    // entry (`"context-management-*"` narrowed back to the concrete
+    // `"context-management-2025-06-27"` satisfies every assertion so far),
+    // and that edit re-breaks all primary traffic on Claude Code's next
+    // release. Rebuild each family with a different date, through the real
+    // filter path.
+    let bumped: Vec<String> = claude_code_flags
+        .iter()
+        .map(|flag| {
+            // Strip the trailing `-YYYY-MM-DD`, keeping the family. Validate
+            // the suffix shape first so a malformed inventory entry (e.g. a
+            // compact `-YYYYMMDD` date) fails naming the entry, instead of
+            // mis-stripping and surfacing as a baffling allowlist miss below.
+            let parts: Vec<&str> = flag.rsplitn(4, '-').collect();
+            assert_eq!(parts.len(), 4, "flag lacks a -YYYY-MM-DD suffix: {flag}");
+            // rsplitn yields the components reversed: day, month, year.
+            assert!(
+                parts[..3]
+                    .iter()
+                    .zip([2usize, 2, 4])
+                    .all(|(p, w)| p.len() == w && p.bytes().all(|b| b.is_ascii_digit())),
+                "flag suffix is not numeric YYYY-MM-DD: {flag}"
+            );
+            let family = parts[3];
+            assert_ne!(family, "", "empty family for {flag}");
+            assert_ne!(family, *flag, "date-suffix strip failed for {flag}");
+            format!("{family}-2099-12-31")
+        })
+        .collect();
+    let mut bumped_headers = axum::http::HeaderMap::new();
+    bumped_headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_str(&bumped.join(",")).unwrap(),
+    );
+    let bumped_dropped = inject_account_auth(
+        &mut bumped_headers,
+        "sk-ant-oat01-test",
+        false,
+        &default_betas(),
+    );
+    assert!(
+        bumped_dropped.is_empty(),
+        "a Claude Code date bump must stay allowed (suffix wildcard lost?): {bumped_dropped:?}"
+    );
+    // `dropped` and the outbound header are separate outputs — an allowed
+    // flag silently discarded (neither forwarded nor reported) passes the
+    // assertion above. Check the header too, exact-token like the main set.
+    let bumped_sent = bumped_headers
+        .get("anthropic-beta")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let bumped_tokens: Vec<&str> = bumped_sent.split(',').map(str::trim).collect();
+    for flag in &bumped {
+        assert!(
+            bumped_tokens.contains(&flag.as_str()),
+            "bumped flag not forwarded as an exact token: {flag} (sent: {bumped_sent})"
+        );
+    }
+}
+
+/// AC-13: passthrough endpoints return early — caller headers untouched,
+/// nothing dropped.
+#[test]
+fn oauth_beta_filter_passthrough_unchanged() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("authorization", HeaderValue::from_static("Bearer caller"));
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("anything-goes-2026"),
+    );
+    let dropped = inject_account_auth(&mut headers, "passthrough", true, &default_betas());
+    assert!(dropped.is_empty());
+    assert_eq!(
+        headers.get("authorization").unwrap(),
+        "Bearer caller",
+        "passthrough must not touch caller auth"
+    );
+    assert_eq!(
+        headers.get("anthropic-beta").unwrap(),
+        "anything-goes-2026",
+        "passthrough must not filter caller betas"
+    );
+}
+
+/// AC-12: dropped flags land in the bounded counter map; past the cap they
+/// fold into `_other` instead of growing per-client-controlled cardinality.
+#[test]
+fn dropped_beta_flag_counter_is_bounded() {
+    let state = test_state_with(vec![]);
+    for i in 0..(MAX_DROPPED_BETA_FLAGS + 10) {
+        state.record_dropped_beta_flags("t", &[format!("flag-{i}")]);
+    }
+    let map = state.beta_flags_dropped.lock().unwrap();
+    assert_eq!(map.len(), MAX_DROPPED_BETA_FLAGS + 1, "cap + _other bucket");
+    assert_eq!(map.get("_other"), Some(&10u64));
+    drop(map);
+    // Existing keys keep counting past the cap.
+    state.record_dropped_beta_flags("t", &["flag-0".to_string()]);
+    assert_eq!(
+        state.beta_flags_dropped.lock().unwrap().get("flag-0"),
+        Some(&2u64)
+    );
+}
+
+/// AC-12/AC-13 end-to-end: a request carrying an unknown beta flag is served,
+/// the flag never reaches the upstream, and /metrics reports the drop.
+#[tokio::test]
+async fn dropped_beta_flag_appears_in_metrics() {
+    let (upstream_url, _handle) = spawn_mock_upstream().await;
+    // test_state_base already carries the default allow-list.
+    let state = test_state_with(vec![mk_endpoint_at(
+        "acct-a",
+        "sk-ant-oat01-test-aaa",
+        &upstream_url,
+    )]);
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("anthropic-beta", "totally-unknown-2026-07-30")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let metrics = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics
+            .contains("anthropic_beta_flag_dropped_total{flag=\"totally-unknown-2026-07-30\"} 1"),
+        "metrics must report the dropped flag"
+    );
+}
+
+/// Panel follow-up (LAB-1191): a client flag that IS one of the required
+/// OAUTH_BETA_FLAGS is always forwarded (the merge re-adds it), so it must
+/// never be reported as dropped — even under a custom allow-list that
+/// omits it. A false drop here would make the diagnostics lie.
+#[test]
+fn oauth_beta_filter_never_reports_required_flags_as_dropped() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("oauth-2025-04-20,claude-code-20250219"),
+    );
+    // Custom allow-list omitting the OAuth flags entirely.
+    let restrictive = vec!["context-1m*".to_string()];
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &restrictive);
+    assert!(
+        dropped.is_empty(),
+        "required OAuth flags are always sent — reporting them dropped is a lie: {dropped:?}"
+    );
+    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    for flag in OAUTH_BETA_FLAGS {
+        assert!(sent.contains(flag));
+    }
+}
+
+/// Panel follow-up (LAB-1191): dropped-flag keys are length-bounded before
+/// logging/counting — a multi-kilobyte client "flag" must not be pinned
+/// verbatim into every /metrics scrape.
+#[test]
+fn dropped_beta_flag_keys_are_length_bounded() {
+    let state = test_state_with(vec![]);
+    let huge = "x".repeat(5000);
+    state.record_dropped_beta_flags("t", &[huge]);
+    let map = state.beta_flags_dropped.lock().unwrap();
+    let key = map.keys().next().unwrap();
+    assert!(
+        key.len() <= MAX_DROPPED_BETA_FLAG_LEN,
+        "key must be truncated, got {} bytes",
+        key.len()
+    );
+}
+
+/// Panel follow-up (LAB-1191 AC-5): on the OpenAI-compat surface an upstream
+/// 3xx must surface as a 502 in the OPENAI error shape — those clients'
+/// parsers cannot read an Anthropic error envelope.
+#[tokio::test]
+async fn upstream_redirect_becomes_openai_shaped_502_on_chat_completions() {
+    use std::sync::atomic::Ordering;
+    let (target_url, target_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let redirecting = spawn_redirecting_upstream(target_url).await;
+
+    let state = test_state_with(vec![mk_endpoint_at("a", "sk-ant-oat01-aaa", &redirecting)]);
+    let addr = serve(build_router(state)).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.get("error").and_then(|e| e.get("message")).is_some(),
+        "OpenAI-surface 502 must be OpenAI-shaped: {body}"
+    );
+    assert!(
+        body.get("type").is_none(),
+        "must not be the Anthropic error envelope: {body}"
+    );
+    assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+}
+
+/// PR #116 review (Kody + CodeRabbit): the 1M-context accounting must read
+/// the FILTERED outbound headers. If a custom allow-list strips
+/// `context-1m`, the upstream runs the request at 200k — recording the
+/// session at 1M would inflate /_stats occupancy.
+#[test]
+fn stripped_context_1m_flag_is_invisible_to_accounting() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("context-1m-2025-08-07"),
+    );
+    // Custom allow-list that omits context-1m*.
+    let restrictive = vec!["oauth-2025-04-20".to_string()];
+    let dropped = inject_account_auth(&mut headers, "sk-ant-oat01-test", false, &restrictive);
+    assert_eq!(dropped, vec!["context-1m-2025-08-07".to_string()]);
+    assert!(
+        !request_has_1m_beta(&headers),
+        "post-filter headers must not carry the stripped 1M flag"
+    );
+}
+
+/// Same defect end-to-end: with a restrictive allow-list, a request carrying
+/// the 1M beta must be registered in the session registry at the 200k window
+/// the upstream actually ran under — not at 1M.
+#[tokio::test]
+async fn session_registry_window_matches_filtered_beta() {
+    // Raw-TCP mock: its canned body carries `usage`, which session
+    // registration requires (the axum mock's body has none).
+    let (upstream_url, _hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let mut state = test_state_with(vec![mk_endpoint_at(
+        "acct-a",
+        "sk-ant-oat01-test-aaa",
+        &upstream_url,
+    )]);
+    Arc::get_mut(&mut state)
+        .expect("test fixture should be uniquely owned")
+        .allowed_client_betas = vec!["oauth-2025-04-20".to_string()];
+    let sessions_state = state.clone();
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-session-id", "sess-1m-strip")
+        .header("anthropic-beta", "context-1m-2025-08-07")
+        .body(r#"{"model":"claude-sonnet-4-6","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let windows: Vec<u64> = sessions_state
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .map(|s| s.context_window)
+        .collect();
+    assert_eq!(
+        windows,
+        vec![DEFAULT_CONTEXT_WINDOW],
+        "session must be tracked at the window the upstream ran (flag was stripped)"
+    );
+}
 // ── Real-Redis integration tests (LAB-931) ──────────────────────────
 //
 // Behavioural coverage for the cross-replica coordination layer against a

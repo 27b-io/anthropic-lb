@@ -27,6 +27,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, trace, warn};
@@ -41,8 +42,20 @@ struct Config {
     rate_limit_cooldown_secs: Option<u64>,
     /// Seconds between utilization probes per account (0 = disabled). Default: 300 (5 min)
     probe_interval_secs: Option<u64>,
-    /// Shared secret clients must send as x-api-key to access the proxy. None = open.
+    /// LEGACY single shared secret, sent as x-api-key. None = open.
+    /// Superseded by `[[clients]]`; configuring both is rejected at startup
+    /// (`reject_legacy_config_keys`) rather than silently precedence-ordered.
     proxy_key: Option<String>,
+    /// Per-client credentials (LAB-1083). When non-empty, EVERY authenticated
+    /// entry point requires a credential matching one of these keys, and the
+    /// matched entry's `name` becomes the request's `client_id` — the
+    /// `x-client-id` header and the `client_names` IP map are then ignored
+    /// entirely. That is the whole point: budgets, utilization ceilings,
+    /// operator bypass, the model allow-list and the response-cache tenant all
+    /// key on `client_id`, so making it unforgeable makes all five unforgeable
+    /// at once.
+    #[serde(default)]
+    clients: Vec<ClientConfig>,
     /// Source IP allowlist. Supports individual IPs and CIDR ranges. None/empty = allow all.
     allowed_ips: Option<Vec<String>>,
     /// Unified routing endpoints. Each entry is either Anthropic-native or
@@ -110,6 +123,52 @@ struct Config {
     /// Opt-in encrypted response cache on `/v1/messages` (LAB-933).
     /// Absent, or present with an empty `clients` list = feature entirely inert.
     response_cache: Option<ResponseCacheConfig>,
+    /// Reflect upstream `anthropic-ratelimit-*` response headers to callers.
+    /// They reveal the pooled capacity of every account behind the proxy, so
+    /// this is trusted-network-only. Default: false (LAB-1191).
+    expose_upstream_ratelimit_headers: Option<bool>,
+    /// Client-supplied `anthropic-beta` flags forwarded upstream on OAuth
+    /// endpoints ("*" suffix wildcards, like `endpoints[].models`). Absent =
+    /// built-in default (`DEFAULT_CLIENT_BETA_ALLOWLIST`); a configured
+    /// value REPLACES that default (it does not extend it), so include the
+    /// defaults alongside any addition. Flags not on the list are dropped,
+    /// logged, and counted (`anthropic_beta_flag_dropped_total`) — otherwise
+    /// any caller could activate arbitrary beta features against the
+    /// operator's accounts (LAB-1191).
+    allowed_client_betas: Option<Vec<String>>,
+}
+
+/// `[[clients]]` — one authenticated caller. The `key` IS the identity: it is
+/// what the caller presents, and `name` is what the proxy attributes the
+/// request to. No `x-client-id` header can override it.
+#[derive(Deserialize, Clone)]
+struct ClientConfig {
+    /// Identity this credential resolves to. Becomes `client_id`, so it is what
+    /// `client_budgets`, `client_utilization_limits`, `operators` and
+    /// `[response_cache].clients` must name.
+    name: String,
+    /// Shared secret this client presents as `x-api-key` (or, on the
+    /// OpenAI-compat surface, `Authorization: Bearer`). Compared in constant
+    /// time against the whole table.
+    key: String,
+    /// Models this client may request. Empty = all models, mirroring
+    /// `EndpointConfig.models` semantics. Same exact + `*`-suffix matcher.
+    #[serde(default)]
+    models: Vec<String>,
+}
+
+/// Hand-written, NOT derived: a derived `Debug` would print `key` verbatim into
+/// any log line, panic message or test assertion that formats this struct —
+/// which is precisely how credentials end up in a log aggregator. Same posture
+/// as `debug_header_value`'s redaction of sensitive headers.
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("name", &self.name)
+            .field("key", &"<redacted>")
+            .field("models", &self.models)
+            .finish()
+    }
 }
 
 /// `[response_cache]` — opt-in, client-side-encrypted response cache on
@@ -174,6 +233,11 @@ struct EndpointConfig {
     /// demoting its priority by `overage_penalty` so included (Max) capacity
     /// drains first. Non-Fable routing is unaffected. Default: true.
     fable_included: Option<bool>,
+    /// Opt-in: allow a `protocol = "anthropic"` endpoint whose `base_url`
+    /// host is not `api.anthropic.com` (e.g. a staging mirror). Without it,
+    /// startup fails — a typo'd or tampered base_url would otherwise send the
+    /// account's OAuth/API token to an arbitrary HTTPS host. Default: false.
+    allow_nonstandard_host: Option<bool>,
 }
 
 /// Wire format on config / state: "anthropic" | "openai".
@@ -386,6 +450,28 @@ const TAU_1H: f64 = 3600.0;
 /// deployments have a handful of clients, far below this; the cap only bounds
 /// unknown/abusive header values — existing clients keep updating past it.
 const MAX_TRACKED_CLIENTS: usize = 10_000;
+
+/// Cap on distinct (client, model) labels in the allowlist-denial counter.
+/// The model half is caller-controlled; overflow buckets into `_other`.
+const MAX_MODEL_DENIED_LABELS: usize = 64;
+
+/// Max chars retained from a caller-controlled string used as a metric label
+/// or echoed in an error body. The model field is bounded only by the request
+/// body cap, so an untruncated copy would be retained for the process lifetime
+/// and re-serialized on every `/metrics` scrape.
+const MAX_LABEL_CHARS: usize = 64;
+
+/// Truncate a caller-controlled string to `MAX_LABEL_CHARS`, marking that it
+/// was cut so an operator does not read a clipped value as the literal input.
+/// Char-based, not byte-based: slicing a UTF-8 string mid-codepoint panics.
+fn truncate_label(s: &str) -> String {
+    if s.chars().count() <= MAX_LABEL_CHARS {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(MAX_LABEL_CHARS).collect();
+    out.push('…');
+    out
+}
 const TAU_6H: f64 = 21600.0;
 
 /// Per-account burn rate tracker: requests per minute at three time scales.
@@ -545,20 +631,28 @@ struct Endpoint {
     last_effective_gate: AtomicU64,
 }
 
+/// Exact match with `*`-suffix wildcards. Empty pattern list, or an empty
+/// model, allows everything.
+///
+/// The SINGLE list-level implementation behind both model allowlists: which
+/// models an *endpoint* may serve (`Endpoint::serves_model`) and which models
+/// a *client* may request (`AppState::client_allows_model`, LAB-1083). The
+/// per-pattern wildcard semantics live in `suffix_wildcard_match`, shared
+/// with the beta-flag allow-list (LAB-1191) — two matchers would be two sets
+/// of wildcard semantics to keep in sync, and the divergence would show up as
+/// a policy bypass rather than a test failure.
+fn model_matches(patterns: &[String], model: &str) -> bool {
+    if patterns.is_empty() || model.is_empty() {
+        return true;
+    }
+    patterns.iter().any(|p| suffix_wildcard_match(p, model))
+}
+
 impl Endpoint {
     /// Check if this endpoint can serve the given model. Empty allowlist = all.
     /// Identical to the historical `Account::serves_model` predicate.
     fn serves_model(&self, model: &str) -> bool {
-        if self.models.is_empty() || model.is_empty() {
-            return true;
-        }
-        self.models.iter().any(|pattern| {
-            if let Some(prefix) = pattern.strip_suffix('*') {
-                model.starts_with(prefix)
-            } else {
-                model == pattern
-            }
-        })
+        model_matches(&self.models, model)
     }
 }
 
@@ -583,7 +677,13 @@ struct AppState {
     /// exercise breaker re-entry without a 30s sleep.
     transport_cooldown: Duration,
     state_path: PathBuf,
+    /// Legacy single shared secret. Mutually exclusive with `clients`.
     proxy_key: Option<String>,
+    /// Authenticated client registry (LAB-1083). Non-empty ⇒ every request
+    /// through an authenticated entry point carries a verified principal, and
+    /// `client_id` is that principal's name rather than a client-asserted
+    /// header. Empty ⇒ legacy `proxy_key` / open behaviour.
+    clients: Vec<ClientConfig>,
     allowed_ips: Vec<IpAllowEntry>,
     client_names: HashMap<String, String>,
     auto_cache: bool,
@@ -647,6 +747,17 @@ struct AppState {
     /// Count of requests shed because the body was not fully received within
     /// `body_read_timeout`. Exposed as `anthropic_body_read_timeout_total`.
     body_read_timeout_total: AtomicU64,
+    /// Reflect upstream `anthropic-ratelimit-*` headers to callers (see
+    /// `Config::expose_upstream_ratelimit_headers`). Default: false.
+    expose_upstream_ratelimit_headers: bool,
+    /// `anthropic-beta` flags a client may forward upstream on OAuth
+    /// endpoints ("*" suffix wildcards). Flags outside the list are dropped.
+    allowed_client_betas: Vec<String>,
+    /// Dropped client beta flags → drop count, for
+    /// `anthropic_beta_flag_dropped_total{flag}`. Flag names are
+    /// client-controlled input, so the map is bounded
+    /// (`MAX_DROPPED_BETA_FLAGS`); overflow lands in the `_other` bucket.
+    beta_flags_dropped: Mutex<HashMap<String, u64>>,
     /// Live session registry: affinity routing key → last-seen context-window
     /// occupancy (LAB-916). Visibility only — routing never reads it. Sync
     /// mutex, never held across `.await`; bounded by `session_registry_max`
@@ -659,6 +770,12 @@ struct AppState {
     /// Upstream "prompt is too long" 400s by model (LAB-916). Exposed as
     /// `anthropic_prompt_too_long_total`; bounded via `_other` overflow.
     prompt_too_long: Mutex<HashMap<String, u64>>,
+    /// Per-client model-allowlist denials, keyed (client, model) (LAB-1083).
+    /// Exposed as `anthropic_client_model_denied_total`. `client` is an
+    /// authenticated principal so it is bounded by config, but `model` is
+    /// caller-controlled — bounded via the same `_other` overflow as
+    /// `prompt_too_long`.
+    model_denied: Mutex<HashMap<(String, String), u64>>,
     /// (endpoint idx, model) pairs an upstream rejected as unsupported — a
     /// gateway without the model, or a plan without access (LAB-941).
     /// `routing_candidates` skips these until the entry expires; because
@@ -1411,13 +1528,186 @@ impl AppState {
         self.allowed_ips.is_empty() || self.allowed_ips.iter().any(|e| e.contains(ip))
     }
 
+    /// Authenticate a request's credential (LAB-1083).
+    ///
+    /// Returns the authenticated principal when `[[clients]]` is configured,
+    /// `None` when it is not (legacy `proxy_key`, or an open proxy), and a 401
+    /// `Response` when a configured credential does not match.
+    ///
+    /// `allow_bearer` additionally accepts `Authorization: Bearer` — set only
+    /// on the OpenAI-compat surface, whose SDKs send nothing else. It is NOT
+    /// enabled on the native surface, where `Authorization` may legitimately
+    /// carry the caller's own upstream token in `passthrough` mode; widening
+    /// acceptance there would be a gratuitous auth surface on a ticket whose
+    /// whole purpose is to narrow one.
+    fn authenticate(
+        &self,
+        client_ip: &IpAddr,
+        headers: &hyper::HeaderMap,
+        allow_bearer: bool,
+    ) -> Result<Option<&ClientConfig>, Box<Response>> {
+        // Boxed Err, matching `reserve_request_body` — an inline `Response` is
+        // 128+ bytes on the hot success path (clippy::result_large_err).
+        let unauthorized = || -> Box<Response> {
+            warn!(client = %client_ip, "rejected: invalid or missing credential");
+            Box::new((StatusCode::UNAUTHORIZED, "unauthorized").into_response())
+        };
+        let from_header = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+        let from_bearer = if allow_bearer {
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| {
+                    // RFC 7235: auth scheme is case-insensitive
+                    if v.len() >= 7 && v[..7].eq_ignore_ascii_case("bearer ") {
+                        Some(&v[7..])
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        };
+
+        if !self.clients.is_empty() {
+            for presented in [from_header, from_bearer].into_iter().flatten() {
+                if let Some(c) = self.match_client(presented) {
+                    return Ok(Some(c));
+                }
+            }
+            return Err(unauthorized());
+        }
+
+        // Legacy: one shared secret, no principal. Byte-for-byte the same
+        // accept/reject decision as before LAB-1083 — only the comparison
+        // primitive changed (audit finding 4).
+        if let Some(ref key) = self.proxy_key {
+            let ok = [from_header, from_bearer]
+                .into_iter()
+                .flatten()
+                .any(|p| bool::from(key.as_bytes().ct_eq(p.as_bytes())));
+            if !ok {
+                return Err(unauthorized());
+            }
+        }
+        Ok(None)
+    }
+
+    /// Constant-time lookup of a presented credential in the client table.
+    ///
+    /// What this actually guarantees, precisely — do not read more into it:
+    /// `ct_eq` removes the per-byte prefix oracle that `==` has, which is the
+    /// leak that matters (it is what lets an attacker recover a key byte by
+    /// byte). Audit finding 4, closed.
+    ///
+    /// The full-table scan removes the coarse "how far down the table did we
+    /// get" signal. It does NOT make the whole function constant-time: the
+    /// `hit = Some(c)` store is a data-dependent branch the optimizer may
+    /// emit as one, and `ct_eq` short-circuits on unequal lengths. Both
+    /// residuals are a handful of instructions against milliseconds of network
+    /// and TLS jitter, and key length is not a secret — so neither is
+    /// exploitable remotely. Want the stronger property? Accumulate with
+    /// `subtle::Choice`; don't assume this already does.
+    fn match_client(&self, presented: &str) -> Option<&ClientConfig> {
+        let mut hit: Option<&ClientConfig> = None;
+        for c in &self.clients {
+            if bool::from(c.key.as_bytes().ct_eq(presented.as_bytes())) {
+                hit = Some(c);
+            }
+        }
+        hit
+    }
+
+    /// Whether `client_id` may request `model` (LAB-1083).
+    ///
+    /// Unknown client, or a client with an empty list, allows everything.
+    /// "Unknown client" is only reachable on the legacy path: with
+    /// `[[clients]]` configured, `client_id` is always a principal name.
+    ///
+    /// FAILS CLOSED on an empty `model`, and this is the one place where the
+    /// shared matcher's semantics are deliberately NOT inherited. An empty
+    /// model means the caller's model is UNKNOWN to us — the body did not
+    /// parse as JSON, or it carries no top-level `model` (the batches API
+    /// nests it under `requests[].params.model`, and `proxy_handler` is the
+    /// catch-all route). For `Endpoint::serves_model` "unknown" rightly means
+    /// "don't narrow the routing pool"; for a policy gate it must mean
+    /// "deny", or a restricted client reaches any model by sending a body we
+    /// cannot read.
+    fn client_allows_model(&self, client_id: &str, model: &str) -> bool {
+        match self.clients.iter().find(|c| c.name == client_id) {
+            Some(c) if c.models.is_empty() => true,
+            Some(c) => !model.is_empty() && model_matches(&c.models, model),
+            None => true,
+        }
+    }
+
+    /// Count + log a model-allowlist denial.
+    ///
+    /// The model string is caller-controlled and bounded only by the request
+    /// body cap, so it is truncated BEFORE becoming a map key: an untruncated
+    /// label would be retained for the process lifetime and re-serialized into
+    /// the `/metrics` body on every scrape. Label COUNT is separately bounded
+    /// by `_other` overflow.
+    ///
+    /// Logs at `warn` the first time a (client, model) pair is denied and at
+    /// `debug` thereafter — a client hammering a denied model must not be able
+    /// to drive unbounded warn-level log volume. The counter still records
+    /// every denial. Mirrors the once-per-model pattern used for
+    /// unsupported-model warnings.
+    fn note_model_denied(&self, client_id: &str, model: &str) {
+        let model = truncate_label(model);
+        let mut first_time = true;
+        if let Ok(mut counts) = self.model_denied.lock() {
+            let key = (client_id.to_owned(), model.clone());
+            let label = if counts.len() < MAX_MODEL_DENIED_LABELS || counts.contains_key(&key) {
+                key
+            } else {
+                (client_id.to_owned(), "_other".to_owned())
+            };
+            let entry = counts.entry(label).or_insert(0);
+            first_time = *entry == 0;
+            *entry += 1;
+        }
+        if first_time {
+            warn!(
+                client_id = %client_id,
+                model = %model,
+                "rejected: model not in client allow-list"
+            );
+        } else {
+            debug!(
+                client_id = %client_id,
+                model = %model,
+                "rejected: model not in client allow-list"
+            );
+        }
+    }
+
     /// Resolve client identity: x-client-id header → IP map fallback → "-"
     ///
     /// Header takes precedence to support multiple clients per IP.
+    ///
+    /// ONLY reached when no `[[clients]]` table is configured. Under
+    /// `[[clients]]`, identity comes from the verified credential
+    /// (`RequestContext::from_request`) and this client-asserted path is dead.
+    ///
+    /// The `debug_assert` is the choke point for that invariant. Nothing in the
+    /// type system stops a future handler from calling
+    /// `RequestContext::from_request(.., None)` and silently reinstating
+    /// header-asserted identity; this makes that mistake fail loudly in tests
+    /// and debug builds instead of quietly becoming an identity bypass.
     fn resolve_client_id(&self, ip: &IpAddr, headers: &hyper::HeaderMap) -> String {
+        debug_assert!(
+            self.clients.is_empty(),
+            "resolve_client_id reached with [[clients]] configured — a caller \
+             skipped the authenticated principal and identity is now spoofable"
+        );
         if let Some(id) = headers.get("x-client-id").and_then(|v| v.to_str().ok()) {
             let id = id.trim();
-            if !id.is_empty() && id != "-" {
+            // "_operator" is the reserved operator-aggregation label on
+            // /_stats and /metrics — a self-asserted claim to it would merge
+            // this caller's usage into the hidden operator bucket.
+            if !id.is_empty() && id != "-" && id != "_operator" {
                 return id.to_string();
             }
         }
@@ -1786,7 +2076,15 @@ impl AppState {
             "anthropic-dangerous-direct-browser-access",
             HeaderValue::from_static("true"),
         );
-        inject_account_auth(&mut headers, &ep.token, ep.passthrough);
+        // Probe headers carry only OAUTH_BETA_FLAGS, which the filter never
+        // drops (they are unconditionally re-added), so the returned drop
+        // list is provably empty — nothing to record.
+        let _ = inject_account_auth(
+            &mut headers,
+            &ep.token,
+            ep.passthrough,
+            &self.allowed_client_betas,
+        );
 
         let req = self.client.post(&url).headers(headers).json(&body);
 
@@ -2168,6 +2466,68 @@ const DEFAULT_MAX_INFLIGHT_BODY_BYTES: u64 = 128 * 1024 * 1024;
 /// Required OAuth beta flags. Both needed: oauth-2025-04-20 for OAuth auth,
 /// claude-code-20250219 for Claude Code API access quota routing.
 const OAUTH_BETA_FLAGS: &[&str] = &["oauth-2025-04-20", "claude-code-20250219"];
+
+/// Default `anthropic-beta` flags a client may forward upstream on OAuth
+/// endpoints (LAB-1191 / audit finding 5). Contains the flags the LB itself
+/// depends on (`OAUTH_BETA_FLAGS`, the `context-1m*` flag the context-window
+/// accounting reads) plus the flag FAMILIES Claude Code sends on every
+/// request, wildcarded on their date suffix so a Claude Code auto-update
+/// that bumps a date can't silently degrade the proxy's primary traffic.
+/// A configured `allowed_client_betas` REPLACES this list (it does not
+/// extend it) — copy these entries alongside any addition; "*" is a suffix
+/// wildcard.
+const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
+    "oauth-2025-04-20",
+    "claude-code-20250219",
+    "interleaved-thinking-*",
+    "fine-grained-tool-streaming-*",
+    "prompt-caching-*",
+    "context-1m*",
+    // The rest of what Claude Code 2.1.x sends on every request (inventory
+    // taken from anthropic_beta_flag_dropped_total on the lab fleet,
+    // 2026-08-01). The first cut of this list under-enumerated them, which
+    // 400'd all primary traffic: several of these flags have a BODY-side
+    // counterpart the LB forwards verbatim (context-management →
+    // `context_management`, structured-outputs → `output_format`,
+    // extended-cache-ttl → `cache_control.ttl`), so stripping only the
+    // header leaves an incoherent request that upstream rejects outright
+    // rather than degrading to the non-beta behaviour.
+    "context-management-*",
+    "structured-outputs-*",
+    "extended-cache-ttl-*",
+    "effort-*",
+    "thinking-token-count-*",
+    "mid-conversation-system-*",
+    "advisor-tool-*",
+    "fallback-credit-*",
+    "redact-thinking-*",
+    "afk-mode-*",
+];
+
+/// Cardinality bound for `beta_flags_dropped` — flag names are
+/// client-controlled input. Past the cap, drops count under `_other`.
+const MAX_DROPPED_BETA_FLAGS: usize = 50;
+
+/// Length bound for a single flag key in `beta_flags_dropped` and its warn
+/// log — the value is client-controlled, and 50 multi-kilobyte keys replayed
+/// into every `/metrics` scrape is the cardinality decision's spirit broken
+/// by size instead of count.
+const MAX_DROPPED_BETA_FLAG_LEN: usize = 64;
+
+/// "*" suffix-wildcard match, shared by the model allowlist
+/// (`Endpoint::serves_model`) and the beta-flag allowlist
+/// (`beta_flag_allowed`) so the two can never drift.
+fn suffix_wildcard_match(pattern: &str, value: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        value.starts_with(prefix)
+    } else {
+        value == pattern
+    }
+}
+
+fn beta_flag_allowed(allowed: &[String], flag: &str) -> bool {
+    allowed.iter().any(|p| suffix_wildcard_match(p, flag))
+}
 
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
 /// weight is below 50% of the alternative, stickiness is broken immediately.
@@ -4165,6 +4525,73 @@ impl AppState {
         }
     }
 
+    /// Log + count client `anthropic-beta` flags dropped by the allow-list
+    /// (AC-12: silent stripping is not acceptable — a caller whose feature
+    /// vanished must be diagnosable from the logs and
+    /// `anthropic_beta_flag_dropped_total{flag}`). Flag names are
+    /// client-controlled, so the counter map is capped at
+    /// `MAX_DROPPED_BETA_FLAGS` distinct flags (overflow counts as `_other`)
+    /// and each key is truncated to `MAX_DROPPED_BETA_FLAG_LEN` bytes —
+    /// count-capped but length-unbounded keys would still bloat every
+    /// `/metrics` scrape.
+    fn record_dropped_beta_flags(&self, client_id: &str, dropped: &[String]) {
+        if dropped.is_empty() {
+            return;
+        }
+        let truncated: Vec<&str> = dropped
+            .iter()
+            .map(|f| {
+                let mut end = f.len().min(MAX_DROPPED_BETA_FLAG_LEN);
+                while !f.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &f[..end]
+            })
+            .collect();
+        let Ok(mut map) = self.beta_flags_dropped.lock() else {
+            return;
+        };
+        // Loud line only on a flag's FIRST sighting — a misconfigured client
+        // sends the same unlisted flag at request rate, and the counter
+        // already carries the volume. Repeats log at debug for correlation.
+        let mut first_seen: Vec<&str> = Vec::new();
+        for flag in &truncated {
+            if map.contains_key(*flag) || map.len() < MAX_DROPPED_BETA_FLAGS {
+                if !map.contains_key(*flag) {
+                    first_seen.push(flag);
+                }
+                *map.entry(flag.to_string()).or_insert(0) += 1;
+            } else {
+                *map.entry("_other".to_string()).or_insert(0) += 1;
+            }
+        }
+        drop(map);
+        if !first_seen.is_empty() {
+            warn!(
+                client_id,
+                flags = %first_seen.join(","),
+                "dropped client anthropic-beta flags not on the allow-list \
+                 (a configured allowed_client_betas REPLACES the default list — \
+                 include the defaults plus the flags to permit)"
+            );
+        }
+        // The repeat subset gets its own debug line even when the same call
+        // also carried a first sighting — every dropped flag leaves a log
+        // trace on every request it was dropped from (AC-12).
+        let repeats: Vec<&str> = truncated
+            .iter()
+            .filter(|f| !first_seen.contains(f))
+            .copied()
+            .collect();
+        if !repeats.is_empty() {
+            debug!(
+                client_id,
+                flags = %repeats.join(","),
+                "dropped client anthropic-beta flags (previously reported)"
+            );
+        }
+    }
+
     /// Flush this replica's accumulated transport-error deltas into the shared
     /// Redis hash (`TRANSPORT_ERRORS_KEY`) so the fleet-wide count is visible
     /// cluster-wide. `upstream_transport_errors` is a DELTA accumulator: it is
@@ -4547,14 +4974,23 @@ impl SseUsageScanner {
 }
 
 /// Inject account authentication headers. Handles API keys, OAuth tokens,
-/// and passthrough mode. For OAuth, merges required beta flags with any
-/// existing flags from the client.
-fn inject_account_auth(headers: &mut axum::http::HeaderMap, token: &str, passthrough: bool) {
+/// and passthrough mode. For OAuth, merges required beta flags with the
+/// client flags that survive the `allowed_betas` allow-list; the flags it
+/// dropped are returned so the caller can log and count them (LAB-1191 /
+/// audit finding 5 — an unfiltered merge let any caller activate arbitrary
+/// beta features against the operator's account).
+fn inject_account_auth(
+    headers: &mut axum::http::HeaderMap,
+    token: &str,
+    passthrough: bool,
+    allowed_betas: &[String],
+) -> Vec<String> {
     if passthrough {
-        return;
+        return Vec::new();
     }
     headers.remove("authorization");
     headers.remove("x-api-key");
+    let mut dropped: Vec<String> = Vec::new();
     if token.starts_with("sk-ant-api") {
         headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
     } else if token.starts_with("sk-ant-oat") {
@@ -4566,16 +5002,29 @@ fn inject_account_auth(headers: &mut axum::http::HeaderMap, token: &str, passthr
             "anthropic-dangerous-direct-browser-access",
             HeaderValue::from_static("true"),
         );
-        // Merge required OAuth beta flags with any existing client flags
+        // Merge required OAuth beta flags with the allow-listed client flags.
         // Use get_all to handle multiple anthropic-beta headers
-        let mut flags: Vec<String> = headers
+        let mut flags: Vec<String> = Vec::new();
+        for flag in headers
             .get_all("anthropic-beta")
             .iter()
             .filter_map(|v| v.to_str().ok())
             .flat_map(|s| s.split(','))
-            .map(|s| s.trim().to_string())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
-            .collect();
+        {
+            // OAUTH_BETA_FLAGS are unconditionally (re-)added below, so a
+            // client flag in that set is never actually dropped — reporting
+            // it as such (e.g. under a custom allowlist omitting them) would
+            // make the drop diagnostics lie.
+            if beta_flag_allowed(allowed_betas, flag) || OAUTH_BETA_FLAGS.contains(&flag) {
+                if !flags.iter().any(|f| f == flag) {
+                    flags.push(flag.to_string());
+                }
+            } else if !dropped.iter().any(|f| f == flag) {
+                dropped.push(flag.to_string());
+            }
+        }
         for flag in OAUTH_BETA_FLAGS {
             if !flags.iter().any(|f| f == flag) {
                 flags.push(flag.to_string());
@@ -4588,6 +5037,7 @@ fn inject_account_auth(headers: &mut axum::http::HeaderMap, token: &str, passthr
     } else {
         headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
     }
+    dropped
 }
 
 /// Client identity extracted from request headers.
@@ -4624,9 +5074,23 @@ fn affinity_routing_key(
 }
 
 impl RequestContext {
-    fn from_request(state: &AppState, client_ip: &IpAddr, headers: &axum::http::HeaderMap) -> Self {
+    /// `principal` is the authenticated client from `AppState::authenticate`.
+    /// When present it IS the identity — `x-client-id` and the `client_names`
+    /// IP map are not consulted at all. This one substitution is what makes
+    /// budgets, ceilings, operator bypass, the model allow-list and the
+    /// response-cache tenant unspoofable: every one of them keys on
+    /// `client_id`, and this is where `client_id` is born.
+    fn from_request(
+        state: &AppState,
+        client_ip: &IpAddr,
+        headers: &axum::http::HeaderMap,
+        principal: Option<&ClientConfig>,
+    ) -> Self {
         Self {
-            client_id: state.resolve_client_id(client_ip, headers),
+            client_id: match principal {
+                Some(c) => c.name.clone(),
+                None => state.resolve_client_id(client_ip, headers),
+            },
             client_ver: headers
                 .get("user-agent")
                 .and_then(|v| v.to_str().ok())
@@ -5401,6 +5865,28 @@ impl AppState {
             return Ok(()); // operator bypasses everything
         }
 
+        // 0. Per-client model allow-list (LAB-1083). First because it is a
+        //    POLICY denial, not a capacity one: "you may not use this model"
+        //    must not be reported as 429 "try again later", which is what the
+        //    three checks below all mean. Reached from both proxy_handler and
+        //    openai_chat_handler, so one placement covers both surfaces.
+        if !self.client_allows_model(client_id, model) {
+            self.note_model_denied(client_id, model);
+            // `model` is caller-controlled and echoed back — truncate it here
+            // too, so a 25 MB model field cannot become a 25 MB error body.
+            let body = if model.is_empty() {
+                format!(
+                    "client '{client_id}' has a model allow-list, but no model could be read from the request"
+                )
+            } else {
+                format!(
+                    "client '{client_id}' is not permitted to use model '{}'",
+                    truncate_label(model)
+                )
+            };
+            return Err((StatusCode::FORBIDDEN, body).into_response());
+        }
+
         // 1. Daily token budget (existing)
         if client_id != "-" && self.check_budget(client_id).await.is_err() {
             warn!(client_id = %client_id, "rejected: daily token budget exceeded");
@@ -5805,6 +6291,9 @@ fn describe_reqwest_error(e: &reqwest::Error) -> String {
     if e.is_request() {
         kinds.push("request");
     }
+    // With `Policy::none()` on the upstream clients a redirect is a normal
+    // 3xx *response* (handled in `classify_retry_status`), so this kind can
+    // no longer fire there — kept because this describer is generic.
     if e.is_redirect() {
         kinds.push("redirect");
     }
@@ -5837,13 +6326,70 @@ fn describe_reqwest_error(e: &reqwest::Error) -> String {
 /// `Err(ForwardOutcome::Retry { .. })`. For any non-retry status (2xx
 /// success or 4xx client error) it returns `Ok(resp)` — handing the
 /// response back so the caller can continue.
+///
+/// `openai_error_shape` picks the error-body format for the terminal 3xx
+/// arm: callers whose downstream parses OpenAI errors (`/v1/chat/completions`
+/// passthrough) get `{"error":{...}}`, Anthropic-surface callers get
+/// `{"type":"error",...}` — matching how every other error arm on those
+/// paths translates per surface.
 async fn classify_retry_status(
     state: &AppState,
     status: StatusCode,
     rate_info: &RwLock<RateLimitInfo>,
     endpoint_name: &str,
     resp: reqwest::Response,
+    openai_error_shape: bool,
 ) -> Result<reqwest::Response, ForwardOutcome> {
+    // 3xx → deliberate 502. The upstream client follows no redirects
+    // (`Policy::none()`), because following one would re-send the account
+    // credential to the Location host. A redirect from a configured endpoint
+    // is anomalous (misconfig or tampering), so it terminates the request
+    // with a distinct log rather than rotating — retrying other accounts
+    // against a redirecting upstream would just spray more credentialed
+    // requests at it (LAB-1191 / 2026-06-02 audit finding 2).
+    if status.is_redirection() {
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        warn!(
+            account = endpoint_name,
+            status = status.as_u16(),
+            location,
+            "upstream returned a redirect — refusing to follow with credentials attached"
+        );
+        let message = format!(
+            "upstream returned {} redirect; refusing to follow with credentials",
+            status.as_u16()
+        );
+        let body = if openai_error_shape {
+            serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "api_error",
+                    "param": null,
+                    "code": null
+                }
+            })
+        } else {
+            serde_json::json!({
+                "type": "error",
+                "error": { "type": "api_error", "message": message }
+            })
+        }
+        .to_string();
+        return Err(ForwardOutcome::Done(
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap_or_else(|_| {
+                    (StatusCode::BAD_GATEWAY, "upstream redirect refused").into_response()
+                }),
+        ));
+    }
+
     // 429 → mark hard-limited and try next account
     if status == StatusCode::TOO_MANY_REQUESTS {
         state
@@ -6054,18 +6600,50 @@ fn untranslatable_request_response(message: &str) -> Response {
         .into_response()
 }
 
-/// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
-/// passes the picked endpoint and its pool index (used for `skip` and usage
-/// accounting).
-/// `ep` is the endpoint to forward to; `endpoint_idx` is its index in
-/// `state.endpoints`. Both are required: the streaming path spawns a
-/// detached 'static task that must re-borrow the endpoint from a cloned
-/// Arc<AppState> — a borrowed &Endpoint cannot cross the spawn boundary,
-/// so the task captures the Copy `endpoint_idx` and re-indexes.
+/// Copy the allow-listed upstream response headers onto `builder`. Everything
+/// not listed here stays behind the proxy (LAB-1191 / 2026-06-02 audit
+/// finding 3: the old copy-everything loop leaked `anthropic-ratelimit-*` —
+/// the pooled capacity of every account — plus `set-cookie` and
+/// org-identifying headers). `expose_ratelimit` (config
+/// `expose_upstream_ratelimit_headers`, trusted networks only) restores the
+/// `anthropic-ratelimit-*` passthrough for tooling that reads it. One other
+/// site reflects upstream headers: `forward_anthropic`'s body-read-failure
+/// 502 arm copies `anthropic-ratelimit-*` behind the same flag.
+fn reflect_upstream_headers(
+    mut builder: axum::http::response::Builder,
+    headers: &reqwest::header::HeaderMap,
+    expose_ratelimit: bool,
+) -> axum::http::response::Builder {
+    // What SDKs need to function: body framing (content-type/length),
+    // SSE cache hint, the Anthropic request id for error reports, and
+    // retry-after on forwarded 4xx.
+    const ALLOWED: &[&str] = &[
+        "content-type",
+        "content-length",
+        "cache-control",
+        "request-id",
+        "retry-after",
+    ];
+    for (k, v) in headers.iter() {
+        let name = k.as_str();
+        if ALLOWED.contains(&name) || (expose_ratelimit && name.starts_with("anthropic-ratelimit-"))
+        {
+            builder = builder.header(k, v);
+        }
+    }
+    builder
+}
+
 /// Shared knob chain for both upstream clients — `client` layers the SSE-tuned
 /// `read_timeout` on top; `client_nonstreaming` takes it as-is (LAB-718).
 fn upstream_client_builder() -> reqwest::ClientBuilder {
     Client::builder()
+        // Never follow redirects: every upstream request carries an account
+        // credential (Authorization / x-api-key), and reqwest re-sends it to
+        // the redirect target. A 3xx surfaces as a response and is turned
+        // into a deliberate 502 by `classify_retry_status` (LAB-1191 /
+        // 2026-06-02 audit finding 2).
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(900))
         // 4s (was 10): a blackholed connect fails fast so the transient
         // backoff-retry recovers in seconds. pool_idle_timeout stays 300s —
@@ -6099,6 +6677,14 @@ fn body_wants_stream(body: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
+/// passes the picked endpoint and its pool index (used for `skip` and usage
+/// accounting).
+/// `ep` is the endpoint to forward to; `endpoint_idx` is its index in
+/// `state.endpoints`. Both are required: the streaming path spawns a
+/// detached 'static task that must re-borrow the endpoint from a cloned
+/// Arc<AppState> — a borrowed &Endpoint cannot cross the spawn boundary,
+/// so the task captures the Copy `endpoint_idx` and re-indexes.
 #[allow(clippy::too_many_arguments)]
 async fn forward_anthropic(
     state: &Arc<AppState>,
@@ -6117,10 +6703,6 @@ async fn forward_anthropic(
     session_key: Option<&str>,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
-    // Context window for the session registry: 200k, or 1M when the request
-    // carries the `context-1m` beta (per-request, so a mixed client is
-    // tracked at the window each request actually ran under).
-    let context_window = context_window_for(model, request_has_1m_beta(&parts.headers));
     let token = ep.token.as_str();
     let passthrough = ep.passthrough;
     let endpoint_name = ep.name.as_str();
@@ -6157,7 +6739,21 @@ async fn forward_anthropic(
     }
 
     // Auth: passthrough keeps caller's headers, otherwise inject account token
-    inject_account_auth(&mut headers, token, passthrough);
+    let dropped = inject_account_auth(
+        &mut headers,
+        token,
+        passthrough,
+        &state.allowed_client_betas,
+    );
+    state.record_dropped_beta_flags(client_id, &dropped);
+
+    // Context window for the session registry: 200k, or 1M when the request
+    // carries the `context-1m` beta (per-request, so a mixed client is
+    // tracked at the window each request actually ran under). Read from the
+    // FILTERED outbound headers, not the client's raw ones — if the beta
+    // allow-list stripped `context-1m`, the upstream runs this request at
+    // 200k and the accounting must agree (PR #116 review).
+    let context_window = context_window_for(model, request_has_1m_beta(&headers));
 
     // Debug: log outbound auth method and key headers
     if tracing::enabled!(tracing::Level::DEBUG) {
@@ -6257,11 +6853,11 @@ async fn forward_anthropic(
     state.update_burn_rate(&ep.burn_rate, client_id);
 
     // Classify 429 / 529 / other 5xx into a retry decision (shared helper).
-    let mut resp = match classify_retry_status(state, status, rate_info, endpoint_name, resp).await
-    {
-        Ok(resp) => resp,
-        Err(outcome) => return outcome,
-    };
+    let mut resp =
+        match classify_retry_status(state, status, rate_info, endpoint_name, resp, false).await {
+            Ok(resp) => resp,
+            Err(outcome) => return outcome,
+        };
 
     // Clear hard limit and burst counter only on a genuine 2xx success.
     // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
@@ -6319,16 +6915,14 @@ async fn forward_anthropic(
     let resp_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = resp.headers().clone();
 
-    let mut builder = Response::builder().status(resp_status);
-    for (k, v) in resp_headers.iter() {
-        if k == "transfer-encoding" {
-            continue;
-        }
-        builder = builder.header(k, v);
-    }
+    let builder = reflect_upstream_headers(
+        Response::builder().status(resp_status),
+        &resp_headers,
+        state.expose_upstream_ratelimit_headers,
+    );
 
     // Inject budget status header
-    builder = builder.header("x-budget-status", budget_status);
+    let builder = builder.header("x-budget-status", budget_status);
 
     // Detect streaming from content-type
     let is_streaming = resp_headers
@@ -6448,17 +7042,20 @@ async fn forward_anthropic(
                     }
                 })
                 .to_string();
-                // Forward the upstream's rate-limit headers + budget status so the
-                // client's limit tracking stays consistent with the success arms.
+                // Forward the upstream's rate-limit headers (behind the same
+                // trusted-network flag as the success arms) + budget status so
+                // the client's limit tracking stays consistent.
                 // Deliberately NOT content-length: the upstream's value describes
                 // the truncated body it promised, not our short JSON frame.
                 let mut err_builder = Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
                     .header("content-type", "application/json")
                     .header("x-budget-status", budget_status);
-                for (k, v) in resp_headers.iter() {
-                    if k.as_str().starts_with("anthropic-ratelimit-") {
-                        err_builder = err_builder.header(k, v);
+                if state.expose_upstream_ratelimit_headers {
+                    for (k, v) in resp_headers.iter() {
+                        if k.as_str().starts_with("anthropic-ratelimit-") {
+                            err_builder = err_builder.header(k, v);
+                        }
                     }
                 }
                 return ForwardOutcome::Done(err_builder.body(Body::from(body)).unwrap_or_else(
@@ -6606,14 +7203,11 @@ async fn proxy_handler(
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
 
-    // Proxy auth: validate x-api-key against proxy_key if configured
-    if let Some(ref key) = state.proxy_key {
-        let provided = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-        if provided != Some(key.as_str()) {
-            warn!(client = %client_ip, "rejected: invalid or missing proxy key");
-            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
-    }
+    // Proxy auth: x-api-key against the [[clients]] table, else legacy proxy_key.
+    let principal = match state.authenticate(&client_ip, req.headers(), false) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
 
     let (parts, body) = req.into_parts();
 
@@ -6624,7 +7218,7 @@ async fn proxy_handler(
     );
 
     // Extract client identification headers
-    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers);
+    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers, principal);
     let RequestContext {
         client_id,
         client_ver,
@@ -7113,10 +7707,14 @@ async fn try_fallback_upstream(
     // it for the cooldown window, and a 529 flags the long-base BEBO backoff.
     // Previously this was a bare rotate — every subsequent request re-hammered
     // the still-rate-limited endpoint before rotating (GH #97).
-    let mut resp = match classify_retry_status(state, status, &ep.rate_info, &ep.name, resp).await {
-        Ok(resp) => resp,
-        Err(outcome) => return outcome,
-    };
+    // Downstream parses OpenAI errors on the passthrough path
+    // (translate = false); Anthropic errors when translating back.
+    let mut resp =
+        match classify_retry_status(state, status, &ep.rate_info, &ep.name, resp, !translate).await
+        {
+            Ok(resp) => resp,
+            Err(outcome) => return outcome,
+        };
 
     if !status.is_success() {
         let err_body = resp
@@ -7544,11 +8142,8 @@ async fn stats_handler(
     if !state.is_ip_allowed(&client_addr.ip()) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
-    if let Some(ref key) = state.proxy_key {
-        let provided = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-        if provided != Some(key.as_str()) {
-            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
+    if let Err(resp) = state.authenticate(&client_addr.ip(), req.headers(), false) {
+        return *resp;
     }
 
     let now_epoch = AppState::now_epoch();
@@ -8018,11 +8613,8 @@ async fn metrics_handler(
     if !state.is_ip_allowed(&client_addr.ip()) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
-    if let Some(ref key) = state.proxy_key {
-        let provided = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-        if provided != Some(key.as_str()) {
-            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
+    if let Err(resp) = state.authenticate(&client_addr.ip(), req.headers(), false) {
+        return *resp;
     }
 
     let now_epoch = AppState::now_epoch();
@@ -8086,6 +8678,18 @@ async fn metrics_handler(
     let cluster_info = state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
     let prompt_too_long: Vec<(String, u64)> = state
         .prompt_too_long
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
+    let model_denied: Vec<((String, String), u64)> = state
+        .model_denied
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
+    let beta_flags_dropped: Vec<(String, u64)> = state
+        .beta_flags_dropped
         .lock()
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
@@ -8899,6 +9503,41 @@ async fn metrics_handler(
             &mut buf,
             "anthropic_prompt_too_long_total",
             &[("model", model.as_str())],
+            *n,
+        );
+    }
+
+    // Per-client model-allowlist denials (LAB-1083). A non-zero rate here is
+    // either a misconfigured caller or a caller reaching for capacity it was
+    // deliberately denied — both worth an alert.
+    prom_header(
+        &mut buf,
+        "anthropic_client_model_denied_total",
+        "counter",
+        "Requests rejected (403) by the per-client model allow-list",
+    );
+    for ((client, model), n) in &model_denied {
+        prom_counter(
+            &mut buf,
+            "anthropic_client_model_denied_total",
+            &[("client", client.as_str()), ("model", model.as_str())],
+            *n,
+        );
+    }
+
+    // Client anthropic-beta flags dropped by the allow-list (LAB-1191).
+    // Per-replica, in-memory; bounded via `_other` overflow.
+    prom_header(
+        &mut buf,
+        "anthropic_beta_flag_dropped_total",
+        "counter",
+        "Client anthropic-beta flags dropped by the allow-list",
+    );
+    for (flag, n) in &beta_flags_dropped {
+        prom_counter(
+            &mut buf,
+            "anthropic_beta_flag_dropped_total",
+            &[("flag", flag.as_str())],
             *n,
         );
     }
@@ -10402,10 +11041,6 @@ async fn forward_openai_compat_anthropic(
     json_mode: bool,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
-    // Session registry window (LAB-916). OpenAI-compat callers can't send the
-    // `context-1m` beta through translation, but check anyway — the header is
-    // forwarded when present.
-    let context_window = context_window_for(model, request_has_1m_beta(&parts.headers));
     let token = ep.token.as_str();
     let passthrough = ep.passthrough;
     let endpoint_name = ep.name.as_str();
@@ -10426,7 +11061,20 @@ async fn forward_openai_compat_anthropic(
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
 
     // Auth injection
-    inject_account_auth(&mut headers, token, passthrough);
+    let dropped = inject_account_auth(
+        &mut headers,
+        token,
+        passthrough,
+        &state.allowed_client_betas,
+    );
+    state.record_dropped_beta_flags(client_id, &dropped);
+
+    // Session registry window (LAB-916). OpenAI-compat callers can't send the
+    // `context-1m` beta through translation, but check anyway — the header is
+    // forwarded when present. Read from the FILTERED outbound headers so the
+    // accounting matches what the upstream actually ran under (PR #116
+    // review), same as forward_anthropic.
+    let context_window = context_window_for(model, request_has_1m_beta(&headers));
 
     // Use OAuth variant (with CC system prompt) for OAuth tokens
     let req_body = if token.starts_with("sk-ant-oat") {
@@ -10499,11 +11147,11 @@ async fn forward_openai_compat_anthropic(
     state.update_burn_rate(&ep.burn_rate, client_id);
 
     // Classify 429 / 529 / other 5xx into a retry decision (shared helper).
-    let mut resp = match classify_retry_status(state, status, rate_info, endpoint_name, resp).await
-    {
-        Ok(resp) => resp,
-        Err(outcome) => return outcome,
-    };
+    let mut resp =
+        match classify_retry_status(state, status, rate_info, endpoint_name, resp, true).await {
+            Ok(resp) => resp,
+            Err(outcome) => return outcome,
+        };
 
     // Clear hard limit and burst counter only on a genuine 2xx success.
     // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
@@ -10853,27 +11501,12 @@ async fn openai_chat_handler(
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
 
-    // Proxy auth: accept if either x-api-key or Authorization: Bearer matches
-    if let Some(ref key) = state.proxy_key {
-        let from_header = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-        let from_bearer = req
-            .headers()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                // RFC 7235: auth scheme is case-insensitive
-                if v.len() >= 7 && v[..7].eq_ignore_ascii_case("bearer ") {
-                    Some(&v[7..])
-                } else {
-                    None
-                }
-            });
-        let authorized = from_header == Some(key.as_str()) || from_bearer == Some(key.as_str());
-        if !authorized {
-            warn!(client = %client_ip, "rejected: invalid or missing proxy key");
-            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
-    }
+    // Proxy auth: accept the credential from either x-api-key or
+    // Authorization: Bearer — OpenAI SDKs send only the latter.
+    let principal = match state.authenticate(&client_ip, req.headers(), true) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
 
     let (parts, body) = req.into_parts();
 
@@ -10884,7 +11517,7 @@ async fn openai_chat_handler(
     );
 
     // Extract client identification headers
-    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers);
+    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers, principal);
     let affinity_key = rctx.affinity_key(&client_ip, None);
     let affinity = affinity_key.as_deref();
     let RequestContext {
@@ -11072,8 +11705,9 @@ async fn openai_chat_handler(
 // ── Main ────────────────────────────────────────────────────────────
 
 /// Validate endpoint configuration. Returns the first hard error encountered.
-/// Soft warnings (non-canonical anthropic host, priority collision with an
-/// openai endpoint) are emitted as `warn!` and do not return an error.
+/// A non-canonical host on an anthropic endpoint is a hard error unless the
+/// endpoint opts in via `allow_nonstandard_host` (then it degrades to the
+/// `warn!`). Priority collision with an openai endpoint stays a soft warning.
 fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
     for ep in endpoints {
         if let Some(url) = ep.base_url.as_deref() {
@@ -11102,6 +11736,19 @@ fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
                         .ok()
                         .and_then(|u| u.host_str().map(str::to_string));
                     if host.as_deref() != Some("api.anthropic.com") {
+                        // This endpoint's token is forwarded to that host on
+                        // every request — a typo here is credential exfil, so
+                        // it must be an explicit opt-in, not a scrolled-past
+                        // warning (LAB-1191 / 2026-06-02 audit finding 1).
+                        if ep.allow_nonstandard_host != Some(true) {
+                            return Err(format!(
+                                "endpoint '{}': base_url host '{}' is not api.anthropic.com — \
+                                 the endpoint token would be sent to a non-Anthropic host. \
+                                 Set allow_nonstandard_host = true on this endpoint if intentional",
+                                ep.name,
+                                host.as_deref().unwrap_or("<unparseable>")
+                            ));
+                        }
                         warn!(
                             endpoint = ep.name,
                             base_url = url,
@@ -11137,6 +11784,117 @@ fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
     Ok(())
 }
 
+/// Startup validation for the `[[clients]]` registry (LAB-1083).
+///
+/// Every rule here exists because its violation fails SILENTLY at runtime
+/// rather than loudly: a duplicate key resolves to whichever entry the scan
+/// saw last, a duplicate or empty name silently merges two callers' budgets and
+/// cache tenancy, and a `[response_cache].clients` typo makes the cache inert
+/// for that client with no signal at all. Cheap to catch at boot; expensive to
+/// notice in production.
+fn validate_clients(config: &Config) -> Result<(), String> {
+    let clients = &config.clients;
+    let mut seen_names: Vec<&str> = Vec::with_capacity(clients.len());
+    let mut seen_keys: Vec<&str> = Vec::with_capacity(clients.len());
+    for c in clients {
+        if c.name.trim().is_empty() {
+            return Err("client: name must not be empty".to_string());
+        }
+        // Stored untrimmed, so " geo" would become a client_id that matches no
+        // `client_budgets` / `operators` / `[response_cache].clients` key —
+        // silently unenforced budget and cache tenancy. `resolve_client_id`
+        // trims its header input; this path has nothing to trim it later.
+        if c.name != c.name.trim() {
+            return Err(format!(
+                "client '{}': name must not have leading or trailing whitespace",
+                c.name
+            ));
+        }
+        if c.name == "-" {
+            return Err(
+                "client: name must not be \"-\" (the unknown-client sentinel — budget enforcement skips it)"
+                    .to_string(),
+            );
+        }
+        if c.name == "_operator" {
+            return Err(
+                "client: name must not be \"_operator\" (the reserved operator-aggregation label on /_stats and /metrics)"
+                    .to_string(),
+            );
+        }
+        if c.key.is_empty() {
+            return Err(format!("client '{}': key must not be empty", c.name));
+        }
+        if seen_names.contains(&c.name.as_str()) {
+            return Err(format!("client '{}': duplicate name", c.name));
+        }
+        // Names, not keys, in the error — never log a credential.
+        if seen_keys.contains(&c.key.as_str()) {
+            return Err(format!(
+                "client '{}': duplicate key (already used by another client)",
+                c.name
+            ));
+        }
+        seen_names.push(&c.name);
+        seen_keys.push(&c.key);
+    }
+
+    // One client registry, not five. Every one of these config surfaces keys on
+    // a client name, and every one of them fails SILENTLY on a typo — in the
+    // dangerous direction: `check_budget` and `check_utilization_limit` both
+    // return Ok(()) for an unknown client, so a mistyped budget means UNLIMITED
+    // spend against the operator's accounts with no log line and no metric; a
+    // mistyped `operators` entry silently gates the caller it was meant to
+    // exempt; a mistyped `response_cache.clients` entry silently makes the
+    // cache inert. Only enforceable when [[clients]] is configured — on the
+    // legacy path client ids are header-derived and there is no registry to
+    // check against.
+    if clients.is_empty() {
+        return Ok(());
+    }
+
+    // `token = "passthrough"` forwards the caller's auth headers to the
+    // upstream UNTOUCHED (`inject_account_auth` returns before the
+    // header-strip). Under [[clients]] the caller's `x-api-key` is its PROXY
+    // credential, not an upstream one — so the two modes together would
+    // transmit every client key verbatim to that endpoint's `base_url`. They
+    // are contradictory by construction: passthrough means "the caller brings
+    // its own upstream credential", [[clients]] means "that header is mine".
+    // Reject rather than half-handle, exactly as with proxy_key above.
+    if let Some(ep) = config.endpoints.iter().find(|e| e.token == "passthrough") {
+        return Err(format!(
+            "endpoint '{}': token = \"passthrough\" is incompatible with [[clients]] — passthrough forwards the caller's auth headers upstream, which would leak client keys to {}",
+            ep.name,
+            ep.base_url.as_deref().unwrap_or("https://api.anthropic.com")
+        ));
+    }
+
+    let known = |name: &str| seen_names.contains(&name);
+    for (surface, name) in std::iter::empty()
+        .chain(config.client_budgets.keys().map(|k| ("client_budgets", k)))
+        .chain(
+            config
+                .client_utilization_limits
+                .keys()
+                .map(|k| ("client_utilization_limits", k)),
+        )
+        .chain(config.operators.iter().map(|k| ("operators", k)))
+        .chain(
+            config
+                .response_cache
+                .iter()
+                .flat_map(|rc| rc.clients.iter().map(|k| ("response_cache.clients", k))),
+        )
+    {
+        if !known(name) {
+            return Err(format!(
+                "{surface}: \"{name}\" names no configured [[clients]] entry"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Reject removed config keys with explicit errors. Run after the raw TOML
 /// has been parsed to a `toml::Value`, before strongly-typed deserialization.
 ///
@@ -11165,6 +11923,17 @@ fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
                 .to_string(),
         );
     }
+    // LAB-1083: `proxy_key` is the legacy single shared secret, `[[clients]]`
+    // its per-client replacement. Rejecting the combination rather than
+    // precedence-ordering it is deliberate — a silent winner between two
+    // authentication schemes is exactly the ambiguity that gets an operator's
+    // migration half-applied and the weaker one left in force.
+    if table.contains_key("proxy_key") && table.contains_key("clients") {
+        return Err(
+            "config: proxy_key and [[clients]] are mutually exclusive — [[clients]] supersedes it; remove proxy_key (see README §Authentication)"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -11186,6 +11955,9 @@ async fn main() {
         .unwrap_or_else(|e| panic!("config parse error: {e}"));
     if let Err(msg) = validate_endpoints(&config.endpoints) {
         panic!("{msg}");
+    }
+    if let Err(msg) = validate_clients(&config) {
+        panic!("config: {msg}");
     }
 
     // Set up tracing: stderr (info+) always, plus optional debug log file
@@ -11313,8 +12085,19 @@ async fn main() {
         })
         .collect();
 
-    if config.proxy_key.is_some() {
-        info!("proxy authentication enabled (x-api-key)");
+    if !config.clients.is_empty() {
+        let with_allowlist = config
+            .clients
+            .iter()
+            .filter(|c| !c.models.is_empty())
+            .count();
+        info!(
+            clients = config.clients.len(),
+            with_model_allowlist = with_allowlist,
+            "per-client authentication enabled — x-client-id is ignored, identity comes from the credential"
+        );
+    } else if config.proxy_key.is_some() {
+        warn!("legacy shared proxy_key in use — every caller shares one identity; migrate to [[clients]] (see README §Authentication)");
     } else {
         warn!("proxy authentication DISABLED — proxy is open to all");
     }
@@ -11462,6 +12245,7 @@ async fn main() {
         transport_cooldown: TRANSPORT_UNHEALTHY_COOLDOWN,
         state_path,
         proxy_key: config.proxy_key.clone(),
+        clients: config.clients.clone(),
         allowed_ips,
         client_names: config.client_names.clone(),
         auto_cache: config.auto_cache.unwrap_or(true),
@@ -11508,7 +12292,18 @@ async fn main() {
         session_registry_ttl_secs: config
             .session_registry_ttl_secs
             .unwrap_or(DEFAULT_SESSION_REGISTRY_TTL_SECS),
+        expose_upstream_ratelimit_headers: config
+            .expose_upstream_ratelimit_headers
+            .unwrap_or(false),
+        allowed_client_betas: config.allowed_client_betas.clone().unwrap_or_else(|| {
+            DEFAULT_CLIENT_BETA_ALLOWLIST
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        }),
+        beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
+        model_denied: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache,
     });

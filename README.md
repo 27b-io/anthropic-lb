@@ -86,7 +86,15 @@ listen = "127.0.0.1:8082"
 rate_limit_cooldown_secs = 60
 probe_interval_secs = 300
 
-# Proxy authentication (optional — omit for local / trusted-network use)
+# Authentication — per-client keys. The key IS the identity: the matched
+# entry's name becomes client_id, and x-client-id is ignored.
+# [[clients]]
+# name = "geo-pipeline"
+# key = "<openssl rand -hex 32>"
+# models = ["claude-sonnet-*", "claude-haiku-*"]  # optional; empty = all
+
+# LEGACY single shared secret. Mutually exclusive with [[clients]] —
+# configuring both fails startup. Omitting both leaves the proxy OPEN.
 # proxy_key = "your-secret-key-here"
 
 # IP allowlist (optional — omit to allow all source IPs)
@@ -148,8 +156,11 @@ token = "sk-ant-api03-..."
 | `listen` | `String` | — | Bind address (e.g. `"127.0.0.1:8082"`) |
 | `rate_limit_cooldown_secs` | `u64` | `60` | Seconds to cool down after 429 |
 | `probe_interval_secs` | `u64` | `300` | Seconds between utilization probes (0 = disabled) |
-| `proxy_key` | `String?` | `None` | Shared secret for proxy access |
-| `allowed_ips` | `[String]?` | `None` | IP/CIDR allowlist |
+| `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id` |
+| `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`) |
+| `clients[].models` | `[String]` | `[]` | Models this client may request (empty = all; `*` suffix wildcards) |
+| `proxy_key` | `String?` | `None` | **Legacy** shared secret. Mutually exclusive with `[[clients]]` |
+| `allowed_ips` | `[String]?` | `None` | IP/CIDR allowlist (unset = **allow all**) |
 | `auto_cache` | `bool` | `true` | Inject prompt caching beta header |
 | `shadow_log` | `String?` | `None` | Path to JSONL shadow log file |
 | `soft_limit` | `f64` | `0.90` | Utilization ceiling — accounts above are excluded from routing |
@@ -160,6 +171,8 @@ token = "sk-ant-api03-..."
 | `strategy` | `String` | `dynamic-capacity-v1` | Routing strategy (see note below) |
 | `emergency_threshold` | `f64` | `0.88` | Utilization threshold for emergency brake |
 | `redis_url` | `String?` | `None` | Redis/Valkey URL for distributed state |
+| `expose_upstream_ratelimit_headers` | `bool` | `false` | Reflect upstream `anthropic-ratelimit-*` headers to callers — they reveal the pooled capacity of every account, so enable on trusted networks only |
+| `allowed_client_betas` | `[String]?` | built-in list | Client `anthropic-beta` flags forwarded upstream on OAuth endpoints (`*` suffix wildcard); a configured list **replaces** the built-in default — copy the defaults alongside additions. Unlisted flags are dropped, logged, and counted (`anthropic_beta_flag_dropped_total`) so a caller can't activate arbitrary beta features against the operator's accounts |
 | `endpoints[].name` | `String` | — | Display name for the endpoint |
 | `endpoints[].protocol` | `String` | `"anthropic"` | `"anthropic"` (default) or `"openai"` |
 | `endpoints[].base_url` | `String?` | `https://api.anthropic.com` | Base URL; required and must be `https://` for `openai` |
@@ -167,6 +180,7 @@ token = "sk-ant-api03-..."
 | `endpoints[].models` | `[String]` | `[]` | Model allowlist (empty = all) |
 | `endpoints[].priority` | `u32` | `0` | Priority tier (lower tried first) |
 | `endpoints[].fable_included` | `bool` | `true` | Plan includes Fable band; set `false` for Pro / standard Team |
+| `endpoints[].allow_nonstandard_host` | `bool` | `false` | Allow an `anthropic` endpoint whose `base_url` host isn't `api.anthropic.com` — without it startup fails, because the endpoint token would be sent to that host |
 | `session_registry_max` | `usize` | `1000` | Max live-session entries tracked for `/_stats` `sessions` (0 = disabled) |
 | `session_registry_ttl_secs` | `u64` | `1800` | Seconds after a session's last request before its entry is evicted |
 
@@ -221,21 +235,59 @@ export ANTHROPIC_BASE_URL=http://localhost:8082
 
 Clients can use their own OAuth login (`claude login`) or set a dummy `ANTHROPIC_API_KEY` — either way the proxy strips client auth and injects the real account token.
 
-### Exposed to the Internet (with proxy_key)
+### Authenticated clients (`[[clients]]`)
 
-Set `proxy_key` in config. Clients send it as their API key:
+Give each caller its own key. The key **is** the identity:
+
+```toml
+[[clients]]
+name = "geo-pipeline"
+key = "<openssl rand -hex 32>"
+models = ["claude-sonnet-*", "claude-haiku-*"]   # optional; empty = all models
+
+[[clients]]
+name = "radar"
+key = "<openssl rand -hex 32>"
+```
 
 ```bash
 export ANTHROPIC_BASE_URL=https://your-proxy.example.com
-export ANTHROPIC_API_KEY=your-proxy-secret
+export ANTHROPIC_API_KEY=<that client's key>
 ```
 
+Claude Code sends it as `x-api-key`; the proxy validates it and swaps in the real account token, so no Anthropic credentials or OAuth login are needed on the client. `/v1/chat/completions` additionally accepts `Authorization: Bearer <key>`, since OpenAI SDKs send nothing else.
+
 > [!IMPORTANT]
-> Claude Code sends the proxy key as `x-api-key`. The proxy validates it and swaps in the real account token. No Anthropic credentials or OAuth login needed on the client.
+> With `[[clients]]` configured, **`x-client-id` and the `client_names` IP map are ignored entirely** — `client_id` comes from the verified credential. That is what makes per-client budgets, utilization ceilings, operator status, model allow-lists and response-cache tenancy enforceable rather than advisory: all five key on `client_id`.
+
+Keys are compared in constant time against the whole table. Startup rejects anything that would otherwise fail silently at runtime: duplicate names, duplicate keys, a name with stray whitespace, and any `client_budgets` / `client_utilization_limits` / `operators` / `[response_cache].clients` entry naming no configured client. That last class matters — an unknown client passes the budget and utilization checks, so a one-character typo would mean *unlimited* spend with no log line and no metric.
+
+`[[clients]]` is also incompatible with `token = "passthrough"` endpoints, and that combination is rejected at startup. Passthrough forwards the caller's auth headers upstream untouched, but under `[[clients]]` those headers carry the caller's *proxy* credential — forwarding them would hand every client key to the upstream.
+
+### Legacy shared secret (`proxy_key`)
+
+```toml
+proxy_key = "your-secret-key-here"
+```
+
+One secret for everyone, sent as `x-api-key`. It authenticates but does **not** identify — every caller presents the same string, so `client_id` still comes from the client-asserted `X-Client-ID` header and a per-client model allow-list would be defeated by editing one header.
+
+**Migration is a flag day, not a rolling cutover.** Setting both `proxy_key` and `[[clients]]` is rejected at startup with a named error rather than silently precedence-ordered — a half-applied migration cannot leave the weaker scheme quietly in force, but it also means there is no window where both credentials are accepted. Plan for it:
+
+1. Mint one key per caller and stage it wherever each caller reads its credential from.
+2. In a single config change, delete `proxy_key` and add the `[[clients]]` table; restart.
+3. Flip every caller to its own key in the same maintenance window. Anything still sending the old shared secret gets a `401` from the moment the new config is live.
+
+Keep the previous config to hand: rolling back is the same single-step swap in reverse.
+
+> [!WARNING]
+> Under `[[clients]]`, `/_stats` and `/metrics` require a credential too. If a Prometheus scrape, an uptime check, or a Kubernetes `httpGet` probe hits this proxy unauthenticated today, it will start returning `401` — give those callers a key in the same change, or a failing probe becomes a restart loop.
 
 ### Client Identification
 
-Clients are identified for usage tracking and budget enforcement:
+With `[[clients]]`: the authenticated principal's `name`. Full stop.
+
+Without it (legacy / open), identity is resolved from the request:
 
 1. **`X-Client-ID` header** — explicit, takes priority
 2. **`client_names` IP mapping** — fallback based on source IP
@@ -243,26 +295,60 @@ Clients are identified for usage tracking and budget enforcement:
 
 Per-client token usage and budget status appear in `/_stats`.
 
+### Per-client model allow-lists
+
+`clients[].models` restricts which models a client may request, using the same exact-match + `*`-suffix wildcard semantics as `endpoints[].models`. Empty or absent = all models allowed.
+
+A request for a model outside the list is rejected with **403** — a policy denial, distinct from the 429s that mean "capacity, try later" — and counted as `anthropic_client_model_denied_total{client,model}`. Operators bypass it, as they do every other gate check. The check sits in `pre_request_gate`, which both `/v1/messages` and `/v1/chat/completions` route through, so it covers both surfaces.
+
+It **fails closed** on a model it cannot read. The proxy takes the model from the top-level `model` key of a JSON body; a body that does not parse, or a route that nests the model elsewhere (`/v1/messages/batches` puts it under `requests[].params.model`), yields no model — and a client that has an allow-list is then denied rather than waved through. Clients with no allow-list are unaffected.
+
 ---
 
 ## Security
 
-Three layers, all optional — use what fits:
+> [!CAUTION]
+> **Every layer below is opt-in and OFF unless you configure it.** Unset `allowed_ips` means allow all; unset `clients` *and* `proxy_key` means no authentication at all. A default install accepts any request from any source. There is no default-deny.
 
-| Layer | Config | Effect |
-|:------|:-------|:-------|
-| **Listen binding** | `listen = "127.0.0.1:8082"` | Only accepts connections on that interface |
-| **IP allowlist** | `allowed_ips = ["100.64.0.0/10"]` | Rejects unlisted source IPs (403) |
-| **Proxy key** | `proxy_key = "secret"` | Requires `x-api-key` header match (401) |
+| Layer | Config | Effect | Unset behaviour |
+|:------|:-------|:-------|:----------------|
+| **Listen binding** | `listen = "127.0.0.1:8082"` | Only accepts connections on that interface | — (required) |
+| **IP allowlist** | `allowed_ips = ["100.64.0.0/10"]` | Rejects unlisted source IPs (403) | **allow all** |
+| **Per-client keys** | `[[clients]]` | Requires a per-client credential; identity = the credential (401) | **no auth** |
+| **Proxy key** (legacy) | `proxy_key = "secret"` | Requires a single shared `x-api-key` (401) | **no auth** |
+| **Model allow-list** | `clients[].models` | Rejects models outside a client's list (403) | all models |
 
-IP check runs first, then proxy key. Both apply to all endpoints including `/_stats`.
+IP check runs first, then the credential check. Both apply to every route including `/_stats` and `/metrics`. Credentials are compared in constant time.
 
-> [!WARNING]
-> With no `proxy_key` and no `allowed_ips`, the proxy is **open to all**. This is fine on a private network (VPN) or localhost, but never expose an open proxy to the internet.
+### Credential-path hardening (LAB-1191)
+
+The proxy forwards operator OAuth/API tokens upstream, so the paths a request
+can steer are locked down by default:
+
+- **Endpoint hosts are pinned.** An `anthropic`-protocol endpoint whose
+  `base_url` host isn't `api.anthropic.com` fails startup validation —
+  a typo'd or tampered URL would ship the account token to that host.
+  Deliberate mirrors opt in per endpoint with `allow_nonstandard_host = true`.
+- **Redirects are never followed.** The upstream HTTP client uses
+  `redirect::Policy::none()`; a `3xx` from an upstream surfaces to the caller
+  as a `502` with a distinct log line instead of re-sending credentials to
+  the `Location` target.
+- **Response headers are allow-listed.** Only `content-type`,
+  `content-length`, `cache-control`, `request-id`, and `retry-after` are
+  reflected to callers (plus the proxy's own `x-budget-status`).
+  `anthropic-ratelimit-*` (the pooled capacity of every account),
+  `set-cookie`, and org-identifying headers are stripped;
+  `expose_upstream_ratelimit_headers = true` restores the ratelimit
+  passthrough for trusted networks.
+- **Client beta flags are allow-listed.** On OAuth endpoints, client
+  `anthropic-beta` values outside `allowed_client_betas` are dropped before
+  forwarding, logged at `warn`, and counted in
+  `anthropic_beta_flag_dropped_total{flag}`.
 
 ### Known Limitations
 
-- **Client ID spoofing**: `x-client-id` header takes priority over IP-based `client_names` mapping. Any authenticated client can claim any identity, including operator names. This is acceptable because all clients are already inside the trust boundary (IP allowlist + proxy key). If you expose the proxy to untrusted networks, invert the priority in `resolve_client_id()`.
+- **`/_stats` and `/metrics` are not operator-gated**: any client holding *any* valid credential can read them, and `/_stats` exposes endpoint names and per-client usage. Restricting them to an operator principal is tracked separately.
+- **Client ID spoofing (legacy configs only)**: without `[[clients]]`, the `x-client-id` header takes priority over the `client_names` IP mapping, so any authenticated client can claim any identity — including an operator name, another client's budget, or another client's response-cache tenant. Configure `[[clients]]` to close this; it is the reason that mode exists.
 - **Emergency brake is model-blind**: The brake evaluates worst-case utilization across all model claims. If sonnet is exhausted but haiku has headroom, the brake blocks all traffic including haiku. This is intentional fail-safe behavior.
 
 ---
@@ -276,7 +362,9 @@ IP check runs first, then proxy key. Both apply to all endpoints including `/_st
 | `/_stats` | GET | JSON stats (utilization, tokens, budgets, live sessions) |
 | `/metrics` | GET | Prometheus-format metrics |
 
-All endpoints are gated by `proxy_key` and `allowed_ips` when configured.
+All endpoints are gated by `[[clients]]` (or legacy `proxy_key`) and
+`allowed_ips` when configured. Any valid client credential grants access to
+`/_stats` and `/metrics` — they are not operator-scoped (see Known Limitations).
 
 ### Session context-window visibility
 
@@ -306,6 +394,11 @@ long"* are additionally counted as `anthropic_prompt_too_long_total{model}`
 on `/metrics` and logged as a structured WARN with the redacted session
 label plus the observed-vs-max token counts parsed from the error message.
 The 400 itself is forwarded to the client unchanged.
+
+Requests rejected by a client's model allow-list are counted as
+`anthropic_client_model_denied_total{client,model}` and logged at WARN. The
+`model` label is caller-controlled, so it is bounded — overflow past 64
+distinct pairs buckets into `model="_other"`.
 
 ### OpenAI JSON-mode compatibility
 
@@ -578,16 +671,20 @@ store / error counters are exposed on `/metrics`, one series per endpoint
 (`anthropic_response_cache_*_total{surface="messages"}` and
 `{surface="count_tokens"}`).
 
-> [!WARNING]
-> **Allow-listed clients must mutually trust each other.** Client identity is
-> the client-asserted `x-client-id` header — the proxy's identity model is
-> trust-based (see [Security](#security)). Per-client encryption keys are
-> derived from that asserted identity, so any authenticated caller who
-> *presents* an opted-in client's ID can read that client's cached responses
-> (prompt content included). This is a *read* capability on top of the
-> pre-existing impersonation surface (budget-burning). Only opt in clients
-> that already share a trust domain, and treat the allow-list as one
-> confidentiality boundary, not N.
+> [!IMPORTANT]
+> **Cache isolation is only as strong as the identity it is keyed on.**
+> Per-client encryption keys are derived from `client_id`, so what that
+> derivation buys depends on where `client_id` comes from:
+>
+> - **With `[[clients]]`** (recommended): `client_id` is a verified principal,
+>   so the derivation is a real confidentiality boundary — N clients, N
+>   boundaries. Every name in `[response_cache].clients` must match a
+>   configured client, enforced at startup.
+> - **Without it** (legacy `proxy_key` / open): `client_id` is the
+>   client-asserted `x-client-id` header, so any authenticated caller who
+>   *presents* an opted-in client's ID reads that client's cached responses,
+>   prompt content included. In that mode the allow-list is **one** trust
+>   domain, not N — only opt in clients that already trust each other.
 
 > [!WARNING]
 > **Non-determinism caveat — opting in is consent to replay.** Sampling

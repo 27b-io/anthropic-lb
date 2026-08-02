@@ -45,14 +45,14 @@ Single Rust binary: all implementation in `src/main.rs` (~9800 lines) with secti
 ### Core Data Flow
 
 ```text
-Request → IP allowlist check → proxy_key auth → pre_request_gate(operator bypass → budget → utilization limit → emergency brake) → pick_endpoint(affinity, model, skip) → forward to endpoint → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
+Request → IP allowlist check → authenticate([[clients]] key, else legacy proxy_key) → resolve client_id (authenticated principal, else x-client-id/IP map) → pre_request_gate(operator bypass → model allow-list → budget → utilization limit → emergency brake) → pick_endpoint(affinity, model, skip) → forward to endpoint → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
 ```
 
 ### Key Sections (in source order)
 
 | Section | What it does |
 |---------|-------------|
-| **Config** (`Config`, `EndpointConfig`) | TOML deserialization structs |
+| **Config** (`Config`, `ClientConfig`, `EndpointConfig`) | TOML deserialization structs |
 | **Runtime state** (`AppState`, `Endpoint`, `RateLimitInfo`) | Shared via `Arc<AppState>`, per-endpoint `RwLock<RateLimitInfo>`, atomic counters, optional fred `RedisClient` (auto-reconnecting) |
 | **Persistence** (`PersistedState`) | JSON state file at `<config_path>.state.json`, saved after every request and on shutdown. Redis for cross-replica state when configured. |
 | **Token usage** (`TokenUsage`, `record_usage`) | Extracts token counts from responses (streaming SSE + non-streaming JSON), tracks per-endpoint and per-client |
@@ -125,7 +125,10 @@ Routing consequences (`constraining_7d_claims`):
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `listen` | string | required | Bind address (e.g. `"0.0.0.0:8080"`) |
-| `proxy_key` | string? | none | Shared secret for `x-api-key` auth |
+| `clients[].name` | string | required | Identity the credential resolves to — becomes `client_id`, overriding `x-client-id` and `client_names` entirely |
+| `clients[].key` | string | required | Per-client secret (`x-api-key`; also `Authorization: Bearer` on `/v1/chat/completions`). Constant-time compared |
+| `clients[].models` | string[]? | [] (all) | Models this client may request; same exact + `*`-suffix matcher as `endpoints[].models`. Violation = 403 |
+| `proxy_key` | string? | none | **Legacy** single shared secret for `x-api-key` auth. Mutually exclusive with `[[clients]]` — configuring both is rejected at startup |
 | `allowed_ips` | string[]? | none (allow all) | IP/CIDR allowlist |
 | `auto_cache` | bool? | true | Auto-inject prompt cache breakpoints |
 | `shadow_log` | string? | none | Path for JSONL audit trail |
@@ -133,7 +136,7 @@ Routing consequences (`constraining_7d_claims`):
 | `client_names` | map? | {} | IP→client name mapping |
 | `client_budgets` | map? | {} | client_id→daily token limit |
 | `client_utilization_limits` | map? | {} | client_id→utilization ceiling (0.0–1.0) |
-| `operators` | string[]? | [] | Client IDs that bypass budget, utilization, and emergency brake enforcement (trust-based, not IP-verified; does not bypass IP allowlist) |
+| `operators` | string[]? | [] | Client IDs that bypass the model allow-list, budget, utilization, and emergency brake enforcement (does not bypass IP allowlist). Under `[[clients]]` these name authenticated principals; without it, operator status is trust-based and forgeable |
 | `emergency_brake` | bool? | true | Enable/disable the emergency brake |
 | `emergency_threshold` | f64? | 0.88 | Utilization threshold for the emergency brake — applied only to `Protocol::Anthropic` endpoints; OpenAI endpoints (stub `RateLimitInfo`) are excluded so they cannot prevent the brake from firing |
 | `redis_url` | string? | none | Redis/Valkey URL for distributed state (`redis://` or `rediss://`) |
@@ -145,6 +148,9 @@ Routing consequences (`constraining_7d_claims`):
 | `endpoints[].models` | string[]? | [] (all) | Model allowlist (supports `*` suffix wildcards) |
 | `endpoints[].priority` | u32? | 0 | Priority tier (0 = highest). Lower tiers tried first |
 | `endpoints[].fable_included` | bool? | true | Plan includes Fable's 50%-of-weekly band. Set false for Pro / standard Team accounts: Fable requests demote the endpoint by `overage_penalty`; non-Fable routing unaffected |
+| `endpoints[].allow_nonstandard_host` | bool? | false | Allow an `anthropic` endpoint whose `base_url` host isn't `api.anthropic.com` (otherwise startup fails — token exfil guard, LAB-1191) |
+| `expose_upstream_ratelimit_headers` | bool? | false | Reflect upstream `anthropic-ratelimit-*` headers to callers (reveals pooled account capacity — trusted networks only, LAB-1191) |
+| `allowed_client_betas` | string[]? | built-in list | Client `anthropic-beta` flags forwarded on OAuth endpoints (`*` suffix wildcard); a configured list REPLACES the default (copy defaults alongside additions); unlisted flags dropped + logged + counted in `anthropic_beta_flag_dropped_total` (LAB-1191) |
 
 
 **Key headers parsed:**

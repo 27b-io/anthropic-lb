@@ -38,6 +38,9 @@ cachekit-rs = { version = "0.5", features = ["redis"] }
 # Same versions cachekit-rs already pins — zero marginal dependency weight.
 blake2 = "0.10"
 serde_bytes = "0.11"
+# Constant-time credential comparison (LAB-1083). Already in the tree via
+# cachekit-rs' AEAD stack — direct use costs no extra compile.
+subtle = "2.6"
 
 [dev-dependencies]
 tempfile = "3.25.0"
