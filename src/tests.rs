@@ -383,6 +383,7 @@ fn test_state_base() -> AppState {
             Duration::from_secs(DEFAULT_AUTH_FAILURE_WINDOW_SECS),
         ),
         auth_failures: Mutex::new(HashMap::new()),
+        open_admin_warn: Mutex::new(HashMap::new()),
         client_names: HashMap::new(),
         auto_cache: true,
         client_usage: Mutex::new(HashMap::new()),
@@ -18850,9 +18851,10 @@ fn auth_throttle_zero_limit_disables() {
 }
 
 /// AC-12: the map is keyed on an attacker-controlled IP, so it must stay
-/// bounded — capacity exceeded evicts the OLDEST window and memory stays flat.
+/// bounded. Among equal-threat (equal-count) entries the oldest window is
+/// evicted, and memory stays flat.
 #[test]
-fn auth_throttle_capacity_evicts_the_oldest_entry() {
+fn auth_throttle_capacity_evicts_the_least_established_entry() {
     let t = AuthThrottle::with_capacity(1, Duration::from_secs(60), 2);
     let first: IpAddr = "203.0.113.1".parse().unwrap();
     t.record_failure(first);
@@ -18863,8 +18865,63 @@ fn auth_throttle_capacity_evicts_the_oldest_entry() {
     assert_eq!(entries.len(), 2, "capacity must hold");
     assert!(
         !entries.contains_key(&first),
-        "the oldest window must be the one evicted"
+        "among equal-count entries the oldest window is evicted"
     );
+}
+
+/// AC-12 hardening: eviction must NOT be an attacker's escape hatch. A burst
+/// of fresh single-failure IPs must not evict an established lockout — else a
+/// guesser could flush its own throttle and resume. Established lockout
+/// (count >= max_failures) is preserved; the fresh count=1 floods evict each
+/// other.
+#[test]
+fn auth_throttle_capacity_preserves_an_established_lockout() {
+    let t = AuthThrottle::with_capacity(3, Duration::from_secs(60), 2);
+    let locked: IpAddr = "203.0.113.9".parse().unwrap();
+    for _ in 0..3 {
+        t.record_failure(locked); // count = 3 = max ⇒ actively throttled
+    }
+    assert!(t.check(&locked).is_some(), "lockout must be active");
+    // Flood fresh count=1 IPs well past capacity.
+    for i in 0..20u8 {
+        t.record_failure(IpAddr::from([198, 51, 100, i]));
+    }
+    assert!(
+        t.entries.lock().unwrap().contains_key(&locked),
+        "the established lockout must survive a flood of fresh failures"
+    );
+    assert!(t.check(&locked).is_some(), "and stay throttled");
+}
+
+/// Expired windows are purged before any live entry is evicted, so a table
+/// full of stale entries never forces out an active one.
+#[test]
+fn auth_throttle_capacity_purges_expired_before_evicting() {
+    let t = AuthThrottle::with_capacity(1, Duration::from_millis(20), 2);
+    t.record_failure("203.0.113.1".parse().unwrap());
+    t.record_failure("203.0.113.2".parse().unwrap());
+    std::thread::sleep(Duration::from_millis(30)); // both windows expire
+    let fresh: IpAddr = "203.0.113.3".parse().unwrap();
+    t.record_failure(fresh);
+    let entries = t.entries.lock().unwrap();
+    assert!(entries.contains_key(&fresh));
+    assert!(entries.len() <= 2, "expired entries purged, capacity held");
+}
+
+/// A successful authentication clears the IP's failure state, so a client's
+/// own sporadic typos never drift toward a lockout (bug-hunter/security
+/// finding: shared-IP false lockout mitigation).
+#[test]
+fn auth_throttle_clear_resets_failures() {
+    let t = AuthThrottle::new(3, Duration::from_secs(60));
+    let ip: IpAddr = "203.0.113.7".parse().unwrap();
+    t.record_failure(ip);
+    t.record_failure(ip);
+    t.clear(&ip);
+    // Back to zero: two fresh failures still under the limit.
+    t.record_failure(ip);
+    t.record_failure(ip);
+    assert_eq!(t.check(&ip), None, "clear must reset the counter to zero");
 }
 
 /// The throttle fires BEFORE the key comparison: once tripped, even the
@@ -18918,9 +18975,72 @@ async fn throttled_ip_gets_429_even_with_a_valid_key() {
         .expect("retry-after must be whole seconds");
     assert!((1..=60).contains(&retry));
 
-    // The counter recorded the three real failures (not the 429s) on the
-    // proxy route.
-    assert_eq!(state.auth_failures.lock().unwrap().get("proxy"), Some(&3));
+    // Counter = 3 rejected credentials + the 1 throttle-429 = 4. The 429 path
+    // is counted too, so the metric keeps climbing through a sustained attack
+    // instead of plateauing at the limit.
+    assert_eq!(state.auth_failures.lock().unwrap().get("proxy"), Some(&4));
+}
+
+/// Reset-on-success through the real router: a client that fails a couple of
+/// times, then authenticates successfully, is NOT throttled by those earlier
+/// failures — its state was cleared. Mitigates shared-IP false lockouts.
+#[tokio::test]
+async fn successful_auth_clears_prior_failures() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
+    acct.base_url = mock_url.to_string();
+    let state = Arc::new(AppState {
+        endpoints: vec![acct],
+        clients: vec![mk_client("geo", "key-geo", &[])],
+        auth_throttle: AuthThrottle::new(3, Duration::from_secs(60)),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state.clone())).await;
+    let client = Client::new();
+
+    // Two bad attempts (under the limit of 3).
+    for _ in 0..2 {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-api-key", "key-wrong")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    // A successful auth clears the two failures.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-geo")
+        .body(r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(
+        state
+            .auth_throttle
+            .check(&"127.0.0.1".parse().unwrap())
+            .is_none(),
+        "the client's own IP must not be throttled after a success reset it"
+    );
+}
+
+/// A dual-stack listener delivers IPv4 peers as `::ffff:a.b.c.d`; a v4
+/// `trusted_proxies` CIDR must still match after canonicalization, or XFF
+/// resolution silently no-ops behind the LB.
+#[test]
+fn resolve_client_ip_canonicalizes_v4_mapped_peer() {
+    let state = state_with_trusted_proxies(&["10.0.0.0/8"]);
+    let mapped_peer: IpAddr = "::ffff:10.1.2.3".parse().unwrap();
+    let resolved =
+        state.resolve_client_ip(mapped_peer, &hdrs(&[("x-forwarded-for", "198.51.100.99")]));
+    assert_eq!(
+        resolved,
+        "198.51.100.99".parse::<IpAddr>().unwrap(),
+        "v4-mapped trusted peer must be recognized so XFF is honoured"
+    );
 }
 
 /// `anthropic_auth_failures_total{route}` is scrape-visible (AC-11).
