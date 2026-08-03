@@ -17618,12 +17618,22 @@ mod redis_integration {
     /// flushing it. Returns None (with a SKIP notice) when the env var is
     /// unset; panics when it is set but the backend is unreachable.
     /// `db` must be unique per test — logical DBs are the isolation unit.
-    async fn redis_test_conn(db: u8) -> Option<redis::aio::ConnectionManager> {
+    ///
+    /// Returns a PAIR of clients on the same DB: the `redis`-crate connection
+    /// is the test's independent fixture/assertion client (deliberately NOT
+    /// the client under test), and the fred client is what goes into
+    /// `AppState.redis` — the production coordination path being verified.
+    async fn redis_test_conn(db: u8) -> Option<(redis::aio::ConnectionManager, RedisClient)> {
         let base = test_redis_url()?;
-        Some(connect_and_flush(&format!("{}/{db}", base.trim_end_matches('/'))).await)
+        let url = format!("{}/{db}", base.trim_end_matches('/'));
+        let conn = connect_and_flush(&url).await;
+        let fred = fred_test_client(&url).await;
+        Some((conn, fred))
     }
 
-    async fn connect_and_flush(url: &str) -> redis::aio::ConnectionManager {
+    /// Independent (redis-crate) connection WITHOUT flushing — for asserting
+    /// on state that must survive, e.g. after a backend recovery.
+    async fn connect(url: &str) -> redis::aio::ConnectionManager {
         let client = redis::Client::open(url)
             .unwrap_or_else(|e| panic!("{TEST_REDIS_ENV}: invalid url {url}: {e}"));
         // Short timeouts + a single retry: the failure-path tests kill the
@@ -17633,15 +17643,43 @@ mod redis_integration {
             .set_response_timeout(Some(Duration::from_secs(1)))
             .set_connection_timeout(Some(Duration::from_secs(2)))
             .set_number_of_retries(1);
-        let mut conn = client
+        client
             .get_connection_manager_with_config(cfg)
             .await
             .unwrap_or_else(|e| {
                 panic!("{TEST_REDIS_ENV} set but backend unreachable at {url}: {e}")
-            });
+            })
+    }
+
+    async fn connect_and_flush(url: &str) -> redis::aio::ConnectionManager {
+        let mut conn = connect(url).await;
         let flushed: redis::RedisResult<()> = redis::cmd("FLUSHDB").query_async(&mut conn).await;
         flushed.unwrap_or_else(|e| panic!("FLUSHDB failed on {url}: {e}"));
         conn
+    }
+
+    /// The client under test: a fred client configured like `connect` (short
+    /// budgets so failure-path tests observe errors in milliseconds) plus a
+    /// fast constant reconnect policy so the recovery test can watch
+    /// coordination resume without production-scale backoff.
+    async fn fred_test_client(url: &str) -> RedisClient {
+        let config = RedisConfig::from_url(url)
+            .unwrap_or_else(|e| panic!("{TEST_REDIS_ENV}: invalid url {url}: {e}"));
+        let perf = PerformanceConfig {
+            default_command_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let conn_config = ConnectionConfig {
+            connection_timeout: Duration::from_secs(2),
+            internal_command_timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let policy = ReconnectPolicy::new_constant(0, 100);
+        let client = RedisClient::new(config, Some(perf), Some(conn_config), Some(policy));
+        let _connect_handle = client.init().await.unwrap_or_else(|e| {
+            panic!("{TEST_REDIS_ENV} set but backend unreachable at {url}: {e}")
+        });
+        client
     }
 
     /// TCP forwarder in front of the real backend that can be killed
@@ -17649,7 +17687,17 @@ mod redis_integration {
     /// Killing aborts every live relay and drops the listener, so both
     /// in-flight commands and subsequent reconnect attempts fail.
     async fn spawn_killable_proxy(target: String) -> (String, tokio::sync::oneshot::Sender<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        spawn_killable_proxy_at("127.0.0.1:0", target).await
+    }
+
+    /// Same as `spawn_killable_proxy`, but at a caller-chosen address — used
+    /// to REVIVE a killed proxy at its old address so a reconnect policy can
+    /// find the backend again.
+    async fn spawn_killable_proxy_at(
+        bind: &str,
+        target: String,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -17680,14 +17728,10 @@ mod redis_integration {
         (format!("127.0.0.1:{}", addr.port()), kill_tx)
     }
 
-    /// Connection to the test backend routed through a killable proxy.
-    /// Same skip/panic contract as `redis_test_conn`.
-    async fn proxied_conn(
-        db: u8,
-    ) -> Option<(
-        redis::aio::ConnectionManager,
-        tokio::sync::oneshot::Sender<()>,
-    )> {
+    /// fred client (the client under test) routed through a killable proxy.
+    /// Same skip/panic contract as `redis_test_conn`. The DB is flushed via
+    /// the independent redis-crate client before the fred client connects.
+    async fn proxied_conn(db: u8) -> Option<(RedisClient, tokio::sync::oneshot::Sender<()>)> {
         let base = test_redis_url()?;
         let target = base
             .trim_start_matches("redis://")
@@ -17697,8 +17741,10 @@ mod redis_integration {
             .unwrap()
             .to_string();
         let (proxy_addr, kill) = spawn_killable_proxy(target).await;
-        let conn = connect_and_flush(&format!("redis://{proxy_addr}/{db}")).await;
-        Some((conn, kill))
+        let url = format!("redis://{proxy_addr}/{db}");
+        drop(connect_and_flush(&url).await);
+        let fred = fred_test_client(&url).await;
+        Some((fred, kill))
     }
 
     async fn kill_proxy(kill: tokio::sync::oneshot::Sender<()>) {
@@ -17718,13 +17764,10 @@ mod redis_integration {
         }
     }
 
-    fn state_with_redis(
-        endpoints: Vec<Endpoint>,
-        conn: redis::aio::ConnectionManager,
-    ) -> Arc<AppState> {
+    fn state_with_redis(endpoints: Vec<Endpoint>, client: RedisClient) -> Arc<AppState> {
         Arc::new(AppState {
             endpoints,
-            redis: Some(conn),
+            redis: Some(client),
             ..test_state_base()
         })
     }
@@ -17794,7 +17837,7 @@ mod redis_integration {
     /// nothing. Pairs with the pure `classify_hard_limit_*` unit tests.
     #[tokio::test]
     async fn sync_from_redis_merges_hard_limits_with_real_backend() {
-        let Some(mut conn) = redis_test_conn(1).await else {
+        let Some((mut conn, fred)) = redis_test_conn(1).await else {
             return;
         };
         let state = state_with_redis(
@@ -17805,7 +17848,7 @@ mod redis_integration {
                 make_endpoint("hl-remote-newer", Protocol::Anthropic),
                 make_endpoint("hl-absent", Protocol::Anthropic),
             ],
-            conn.clone(),
+            fred,
         );
 
         let now_epoch = AppState::now_epoch();
@@ -17907,7 +17950,7 @@ mod redis_integration {
     /// both directions, plus the absent-key case, against real MGET replies.
     #[tokio::test]
     async fn sync_from_redis_rate_info_most_recent_wins_both_directions() {
-        let Some(mut conn) = redis_test_conn(2).await else {
+        let Some((mut conn, fred)) = redis_test_conn(2).await else {
             return;
         };
         let state = state_with_redis(
@@ -17916,7 +17959,7 @@ mod redis_integration {
                 make_endpoint("ri-remote-older", Protocol::Anthropic),
                 make_endpoint("ri-absent", Protocol::Anthropic),
             ],
-            conn.clone(),
+            fred,
         );
         let now_epoch = AppState::now_epoch();
 
@@ -17970,7 +18013,7 @@ mod redis_integration {
     /// malformed and absent values touch nothing.
     #[tokio::test]
     async fn sync_from_redis_applies_published_routing_weights() {
-        let Some(mut conn) = redis_test_conn(3).await else {
+        let Some((mut conn, fred)) = redis_test_conn(3).await else {
             return;
         };
         let state = state_with_redis(
@@ -17980,7 +18023,7 @@ mod redis_integration {
                 make_endpoint("w-bad", Protocol::Anthropic),
                 make_endpoint("w-absent", Protocol::Anthropic),
             ],
-            conn.clone(),
+            fred,
         );
         for ep in &state.endpoints {
             ep.last_routing_weight
@@ -18027,10 +18070,10 @@ mod redis_integration {
     /// covered by the pure `classify_hard_limit_*` tests.
     #[tokio::test]
     async fn recovery_sentinel_cas_clears_stale_but_not_live_hard_limits() {
-        let Some(mut conn) = redis_test_conn(4).await else {
+        let Some((mut conn, fred)) = redis_test_conn(4).await else {
             return;
         };
-        let state = state_with_redis(vec![], conn.clone());
+        let state = state_with_redis(vec![], fred);
         let key = "alb:hard:cas-ep";
 
         // Absent key → sentinel written, with the sentinel TTL.
@@ -18084,19 +18127,19 @@ mod redis_integration {
     /// yesterday's spend invisible today.
     #[tokio::test]
     async fn budget_incrby_accumulates_across_replicas_with_expiry() {
-        let Some(mut conn) = redis_test_conn(5).await else {
+        let Some((mut conn, fred)) = redis_test_conn(5).await else {
             return;
         };
         avoid_utc_midnight().await;
         let budgets: HashMap<String, u64> = [("budget-cli".to_string(), 1000u64)].into();
         let replica_a = Arc::new(AppState {
             client_budgets: budgets.clone(),
-            redis: Some(conn.clone()),
+            redis: Some(fred.clone()),
             ..test_state_base()
         });
         let replica_b = Arc::new(AppState {
             client_budgets: budgets,
-            redis: Some(conn.clone()),
+            redis: Some(fred.clone()),
             ..test_state_base()
         });
 
@@ -18124,7 +18167,7 @@ mod redis_integration {
         // local usage of its own sees the shared counter and refuses.
         let enforcing = Arc::new(AppState {
             client_budgets: [("budget-cli".to_string(), 300u64)].into(),
-            redis: Some(conn.clone()),
+            redis: Some(fred.clone()),
             ..test_state_base()
         });
         assert_eq!(
@@ -18145,7 +18188,7 @@ mod redis_integration {
             .unwrap();
         let roll = Arc::new(AppState {
             client_budgets: [("roll-cli".to_string(), 100u64)].into(),
-            redis: Some(conn.clone()),
+            redis: Some(fred.clone()),
             ..test_state_base()
         });
         assert!(
@@ -18160,13 +18203,13 @@ mod redis_integration {
     /// errors.
     #[tokio::test]
     async fn budget_incrby_failure_deletes_key_and_local_fallback_enforces() {
-        let Some(mut conn) = redis_test_conn(6).await else {
+        let Some((mut conn, fred)) = redis_test_conn(6).await else {
             return;
         };
         avoid_utc_midnight().await;
         let state = Arc::new(AppState {
             client_budgets: [("poison-cli".to_string(), 100u64)].into(),
-            redis: Some(conn.clone()),
+            redis: Some(fred),
             ..test_state_base()
         });
         let today = AppState::now_epoch() / 86400;
@@ -18224,7 +18267,7 @@ mod redis_integration {
     /// undercounts. Budget MGET aggregation is asserted in the same pass.
     #[tokio::test]
     async fn cluster_info_counts_heartbeats_across_multiple_scan_pages() {
-        let Some(mut conn) = redis_test_conn(7).await else {
+        let Some((mut conn, fred)) = redis_test_conn(7).await else {
             return;
         };
         avoid_utc_midnight().await;
@@ -18245,7 +18288,7 @@ mod redis_integration {
 
         let state = Arc::new(AppState {
             client_budgets: [("scan-cli".to_string(), 1000u64)].into(),
-            redis: Some(conn.clone()),
+            redis: Some(fred),
             ..test_state_base()
         });
         let info = state.cluster_info().await.expect("cluster_info with redis");
@@ -18263,11 +18306,11 @@ mod redis_integration {
     /// the idle tick refresh the TTL.
     #[tokio::test]
     async fn flush_transport_errors_hincrby_accumulates_across_replicas() {
-        let Some(mut conn) = redis_test_conn(8).await else {
+        let Some((mut conn, fred)) = redis_test_conn(8).await else {
             return;
         };
-        let replica_a = state_with_redis(vec![], conn.clone());
-        let replica_b = state_with_redis(vec![], conn.clone());
+        let replica_a = state_with_redis(vec![], fred.clone());
+        let replica_b = state_with_redis(vec![], fred.clone());
         {
             let mut m = replica_a.lock_transport_errors();
             m.insert("connect", 3);
@@ -18323,10 +18366,10 @@ mod redis_integration {
     /// signal.
     #[tokio::test]
     async fn flush_transport_errors_requeues_deltas_when_redis_dies() {
-        let Some((conn, kill)) = proxied_conn(9).await else {
+        let Some((fred, kill)) = proxied_conn(9).await else {
             return;
         };
-        let state = state_with_redis(vec![], conn);
+        let state = state_with_redis(vec![], fred);
         {
             let mut m = state.lock_transport_errors();
             m.insert("reset", 4);
@@ -18345,22 +18388,22 @@ mod redis_integration {
     /// is held, and a different model probes under its own lock.
     #[tokio::test]
     async fn probe_lock_grants_one_replica_per_endpoint_model() {
-        let Some(mut conn) = redis_test_conn(10).await else {
+        let Some((mut conn, fred)) = redis_test_conn(10).await else {
             return;
         };
         let (mock_url, hits) = spawn_counting_upstream().await;
         let dir = tempfile::tempdir().unwrap();
 
-        let mk_replica = |file: &str, conn: redis::aio::ConnectionManager| {
+        let mk_replica = |file: &str, client: RedisClient| {
             Arc::new(AppState {
                 endpoints: vec![mk_endpoint_at("probe-ep", "sk-test", &mock_url)],
-                redis: Some(conn),
+                redis: Some(client),
                 state_path: dir.path().join(file),
                 ..test_state_base()
             })
         };
-        let replica_a = mk_replica("a.json", conn.clone());
-        let replica_b = mk_replica("b.json", conn.clone());
+        let replica_a = mk_replica("a.json", fred.clone());
+        let replica_b = mk_replica("b.json", fred.clone());
 
         replica_a.probe_endpoint(0, "claude-sonnet-4-5").await;
         assert_eq!(
@@ -18394,14 +18437,14 @@ mod redis_integration {
     /// probe proceeds anyway (a dead coordinator must not stop probing).
     #[tokio::test]
     async fn probe_lock_fails_open_when_redis_is_down() {
-        let Some((conn, kill)) = proxied_conn(11).await else {
+        let Some((fred, kill)) = proxied_conn(11).await else {
             return;
         };
         let (mock_url, hits) = spawn_counting_upstream().await;
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(AppState {
             endpoints: vec![mk_endpoint_at("failopen-ep", "sk-test", &mock_url)],
-            redis: Some(conn),
+            redis: Some(fred),
             state_path: dir.path().join("s.json"),
             ..test_state_base()
         });
@@ -18409,8 +18452,8 @@ mod redis_integration {
         // Prove the backend is actually dead before probing — otherwise a
         // silently-regressed kill_proxy would make hits==1 pass via the
         // lock-acquired path instead of the fail-open path.
-        let mut dead = state.redis.clone().unwrap();
-        let ping: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut dead).await;
+        let dead = state.redis.clone().unwrap();
+        let ping: Result<String, fred::error::RedisError> = dead.ping().await;
         assert!(ping.is_err(), "proxy kill must sever the redis connection");
         state.probe_endpoint(0, "claude-sonnet-4-5").await;
         assert_eq!(
@@ -18426,14 +18469,14 @@ mod redis_integration {
     /// cold-start absence case; this covers loss of an established backend.
     #[tokio::test]
     async fn backend_death_mid_run_degrades_to_local_only() {
-        let Some((conn, kill)) = proxied_conn(12).await else {
+        let Some((fred, kill)) = proxied_conn(12).await else {
             return;
         };
         avoid_utc_midnight().await;
         let state = Arc::new(AppState {
             endpoints: vec![make_endpoint("degrade-ep", Protocol::Anthropic)],
             client_budgets: [("degrade-cli".to_string(), 100u64)].into(),
-            redis: Some(conn),
+            redis: Some(fred),
             ..test_state_base()
         });
 
@@ -18468,6 +18511,95 @@ mod redis_integration {
         assert_eq!(
             info["redis_connected"], false,
             "cluster_info must surface the outage"
+        );
+    }
+
+    /// AC5 (LAB-932) — the one deliberate behaviour change of the fred
+    /// migration: after a backend outage degrades coordination to local-only,
+    /// the backend coming BACK must restore cross-replica coordination
+    /// without a process restart. The sibling test above proves graceful
+    /// degradation; this proves recovery. Under the old `redis`-crate client
+    /// the second half of this test would hang degraded forever.
+    #[tokio::test]
+    async fn backend_recovery_mid_run_resumes_coordination() {
+        let Some(base) = test_redis_url() else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let target = base
+            .trim_start_matches("redis://")
+            .trim_end_matches('/')
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let (proxy_addr, kill) = spawn_killable_proxy(target.clone()).await;
+        let url = format!("redis://{proxy_addr}/13");
+        drop(connect_and_flush(&url).await);
+        let fred = fred_test_client(&url).await;
+        // Independent assertion client, connected DIRECTLY to the backend
+        // (not through the killable proxy, and without flushing) so it can
+        // verify post-recovery writes actually landed.
+        let direct = connect(&format!("{}/13", base.trim_end_matches('/'))).await;
+
+        let state = Arc::new(AppState {
+            client_budgets: [("recover-cli".to_string(), 100u64)].into(),
+            redis: Some(fred),
+            ..test_state_base()
+        });
+
+        // Healthy first: the shared counter works through the proxy.
+        state.record_budget_usage("recover-cli", 50).await;
+        assert!(state.check_budget("recover-cli").await.is_ok());
+
+        kill_proxy(kill).await;
+
+        // Dead: INCRBY and its follow-up DEL both fail; the local accumulator
+        // (50+60=110) enforces the 100 budget.
+        state.record_budget_usage("recover-cli", 60).await;
+        assert_eq!(
+            state.check_budget("recover-cli").await,
+            Err(0),
+            "local fallback must enforce the budget while the backend is dead"
+        );
+
+        // Revive the backend at the SAME address. fred's reconnect policy
+        // must re-establish the connection on its own.
+        let (revived_addr, _revived_kill) = spawn_killable_proxy_at(&proxy_addr, target).await;
+        assert_eq!(
+            revived_addr, proxy_addr,
+            "proxy must revive at its old address"
+        );
+
+        // Coordination resumes: the shared counter (still 50 — the
+        // dead-window INCRBY failed, and so did its delete-on-failure)
+        // becomes authoritative again, flipping check_budget from the local
+        // Err(0) back to Ok.
+        eventually("coordination to resume after backend recovery", || {
+            let s = state.clone();
+            async move { s.check_budget("recover-cli").await.is_ok() }
+        })
+        .await;
+
+        // And writes flow again, verified through the independent direct
+        // connection: a fresh INCRBY lands in the real backend.
+        state.record_budget_usage("recover-cli", 7).await;
+        let today = AppState::now_epoch() / 86400;
+        let key = format!("alb:budget:recover-cli:{today}");
+        eventually("post-recovery INCRBY to land in the backend", || {
+            let mut c = direct.clone();
+            let key = key.clone();
+            async move { c.get::<_, Option<u64>>(&key).await.ok().flatten() == Some(57) }
+        })
+        .await;
+
+        let info = state
+            .cluster_info()
+            .await
+            .expect("cluster_info after recovery");
+        assert_eq!(
+            info["redis_connected"], true,
+            "cluster_info must reflect the recovered backend"
         );
     }
 }

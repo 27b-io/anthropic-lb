@@ -106,7 +106,7 @@ kill "$(cat /tmp/alb-test-redis.pid)"
 > (test job) and `.github/workflows/release.yml` (validate job). Neither
 > can ever skip the suite silently.
 
-Each test owns a dedicated logical DB (`SELECT 1`–`12`) because all `alb:*`
+Each test owns a dedicated logical DB (`SELECT 1`–`13`, one per test) because all `alb:*`
 coordination keys are hardcoded in production code and cannot be prefixed
 per-test. Failure-path tests route the connection through an in-test
 killable TCP proxy to simulate the backend dying mid-run.

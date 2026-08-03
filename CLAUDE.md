@@ -53,7 +53,7 @@ Request → IP allowlist check → authenticate([[clients]] key, else legacy pro
 | Section | What it does |
 |---------|-------------|
 | **Config** (`Config`, `ClientConfig`, `EndpointConfig`) | TOML deserialization structs |
-| **Runtime state** (`AppState`, `Endpoint`, `RateLimitInfo`) | Shared via `Arc<AppState>`, per-endpoint `RwLock<RateLimitInfo>`, atomic counters, optional Redis `ConnectionManager` |
+| **Runtime state** (`AppState`, `Endpoint`, `RateLimitInfo`) | Shared via `Arc<AppState>`, per-endpoint `RwLock<RateLimitInfo>`, atomic counters, optional fred `RedisClient` (auto-reconnecting) |
 | **Persistence** (`PersistedState`) | JSON state file at `<config_path>.state.json`, saved after every request and on shutdown. Redis for cross-replica state when configured. |
 | **Token usage** (`TokenUsage`, `record_usage`) | Extracts token counts from responses (streaming SSE + non-streaming JSON), tracks per-endpoint and per-client |
 | **Auto-cache** (`inject_cache_breakpoints`) | Injects up to 3 prompt cache breakpoints (last tool, system, last user message) unless cache_control already present |

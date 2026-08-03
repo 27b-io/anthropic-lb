@@ -6,6 +6,14 @@ use axum::{
     routing::any,
     Router,
 };
+use fred::{
+    clients::RedisClient,
+    interfaces::{ClientLike, EventInterface, HashesInterface, KeysInterface, LuaInterface},
+    types::{
+        ConnectionConfig, Expiration, PerformanceConfig, ReconnectPolicy, RedisConfig, RedisValue,
+        SetOptions,
+    },
+};
 use ipnet::IpNet;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -702,8 +710,10 @@ struct AppState {
     /// Utilization soft ceiling. Accounts above this are excluded from routing
     /// unless all candidates exceed it. Default: 0.90.
     soft_limit: f64,
-    /// Redis connection for distributed state. None = local-only (single instance).
-    redis: Option<redis::aio::ConnectionManager>,
+    /// Redis client for distributed state. None = local-only (single instance).
+    /// fred clients are cheap to clone; every clone shares one multiplexed
+    /// connection driven by a background task with a reconnect policy.
+    redis: Option<RedisClient>,
     /// Cached cluster info from Redis, updated by background sync task.
     cluster_info_cache: Mutex<Option<serde_json::Value>>,
     /// Monotonic request ID counter for log correlation.
@@ -2008,20 +2018,22 @@ impl AppState {
 
         // Distributed probe lock: one pod per endpoint+model per interval.
         if let Some(redis) = &self.redis {
-            let mut conn = redis.clone();
             let lock_key = format!("alb:probe:{}:{}", ep.name, model);
             let lock_ttl = self.probe_interval_secs.max(1);
-            let acquired: redis::RedisResult<bool> = redis::cmd("SET")
-                .arg(&lock_key)
-                .arg(1u8)
-                .arg("NX")
-                .arg("EX")
-                .arg(lock_ttl)
-                .query_async(&mut conn)
+            // SET NX EX: OK reply when acquired, nil (None) when another
+            // replica already holds the lock.
+            let acquired: Result<Option<String>, fred::error::RedisError> = redis
+                .set(
+                    lock_key.as_str(),
+                    1,
+                    Some(Expiration::EX(lock_ttl as i64)),
+                    Some(SetOptions::NX),
+                    false,
+                )
                 .await;
             match acquired {
-                Ok(true) => {} // Lock acquired, proceed with probe
-                Ok(false) => {
+                Ok(Some(_)) => {} // Lock acquired, proceed with probe
+                Ok(None) => {
                     trace!(
                         endpoint = ep.name,
                         probe_model = model,
@@ -2403,6 +2415,25 @@ const TRANSPORT_ERRORS_TTL_SECS: u64 = 172_800;
 /// 48h: a daily counter only needs to survive its own day plus enough slack
 /// for stats/aggregation to read yesterday; after two days it is garbage.
 const BUDGET_TTL_SECS: i64 = 172_800;
+
+/// Per-command budget for the coordination client (fred's
+/// `default_command_timeout`), carried over from the old ConnectionManager's
+/// 2s response timeout.
+const REDIS_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `SET key value EX ttl` — the one-line convenience the redis crate's
+/// `set_ex` provided; fred's five-argument `set` buries the common case in
+/// `None, false` noise at every call site.
+async fn redis_set_ex(
+    client: &RedisClient,
+    key: &str,
+    value: String,
+    ttl_secs: i64,
+) -> Result<(), fred::error::RedisError> {
+    client
+        .set(key, value, Some(Expiration::EX(ttl_secs)), None, false)
+        .await
+}
 
 /// Maximum request body size (25 MiB). Kept deliberately below Anthropic's own
 /// 32 MB Messages API request limit so multi-image/PDF payloads upstream would
@@ -3474,7 +3505,6 @@ impl AppState {
             Some(r) => r,
             None => return,
         };
-        use redis::AsyncCommands;
         let ttl = Self::routing_weight_publish_ttl(self.probe_interval_secs);
         let publish = |name: &str, weight: &AtomicU64, share: &AtomicU64, gate: &AtomicU64| {
             let w = f64::from_bits(weight.load(Ordering::Relaxed));
@@ -3482,10 +3512,9 @@ impl AppState {
             let g = f64::from_bits(gate.load(Ordering::Relaxed));
             let key = format!("alb:weight:{}", name);
             let val = format!("{w},{s},{g}");
-            let mut conn = redis.clone();
+            let conn = redis.clone();
             tokio::spawn(async move {
-                let result: redis::RedisResult<()> = conn.set_ex(&key, val, ttl).await;
-                if let Err(e) = result {
+                if let Err(e) = redis_set_ex(&conn, &key, val, ttl as i64).await {
                     tracing::warn!(error = %e, "redis routing weight publish failed");
                 }
             });
@@ -3524,14 +3553,13 @@ impl AppState {
     /// sentinel key is derived from the name alone.
     async fn signal_hard_limit_recovery(&self, endpoint_name: &str) {
         if let Some(redis) = &self.redis {
-            let mut conn = redis.clone();
+            let conn = redis.clone();
             let key = format!("alb:hard:{}", endpoint_name);
             let now_epoch = Self::now_epoch();
             // Lua CAS: only write the sentinel if the current value is absent,
             // already the sentinel, or an expired hard-limit (epoch <= now).
             // Rejects a concurrent mark_hard_limited write with epoch > now.
-            let script = redis::Script::new(
-                r#"
+            const RECOVERY_CAS_SCRIPT: &str = r#"
                 local current = redis.call('GET', KEYS[1])
                 if current == false then
                     return redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
@@ -3541,15 +3569,21 @@ impl AppState {
                     return redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
                 end
                 return 0
-                "#,
-            );
+                "#;
             tokio::spawn(async move {
-                let result: redis::RedisResult<redis::Value> = script
-                    .key(&key)
-                    .arg(HARD_LIMIT_CLEARED_SENTINEL)
-                    .arg(HARD_LIMIT_SENTINEL_TTL_SECS)
-                    .arg(now_epoch)
-                    .invoke_async(&mut conn)
+                // Args travel as decimal strings — byte-identical to the wire
+                // encoding the redis crate used, so the stored sentinel still
+                // parses as u64 on the sync_from_redis read side.
+                let result: Result<RedisValue, fred::error::RedisError> = conn
+                    .eval(
+                        RECOVERY_CAS_SCRIPT,
+                        vec![key],
+                        vec![
+                            HARD_LIMIT_CLEARED_SENTINEL.to_string(),
+                            HARD_LIMIT_SENTINEL_TTL_SECS.to_string(),
+                            now_epoch.to_string(),
+                        ],
+                    )
                     .await;
                 if let Err(e) = result {
                     tracing::warn!(error = %e, "redis sentinel write failed for hard-limit clear");
@@ -4131,13 +4165,11 @@ impl AppState {
                 .map(|r| r.saturating_sub(now_epoch).max(60))
                 .unwrap_or(3600); // default 1h if no reset known
 
-            let mut conn = redis.clone();
+            let conn = redis.clone();
             let key = format!("alb:rate:{}", endpoint_name);
             tokio::spawn(async move {
                 if let Ok(json) = serde_json::to_string(&rate_data) {
-                    use redis::AsyncCommands;
-                    let result: redis::RedisResult<()> = conn.set_ex(&key, json, ttl).await;
-                    if let Err(e) = result {
+                    if let Err(e) = redis_set_ex(&conn, &key, json, ttl as i64).await {
                         tracing::warn!(error = %e, "redis rate info write failed");
                     }
                 }
@@ -4232,17 +4264,16 @@ impl AppState {
 
         // Propagate to Redis for cross-replica awareness
         if let Some(redis) = &self.redis {
-            let mut conn = redis.clone();
+            let conn = redis.clone();
             let key = format!("alb:hard:{}", endpoint_name);
             let until_epoch = Self::now_epoch()
                 + cooldown.as_secs()
                 + if cooldown.subsec_nanos() > 0 { 1 } else { 0 };
             let ttl = cooldown.as_secs().max(1);
             tokio::spawn(async move {
-                use redis::AsyncCommands;
-                let result: redis::RedisResult<()> = conn.set_ex(&key, until_epoch, ttl).await;
-                if let Err(e) = result {
-                    tracing::warn!(error = %e, "redis SETEX failed for hard-limit propagation");
+                if let Err(e) = redis_set_ex(&conn, &key, until_epoch.to_string(), ttl as i64).await
+                {
+                    tracing::warn!(error = %e, "redis SET EX failed for hard-limit propagation");
                 }
             });
         }
@@ -4325,8 +4356,6 @@ impl AppState {
             Some(r) => r,
             None => return,
         };
-        use redis::AsyncCommands;
-        let mut conn = redis.clone();
         let now_epoch = Self::now_epoch();
         let now_instant = Instant::now();
 
@@ -4359,7 +4388,7 @@ impl AppState {
             .map(|t| format!("alb:hard:{}", t.name))
             .collect();
 
-        if let Ok(values) = conn.mget::<_, Vec<Option<String>>>(&hard_keys).await {
+        if let Ok(values) = redis.mget::<Vec<Option<String>>, _>(hard_keys).await {
             for (i, remote) in values.into_iter().enumerate() {
                 let remote = remote.and_then(|value| value.parse::<u64>().ok());
                 match classify_hard_limit_sync(remote, now_epoch, now_instant) {
@@ -4401,7 +4430,7 @@ impl AppState {
             .map(|t| format!("alb:rate:{}", t.name))
             .collect();
 
-        if let Ok(values) = conn.mget::<_, Vec<Option<String>>>(&rate_keys).await {
+        if let Ok(values) = redis.mget::<Vec<Option<String>>, _>(rate_keys).await {
             for (i, val) in values.iter().enumerate() {
                 if let Some(json) = val {
                     if let Ok(remote) = serde_json::from_str::<RedisRateInfo>(json) {
@@ -4449,7 +4478,7 @@ impl AppState {
             .iter()
             .map(|t| format!("alb:weight:{}", t.name))
             .collect();
-        if let Ok(values) = conn.mget::<_, Vec<Option<String>>>(&weight_keys).await {
+        if let Ok(values) = redis.mget::<Vec<Option<String>>, _>(weight_keys).await {
             for (i, val) in values.iter().enumerate() {
                 if let Some(csv) = val {
                     let mut parts = csv.splitn(3, ',');
@@ -4592,11 +4621,8 @@ impl AppState {
             // window; skipping this would wipe the fleet-wide counter after
             // 48h of perfectly healthy, error-free traffic. EXPIRE on a
             // not-yet-existing key is a no-op, so this is safe pre-first-error.
-            let mut conn = redis.clone();
-            let result: redis::RedisResult<()> = redis::cmd("EXPIRE")
-                .arg(TRANSPORT_ERRORS_KEY)
-                .arg(TRANSPORT_ERRORS_TTL_SECS)
-                .query_async(&mut conn)
+            let result: Result<(), fred::error::RedisError> = redis
+                .expire(TRANSPORT_ERRORS_KEY, TRANSPORT_ERRORS_TTL_SECS as i64)
                 .await;
             if let Err(e) = result {
                 warn!(error = %e, "redis EXPIRE failed for transport-errors TTL refresh");
@@ -4604,23 +4630,20 @@ impl AppState {
             return;
         }
 
-        // One round-trip: HINCRBY every kind, then refresh the TTL. Low-level
-        // cmd/arg form so this does not depend on generated fluent pipe methods.
-        let mut conn = redis.clone();
-        let mut pipe = redis::pipe();
+        // One round-trip: HINCRBY every kind, then refresh the TTL. fred
+        // pipeline commands resolve immediately when queued; `all()` sends the
+        // batch and surfaces the first error, matching the old atomic
+        // success-or-requeue contract.
+        let pipe = redis.pipeline();
         for (kind, n) in &deltas {
-            pipe.cmd("HINCRBY")
-                .arg(TRANSPORT_ERRORS_KEY)
-                .arg(*kind)
-                .arg(*n)
-                .ignore();
+            let _: Result<(), fred::error::RedisError> =
+                pipe.hincrby(TRANSPORT_ERRORS_KEY, *kind, *n as i64).await;
         }
-        pipe.cmd("EXPIRE")
-            .arg(TRANSPORT_ERRORS_KEY)
-            .arg(TRANSPORT_ERRORS_TTL_SECS)
-            .ignore();
+        let _: Result<(), fred::error::RedisError> = pipe
+            .expire(TRANSPORT_ERRORS_KEY, TRANSPORT_ERRORS_TTL_SECS as i64)
+            .await;
 
-        let result: redis::RedisResult<()> = pipe.query_async(&mut conn).await;
+        let result: Result<Vec<RedisValue>, fred::error::RedisError> = pipe.all().await;
         if let Err(e) = result {
             // Redis is unreachable (or the pipeline reply was lost) — return the
             // drained deltas to the local accumulator so error signal is not
@@ -4642,27 +4665,41 @@ impl AppState {
     }
     async fn cluster_info(&self) -> Option<serde_json::Value> {
         let redis = self.redis.as_ref()?;
-        use redis::AsyncCommands;
-        let mut conn = redis.clone();
         let mut redis_ok = true;
 
-        // Count active replicas via SCAN (non-blocking, unlike KEYS)
+        // Count active replicas via SCAN (non-blocking, unlike KEYS). The
+        // cursor is driven manually as a plain command per page — NOT via
+        // fred's scan stream. The stream's pages arrive over a channel that
+        // `default_command_timeout` does not cover, and abandoning the stream
+        // does not stop the scan: `ScanResult`'s Drop impl auto-requests the
+        // next page with nobody listening, so every abandoned scan keeps
+        // walking the keyspace against a backend that is already slow. A
+        // manual cursor loop keeps each page under the ordinary 2s command
+        // budget and genuinely ends the scan when this function returns.
         let mut replicas = 0u64;
-        let mut cursor: u64 = 0;
+        let mut cursor = String::from("0");
         loop {
-            let result: redis::RedisResult<(u64, Vec<String>)> = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg("alb:heartbeat:*")
-                .arg("COUNT")
-                .arg(100)
-                .query_async(&mut conn)
+            let result: Result<(String, Vec<String>), fred::error::RedisError> = redis
+                .custom(
+                    fred::types::CustomCommand::new_static(
+                        "SCAN",
+                        fred::types::ClusterHash::FirstKey,
+                        false,
+                    ),
+                    vec![
+                        cursor,
+                        "MATCH".to_string(),
+                        "alb:heartbeat:*".to_string(),
+                        "COUNT".to_string(),
+                        "100".to_string(),
+                    ],
+                )
                 .await;
             match result {
                 Ok((next_cursor, keys)) => {
                     replicas += keys.len() as u64;
                     cursor = next_cursor;
-                    if cursor == 0 {
+                    if cursor == "0" {
                         break;
                     }
                 }
@@ -4683,7 +4720,7 @@ impl AppState {
                 .iter()
                 .map(|id| format!("alb:budget:{id}:{today}"))
                 .collect();
-            match conn.mget::<_, Vec<Option<u64>>>(&budget_keys).await {
+            match redis.mget::<Vec<Option<u64>>, _>(budget_keys).await {
                 Ok(values) => {
                     for (i, client_id) in client_ids.iter().enumerate() {
                         let used = values.get(i).copied().flatten().unwrap_or(0);
@@ -4707,8 +4744,8 @@ impl AppState {
         // handler to fall back to this replica's local accumulator.
         let mut transport_errors: Option<serde_json::Map<String, serde_json::Value>> = None;
         if redis_ok {
-            match conn
-                .hgetall::<_, HashMap<String, u64>>(TRANSPORT_ERRORS_KEY)
+            match redis
+                .hgetall::<HashMap<String, u64>, _>(TRANSPORT_ERRORS_KEY)
                 .await
             {
                 Ok(map) => {
@@ -5640,17 +5677,24 @@ impl AppState {
         };
         let today = Self::now_epoch() / 86400;
 
-        // Try Redis first for cross-replica budget enforcement
+        // Try Redis first for cross-replica budget enforcement. The
+        // is_connected gate matters on this request-path call: while fred is
+        // reconnecting it BUFFERS commands until default_command_timeout
+        // instead of erroring, so without the gate a sustained outage would
+        // add ~2s to every budgeted request. Known-down transport skips
+        // straight to local enforcement at the old client's speed.
         if let Some(redis) = &self.redis {
-            use redis::AsyncCommands;
-            let key = format!("alb:budget:{client_id}:{today}");
-            let mut conn = redis.clone();
-            match conn.get::<_, Option<u64>>(&key).await {
-                Ok(Some(used)) if used >= limit => return Err(0),
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    warn!(error = %e, "redis budget check failed, falling back to local");
+            if redis.is_connected() {
+                let key = format!("alb:budget:{client_id}:{today}");
+                match redis.get::<Option<u64>, _>(key.as_str()).await {
+                    Ok(Some(used)) if used >= limit => return Err(0),
+                    Ok(_) => return Ok(()),
+                    Err(e) => {
+                        warn!(error = %e, "redis budget check failed, falling back to local");
+                    }
                 }
+            } else {
+                trace!("redis disconnected, budget check falling back to local");
             }
         }
 
@@ -5683,16 +5727,26 @@ impl AppState {
             entry.1 += tokens;
         }
 
-        // Await Redis INCRBY (not fire-and-forget) so check_budget always sees latest counter
+        // Await Redis INCRBY (not fire-and-forget) so check_budget always sees
+        // latest counter. Same is_connected rationale as check_budget: this
+        // runs on the request path, and a reconnecting fred client would
+        // buffer the INCRBY (and the follow-up DEL on its error branch) for
+        // 2s each instead of failing fast. Skipping while down is equivalent
+        // to the old attempt-and-fail: local state above is already updated,
+        // and the DEL that failure would trigger could not reach the backend
+        // either.
         if let Some(redis) = &self.redis {
-            use redis::AsyncCommands;
-            let mut conn = redis.clone();
+            if !redis.is_connected() {
+                trace!("redis disconnected, budget INCRBY skipped (local state updated)");
+                return;
+            }
             let key = format!("alb:budget:{client_id}:{today}");
-            let result: redis::RedisResult<u64> = conn.incr(&key, tokens).await;
+            let result: Result<u64, fred::error::RedisError> =
+                redis.incr_by(key.as_str(), tokens as i64).await;
             match result {
                 Ok(_) => {
-                    let expire_result: redis::RedisResult<bool> =
-                        conn.expire(&key, BUDGET_TTL_SECS).await;
+                    let expire_result: Result<bool, fred::error::RedisError> =
+                        redis.expire(key.as_str(), BUDGET_TTL_SECS).await;
                     if let Err(e) = expire_result {
                         tracing::warn!(error = %e, "redis EXPIRE failed for budget key");
                     }
@@ -5700,7 +5754,7 @@ impl AppState {
                 Err(e) => {
                     // Delete stale key so check_budget falls through to local state
                     tracing::warn!(error = %e, "redis INCRBY failed, deleting stale budget key");
-                    let _: redis::RedisResult<()> = conn.del(&key).await;
+                    let _: Result<(), fred::error::RedisError> = redis.del(key.as_str()).await;
                 }
             }
         }
@@ -12087,17 +12141,44 @@ async fn main() {
         None
     };
 
-    // Set up Redis connection for distributed state (if configured)
+    // Set up Redis connection for distributed state (if configured).
+    // Timeout budgets carry over from the old ConnectionManager: 2s per
+    // command, 5s to establish a connection. `fail_fast` (fred's default)
+    // preserves the startup contract — an unreachable backend degrades to
+    // local-only rather than aborting or retrying forever. The reconnect
+    // policy is the one deliberate behaviour change (LAB-932 AC5): once the
+    // initial connect succeeds, a mid-run outage reconnects with capped
+    // exponential backoff instead of degrading permanently until restart.
     let redis = if let Some(ref url) = config.redis_url {
-        match redis::Client::open(url.as_str()) {
-            Ok(client) => {
-                let mgr_config = redis::aio::ConnectionManagerConfig::new()
-                    .set_response_timeout(Some(Duration::from_secs(2)))
-                    .set_connection_timeout(Some(Duration::from_secs(5)));
-                match client.get_connection_manager_with_config(mgr_config).await {
-                    Ok(mgr) => {
+        match RedisConfig::from_url(url.as_str()) {
+            Ok(redis_config) => {
+                let perf = PerformanceConfig {
+                    default_command_timeout: REDIS_COMMAND_TIMEOUT,
+                    ..Default::default()
+                };
+                let conn_config = ConnectionConfig {
+                    connection_timeout: Duration::from_secs(5),
+                    internal_command_timeout: Duration::from_secs(5),
+                    ..Default::default()
+                };
+                // 0 = retry forever; delays 100ms → 30s, doubling.
+                let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
+                let client =
+                    RedisClient::new(redis_config, Some(perf), Some(conn_config), Some(policy));
+                // Reconnect transitions are sparse, high-signal events; log
+                // them so a flapping backend is visible in operator logs.
+                client.on_reconnect(|server| {
+                    info!(%server, "redis reconnected for distributed state");
+                    Ok(())
+                });
+                // init() spawns the connection task and waits for the first
+                // connect. The returned handle detaches on drop; the task
+                // keeps driving the connection (and reconnects) for the
+                // lifetime of the client.
+                match client.init().await {
+                    Ok(_connect_handle) => {
                         info!("redis connected for distributed state");
-                        Some(mgr)
+                        Some(client)
                     }
                     Err(e) => {
                         warn!(error = %e, "redis connection failed — running in local-only mode");
@@ -12335,11 +12416,8 @@ async fn main() {
                 sync_state.sync_from_redis().await;
                 // Heartbeat: register this instance
                 if let Some(redis) = &sync_state.redis {
-                    use redis::AsyncCommands;
-                    let mut conn = redis.clone();
                     let key = format!("alb:heartbeat:{instance_id}");
-                    let _: redis::RedisResult<()> =
-                        conn.set_ex(&key, AppState::now_epoch(), 30u64).await;
+                    let _ = redis_set_ex(redis, &key, AppState::now_epoch().to_string(), 30).await;
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
