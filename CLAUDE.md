@@ -24,6 +24,23 @@ cargo llvm-cov                       # Coverage report (requires cargo-llvm-cov)
 
 Run the proxy: `./target/release/anthropic-lb config.toml`
 
+## Releases (release-please)
+
+Versioning is automated by release-please (`release-please.yml` +
+`release-please-config.json`): it maintains a rolling release PR from
+**conventional commits**, and merging that PR tags `vX.Y.Z`, which triggers
+the build/crates.io (`release.yml`) and image (`docker.yml`) workflows.
+
+- **PR titles must be conventional commits** — the repo squash-merges, so the
+  PR title becomes the commit release-please parses. Use `feat: ...`,
+  `fix: ...`, `feat!: ...` etc.; ticket refs go in the scope or after the
+  prefix (e.g. `fix(LAB-932): ...`). Non-conventional titles are invisible to
+  release-please and produce no release.
+- **Pre-1.0 is pinned**: breaking changes bump the minor (never to 1.0.0),
+  features bump the patch, and 0.x GitHub releases are flagged pre-release.
+  Publishing 1.0.0 is an explicit human act via a `Release-As: 1.0.0` commit
+  footer.
+
 ## Deployment
 
 Deployed via GitOps to internal Kubernetes clusters as a multi-replica

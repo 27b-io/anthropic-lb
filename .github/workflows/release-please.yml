@@ -1,0 +1,39 @@
+# Release automation: release-please maintains a rolling release PR (version
+# bump in Cargo.toml/Cargo.lock + CHANGELOG.md) from conventional commits.
+# Merging that PR creates the vX.Y.Z tag + GitHub release, which triggers
+# release.yml (build + crates.io publish) and docker.yml (image push).
+#
+# Pre-1.0 pinning (release-please-config.json):
+#   bump-minor-pre-major          — feat!/BREAKING bumps 0.x minor, never to 1.0.0
+#   bump-patch-for-minor-pre-major — feat: bumps patch, so minor bumps = breaking
+#   prerelease                    — 0.x GitHub releases are flagged "Pre-release"
+# Releasing 1.0.0 is an explicit act: land a commit with a "Release-As: 1.0.0"
+# footer (and drop the two bump-* options afterwards).
+#
+# Uses a stev3-bot App token instead of GITHUB_TOKEN because tags created with
+# the default token do not trigger other workflows — release.yml would
+# silently never run.
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate stev3-bot token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: Iv23lieFLYEGsNrjeOYu
+          private-key: ${{ secrets.STEV3_BOT_PEM }}
+
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
