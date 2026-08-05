@@ -24,6 +24,25 @@ cargo llvm-cov                       # Coverage report (requires cargo-llvm-cov)
 
 Run the proxy: `./target/release/anthropic-lb config.toml`
 
+## Releases (release-please)
+
+Releases are automated by release-please (`release-please.yml` +
+`release-please-config.json`); merging its rolling release PR tags `vX.Y.Z`,
+which triggers `release.yml` (build + crates.io) and `docker.yml`.
+
+- **Squash-merge titles must be conventional commits** — `feat: ...`,
+  `fix: ...`, `feat!: ...`; ticket refs go in the scope (e.g.
+  `fix(LAB-932): ...`). Non-conventional subjects are invisible to
+  release-please and produce no release. Caveat: with the repo's current
+  merge settings the squash subject can come from the *commit* title
+  (single-commit PRs) rather than the PR title — make both conventional.
+- **Pre-1.0 is pinned**: breaking changes bump the minor (never to 1.0.0),
+  features bump the patch, and 0.x GitHub releases are flagged pre-release.
+- **Releasing 1.0.0** is an explicit human act: land a commit with a
+  `Release-As: 1.0.0` footer, then drop `bump-minor-pre-major` and
+  `bump-patch-for-minor-pre-major` from `release-please-config.json`
+  (`prerelease: true` is inert at major ≥ 1 and can stay).
+
 ## Deployment
 
 Deployed via GitOps to internal Kubernetes clusters as a multi-replica
