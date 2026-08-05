@@ -1,0 +1,35 @@
+# Release automation — mechanism, pre-1.0 pinning, and the 1.0.0 runbook are
+# documented in CLAUDE.md ("Releases").
+#
+# Uses a stev3-bot App token instead of GITHUB_TOKEN because tags created with
+# the default token do not trigger other workflows — release.yml would
+# silently never run.
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release-please
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate stev3-bot token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: Iv23lieFLYEGsNrjeOYu
+          private-key: ${{ secrets.STEV3_BOT_PEM }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
