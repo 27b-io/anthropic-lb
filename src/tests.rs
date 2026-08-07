@@ -377,6 +377,13 @@ fn test_state_base() -> AppState {
         proxy_key: None,
         clients: vec![],
         allowed_ips: vec![],
+        trusted_proxies: vec![],
+        auth_throttle: AuthThrottle::new(
+            DEFAULT_AUTH_FAILURE_LIMIT,
+            Duration::from_secs(DEFAULT_AUTH_FAILURE_WINDOW_SECS),
+        ),
+        auth_failures: Mutex::new(HashMap::new()),
+        open_admin_warn: Mutex::new(HashMap::new()),
         client_names: HashMap::new(),
         auto_cache: true,
         client_usage: Mutex::new(HashMap::new()),
@@ -16921,14 +16928,16 @@ async fn all_four_auth_sites_reject_an_unknown_key() {
             reqwest::StatusCode::UNAUTHORIZED,
             "{path} accepted an unknown key"
         );
-        // …and the right one still works.
+        // …and the right one is recognized — but 403, not 200: the admin
+        // surfaces are operator-only since LAB-1192 and `geo` is a plain
+        // client. The operator 200 path is covered by the AC-6 matrix tests.
         let resp = client
             .get(format!("http://{addr}{path}"))
             .header("x-api-key", "key-geo")
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{path}");
+        assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN, "{path}");
     }
 
     let resp = client
@@ -16971,13 +16980,23 @@ async fn all_four_auth_sites_reject_an_unknown_key() {
 }
 
 /// AC-11: the denial counter reaches /metrics under its documented name.
+/// The scrape presents an OPERATOR credential — /metrics is operator-only
+/// since LAB-1192.
 #[tokio::test]
 async fn metrics_exposes_the_model_denial_counter() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, state) = authed_app(
-        &mock_url,
-        vec![mk_client("limited", "key-limited", &["claude-haiku-*"])],
-    );
+    let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
+    acct.base_url = mock_url.to_string();
+    let state = Arc::new(AppState {
+        endpoints: vec![acct],
+        clients: vec![
+            mk_client("limited", "key-limited", &["claude-haiku-*"]),
+            mk_client("ops", "key-ops", &[]),
+        ],
+        operators: vec!["ops".to_string()],
+        ..test_state_base()
+    });
+    let app = build_router(state.clone());
     assert!(state
         .pre_request_gate("limited", "claude-opus-5")
         .await
@@ -16986,7 +17005,7 @@ async fn metrics_exposes_the_model_denial_counter() {
     let addr = serve(app).await;
     let body = Client::new()
         .get(format!("http://{addr}/metrics"))
-        .header("x-api-key", "key-limited")
+        .header("x-api-key", "key-ops")
         .send()
         .await
         .unwrap()
@@ -18602,4 +18621,587 @@ mod redis_integration {
             "cluster_info must reflect the recovered backend"
         );
     }
+}
+
+// ── LAB-1192: exposure controls ─────────────────────────────────
+//
+// Four mechanisms, one posture: unauthenticated is a boot failure not a
+// default (AC-1..3), the admin surfaces answer only to an operator
+// principal (AC-4..6), behind a trusted load balancer the proxy resolves
+// the real client IP or refuses to guess (AC-7..9), and credential
+// guessing is throttled per client IP with bounded state (AC-11..12).
+
+// ── AC-3: startup posture ──
+
+/// 64-hex — what `openssl rand -hex 32` emits, and the documented floor.
+const STRONG_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[test]
+fn exposure_rejects_a_credential_free_config_by_default() {
+    let err = validate_exposure(&cfg("")).unwrap_err();
+    assert!(
+        err.contains("allow_unauthenticated"),
+        "error must name the escape hatch: {err}"
+    );
+    assert!(
+        err.contains("[[clients]]"),
+        "error must name the credential fix: {err}"
+    );
+}
+
+#[test]
+fn exposure_accepts_the_explicit_escape_hatch() {
+    assert!(validate_exposure(&cfg("allow_unauthenticated = true\n")).is_ok());
+    // `false` is NOT an escape hatch — omission and explicit false are the
+    // same default-deny.
+    assert!(validate_exposure(&cfg("allow_unauthenticated = false\n")).is_err());
+}
+
+#[test]
+fn exposure_accepts_either_credential_form() {
+    assert!(validate_exposure(&cfg(&format!("proxy_key = \"{STRONG_KEY}\"\n"))).is_ok());
+    assert!(validate_exposure(&cfg(&format!(
+        "[[clients]]\nname = \"geo\"\nkey = \"{STRONG_KEY}\"\n"
+    )))
+    .is_ok());
+}
+
+#[test]
+fn exposure_rejects_the_flag_alongside_credentials() {
+    let err = validate_exposure(&cfg(&format!(
+        "allow_unauthenticated = true\nproxy_key = \"{STRONG_KEY}\"\n"
+    )))
+    .unwrap_err();
+    assert!(err.contains("incompatible"), "{err}");
+    let err = validate_exposure(&cfg(&format!(
+        "allow_unauthenticated = true\n[[clients]]\nname = \"geo\"\nkey = \"{STRONG_KEY}\"\n"
+    )))
+    .unwrap_err();
+    assert!(err.contains("incompatible"), "{err}");
+}
+
+/// AC-13: every configured credential form is held to the 32-char floor, and
+/// the error carries the generation command.
+#[test]
+fn exposure_rejects_short_credentials_with_the_generation_command() {
+    for fragment in [
+        "proxy_key = \"short\"\n".to_string(),
+        "[[clients]]\nname = \"geo\"\nkey = \"short\"\n".to_string(),
+        // 31 chars — one under the floor, so the boundary is pinned.
+        format!("proxy_key = \"{}\"\n", "a".repeat(31)),
+    ] {
+        let err = validate_exposure(&cfg(&fragment)).unwrap_err();
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "error must carry the generation command: {err}"
+        );
+    }
+    // 32 exactly passes.
+    assert!(validate_exposure(&cfg(&format!("proxy_key = \"{}\"\n", "a".repeat(32)))).is_ok());
+}
+
+#[test]
+fn exposure_rejects_a_zero_window_with_the_throttle_enabled() {
+    let err = validate_exposure(&cfg(&format!(
+        "proxy_key = \"{STRONG_KEY}\"\nauth_failure_window_secs = 0\n"
+    )))
+    .unwrap_err();
+    assert!(err.contains("auth_failure_window_secs"), "{err}");
+    // Explicitly disabled throttle: a zero window is fine because it is never read.
+    assert!(validate_exposure(&cfg(&format!(
+        "proxy_key = \"{STRONG_KEY}\"\nauth_failure_limit = 0\nauth_failure_window_secs = 0\n"
+    )))
+    .is_ok());
+}
+
+// ── AC-9: real client IP behind a trusted proxy ──
+
+fn state_with_trusted_proxies(cidrs: &[&str]) -> Arc<AppState> {
+    Arc::new(AppState {
+        trusted_proxies: cidrs
+            .iter()
+            .map(|s| IpAllowEntry::Net(s.parse().unwrap()))
+            .collect(),
+        ..test_state_base()
+    })
+}
+
+#[test]
+fn xff_from_an_untrusted_peer_is_ignored_entirely() {
+    let state = state_with_trusted_proxies(&["10.0.0.0/8"]);
+    let peer: IpAddr = "203.0.113.7".parse().unwrap();
+    let resolved = state.resolve_client_ip(peer, &hdrs(&[("x-forwarded-for", "198.51.100.99")]));
+    assert_eq!(
+        resolved, peer,
+        "spoofed XFF from an untrusted peer must not win"
+    );
+}
+
+#[test]
+fn xff_is_honoured_from_a_trusted_peer() {
+    let state = state_with_trusted_proxies(&["10.0.0.0/8"]);
+    let peer: IpAddr = "10.1.2.3".parse().unwrap();
+    let resolved = state.resolve_client_ip(peer, &hdrs(&[("x-forwarded-for", "198.51.100.99")]));
+    assert_eq!(resolved, "198.51.100.99".parse::<IpAddr>().unwrap());
+}
+
+#[test]
+fn xff_chain_picks_the_rightmost_untrusted_hop() {
+    // client-spoofed, real client, inner LB — the inner LB is trusted, the
+    // real client is the rightmost entry that is not.
+    let state = state_with_trusted_proxies(&["10.0.0.0/8"]);
+    let peer: IpAddr = "10.1.2.3".parse().unwrap();
+    let resolved = state.resolve_client_ip(
+        peer,
+        &hdrs(&[("x-forwarded-for", "1.2.3.4, 198.51.100.99, 10.9.9.9")]),
+    );
+    assert_eq!(
+        resolved,
+        "198.51.100.99".parse::<IpAddr>().unwrap(),
+        "must skip trusted hops and stop at the first untrusted one — never walk to attacker-appended entries"
+    );
+}
+
+#[test]
+fn xff_malformed_entries_fall_back_to_the_peer_without_panicking() {
+    let state = state_with_trusted_proxies(&["10.0.0.0/8"]);
+    let peer: IpAddr = "10.1.2.3".parse().unwrap();
+    for garbage in [
+        "not-an-ip",
+        "198.51.100.99, garbage",
+        "",
+        "198.51.100.99,,10.0.0.1",
+        "[::1]:8080",          // port suffix is not a bare IP
+        "198.51.100.99; DROP", // header-injection shaped
+    ] {
+        let resolved = state.resolve_client_ip(peer, &hdrs(&[("x-forwarded-for", garbage)]));
+        assert_eq!(
+            resolved, peer,
+            "garbage XFF {garbage:?} must resolve to the peer"
+        );
+    }
+    // Header absent entirely: peer.
+    assert_eq!(state.resolve_client_ip(peer, &hdrs(&[])), peer);
+}
+
+#[test]
+fn xff_with_empty_trusted_proxies_is_todays_behaviour_exactly() {
+    let state = Arc::new(AppState {
+        ..test_state_base()
+    });
+    let peer: IpAddr = "10.1.2.3".parse().unwrap();
+    let resolved = state.resolve_client_ip(peer, &hdrs(&[("x-forwarded-for", "198.51.100.99")]));
+    assert_eq!(
+        resolved, peer,
+        "no trusted_proxies ⇒ the header is never consulted"
+    );
+}
+
+#[test]
+fn xff_all_hops_trusted_falls_back_to_the_peer() {
+    let state = state_with_trusted_proxies(&["10.0.0.0/8"]);
+    let peer: IpAddr = "10.1.2.3".parse().unwrap();
+    let resolved =
+        state.resolve_client_ip(peer, &hdrs(&[("x-forwarded-for", "10.0.0.1, 10.0.0.2")]));
+    assert_eq!(resolved, peer);
+}
+
+#[test]
+fn xff_multiple_headers_are_one_logical_list_walked_from_the_right() {
+    let state = state_with_trusted_proxies(&["10.0.0.0/8"]);
+    let peer: IpAddr = "10.1.2.3".parse().unwrap();
+    let mut headers = hyper::HeaderMap::new();
+    headers.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+    headers.append(
+        "x-forwarded-for",
+        HeaderValue::from_static("198.51.100.99, 10.9.9.9"),
+    );
+    let resolved = state.resolve_client_ip(peer, &headers);
+    assert_eq!(resolved, "198.51.100.99".parse::<IpAddr>().unwrap());
+}
+
+// ── AC-6: admin surfaces × {unauthenticated, non-operator, operator} ──
+
+/// `[[clients]]` app with an operator and a plain client, both surfaces.
+fn admin_matrix_app(upstream_url: &str) -> (Router, Arc<AppState>) {
+    let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
+    acct.base_url = upstream_url.to_string();
+    let state = Arc::new(AppState {
+        endpoints: vec![acct],
+        clients: vec![
+            mk_client("ops", "key-ops", &[]),
+            mk_client("geo", "key-geo", &[]),
+        ],
+        operators: vec!["ops".to_string()],
+        ..test_state_base()
+    });
+    (build_router(state.clone()), state)
+}
+
+#[tokio::test]
+async fn admin_surfaces_gate_by_operator_principal() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = admin_matrix_app(&mock_url);
+    let addr = serve(app).await;
+    let client = Client::new();
+
+    for path in ["/_stats", "/metrics"] {
+        // Unauthenticated → 401.
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{path} unauthenticated"
+        );
+
+        // Authenticated non-operator → 403: a per-client key holder has no
+        // business reading other clients' ids and the account names.
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .header("x-api-key", "key-geo")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "{path} non-operator"
+        );
+
+        // Operator → 200.
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .header("x-api-key", "key-ops")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{path} operator");
+    }
+}
+
+/// AC-5: under `allow_unauthenticated` (no credentials configured), both
+/// surfaces still serve — this is the lab posture, and it is what keeps the
+/// Grafana/vmagent scrape of `/metrics` working there (LAB-925/LAB-927):
+/// the scraper presents no credential, and none is required.
+#[tokio::test]
+async fn admin_surfaces_still_serve_without_credentials_configured() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = test_app(&mock_url, None);
+    let addr = serve(app).await;
+    let client = Client::new();
+
+    for path in ["/_stats", "/metrics"] {
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{path} open mode");
+    }
+}
+
+/// Legacy `proxy_key`: one shared secret means the key holder IS the
+/// operator — a valid key reads both surfaces, a missing one does not.
+#[tokio::test]
+async fn admin_surfaces_accept_the_legacy_shared_key() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = test_app(&mock_url, Some("legacy-shared-secret-0123456789ab".into()));
+    let addr = serve(app).await;
+    let client = Client::new();
+
+    for path in ["/_stats", "/metrics"] {
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .header("x-api-key", "legacy-shared-secret-0123456789ab")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{path} proxy_key");
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{path} missing key"
+        );
+    }
+}
+
+// ── AC-11/AC-12: failed-auth throttle ──
+
+#[test]
+fn auth_throttle_trips_after_the_limit_and_reports_retry_after() {
+    let t = AuthThrottle::new(3, Duration::from_secs(60));
+    let ip: IpAddr = "203.0.113.7".parse().unwrap();
+    for _ in 0..2 {
+        t.record_failure(ip);
+        assert_eq!(t.check(&ip), None, "under the limit must not throttle");
+    }
+    t.record_failure(ip);
+    let retry = t.check(&ip).expect("limit reached must throttle");
+    assert!(
+        (1..=60).contains(&retry),
+        "retry-after {retry} out of range"
+    );
+    // A different IP is unaffected.
+    assert_eq!(t.check(&"203.0.113.8".parse().unwrap()), None);
+}
+
+#[test]
+fn auth_throttle_window_expiry_unlocks() {
+    let t = AuthThrottle::new(1, Duration::from_millis(30));
+    let ip: IpAddr = "203.0.113.7".parse().unwrap();
+    t.record_failure(ip);
+    assert!(t.check(&ip).is_some());
+    std::thread::sleep(Duration::from_millis(40));
+    assert_eq!(t.check(&ip), None, "expired window must unlock");
+    assert!(
+        t.entries.lock().unwrap().is_empty(),
+        "expired entry must be removed, not retained"
+    );
+}
+
+#[test]
+fn auth_throttle_zero_limit_disables() {
+    let t = AuthThrottle::new(0, Duration::from_secs(60));
+    let ip: IpAddr = "203.0.113.7".parse().unwrap();
+    for _ in 0..100 {
+        t.record_failure(ip);
+    }
+    assert_eq!(t.check(&ip), None);
+    assert!(
+        t.entries.lock().unwrap().is_empty(),
+        "disabled throttle must not accumulate state"
+    );
+}
+
+/// AC-12: the map is keyed on an attacker-controlled IP, so it must stay
+/// bounded. Among equal-threat (equal-count) entries the oldest window is
+/// evicted, and memory stays flat.
+#[test]
+fn auth_throttle_capacity_evicts_the_least_established_entry() {
+    let t = AuthThrottle::with_capacity(1, Duration::from_secs(60), 2);
+    let first: IpAddr = "203.0.113.1".parse().unwrap();
+    t.record_failure(first);
+    std::thread::sleep(Duration::from_millis(5)); // strictly older window_start
+    t.record_failure("203.0.113.2".parse().unwrap());
+    t.record_failure("203.0.113.3".parse().unwrap()); // over capacity
+    let entries = t.entries.lock().unwrap();
+    assert_eq!(entries.len(), 2, "capacity must hold");
+    assert!(
+        !entries.contains_key(&first),
+        "among equal-count entries the oldest window is evicted"
+    );
+}
+
+/// AC-12 hardening: eviction must NOT be an attacker's escape hatch. A burst
+/// of fresh single-failure IPs must not evict an established lockout — else a
+/// guesser could flush its own throttle and resume. Established lockout
+/// (count >= max_failures) is preserved; the fresh count=1 floods evict each
+/// other.
+#[test]
+fn auth_throttle_capacity_preserves_an_established_lockout() {
+    let t = AuthThrottle::with_capacity(3, Duration::from_secs(60), 2);
+    let locked: IpAddr = "203.0.113.9".parse().unwrap();
+    for _ in 0..3 {
+        t.record_failure(locked); // count = 3 = max ⇒ actively throttled
+    }
+    assert!(t.check(&locked).is_some(), "lockout must be active");
+    // Flood fresh count=1 IPs well past capacity.
+    for i in 0..20u8 {
+        t.record_failure(IpAddr::from([198, 51, 100, i]));
+    }
+    assert!(
+        t.entries.lock().unwrap().contains_key(&locked),
+        "the established lockout must survive a flood of fresh failures"
+    );
+    assert!(t.check(&locked).is_some(), "and stay throttled");
+}
+
+/// Expired windows are purged before any live entry is evicted, so a table
+/// full of stale entries never forces out an active one.
+#[test]
+fn auth_throttle_capacity_purges_expired_before_evicting() {
+    let t = AuthThrottle::with_capacity(1, Duration::from_millis(20), 2);
+    t.record_failure("203.0.113.1".parse().unwrap());
+    t.record_failure("203.0.113.2".parse().unwrap());
+    std::thread::sleep(Duration::from_millis(30)); // both windows expire
+    let fresh: IpAddr = "203.0.113.3".parse().unwrap();
+    t.record_failure(fresh);
+    let entries = t.entries.lock().unwrap();
+    assert!(entries.contains_key(&fresh));
+    assert!(entries.len() <= 2, "expired entries purged, capacity held");
+}
+
+/// A successful authentication clears the IP's failure state, so a client's
+/// own sporadic typos never drift toward a lockout (bug-hunter/security
+/// finding: shared-IP false lockout mitigation).
+#[test]
+fn auth_throttle_clear_resets_failures() {
+    let t = AuthThrottle::new(3, Duration::from_secs(60));
+    let ip: IpAddr = "203.0.113.7".parse().unwrap();
+    t.record_failure(ip);
+    t.record_failure(ip);
+    t.clear(&ip);
+    // Back to zero: two fresh failures still under the limit.
+    t.record_failure(ip);
+    t.record_failure(ip);
+    assert_eq!(t.check(&ip), None, "clear must reset the counter to zero");
+}
+
+/// The throttle fires BEFORE the key comparison: once tripped, even the
+/// CORRECT credential gets 429 until the window expires — the guessing
+/// surface (including its timing) closes entirely. Also pins the counter.
+#[tokio::test]
+async fn throttled_ip_gets_429_even_with_a_valid_key() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
+    acct.base_url = mock_url.to_string();
+    let state = Arc::new(AppState {
+        endpoints: vec![acct],
+        clients: vec![
+            mk_client("ops", "key-ops", &[]),
+            mk_client("geo", "key-geo", &[]),
+        ],
+        operators: vec!["ops".to_string()],
+        auth_throttle: AuthThrottle::new(3, Duration::from_secs(60)),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state.clone())).await;
+    let client = Client::new();
+
+    for _ in 0..3 {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-api-key", "key-wrong")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    // Valid credential, throttled IP: 429 with retry-after, before comparison.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-geo")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let retry: u64 = resp
+        .headers()
+        .get("retry-after")
+        .expect("429 must carry retry-after")
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("retry-after must be whole seconds");
+    assert!((1..=60).contains(&retry));
+
+    // Counter = 3 rejected credentials + the 1 throttle-429 = 4. The 429 path
+    // is counted too, so the metric keeps climbing through a sustained attack
+    // instead of plateauing at the limit.
+    assert_eq!(state.auth_failures.lock().unwrap().get("proxy"), Some(&4));
+}
+
+/// Reset-on-success through the real router: a client that fails a couple of
+/// times, then authenticates successfully, is NOT throttled by those earlier
+/// failures — its state was cleared. Mitigates shared-IP false lockouts.
+#[tokio::test]
+async fn successful_auth_clears_prior_failures() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
+    acct.base_url = mock_url.to_string();
+    let state = Arc::new(AppState {
+        endpoints: vec![acct],
+        clients: vec![mk_client("geo", "key-geo", &[])],
+        auth_throttle: AuthThrottle::new(3, Duration::from_secs(60)),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state.clone())).await;
+    let client = Client::new();
+
+    // Two bad attempts (under the limit of 3).
+    for _ in 0..2 {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-api-key", "key-wrong")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    // A successful auth clears the two failures.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-geo")
+        .body(r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(
+        state
+            .auth_throttle
+            .check(&"127.0.0.1".parse().unwrap())
+            .is_none(),
+        "the client's own IP must not be throttled after a success reset it"
+    );
+}
+
+/// A dual-stack listener delivers IPv4 peers as `::ffff:a.b.c.d`; a v4
+/// `trusted_proxies` CIDR must still match after canonicalization, or XFF
+/// resolution silently no-ops behind the LB.
+#[test]
+fn resolve_client_ip_canonicalizes_v4_mapped_peer() {
+    let state = state_with_trusted_proxies(&["10.0.0.0/8"]);
+    let mapped_peer: IpAddr = "::ffff:10.1.2.3".parse().unwrap();
+    let resolved =
+        state.resolve_client_ip(mapped_peer, &hdrs(&[("x-forwarded-for", "198.51.100.99")]));
+    assert_eq!(
+        resolved,
+        "198.51.100.99".parse::<IpAddr>().unwrap(),
+        "v4-mapped trusted peer must be recognized so XFF is honoured"
+    );
+}
+
+/// `anthropic_auth_failures_total{route}` is scrape-visible (AC-11).
+#[tokio::test]
+async fn metrics_expose_auth_failures_by_route() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = admin_matrix_app(&mock_url);
+    let addr = serve(app).await;
+    let client = Client::new();
+
+    // One failure on the stats route.
+    let _ = client
+        .get(format!("http://{addr}/_stats"))
+        .header("x-api-key", "key-wrong")
+        .send()
+        .await
+        .unwrap();
+
+    let body = client
+        .get(format!("http://{addr}/metrics"))
+        .header("x-api-key", "key-ops")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("anthropic_auth_failures_total{route=\"stats\"} 1"),
+        "missing auth-failure counter in:\n{body}"
+    );
 }

@@ -29,16 +29,37 @@ probe_interval_secs = 300
 # key = "<from secret store: openssl rand -hex 32>"
 
 # proxy_key — LEGACY single shared secret. Authenticates but does not identify.
-# Mutually exclusive with [[clients]]; omitting both leaves the proxy OPEN.
-# proxy_key = "your-secret-key-here"
+# Mutually exclusive with [[clients]]. Minimum 32 characters (openssl rand -hex 32).
+# proxy_key = "<from secret store: openssl rand -hex 32>"
+
+# DEFAULT-DENY (LAB-1192): startup FAILS unless [[clients]], proxy_key, or this
+# flag is set. The flag is the ONE escape hatch — trusted-network-only
+# (NetworkPolicy / tailnet), never on a public ingress. It logs a warning at
+# boot; unauthenticated /_stats and /metrics access also warns, rate-limited
+# to once per route per 5 minutes.
+# allow_unauthenticated = true
 
 # IP allowlist: only accept connections from these IPs/CIDRs.
 # Supports individual IPs and CIDR ranges. Omit or leave empty to allow all.
-# NOTE: omitted = ALLOW ALL. This is not a default-deny.
+# NOTE: omitted = ALLOW ALL (authentication above still applies).
 # allowed_ips = ["100.64.0.0/10", "10.0.0.0/8", "1.2.3.4"]
 
+# Trusted proxies (LAB-1192): load balancers whose x-forwarded-for is honoured.
+# When the TCP peer is in this list, the client IP is the rightmost XFF entry
+# not itself in the list; from any other peer the header is IGNORED. Behind an
+# LB, [[clients]] credentials are the identity — client_names is lab-only.
+# trusted_proxies = ["10.128.0.0/20"]
+
+# Failed-auth throttle (LAB-1192): after auth_failure_limit failures from one
+# client IP inside the window, that IP gets 429 + retry-after before any key
+# comparison. Counted in anthropic_auth_failures_total{route}. 0 disables.
+# auth_failure_limit = 10
+# auth_failure_window_secs = 300
+
 # Operators: these client_ids are never throttled by utilization limits, budget
-# limits, the emergency brake, or the per-client model allow-list.
+# limits, the emergency brake, or the per-client model allow-list. Under
+# [[clients]] they are also the ONLY principals that may read /_stats and
+# /metrics (LAB-1192) — give your monitoring scraper an operator credential.
 # Under [[clients]] these name authenticated principals. Without it, identity is
 # resolved via the x-client-id header or the client_names IP map — i.e. operator
 # status is then trust-based and forgeable.

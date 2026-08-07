@@ -94,11 +94,25 @@ probe_interval_secs = 300
 # models = ["claude-sonnet-*", "claude-haiku-*"]  # optional; empty = all
 
 # LEGACY single shared secret. Mutually exclusive with [[clients]] —
-# configuring both fails startup. Omitting both leaves the proxy OPEN.
-# proxy_key = "your-secret-key-here"
+# configuring both fails startup.
+# proxy_key = "<openssl rand -hex 32>"
+
+# Startup FAILS unless [[clients]], proxy_key, or this flag is set.
+# Trusted-network-only (NetworkPolicy / tailnet) — never on a public ingress.
+# allow_unauthenticated = true
 
 # IP allowlist (optional — omit to allow all source IPs)
 # allowed_ips = ["100.64.0.0/10", "10.0.0.0/8"]
+
+# Load balancers whose x-forwarded-for is trusted (optional). Client IP =
+# rightmost XFF entry not in this list when the TCP peer is listed;
+# otherwise the peer address, and the header is ignored.
+# trusted_proxies = ["10.128.0.0/20"]
+
+# Failed-auth throttle: after this many failures per client IP inside the
+# window, requests from that IP get 429 + retry-after. 0 disables.
+# auth_failure_limit = 10
+# auth_failure_window_secs = 300
 
 # Auto-inject prompt caching beta header (default: true)
 # auto_cache = true
@@ -160,7 +174,11 @@ token = "sk-ant-api03-..."
 | `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`) |
 | `clients[].models` | `[String]` | `[]` | Models this client may request (empty = all; `*` suffix wildcards) |
 | `proxy_key` | `String?` | `None` | **Legacy** shared secret. Mutually exclusive with `[[clients]]` |
+| `allow_unauthenticated` | `bool` | `false` | The one escape hatch from default-deny: boot with no credentials at all. Trusted-network-only; incompatible with configured credentials |
 | `allowed_ips` | `[String]?` | `None` | IP/CIDR allowlist (unset = **allow all**) |
+| `trusted_proxies` | `[String]?` | `None` | IPs/CIDRs of load balancers whose `x-forwarded-for` is honoured (unset = header ignored) |
+| `auth_failure_limit` | `u32` | `10` | Failed-auth attempts per client IP inside the window before 429 (0 = throttle off) |
+| `auth_failure_window_secs` | `u64` | `300` | Failed-auth throttle window |
 | `auto_cache` | `bool` | `true` | Inject prompt caching beta header |
 | `shadow_log` | `String?` | `None` | Path to JSONL shadow log file |
 | `soft_limit` | `f64` | `0.90` | Utilization ceiling — accounts above are excluded from routing |
@@ -225,9 +243,12 @@ When a request specifies a model, only accounts whose `models` list matches (exa
 
 ## Client Setup
 
-### Local / trusted network (no proxy_key)
+### Local / trusted network (no credentials)
 
-Omit `proxy_key` from config. Point Claude Code at the proxy:
+Set `allow_unauthenticated = true` — startup **fails** without a credential
+otherwise, and the flag logs a warning at boot naming the risk. This mode is
+for networks where access control already exists outside the proxy (a
+Kubernetes NetworkPolicy, a tailnet). Point Claude Code at the proxy:
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8082
@@ -281,7 +302,7 @@ One secret for everyone, sent as `x-api-key`. It authenticates but does **not** 
 Keep the previous config to hand: rolling back is the same single-step swap in reverse.
 
 > [!WARNING]
-> Under `[[clients]]`, `/_stats` and `/metrics` require a credential too. If a Prometheus scrape, an uptime check, or a Kubernetes `httpGet` probe hits this proxy unauthenticated today, it will start returning `401` — give those callers a key in the same change, or a failing probe becomes a restart loop.
+> Under `[[clients]]`, `/_stats` and `/metrics` require an **operator** credential (a client named in `operators`) — a plain client key gets `403`, no key gets `401`. If a Prometheus scrape, an uptime check, or a Kubernetes `httpGet` probe hits this proxy unauthenticated today, it will start failing — give those callers an operator key in the same change, or a failing probe becomes a restart loop. Under `allow_unauthenticated` both surfaces stay open (a `warn` fires at most once per route per 5 minutes so a scraper can't drown the log).
 
 ### Client Identification
 
@@ -307,18 +328,38 @@ It **fails closed** on a model it cannot read. The proxy takes the model from th
 
 ## Security
 
-> [!CAUTION]
-> **Every layer below is opt-in and OFF unless you configure it.** Unset `allowed_ips` means allow all; unset `clients` *and* `proxy_key` means no authentication at all. A default install accepts any request from any source. There is no default-deny.
+> [!IMPORTANT]
+> **Authentication is default-deny (LAB-1192).** A config with neither `[[clients]]` nor `proxy_key` **fails startup** with a named error. The single escape hatch is `allow_unauthenticated = true`, which boots with a startup warning and is meant for networks where access control exists outside the proxy (NetworkPolicy, tailnet) — never a public ingress. A misconfigured deploy is a crash loop, not a silently open proxy.
 
 | Layer | Config | Effect | Unset behaviour |
 |:------|:-------|:-------|:----------------|
 | **Listen binding** | `listen = "127.0.0.1:8082"` | Only accepts connections on that interface | — (required) |
 | **IP allowlist** | `allowed_ips = ["100.64.0.0/10"]` | Rejects unlisted source IPs (403) | **allow all** |
-| **Per-client keys** | `[[clients]]` | Requires a per-client credential; identity = the credential (401) | **no auth** |
-| **Proxy key** (legacy) | `proxy_key = "secret"` | Requires a single shared `x-api-key` (401) | **no auth** |
+| **Per-client keys** | `[[clients]]` | Requires a per-client credential; identity = the credential (401) | **startup error** (unless `allow_unauthenticated`) |
+| **Proxy key** (legacy) | `proxy_key = "<64 hex>"` | Requires a single shared `x-api-key` (401) | **startup error** (unless `allow_unauthenticated`) |
+| **Admin surfaces** | `operators = ["ops"]` | `/_stats` + `/metrics` need an operator credential (401/403) | no one can read them under `[[clients]]` |
+| **Failed-auth throttle** | `auth_failure_limit` / `auth_failure_window_secs` | 429 + `retry-after` per client IP after repeated failures | on (10 / 300s) |
+| **Trusted proxies** | `trusted_proxies = ["10.128.0.0/20"]` | Real client IP recovered from `x-forwarded-for` behind a listed LB | header ignored |
 | **Model allow-list** | `clients[].models` | Rejects models outside a client's list (403) | all models |
 
-IP check runs first, then the credential check. Both apply to every route including `/_stats` and `/metrics`. Credentials are compared in constant time.
+IP check runs first, then the throttle, then the credential check. All apply to every route including `/_stats` and `/metrics`. Credentials are compared in constant time, and startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`).
+
+**TLS terminates at the ingress.** The proxy speaks plain HTTP and its container port must never be published directly to the internet — put it behind a TLS-terminating load balancer or ingress, list that LB in `trusted_proxies`, and let the ingress carry the certificate. Bearer credentials without TLS are credentials in cleartext.
+
+### Admin surfaces are operator-only (LAB-1192)
+
+`/_stats` disclosures are a reconnaissance report for anyone planning to spend the pool: raw `client_id`s, agent/session prefixes, models, **endpoint account names**, token counts, per-account utilisation and budgets. So under `[[clients]]` both `/_stats` and `/metrics` answer only to a client named in `operators` — unauthenticated gets `401`, a valid non-operator credential gets `403`. Under legacy `proxy_key` the (single) key holder is the operator by construction. Under `allow_unauthenticated` both surfaces serve, and unauthenticated access logs at `warn` — rate-limited to once per route per 5 minutes, so the open posture stays visible without a per-scrape firehose.
+
+### Real client IP behind a load balancer (LAB-1192)
+
+Behind a GCLB/Cloudflare/ingress, the TCP peer is the LB — without XFF handling, IP allowlists degenerate to "allow the LB", per-IP throttles rate-limit the LB, and every log line records the LB. Configure `trusted_proxies` with the LB's address range; the client IP then becomes the **rightmost `x-forwarded-for` entry not itself in `trusted_proxies`** — the last hop an attacker cannot append to. From any peer *not* in the list the header is ignored entirely (never trusted, never logged as authoritative), and malformed entries fall back to the peer address.
+
+> [!IMPORTANT]
+> Behind a load balancer, **`[[clients]]` credentials are the identity**. The `client_names` IP map is a lab-only convenience: it maps *source addresses*, and once traffic arrives through an LB the recovered XFF address is only as trustworthy as the LB's own header hygiene. Do not hang budgets or operator status on `client_names` on a public ingress.
+
+### Failed-auth throttling (LAB-1192)
+
+A static bearer credential on the public internet gets scanned. After `auth_failure_limit` failures from one client IP inside `auth_failure_window_secs`, further requests from that IP get `429` with `retry-after` **before any key comparison runs** — a locked-out guesser gets nothing back, not even timing, until the window expires. Failures are counted in `anthropic_auth_failures_total{route}` and logged with the resolved client IP. The throttle table is bounded (4096 IPs), so the tracking structure itself cannot be flooded into an OOM — and eviction is threat-aware: expired windows are purged first, then the least-established live entry (lowest failure count, oldest window as tie-breaker) is evicted, so a flood of fresh failures cannot flush an active lockout to reset it.
 
 ### Credential-path hardening (LAB-1191)
 
@@ -347,7 +388,6 @@ can steer are locked down by default:
 
 ### Known Limitations
 
-- **`/_stats` and `/metrics` are not operator-gated**: any client holding *any* valid credential can read them, and `/_stats` exposes endpoint names and per-client usage. Restricting them to an operator principal is tracked separately.
 - **Client ID spoofing (legacy configs only)**: without `[[clients]]`, the `x-client-id` header takes priority over the `client_names` IP mapping, so any authenticated client can claim any identity — including an operator name, another client's budget, or another client's response-cache tenant. Configure `[[clients]]` to close this; it is the reason that mode exists.
 - **Emergency brake is model-blind**: The brake evaluates worst-case utilization across all model claims. If sonnet is exhausted but haiku has headroom, the brake blocks all traffic including haiku. This is intentional fail-safe behavior.
 
@@ -363,8 +403,9 @@ can steer are locked down by default:
 | `/metrics` | GET | Prometheus-format metrics |
 
 All endpoints are gated by `[[clients]]` (or legacy `proxy_key`) and
-`allowed_ips` when configured. Any valid client credential grants access to
-`/_stats` and `/metrics` — they are not operator-scoped (see Known Limitations).
+`allowed_ips`. `/_stats` and `/metrics` are **operator-scoped**: under
+`[[clients]]` they require a credential whose name is in `operators`
+(401 unauthenticated / 403 non-operator — see §Security).
 
 ### Session context-window visibility
 

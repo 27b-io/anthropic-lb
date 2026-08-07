@@ -58,6 +58,25 @@ struct Config {
     clients: Vec<ClientConfig>,
     /// Source IP allowlist. Supports individual IPs and CIDR ranges. None/empty = allow all.
     allowed_ips: Option<Vec<String>>,
+    /// LAB-1192: the ONE escape hatch from default-deny authentication.
+    /// Startup FAILS when neither `[[clients]]` nor `proxy_key` is configured
+    /// unless this is explicitly true. Trusted-network-only (e.g. behind the
+    /// lab NetworkPolicy) — never on a public ingress. Mutually exclusive
+    /// with configured credentials, so it cannot mask a half-applied
+    /// migration.
+    allow_unauthenticated: Option<bool>,
+    /// LAB-1192: IPs/CIDRs of load balancers whose `x-forwarded-for` is
+    /// trusted. When the TCP peer is inside this list, the client IP becomes
+    /// the rightmost `x-forwarded-for` entry that is NOT itself in the list;
+    /// otherwise the peer address is used and the header is ignored entirely.
+    /// Empty/absent = header never consulted (direct-connection behaviour).
+    trusted_proxies: Option<Vec<String>>,
+    /// LAB-1192: failed-auth throttle — failures per client IP inside the
+    /// window before further requests from that IP get 429. 0 disables.
+    /// Default: 10.
+    auth_failure_limit: Option<u32>,
+    /// LAB-1192: failed-auth throttle window in seconds. Default: 300.
+    auth_failure_window_secs: Option<u64>,
     /// Unified routing endpoints. Each entry is either Anthropic-native or
     /// OpenAI-compatible, distinguished by `protocol`. The sole endpoint pool —
     /// the legacy [[accounts]] / [[upstreams]] / fallback_upstream keys are
@@ -685,6 +704,18 @@ struct AppState {
     /// header. Empty ⇒ legacy `proxy_key` / open behaviour.
     clients: Vec<ClientConfig>,
     allowed_ips: Vec<IpAllowEntry>,
+    /// Load balancers whose `x-forwarded-for` is trusted (LAB-1192).
+    /// Consulted only by `resolve_client_ip`. Empty = header ignored.
+    trusted_proxies: Vec<IpAllowEntry>,
+    /// Per-client-IP failed-authentication throttle (LAB-1192).
+    auth_throttle: AuthThrottle,
+    /// Failed authentication attempts by route, for
+    /// `anthropic_auth_failures_total{route}`. Routes are the four static
+    /// handler names, so cardinality is fixed.
+    auth_failures: Mutex<HashMap<&'static str, u64>>,
+    /// Last time the `allow_unauthenticated` admin-access warn fired per route,
+    /// so it stays visible without one line per scrape (LAB-1192 AC-5).
+    open_admin_warn: Mutex<HashMap<&'static str, Instant>>,
     client_names: HashMap<String, String>,
     auto_cache: bool,
     /// Per-client token usage: client_id → [input, output, cache_creation, cache_read]
@@ -1523,9 +1554,208 @@ impl IpAllowEntry {
     }
 }
 
+/// Parse a list of IP/CIDR strings into allow entries, panicking (startup) on
+/// a malformed entry. Shared by `allowed_ips` and `trusted_proxies` — one
+/// parse + panic semantics, named by `field` for the error.
+fn parse_ip_entries(entries: Option<&[String]>, field: &str) -> Vec<IpAllowEntry> {
+    entries
+        .unwrap_or_default()
+        .iter()
+        .map(|s| {
+            if let Ok(net) = s.parse::<IpNet>() {
+                IpAllowEntry::Net(net)
+            } else if let Ok(addr) = s.parse::<IpAddr>() {
+                IpAllowEntry::Addr(addr)
+            } else {
+                panic!("invalid {field} entry: {s}");
+            }
+        })
+        .collect()
+}
+
+/// Default failed-auth attempts per IP inside the window before 429.
+const DEFAULT_AUTH_FAILURE_LIMIT: u32 = 10;
+/// Default failed-auth throttle window.
+const DEFAULT_AUTH_FAILURE_WINDOW_SECS: u64 = 300;
+/// Hard cap on tracked IPs. The key is attacker-controlled, so an unbounded
+/// map here would itself be the DoS the throttle exists to prevent (AC-12).
+/// 4096 entries × ~64 bytes ≈ 256 KiB worst case — memory stays flat.
+const AUTH_THROTTLE_CAPACITY: usize = 4096;
+/// Minimum spacing between `allow_unauthenticated` admin-access warns per route.
+const OPEN_ADMIN_WARN_INTERVAL: Duration = Duration::from_secs(300);
+/// Minimum length of any configured credential (LAB-1192 AC-13). A static
+/// bearer on a public ingress gets scanned; below this the keyspace is the
+/// vulnerability. 32 chars = what `openssl rand -hex 32` (64 hex) exceeds.
+const MIN_KEY_LEN: usize = 32;
+
+/// Per-client-IP failed-authentication throttle (LAB-1192).
+///
+/// Fixed window per IP: the first failure starts the window, subsequent
+/// failures increment the count, and once the count reaches `max_failures`
+/// every request from that IP gets `429 + retry-after` until the window
+/// expires — BEFORE any key comparison runs, so a guesser locked out of the
+/// timing surface stays locked out even when it eventually guesses right.
+struct AuthThrottle {
+    /// Failures per window before throttling. 0 = throttle disabled.
+    max_failures: u32,
+    window: Duration,
+    capacity: usize,
+    /// ip → (window_start, failures). Bounded by `capacity`: expired windows
+    /// are purged first, then the least-established (lowest-count) live entry
+    /// is evicted, so a flood of fresh failures cannot flush an active lockout.
+    entries: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+}
+
+impl AuthThrottle {
+    fn new(max_failures: u32, window: Duration) -> Self {
+        Self::with_capacity(max_failures, window, AUTH_THROTTLE_CAPACITY)
+    }
+
+    fn with_capacity(max_failures: u32, window: Duration, capacity: usize) -> Self {
+        Self {
+            max_failures,
+            window,
+            capacity,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns `Some(retry_after_secs)` while `ip` is throttled. Expired
+    /// windows are removed on sight, so steady-state size tracks only IPs
+    /// that failed recently.
+    fn check(&self, ip: &IpAddr) -> Option<u64> {
+        if self.max_failures == 0 {
+            return None;
+        }
+        let mut entries = self.entries.lock().ok()?;
+        let (start, count) = *entries.get(ip)?;
+        let elapsed = start.elapsed();
+        if elapsed >= self.window {
+            entries.remove(ip);
+            return None;
+        }
+        if count < self.max_failures {
+            return None;
+        }
+        // Round UP to whole seconds, never advertise 0: `as_secs()` truncates,
+        // so a client honouring the header exactly would return a sub-second
+        // early and eat a spurious extra 429.
+        let remaining = self.window - elapsed;
+        let secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+        Some(secs.max(1))
+    }
+
+    fn record_failure(&self, ip: IpAddr) {
+        if self.max_failures == 0 {
+            return;
+        }
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        match entries.get_mut(&ip) {
+            Some((start, count)) => {
+                if start.elapsed() >= self.window {
+                    *start = Instant::now();
+                    *count = 1;
+                } else {
+                    *count = count.saturating_add(1);
+                }
+            }
+            None => {
+                if entries.len() >= self.capacity {
+                    // ponytail: O(n) purge + min-scan on insert at capacity —
+                    // fires only with 4096 live entries under active attack; an
+                    // LRU/heap if it ever shows up in a profile.
+                    //
+                    // Purge expired windows first — they are no active threat
+                    // and the correct thing to drop. Only if the table is full
+                    // of LIVE windows do we evict, and then the
+                    // LEAST-established one (lowest failure count). An
+                    // established lockout has `count >= max_failures`, strictly
+                    // above an attacker's fresh `count = 1` floods, so a burst
+                    // of new IPs cannot evict a real offender's lockout to reset
+                    // it (AC-12: the eviction policy must not itself be an
+                    // attacker's escape hatch).
+                    let window = self.window;
+                    entries.retain(|_, (start, _)| start.elapsed() < window);
+                    if entries.len() >= self.capacity {
+                        if let Some(victim) = entries
+                            .iter()
+                            .min_by_key(|(_, (start, count))| (*count, *start))
+                            .map(|(k, _)| *k)
+                        {
+                            entries.remove(&victim);
+                        }
+                    }
+                }
+                entries.insert(ip, (Instant::now(), 1));
+            }
+        }
+    }
+
+    /// Drop `ip`'s failure state — called after a SUCCESSFUL authentication so
+    /// a client's own sporadic typos never accumulate toward a lockout, and a
+    /// recovered client immediately stops counting against a shared source IP.
+    fn clear(&self, ip: &IpAddr) {
+        if self.max_failures == 0 {
+            return;
+        }
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(ip);
+        }
+    }
+}
+
 impl AppState {
     fn is_ip_allowed(&self, ip: &IpAddr) -> bool {
         self.allowed_ips.is_empty() || self.allowed_ips.iter().any(|e| e.contains(ip))
+    }
+
+    /// Resolve the REAL client IP behind a trusted load balancer (LAB-1192).
+    ///
+    /// When the TCP peer is inside `trusted_proxies`, the client IP is the
+    /// rightmost `x-forwarded-for` entry that is not itself a trusted proxy —
+    /// the last hop an attacker cannot append to. In every other case the
+    /// peer address wins and the header is ignored entirely: an XFF from an
+    /// untrusted peer is attacker input, never trusted, never logged as
+    /// authoritative. Malformed or empty entries abort the walk and fall back
+    /// to the peer address — never guess.
+    ///
+    /// This is the ONE resolution function (AC-8): every handler calls it
+    /// exactly once, immediately, and threads the result into the IP
+    /// allowlist, authentication, `client_names`, budgets, the auth throttle
+    /// and every log line. A second `client_addr.ip()` use inside a handler
+    /// is a review defect.
+    fn resolve_client_ip(&self, peer: IpAddr, headers: &hyper::HeaderMap) -> IpAddr {
+        // Canonicalize an IPv4-mapped IPv6 peer (`::ffff:a.b.c.d`) to the bare
+        // v4 address BEFORE the trust check. On a dual-stack listener (`::`)
+        // v4 clients arrive mapped, and a v4 `trusted_proxies` CIDR would
+        // otherwise never match — silently disabling XFF resolution and
+        // letting the LB's address become the client IP for the allowlist,
+        // throttle and budgets.
+        let peer = peer.to_canonical();
+        let is_trusted = |ip: &IpAddr| self.trusted_proxies.iter().any(|e| e.contains(ip));
+        // `any()` over an empty list is already false, so an empty
+        // `trusted_proxies` falls through here — direct-connection behaviour.
+        if !is_trusted(&peer) {
+            return peer;
+        }
+        // Multiple x-forwarded-for headers are one logical comma-joined list
+        // (RFC 7230 §3.2.2); walk values last-to-first, entries right-to-left.
+        for value in headers.get_all("x-forwarded-for").iter().rev() {
+            let Ok(s) = value.to_str() else { return peer };
+            for entry in s.rsplit(',') {
+                let Ok(ip) = entry.trim().parse::<IpAddr>().map(|ip| ip.to_canonical()) else {
+                    return peer;
+                };
+                if !is_trusted(&ip) {
+                    return ip;
+                }
+            }
+        }
+        // Header absent, or every hop is a trusted proxy: the nearest
+        // trusted peer is the most authoritative address we have.
+        peer
     }
 
     /// Authenticate a request's credential (LAB-1083).
@@ -1591,6 +1821,131 @@ impl AppState {
             }
         }
         Ok(None)
+    }
+
+    /// `authenticate` behind the failed-auth throttle (LAB-1192 AC-11).
+    ///
+    /// A throttled IP gets `429 + retry-after` BEFORE the key comparison runs
+    /// — the guessing surface (including its timing) closes entirely, even
+    /// for a correct guess, until the window expires. Failures are recorded
+    /// against the AC-7 resolved client IP and counted per route in
+    /// `anthropic_auth_failures_total`; the 429 short-circuit is counted
+    /// separately so the metric keeps rising through a sustained attack
+    /// instead of plateauing at the limit.
+    ///
+    /// A SUCCESSFUL authentication clears the IP's failure state, so a client
+    /// whose own earlier typos accumulated does not drift toward a lockout,
+    /// and a recovered client stops counting against a shared source IP.
+    fn authenticate_throttled(
+        &self,
+        client_ip: &IpAddr,
+        headers: &hyper::HeaderMap,
+        allow_bearer: bool,
+        route: &'static str,
+    ) -> Result<Option<&ClientConfig>, Box<Response>> {
+        if let Some(retry_after) = self.auth_throttle.check(client_ip) {
+            warn!(
+                client = %client_ip,
+                route,
+                retry_after,
+                "rejected: failed-auth throttle active"
+            );
+            self.count_auth_failure(route);
+            let mut resp = (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed authentication attempts",
+            )
+                .into_response();
+            resp.headers_mut()
+                .insert("retry-after", HeaderValue::from(retry_after));
+            return Err(Box::new(resp));
+        }
+        let result = self.authenticate(client_ip, headers, allow_bearer);
+        match &result {
+            Ok(_) => self.auth_throttle.clear(client_ip),
+            Err(_) => {
+                self.auth_throttle.record_failure(*client_ip);
+                self.count_auth_failure(route);
+            }
+        }
+        result
+    }
+
+    fn count_auth_failure(&self, route: &'static str) {
+        if let Ok(mut counts) = self.auth_failures.lock() {
+            *counts.entry(route).or_insert(0) += 1;
+        }
+    }
+
+    /// Gate an admin surface (`/_stats`, `/metrics`) behind an OPERATOR
+    /// principal (LAB-1192 AC-4). Returns the rejection response, or `None`
+    /// when the caller may proceed.
+    ///
+    /// Under `[[clients]]`: unauthenticated → 401, authenticated
+    /// non-operator → 403 — `/_stats` discloses other clients' ids and the
+    /// endpoint account names, which a per-client key holder has no business
+    /// reading. Under legacy `proxy_key`, a valid key serves: one shared
+    /// secret means the key holder IS the operator. Under
+    /// `allow_unauthenticated` (the only way to boot with no credentials),
+    /// both surfaces serve but each access logs at `warn` (AC-5) so the open
+    /// posture stays visible even on a trusted network.
+    fn authorize_admin(
+        &self,
+        client_ip: &IpAddr,
+        headers: &hyper::HeaderMap,
+        route: &'static str,
+    ) -> Option<Box<Response>> {
+        match self.authenticate_throttled(client_ip, headers, false, route) {
+            Err(resp) => Some(resp),
+            Ok(Some(c)) if !self.is_operator(&c.name) => {
+                warn!(
+                    client = %client_ip,
+                    client_id = %c.name,
+                    route,
+                    "rejected: admin surface requires an operator principal"
+                );
+                Some(Box::new(
+                    (
+                        StatusCode::FORBIDDEN,
+                        "forbidden: operator principal required",
+                    )
+                        .into_response(),
+                ))
+            }
+            Ok(Some(_)) => None,
+            Ok(None) => {
+                // allow_unauthenticated: keep the open posture VISIBLE (AC-5)
+                // but rate-limit the warn per route — in the lab a vmagent
+                // scrapes /metrics every ~15s, and one warn per scrape is
+                // ~11k lines/day/replica that drowns the signal it exists to
+                // give. Once per route per OPEN_ADMIN_WARN_INTERVAL preserves
+                // visibility without the firehose.
+                if self.proxy_key.is_none() && self.should_warn_open_admin(route) {
+                    warn!(
+                        client = %client_ip,
+                        route,
+                        "unauthenticated admin access (allow_unauthenticated) — trusted-network-only; rate-limited log"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Rate-limiter for the `allow_unauthenticated` admin-access warn: true at
+    /// most once per route per `OPEN_ADMIN_WARN_INTERVAL`.
+    fn should_warn_open_admin(&self, route: &'static str) -> bool {
+        let Ok(mut last) = self.open_admin_warn.lock() else {
+            return true;
+        };
+        let now = Instant::now();
+        match last.get(route) {
+            Some(t) if t.elapsed() < OPEN_ADMIN_WARN_INTERVAL => false,
+            _ => {
+                last.insert(route, now);
+                true
+            }
+        }
     }
 
     /// Constant-time lookup of a presented credential in the client table.
@@ -7194,7 +7549,9 @@ async fn proxy_handler(
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
     req: Request<Body>,
 ) -> Response {
-    let client_ip = client_addr.ip();
+    // AC-8: the ONLY client_addr.ip() read in this handler — everything
+    // downstream consumes the resolved client IP.
+    let client_ip = state.resolve_client_ip(client_addr.ip(), req.headers());
     let request_start = Instant::now();
 
     // IP allowlist check
@@ -7204,7 +7561,7 @@ async fn proxy_handler(
     }
 
     // Proxy auth: x-api-key against the [[clients]] table, else legacy proxy_key.
-    let principal = match state.authenticate(&client_ip, req.headers(), false) {
+    let principal = match state.authenticate_throttled(&client_ip, req.headers(), false, "proxy") {
         Ok(p) => p,
         Err(resp) => return *resp,
     };
@@ -8139,10 +8496,14 @@ async fn stats_handler(
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
     req: Request<Body>,
 ) -> Response {
-    if !state.is_ip_allowed(&client_addr.ip()) {
+    // AC-8: the ONLY client_addr.ip() read in this handler.
+    let client_ip = state.resolve_client_ip(client_addr.ip(), req.headers());
+    if !state.is_ip_allowed(&client_ip) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
-    if let Err(resp) = state.authenticate(&client_addr.ip(), req.headers(), false) {
+    // AC-4: operator principal required — /_stats discloses other clients'
+    // ids, the endpoint account names and pool utilisation.
+    if let Some(resp) = state.authorize_admin(&client_ip, req.headers(), "stats") {
         return *resp;
     }
 
@@ -8610,10 +8971,14 @@ async fn metrics_handler(
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
     req: Request<Body>,
 ) -> Response {
-    if !state.is_ip_allowed(&client_addr.ip()) {
+    // AC-8: the ONLY client_addr.ip() read in this handler.
+    let client_ip = state.resolve_client_ip(client_addr.ip(), req.headers());
+    if !state.is_ip_allowed(&client_ip) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
-    if let Err(resp) = state.authenticate(&client_addr.ip(), req.headers(), false) {
+    // AC-4: operator principal required, same gate as /_stats — per-account
+    // utilisation and budget gauges are pool reconnaissance.
+    if let Some(resp) = state.authorize_admin(&client_ip, req.headers(), "metrics") {
         return *resp;
     }
 
@@ -8693,6 +9058,12 @@ async fn metrics_handler(
         .lock()
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
+    let auth_failures: Vec<(&'static str, u64)> = state
+        .auth_failures
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (*k, *v)).collect())
         .unwrap_or_default();
     let (session_buckets, session_tokens_sum) = state.session_tokens_histogram(now_epoch);
 
@@ -9538,6 +9909,23 @@ async fn metrics_handler(
             &mut buf,
             "anthropic_beta_flag_dropped_total",
             &[("flag", flag.as_str())],
+            *n,
+        );
+    }
+
+    // Failed authentication attempts (LAB-1192). A non-zero rate on a public
+    // ingress is credential scanning — alert on it.
+    prom_header(
+        &mut buf,
+        "anthropic_auth_failures_total",
+        "counter",
+        "Requests rejected for auth — invalid/missing credential OR throttle 429 — by route",
+    );
+    for (route, n) in &auth_failures {
+        prom_counter(
+            &mut buf,
+            "anthropic_auth_failures_total",
+            &[("route", route)],
             *n,
         );
     }
@@ -11492,7 +11880,8 @@ async fn openai_chat_handler(
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
     req: Request<Body>,
 ) -> Response {
-    let client_ip = client_addr.ip();
+    // AC-8: the ONLY client_addr.ip() read in this handler.
+    let client_ip = state.resolve_client_ip(client_addr.ip(), req.headers());
     let request_start = Instant::now();
 
     // IP allowlist check
@@ -11503,7 +11892,7 @@ async fn openai_chat_handler(
 
     // Proxy auth: accept the credential from either x-api-key or
     // Authorization: Bearer — OpenAI SDKs send only the latter.
-    let principal = match state.authenticate(&client_ip, req.headers(), true) {
+    let principal = match state.authenticate_throttled(&client_ip, req.headers(), true, "openai") {
         Ok(p) => p,
         Err(resp) => return *resp,
     };
@@ -11825,6 +12214,11 @@ fn validate_clients(config: &Config) -> Result<(), String> {
         if c.key.is_empty() {
             return Err(format!("client '{}': key must not be empty", c.name));
         }
+        // NOTE: the MIN_KEY_LEN strength floor (AC-13) is enforced in
+        // validate_exposure, not here — this function's structural rules
+        // (empty / duplicate / whitespace) are exercised by tests with
+        // deliberately short keys, and the deployment-posture floor belongs
+        // with the other posture checks. Both reference the shared const.
         if seen_names.contains(&c.name.as_str()) {
             return Err(format!("client '{}': duplicate name", c.name));
         }
@@ -11895,6 +12289,67 @@ fn validate_clients(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Startup exposure posture (LAB-1192): unauthenticated is a BOOT FAILURE,
+/// not a default. Same shape as `reject_legacy_config_keys` — a named error
+/// at startup instead of a silent misconfiguration in production, where an
+/// open proxy is indistinguishable from a configured one until someone
+/// finds it.
+fn validate_exposure(config: &Config) -> Result<(), String> {
+    let has_credentials = config.proxy_key.is_some() || !config.clients.is_empty();
+    let allow_unauthenticated = config.allow_unauthenticated.unwrap_or(false);
+    if !has_credentials && !allow_unauthenticated {
+        return Err(
+            "config: no credentials configured — add [[clients]] entries (or legacy proxy_key), \
+             or explicitly set allow_unauthenticated = true for a trusted-network-only deployment \
+             (see README §Authentication)"
+                .to_string(),
+        );
+    }
+    // One escape hatch, one meaning. Credentials + allow_unauthenticated
+    // together would make the flag silently dead (or worse, ambiguous) —
+    // exactly the half-applied-migration state the mutual-exclusion rules
+    // exist to reject.
+    if has_credentials && allow_unauthenticated {
+        return Err(
+            "config: allow_unauthenticated = true is incompatible with configured credentials — \
+             remove it, or remove [[clients]]/proxy_key (see README §Authentication)"
+                .to_string(),
+        );
+    }
+    // AC-13: a static bearer credential on a public ingress gets scanned;
+    // below 32 characters the keyspace is the vulnerability.
+    if let Some(ref key) = config.proxy_key {
+        if key.len() < MIN_KEY_LEN {
+            return Err(format!(
+                "config: proxy_key is shorter than {MIN_KEY_LEN} characters — generate one with `openssl rand -hex 32`"
+            ));
+        }
+    }
+    for c in &config.clients {
+        if c.key.len() < MIN_KEY_LEN {
+            return Err(format!(
+                "client '{}': key is shorter than {MIN_KEY_LEN} characters — generate one with `openssl rand -hex 32`",
+                c.name
+            ));
+        }
+    }
+    if config
+        .auth_failure_limit
+        .unwrap_or(DEFAULT_AUTH_FAILURE_LIMIT)
+        > 0
+        && config
+            .auth_failure_window_secs
+            .unwrap_or(DEFAULT_AUTH_FAILURE_WINDOW_SECS)
+            == 0
+    {
+        return Err(
+            "config: auth_failure_window_secs must be > 0 (set auth_failure_limit = 0 to disable the throttle)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Reject removed config keys with explicit errors. Run after the raw TOML
 /// has been parsed to a `toml::Value`, before strongly-typed deserialization.
 ///
@@ -11959,6 +12414,9 @@ async fn main() {
     if let Err(msg) = validate_clients(&config) {
         panic!("config: {msg}");
     }
+    if let Err(msg) = validate_exposure(&config) {
+        panic!("{msg}");
+    }
 
     // Set up tracing: stderr (info+) always, plus optional debug log file
     {
@@ -12017,25 +12475,41 @@ async fn main() {
 
     let cooldown = Duration::from_secs(config.rate_limit_cooldown_secs.unwrap_or(5));
 
-    // Parse IP allowlist
-    let allowed_ips: Vec<IpAllowEntry> = config
-        .allowed_ips
-        .unwrap_or_default()
-        .iter()
-        .map(|s| {
-            if let Ok(net) = s.parse::<IpNet>() {
-                IpAllowEntry::Net(net)
-            } else if let Ok(addr) = s.parse::<IpAddr>() {
-                IpAllowEntry::Addr(addr)
-            } else {
-                panic!("invalid allowed_ips entry: {s}");
-            }
-        })
-        .collect();
+    // Parse IP allowlist + trusted proxy list (LAB-1192) — same IP/CIDR syntax.
+    let allowed_ips = parse_ip_entries(config.allowed_ips.as_deref(), "allowed_ips");
+    let trusted_proxies = parse_ip_entries(config.trusted_proxies.as_deref(), "trusted_proxies");
     if allowed_ips.is_empty() {
         warn!("IP allowlist DISABLED — all source IPs accepted");
     } else {
         info!(count = allowed_ips.len(), "IP allowlist enabled");
+    }
+    if !trusted_proxies.is_empty() {
+        info!(
+            count = trusted_proxies.len(),
+            "trusted proxies configured — x-forwarded-for honoured from these peers"
+        );
+    } else if !config.clients.is_empty() || config.proxy_key.is_some() {
+        // Credentials but no trusted_proxies: behind a load balancer every
+        // client collapses to the LB's peer IP, so the allowlist admits the
+        // LB (i.e. everything) and the failed-auth throttle can be tripped for
+        // ALL clients by one bad neighbour. Fine for a direct-exposed instance;
+        // a footgun the moment an LB is introduced. Warn loudly (LAB-1192).
+        warn!(
+            "no trusted_proxies configured — if this instance sits behind a load balancer, \
+             all clients share the LB's peer IP for the allowlist and failed-auth throttle; \
+             set trusted_proxies to the LB's address range"
+        );
+    }
+
+    // Operators gate /_stats + /metrics under [[clients]] (LAB-1192 AC-4). An
+    // empty operators list there means NO principal can read them — a silent
+    // way to blind a monitoring scrape. Warn so the omission is visible.
+    if !config.clients.is_empty() && config.operators.is_empty() {
+        warn!(
+            "[[clients]] configured with an empty operators list — /_stats and /metrics will \
+             reject EVERY caller (403); name at least one client in operators or your \
+             monitoring scrape goes blind"
+        );
     }
 
     // Build the unified endpoint vector from the [[endpoints]] config.
@@ -12099,7 +12573,12 @@ async fn main() {
     } else if config.proxy_key.is_some() {
         warn!("legacy shared proxy_key in use — every caller shares one identity; migrate to [[clients]] (see README §Authentication)");
     } else {
-        warn!("proxy authentication DISABLED — proxy is open to all");
+        // validate_exposure guarantees this state is only reachable with the
+        // flag explicitly set (AC-2).
+        warn!(
+            "allow_unauthenticated = true — proxy, /_stats and /metrics accept unauthenticated \
+             traffic; safe ONLY on a trusted network (NetworkPolicy/tailnet), never on a public ingress"
+        );
     }
 
     info!(
@@ -12247,6 +12726,19 @@ async fn main() {
         proxy_key: config.proxy_key.clone(),
         clients: config.clients.clone(),
         allowed_ips,
+        trusted_proxies,
+        auth_throttle: AuthThrottle::new(
+            config
+                .auth_failure_limit
+                .unwrap_or(DEFAULT_AUTH_FAILURE_LIMIT),
+            Duration::from_secs(
+                config
+                    .auth_failure_window_secs
+                    .unwrap_or(DEFAULT_AUTH_FAILURE_WINDOW_SECS),
+            ),
+        ),
+        auth_failures: Mutex::new(HashMap::new()),
+        open_admin_warn: Mutex::new(HashMap::new()),
         client_names: config.client_names.clone(),
         auto_cache: config.auto_cache.unwrap_or(true),
         client_usage: Mutex::new(HashMap::new()),
