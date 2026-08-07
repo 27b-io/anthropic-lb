@@ -745,6 +745,11 @@ struct AppState {
     /// fred clients are cheap to clone; every clone shares one multiplexed
     /// connection driven by a background task with a reconnect policy.
     redis: Option<RedisClient>,
+    /// Whether the coordination client has EVER connected. False from process
+    /// start until the first successful connect (set once by
+    /// `spawn_redis_connect_watcher`, never cleared). Gates coordination ops
+    /// off entirely while never-yet-connected — see `coordination_redis`.
+    redis_ever_connected: AtomicBool,
     /// Cached cluster info from Redis, updated by background sync task.
     cluster_info_cache: Mutex<Option<serde_json::Value>>,
     /// Monotonic request ID counter for log correlation.
@@ -2372,7 +2377,7 @@ impl AppState {
         }
 
         // Distributed probe lock: one pod per endpoint+model per interval.
-        if let Some(redis) = &self.redis {
+        if let Some(redis) = self.coordination_redis() {
             let lock_key = format!("alb:probe:{}:{}", ep.name, model);
             let lock_ttl = self.probe_interval_secs.max(1);
             // SET NX EX: OK reply when acquired, nil (None) when another
@@ -2775,6 +2780,65 @@ const BUDGET_TTL_SECS: i64 = 172_800;
 /// `default_command_timeout`), carried over from the old ConnectionManager's
 /// 2s response timeout.
 const REDIS_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long after startup an unconnected coordination backend earns its one
+/// WARN (`spawn_redis_connect_watcher`). Matches the connection budget the
+/// old blocking `init()` gave the first attempt, so the log fires on the
+/// same timeline operators already know — it just no longer implies
+/// permanence.
+const REDIS_STARTUP_GRACE: Duration = Duration::from_secs(5);
+
+/// Build the coordination Redis client and spawn its connection task WITHOUT
+/// waiting for the first connect (LAB-1639). `Err` only for an unparseable
+/// URL — an unreachable backend is not an error here.
+///
+/// `fail_fast = false` routes the INITIAL connect through `policy` — the
+/// same retry loop that already handles mid-run drops — instead of fred's
+/// default single attempt. `connect()` (not `init()`) spawns that task and
+/// returns immediately: with a retry-forever policy, awaiting the first
+/// connect would block the caller for the whole backend outage, so a pod
+/// cold-starting during a Redis window would never bind its listener — a
+/// full LB outage instead of degraded local-only mode. The returned handle
+/// detaches on drop; the task keeps driving the connection (and reconnects)
+/// for the lifetime of the client.
+fn start_coordination_redis(
+    url: &str,
+    perf: PerformanceConfig,
+    conn_config: ConnectionConfig,
+    policy: ReconnectPolicy,
+) -> Result<RedisClient, fred::error::RedisError> {
+    let mut redis_config = RedisConfig::from_url(url)?;
+    redis_config.fail_fast = false;
+    let client = RedisClient::new(redis_config, Some(perf), Some(conn_config), Some(policy));
+    // Connection transitions are sparse, high-signal events; log them so a
+    // flapping backend is visible in operator logs. fred emits this on EVERY
+    // successful connection establishment, the first one included.
+    client.on_reconnect(|server| {
+        info!(%server, "redis reconnected for distributed state");
+        Ok(())
+    });
+    // Connection-level errors are otherwise INVISIBLE under a retry-forever
+    // policy: failed attempts broadcast errors, never a connect result, so
+    // neither wait_for_connect nor on_reconnect ever fires for them. A
+    // persistently wrong password (NOAUTH retries forever in fred) would be
+    // indistinguishable from a backend outage without this. Rate-limited to
+    // one line per 60s — the backoff ramp starts sub-second.
+    let last_error_log = AtomicU64::new(0);
+    client.on_error(move |error| {
+        let now = AppState::now_epoch();
+        let prev = last_error_log.load(Ordering::Relaxed);
+        if now.saturating_sub(prev) >= 60
+            && last_error_log
+                .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            warn!(%error, "redis connection error — reconnect policy retrying");
+        }
+        Ok(())
+    });
+    let _connect_task = client.connect();
+    Ok(client)
+}
 
 /// `SET key value EX ttl` — the one-line convenience the redis crate's
 /// `set_ex` provided; fred's five-argument `set` buries the common case in
@@ -3853,10 +3917,84 @@ impl AppState {
         effective_interval.saturating_mul(2).max(1)
     }
 
+    /// Redis handle for coordination reads/writes, or `None` while the
+    /// client has never yet connected (a process that started during a
+    /// backend outage — LAB-1639). Before the first connect fred BUFFERS
+    /// every command for `REDIS_COMMAND_TIMEOUT` (2s) and each failure would
+    /// WARN, so coordination ops skip outright: no stalls, no per-operation
+    /// log spam — the startup grace WARN is the one signal. After the first
+    /// connect this is permanently `Some`: mid-run drops keep the LAB-932
+    /// contract (bounded 2s buffered failures, request paths gated on
+    /// `is_connected`). The `is_connected()` arm only covers the moments
+    /// between an early first connect and the watcher task storing the flag.
+    fn coordination_redis(&self) -> Option<&RedisClient> {
+        let redis = self.redis.as_ref()?;
+        if self.redis_ever_connected.load(Ordering::Relaxed) || redis.is_connected() {
+            Some(redis)
+        } else {
+            None
+        }
+    }
+
+    /// Spawn the tasks that observe the coordination client's FIRST connect
+    /// (LAB-1639). Call once after construction; no-op without Redis.
+    /// One task records the connect — permanently opening the
+    /// `coordination_redis` gate — and one emits the single startup WARN if
+    /// the backend is still unreachable after `REDIS_STARTUP_GRACE`.
+    fn spawn_redis_connect_watcher(self: &Arc<Self>) {
+        let Some(client) = self.redis.clone() else {
+            return;
+        };
+        // Belt for the recorder task below: fred's wait_for_connect reads
+        // client state THEN subscribes, so a connect landing between those
+        // two ops is missed until the next reconnect — with a mid-run drop
+        // in between, the gate would wrongly read closed and skip writes
+        // LAB-932 buffers. This subscription fires on every successful
+        // connection (the first included), so the flag cannot lag reality
+        // past one broadcast.
+        let state = self.clone();
+        client.on_reconnect(move |_server| {
+            state.redis_ever_connected.store(true, Ordering::Relaxed);
+            Ok(())
+        });
+        let state = self.clone();
+        let waiter = client.clone();
+        tokio::spawn(async move {
+            // Resolves immediately when already connected. With a
+            // retry-forever policy it otherwise resolves only on success:
+            // failed attempts broadcast errors, not connect results.
+            match waiter.wait_for_connect().await {
+                Ok(()) => {
+                    state.redis_ever_connected.store(true, Ordering::Relaxed);
+                    info!("redis connected for distributed state");
+                }
+                // Only broadcast when the connection task exits for good
+                // (non-retryable config/URL-class errors). Without this arm
+                // that exit would be silent and the startup WARN's "until
+                // the backend becomes reachable" a lie.
+                Err(e) => error!(
+                    error = %e,
+                    "redis connection task exited before first connect — coordination stays local-only"
+                ),
+            }
+        });
+        let state = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(REDIS_STARTUP_GRACE).await;
+            // Double-check is_connected: a connect racing the recorder task
+            // above must not produce a false outage WARN.
+            if !state.redis_ever_connected.load(Ordering::Relaxed) && !client.is_connected() {
+                warn!(
+                    "redis unreachable at startup — running local-only until the backend becomes reachable"
+                );
+            }
+        });
+    }
+
     /// Publish precomputed routing weights to Redis so non-probing pods
     /// can set their gauge atomics without recomputing.
     async fn publish_routing_weights(&self) {
-        let redis = match &self.redis {
+        let redis = match self.coordination_redis() {
             Some(r) => r,
             None => return,
         };
@@ -3907,7 +4045,7 @@ impl AppState {
     /// Broadcast a hard-limit recovery for an endpoint by name. The Redis
     /// sentinel key is derived from the name alone.
     async fn signal_hard_limit_recovery(&self, endpoint_name: &str) {
-        if let Some(redis) = &self.redis {
+        if let Some(redis) = self.coordination_redis() {
             let conn = redis.clone();
             let key = format!("alb:hard:{}", endpoint_name);
             let now_epoch = Self::now_epoch();
@@ -4488,7 +4626,7 @@ impl AppState {
         );
 
         // Fire-and-forget: publish rate info to Redis for cross-replica sync
-        if let Some(redis) = &self.redis {
+        if let Some(redis) = self.coordination_redis() {
             let rate_data = RedisRateInfo {
                 utilization: info.utilization,
                 utilization_5h: info.utilization_5h,
@@ -4618,7 +4756,7 @@ impl AppState {
         );
 
         // Propagate to Redis for cross-replica awareness
-        if let Some(redis) = &self.redis {
+        if let Some(redis) = self.coordination_redis() {
             let conn = redis.clone();
             let key = format!("alb:hard:{}", endpoint_name);
             let until_epoch = Self::now_epoch()
@@ -4707,7 +4845,7 @@ impl AppState {
     /// Sync shared state from Redis: hard limits + rate info.
     /// Called periodically by background task.
     async fn sync_from_redis(&self) {
-        let redis = match &self.redis {
+        let redis = match self.coordination_redis() {
             Some(r) => r,
             None => return,
         };
@@ -4958,7 +5096,7 @@ impl AppState {
     /// deployments keep accumulating locally; on an idle tick the TTL is still
     /// refreshed so the fleet-wide hash never expires under healthy traffic.
     async fn flush_transport_errors(&self) {
-        let redis = match &self.redis {
+        let redis = match self.coordination_redis() {
             Some(r) => r,
             None => return,
         };
@@ -5019,7 +5157,7 @@ impl AppState {
         }
     }
     async fn cluster_info(&self) -> Option<serde_json::Value> {
-        let redis = self.redis.as_ref()?;
+        let redis = self.coordination_redis()?;
         let mut redis_ok = true;
 
         // Count active replicas via SCAN (non-blocking, unlike KEYS). The
@@ -12622,49 +12760,32 @@ async fn main() {
 
     // Set up Redis connection for distributed state (if configured).
     // Timeout budgets carry over from the old ConnectionManager: 2s per
-    // command, 5s to establish a connection. `fail_fast` (fred's default)
-    // preserves the startup contract — an unreachable backend degrades to
-    // local-only rather than aborting or retrying forever. The reconnect
-    // policy is the one deliberate behaviour change (LAB-932 AC5): once the
-    // initial connect succeeds, a mid-run outage reconnects with capped
-    // exponential backoff instead of degrading permanently until restart.
+    // command, 5s to establish a connection. The startup contract (LAB-1639):
+    // the connect runs in the BACKGROUND under the retry-forever reconnect
+    // policy — startup never blocks on Redis and never aborts for an
+    // unreachable backend. A process that boots during a backend outage
+    // serves local-only (coordination ops gated off via
+    // `coordination_redis`) and attaches automatically when the backend
+    // becomes reachable; `None` here means a config error (unparseable URL),
+    // which stays local-only for the process lifetime. Mid-run outage
+    // behaviour is unchanged from LAB-932 AC5: once connected, drops
+    // reconnect with capped exponential backoff.
     let redis = if let Some(ref url) = config.redis_url {
-        match RedisConfig::from_url(url.as_str()) {
-            Ok(redis_config) => {
-                let perf = PerformanceConfig {
-                    default_command_timeout: REDIS_COMMAND_TIMEOUT,
-                    ..Default::default()
-                };
-                let conn_config = ConnectionConfig {
-                    connection_timeout: Duration::from_secs(5),
-                    internal_command_timeout: Duration::from_secs(5),
-                    ..Default::default()
-                };
-                // 0 = retry forever; delays 100ms → 30s, doubling.
-                let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
-                let client =
-                    RedisClient::new(redis_config, Some(perf), Some(conn_config), Some(policy));
-                // Reconnect transitions are sparse, high-signal events; log
-                // them so a flapping backend is visible in operator logs.
-                client.on_reconnect(|server| {
-                    info!(%server, "redis reconnected for distributed state");
-                    Ok(())
-                });
-                // init() spawns the connection task and waits for the first
-                // connect. The returned handle detaches on drop; the task
-                // keeps driving the connection (and reconnects) for the
-                // lifetime of the client.
-                match client.init().await {
-                    Ok(_connect_handle) => {
-                        info!("redis connected for distributed state");
-                        Some(client)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "redis connection failed — running in local-only mode");
-                        None
-                    }
-                }
-            }
+        let perf = PerformanceConfig {
+            default_command_timeout: REDIS_COMMAND_TIMEOUT,
+            ..Default::default()
+        };
+        let conn_config = ConnectionConfig {
+            // Keep connection_timeout in step with REDIS_STARTUP_GRACE: the
+            // startup WARN is timed to fire after one full connect budget.
+            connection_timeout: Duration::from_secs(5),
+            internal_command_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        // 0 = retry forever; delays 100ms → 30s, doubling.
+        let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
+        match start_coordination_redis(url.as_str(), perf, conn_config, policy) {
+            Ok(client) => Some(client),
             Err(e) => {
                 warn!(error = %e, "invalid redis_url — running in local-only mode");
                 None
@@ -12755,6 +12876,7 @@ async fn main() {
         client_request_rates: Mutex::new(HashMap::new()),
         soft_limit: config.soft_limit.unwrap_or(0.90),
         redis,
+        redis_ever_connected: AtomicBool::new(false),
         cluster_info_cache: Mutex::new(None),
         next_req_id: AtomicU64::new(0),
         instance_id: {
@@ -12803,6 +12925,11 @@ async fn main() {
     if state.auto_cache {
         info!("auto-cache enabled");
     }
+
+    // Observe the coordination client's first connect: opens the
+    // `coordination_redis` gate and owns the startup connected/unreachable
+    // log lines (LAB-1639).
+    state.spawn_redis_connect_watcher();
 
     // Restore persisted state (cooldowns, utilization, request counts)
     state.load_state().await;
@@ -12907,7 +13034,7 @@ async fn main() {
             loop {
                 sync_state.sync_from_redis().await;
                 // Heartbeat: register this instance
-                if let Some(redis) = &sync_state.redis {
+                if let Some(redis) = sync_state.coordination_redis() {
                     let key = format!("alb:heartbeat:{instance_id}");
                     let _ = redis_set_ex(redis, &key, AppState::now_epoch().to_string(), 30).await;
                 }
