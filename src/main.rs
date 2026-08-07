@@ -2817,6 +2817,25 @@ fn start_coordination_redis(
         info!(%server, "redis reconnected for distributed state");
         Ok(())
     });
+    // Connection-level errors are otherwise INVISIBLE under a retry-forever
+    // policy: failed attempts broadcast errors, never a connect result, so
+    // neither wait_for_connect nor on_reconnect ever fires for them. A
+    // persistently wrong password (NOAUTH retries forever in fred) would be
+    // indistinguishable from a backend outage without this. Rate-limited to
+    // one line per 60s — the backoff ramp starts sub-second.
+    let last_error_log = AtomicU64::new(0);
+    client.on_error(move |error| {
+        let now = AppState::now_epoch();
+        let prev = last_error_log.load(Ordering::Relaxed);
+        if now.saturating_sub(prev) >= 60
+            && last_error_log
+                .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            warn!(%error, "redis connection error — reconnect policy retrying");
+        }
+        Ok(())
+    });
     let _connect_task = client.connect();
     Ok(client)
 }
@@ -3926,15 +3945,37 @@ impl AppState {
         let Some(client) = self.redis.clone() else {
             return;
         };
+        // Belt for the recorder task below: fred's wait_for_connect reads
+        // client state THEN subscribes, so a connect landing between those
+        // two ops is missed until the next reconnect — with a mid-run drop
+        // in between, the gate would wrongly read closed and skip writes
+        // LAB-932 buffers. This subscription fires on every successful
+        // connection (the first included), so the flag cannot lag reality
+        // past one broadcast.
+        let state = self.clone();
+        client.on_reconnect(move |_server| {
+            state.redis_ever_connected.store(true, Ordering::Relaxed);
+            Ok(())
+        });
         let state = self.clone();
         let waiter = client.clone();
         tokio::spawn(async move {
             // Resolves immediately when already connected. With a
             // retry-forever policy it otherwise resolves only on success:
             // failed attempts broadcast errors, not connect results.
-            if waiter.wait_for_connect().await.is_ok() {
-                state.redis_ever_connected.store(true, Ordering::Relaxed);
-                info!("redis connected for distributed state");
+            match waiter.wait_for_connect().await {
+                Ok(()) => {
+                    state.redis_ever_connected.store(true, Ordering::Relaxed);
+                    info!("redis connected for distributed state");
+                }
+                // Only broadcast when the connection task exits for good
+                // (non-retryable config/URL-class errors). Without this arm
+                // that exit would be silent and the startup WARN's "until
+                // the backend becomes reachable" a lie.
+                Err(e) => error!(
+                    error = %e,
+                    "redis connection task exited before first connect — coordination stays local-only"
+                ),
             }
         });
         let state = self.clone();
@@ -3944,7 +3985,7 @@ impl AppState {
             // above must not produce a false outage WARN.
             if !state.redis_ever_connected.load(Ordering::Relaxed) && !client.is_connected() {
                 warn!(
-                    "redis unreachable at startup — serving local-only until the backend becomes reachable"
+                    "redis unreachable at startup — running local-only until the backend becomes reachable"
                 );
             }
         });
@@ -12735,6 +12776,8 @@ async fn main() {
             ..Default::default()
         };
         let conn_config = ConnectionConfig {
+            // Keep connection_timeout in step with REDIS_STARTUP_GRACE: the
+            // startup WARN is timed to fire after one full connect budget.
             connection_timeout: Duration::from_secs(5),
             internal_command_timeout: Duration::from_secs(5),
             ..Default::default()
