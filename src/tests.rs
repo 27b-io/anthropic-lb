@@ -398,6 +398,12 @@ fn test_state_base() -> AppState {
         client_request_rates: Mutex::new(HashMap::new()),
         soft_limit: 1.0,
         redis: None,
+        // true, not production's false: every fixture that overrides `redis`
+        // hands in a client that CONNECTED at creation (`fred_test_client`
+        // panics if it can't), so the ever-connected gate is open — exactly
+        // the post-first-connect state those tests exercise. The LAB-1639
+        // startup-outage test overrides this back to false.
+        redis_ever_connected: AtomicBool::new(true),
         cluster_info_cache: Mutex::new(None),
         next_req_id: AtomicU64::new(0),
         instance_id: 0,
@@ -18619,6 +18625,142 @@ mod redis_integration {
         assert_eq!(
             info["redis_connected"], true,
             "cluster_info must reflect the recovered backend"
+        );
+    }
+
+    /// LAB-1639: a process that STARTS while the backend is down must come
+    /// up serving local-only immediately — client construction must not
+    /// block on the unreachable backend — and must attach automatically when
+    /// the backend appears, without a restart. The startup analogue of the
+    /// mid-run death/recovery pair above. Under the pre-LAB-1639 contract
+    /// (fred's default `fail_fast = true` + a blocking `init()`) the single
+    /// refused connect at creation pinned the process local-only for its
+    /// entire lifetime.
+    #[tokio::test]
+    async fn backend_down_at_startup_serves_local_only_then_attaches() {
+        let Some(base) = test_redis_url() else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let target = base
+            .trim_start_matches("redis://")
+            .trim_end_matches('/')
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
+        // Flush DB 14 through a DIRECT connection — the proxy is dead at
+        // client creation, so the usual flush-through-proxy path cannot run.
+        // The same client later verifies that post-attach writes landed.
+        let direct = connect_and_flush(&format!("{}/14", base.trim_end_matches('/'))).await;
+
+        // Reserve an address, then kill it BEFORE the client under test
+        // exists: nothing is listening when the connection task makes its
+        // first attempt — the exact boot-during-outage scenario.
+        let (proxy_addr, kill) = spawn_killable_proxy(target.clone()).await;
+        kill_proxy(kill).await;
+        let url = format!("redis://{proxy_addr}/14");
+
+        // The PRODUCTION constructor (fail_fast=false, background connect),
+        // with the harness's short budgets and fast constant reconnect.
+        let constructed = std::time::Instant::now();
+        let client = start_coordination_redis(
+            &url,
+            PerformanceConfig {
+                default_command_timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
+            ConnectionConfig {
+                connection_timeout: Duration::from_secs(2),
+                internal_command_timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
+            ReconnectPolicy::new_constant(0, 100),
+        )
+        .expect("a well-formed url must always yield a client");
+        assert!(
+            constructed.elapsed() < Duration::from_millis(500),
+            "client construction must not block on the unreachable backend"
+        );
+        assert!(
+            !client.is_connected(),
+            "never-yet-connected client must read disconnected"
+        );
+
+        let state = Arc::new(AppState {
+            client_budgets: [("startup-cli".to_string(), 100u64)].into(),
+            redis: Some(client.clone()),
+            // Production boots with the gate closed; test_state_base opens
+            // it for the connected-at-creation fixtures.
+            redis_ever_connected: AtomicBool::new(false),
+            ..test_state_base()
+        });
+        state.spawn_redis_connect_watcher();
+
+        // Never-yet-connected: the coordination gate is closed, so request
+        // paths and background ticks return at local speed — no buffered
+        // fred command burning its 1s timeout, no per-operation warnings.
+        assert!(
+            state.coordination_redis().is_none(),
+            "coordination gate must be closed before the first connect"
+        );
+        let ops = std::time::Instant::now();
+        assert!(state.check_budget("startup-cli").await.is_ok());
+        state.record_budget_usage("startup-cli", 50).await;
+        state.sync_from_redis().await;
+        state.publish_routing_weights().await;
+        assert!(
+            state.cluster_info().await.is_none(),
+            "cluster_info must skip (not stall) while never-yet-connected"
+        );
+        assert!(
+            ops.elapsed() < Duration::from_millis(500),
+            "local-only ops must not stall on the dead backend"
+        );
+
+        // Local budget accounting still enforces (50 + 60 > 100).
+        state.record_budget_usage("startup-cli", 60).await;
+        assert_eq!(
+            state.check_budget("startup-cli").await,
+            Err(0),
+            "local fallback must enforce the budget while unconnected"
+        );
+
+        // Backend appears (proxy revives at the SAME address): the
+        // retry-forever connection task must attach on its own.
+        let (revived_addr, _revived_kill) = spawn_killable_proxy_at(&proxy_addr, target).await;
+        assert_eq!(
+            revived_addr, proxy_addr,
+            "proxy must revive at its old address"
+        );
+
+        eventually("the first connect to open the coordination gate", || {
+            let s = state.clone();
+            async move { s.coordination_redis().is_some() }
+        })
+        .await;
+
+        // Coordination writes begin: a fresh INCRBY lands in the real
+        // backend, verified through the independent direct connection.
+        // 7, not 117 — the pre-attach 50 and 60 were local-only by design.
+        state.record_budget_usage("startup-cli", 7).await;
+        let today = AppState::now_epoch() / 86400;
+        let key = format!("alb:budget:startup-cli:{today}");
+        eventually("the post-attach INCRBY to land in the backend", || {
+            let mut c = direct.clone();
+            let key = key.clone();
+            async move { c.get::<_, Option<u64>>(&key).await.ok().flatten() == Some(7) }
+        })
+        .await;
+
+        // And the operator surface reflects the attach.
+        let info = state
+            .cluster_info()
+            .await
+            .expect("cluster_info after attach");
+        assert_eq!(
+            info["redis_connected"], true,
+            "cluster_info must reflect the attached backend"
         );
     }
 }
