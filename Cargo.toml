@@ -12,7 +12,17 @@ categories = ["network-programming", "web-programming"]
 axum = "0.8"
 hyper = { version = "1", features = ["full"] }
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# rustls, not native-tls (LAB-1675/#132): openssl-sys can't build in the cross
+# container (aarch64 release leg), and fred/cachekit-rs already run on
+# rustls-ring. Defaults are off to drop it (this also drops system-proxy:
+# env-var HTTPS_PROXY still works everywhere, only macOS/Windows OS-level
+# proxy lookup is lost); http2 is required (the client builder sets
+# http2_keep_alive_*). native-roots keeps operator-added system CAs working
+# for openai-protocol upstreams — NOTE the effective trust store is the
+# UNION of system roots and the Mozilla webpki bundle, because cachekit-rs
+# enables reqwest/rustls-tls (webpki) and cargo features unify. rustls has
+# no CN fallback: upstream certs must carry SANs.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "http2", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"

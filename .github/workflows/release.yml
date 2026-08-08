@@ -5,9 +5,12 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+*"
 
+# Least privilege per job (LAB-1675 panel finding): validate/build execute
+# arbitrary dependency build.rs code via cargo — they must not inherit the
+# ability to mint an OIDC publish token or write to the repo. Each job
+# declares exactly what it needs below.
 permissions:
-  id-token: write
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -74,6 +77,9 @@ jobs:
     needs: validate
     runs-on: ${{ matrix.runner }}
     strategy:
+      # One exotic target failing must not cancel the siblings — we want the
+      # full failure picture in one run (LAB-1675/#132).
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -102,7 +108,7 @@ jobs:
       - name: Install cross-compilation tools
         if: matrix.cross
         run: |
-          cargo install cross --git https://github.com/cross-rs/cross
+          cargo install cross --locked --version 0.2.5
           sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu
 
       - name: Build
@@ -138,18 +144,20 @@ jobs:
             anthropic-lb-*.tar.gz
             anthropic-lb-*.tar.gz.sha256
 
-  release:
-    name: Release
-    needs: [validate, build]
+  # Publish gates on Validate only, NOT the binary matrix (LAB-1675/#132):
+  # with "require trusted publishing" ON this workflow is the only publish
+  # path, and a tag-triggered run can't be re-run against a fixed workflow —
+  # so an exotic cross-target failure must not permanently strand a version.
+  # Binaries are convenience artifacts; the source release is the product.
+  publish:
+    name: Publish to crates.io
+    needs: validate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          path: artifacts
-          merge-multiple: true
 
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
@@ -161,6 +169,23 @@ jobs:
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io.outputs.token }}
+
+  upload-artifacts:
+    name: Upload release artifacts
+    needs: [validate, build]
+    # Run even when a build leg failed (needs-semantics would otherwise skip
+    # this job entirely): upload whatever binaries DID build. All-legs-failed
+    # leaves download-artifact with nothing and fails the job — honest red.
+    if: ${{ !cancelled() && needs.validate.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
 
       # release-please already created the release for this tag with the
       # CHANGELOG section as its body — only upload artifacts here. Passing

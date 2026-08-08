@@ -42,6 +42,15 @@ which triggers `release.yml` (build + crates.io) and `docker.yml`.
   `Release-As: 1.0.0` footer, then drop `bump-minor-pre-major` and
   `bump-patch-for-minor-pre-major` from `release-please-config.json`
   (`prerelease: true` is inert at major ≥ 1 and can stay).
+- **Release PR bodies are machine-parsed** — release-please reads its own
+  PR body on merge to create the tag; any bot that rewrites PR descriptions
+  breaks the release (LAB-1675/#132: Kody did exactly this to #126). Kody
+  must keep `chore(main): release` in its Ignored Title Keywords (Kodus
+  console → Settings → Code Review → General); there is no in-repo config
+  for this unless the console's config-file override is enabled.
+- **crates.io requires trusted publishing** — a green `release.yml` `publish`
+  job is the only publishing path; there is no manual token fallback. The
+  `publish` job deliberately gates on `validate` only, not the binary matrix.
 
 ## Deployment
 
