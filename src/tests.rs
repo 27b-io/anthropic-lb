@@ -3916,6 +3916,34 @@ fn reverse_sse_no_duplicate_message_stop() {
 }
 
 #[test]
+fn reverse_sse_message_stopped_set_by_both_terminator_paths() {
+    // LAB-710: `ctx.message_stopped` gates the transport-error frame — once
+    // the client has its `message_stop`, a later read failure must not ship
+    // an error frame. Both emit sites must set it: finish_reason (the normal
+    // case) and a bare [DONE] with no finish_reason seen.
+    let mut ctx = ReverseStreamContext::default();
+    translate_openai_sse_to_anthropic(
+        "{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
+    assert!(!ctx.message_stopped);
+    translate_openai_sse_to_anthropic(
+        "{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        &mut ctx,
+    );
+    assert!(ctx.message_stopped, "finish_reason emitted message_stop");
+
+    let mut ctx = ReverseStreamContext::default();
+    translate_openai_sse_to_anthropic(
+        "{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
+    let done_events = translate_openai_sse_to_anthropic("[DONE]", &mut ctx);
+    assert!(done_events[0].contains("message_stop"));
+    assert!(ctx.message_stopped, "bare [DONE] emitted message_stop");
+}
+
+#[test]
 fn reverse_sse_inband_error_before_message_start() {
     // LAB-710: an in-band OpenAI {"error": {...}} line before any content
     // must emit an Anthropic `event: error` frame — previously it hit the
@@ -14178,6 +14206,90 @@ async fn proxy_handler_fallback_streaming() {
     assert!(
         body.contains("message_stop"),
         "should have message_stop event"
+    );
+}
+
+#[tokio::test]
+async fn fallback_translated_stream_no_error_frame_after_message_stop() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // LAB-710: a transport read failure AFTER the upstream's `[DONE]` must
+    // not ship an Anthropic error frame — the translated `message_stop`
+    // already terminated the stream from the client's view. Mirror of the
+    // passthrough `sent_done` guard, one protocol over.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let _ = stream.read(&mut buf).await;
+        let head = "HTTP/1.1 200 OK\r\n\
+             content-type: text/event-stream\r\n\
+             transfer-encoding: chunked\r\n\
+             \r\n";
+        let _ = stream.write_all(head.as_bytes()).await;
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let chunk = format!("{:x}\r\n{}\r\n", body.len(), body);
+        let _ = stream.write_all(chunk.as_bytes()).await;
+        // Drop WITHOUT the 0-length chunked terminator: the proxy's next
+        // resp.chunk() errors after message_stop already went downstream.
+        let _ = stream.shutdown().await;
+    });
+
+    let mut openai = make_endpoint("fallback", Protocol::OpenAI);
+    openai.base_url = format!("http://{}", mock_addr);
+    openai.priority = 100;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("acct-a", "sk-ant-api-a"), openai],
+        state_path: PathBuf::from("/tmp/anthropic-lb-done-then-err-test.state.json"),
+        auto_cache: false,
+        ..test_state_base()
+    });
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+    }
+
+    let app = Router::new()
+        .fallback(any(proxy_handler))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let resp = Client::new()
+        .post(format!("http://{}/v1/messages", addr))
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 1024,
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+
+    assert!(
+        body.contains("message_stop"),
+        "stream completed — must carry the success terminator, got: {body:?}"
+    );
+    assert!(
+        !body.contains("event: error"),
+        "no error frame may follow message_stop, got: {body:?}"
     );
 }
 

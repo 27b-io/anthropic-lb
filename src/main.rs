@@ -8279,8 +8279,8 @@ async fn try_fallback_upstream(
             // Passthrough-only: tracks whether upstream's `[DONE]` terminator
             // has been forwarded verbatim, so an error frame on the next read
             // doesn't ship a second `[DONE]` and break strict OpenAI parsers.
-            // Not needed in the translate branch — translation converts
-            // `[DONE]` to `message_stop`, which has no analogous terminator.
+            // The translate branch tracks its equivalent (`message_stop`
+            // emitted) as `ctx.message_stopped`, set inside the translator.
             let mut sent_done = false;
             // Carries any partial trailing SSE line between chunks so the
             // `[DONE]` terminator is detected across resp.chunk() boundaries.
@@ -8357,20 +8357,20 @@ async fn try_fallback_upstream(
                         // Downstream protocol depends on whether we're translating:
                         // translate_response=true → /v1/messages client expects
                         // Anthropic SSE; translate_response=false → /v1/chat/completions
-                        // passthrough, downstream is the OpenAI SSE format. Skip
-                        // the openai error frame when `[DONE]` was already
-                        // forwarded — emitting it would ship a second `[DONE]`.
+                        // passthrough, downstream is the OpenAI SSE format.
                         let msg = format!("upstream stream interrupted: {e}");
                         // Error frame is terminal: mark the ctx so the
                         // post-loop buffer flush translates to nothing, no
                         // frame follows the error, and finalization logs the
-                        // stream as failed on both protocols. When `[DONE]`
-                        // already went out the client saw a complete stream —
-                        // no frame is sent and the stream stays a success.
-                        let frame = if translate_response {
+                        // stream as failed on both protocols. When the
+                        // success terminator already went out (`message_stop`
+                        // translated, or `[DONE]` forwarded verbatim) the
+                        // client saw a complete stream — no frame is sent and
+                        // the stream stays a success.
+                        let frame = if translate_response && !ctx.message_stopped {
                             ctx.upstream_error = true;
                             Some(anthropic_error_frame(&msg))
-                        } else if !sent_done {
+                        } else if !translate_response && !sent_done {
                             ctx.upstream_error = true;
                             Some(openai_error_frame(&msg))
                         } else {
@@ -11345,6 +11345,12 @@ struct ReverseStreamContext {
     /// translator emits nothing once this is set (including `[DONE]` →
     /// `message_stop`), so no success terminator can follow an error.
     upstream_error: bool,
+    /// The Anthropic success terminator (`message_stop`) has been emitted —
+    /// from a finish_reason chunk or a bare upstream `[DONE]`. The stream is
+    /// complete from the client's view; a later transport failure must not
+    /// ship an error frame after it (mirror of the passthrough `sent_done`
+    /// guard, one protocol over).
+    message_stopped: bool,
 }
 
 impl Default for ReverseStreamContext {
@@ -11357,6 +11363,7 @@ impl Default for ReverseStreamContext {
             in_text_block: false,
             in_tool_use: false,
             upstream_error: false,
+            message_stopped: false,
         }
     }
 }
@@ -11420,6 +11427,7 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
     if trimmed == "[DONE]" {
         // Only emit message_stop if we started a message
         if ctx.message_started {
+            ctx.message_stopped = true;
             return vec![make_anthropic_event(
                 "message_stop",
                 &serde_json::json!({"type": "message_stop"}),
@@ -11624,6 +11632,7 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
             &serde_json::json!({"type": "message_stop"}),
         ));
         ctx.message_started = false; // prevent duplicate from [DONE]
+        ctx.message_stopped = true;
     }
 
     events
