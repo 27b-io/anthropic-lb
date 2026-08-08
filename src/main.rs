@@ -8361,13 +8361,17 @@ async fn try_fallback_upstream(
                         // the openai error frame when `[DONE]` was already
                         // forwarded — emitting it would ship a second `[DONE]`.
                         let msg = format!("upstream stream interrupted: {e}");
+                        // Error frame is terminal: mark the ctx so the
+                        // post-loop buffer flush translates to nothing, no
+                        // frame follows the error, and finalization logs the
+                        // stream as failed on both protocols. When `[DONE]`
+                        // already went out the client saw a complete stream —
+                        // no frame is sent and the stream stays a success.
                         let frame = if translate_response {
-                            // Error frame is terminal: mark the ctx so the
-                            // post-loop buffer flush translates to nothing
-                            // instead of emitting frames after the error.
                             ctx.upstream_error = true;
                             Some(anthropic_error_frame(&msg))
                         } else if !sent_done {
+                            ctx.upstream_error = true;
                             Some(openai_error_frame(&msg))
                         } else {
                             None
