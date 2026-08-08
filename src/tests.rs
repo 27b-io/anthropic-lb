@@ -3641,6 +3641,10 @@ fn json_mode_stream_message_stop_safety_net_flushes_buffer() {
     let content: serde_json::Value = serde_json::from_str(frames.next().unwrap()).unwrap();
     assert_eq!(content["choices"][0]["delta"]["content"], r#"{"ok":true}"#);
     assert_eq!(frames.next(), Some("[DONE]"));
+    // The stream loop detects the terminator with ends_with("data: [DONE]\n\n")
+    // — a combined frame that failed this would earn a second [DONE] from the
+    // post-loop guard (LAB-710 panel finding).
+    assert!(output.ends_with("data: [DONE]\n\n"));
 }
 
 // ── Reverse translation: Anthropic → OpenAI ──────────────────────

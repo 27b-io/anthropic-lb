@@ -8311,7 +8311,10 @@ async fn try_fallback_upstream(
                                         }
                                     }
                                 }
-                                if client_gone {
+                                if client_gone || ctx.upstream_error {
+                                    // upstream_error: the in-band error frame
+                                    // just sent is the stream's final frame —
+                                    // stop draining so nothing can follow it.
                                     break;
                                 }
                             }
@@ -8344,7 +8347,7 @@ async fn try_fallback_upstream(
                                 client_gone = true;
                             }
                         }
-                        if client_gone {
+                        if client_gone || ctx.upstream_error {
                             break;
                         }
                     }
@@ -8359,6 +8362,10 @@ async fn try_fallback_upstream(
                         // forwarded — emitting it would ship a second `[DONE]`.
                         let msg = format!("upstream stream interrupted: {e}");
                         let frame = if translate_response {
+                            // Error frame is terminal: mark the ctx so the
+                            // post-loop buffer flush translates to nothing
+                            // instead of emitting frames after the error.
+                            ctx.upstream_error = true;
                             Some(anthropic_error_frame(&msg))
                         } else if !sent_done {
                             Some(openai_error_frame(&msg))
@@ -8397,7 +8404,7 @@ async fn try_fallback_upstream(
                 warn!(
                     req_id,
                     upstream = upstream_name,
-                    "fallback: unified endpoint stream ended with in-band upstream error"
+                    "fallback: unified endpoint stream ended with upstream error frame"
                 );
             } else {
                 info!(
@@ -10894,6 +10901,11 @@ fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
                 .pointer("/error/message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("upstream error");
+            warn!(
+                error_type = err_type,
+                error_message = err_msg,
+                "Anthropic upstream emitted in-band error event mid-stream"
+            );
             Some(openai_error_sse(&format!("{err_type}: {err_msg}")))
         }
         _ => None, // ping
@@ -11323,10 +11335,11 @@ struct ReverseStreamContext {
     block_index: i64,
     in_text_block: bool,
     in_tool_use: bool,
-    /// Upstream emitted an in-band `{"error": {...}}` data line. The
-    /// translator has already surfaced it as an Anthropic `event: error`
-    /// frame; everything after it (including `[DONE]` → `message_stop`) is
-    /// suppressed so no success terminator follows an error.
+    /// An Anthropic `event: error` frame has been sent downstream — either
+    /// translated from an in-band `{"error": {...}}` data line, or by the
+    /// stream loop on a transport failure. That frame is terminal: the
+    /// translator emits nothing once this is set (including `[DONE]` →
+    /// `message_stop`), so no success terminator can follow an error.
     upstream_error: bool,
 }
 
@@ -11354,7 +11367,7 @@ fn make_anthropic_event(event_type: &str, data: &serde_json::Value) -> String {
 /// ("socket closed unexpectedly"). Emits a single `event: error` frame; the
 /// Anthropic SSE protocol has no terminator analogous to OpenAI's `[DONE]`,
 /// so the channel may close naturally after this frame.
-fn anthropic_error_frame(message: &str) -> bytes::Bytes {
+fn anthropic_error_sse(message: &str) -> String {
     // `error.type` must be one of Anthropic's documented values
     // (overloaded_error, api_error, invalid_request_error, ...). Using a
     // custom type like "upstream_error" risks the SDK rejecting the frame
@@ -11365,7 +11378,12 @@ fn anthropic_error_frame(message: &str) -> bytes::Bytes {
         "type": "error",
         "error": { "type": "api_error", "message": message }
     });
-    bytes::Bytes::from(make_anthropic_event("error", &body))
+    make_anthropic_event("error", &body)
+}
+
+/// `anthropic_error_sse` as Bytes, for the raw stream-loop send paths.
+fn anthropic_error_frame(message: &str) -> bytes::Bytes {
+    bytes::Bytes::from(anthropic_error_sse(message))
 }
 
 /// Final-frame OpenAI SSE error for downstream. Emits the error JSON
@@ -11424,15 +11442,12 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
             Some(m) => m.to_string(),
             None => err.to_string(),
         };
-        // "api_error" is Anthropic's documented catch-all type (see
-        // anthropic_error_frame); the upstream detail lives in message.
-        return vec![make_anthropic_event(
-            "error",
-            &serde_json::json!({
-                "type": "error",
-                "error": {"type": "api_error", "message": format!("{err_type}: {err_msg}")}
-            }),
-        )];
+        warn!(
+            error_type = err_type,
+            error_message = err_msg,
+            "OpenAI upstream emitted in-band error mid-stream"
+        );
+        return vec![anthropic_error_sse(&format!("{err_type}: {err_msg}"))];
     }
 
     let mut events: Vec<String> = Vec::new();
@@ -11924,7 +11939,10 @@ async fn forward_openai_compat_anthropic(
                             }
 
                             if let Some(translated) = translate_sse_event(&event, &mut ctx) {
-                                if translated.trim() == "data: [DONE]" {
+                                // ends_with, not equality: the json_mode flush
+                                // and the in-band error frame both append the
+                                // terminator to another frame in one string.
+                                if translated.ends_with("data: [DONE]\n\n") {
                                     sent_done = true;
                                 }
                                 if ctx.upstream_error {
@@ -11934,7 +11952,6 @@ async fn forward_openai_compat_anthropic(
                                     // skip the buffer flush and the clean-[DONE]
                                     // guard, and finalize as a failure.
                                     upstream_error = true;
-                                    sent_done = true;
                                 }
                                 if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
                                     client_gone = true;
@@ -11977,16 +11994,14 @@ async fn forward_openai_compat_anthropic(
                 let remaining = String::from_utf8_lossy(&buffer).into_owned();
                 if !remaining.trim().is_empty() {
                     if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
-                        if translated.trim() == "data: [DONE]" {
+                        if translated.ends_with("data: [DONE]\n\n") {
                             sent_done = true;
                         }
                         if ctx.upstream_error {
-                            // Error event arrived in the trailing buffer
-                            // (stream closed without a final \n\n) — same
-                            // rules as in-loop: its frame has [DONE], the
-                            // guard below must not add a clean one.
+                            // Error event in the trailing buffer (stream
+                            // closed without a final \n\n) — same rules as
+                            // in-loop.
                             upstream_error = true;
-                            sent_done = true;
                         }
                         if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
                             client_gone = true;
