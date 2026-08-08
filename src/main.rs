@@ -11416,10 +11416,13 @@ fn openai_error_frame(message: &str) -> bytes::Bytes {
 /// Returns Vec because one OpenAI chunk may produce multiple Anthropic events.
 /// `raw` is the raw SSE data line (after stripping "data: " prefix).
 fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) -> Vec<String> {
-    // After an in-band upstream error the Anthropic error frame is the final
-    // frame; drop whatever else the upstream sends (a trailing [DONE] would
-    // otherwise emit a message_stop — a success terminator after an error).
-    if ctx.upstream_error {
+    // Both terminators are final. After an in-band upstream error the
+    // Anthropic error frame is the last frame; drop whatever else the
+    // upstream sends (a trailing [DONE] would otherwise emit a message_stop —
+    // a success terminator after an error). Symmetrically, after
+    // `message_stop` nothing may follow — an in-band error line or stray
+    // delta arriving post-completion would violate the protocol the same way.
+    if ctx.upstream_error || ctx.message_stopped {
         return vec![];
     }
 

@@ -3933,6 +3933,18 @@ fn reverse_sse_message_stopped_set_by_both_terminator_paths() {
     );
     assert!(ctx.message_stopped, "finish_reason emitted message_stop");
 
+    // message_stop is terminal inside the translator too: an in-band error
+    // line (or stray delta) arriving post-completion must emit nothing.
+    let after = translate_openai_sse_to_anthropic(
+        "{\"error\":{\"message\":\"late\",\"type\":\"server_error\"}}",
+        &mut ctx,
+    );
+    assert!(
+        after.is_empty(),
+        "no frame may follow message_stop, got: {after:?}"
+    );
+    assert!(!ctx.upstream_error);
+
     let mut ctx = ReverseStreamContext::default();
     translate_openai_sse_to_anthropic(
         "{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}",
