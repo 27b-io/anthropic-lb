@@ -3404,6 +3404,31 @@ fn translate_sse_tool_use_stop_reason() {
 }
 
 #[test]
+fn translate_sse_inband_error_emits_openai_error_frame() {
+    // LAB-710: an Anthropic `event: error` mid-stream must reach the OpenAI
+    // client as an error frame, not vanish into the `_ => None` arm.
+    let mut ctx = StreamContext::default();
+    let raw = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}";
+    let result = translate_sse_event(raw, &mut ctx).unwrap();
+
+    // Flag set → stream loop finalizes as failure and skips the clean [DONE]
+    // guard (the error frame carries its own terminator).
+    assert!(ctx.upstream_error);
+
+    // Exactly one [DONE], and it belongs to the error frame itself.
+    assert_eq!(result.matches("[DONE]").count(), 1);
+    assert!(result.ends_with("data: [DONE]\n\n"));
+
+    let first_event = result.split("\n\n").next().unwrap();
+    let chunk: serde_json::Value =
+        serde_json::from_str(first_event.strip_prefix("data: ").unwrap()).unwrap();
+    assert_eq!(chunk["error"]["type"], "upstream_error");
+    let msg = chunk["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("overloaded_error"));
+    assert!(msg.contains("Overloaded"));
+}
+
+#[test]
 fn translate_sse_text_block_start_skipped() {
     let mut ctx = StreamContext::default();
     let raw = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}";
@@ -3883,6 +3908,58 @@ fn reverse_sse_no_duplicate_message_stop() {
     assert!(
         done_events.is_empty(),
         "DONE after finish_reason should emit nothing (message_stop already sent)"
+    );
+}
+
+#[test]
+fn reverse_sse_inband_error_before_message_start() {
+    // LAB-710: an in-band OpenAI {"error": {...}} line before any content
+    // must emit an Anthropic `event: error` frame — previously it hit the
+    // missing-choices early-return and the client got 200 + empty SSE body.
+    let mut ctx = ReverseStreamContext::default();
+    let events = translate_openai_sse_to_anthropic(
+        "{\"error\":{\"message\":\"The server had an error\",\"type\":\"server_error\"}}",
+        &mut ctx,
+    );
+    assert!(ctx.upstream_error);
+    assert_eq!(events.len(), 1);
+    assert!(events[0].starts_with("event: error\n"));
+    let data_line = events[0].lines().nth(1).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(data_line.strip_prefix("data: ").unwrap()).unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "api_error");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("server_error"));
+    assert!(msg.contains("The server had an error"));
+
+    // No fake success terminator: trailing [DONE] after the error emits nothing.
+    let after = translate_openai_sse_to_anthropic("[DONE]", &mut ctx);
+    assert!(after.is_empty());
+}
+
+#[test]
+fn reverse_sse_inband_error_mid_message_suppresses_message_stop() {
+    // Error arriving after content started: error frame is final — no
+    // message_stop may follow it, even if the upstream still sends [DONE].
+    let mut ctx = ReverseStreamContext::default();
+    translate_openai_sse_to_anthropic(
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
+    assert!(ctx.message_started);
+
+    let err_events = translate_openai_sse_to_anthropic(
+        "{\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\"}}",
+        &mut ctx,
+    );
+    assert_eq!(err_events.len(), 1);
+    assert!(err_events[0].starts_with("event: error\n"));
+
+    let done_events = translate_openai_sse_to_anthropic("[DONE]", &mut ctx);
+    assert!(
+        done_events.is_empty(),
+        "no message_stop may follow an in-band error frame"
     );
 }
 
