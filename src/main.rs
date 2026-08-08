@@ -8374,6 +8374,11 @@ async fn try_fallback_upstream(
                             ctx.upstream_error = true;
                             Some(openai_error_frame(&msg))
                         } else {
+                            debug!(
+                                req_id,
+                                "fallback: transport error after success \
+                                 terminator — error frame suppressed"
+                            );
                             None
                         };
                         if let Some(frame) = frame {
@@ -11634,7 +11639,8 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
             "message_stop",
             &serde_json::json!({"type": "message_stop"}),
         ));
-        ctx.message_started = false; // prevent duplicate from [DONE]
+        // message_stopped's early-return keeps a trailing [DONE] (or anything
+        // else) from emitting a duplicate message_stop.
         ctx.message_stopped = true;
     }
 
