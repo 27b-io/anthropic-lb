@@ -48,9 +48,9 @@ which triggers `release.yml` (build + crates.io) and `docker.yml`.
   must keep `chore(main): release` in its Ignored Title Keywords (Kodus
   console → Settings → Code Review → General); there is no in-repo config
   for this unless the console's config-file override is enabled.
-- **crates.io requires trusted publishing** — a green `release.yml` publish
-  job is the only publish path; there is no manual token fallback. The
-  publish job deliberately gates on `validate` only, not the binary matrix.
+- **crates.io requires trusted publishing** — a green `release.yml` `publish`
+  job is the only publishing path; there is no manual token fallback. The
+  `publish` job deliberately gates on `validate` only, not the binary matrix.
 
 ## Deployment
 
