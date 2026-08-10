@@ -14266,19 +14266,7 @@ async fn fallback_translated_stream_no_error_frame_after_message_stop() {
         info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
     }
 
-    let app = Router::new()
-        .fallback(any(proxy_handler))
-        .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
+    let addr = serve(build_router(state.clone())).await;
 
     let resp = Client::new()
         .post(format!("http://{}/v1/messages", addr))
