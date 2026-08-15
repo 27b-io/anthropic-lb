@@ -18222,14 +18222,54 @@ mod redis_integration {
         );
     }
 
+    /// LAB-1962 Kody amendment: the poisoned-value classifier must match
+    /// only server-reported value errors (the verbatim WRONGTYPE /
+    /// non-integer frames Redis and Dragonfly emit) and never transport
+    /// failures — a transport match would reintroduce the F8 fleet-wide
+    /// counter erasure this ticket removed.
+    #[test]
+    fn budget_value_poisoned_classifies_server_value_errors_only() {
+        use fred::error::{RedisError, RedisErrorKind};
+        assert!(AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::InvalidArgument,
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+        )));
+        assert!(AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::Unknown,
+            "ERR value is not an integer or out of range",
+        )));
+        // Transport failures leave a valid counter behind — never delete.
+        assert!(!AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::IO,
+            "Connection reset by peer (os error 104)",
+        )));
+        assert!(!AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::Timeout,
+            "Request timed out",
+        )));
+        // Overflow means the counter holds a valid (huge) integer — GET
+        // still reads it and check_budget denies; that is real accounting,
+        // not poison.
+        assert!(!AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::Unknown,
+            "ERR increment or decrement would overflow",
+        )));
+    }
+
     /// LAB-1962 (panel F8) — reversal of the LAB-931 pin, which deliberately
-    /// deferred this: INCRBY failure must NOT delete the shared counter (one
-    /// replica's failed write must never erase fleet-wide accounting), and an
+    /// deferred this: a transport-level INCRBY failure must NOT delete the
+    /// shared counter (one replica's failed write must never erase
+    /// fleet-wide accounting — see
+    /// budget_denies_after_incrby_lost_to_dead_backend_and_revival), and an
     /// absent key with redis reachable falls through to the LOCAL floor
-    /// instead of authoritatively allowing. A present under-limit counter
-    /// remains authoritative over larger local state — that pin stands.
+    /// instead of authoritatively allowing. Amended by Kody review on
+    /// LAB-1962: a POISONED value (server-reported WRONGTYPE / non-integer)
+    /// is the one case that still deletes — such a key fails every INCRBY
+    /// and GET for its full 48h TTL, so leaving it wedges cross-replica
+    /// accounting for the day. A present under-limit counter remains
+    /// authoritative over larger local state — that pin stands.
     #[tokio::test]
-    async fn budget_incrby_failure_preserves_key_and_absent_key_uses_local_floor() {
+    async fn budget_incrby_poisoned_key_self_heals_and_absent_key_uses_local_floor() {
         let Some((mut conn, fred)) = redis_test_conn(6).await else {
             return;
         };
@@ -18260,16 +18300,14 @@ mod redis_integration {
             "local fallback must enforce while the redis value is unreadable"
         );
 
-        // INCRBY fails on the poisoned key → the key SURVIVES (LAB-1962
-        // removed the LAB-931 delete-on-failure), local still updated.
+        // INCRBY fails with a server-reported value error → the poisoned key
+        // is DELETED so the shared counter can rebuild (Kody amendment on
+        // LAB-1962). Only transport failures preserve the key.
         state.record_budget_usage("poison-cli", 10).await;
         assert_eq!(
-            conn.get::<_, Option<String>>(&key)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("not-a-number"),
-            "failed INCRBY must NOT delete the shared counter (LAB-1962/F8)"
+            conn.get::<_, Option<String>>(&key).await.unwrap(),
+            None,
+            "poisoned budget key must self-heal via DEL so the counter can rebuild"
         );
         assert_eq!(
             state
@@ -18283,10 +18321,10 @@ mod redis_integration {
             "local accumulator must survive the redis failure"
         );
 
-        // Absent key + reachable redis + local over limit → the local floor
-        // gates. Under the pre-LAB-1962 contract Ok(None) was an
-        // authoritative allow — the enforcement bypass the panel flagged.
-        let _: () = conn.del(&key).await.unwrap();
+        // Absent key (just self-healed) + reachable redis + local over limit
+        // → the local floor gates. Under the pre-LAB-1962 contract Ok(None)
+        // was an authoritative allow — the enforcement bypass the panel
+        // flagged.
         assert_eq!(
             state.check_budget("poison-cli").await,
             Err(0),

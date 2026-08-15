@@ -6210,12 +6210,25 @@ impl AppState {
         Ok(())
     }
 
+    /// True when a Redis error means the budget key's VALUE is unusable
+    /// (server-reported WRONGTYPE or non-integer), as opposed to a transport
+    /// failure. Server error frames arrive verbatim in `details()` — Redis
+    /// and Dragonfly both emit these exact strings — while IO/timeout errors
+    /// never do, so a poisoned key is safely distinguishable from a lost
+    /// write.
+    fn budget_value_poisoned(e: &fred::error::RedisError) -> bool {
+        let details = e.details();
+        details.starts_with("WRONGTYPE") || details.contains("not an integer")
+    }
+
     /// Record tokens against a client's daily budget.
     /// Updates local state synchronously; awaits Redis INCRBY inline to prevent TOCTOU races.
-    /// On Redis INCRBY failure the increment is lost from the shared counter — the key is
-    /// left untouched so one replica's failed write never erases fleet-wide accounting;
-    /// the local accumulator (updated first, before any Redis I/O) keeps the floor
-    /// (LAB-1962).
+    /// On a transport-level INCRBY failure the increment is lost from the shared counter —
+    /// the key is left untouched so one replica's failed write never erases fleet-wide
+    /// accounting; the local accumulator (updated first, before any Redis I/O) keeps the
+    /// floor (LAB-1962). A server-reported poisoned value (WRONGTYPE / non-integer) is the
+    /// one case that still deletes: the key is unreadable garbage for its full TTL and
+    /// deleting it lets the shared counter rebuild.
     async fn record_budget_usage(&self, client_id: &str, tokens: u64) {
         if tokens == 0 || !self.client_budgets.contains_key(client_id) {
             return;
@@ -6253,13 +6266,32 @@ impl AppState {
                         tracing::warn!(error = %e, "redis EXPIRE failed for budget key");
                     }
                 }
+                Err(e) if Self::budget_value_poisoned(&e) => {
+                    // The server itself reported the key's value as
+                    // unusable (WRONGTYPE / non-integer). Such a key fails
+                    // every INCRBY and GET for its full TTL and carries no
+                    // real accounting, so deleting it is the only way the
+                    // shared counter can rebuild — and check_budget's
+                    // absent-key local floor means the DEL cannot recreate
+                    // the old allow-bypass (LAB-1962 Kody review).
+                    tracing::warn!(
+                        error = %e,
+                        key = %key,
+                        "budget key holds a non-integer value, deleting so the shared counter can rebuild"
+                    );
+                    let del_result: Result<u64, fred::error::RedisError> =
+                        redis.del(key.as_str()).await;
+                    if let Err(del_err) = del_result {
+                        tracing::warn!(error = %del_err, key = %key, "failed to delete poisoned budget key");
+                    }
+                }
                 Err(e) => {
-                    // Do NOT delete the shared counter: erasing it on one
-                    // replica's write failure destroyed the fleet's day of
-                    // accounting and, with the old absent-key allow in
-                    // check_budget, bypassed enforcement entirely
-                    // (LAB-1962/F8). The increment is lost; check_budget's
-                    // local floor covers this replica.
+                    // Transport failure: do NOT delete the shared counter —
+                    // erasing a valid counter on one replica's write failure
+                    // destroyed the fleet's day of accounting and, with the
+                    // old absent-key allow in check_budget, bypassed
+                    // enforcement entirely (LAB-1962/F8). The increment is
+                    // lost; check_budget's local floor covers this replica.
                     tracing::warn!(
                         error = %e,
                         key = %key,
