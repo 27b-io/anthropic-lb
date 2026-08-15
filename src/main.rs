@@ -6166,7 +6166,9 @@ impl AppState {
     /// Check if a client is within their daily token budget. Returns Ok(()) or Err with remaining.
     /// When Redis is available, a present counter is authoritative; an absent key or a read
     /// error falls through to the local floor — an absent key may be a counter lost to a
-    /// failed INCRBY, not genuine zero usage (LAB-1962).
+    /// failed INCRBY, or a poisoned key record_budget_usage deliberately deleted (LAB-1962).
+    /// The poison self-heal DEL is only safe because of this floor: relaxing the absent-key
+    /// path back to an authoritative allow would reopen the enforcement bypass.
     async fn check_budget(&self, client_id: &str) -> Result<(), u64> {
         let limit = match self.client_budgets.get(client_id) {
             Some(&limit) => limit,
@@ -6209,6 +6211,21 @@ impl AppState {
         }
         Ok(())
     }
+
+    /// Atomic check-and-delete for a poisoned budget key: deletes only if the
+    /// value is STILL non-numeric at delete time. A bare DEL issued after the
+    /// INCRBY error can land late (concurrent replicas also healing, or fred
+    /// replaying it after a reconnect) and would erase a counter the fleet
+    /// already rebuilt.
+    const BUDGET_DEL_IF_POISONED_SCRIPT: &'static str = r#"
+        if redis.call('TYPE', KEYS[1]).ok ~= 'string' then
+            return redis.call('DEL', KEYS[1])
+        end
+        if tonumber(redis.call('GET', KEYS[1])) == nil then
+            return redis.call('DEL', KEYS[1])
+        end
+        return 0
+        "#;
 
     /// True when a Redis error means the budget key's VALUE is unusable
     /// (server-reported WRONGTYPE or non-integer), as opposed to a transport
@@ -6267,20 +6284,22 @@ impl AppState {
                     }
                 }
                 Err(e) if Self::budget_value_poisoned(&e) => {
-                    // The server itself reported the key's value as
-                    // unusable (WRONGTYPE / non-integer). Such a key fails
-                    // every INCRBY and GET for its full TTL and carries no
-                    // real accounting, so deleting it is the only way the
-                    // shared counter can rebuild — and check_budget's
-                    // absent-key local floor means the DEL cannot recreate
-                    // the old allow-bypass (LAB-1962 Kody review).
+                    // Poisoned value: delete so the counter can rebuild (see
+                    // fn doc). Safe only because check_budget's absent-key
+                    // local floor closes the old allow-bypass; the Lua guard
+                    // keeps a late DEL from erasing a rebuilt valid counter.
                     tracing::warn!(
                         error = %e,
                         key = %key,
                         "budget key holds a non-integer value, deleting so the shared counter can rebuild"
                     );
-                    let del_result: Result<u64, fred::error::RedisError> =
-                        redis.del(key.as_str()).await;
+                    let del_result: Result<RedisValue, fred::error::RedisError> = redis
+                        .eval(
+                            Self::BUDGET_DEL_IF_POISONED_SCRIPT,
+                            vec![key.as_str()],
+                            Vec::<String>::new(),
+                        )
+                        .await;
                     if let Err(del_err) = del_result {
                         tracing::warn!(error = %del_err, key = %key, "failed to delete poisoned budget key");
                     }

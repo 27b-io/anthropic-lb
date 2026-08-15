@@ -18345,6 +18345,24 @@ mod redis_integration {
             state.check_budget("poison-cli").await.is_ok(),
             "deliberate pin: a reachable redis counter (5) is authoritative over larger local state (165)"
         );
+
+        // The Lua guard is the race half of the fix: a DEL landing late
+        // (fred reconnect replay, or a second replica healing concurrently)
+        // must never erase a valid counter the fleet already rebuilt.
+        // Evaluated directly against the rebuilt numeric counter: refuses.
+        let refused: i64 = redis::cmd("EVAL")
+            .arg(AppState::BUDGET_DEL_IF_POISONED_SCRIPT)
+            .arg(1)
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(refused, 0, "guard must refuse to delete a numeric counter");
+        assert_eq!(
+            conn.get::<_, Option<u64>>(&key).await.unwrap(),
+            Some(5),
+            "a late guarded DEL must leave rebuilt accounting intact"
+        );
     }
 
     /// LAB-1962 AC3: a kill-proxy-induced INCRBY failure loses the increment
