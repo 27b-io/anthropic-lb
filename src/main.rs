@@ -6213,15 +6213,31 @@ impl AppState {
     }
 
     /// Atomic check-and-delete for a poisoned budget key: deletes only if the
-    /// value is STILL non-numeric at delete time. A bare DEL issued after the
-    /// INCRBY error can land late (concurrent replicas also healing, or fred
-    /// replaying it after a reconnect) and would erase a counter the fleet
-    /// already rebuilt.
+    /// value STILL cannot be INCRBY'd at delete time. A bare DEL issued after
+    /// the INCRBY error can land late (concurrent replicas also healing, or
+    /// fred replaying it after a reconnect) and would erase a counter the
+    /// fleet already rebuilt. "Still poisoned" is decided by Redis's own
+    /// parser — a zero-increment INCRBY probe — NOT Lua's tonumber(), which
+    /// accepts values INCRBY rejects ("1.5", "1e3", hex, out-of-i64-range);
+    /// any value in that gap would wedge the counter for its full TTL
+    /// (LAB-1962 review). The probe also errors on WRONGTYPE keys, so no
+    /// separate TYPE check is needed; a zero increment on a valid counter
+    /// leaves its value and TTL untouched and cannot overflow. The EXISTS
+    /// gate stops the probe from creating the key at 0 — which check_budget
+    /// would treat as an authoritative fleet-wide allow. The probe error
+    /// must match the same value-error frames as budget_value_poisoned
+    /// (keep the two in lockstep): INCRBY can also fail for non-value
+    /// reasons — notably OOM at maxmemory, where DEL still succeeds — and
+    /// deleting a valid counter on such an error would be exactly the
+    /// erasure this guard exists to prevent.
     const BUDGET_DEL_IF_POISONED_SCRIPT: &'static str = r#"
-        if redis.call('TYPE', KEYS[1]).ok ~= 'string' then
-            return redis.call('DEL', KEYS[1])
+        if redis.call('EXISTS', KEYS[1]) == 0 then
+            return 0
         end
-        if tonumber(redis.call('GET', KEYS[1])) == nil then
+        local probe = redis.pcall('INCRBY', KEYS[1], 0)
+        if type(probe) == 'table' and probe.err
+            and (probe.err:find('WRONGTYPE', 1, true) == 1
+                or probe.err:find('not an integer', 1, true)) then
             return redis.call('DEL', KEYS[1])
         end
         return 0
@@ -6232,7 +6248,9 @@ impl AppState {
     /// failure. Server error frames arrive verbatim in `details()` — Redis
     /// and Dragonfly both emit these exact strings — while IO/timeout errors
     /// never do, so a poisoned key is safely distinguishable from a lost
-    /// write.
+    /// write. BUDGET_DEL_IF_POISONED_SCRIPT matches the same two frames on
+    /// the Lua side — change them together or the guard and classifier
+    /// drift.
     fn budget_value_poisoned(e: &fred::error::RedisError) -> bool {
         let details = e.details();
         details.starts_with("WRONGTYPE") || details.contains("not an integer")

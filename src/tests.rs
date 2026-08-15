@@ -18363,6 +18363,46 @@ mod redis_integration {
             Some(5),
             "a late guarded DEL must leave rebuilt accounting intact"
         );
+
+        // tonumber()-gap regression (LAB-1962 review): values Lua's
+        // tonumber() accepts but INCRBY rejects ("1.5" was the reported
+        // wedge; exponent, hex, padded, and out-of-i64-range forms sit in
+        // the same gap) must still be deleted — such a key fails every
+        // INCRBY for its full TTL, which is the exact wedge the self-heal
+        // exists to clear.
+        for gap in ["1.5", "1e3", "0x10", " 1", "9223372036854775808"] {
+            let _: () = conn.set(&key, gap).await.unwrap();
+            let deleted: i64 = redis::cmd("EVAL")
+                .arg(AppState::BUDGET_DEL_IF_POISONED_SCRIPT)
+                .arg(1)
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(deleted, 1, "guard must delete tonumber-gap value {gap:?}");
+            assert_eq!(
+                conn.get::<_, Option<String>>(&key).await.unwrap(),
+                None,
+                "tonumber-gap value {gap:?} must not survive the guard"
+            );
+        }
+
+        // WRONGTYPE self-heal: the guard's INCRBY probe errors on non-string
+        // keys too — the removed TYPE branch must stay covered by a test,
+        // not just the doc comment's equivalence claim.
+        let _: () = conn.rpush(&key, "x").await.unwrap();
+        let deleted: i64 = redis::cmd("EVAL")
+            .arg(AppState::BUDGET_DEL_IF_POISONED_SCRIPT)
+            .arg(1)
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1, "guard must delete a WRONGTYPE (list) key");
+        assert!(
+            !conn.exists::<_, bool>(&key).await.unwrap(),
+            "WRONGTYPE key must not survive the guard"
+        );
     }
 
     /// LAB-1962 AC3: a kill-proxy-induced INCRBY failure loses the increment
