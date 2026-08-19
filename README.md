@@ -564,8 +564,8 @@ The Anthropic↔OpenAI translation layer is not lossless. When an Anthropic-form
 - **Silently dropped**: `tool_choice: {"type": "none"}` — the only unhandled `tool_choice` variant.
 - **Hard 400, no retry** (request itself is the problem, so rotating endpoints won't help): `document` content blocks (PDFs), and image `source.type` values other than `base64`/`url`.
 - **Streaming responses from `openai` endpoints record no token usage** — budget/utilization checks still run, but nothing is debited (non-streaming has been debited since #96 / LAB-712).
-- **In-band upstream SSE error events are dropped mid-stream** rather than surfaced to the client ([#94](https://github.com/27b-io/anthropic-lb/issues/94), open).
-- **The emergency brake only watches Anthropic endpoints** and fires pre-routing: once the Anthropic pool is saturated it 429s every request, even ones whose model is served exclusively by an `openai` endpoint with capacity to spare.
+- **In-band upstream SSE error events are dropped mid-stream on translated streams** (Anthropic-format requests streamed from an `openai` endpoint) rather than surfaced to the client ([#94](https://github.com/27b-io/anthropic-lb/issues/94), open); direct passthrough (`POST /v1/chat/completions`) forwards them unchanged.
+- **The emergency brake only watches Anthropic endpoints** and fires pre-routing: once the Anthropic pool is saturated it 429s every authenticated non-operator request (operator clients bypass it), even ones whose model is served exclusively by an `openai` endpoint with capacity to spare.
 
 ---
 
