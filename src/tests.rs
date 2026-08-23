@@ -4681,6 +4681,39 @@ async fn spawn_status_then_ok_upstream(
     (format!("http://{addr}"), hits)
 }
 
+/// Axum mock upstream that captures each raw request body on the returned
+/// channel, then replies with `status` + `body`. For tests that must assert
+/// on the exact wire bytes an endpoint received — `spawn_mock_upstream()` is
+/// canned-Anthropic/always-200 and does not capture, and the raw-TCP mocks
+/// above only count hits.
+async fn spawn_capturing_upstream(
+    status: StatusCode,
+    body: &'static [u8],
+) -> (String, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+    let app = Router::new().fallback(any(move |req: Request<Body>| {
+        let tx = tx.clone();
+        async move {
+            let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let _ = tx.send(bytes).await;
+            (
+                status,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), rx)
+}
+
 /// GH #97 regression: a 429 from a `Protocol::OpenAI` endpoint must set a
 /// hard-limit cooldown (honouring `retry-after`) so a SUBSEQUENT request
 /// skips it at `pick_endpoint` instead of re-hammering an upstream that
@@ -14476,63 +14509,19 @@ async fn proxy_handler_translates_to_openai_endpoint() {
 /// this test's thread, so the thread-local counter sees exactly this request.
 #[tokio::test]
 async fn proxy_handler_translates_once_across_endpoint_rotation() {
-    // Failing upstream: captures the raw body, then 500s → rotate.
-    let (bad_tx, mut bad_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
-    let bad_app = Router::new().fallback(any(move |req: Request<Body>| {
-        let tx = bad_tx.clone();
-        async move {
-            let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let _ = tx.send(bytes).await;
-            (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
-        }
-    }));
-    let bad_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bad_addr = bad_listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(bad_listener, bad_app).await.unwrap();
-    });
-
-    // Healthy upstream: captures the raw body, returns an OpenAI response.
-    let (ok_tx, mut ok_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
-    let ok_app = Router::new().fallback(any(move |req: Request<Body>| {
-        let tx = ok_tx.clone();
-        async move {
-            let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let _ = tx.send(bytes).await;
-            (
-                StatusCode::OK,
-                axum::Json(serde_json::json!({
-                    "id": "chatcmpl-x",
-                    "object": "chat.completion",
-                    "model": "claude-opus-4-7",
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "hi back"},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-                })),
-            )
-                .into_response()
-        }
-    }));
-    let ok_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ok_addr = ok_listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(ok_listener, ok_app).await.unwrap();
-    });
+    // Failing upstream 500s → rotate; healthy upstream serves a canned
+    // OpenAI completion. Both capture the raw wire body for comparison.
+    let (bad_url, mut bad_rx) =
+        spawn_capturing_upstream(StatusCode::INTERNAL_SERVER_ERROR, b"boom").await;
+    let (ok_url, mut ok_rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
 
     // Priority 0 = failing endpoint picked first; priority 100 = healthy
     // rotation target (deterministic ordering, same trick as LAB-365).
     let mut state = test_state_with(vec![]);
     let mut bad_ep = make_endpoint("bad-gw", Protocol::OpenAI);
-    bad_ep.base_url = format!("http://{}", bad_addr);
+    bad_ep.base_url = bad_url;
     let mut ok_ep = make_endpoint("ok-gw", Protocol::OpenAI);
-    ok_ep.base_url = format!("http://{}", ok_addr);
+    ok_ep.base_url = ok_url;
     ok_ep.priority = 100;
     {
         let s = Arc::get_mut(&mut state).unwrap();
