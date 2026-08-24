@@ -50,7 +50,8 @@ probe_interval_secs = 300
 # LB, [[clients]] credentials are the identity — client_names is lab-only.
 # trusted_proxies = ["10.128.0.0/20"]
 
-# Failed-auth throttle (LAB-1192): after auth_failure_limit failures from one
+# Failed-auth throttle (LAB-1193, superseding LAB-1192 AC-11 after the
+# 2026-08-24 shared-IP outage): after auth_failure_limit failures from one
 # client IP inside the window, further INVALID credentials get 429 +
 # retry-after. Valid credentials always pass, so one bad caller behind a shared
 # NAT/LB cannot lock out authenticated neighbours. Counted in

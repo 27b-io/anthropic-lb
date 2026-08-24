@@ -71,9 +71,11 @@ struct Config {
     /// otherwise the peer address is used and the header is ignored entirely.
     /// Empty/absent = header never consulted (direct-connection behaviour).
     trusted_proxies: Option<Vec<String>>,
-    /// LAB-1192: failed-auth throttle — failures per client IP inside the
-    /// window before further requests from that IP get 429. 0 disables.
-    /// Default: 10.
+    /// LAB-1193 amendment: failed-auth throttle — failures per client IP
+    /// inside the window before further INVALID credentials from that IP get
+    /// 429; valid credentials always pass. Supersedes LAB-1192 AC-11's
+    /// pre-comparison ordering after the 2026-08-24 shared-IP outage.
+    /// 0 disables. Default: 10.
     auth_failure_limit: Option<u32>,
     /// LAB-1192: failed-auth throttle window in seconds. Default: 300.
     auth_failure_window_secs: Option<u64>,
@@ -1815,15 +1817,20 @@ impl AppState {
         Ok(None)
     }
 
-    /// Authenticate, then throttle failed credentials (LAB-1192 AC-11).
+    /// Authenticate, then throttle failed credentials (LAB-1193).
     ///
-    /// The key comparison deliberately runs before the throttle decision.
+    /// This supersedes LAB-1192 AC-11's pre-comparison ordering after the
+    /// 2026-08-24 shared-IP outage. The key comparison deliberately runs
+    /// before the throttle decision.
     /// Valid credentials always pass, even when the resolved IP has an active
     /// failure window: behind NAT or an LB that IP may represent unrelated
     /// callers, and rejecting a known-good principal turns ten bad requests
     /// into a five-minute denial of service for every neighbour. Invalid
     /// credentials still get `429 + retry-after` once the IP reaches the
     /// limit, and successful traffic does NOT clear the shared failure state.
+    /// This trade relies on `MIN_KEY_LEN` keeping credential guessing
+    /// impractical; if the credential floor is lowered, restore AC-11's
+    /// pre-comparison ordering.
     ///
     /// Every rejection is counted per route in
     /// `anthropic_auth_failures_total`; throttle 429s keep the metric rising
@@ -12614,14 +12621,17 @@ async fn main() {
         );
     } else if !config.clients.is_empty() || config.proxy_key.is_some() {
         // Credentials but no trusted_proxies: behind a load balancer every
-        // client collapses to the LB's peer IP, so the allowlist admits the
-        // LB (i.e. everything) and the failed-auth throttle can be tripped for
-        // ALL clients by one bad neighbour. Fine for a direct-exposed instance;
-        // a footgun the moment an LB is introduced. Warn loudly (LAB-1192).
+        // client collapses to the LB's peer IP, leaving one shared allowlist
+        // decision and one shared invalid-credential throttle bucket. Valid
+        // credentials still pass, but source attribution and per-client
+        // failure isolation are lost. Warn loudly (LAB-1192, amended by
+        // LAB-1193).
         warn!(
             "no trusted_proxies configured — if this instance sits behind a load balancer, \
-             all clients share the LB's peer IP for the allowlist and failed-auth throttle; \
-             set trusted_proxies to the LB's address range"
+             all clients share the LB's peer IP for the allowlist decision and one \
+             invalid-credential throttle bucket; valid credentials still pass, but \
+             per-client source attribution and failure isolation are lost; set \
+             trusted_proxies to the LB's address range"
         );
     }
 
