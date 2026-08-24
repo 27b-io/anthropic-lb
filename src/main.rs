@@ -1596,10 +1596,11 @@ const MIN_KEY_LEN: usize = 32;
 /// Per-client-IP failed-authentication throttle (LAB-1192).
 ///
 /// Fixed window per IP: the first failure starts the window, subsequent
-/// failures increment the count, and once the count reaches `max_failures`
-/// every request from that IP gets `429 + retry-after` until the window
-/// expires — BEFORE any key comparison runs, so a guesser locked out of the
-/// timing surface stays locked out even when it eventually guesses right.
+/// failures increment the count, and once the count reaches `max_failures`,
+/// further INVALID credentials from that IP get `429 + retry-after` until the
+/// window expires. Valid credentials always pass: an IP may represent many
+/// callers behind a NAT or load balancer, so one bad caller must not lock out
+/// every authenticated neighbour sharing that address.
 struct AuthThrottle {
     /// Failures per window before throttling. 0 = throttle disabled.
     max_failures: u32,
@@ -1697,18 +1698,6 @@ impl AuthThrottle {
             }
         }
     }
-
-    /// Drop `ip`'s failure state — called after a SUCCESSFUL authentication so
-    /// a client's own sporadic typos never accumulate toward a lockout, and a
-    /// recovered client immediately stops counting against a shared source IP.
-    fn clear(&self, ip: &IpAddr) {
-        if self.max_failures == 0 {
-            return;
-        }
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.remove(ip);
-        }
-    }
 }
 
 impl AppState {
@@ -1777,14 +1766,12 @@ impl AppState {
     /// whole purpose is to narrow one.
     fn authenticate(
         &self,
-        client_ip: &IpAddr,
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
     ) -> Result<Option<&ClientConfig>, Box<Response>> {
         // Boxed Err, matching `reserve_request_body` — an inline `Response` is
         // 128+ bytes on the hot success path (clippy::result_large_err).
         let unauthorized = || -> Box<Response> {
-            warn!(client = %client_ip, "rejected: invalid or missing credential");
             Box::new((StatusCode::UNAUTHORIZED, "unauthorized").into_response())
         };
         let from_header = headers.get("x-api-key").and_then(|v| v.to_str().ok());
@@ -1828,19 +1815,19 @@ impl AppState {
         Ok(None)
     }
 
-    /// `authenticate` behind the failed-auth throttle (LAB-1192 AC-11).
+    /// Authenticate, then throttle failed credentials (LAB-1192 AC-11).
     ///
-    /// A throttled IP gets `429 + retry-after` BEFORE the key comparison runs
-    /// — the guessing surface (including its timing) closes entirely, even
-    /// for a correct guess, until the window expires. Failures are recorded
-    /// against the AC-7 resolved client IP and counted per route in
-    /// `anthropic_auth_failures_total`; the 429 short-circuit is counted
-    /// separately so the metric keeps rising through a sustained attack
-    /// instead of plateauing at the limit.
+    /// The key comparison deliberately runs before the throttle decision.
+    /// Valid credentials always pass, even when the resolved IP has an active
+    /// failure window: behind NAT or an LB that IP may represent unrelated
+    /// callers, and rejecting a known-good principal turns ten bad requests
+    /// into a five-minute denial of service for every neighbour. Invalid
+    /// credentials still get `429 + retry-after` once the IP reaches the
+    /// limit, and successful traffic does NOT clear the shared failure state.
     ///
-    /// A SUCCESSFUL authentication clears the IP's failure state, so a client
-    /// whose own earlier typos accumulated does not drift toward a lockout,
-    /// and a recovered client stops counting against a shared source IP.
+    /// Every rejection is counted per route in
+    /// `anthropic_auth_failures_total`; throttle 429s keep the metric rising
+    /// through a sustained attack instead of plateauing at the limit.
     fn authenticate_throttled(
         &self,
         client_ip: &IpAddr,
@@ -1848,32 +1835,31 @@ impl AppState {
         allow_bearer: bool,
         route: &'static str,
     ) -> Result<Option<&ClientConfig>, Box<Response>> {
-        if let Some(retry_after) = self.auth_throttle.check(client_ip) {
-            warn!(
-                client = %client_ip,
-                route,
-                retry_after,
-                "rejected: failed-auth throttle active"
-            );
-            self.count_auth_failure(route);
-            let mut resp = (
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many failed authentication attempts",
-            )
-                .into_response();
-            resp.headers_mut()
-                .insert("retry-after", HeaderValue::from(retry_after));
-            return Err(Box::new(resp));
-        }
-        let result = self.authenticate(client_ip, headers, allow_bearer);
-        match &result {
-            Ok(_) => self.auth_throttle.clear(client_ip),
-            Err(_) => {
-                self.auth_throttle.record_failure(*client_ip);
+        match self.authenticate(headers, allow_bearer) {
+            Ok(principal) => Ok(principal),
+            Err(unauthorized) => {
                 self.count_auth_failure(route);
+                if let Some(retry_after) = self.auth_throttle.check(client_ip) {
+                    warn!(
+                        client = %client_ip,
+                        route,
+                        retry_after,
+                        "rejected: failed-auth throttle active"
+                    );
+                    let mut resp = (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "too many failed authentication attempts",
+                    )
+                        .into_response();
+                    resp.headers_mut()
+                        .insert("retry-after", HeaderValue::from(retry_after));
+                    return Err(Box::new(resp));
+                }
+                self.auth_throttle.record_failure(*client_ip);
+                warn!(client = %client_ip, route, "rejected: invalid or missing credential");
+                Err(unauthorized)
             }
         }
-        result
     }
 
     fn count_auth_failure(&self, route: &'static str) {

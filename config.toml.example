@@ -51,8 +51,10 @@ probe_interval_secs = 300
 # trusted_proxies = ["10.128.0.0/20"]
 
 # Failed-auth throttle (LAB-1192): after auth_failure_limit failures from one
-# client IP inside the window, that IP gets 429 + retry-after before any key
-# comparison. Counted in anthropic_auth_failures_total{route}. 0 disables.
+# client IP inside the window, further INVALID credentials get 429 +
+# retry-after. Valid credentials always pass, so one bad caller behind a shared
+# NAT/LB cannot lock out authenticated neighbours. Counted in
+# anthropic_auth_failures_total{route}. 0 disables.
 # auth_failure_limit = 10
 # auth_failure_window_secs = 300
 
