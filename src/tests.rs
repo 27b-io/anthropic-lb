@@ -18222,18 +18222,64 @@ mod redis_integration {
         );
     }
 
-    /// AC4 failure path: INCRBY against a poisoned (non-integer) key fails;
-    /// record_budget_usage must DELETE the key — unblocking future INCRBYs —
-    /// while local state keeps enforcing for as long as the redis read path
-    /// errors.
+    /// LAB-1962 Kody amendment: the poisoned-value classifier must match
+    /// only server-reported value errors (the verbatim WRONGTYPE /
+    /// non-integer frames Redis and Dragonfly emit) and never transport
+    /// failures — a transport match would reintroduce the F8 fleet-wide
+    /// counter erasure this ticket removed.
+    #[test]
+    fn budget_value_poisoned_classifies_server_value_errors_only() {
+        use fred::error::{RedisError, RedisErrorKind};
+        assert!(AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::InvalidArgument,
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+        )));
+        assert!(AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::Unknown,
+            "ERR value is not an integer or out of range",
+        )));
+        // Transport failures leave a valid counter behind — never delete.
+        assert!(!AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::IO,
+            "Connection reset by peer (os error 104)",
+        )));
+        assert!(!AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::Timeout,
+            "Request timed out",
+        )));
+        // Overflow means the counter holds a valid (huge) integer — GET
+        // still reads it and check_budget denies; that is real accounting,
+        // not poison.
+        assert!(!AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::Unknown,
+            "ERR increment or decrement would overflow",
+        )));
+    }
+
+    /// LAB-1962 (panel F8) — reversal of the LAB-931 pin, which deliberately
+    /// deferred this: a transport-level INCRBY failure must NOT delete the
+    /// shared counter (one replica's failed write must never erase
+    /// fleet-wide accounting — see
+    /// budget_denies_after_incrby_lost_to_dead_backend_and_revival), and an
+    /// absent key with redis reachable falls through to the LOCAL floor
+    /// instead of authoritatively allowing. Amended by Kody review on
+    /// LAB-1962: a POISONED value (server-reported WRONGTYPE / non-integer)
+    /// is the one case that still deletes — such a key fails every INCRBY
+    /// and GET for its full 48h TTL, so leaving it wedges cross-replica
+    /// accounting for the day. A present under-limit counter remains
+    /// authoritative over larger local state — that pin stands.
     #[tokio::test]
-    async fn budget_incrby_failure_deletes_key_and_local_fallback_enforces() {
+    async fn budget_incrby_poisoned_key_self_heals_and_absent_key_uses_local_floor() {
         let Some((mut conn, fred)) = redis_test_conn(6).await else {
             return;
         };
         avoid_utc_midnight().await;
         let state = Arc::new(AppState {
-            client_budgets: [("poison-cli".to_string(), 100u64)].into(),
+            client_budgets: [
+                ("poison-cli".to_string(), 100u64),
+                ("fresh-cli".to_string(), 100u64),
+            ]
+            .into(),
             redis: Some(fred),
             ..test_state_base()
         });
@@ -18254,11 +18300,14 @@ mod redis_integration {
             "local fallback must enforce while the redis value is unreadable"
         );
 
-        // INCRBY fails on the poisoned key → key deleted, local still updated.
+        // INCRBY fails with a server-reported value error → the poisoned key
+        // is DELETED so the shared counter can rebuild (Kody amendment on
+        // LAB-1962). Only transport failures preserve the key.
         state.record_budget_usage("poison-cli", 10).await;
-        assert!(
-            !conn.exists::<_, bool>(&key).await.unwrap(),
-            "failed INCRBY must delete the poisoned key"
+        assert_eq!(
+            conn.get::<_, Option<String>>(&key).await.unwrap(),
+            None,
+            "poisoned budget key must self-heal via DEL so the counter can rebuild"
         );
         assert_eq!(
             state
@@ -18272,17 +18321,163 @@ mod redis_integration {
             "local accumulator must survive the redis failure"
         );
 
-        // With the poison gone, the next INCRBY starts clean.
+        // Absent key (just self-healed) + reachable redis + local over limit
+        // → the local floor gates. Under the pre-LAB-1962 contract Ok(None)
+        // was an authoritative allow — the enforcement bypass the panel
+        // flagged.
+        assert_eq!(
+            state.check_budget("poison-cli").await,
+            Err(0),
+            "absent key with redis reachable must fall through to the local floor and deny"
+        );
+
+        // Absent key + no local usage (genuine zero) → still allows.
+        assert!(
+            state.check_budget("fresh-cli").await.is_ok(),
+            "absent key with no local usage must still allow"
+        );
+
+        // A rebuilt under-limit shared counter is authoritative over larger
+        // local state — the surviving half of the LAB-931 pin.
         state.record_budget_usage("poison-cli", 5).await;
         assert_eq!(conn.get::<_, Option<u64>>(&key).await.unwrap(), Some(5));
-
-        // Current contract, pinned deliberately: with redis reachable and the
-        // key rebuilt (5 < 100), the shared counter is authoritative and
-        // check_budget passes even though local memory says 165. The local
-        // count only gates when the redis read path errors.
         assert!(
             state.check_budget("poison-cli").await.is_ok(),
             "deliberate pin: a reachable redis counter (5) is authoritative over larger local state (165)"
+        );
+
+        // The Lua guard is the race half of the fix: a DEL landing late
+        // (fred reconnect replay, or a second replica healing concurrently)
+        // must never erase a valid counter the fleet already rebuilt.
+        // Evaluated directly against the rebuilt numeric counter: refuses.
+        let refused: i64 = redis::cmd("EVAL")
+            .arg(AppState::BUDGET_DEL_IF_POISONED_SCRIPT)
+            .arg(1)
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(refused, 0, "guard must refuse to delete a numeric counter");
+        assert_eq!(
+            conn.get::<_, Option<u64>>(&key).await.unwrap(),
+            Some(5),
+            "a late guarded DEL must leave rebuilt accounting intact"
+        );
+
+        // tonumber()-gap regression (LAB-1962 review): values Lua's
+        // tonumber() accepts but INCRBY rejects ("1.5" was the reported
+        // wedge; exponent, hex, padded, and out-of-i64-range forms sit in
+        // the same gap) must still be deleted — such a key fails every
+        // INCRBY for its full TTL, which is the exact wedge the self-heal
+        // exists to clear.
+        for gap in ["1.5", "1e3", "0x10", " 1", "9223372036854775808"] {
+            let _: () = conn.set(&key, gap).await.unwrap();
+            let deleted: i64 = redis::cmd("EVAL")
+                .arg(AppState::BUDGET_DEL_IF_POISONED_SCRIPT)
+                .arg(1)
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(deleted, 1, "guard must delete tonumber-gap value {gap:?}");
+            assert_eq!(
+                conn.get::<_, Option<String>>(&key).await.unwrap(),
+                None,
+                "tonumber-gap value {gap:?} must not survive the guard"
+            );
+        }
+
+        // WRONGTYPE self-heal: the guard's INCRBY probe errors on non-string
+        // keys too — the removed TYPE branch must stay covered by a test,
+        // not just the doc comment's equivalence claim.
+        let _: () = conn.rpush(&key, "x").await.unwrap();
+        let deleted: i64 = redis::cmd("EVAL")
+            .arg(AppState::BUDGET_DEL_IF_POISONED_SCRIPT)
+            .arg(1)
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1, "guard must delete a WRONGTYPE (list) key");
+        assert!(
+            !conn.exists::<_, bool>(&key).await.unwrap(),
+            "WRONGTYPE key must not survive the guard"
+        );
+    }
+
+    /// LAB-1962 AC3: a kill-proxy-induced INCRBY failure loses the increment
+    /// from the shared counter, but the SAME replica keeps denying once over
+    /// limit — while the backend is dead (error fallback) AND after it
+    /// revives with the key absent (absent-key local floor). Under the
+    /// pre-LAB-1962 contract the revival half returned Ok: reachable redis +
+    /// absent key was an authoritative allow, so every replica granted
+    /// unlimited spend the moment the counter vanished.
+    #[tokio::test]
+    async fn budget_denies_after_incrby_lost_to_dead_backend_and_revival() {
+        let Some(base) = test_redis_url() else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let target = base
+            .trim_start_matches("redis://")
+            .trim_end_matches('/')
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let (proxy_addr, kill) = spawn_killable_proxy(target.clone()).await;
+        let url = format!("redis://{proxy_addr}/15");
+        drop(connect_and_flush(&url).await);
+        let fred = fred_test_client(&url).await;
+        // Independent assertion client, connected DIRECTLY to the backend so
+        // it can verify the increment really was lost (not buffered/replayed).
+        let mut direct = connect(&format!("{}/15", base.trim_end_matches('/'))).await;
+
+        let state = Arc::new(AppState {
+            client_budgets: [("lost-cli".to_string(), 100u64)].into(),
+            redis: Some(fred),
+            ..test_state_base()
+        });
+
+        kill_proxy(kill).await;
+
+        // The very first INCRBY fails (or is skipped once fred notices the
+        // outage) — the shared counter is never created. The local
+        // accumulator carries the only record of the spend (150 > 100).
+        state.record_budget_usage("lost-cli", 150).await;
+        assert_eq!(
+            state.check_budget("lost-cli").await,
+            Err(0),
+            "local fallback must deny while the backend is dead"
+        );
+
+        // Revive the backend at the SAME address; fred reconnects on its own.
+        let (revived_addr, _revived_kill) = spawn_killable_proxy_at(&proxy_addr, target).await;
+        assert_eq!(
+            revived_addr, proxy_addr,
+            "proxy must revive at its old address"
+        );
+        eventually("fred to reconnect after revival", || {
+            let r = state.redis.clone().unwrap();
+            async move { r.ping::<String>().await.is_ok() }
+        })
+        .await;
+
+        // The dead-window increment is lost for good: no key in the backend.
+        let today = AppState::now_epoch() / 86400;
+        let key = format!("alb:budget:lost-cli:{today}");
+        assert_eq!(
+            direct.get::<_, Option<u64>>(&key).await.unwrap(),
+            None,
+            "the dead-window INCRBY must be lost, not buffered and replayed"
+        );
+
+        // The money assertion: redis reachable + absent key must fall
+        // through to the local floor (150 >= 100) and DENY.
+        assert_eq!(
+            state.check_budget("lost-cli").await,
+            Err(0),
+            "absent key after revival must not bypass the local floor (LAB-1962/F8)"
         );
     }
 
@@ -18511,9 +18706,9 @@ mod redis_integration {
 
         kill_proxy(kill).await;
 
-        // Budget: INCRBY and the follow-up DEL both fail; the local
-        // accumulator still advances (50+60=110) and check_budget falls back
-        // to it, refusing over-limit spend with redis dead.
+        // Budget: the INCRBY fails; the local accumulator still advances
+        // (50+60=110) and check_budget falls back to it, refusing
+        // over-limit spend with redis dead.
         state.record_budget_usage("degrade-cli", 60).await;
         assert_eq!(
             state.check_budget("degrade-cli").await,
@@ -18579,8 +18774,8 @@ mod redis_integration {
 
         kill_proxy(kill).await;
 
-        // Dead: INCRBY and its follow-up DEL both fail; the local accumulator
-        // (50+60=110) enforces the 100 budget.
+        // Dead: the INCRBY fails; the local accumulator (50+60=110)
+        // enforces the 100 budget.
         state.record_budget_usage("recover-cli", 60).await;
         assert_eq!(
             state.check_budget("recover-cli").await,
@@ -18597,9 +18792,8 @@ mod redis_integration {
         );
 
         // Coordination resumes: the shared counter (still 50 — the
-        // dead-window INCRBY failed, and so did its delete-on-failure)
-        // becomes authoritative again, flipping check_budget from the local
-        // Err(0) back to Ok.
+        // dead-window INCRBY failed and was lost) becomes authoritative
+        // again, flipping check_budget from the local Err(0) back to Ok.
         eventually("coordination to resume after backend recovery", || {
             let s = state.clone();
             async move { s.check_budget("recover-cli").await.is_ok() }
