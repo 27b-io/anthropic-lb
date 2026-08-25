@@ -6438,8 +6438,10 @@ impl AppState {
     }
 
     /// Shared pre-request gate for all Anthropic-proxied requests.
-    /// Returns Ok(()) or an error Response (429).
-    async fn pre_request_gate(&self, client_id: &str, model: &str) -> Result<(), Response> {
+    /// Returns Ok(()) or an error Response (403/429).
+    ///
+    /// Boxed Err — see `ForwardOutcome` (clippy::result_large_err).
+    async fn pre_request_gate(&self, client_id: &str, model: &str) -> Result<(), Box<Response>> {
         if self.is_operator(client_id) {
             return Ok(()); // operator bypasses everything
         }
@@ -6463,15 +6465,15 @@ impl AppState {
                     truncate_label(model)
                 )
             };
-            return Err((StatusCode::FORBIDDEN, body).into_response());
+            return Err(Box::new((StatusCode::FORBIDDEN, body).into_response()));
         }
 
         // 1. Daily token budget (existing)
         if client_id != "-" && self.check_budget(client_id).await.is_err() {
             warn!(client_id = %client_id, "rejected: daily token budget exceeded");
-            return Err(
+            return Err(Box::new(
                 (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response(),
-            );
+            ));
         }
 
         // 2. Utilization limit (new)
@@ -6490,7 +6492,7 @@ impl AppState {
                 "retry-after",
                 HeaderValue::from_str(&retry_after.to_string()).unwrap(),
             );
-            return Err(resp);
+            return Err(Box::new(resp));
         }
 
         // 3. Emergency brake (new)
@@ -6499,11 +6501,13 @@ impl AppState {
                 client_id = %client_id,
                 "rejected: emergency brake active"
             );
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                "emergency: all accounts near exhaustion",
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "emergency: all accounts near exhaustion",
+                )
+                    .into_response(),
+            ));
         }
 
         Ok(())
@@ -6808,9 +6812,13 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 ///     429 while stashing the upstream's error response, so a model no OTHER
 ///     endpoint can serve still surfaces the real error — a nonexistent-model
 ///     404 must not morph into a synthetic 429 that invites retries.
+// Response payloads are boxed so the enum stays small (one word per payload):
+// it rides in the Err of `classify_retry_status`'s Result, where an inline
+// `Response` is 128+ bytes on the hot success path (clippy::result_large_err —
+// same pattern as `authenticate` / `reserve_request_body`).
 enum ForwardOutcome {
-    Done(Response),
-    RetryModelUnsupported(Response),
+    Done(Box<Response>),
+    RetryModelUnsupported(Box<Response>),
     Retry {
         saw_529: bool,
         push_skip: bool,
@@ -6958,7 +6966,7 @@ async fn classify_retry_status(
             })
         }
         .to_string();
-        return Err(ForwardOutcome::Done(
+        return Err(ForwardOutcome::Done(Box::new(
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .header("content-type", "application/json")
@@ -6966,7 +6974,7 @@ async fn classify_retry_status(
                 .unwrap_or_else(|_| {
                     (StatusCode::BAD_GATEWAY, "upstream redirect refused").into_response()
                 }),
-        ));
+        )));
     }
 
     // 429 → mark hard-limited and try next account
@@ -7041,12 +7049,12 @@ fn apply_round_outcome(
     model_unsupported_resp: &mut Option<Response>,
 ) -> RetryStep {
     match outcome {
-        ForwardOutcome::Done(resp) => RetryStep::Return(resp),
+        ForwardOutcome::Done(resp) => RetryStep::Return(*resp),
         // Model rejected by this endpoint: rotate immediately (another
         // account may serve it) but keep the upstream's error in hand for
         // the case where none does (LAB-941).
         ForwardOutcome::RetryModelUnsupported(resp) => {
-            *model_unsupported_resp = Some(resp);
+            *model_unsupported_resp = Some(*resp);
             skip.push(picked_idx);
             RetryStep::NextAttempt
         }
@@ -7587,7 +7595,7 @@ async fn forward_anthropic(
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
-        ForwardOutcome::Done(response)
+        ForwardOutcome::Done(Box::new(response))
     } else {
         // Non-streaming: buffer, extract usage, forward.
         //
@@ -7637,8 +7645,10 @@ async fn forward_anthropic(
                         }
                     }
                 }
-                return ForwardOutcome::Done(err_builder.body(Body::from(body)).unwrap_or_else(
-                    |_| (StatusCode::BAD_GATEWAY, "upstream body read failed").into_response(),
+                return ForwardOutcome::Done(Box::new(
+                    err_builder.body(Body::from(body)).unwrap_or_else(|_| {
+                        (StatusCode::BAD_GATEWAY, "upstream body read failed").into_response()
+                    }),
                 ));
             }
         };
@@ -7663,7 +7673,7 @@ async fn forward_anthropic(
                     .unwrap_or_else(|_| {
                         (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                     });
-                return ForwardOutcome::RetryModelUnsupported(response);
+                return ForwardOutcome::RetryModelUnsupported(Box::new(response));
             }
         }
         finalize_non_stream(
@@ -7689,7 +7699,7 @@ async fn forward_anthropic(
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
-        ForwardOutcome::Done(response)
+        ForwardOutcome::Done(Box::new(response))
     }
 }
 
@@ -7988,7 +7998,7 @@ async fn proxy_handler(
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
     if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
-        return resp;
+        return *resp;
     }
 
     // LAB-933: serve an opted-in replay from the encrypted response cache.
@@ -8218,7 +8228,7 @@ async fn try_fallback_upstream(
                 );
                 // Terminal, not a retry: the request itself is the problem, so
                 // rotating to another endpoint would just fail the same way.
-                return ForwardOutcome::Done(untranslatable_request_response(&msg));
+                return ForwardOutcome::Done(Box::new(untranslatable_request_response(&msg)));
             }
         };
         match serde_json::to_vec(&openai_body) {
@@ -8346,9 +8356,9 @@ async fn try_fallback_upstream(
         };
         if model_unsupported {
             state.note_model_unsupported(&ep.name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(response);
+            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
         }
-        return ForwardOutcome::Done(response);
+        return ForwardOutcome::Done(Box::new(response));
     }
 
     // Streaming response
@@ -8486,7 +8496,7 @@ async fn try_fallback_upstream(
             );
         });
 
-        return ForwardOutcome::Done(
+        return ForwardOutcome::Done(Box::new(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/event-stream")
@@ -8498,7 +8508,7 @@ async fn try_fallback_upstream(
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "fallback stream error").into_response()
                 }),
-        );
+        ));
     }
 
     // Non-streaming response
@@ -8560,7 +8570,7 @@ async fn try_fallback_upstream(
             upstream = ep.name,
             "fallback: unified endpoint translated response"
         );
-        ForwardOutcome::Done(
+        ForwardOutcome::Done(Box::new(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
@@ -8568,14 +8578,14 @@ async fn try_fallback_upstream(
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
                 }),
-        )
+        ))
     } else {
         info!(
             req_id,
             upstream = ep.name,
             "fallback: unified endpoint forwarded response"
         );
-        ForwardOutcome::Done(
+        ForwardOutcome::Done(Box::new(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
@@ -8583,7 +8593,7 @@ async fn try_fallback_upstream(
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
                 }),
-        )
+        ))
     }
 }
 
@@ -11888,9 +11898,9 @@ async fn forward_openai_compat_anthropic(
             });
         if model_unsupported {
             state.note_model_unsupported(endpoint_name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(response);
+            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
         }
-        return ForwardOutcome::Done(response);
+        return ForwardOutcome::Done(Box::new(response));
     }
 
     if is_streaming {
@@ -12034,7 +12044,7 @@ async fn forward_openai_compat_anthropic(
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
-        return ForwardOutcome::Done(response);
+        return ForwardOutcome::Done(Box::new(response));
     }
 
     // Non-streaming: buffer, translate, return
@@ -12042,9 +12052,9 @@ async fn forward_openai_compat_anthropic(
         Ok(b) => b,
         Err(e) => {
             error!("failed to read upstream response: {e}");
-            return ForwardOutcome::Done(
+            return ForwardOutcome::Done(Box::new(
                 (StatusCode::BAD_GATEWAY, "failed to read upstream response").into_response(),
-            );
+            ));
         }
     };
 
@@ -12059,7 +12069,7 @@ async fn forward_openai_compat_anthropic(
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                 });
-            return ForwardOutcome::Done(response);
+            return ForwardOutcome::Done(Box::new(response));
         }
     };
 
@@ -12096,7 +12106,7 @@ async fn forward_openai_compat_anthropic(
         .unwrap_or_else(|_| {
             (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
         });
-    ForwardOutcome::Done(response)
+    ForwardOutcome::Done(Box::new(response))
 }
 
 async fn openai_chat_handler(
@@ -12175,7 +12185,7 @@ async fn openai_chat_handler(
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
     if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
-        return resp;
+        return *resp;
     }
 
     let mut anthropic_body = translate_openai_to_anthropic(&openai_body);
