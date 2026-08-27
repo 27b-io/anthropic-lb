@@ -804,9 +804,12 @@ WantedBy=multi-user.target
 
 ## Testing
 
-The Rust toolchain is pinned in `rust-toolchain.toml`, so local builds and CI
-use the same compiler — rustup reads the file automatically and installs that
-version on first `cargo` invocation. Toolchain updates arrive as Renovate PRs
+The Rust toolchain is pinned in `rust-toolchain.toml`, so local builds, CI,
+and the Docker image all use the same compiler — rustup reads the file
+automatically and installs that version on first `cargo` invocation. (CI's
+toolchain action only bootstraps `stable`; every `cargo` command still
+resolves through the pin via rustup's toolchain-file override, and the
+Dockerfile copies the file into the builder stage.) Toolchain updates arrive as Renovate PRs
 and are never automerged (CI infra has a wide blast radius). This matters
 because CI runs with `-Dwarnings`: a new stable Rust ships new clippy lints that
 can fail code nobody touched, and with the pin that failure lands as a red
