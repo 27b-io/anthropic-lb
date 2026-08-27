@@ -1,0 +1,12 @@
+# Pinned so a new stable Rust release cannot turn main red with zero commits.
+# CI runs with RUSTFLAGS=-Dwarnings, so a clippy lint added by a new compiler
+# fails code nobody touched (LAB-2214 / #142: 1.98's result_large_err blocked
+# every merge for two days and gated the v0.2.4 release).
+#
+# This must stay a CONCRETE version, never a named channel — Renovate's
+# rust-toolchain manager only bumps concrete versions, and a named channel here
+# would silently reintroduce the drift. Bumps arrive as Renovate PRs; see the
+# Testing section of README.md.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

@@ -804,6 +804,17 @@ WantedBy=multi-user.target
 
 ## Testing
 
+The Rust toolchain is pinned in `rust-toolchain.toml`, so local builds and CI
+use the same compiler — rustup reads the file automatically and installs that
+version on first `cargo` invocation. Toolchain updates arrive as Renovate PRs
+and are never automerged (CI infra has a wide blast radius). This matters
+because CI runs with `-Dwarnings`: a new stable Rust ships new clippy lints that
+can fail code nobody touched, and with the pin that failure lands as a red
+*bump PR* — reviewable, with the lint fixes in the same branch — instead of a
+red `main` that blocks every merge and the next release
+([#142](https://github.com/27b-io/anthropic-lb/issues/142)). Fix new lints
+inside the bump PR; don't weaken `-Dwarnings`.
+
 ```bash
 # Run all tests
 cargo test
