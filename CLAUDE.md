@@ -73,7 +73,7 @@ Single Rust binary: all implementation in `src/main.rs` (~9800 lines) with secti
 ### Core Data Flow
 
 ```text
-Request → resolve_client_ip(peer, x-forwarded-for vs trusted_proxies) → IP allowlist check → failed-auth throttle check → authenticate([[clients]] key, else legacy proxy_key) → resolve client_id (authenticated principal, else x-client-id/IP map) → pre_request_gate(operator bypass → model allow-list → budget → utilization limit → emergency brake) → pick_endpoint(affinity, model, skip) → forward to endpoint → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
+Request → resolve_client_ip(peer, x-forwarded-for vs trusted_proxies) → IP allowlist check → authenticate([[clients]] key, else legacy proxy_key) → throttle failed credentials (valid principals always pass) → resolve client_id (authenticated principal, else x-client-id/IP map) → pre_request_gate(operator bypass → model allow-list → budget → utilization limit → emergency brake) → pick_endpoint(affinity, model, skip) → forward to endpoint → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
 ```
 
 ### Key Sections (in source order)
@@ -160,7 +160,7 @@ Routing consequences (`constraining_7d_claims`):
 | `allow_unauthenticated` | bool? | false | LAB-1192 default-deny escape hatch: startup FAILS with no credentials unless this is explicitly true. Incompatible with configured credentials. Trusted-network-only; warns at boot, and unauthenticated `/_stats`/`/metrics` access warns at most once per route per 5 min (`OPEN_ADMIN_WARN_INTERVAL`) |
 | `allowed_ips` | string[]? | none (allow all) | IP/CIDR allowlist |
 | `trusted_proxies` | string[]? | none | LBs whose `x-forwarded-for` is honoured (LAB-1192). Peer in list ⇒ client IP = rightmost XFF entry not in list; otherwise peer address, header ignored. One resolution function (`resolve_client_ip`), called once per handler |
-| `auth_failure_limit` | u32? | 10 | Failed-auth attempts per client IP in the window before 429 + `retry-after` (pre-comparison). 0 disables. Counted in `anthropic_auth_failures_total{route}`; state bounded at 4096 IPs; eviction purges expired windows first, then the least-established live entry (lowest count, oldest window as tie-breaker) so fresh-failure floods can't flush an active lockout |
+| `auth_failure_limit` | u32? | 10 | Failed-auth attempts per client IP in the window before further invalid credentials get 429 + `retry-after`; valid credentials always pass. 0 disables. Counted in `anthropic_auth_failures_total{route}`; state bounded at 4096 IPs; eviction purges expired windows first, then the least-established live entry (lowest count, oldest window as tie-breaker) so fresh-failure floods can't flush an active lockout |
 | `auth_failure_window_secs` | u64? | 300 | Failed-auth throttle window |
 | `auto_cache` | bool? | true | Auto-inject prompt cache breakpoints |
 | `shadow_log` | string? | none | Path for JSONL audit trail |

@@ -16165,7 +16165,7 @@ fn distinct_client_keys_resolve_to_distinct_identities() {
     for (key, expected) in [("key-geo", "geo"), ("key-radar", "radar")] {
         let headers = hdrs(&[("x-api-key", key)]);
         let principal = state
-            .authenticate(&ip, &headers, false)
+            .authenticate(&headers, false)
             .expect("configured key must authenticate")
             .expect("a [[clients]] match must yield a principal");
         assert_eq!(principal.name, expected);
@@ -16182,7 +16182,7 @@ fn distinct_client_keys_resolve_to_distinct_identities() {
 fn unknown_client_key_is_rejected() {
     let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
     let resp = state
-        .authenticate(&test_ip(), &hdrs(&[("x-api-key", "key-wrong")]), false)
+        .authenticate(&hdrs(&[("x-api-key", "key-wrong")]), false)
         .expect_err("unknown key must not authenticate");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -16191,7 +16191,7 @@ fn unknown_client_key_is_rejected() {
 fn missing_credential_is_rejected_when_clients_configured() {
     let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
     let resp = state
-        .authenticate(&test_ip(), &hyper::HeaderMap::new(), false)
+        .authenticate(&hyper::HeaderMap::new(), false)
         .expect_err("absent credential must not authenticate");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -16204,7 +16204,7 @@ fn client_key_match_is_exact_not_prefix() {
     for wrong in ["key-ge", "key-geo ", "key-geox", "", "KEY-GEO"] {
         assert!(
             state
-                .authenticate(&test_ip(), &hdrs(&[("x-api-key", wrong)]), false)
+                .authenticate(&hdrs(&[("x-api-key", wrong)]), false)
                 .is_err(),
             "'{wrong}' must not authenticate as 'key-geo'"
         );
@@ -16216,18 +16216,17 @@ fn client_key_match_is_exact_not_prefix() {
 #[test]
 fn bearer_credential_accepted_only_where_enabled() {
     let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
-    let ip = test_ip();
     let headers = hdrs(&[("authorization", "Bearer key-geo")]);
 
     let principal = state
-        .authenticate(&ip, &headers, true)
+        .authenticate(&headers, true)
         .expect("bearer must authenticate where enabled")
         .expect("principal");
     assert_eq!(principal.name, "geo");
 
     // The native surface may carry the caller's OWN upstream token in
     // `Authorization` (passthrough endpoints), so bearer is not accepted there.
-    assert!(state.authenticate(&ip, &headers, false).is_err());
+    assert!(state.authenticate(&headers, false).is_err());
 }
 
 #[test]
@@ -16235,11 +16234,7 @@ fn bearer_scheme_match_is_case_insensitive() {
     let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
     let headers = hdrs(&[("authorization", "bEaReR key-geo")]);
     assert_eq!(
-        state
-            .authenticate(&test_ip(), &headers, true)
-            .unwrap()
-            .unwrap()
-            .name,
+        state.authenticate(&headers, true).unwrap().unwrap().name,
         "geo"
     );
 }
@@ -16255,7 +16250,7 @@ fn spoofed_x_client_id_is_ignored_under_clients_table() {
     let ip = test_ip();
     let headers = hdrs(&[("x-api-key", "key-alpha"), ("x-client-id", "bravo")]);
 
-    let principal = state.authenticate(&ip, &headers, false).unwrap().unwrap();
+    let principal = state.authenticate(&headers, false).unwrap().unwrap();
     assert_eq!(principal.name, "alpha");
 
     let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
@@ -16278,7 +16273,7 @@ fn client_names_ip_map_is_ignored_under_clients_table() {
     });
     let ip = test_ip();
     let headers = hdrs(&[("x-api-key", "key-alpha")]);
-    let principal = state.authenticate(&ip, &headers, false).unwrap().unwrap();
+    let principal = state.authenticate(&headers, false).unwrap().unwrap();
     let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
     assert_eq!(rctx.client_id, "alpha");
 }
@@ -16291,10 +16286,9 @@ fn legacy_proxy_key_still_authenticates_and_yields_no_principal() {
         proxy_key: Some("shared-secret".to_string()),
         ..test_state_base()
     });
-    let ip = test_ip();
 
     let principal = state
-        .authenticate(&ip, &hdrs(&[("x-api-key", "shared-secret")]), false)
+        .authenticate(&hdrs(&[("x-api-key", "shared-secret")]), false)
         .expect("correct legacy key must authenticate");
     assert!(
         principal.is_none(),
@@ -16302,11 +16296,9 @@ fn legacy_proxy_key_still_authenticates_and_yields_no_principal() {
     );
 
     assert!(state
-        .authenticate(&ip, &hdrs(&[("x-api-key", "nope")]), false)
+        .authenticate(&hdrs(&[("x-api-key", "nope")]), false)
         .is_err());
-    assert!(state
-        .authenticate(&ip, &hyper::HeaderMap::new(), false)
-        .is_err());
+    assert!(state.authenticate(&hyper::HeaderMap::new(), false).is_err());
 }
 
 #[test]
@@ -16317,7 +16309,7 @@ fn legacy_proxy_key_leaves_x_client_id_resolution_intact() {
     });
     let ip = test_ip();
     let headers = hdrs(&[("x-api-key", "shared-secret"), ("x-client-id", "gastown")]);
-    let principal = state.authenticate(&ip, &headers, false).unwrap();
+    let principal = state.authenticate(&headers, false).unwrap();
     let rctx = RequestContext::from_request(&state, &ip, &headers, principal);
     assert_eq!(
         rctx.client_id, "gastown",
@@ -16329,7 +16321,7 @@ fn legacy_proxy_key_leaves_x_client_id_resolution_intact() {
 fn open_proxy_authenticates_every_request() {
     let state = test_state_with(vec![]);
     assert!(state
-        .authenticate(&test_ip(), &hyper::HeaderMap::new(), false)
+        .authenticate(&hyper::HeaderMap::new(), false)
         .unwrap()
         .is_none());
 }
@@ -16810,7 +16802,7 @@ fn response_cache_tenant_follows_the_authenticated_principal() {
     ]);
     let ip = test_ip();
     let headers = hdrs(&[("x-api-key", "key-alpha"), ("x-client-id", "bravo")]);
-    let principal = state.authenticate(&ip, &headers, false).unwrap().unwrap();
+    let principal = state.authenticate(&headers, false).unwrap().unwrap();
     let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
 
     // The cache is keyed by this exact string (`rc.clients.get(&client_id)`),
@@ -19376,27 +19368,12 @@ fn auth_throttle_capacity_purges_expired_before_evicting() {
     assert!(entries.len() <= 2, "expired entries purged, capacity held");
 }
 
-/// A successful authentication clears the IP's failure state, so a client's
-/// own sporadic typos never drift toward a lockout (bug-hunter/security
-/// finding: shared-IP false lockout mitigation).
-#[test]
-fn auth_throttle_clear_resets_failures() {
-    let t = AuthThrottle::new(3, Duration::from_secs(60));
-    let ip: IpAddr = "203.0.113.7".parse().unwrap();
-    t.record_failure(ip);
-    t.record_failure(ip);
-    t.clear(&ip);
-    // Back to zero: two fresh failures still under the limit.
-    t.record_failure(ip);
-    t.record_failure(ip);
-    assert_eq!(t.check(&ip), None, "clear must reset the counter to zero");
-}
-
-/// The throttle fires BEFORE the key comparison: once tripped, even the
-/// CORRECT credential gets 429 until the window expires — the guessing
-/// surface (including its timing) closes entirely. Also pins the counter.
+/// A locked-out invalid caller must not deny service to a valid principal
+/// sharing its resolved IP (NAT, tailnet proxy, or load balancer). Invalid
+/// attempts remain throttled after the valid request, so success is a bypass
+/// for that authenticated request rather than a reset attackers can induce.
 #[tokio::test]
-async fn throttled_ip_gets_429_even_with_a_valid_key() {
+async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
     acct.base_url = mock_url.to_string();
@@ -19424,10 +19401,10 @@ async fn throttled_ip_gets_429_even_with_a_valid_key() {
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
 
-    // Valid credential, throttled IP: 429 with retry-after, before comparison.
+    // The next invalid credential is throttled with retry-after.
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
-        .header("x-api-key", "key-geo")
+        .header("x-api-key", "key-wrong")
         .body("{}")
         .send()
         .await
@@ -19443,17 +19420,34 @@ async fn throttled_ip_gets_429_even_with_a_valid_key() {
         .expect("retry-after must be whole seconds");
     assert!((1..=60).contains(&retry));
 
-    // Counter = 3 rejected credentials + the 1 throttle-429 = 4. The 429 path
-    // is counted too, so the metric keeps climbing through a sustained attack
-    // instead of plateauing at the limit.
-    assert_eq!(state.auth_failures.lock().unwrap().get("proxy"), Some(&4));
+    // A valid credential from the same IP must still reach the handler.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-geo")
+        .body(r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Success does not erase a shared IP's attack history: another invalid
+    // credential is still throttled, and only failures increment the metric.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-wrong")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(state.auth_failures.lock().unwrap().get("proxy"), Some(&5));
 }
 
-/// Reset-on-success through the real router: a client that fails a couple of
-/// times, then authenticates successfully, is NOT throttled by those earlier
-/// failures — its state was cleared. Mitigates shared-IP false lockouts.
+/// Successful traffic below the limit also leaves the shared IP's failure
+/// history intact. This keeps an authenticated neighbour from accidentally
+/// defeating the invalid-request throttle for an attacker behind the same NAT.
 #[tokio::test]
-async fn successful_auth_clears_prior_failures() {
+async fn successful_auth_does_not_clear_shared_ip_failures() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
     acct.base_url = mock_url.to_string();
@@ -19477,7 +19471,7 @@ async fn successful_auth_clears_prior_failures() {
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
-    // A successful auth clears the two failures.
+    // A successful auth is served but does not clear the two failures.
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
         .header("x-api-key", "key-geo")
@@ -19486,13 +19480,24 @@ async fn successful_auth_clears_prior_failures() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert!(
-        state
-            .auth_throttle
-            .check(&"127.0.0.1".parse().unwrap())
-            .is_none(),
-        "the client's own IP must not be throttled after a success reset it"
-    );
+    // The third bad request is still the threshold-reaching 401; the next is
+    // a 429. If success had cleared the state, both would be 401.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-wrong")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-wrong")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
 }
 
 /// A dual-stack listener delivers IPv4 peers as `::ffff:a.b.c.d`; a v4

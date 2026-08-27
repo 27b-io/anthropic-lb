@@ -110,7 +110,9 @@ probe_interval_secs = 300
 # trusted_proxies = ["10.128.0.0/20"]
 
 # Failed-auth throttle: after this many failures per client IP inside the
-# window, requests from that IP get 429 + retry-after. 0 disables.
+# window, further invalid credentials get 429 + retry-after. Valid credentials
+# always pass so one caller cannot lock out authenticated NAT/LB neighbours.
+# 0 disables.
 # auth_failure_limit = 10
 # auth_failure_window_secs = 300
 
@@ -177,7 +179,7 @@ token = "sk-ant-api03-..."
 | `allow_unauthenticated` | `bool` | `false` | The one escape hatch from default-deny: boot with no credentials at all. Trusted-network-only; incompatible with configured credentials |
 | `allowed_ips` | `[String]?` | `None` | IP/CIDR allowlist (unset = **allow all**) |
 | `trusted_proxies` | `[String]?` | `None` | IPs/CIDRs of load balancers whose `x-forwarded-for` is honoured (unset = header ignored) |
-| `auth_failure_limit` | `u32` | `10` | Failed-auth attempts per client IP inside the window before 429 (0 = throttle off) |
+| `auth_failure_limit` | `u32` | `10` | Failed-auth attempts per client IP inside the window before further invalid credentials get 429; valid credentials always pass (0 = throttle off) |
 | `auth_failure_window_secs` | `u64` | `300` | Failed-auth throttle window |
 | `auto_cache` | `bool` | `true` | Inject prompt caching beta header |
 | `shadow_log` | `String?` | `None` | Path to JSONL shadow log file |
@@ -338,11 +340,11 @@ It **fails closed** on a model it cannot read. The proxy takes the model from th
 | **Per-client keys** | `[[clients]]` | Requires a per-client credential; identity = the credential (401) | **startup error** (unless `allow_unauthenticated`) |
 | **Proxy key** (legacy) | `proxy_key = "<64 hex>"` | Requires a single shared `x-api-key` (401) | **startup error** (unless `allow_unauthenticated`) |
 | **Admin surfaces** | `operators = ["ops"]` | `/_stats` + `/metrics` need an operator credential (401/403) | no one can read them under `[[clients]]` |
-| **Failed-auth throttle** | `auth_failure_limit` / `auth_failure_window_secs` | 429 + `retry-after` per client IP after repeated failures | on (10 / 300s) |
+| **Failed-auth throttle** | `auth_failure_limit` / `auth_failure_window_secs` | Further invalid credentials get 429 + `retry-after` per client IP after repeated failures; valid credentials always pass | on (10 / 300s) |
 | **Trusted proxies** | `trusted_proxies = ["10.128.0.0/20"]` | Real client IP recovered from `x-forwarded-for` behind a listed LB | header ignored |
 | **Model allow-list** | `clients[].models` | Rejects models outside a client's list (403) | all models |
 
-IP check runs first, then the throttle, then the credential check. All apply to every route including `/_stats` and `/metrics`. Credentials are compared in constant time, and startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`).
+IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are compared in constant time, and startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`).
 
 **TLS terminates at the ingress.** The proxy speaks plain HTTP and its container port must never be published directly to the internet — put it behind a TLS-terminating load balancer or ingress, list that LB in `trusted_proxies`, and let the ingress carry the certificate. Bearer credentials without TLS are credentials in cleartext.
 
@@ -357,9 +359,9 @@ Behind a GCLB/Cloudflare/ingress, the TCP peer is the LB — without XFF handlin
 > [!IMPORTANT]
 > Behind a load balancer, **`[[clients]]` credentials are the identity**. The `client_names` IP map is a lab-only convenience: it maps *source addresses*, and once traffic arrives through an LB the recovered XFF address is only as trustworthy as the LB's own header hygiene. Do not hang budgets or operator status on `client_names` on a public ingress.
 
-### Failed-auth throttling (LAB-1192)
+### Failed-auth throttling (LAB-1193; supersedes LAB-1192 AC-11)
 
-A static bearer credential on the public internet gets scanned. After `auth_failure_limit` failures from one client IP inside `auth_failure_window_secs`, further requests from that IP get `429` with `retry-after` **before any key comparison runs** — a locked-out guesser gets nothing back, not even timing, until the window expires. Failures are counted in `anthropic_auth_failures_total{route}` and logged with the resolved client IP. The throttle table is bounded (4096 IPs), so the tracking structure itself cannot be flooded into an OOM — and eviction is threat-aware: expired windows are purged first, then the least-established live entry (lowest failure count, oldest window as tie-breaker) is evicted, so a flood of fresh failures cannot flush an active lockout to reset it.
+This in-process throttle bounds the volume of detailed `401` responses; it does not reduce credential-comparison throughput. Credential-stuffing and request-rate controls belong at the public ingress. After `auth_failure_limit` failures from one client IP inside `auth_failure_window_secs`, further **invalid** credentials from that IP get `429` with `retry-after`. LAB-1193 supersedes LAB-1192 AC-11's pre-comparison ordering after the 2026-08-24 shared-IP outage: credential comparison runs first so a known-good principal still passes when NATs and load balancers collapse unrelated callers onto one resolved address. Successful requests do not clear the shared IP's failure window, so invalid traffic remains throttled until expiry. This trade relies on the enforced `MIN_KEY_LEN = 32`; if the credential floor is lowered, restore AC-11's pre-comparison ordering. Failures are counted in `anthropic_auth_failures_total{route}` and logged with the resolved client IP. The throttle table is bounded (4096 IPs), so the tracking structure itself cannot be flooded into an OOM — and eviction is threat-aware: expired windows are purged first, then the least-established live entry (lowest failure count, oldest window as tie-breaker) is evicted, so a flood of fresh failures cannot flush an active lockout to reset it.
 
 ### Credential-path hardening (LAB-1191)
 
