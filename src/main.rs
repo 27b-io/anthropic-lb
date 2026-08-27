@@ -5137,8 +5137,10 @@ impl AppState {
             // applied some HINCRBYs, re-queuing can over-count by a few next
             // tick. For an error *counter* that bias is correct — a slight
             // over-report beats a silently missed egress fault. (Contrast
-            // record_budget_usage, which deletes-on-failure: over-counting a
-            // budget would wrongly throttle a client.) The deltas also stay
+            // record_budget_usage, which never retries a failed INCRBY:
+            // over-counting a budget would wrongly throttle a client, so the
+            // lost increment is covered by the local floor instead —
+            // LAB-1962.) The deltas also stay
             // visible via the local metrics fallback until Redis heals.
             warn!(error = %e, "redis HINCRBY failed for transport errors; re-queuing deltas locally");
             // Poison-recovering lock: an `if let Ok` here would silently DROP
@@ -6155,7 +6157,11 @@ impl AppState {
     }
 
     /// Check if a client is within their daily token budget. Returns Ok(()) or Err with remaining.
-    /// When Redis is available, checks the global counter; falls back to local on error.
+    /// When Redis is available, a present counter is authoritative; an absent key or a read
+    /// error falls through to the local floor — an absent key may be a counter lost to a
+    /// failed INCRBY, or a poisoned key record_budget_usage deliberately deleted (LAB-1962).
+    /// The poison self-heal DEL is only safe because of this floor: relaxing the absent-key
+    /// path back to an authoritative allow would reopen the enforcement bypass.
     async fn check_budget(&self, client_id: &str) -> Result<(), u64> {
         let limit = match self.client_budgets.get(client_id) {
             Some(&limit) => limit,
@@ -6174,7 +6180,11 @@ impl AppState {
                 let key = format!("alb:budget:{client_id}:{today}");
                 match redis.get::<Option<u64>, _>(key.as_str()).await {
                     Ok(Some(used)) if used >= limit => return Err(0),
-                    Ok(_) => return Ok(()),
+                    Ok(Some(_)) => return Ok(()),
+                    // Absent key: fall through to the local floor. Treating
+                    // absence as an authoritative allow let a single failed
+                    // INCRBY widen the budget fleet-wide (LAB-1962/F8).
+                    Ok(None) => {}
                     Err(e) => {
                         warn!(error = %e, "redis budget check failed, falling back to local");
                     }
@@ -6195,9 +6205,58 @@ impl AppState {
         Ok(())
     }
 
+    /// Atomic check-and-delete for a poisoned budget key: deletes only if the
+    /// value STILL cannot be INCRBY'd at delete time. A bare DEL issued after
+    /// the INCRBY error can land late (concurrent replicas also healing, or
+    /// fred replaying it after a reconnect) and would erase a counter the
+    /// fleet already rebuilt. "Still poisoned" is decided by Redis's own
+    /// parser — a zero-increment INCRBY probe — NOT Lua's tonumber(), which
+    /// accepts values INCRBY rejects ("1.5", "1e3", hex, out-of-i64-range);
+    /// any value in that gap would wedge the counter for its full TTL
+    /// (LAB-1962 review). The probe also errors on WRONGTYPE keys, so no
+    /// separate TYPE check is needed; a zero increment on a valid counter
+    /// leaves its value and TTL untouched and cannot overflow. The EXISTS
+    /// gate stops the probe from creating the key at 0 — which check_budget
+    /// would treat as an authoritative fleet-wide allow. The probe error
+    /// must match the same value-error frames as budget_value_poisoned
+    /// (keep the two in lockstep): INCRBY can also fail for non-value
+    /// reasons — notably OOM at maxmemory, where DEL still succeeds — and
+    /// deleting a valid counter on such an error would be exactly the
+    /// erasure this guard exists to prevent.
+    const BUDGET_DEL_IF_POISONED_SCRIPT: &'static str = r#"
+        if redis.call('EXISTS', KEYS[1]) == 0 then
+            return 0
+        end
+        local probe = redis.pcall('INCRBY', KEYS[1], 0)
+        if type(probe) == 'table' and probe.err
+            and (probe.err:find('WRONGTYPE', 1, true) == 1
+                or probe.err:find('not an integer', 1, true)) then
+            return redis.call('DEL', KEYS[1])
+        end
+        return 0
+        "#;
+
+    /// True when a Redis error means the budget key's VALUE is unusable
+    /// (server-reported WRONGTYPE or non-integer), as opposed to a transport
+    /// failure. Server error frames arrive verbatim in `details()` — Redis
+    /// and Dragonfly both emit these exact strings — while IO/timeout errors
+    /// never do, so a poisoned key is safely distinguishable from a lost
+    /// write. BUDGET_DEL_IF_POISONED_SCRIPT matches the same two frames on
+    /// the Lua side — change them together or the guard and classifier
+    /// drift.
+    fn budget_value_poisoned(e: &fred::error::RedisError) -> bool {
+        let details = e.details();
+        details.starts_with("WRONGTYPE") || details.contains("not an integer")
+    }
+
     /// Record tokens against a client's daily budget.
     /// Updates local state synchronously; awaits Redis INCRBY inline to prevent TOCTOU races.
-    /// On Redis INCRBY failure, deletes the stale key so check_budget falls through to local.
+    /// On a transport-level INCRBY failure the increment is lost from the shared counter —
+    /// the key is left untouched so one replica's failed write never erases fleet-wide
+    /// accounting; the local accumulator (updated first, before any Redis I/O) keeps the
+    /// floor (LAB-1962). A server-reported poisoned value (WRONGTYPE / non-integer) is the
+    /// one case that still deletes: the key is unreadable garbage for its full TTL and
+    /// deleting it lets the shared counter rebuild.
     async fn record_budget_usage(&self, client_id: &str, tokens: u64) {
         if tokens == 0 || !self.client_budgets.contains_key(client_id) {
             return;
@@ -6216,11 +6275,9 @@ impl AppState {
         // Await Redis INCRBY (not fire-and-forget) so check_budget always sees
         // latest counter. Same is_connected rationale as check_budget: this
         // runs on the request path, and a reconnecting fred client would
-        // buffer the INCRBY (and the follow-up DEL on its error branch) for
-        // 2s each instead of failing fast. Skipping while down is equivalent
-        // to the old attempt-and-fail: local state above is already updated,
-        // and the DEL that failure would trigger could not reach the backend
-        // either.
+        // buffer the INCRBY for 2s instead of failing fast. Skipping while
+        // down is equivalent to attempt-and-fail: local state above is
+        // already updated, and the increment is lost either way.
         if let Some(redis) = &self.redis {
             if !redis.is_connected() {
                 trace!("redis disconnected, budget INCRBY skipped (local state updated)");
@@ -6237,10 +6294,39 @@ impl AppState {
                         tracing::warn!(error = %e, "redis EXPIRE failed for budget key");
                     }
                 }
+                Err(e) if Self::budget_value_poisoned(&e) => {
+                    // Poisoned value: delete so the counter can rebuild (see
+                    // fn doc). Safe only because check_budget's absent-key
+                    // local floor closes the old allow-bypass; the Lua guard
+                    // keeps a late DEL from erasing a rebuilt valid counter.
+                    tracing::warn!(
+                        error = %e,
+                        key = %key,
+                        "budget key holds a non-integer value, deleting so the shared counter can rebuild"
+                    );
+                    let del_result: Result<RedisValue, fred::error::RedisError> = redis
+                        .eval(
+                            Self::BUDGET_DEL_IF_POISONED_SCRIPT,
+                            vec![key.as_str()],
+                            Vec::<String>::new(),
+                        )
+                        .await;
+                    if let Err(del_err) = del_result {
+                        tracing::warn!(error = %del_err, key = %key, "failed to delete poisoned budget key");
+                    }
+                }
                 Err(e) => {
-                    // Delete stale key so check_budget falls through to local state
-                    tracing::warn!(error = %e, "redis INCRBY failed, deleting stale budget key");
-                    let _: Result<(), fred::error::RedisError> = redis.del(key.as_str()).await;
+                    // Transport failure: do NOT delete the shared counter —
+                    // erasing a valid counter on one replica's write failure
+                    // destroyed the fleet's day of accounting and, with the
+                    // old absent-key allow in check_budget, bypassed
+                    // enforcement entirely (LAB-1962/F8). The increment is
+                    // lost; check_budget's local floor covers this replica.
+                    tracing::warn!(
+                        error = %e,
+                        key = %key,
+                        "redis INCRBY failed, increment lost from shared budget counter"
+                    );
                 }
             }
         }
@@ -6345,8 +6431,10 @@ impl AppState {
     }
 
     /// Shared pre-request gate for all Anthropic-proxied requests.
-    /// Returns Ok(()) or an error Response (429).
-    async fn pre_request_gate(&self, client_id: &str, model: &str) -> Result<(), Response> {
+    /// Returns Ok(()) or an error Response (403/429).
+    ///
+    /// Boxed Err — see `ForwardOutcome` (clippy::result_large_err).
+    async fn pre_request_gate(&self, client_id: &str, model: &str) -> Result<(), Box<Response>> {
         if self.is_operator(client_id) {
             return Ok(()); // operator bypasses everything
         }
@@ -6370,15 +6458,15 @@ impl AppState {
                     truncate_label(model)
                 )
             };
-            return Err((StatusCode::FORBIDDEN, body).into_response());
+            return Err(Box::new((StatusCode::FORBIDDEN, body).into_response()));
         }
 
         // 1. Daily token budget (existing)
         if client_id != "-" && self.check_budget(client_id).await.is_err() {
             warn!(client_id = %client_id, "rejected: daily token budget exceeded");
-            return Err(
+            return Err(Box::new(
                 (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response(),
-            );
+            ));
         }
 
         // 2. Utilization limit (new)
@@ -6397,7 +6485,7 @@ impl AppState {
                 "retry-after",
                 HeaderValue::from_str(&retry_after.to_string()).unwrap(),
             );
-            return Err(resp);
+            return Err(Box::new(resp));
         }
 
         // 3. Emergency brake (new)
@@ -6406,11 +6494,13 @@ impl AppState {
                 client_id = %client_id,
                 "rejected: emergency brake active"
             );
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                "emergency: all accounts near exhaustion",
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "emergency: all accounts near exhaustion",
+                )
+                    .into_response(),
+            ));
         }
 
         Ok(())
@@ -6715,9 +6805,13 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 ///     429 while stashing the upstream's error response, so a model no OTHER
 ///     endpoint can serve still surfaces the real error — a nonexistent-model
 ///     404 must not morph into a synthetic 429 that invites retries.
+// Response payloads are boxed so the enum stays small (one word per payload):
+// it rides in the Err of `classify_retry_status`'s Result, where an inline
+// `Response` is 128+ bytes on the hot success path (clippy::result_large_err —
+// same pattern as `authenticate` / `reserve_request_body`).
 enum ForwardOutcome {
-    Done(Response),
-    RetryModelUnsupported(Response),
+    Done(Box<Response>),
+    RetryModelUnsupported(Box<Response>),
     Retry {
         saw_529: bool,
         push_skip: bool,
@@ -6865,7 +6959,7 @@ async fn classify_retry_status(
             })
         }
         .to_string();
-        return Err(ForwardOutcome::Done(
+        return Err(ForwardOutcome::Done(Box::new(
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .header("content-type", "application/json")
@@ -6873,7 +6967,7 @@ async fn classify_retry_status(
                 .unwrap_or_else(|_| {
                     (StatusCode::BAD_GATEWAY, "upstream redirect refused").into_response()
                 }),
-        ));
+        )));
     }
 
     // 429 → mark hard-limited and try next account
@@ -6948,12 +7042,12 @@ fn apply_round_outcome(
     model_unsupported_resp: &mut Option<Response>,
 ) -> RetryStep {
     match outcome {
-        ForwardOutcome::Done(resp) => RetryStep::Return(resp),
+        ForwardOutcome::Done(resp) => RetryStep::Return(*resp),
         // Model rejected by this endpoint: rotate immediately (another
         // account may serve it) but keep the upstream's error in hand for
         // the case where none does (LAB-941).
         ForwardOutcome::RetryModelUnsupported(resp) => {
-            *model_unsupported_resp = Some(resp);
+            *model_unsupported_resp = Some(*resp);
             skip.push(picked_idx);
             RetryStep::NextAttempt
         }
@@ -7494,7 +7588,7 @@ async fn forward_anthropic(
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
-        ForwardOutcome::Done(response)
+        ForwardOutcome::Done(Box::new(response))
     } else {
         // Non-streaming: buffer, extract usage, forward.
         //
@@ -7544,8 +7638,10 @@ async fn forward_anthropic(
                         }
                     }
                 }
-                return ForwardOutcome::Done(err_builder.body(Body::from(body)).unwrap_or_else(
-                    |_| (StatusCode::BAD_GATEWAY, "upstream body read failed").into_response(),
+                return ForwardOutcome::Done(Box::new(
+                    err_builder.body(Body::from(body)).unwrap_or_else(|_| {
+                        (StatusCode::BAD_GATEWAY, "upstream body read failed").into_response()
+                    }),
                 ));
             }
         };
@@ -7570,7 +7666,7 @@ async fn forward_anthropic(
                     .unwrap_or_else(|_| {
                         (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                     });
-                return ForwardOutcome::RetryModelUnsupported(response);
+                return ForwardOutcome::RetryModelUnsupported(Box::new(response));
             }
         }
         finalize_non_stream(
@@ -7596,7 +7692,7 @@ async fn forward_anthropic(
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
-        ForwardOutcome::Done(response)
+        ForwardOutcome::Done(Box::new(response))
     }
 }
 
@@ -7895,7 +7991,7 @@ async fn proxy_handler(
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
     if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
-        return resp;
+        return *resp;
     }
 
     // LAB-933: serve an opted-in replay from the encrypted response cache.
@@ -8125,7 +8221,7 @@ async fn try_fallback_upstream(
                 );
                 // Terminal, not a retry: the request itself is the problem, so
                 // rotating to another endpoint would just fail the same way.
-                return ForwardOutcome::Done(untranslatable_request_response(&msg));
+                return ForwardOutcome::Done(Box::new(untranslatable_request_response(&msg)));
             }
         };
         match serde_json::to_vec(&openai_body) {
@@ -8253,9 +8349,9 @@ async fn try_fallback_upstream(
         };
         if model_unsupported {
             state.note_model_unsupported(&ep.name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(response);
+            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
         }
-        return ForwardOutcome::Done(response);
+        return ForwardOutcome::Done(Box::new(response));
     }
 
     // Streaming response
@@ -8393,7 +8489,7 @@ async fn try_fallback_upstream(
             );
         });
 
-        return ForwardOutcome::Done(
+        return ForwardOutcome::Done(Box::new(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/event-stream")
@@ -8405,7 +8501,7 @@ async fn try_fallback_upstream(
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "fallback stream error").into_response()
                 }),
-        );
+        ));
     }
 
     // Non-streaming response
@@ -8467,7 +8563,7 @@ async fn try_fallback_upstream(
             upstream = ep.name,
             "fallback: unified endpoint translated response"
         );
-        ForwardOutcome::Done(
+        ForwardOutcome::Done(Box::new(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
@@ -8475,14 +8571,14 @@ async fn try_fallback_upstream(
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
                 }),
-        )
+        ))
     } else {
         info!(
             req_id,
             upstream = ep.name,
             "fallback: unified endpoint forwarded response"
         );
-        ForwardOutcome::Done(
+        ForwardOutcome::Done(Box::new(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
@@ -8490,7 +8586,7 @@ async fn try_fallback_upstream(
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
                 }),
-        )
+        ))
     }
 }
 
@@ -11795,9 +11891,9 @@ async fn forward_openai_compat_anthropic(
             });
         if model_unsupported {
             state.note_model_unsupported(endpoint_name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(response);
+            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
         }
-        return ForwardOutcome::Done(response);
+        return ForwardOutcome::Done(Box::new(response));
     }
 
     if is_streaming {
@@ -11941,7 +12037,7 @@ async fn forward_openai_compat_anthropic(
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
-        return ForwardOutcome::Done(response);
+        return ForwardOutcome::Done(Box::new(response));
     }
 
     // Non-streaming: buffer, translate, return
@@ -11949,9 +12045,9 @@ async fn forward_openai_compat_anthropic(
         Ok(b) => b,
         Err(e) => {
             error!("failed to read upstream response: {e}");
-            return ForwardOutcome::Done(
+            return ForwardOutcome::Done(Box::new(
                 (StatusCode::BAD_GATEWAY, "failed to read upstream response").into_response(),
-            );
+            ));
         }
     };
 
@@ -11966,7 +12062,7 @@ async fn forward_openai_compat_anthropic(
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                 });
-            return ForwardOutcome::Done(response);
+            return ForwardOutcome::Done(Box::new(response));
         }
     };
 
@@ -12003,7 +12099,7 @@ async fn forward_openai_compat_anthropic(
         .unwrap_or_else(|_| {
             (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
         });
-    ForwardOutcome::Done(response)
+    ForwardOutcome::Done(Box::new(response))
 }
 
 async fn openai_chat_handler(
@@ -12082,7 +12178,7 @@ async fn openai_chat_handler(
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
     if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
-        return resp;
+        return *resp;
     }
 
     let mut anthropic_body = translate_openai_to_anthropic(&openai_body);
