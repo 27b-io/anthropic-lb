@@ -387,6 +387,7 @@ fn test_state_base() -> AppState {
         client_names: HashMap::new(),
         auto_cache: true,
         client_usage: Mutex::new(HashMap::new()),
+        client_model_usage: Mutex::new(HashMap::new()),
         shadow_log_tx: None,
         shadow_log_dropped: AtomicU64::new(0),
         client_budgets: HashMap::new(),
@@ -6416,7 +6417,12 @@ async fn record_usage_updates_account_and_client() {
         cache_read_input_tokens: 30,
     };
     state
-        .record_usage(&state.endpoints[0], "test-client", &usage)
+        .record_usage(
+            &state.endpoints[0],
+            "test-client",
+            "claude-sonnet-5",
+            &usage,
+        )
         .await;
 
     assert_eq!(state.endpoints[0].input_tokens.load(Ordering::Relaxed), 100);
@@ -6446,7 +6452,9 @@ async fn record_usage_ignores_anonymous() {
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
     };
-    state.record_usage(&state.endpoints[0], "-", &usage).await;
+    state
+        .record_usage(&state.endpoints[0], "-", "claude-sonnet-5", &usage)
+        .await;
 
     // Account gets updated
     assert_eq!(state.endpoints[0].input_tokens.load(Ordering::Relaxed), 100);
@@ -6485,7 +6493,12 @@ async fn client_usage_is_bounded() {
     };
     for i in 0..10_050 {
         state
-            .record_usage(&state.endpoints[0], &format!("c{i}"), &usage)
+            .record_usage(
+                &state.endpoints[0],
+                &format!("c{i}"),
+                "claude-sonnet-5",
+                &usage,
+            )
             .await;
     }
     let n = state.client_usage.lock().unwrap().len();
@@ -6493,6 +6506,118 @@ async fn client_usage_is_bounded() {
         n <= 10_000,
         "client_usage must be bounded against unbounded x-client-id values, got {n}"
     );
+}
+
+// ── LAB-2330: per-(client, model) usage accounting ─────────────
+
+#[tokio::test]
+async fn record_usage_tracks_per_model() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_creation_input_tokens: 2,
+        cache_read_input_tokens: 3,
+    };
+    for model in ["claude-sonnet-5", "claude-sonnet-5", "claude-haiku-4-5"] {
+        state
+            .record_usage(&state.endpoints[0], "c1", model, &usage)
+            .await;
+    }
+
+    let map = state.client_model_usage.lock().unwrap();
+    assert_eq!(
+        map.get(&("c1".to_string(), "claude-sonnet-5".to_string())),
+        Some(&[20, 10, 4, 6])
+    );
+    assert_eq!(
+        map.get(&("c1".to_string(), "claude-haiku-4-5".to_string())),
+        Some(&[10, 5, 2, 3])
+    );
+    // The per-client family stays the authoritative total across models.
+    assert_eq!(
+        state.client_usage.lock().unwrap().get("c1"),
+        Some(&[30, 15, 6, 9])
+    );
+}
+
+#[tokio::test]
+async fn record_usage_empty_model_records_unknown() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    state
+        .record_usage(&state.endpoints[0], "c1", "", &usage)
+        .await;
+    let map = state.client_model_usage.lock().unwrap();
+    assert!(map.contains_key(&("c1".to_string(), "unknown".to_string())));
+}
+
+#[tokio::test]
+async fn record_usage_truncates_model_label() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 1,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    let huge = "m".repeat(500);
+    state
+        .record_usage(&state.endpoints[0], "c1", &huge, &usage)
+        .await;
+    let map = state.client_model_usage.lock().unwrap();
+    let (_, model) = map.keys().next().unwrap();
+    assert!(
+        model.chars().count() <= MAX_LABEL_CHARS + 1,
+        "model label must be truncated, got {} chars",
+        model.chars().count()
+    );
+    assert!(model.ends_with('…'));
+}
+
+#[tokio::test]
+async fn client_model_usage_is_bounded() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 1,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    for i in 0..(MAX_CLIENT_MODEL_LABELS + 50) {
+        state
+            .record_usage(&state.endpoints[0], "c1", &format!("model-{i}"), &usage)
+            .await;
+    }
+    let map = state.client_model_usage.lock().unwrap();
+    assert!(
+        map.len() <= MAX_CLIENT_MODEL_LABELS + 1,
+        "client_model_usage must be bounded, got {}",
+        map.len()
+    );
+    // Overflow tokens are not dropped — they land in the _other bucket.
+    let other = map.get(&("c1".to_string(), "_other".to_string())).unwrap();
+    assert_eq!(other[0], 50);
+}
+
+#[test]
+fn sse_scanner_captures_response_model() {
+    let sse_text = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":150}}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":75}}\n\n";
+    let mut scanner = SseUsageScanner::default();
+    scanner.push(sse_text.as_bytes());
+    scanner.finish();
+    assert_eq!(scanner.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(scanner.usage.input_tokens, 150);
 }
 
 // ── Unit: model-based routing ──────────────────────────────────
@@ -12243,6 +12368,21 @@ async fn metrics_operator_hiding() {
         usage.insert("user-charlie".to_string(), [10, 20, 0, 0]);
     }
     {
+        let mut usage = state.client_model_usage.lock().unwrap();
+        usage.insert(
+            ("op-alice".to_string(), "claude-sonnet-5".to_string()),
+            [100, 200, 0, 0],
+        );
+        usage.insert(
+            ("op-bob".to_string(), "claude-sonnet-5".to_string()),
+            [50, 100, 0, 0],
+        );
+        usage.insert(
+            ("user-charlie".to_string(), "claude-haiku-4-5".to_string()),
+            [10, 20, 0, 0],
+        );
+    }
+    {
         let mut rates = state.client_request_rates.lock().unwrap();
         rates.insert(
             "op-alice".to_string(),
@@ -12315,6 +12455,20 @@ async fn metrics_operator_hiding() {
     assert!(
         body.contains("anthropic_client_requests_total{client=\"_operator\"} 8"),
         "operator requests should sum to 8:\n{body}"
+    );
+
+    // LAB-2330: per-model family aggregates operators the same way
+    assert!(
+        body.contains(
+            "anthropic_client_model_token_usage_total{client=\"_operator\",model=\"claude-sonnet-5\",type=\"input\"} 150"
+        ),
+        "operator per-model input tokens should sum to 150:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "anthropic_client_model_token_usage_total{client=\"user-charlie\",model=\"claude-haiku-4-5\",type=\"output\"} 20"
+        ),
+        "regular client per-model tokens should be emitted:\n{body}"
     );
 
     // Regular client should appear normally
