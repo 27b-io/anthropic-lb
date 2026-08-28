@@ -16743,16 +16743,24 @@ fn model_denial_labels_are_bounded_by_other_overflow() {
     for i in 0..(MAX_MODEL_DENIED_LABELS + 25) {
         state.note_model_denied("limited", &format!("junk-model-{i}"));
     }
+    // Expert-panel finding (LAB-2330, mirrored by LAB-2332): rotating the
+    // caller-controlled client id past the cap must NOT mint per-client
+    // overflow keys — the bound has to hold on the client axis too.
+    for i in 0..50 {
+        state.note_model_denied(&format!("evil-{i}"), "claude-x");
+    }
     let counts = state.model_denied.lock().unwrap();
     assert!(
         counts.len() <= MAX_MODEL_DENIED_LABELS + 1,
         "label map grew unbounded: {} entries",
         counts.len()
     );
+    // Overflow denials are not dropped — they land in the ONE global bucket:
+    // 25 "limited" overflow models + 50 rotated clients.
     assert_eq!(
-        counts.get(&("limited".to_string(), "_other".to_string())),
-        Some(&25),
-        "overflow must land in the _other bucket, not be dropped"
+        counts.get(&("_other".to_string(), "_other".to_string())),
+        Some(&75),
+        "overflow must land in the global _other bucket, not be dropped"
     );
 }
 
