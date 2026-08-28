@@ -42,7 +42,7 @@ Routes requests across multiple Anthropic accounts using dynamic capacity-based 
 | **Status-based routing** | Parses API status headers — `warning`/`throttled`/`rejected` enforce utilization floors |
 | **429 rotation** | Rate-limited accounts cool down, traffic shifts instantly |
 | **5xx retry** | Automatic retry on 500/502/503/504/529 (picks different account) |
-| **Token tracking** | Per-account and per-client input/output/cache token counters |
+| **Token tracking** | Per-account and per-client input/output/cache token counters, plus a per-(client, model) breakdown (`anthropic_client_model_token_usage_total{client,model,type}`) for model-mix and API-price attribution |
 | **Client budgets** | Daily per-client token budgets with automatic reset |
 | **Utilization limits** | Per-client utilization ceiling — 429 when all Anthropic endpoints exceed limit |
 | **Operator bypass** | Designated client bypasses all budget, utilization, and emergency checks |

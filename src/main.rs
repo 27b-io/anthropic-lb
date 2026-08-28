@@ -476,6 +476,15 @@ const MAX_TRACKED_CLIENTS: usize = 10_000;
 /// The model half is caller-controlled; overflow buckets into `_other`.
 const MAX_MODEL_DENIED_LABELS: usize = 64;
 
+/// Cap on distinct (client, model) pairs in the per-model usage counter
+/// (LAB-2330). The model key is normally response-derived (upstream-validated),
+/// but the request-model fallback is caller-influenced and the client key is
+/// caller-controlled under legacy auth, so overflow lumps into a single
+/// global ("_other", "_other") bucket — a HARD bound of cap + 1 entries.
+/// Sized for the real fleet (tens of clients × a handful of models) with
+/// generous slack.
+const MAX_CLIENT_MODEL_LABELS: usize = 256;
+
 /// Max chars retained from a caller-controlled string used as a metric label
 /// or echoed in an error body. The model field is bounded only by the request
 /// body cap, so an untruncated copy would be retained for the process lifetime
@@ -722,6 +731,13 @@ struct AppState {
     auto_cache: bool,
     /// Per-client token usage: client_id → [input, output, cache_creation, cache_read]
     client_usage: Mutex<HashMap<String, [u64; 4]>>,
+    /// Per-(client, model) token usage (LAB-2330) — same [u64; 4] layout as
+    /// `client_usage`, which stays the authoritative per-client total. The
+    /// model key is response-derived and truncated; the pair count is hard-
+    /// bounded at `MAX_CLIENT_MODEL_LABELS` + 1 (overflow lumps into the
+    /// global ("_other", "_other") bucket), so callers cannot inflate the
+    /// label set on either axis.
+    client_model_usage: Mutex<HashMap<(String, String), [u64; 4]>>,
     /// Shadow log sender (fire-and-forget JSONL appends). None = disabled.
     shadow_log_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Count of shadow log entries dropped due to channel backpressure.
@@ -5354,6 +5370,10 @@ const SSE_SCAN_MAX_LINE: usize = 64 * 1024;
 #[derive(Default)]
 struct SseUsageScanner {
     usage: TokenUsage,
+    /// Model reported by the upstream `message_start` event (LAB-2330) —
+    /// the response-derived model used for per-(client, model) accounting,
+    /// preferred over the caller-supplied request model.
+    model: Option<String>,
     /// Bytes of the current line seen so far, awaiting its `\n`.
     carry: Vec<u8>,
     /// Set when a line overflows `SSE_SCAN_MAX_LINE`; the rest of that line
@@ -5433,6 +5453,13 @@ impl SseUsageScanner {
         };
         match event.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "message_start" => {
+                if let Some(m) = event
+                    .pointer("/message/model")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    self.model = Some(m.to_owned());
+                }
                 if let Some(msg_usage) = event.get("message").and_then(|m| m.get("usage")) {
                     self.usage.input_tokens = msg_usage
                         .get("input_tokens")
@@ -5960,10 +5987,14 @@ async fn finalize_stream(
 ) {
     scanner.finish();
     let usage = &scanner.usage;
+    // Response-derived model (message_start) preferred; request model fallback.
+    let usage_model = scanner.model.as_deref().unwrap_or(model);
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
     if !usage.is_empty() {
-        state.record_usage(ep, client_id, usage).await;
-        log_usage(req_id, client_id, model, acct_name, usage);
+        state.record_usage(ep, client_id, usage_model, usage).await;
+        // Log the same model the metric records, so the usage log and
+        // anthropic_client_model_token_usage_total reconcile.
+        log_usage(req_id, client_id, usage_model, acct_name, usage);
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -6025,6 +6056,8 @@ async fn finalize_stream(
 }
 
 /// Finalize a non-streaming response: extract usage from JSON body, log, and shadow log.
+/// `response_model` is the model reported by the upstream response body
+/// (LAB-2330) — preferred over the request `model` for per-model accounting.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_non_stream(
     state: &AppState,
@@ -6032,6 +6065,7 @@ async fn finalize_non_stream(
     req_id: &str,
     client_id: &str,
     model: &str,
+    response_model: Option<&str>,
     acct_name: &str,
     client_ip: &str,
     agent: &str,
@@ -6044,8 +6078,11 @@ async fn finalize_non_stream(
     context_window: u64,
 ) {
     if !usage.is_empty() {
-        state.record_usage(ep, client_id, usage).await;
-        log_usage(req_id, client_id, model, acct_name, usage);
+        let usage_model = response_model.unwrap_or(model);
+        state.record_usage(ep, client_id, usage_model, usage).await;
+        // Log the same model the metric records, so the usage log and
+        // anthropic_client_model_token_usage_total reconcile.
+        log_usage(req_id, client_id, usage_model, acct_name, usage);
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -6083,8 +6120,12 @@ async fn finalize_non_stream(
 }
 
 impl AppState {
-    /// Record token usage for an endpoint and client.
-    async fn record_usage(&self, ep: &Endpoint, client_id: &str, usage: &TokenUsage) {
+    /// Record token usage for an endpoint and client. `model` feeds the
+    /// per-(client, model) counter (LAB-2330): callers pass the
+    /// response-derived model where available, falling back to the request
+    /// model — either way it is truncated and the pair-count is capped here,
+    /// so callers cannot inflate the label set.
+    async fn record_usage(&self, ep: &Endpoint, client_id: &str, model: &str, usage: &TokenUsage) {
         if usage.is_empty() {
             return;
         }
@@ -6113,6 +6154,33 @@ impl AppState {
                     entry[2] += usage.cache_creation_input_tokens;
                     entry[3] += usage.cache_read_input_tokens;
                 }
+            }
+            // Per-(client, model) accounting (LAB-2330). A usage record only
+            // exists when the upstream returned usage, so the model string was
+            // accepted upstream; truncation + the pair cap bound the label set
+            // regardless.
+            let model = if model.is_empty() {
+                "unknown".to_owned()
+            } else {
+                truncate_label(model)
+            };
+            if let Ok(mut map) = self.client_model_usage.lock() {
+                let key = (client_id.to_owned(), model);
+                let key = if map.len() < MAX_CLIENT_MODEL_LABELS || map.contains_key(&key) {
+                    key
+                } else {
+                    // Map full and this pair is new: lump into ONE global
+                    // overflow bucket — hard bound of MAX_CLIENT_MODEL_LABELS
+                    // + 1 entries. A per-client ("<client>", "_other") key
+                    // would let x-client-id rotation (legacy auth modes) grow
+                    // the map without bound (expert-panel finding, LAB-2330).
+                    ("_other".to_owned(), "_other".to_owned())
+                };
+                let entry = map.entry(key).or_insert([0; 4]);
+                entry[0] += usage.input_tokens;
+                entry[1] += usage.output_tokens;
+                entry[2] += usage.cache_creation_input_tokens;
+                entry[3] += usage.cache_read_input_tokens;
             }
             // Budget accounting
             self.record_budget_usage(client_id, total).await;
@@ -7646,8 +7714,13 @@ async fn forward_anthropic(
             }
         };
         let mut usage = TokenUsage::default();
+        let mut response_model: Option<String> = None;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&resp_body_bytes) {
             usage = TokenUsage::from_response_body(&parsed);
+            response_model = parsed
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
             // Count + trace upstream context-window overflows (LAB-916). The
             // 400 itself is forwarded below byte-for-byte, as before.
             if status.as_u16() == 400 {
@@ -7675,6 +7748,7 @@ async fn forward_anthropic(
             req_id,
             client_id,
             model,
+            response_model.as_deref(),
             endpoint_name,
             &client_ip.to_string(),
             agent_id,
@@ -8541,6 +8615,7 @@ async fn try_fallback_upstream(
         req_id,
         client_id,
         model,
+        openai_resp.get("model").and_then(|v| v.as_str()),
         &ep.name,
         &client_ip.to_string(),
         agent_id,
@@ -9261,6 +9336,12 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.clone())
         .unwrap_or_default();
+    let client_model_usage: Vec<((String, String), [u64; 4])> = state
+        .client_model_usage
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
     let budget_usage = state
         .budget_usage
         .lock()
@@ -9846,6 +9927,46 @@ async fn metrics_handler(
                     tokens[i],
                 );
             }
+        }
+    }
+
+    // Per-(client, model) usage (LAB-2330). Sibling of the per-client family
+    // above — that one stays authoritative for per-client totals; this one
+    // adds the model dimension so per-model pricing can be applied downstream.
+    // Operators aggregate into `_operator` per model, matching the house
+    // pattern. Cardinality is bounded at record time (MAX_CLIENT_MODEL_LABELS).
+    prom_header(
+        &mut buf,
+        "anthropic_client_model_token_usage_total",
+        "counter",
+        "Per-client token usage by model and type",
+    );
+    let mut op_model_tokens: HashMap<&str, [u64; 4]> = HashMap::new();
+    for ((client, mdl), tokens) in &client_model_usage {
+        if state.is_operator(client) {
+            let e = op_model_tokens.entry(mdl.as_str()).or_insert([0; 4]);
+            for i in 0..4 {
+                e[i] += tokens[i];
+            }
+        } else {
+            for (i, t) in types.iter().enumerate() {
+                prom_counter(
+                    &mut buf,
+                    "anthropic_client_model_token_usage_total",
+                    &[("client", client), ("model", mdl), ("type", t)],
+                    tokens[i],
+                );
+            }
+        }
+    }
+    for (mdl, tokens) in &op_model_tokens {
+        for (i, t) in types.iter().enumerate() {
+            prom_counter(
+                &mut buf,
+                "anthropic_client_model_token_usage_total",
+                &[("client", "_operator"), ("model", mdl), ("type", t)],
+                tokens[i],
+            );
         }
     }
 
@@ -12076,6 +12197,7 @@ async fn forward_openai_compat_anthropic(
         req_id,
         client_id,
         model,
+        anthropic_resp.get("model").and_then(|v| v.as_str()),
         endpoint_name,
         &client_ip.to_string(),
         agent_id,
@@ -12955,6 +13077,7 @@ async fn main() {
         client_names: config.client_names.clone(),
         auto_cache: config.auto_cache.unwrap_or(true),
         client_usage: Mutex::new(HashMap::new()),
+        client_model_usage: Mutex::new(HashMap::new()),
         shadow_log_tx,
         shadow_log_dropped: AtomicU64::new(0),
         client_budgets: config.client_budgets.clone(),
