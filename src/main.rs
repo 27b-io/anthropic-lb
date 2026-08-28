@@ -2027,9 +2027,11 @@ impl AppState {
     ///
     /// Logs at `warn` the first time a (client, model) pair is denied and at
     /// `debug` thereafter — a client hammering a denied model must not be able
-    /// to drive unbounded warn-level log volume. The counter still records
-    /// every denial. Mirrors the once-per-model pattern used for
-    /// unsupported-model warnings.
+    /// to drive unbounded warn-level log volume. Pairs lumped into the
+    /// overflow bucket share its first-seen flag (deliberate: client-id
+    /// rotation must not mint warns). The counter still records every denial.
+    /// Mirrors the once-per-model pattern used for unsupported-model
+    /// warnings.
     fn note_model_denied(&self, client_id: &str, model: &str) {
         let model = truncate_label(model);
         let mut first_time = true;
