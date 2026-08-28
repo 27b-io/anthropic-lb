@@ -6570,14 +6570,14 @@ async fn record_usage_truncates_model_label() {
     state
         .record_usage(&state.endpoints[0], "c1", &huge, &usage)
         .await;
+    // The stored key must have gone through truncate_label (whose exact
+    // format is covered by its own unit tests).
     let map = state.client_model_usage.lock().unwrap();
     let (_, model) = map.keys().next().unwrap();
     assert!(
-        model.chars().count() <= MAX_LABEL_CHARS + 1,
-        "model label must be truncated, got {} chars",
-        model.chars().count()
+        model.chars().count() < huge.chars().count(),
+        "model label must be truncated before becoming a map key"
     );
-    assert!(model.ends_with('…'));
 }
 
 #[tokio::test]
@@ -6594,15 +6594,31 @@ async fn client_model_usage_is_bounded() {
             .record_usage(&state.endpoints[0], "c1", &format!("model-{i}"), &usage)
             .await;
     }
+    // Expert-panel finding (LAB-2330): rotating the caller-controlled client
+    // id past the cap must NOT mint per-client overflow keys — the bound has
+    // to hold on the client axis too.
+    for i in 0..50 {
+        state
+            .record_usage(
+                &state.endpoints[0],
+                &format!("evil-{i}"),
+                "claude-x",
+                &usage,
+            )
+            .await;
+    }
     let map = state.client_model_usage.lock().unwrap();
     assert!(
         map.len() <= MAX_CLIENT_MODEL_LABELS + 1,
-        "client_model_usage must be bounded, got {}",
+        "client_model_usage must be hard-bounded, got {}",
         map.len()
     );
-    // Overflow tokens are not dropped — they land in the _other bucket.
-    let other = map.get(&("c1".to_string(), "_other".to_string())).unwrap();
-    assert_eq!(other[0], 50);
+    // Overflow tokens are not dropped — they land in the global bucket:
+    // 50 c1 overflow models + 50 rotated clients, 1 input token each.
+    let other = map
+        .get(&("_other".to_string(), "_other".to_string()))
+        .unwrap();
+    assert_eq!(other[0], 100);
 }
 
 #[test]

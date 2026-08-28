@@ -478,9 +478,11 @@ const MAX_MODEL_DENIED_LABELS: usize = 64;
 
 /// Cap on distinct (client, model) pairs in the per-model usage counter
 /// (LAB-2330). The model key is normally response-derived (upstream-validated),
-/// but the request-model fallback is caller-influenced, so the map is bounded
-/// like `model_denied`: overflow buckets into model="_other". Sized for the
-/// real fleet (tens of clients × a handful of models) with generous slack.
+/// but the request-model fallback is caller-influenced and the client key is
+/// caller-controlled under legacy auth, so overflow lumps into a single
+/// global ("_other", "_other") bucket — a HARD bound of cap + 1 entries.
+/// Sized for the real fleet (tens of clients × a handful of models) with
+/// generous slack.
 const MAX_CLIENT_MODEL_LABELS: usize = 256;
 
 /// Max chars retained from a caller-controlled string used as a metric label
@@ -731,8 +733,10 @@ struct AppState {
     client_usage: Mutex<HashMap<String, [u64; 4]>>,
     /// Per-(client, model) token usage (LAB-2330) — same [u64; 4] layout as
     /// `client_usage`, which stays the authoritative per-client total. The
-    /// model key is response-derived and bounded (`MAX_CLIENT_MODEL_LABELS`,
-    /// overflow → "_other") so callers cannot inflate the label set.
+    /// model key is response-derived and truncated; the pair count is hard-
+    /// bounded at `MAX_CLIENT_MODEL_LABELS` + 1 (overflow lumps into the
+    /// global ("_other", "_other") bucket), so callers cannot inflate the
+    /// label set on either axis.
     client_model_usage: Mutex<HashMap<(String, String), [u64; 4]>>,
     /// Shadow log sender (fire-and-forget JSONL appends). None = disabled.
     shadow_log_tx: Option<tokio::sync::mpsc::Sender<String>>,
@@ -5988,7 +5992,9 @@ async fn finalize_stream(
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
     if !usage.is_empty() {
         state.record_usage(ep, client_id, usage_model, usage).await;
-        log_usage(req_id, client_id, model, acct_name, usage);
+        // Log the same model the metric records, so the usage log and
+        // anthropic_client_model_token_usage_total reconcile.
+        log_usage(req_id, client_id, usage_model, acct_name, usage);
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -6074,7 +6080,9 @@ async fn finalize_non_stream(
     if !usage.is_empty() {
         let usage_model = response_model.unwrap_or(model);
         state.record_usage(ep, client_id, usage_model, usage).await;
-        log_usage(req_id, client_id, model, acct_name, usage);
+        // Log the same model the metric records, so the usage log and
+        // anthropic_client_model_token_usage_total reconcile.
+        log_usage(req_id, client_id, usage_model, acct_name, usage);
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -6161,7 +6169,12 @@ impl AppState {
                 let key = if map.len() < MAX_CLIENT_MODEL_LABELS || map.contains_key(&key) {
                     key
                 } else {
-                    (client_id.to_owned(), "_other".to_owned())
+                    // Map full and this pair is new: lump into ONE global
+                    // overflow bucket — hard bound of MAX_CLIENT_MODEL_LABELS
+                    // + 1 entries. A per-client ("<client>", "_other") key
+                    // would let x-client-id rotation (legacy auth modes) grow
+                    // the map without bound (expert-panel finding, LAB-2330).
+                    ("_other".to_owned(), "_other".to_owned())
                 };
                 let entry = map.entry(key).or_insert([0; 4]);
                 entry[0] += usage.input_tokens;
