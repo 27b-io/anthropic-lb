@@ -89,7 +89,7 @@ probe_interval_secs = 300
 # Authentication — per-client keys. The key IS the identity: the matched
 # entry's name becomes client_id, and x-client-id is ignored.
 # [[clients]]
-# name = "geo-pipeline"
+# name = "alice"
 # key = "<openssl rand -hex 32>"
 # models = ["claude-sonnet-*", "claude-haiku-*"]  # optional; empty = all
 
@@ -107,7 +107,7 @@ probe_interval_secs = 300
 # Load balancers whose x-forwarded-for is trusted (optional). Client IP =
 # rightmost XFF entry not in this list when the TCP peer is listed;
 # otherwise the peer address, and the header is ignored.
-# trusted_proxies = ["10.128.0.0/20"]
+# trusted_proxies = ["192.0.2.0/24"]
 
 # Failed-auth throttle: after this many failures per client IP inside the
 # window, further invalid credentials get 429 + retry-after. Valid credentials
@@ -134,11 +134,11 @@ probe_interval_secs = 300
 # Per-client utilization limits (optional, 0.0–1.0)
 # Client gets 429 when ALL model-compatible Anthropic endpoints exceed their limit.
 # [client_utilization_limits]
-# "gastown" = 0.85
-# "openclaw" = 0.95
+# "alice" = 0.85
+# "bob" = 0.95
 
 # Operators — bypass all budget, utilization, and emergency checks
-# operators = ["ray", "openclaw", "claude"]
+# operators = ["ops", "claude"]
 
 # Emergency brake — auto-block non-operator traffic when all Anthropic
 # endpoints exceed this threshold (OpenAI endpoints carry no rate-limit
@@ -147,12 +147,12 @@ probe_interval_secs = 300
 
 # Redis/Valkey for distributed state across replicas (optional)
 # Supports redis:// (plaintext) and rediss:// (TLS)
-# redis_url = "redis://10.0.0.5:6379"
+# redis_url = "redis://redis.example.com:6379"
 
 # IP-to-client-name mapping (optional, fallback when no X-Client-ID header)
 # [client_names]
-# "10.0.0.5" = "alice-desktop"
-# "10.0.0.6" = "bob-laptop"
+# "192.0.2.10" = "alice-desktop"
+# "192.0.2.11" = "bob-laptop"
 
 [[endpoints]]
 name = "primary"
@@ -264,12 +264,12 @@ Give each caller its own key. The key **is** the identity:
 
 ```toml
 [[clients]]
-name = "geo-pipeline"
+name = "alice"
 key = "<openssl rand -hex 32>"
 models = ["claude-sonnet-*", "claude-haiku-*"]   # optional; empty = all models
 
 [[clients]]
-name = "radar"
+name = "bob"
 key = "<openssl rand -hex 32>"
 ```
 
@@ -331,7 +331,7 @@ It **fails closed** on a model it cannot read. The proxy takes the model from th
 ## Security
 
 > [!IMPORTANT]
-> **Authentication is default-deny (LAB-1192).** A config with neither `[[clients]]` nor `proxy_key` **fails startup** with a named error. The single escape hatch is `allow_unauthenticated = true`, which boots with a startup warning and is meant for networks where access control exists outside the proxy (NetworkPolicy, tailnet) — never a public ingress. A misconfigured deploy is a crash loop, not a silently open proxy.
+> **Authentication is default-deny.** A config with neither `[[clients]]` nor `proxy_key` **fails startup** with a named error. The single escape hatch is `allow_unauthenticated = true`, which boots with a startup warning and is meant for networks where access control exists outside the proxy (NetworkPolicy, tailnet) — never a public ingress. A misconfigured deploy is a crash loop, not a silently open proxy.
 
 | Layer | Config | Effect | Unset behaviour |
 |:------|:-------|:-------|:----------------|
@@ -341,29 +341,29 @@ It **fails closed** on a model it cannot read. The proxy takes the model from th
 | **Proxy key** (legacy) | `proxy_key = "<64 hex>"` | Requires a single shared `x-api-key` (401) | **startup error** (unless `allow_unauthenticated`) |
 | **Admin surfaces** | `operators = ["ops"]` | `/_stats` + `/metrics` need an operator credential (401/403) | no one can read them under `[[clients]]` |
 | **Failed-auth throttle** | `auth_failure_limit` / `auth_failure_window_secs` | Further invalid credentials get 429 + `retry-after` per client IP after repeated failures; valid credentials always pass | on (10 / 300s) |
-| **Trusted proxies** | `trusted_proxies = ["10.128.0.0/20"]` | Real client IP recovered from `x-forwarded-for` behind a listed LB | header ignored |
+| **Trusted proxies** | `trusted_proxies = ["192.0.2.0/24"]` | Real client IP recovered from `x-forwarded-for` behind a listed LB | header ignored |
 | **Model allow-list** | `clients[].models` | Rejects models outside a client's list (403) | all models |
 
 IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are compared in constant time, and startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`).
 
 **TLS terminates at the ingress.** The proxy speaks plain HTTP and its container port must never be published directly to the internet — put it behind a TLS-terminating load balancer or ingress, list that LB in `trusted_proxies`, and let the ingress carry the certificate. Bearer credentials without TLS are credentials in cleartext.
 
-### Admin surfaces are operator-only (LAB-1192)
+### Admin surfaces are operator-only
 
 `/_stats` disclosures are a reconnaissance report for anyone planning to spend the pool: raw `client_id`s, agent/session prefixes, models, **endpoint account names**, token counts, per-account utilisation and budgets. So under `[[clients]]` both `/_stats` and `/metrics` answer only to a client named in `operators` — unauthenticated gets `401`, a valid non-operator credential gets `403`. Under legacy `proxy_key` the (single) key holder is the operator by construction. Under `allow_unauthenticated` both surfaces serve, and unauthenticated access logs at `warn` — rate-limited to once per route per 5 minutes, so the open posture stays visible without a per-scrape firehose.
 
-### Real client IP behind a load balancer (LAB-1192)
+### Real client IP behind a load balancer
 
 Behind a GCLB/Cloudflare/ingress, the TCP peer is the LB — without XFF handling, IP allowlists degenerate to "allow the LB", per-IP throttles rate-limit the LB, and every log line records the LB. Configure `trusted_proxies` with the LB's address range; the client IP then becomes the **rightmost `x-forwarded-for` entry not itself in `trusted_proxies`** — the last hop an attacker cannot append to. From any peer *not* in the list the header is ignored entirely (never trusted, never logged as authoritative), and malformed entries fall back to the peer address.
 
 > [!IMPORTANT]
 > Behind a load balancer, **`[[clients]]` credentials are the identity**. The `client_names` IP map is a lab-only convenience: it maps *source addresses*, and once traffic arrives through an LB the recovered XFF address is only as trustworthy as the LB's own header hygiene. Do not hang budgets or operator status on `client_names` on a public ingress.
 
-### Failed-auth throttling (LAB-1193; supersedes LAB-1192 AC-11)
+### Failed-auth throttling
 
-This in-process throttle bounds the volume of detailed `401` responses; it does not reduce credential-comparison throughput. Credential-stuffing and request-rate controls belong at the public ingress. After `auth_failure_limit` failures from one client IP inside `auth_failure_window_secs`, further **invalid** credentials from that IP get `429` with `retry-after`. LAB-1193 supersedes LAB-1192 AC-11's pre-comparison ordering after the 2026-08-24 shared-IP outage: credential comparison runs first so a known-good principal still passes when NATs and load balancers collapse unrelated callers onto one resolved address. Successful requests do not clear the shared IP's failure window, so invalid traffic remains throttled until expiry. This trade relies on the enforced `MIN_KEY_LEN = 32`; if the credential floor is lowered, restore AC-11's pre-comparison ordering. Failures are counted in `anthropic_auth_failures_total{route}` and logged with the resolved client IP. The throttle table is bounded (4096 IPs), so the tracking structure itself cannot be flooded into an OOM — and eviction is threat-aware: expired windows are purged first, then the least-established live entry (lowest failure count, oldest window as tie-breaker) is evicted, so a flood of fresh failures cannot flush an active lockout to reset it.
+This in-process throttle bounds the volume of detailed `401` responses; it does not reduce credential-comparison throughput. Credential-stuffing and request-rate controls belong at the public ingress. After `auth_failure_limit` failures from one client IP inside `auth_failure_window_secs`, further **invalid** credentials from that IP get `429` with `retry-after`. Credential comparison runs first, before the throttle check, so a known-good principal still passes when NATs and load balancers collapse unrelated callers onto one resolved address. Successful requests do not clear the shared IP's failure window, so invalid traffic remains throttled until expiry. This trade relies on the enforced `MIN_KEY_LEN = 32`; if the credential floor is lowered, the throttle check should run before credential comparison instead. Failures are counted in `anthropic_auth_failures_total{route}` and logged with the resolved client IP. The throttle table is bounded (4096 IPs), so the tracking structure itself cannot be flooded into an OOM — and eviction is threat-aware: expired windows are purged first, then the least-established live entry (lowest failure count, oldest window as tie-breaker) is evicted, so a flood of fresh failures cannot flush an active lockout to reset it.
 
-### Credential-path hardening (LAB-1191)
+### Credential-path hardening
 
 The proxy forwards operator OAuth/API tokens upstream, so the paths a request
 can steer are locked down by default:
@@ -482,7 +482,7 @@ distinct pairs buckets into `model="_other"`.
       }
     },
     {
-      "name": "portkey",
+      "name": "openrouter",
       "protocol": "openai",
       "priority": 100,
       "passthrough": false,
@@ -545,7 +545,7 @@ distinct pairs buckets into `model="_other"`.
 
 ## OpenAI-Compatible Upstreams
 
-Route to non-Anthropic, OpenAI-compatible APIs (OpenRouter, Portkey, local models) by adding an endpoint with `protocol = "openai"`. There is no separate upstream pool and no `/upstream/<name>/` route — an OpenAI endpoint is a first-class member of the unified `[[endpoints]]` pool. Because these endpoints carry no Anthropic rate-limit data, they are not selected by headroom: each enters routing as a fixed-weight candidate at its configured `priority` (the transport circuit breaker still applies).
+Route to non-Anthropic, OpenAI-compatible APIs (OpenRouter, local models) by adding an endpoint with `protocol = "openai"`. There is no separate upstream pool and no `/upstream/<name>/` route — an OpenAI endpoint is a first-class member of the unified `[[endpoints]]` pool. Because these endpoints carry no Anthropic rate-limit data, they are not selected by headroom: each enters routing as a fixed-weight candidate at its configured `priority` (the transport circuit breaker still applies).
 
 ```toml
 [[endpoints]]
@@ -620,9 +620,9 @@ Logging is fire-and-forget via an async channel — handlers never block on disk
 For multi-replica deployments, configure `redis_url` to share state across instances:
 
 ```toml
-redis_url = "redis://10.0.0.5:6379"
+redis_url = "redis://redis.example.com:6379"
 # or with TLS:
-# redis_url = "rediss://10.0.0.5:6380"
+# redis_url = "rediss://redis.example.com:6380"
 ```
 
 | What's shared | Mechanism | Propagation |
@@ -669,14 +669,14 @@ Clients not on the allow-list never touch the cache.
 ```toml
 [response_cache]
 # Only these client IDs (x-client-id header / client_names mapping) use the cache.
-clients = ["geo-pipeline"]
+clients = ["alice"]
 
 # Backend: "cachekitio" (cachekit.io SaaS) or "redis" (local Redis/Valkey).
 backend = "redis"
-redis_url = "redis://10.0.0.5:6379/1"
+redis_url = "redis://redis.example.com:6379/1"
 # backend = "cachekitio"
 # api_key = "ck_live_..."
-# api_url = "https://api.dev.cachekit.io"  # optional; default https://api.cachekit.io. HTTPS enforced, private/loopback IPs rejected at startup.
+# api_url = "https://cachekit.example.com"  # optional; default https://api.cachekit.io. HTTPS enforced, private/loopback IPs rejected at startup.
 
 # Hex-encoded 32-byte master key for client-side encryption (MANDATORY —
 # there is no plaintext mode). Generate: openssl rand -hex 32

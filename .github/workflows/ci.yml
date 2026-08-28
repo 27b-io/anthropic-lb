@@ -24,6 +24,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+      - name: Check README for lab-deployment identifiers
+        run: |
+          if grep -inE '\b(gastown|openclaw|portkey|geo-pipeline|radar)\b|"ray"|LAB-[0-9]+|shared-ip outage|2026-08-24|api\.dev\.cachekit\.io|10\.128\.0\.0/20|10\.0\.0\.5|10\.0\.0\.6' README.md; then
+            echo "::error file=README.md::Found a lab-deployment identifier in the public README (LAB-2335). Use generic placeholders instead."
+            exit 1
+          fi
 
   lint:
     name: Lint
