@@ -6887,6 +6887,14 @@ enum ForwardOutcome {
     },
 }
 
+/// Non-transient rotation: skip this endpoint and try the next candidate.
+/// Pre-dates the `ForwardOutcome` return type as a bare `None`.
+const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
+    saw_529: false,
+    push_skip: true,
+    transient: false,
+};
+
 /// True when an upstream error body says this ACCOUNT cannot serve the
 /// requested model — distinct from a malformed request (LAB-941). Matched
 /// conservatively against observed wire formats:
@@ -8093,6 +8101,11 @@ async fn proxy_handler(
     // Upstream error from the most recent model-unsupported rejection —
     // returned verbatim if the pool exhausts on nothing but rejections.
     let mut model_unsupported_resp: Option<Response> = None;
+    // OpenAI-shape body, built lazily on the first OpenAI-endpoint attempt
+    // and reused across rotations/retries (LAB-716). Lazy so requests served
+    // entirely by Anthropic endpoints — the common case — never pay for the
+    // translation.
+    let mut openai_fallback_body: Option<FallbackBody> = None;
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
             let delay = round_backoff_delay(retry_round, last_saw_529);
@@ -8112,58 +8125,89 @@ async fn proxy_handler(
             // `forward_anthropic` (Anthropic) or `try_fallback_upstream`
             // (OpenAI). Both return a `ForwardOutcome` so the shared
             // round-gated policy in `apply_round_outcome` covers both.
-            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) =
-                match state.pick_endpoint(affinity, &model, &skip).await {
-                    Some(i) => {
-                        let ep = &state.endpoints[i];
-                        match ep.protocol {
-                            Protocol::Anthropic => {
-                                let out = forward_anthropic(
-                                    &state,
-                                    &parts,
-                                    &body_bytes,
-                                    &oauth_body_bytes,
-                                    ep,
-                                    i,
-                                    &req_id,
-                                    &client_id,
-                                    &client_ver,
-                                    &client_ip,
-                                    &agent_id,
-                                    &session_id,
-                                    &model,
-                                    affinity,
-                                    request_start,
-                                )
-                                .await;
-                                (out, i)
-                            }
-                            Protocol::OpenAI => {
-                                let out = try_fallback_upstream(
-                                    &state,
-                                    &body_bytes,
-                                    &req_id,
-                                    &client_id,
-                                    &client_ip,
-                                    &agent_id,
-                                    &session_id,
-                                    &model,
-                                    i,
-                                    request_start,
-                                    true,
-                                )
-                                .await;
-                                (out, i)
-                            }
+            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
+                .pick_endpoint(affinity, &model, &skip)
+                .await
+            {
+                Some(i) => {
+                    let ep = &state.endpoints[i];
+                    match ep.protocol {
+                        Protocol::Anthropic => {
+                            let out = forward_anthropic(
+                                &state,
+                                &parts,
+                                &body_bytes,
+                                &oauth_body_bytes,
+                                ep,
+                                i,
+                                &req_id,
+                                &client_id,
+                                &client_ver,
+                                &client_ip,
+                                &agent_id,
+                                &session_id,
+                                &model,
+                                affinity,
+                                request_start,
+                            )
+                            .await;
+                            (out, i)
+                        }
+                        Protocol::OpenAI => {
+                            let out = match openai_fallback_body
+                                .get_or_insert_with(|| build_openai_fallback_body(&body_bytes))
+                            {
+                                FallbackBody::Ready { body, is_streaming } => {
+                                    try_fallback_upstream(
+                                        &state,
+                                        body,
+                                        &req_id,
+                                        &client_id,
+                                        &client_ip,
+                                        &agent_id,
+                                        &session_id,
+                                        &model,
+                                        i,
+                                        request_start,
+                                        true,
+                                        *is_streaming,
+                                    )
+                                    .await
+                                }
+                                FallbackBody::Unparseable => {
+                                    warn!(
+                                            req_id,
+                                            upstream = ep.name,
+                                            "fallback: request JSON unparseable, skipping OpenAI endpoint"
+                                        );
+                                    ROTATE
+                                }
+                                FallbackBody::Untranslatable(msg) => {
+                                    warn!(
+                                        req_id,
+                                        upstream = ep.name,
+                                        error = %msg,
+                                        "fallback: request not representable in OpenAI format"
+                                    );
+                                    // Terminal, not a retry: the request itself
+                                    // is the problem, so rotating would fail the
+                                    // same way on every endpoint.
+                                    ForwardOutcome::Done(Box::new(untranslatable_request_response(
+                                        msg,
+                                    )))
+                                }
+                            };
+                            (out, i)
                         }
                     }
-                    // Candidates exhausted mid-round (all skipped / hard-limited /
-                    // model-filtered). Break to the round-end logic rather than
-                    // returning here, so a transient-only round still reaches the
-                    // transient-aware exhaustion status instead of short-circuiting
-                    // to a premature 429.
-                    None => break,
-                };
+                }
+                // Candidates exhausted mid-round (all skipped / hard-limited /
+                // model-filtered). Break to the round-end logic rather than
+                // returning here, so a transient-only round still reaches the
+                // transient-aware exhaustion status instead of short-circuiting
+                // to a premature 429.
+                None => break,
+            };
 
             match apply_round_outcome(
                 retry_round,
@@ -8221,10 +8265,56 @@ async fn proxy_handler(
 
 // ── Fallback upstream handler ────────────────────────────────────────
 
-/// Forward a request to a `Protocol::OpenAI` endpoint. For Anthropic-format
-/// callers (`proxy_handler`) it translates the request to OpenAI format and the
-/// response back (`translate = true`); for OpenAI-format callers
-/// (`openai_chat_handler`) it forwards directly (`translate = false`).
+/// Anthropic→OpenAI request body for `try_fallback_upstream`, built lazily by
+/// `proxy_handler` on the first OpenAI-endpoint attempt of a request and
+/// memoized across rotations/retries (LAB-716).
+enum FallbackBody {
+    /// Translated + serialized once; `is_streaming` read from the same parse.
+    Ready {
+        body: bytes::Bytes,
+        is_streaming: bool,
+    },
+    /// Request JSON didn't parse (or couldn't re-serialize) — rotate past
+    /// OpenAI endpoints; Anthropic endpoints still forward the raw bytes and
+    /// let the upstream reject them.
+    Unparseable,
+    /// Parsed but not representable in OpenAI format — terminal for the
+    /// request: rotating would fail identically on every endpoint.
+    Untranslatable(String),
+}
+
+fn build_openai_fallback_body(body_bytes: &[u8]) -> FallbackBody {
+    let parsed: serde_json::Value = match serde_json::from_slice(body_bytes) {
+        Ok(v) => v,
+        Err(_) => return FallbackBody::Unparseable,
+    };
+    let is_streaming = parsed
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    let openai_body = match translate_anthropic_request_to_openai(&parsed) {
+        Ok(v) => v,
+        Err(msg) => return FallbackBody::Untranslatable(msg),
+    };
+    match serde_json::to_vec(&openai_body) {
+        Ok(b) => FallbackBody::Ready {
+            body: b.into(),
+            is_streaming,
+        },
+        Err(e) => {
+            // Can't happen for a Value built from parsed JSON (string keys
+            // only) — but don't rotate invisibly if it somehow does.
+            warn!(error = %e, "fallback: translated body failed to serialize");
+            FallbackBody::Unparseable
+        }
+    }
+}
+
+/// Forward a request to a `Protocol::OpenAI` endpoint. Callers hand over the
+/// final wire body: `proxy_handler` pre-translates via
+/// `build_openai_fallback_body` and sets `translate = true` so the *response*
+/// is translated back to Anthropic format; `openai_chat_handler` passes the
+/// raw OpenAI-format bytes with `translate = false` (passthrough).
 ///
 /// Returns `ForwardOutcome` so the caller's retry loop applies the SAME
 /// round-gated policy as the Anthropic path (`apply_round_outcome`): a
@@ -8241,7 +8331,9 @@ async fn proxy_handler(
 #[allow(clippy::too_many_arguments)]
 async fn try_fallback_upstream(
     state: &AppState,
-    body_bytes: &[u8],
+    // Final wire body (already OpenAI-shaped), serialized once by the
+    // caller; each attempt clones the refcounted `Bytes`.
+    request_body: &bytes::Bytes,
     req_id: &str,
     client_id: &str,
     client_ip: &std::net::IpAddr,
@@ -8250,15 +8342,9 @@ async fn try_fallback_upstream(
     model: &str,
     endpoint_idx: usize,
     request_start: std::time::Instant,
-    translate: bool, // true = Anthropic↔OpenAI translation needed
+    translate: bool, // true = upstream response needs OpenAI→Anthropic translation
+    is_streaming: bool,
 ) -> ForwardOutcome {
-    // Non-transient rotation: skip this endpoint and try the next candidate.
-    // Pre-dates the ForwardOutcome return type as a bare `None`.
-    const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
-        saw_529: false,
-        push_skip: true,
-        transient: false,
-    };
     let ep = &state.endpoints[endpoint_idx];
 
     info!(
@@ -8272,40 +8358,6 @@ async fn try_fallback_upstream(
 
     ep.requests.fetch_add(1, Ordering::Relaxed);
 
-    // Parse once to extract streaming flag before potential translation
-    let parsed: serde_json::Value = match serde_json::from_slice(body_bytes) {
-        Ok(v) => v,
-        Err(_) => return ROTATE,
-    };
-    let is_streaming = parsed
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
-
-    // Build request body
-    let request_body = if translate {
-        let openai_body = match translate_anthropic_request_to_openai(&parsed) {
-            Ok(v) => v,
-            Err(msg) => {
-                warn!(
-                    req_id,
-                    upstream = ep.name,
-                    error = %msg,
-                    "fallback: request not representable in OpenAI format"
-                );
-                // Terminal, not a retry: the request itself is the problem, so
-                // rotating to another endpoint would just fail the same way.
-                return ForwardOutcome::Done(Box::new(untranslatable_request_response(&msg)));
-            }
-        };
-        match serde_json::to_vec(&openai_body) {
-            Ok(b) => b,
-            Err(_) => return ROTATE,
-        }
-    } else {
-        body_bytes.to_vec()
-    };
-
     let url = format!("{}/v1/chat/completions", ep.base_url);
 
     // Same non-streaming read_timeout exemption as forward_anthropic (LAB-718).
@@ -8318,7 +8370,7 @@ async fn try_fallback_upstream(
         .post(&url)
         .header("authorization", format!("Bearer {}", ep.token))
         .header("content-type", "application/json")
-        .body(request_body)
+        .body(request_body.clone())
         .send()
         .await
     {
@@ -11171,12 +11223,24 @@ fn anthropic_user_blocks_to_openai_content(
     })
 }
 
+// Test-only invocation counter for `translate_anthropic_request_to_openai`
+// (LAB-716 AC: translation must run at most once per request, not per retry
+// attempt). Thread-local: `#[tokio::test]` defaults to a current-thread
+// runtime on the test's own thread, so parallel tests can't cross-pollute.
+#[cfg(test)]
+thread_local! {
+    static TRANSLATE_A2O_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Err (with a client-facing message) when a message contains an image this
 /// translator can't represent faithfully — the caller must surface a real
 /// error instead of silently forwarding a request with the image dropped.
 fn translate_anthropic_request_to_openai(
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    #[cfg(test)]
+    TRANSLATE_A2O_CALLS.with(|c| c.set(c.get() + 1));
+
     let mut out = serde_json::Map::new();
 
     if let Some(model) = body.get("model") {
@@ -11746,9 +11810,9 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
 }
 
 /// Forward one OpenAI-compat request to a single Anthropic-protocol `Endpoint`.
-/// The caller has already translated the OpenAI request into `anthropic_body`
-/// (plus the OAuth variant `oauth_anthropic_body`); this helper picks the right
-/// variant by token prefix, forwards to the endpoint, and translates the
+/// The caller has already translated the OpenAI request and serialized it once
+/// into `anthropic_body_bytes` (plus the OAuth variant); this helper picks the
+/// right variant by token prefix, forwards to the endpoint, and translates the
 /// Anthropic response back to OpenAI format. Structurally similar to
 /// `forward_anthropic`, but intentionally kept separate: it speaks OpenAI on
 /// both edges (request body already translated, response translated back).
@@ -11763,8 +11827,10 @@ async fn forward_openai_compat_anthropic(
     parts: &axum::http::request::Parts,
     ep: &Endpoint,
     endpoint_idx: usize,
-    anthropic_body: &serde_json::Value,
-    oauth_anthropic_body: &serde_json::Value,
+    // Translated Anthropic-shape bodies, serialized once by the caller
+    // (LAB-716); each attempt clones the refcounted `Bytes`.
+    anthropic_body_bytes: &bytes::Bytes,
+    oauth_anthropic_body_bytes: &bytes::Bytes,
     req_id: &str,
     client_id: &str,
     client_ver: &str,
@@ -11814,15 +11880,14 @@ async fn forward_openai_compat_anthropic(
 
     // Use OAuth variant (with CC system prompt) for OAuth tokens
     let req_body = if token.starts_with("sk-ant-oat") {
-        oauth_anthropic_body
+        oauth_anthropic_body_bytes
     } else {
-        anthropic_body
+        anthropic_body_bytes
     };
-    let body_str = req_body.to_string();
     debug!(
         account = endpoint_name,
         model = %model,
-        body_len = body_str.len(),
+        body_len = req_body.len(),
         "openai-compat: upstream request"
     );
 
@@ -11835,7 +11900,7 @@ async fn forward_openai_compat_anthropic(
     let upstream_req = http_client
         .request(reqwest::Method::POST, &url)
         .headers(headers)
-        .body(body_str);
+        .body(req_body.clone());
 
     let resp = match upstream_req.send().await {
         Ok(r) => r,
@@ -12324,6 +12389,26 @@ async fn openai_chat_handler(
     let mut oauth_anthropic_body = anthropic_body.clone();
     inject_oauth_system_prompt(&mut oauth_anthropic_body);
 
+    // Serialize both variants once (LAB-716): the forward helper used to
+    // `to_string()` the JSON on every retry attempt; now each attempt clones
+    // a refcounted `Bytes`. Serializing a `Value` can only fail on a
+    // non-string map key, which JSON input can't produce — the 500 arm is a
+    // formality.
+    let (anthropic_body_bytes, oauth_body_bytes) = match (
+        serde_json::to_vec(&anthropic_body),
+        serde_json::to_vec(&oauth_anthropic_body),
+    ) {
+        (Ok(a), Ok(o)) => (bytes::Bytes::from(a), bytes::Bytes::from(o)),
+        _ => {
+            error!(req_id, "failed to serialize translated request body");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "body serialization failed",
+            )
+                .into_response();
+        }
+    };
+
     let n = state.endpoints.len();
     let mut last_saw_529 = false;
     let mut last_saw_transient = false;
@@ -12359,8 +12444,8 @@ async fn openai_chat_handler(
                                     &parts,
                                     ep,
                                     i,
-                                    &anthropic_body,
-                                    &oauth_anthropic_body,
+                                    &anthropic_body_bytes,
+                                    &oauth_body_bytes,
                                     &req_id,
                                     &client_id,
                                     &client_ver,
@@ -12391,6 +12476,7 @@ async fn openai_chat_handler(
                                     i,
                                     request_start,
                                     false,
+                                    is_streaming,
                                 )
                                 .await;
                                 (out, i)

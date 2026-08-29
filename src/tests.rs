@@ -4682,6 +4682,39 @@ async fn spawn_status_then_ok_upstream(
     (format!("http://{addr}"), hits)
 }
 
+/// Axum mock upstream that captures each raw request body on the returned
+/// channel, then replies with `status` + `body`. For tests that must assert
+/// on the exact wire bytes an endpoint received — `spawn_mock_upstream()` is
+/// canned-Anthropic/always-200 and does not capture, and the raw-TCP mocks
+/// above only count hits.
+async fn spawn_capturing_upstream(
+    status: StatusCode,
+    body: &'static [u8],
+) -> (String, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+    let app = Router::new().fallback(any(move |req: Request<Body>| {
+        let tx = tx.clone();
+        async move {
+            let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let _ = tx.send(bytes).await;
+            (
+                status,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), rx)
+}
+
 /// GH #97 regression: a 429 from a `Protocol::OpenAI` endpoint must set a
 /// hard-limit cooldown (honouring `retry-after`) so a SUBSEQUENT request
 /// skips it at `pick_endpoint` instead of re-hammering an upstream that
@@ -14307,10 +14340,11 @@ async fn try_fallback_upstream_rotates_on_429() {
     ep.base_url = format!("http://{}", addr);
     Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
 
-    let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+    let body =
+        bytes::Bytes::from_static(br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#);
     let result = try_fallback_upstream(
         &state,
-        body,
+        &body,
         "req-1",
         "client-1",
         &"127.0.0.1".parse().unwrap(),
@@ -14319,6 +14353,7 @@ async fn try_fallback_upstream_rotates_on_429() {
         "claude-opus-4-7",
         0,
         Instant::now(),
+        false,
         false,
     )
     .await;
@@ -14351,10 +14386,11 @@ async fn try_fallback_upstream_rotates_on_500() {
     ep.base_url = format!("http://{}", addr);
     Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
 
-    let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+    let body =
+        bytes::Bytes::from_static(br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#);
     let result = try_fallback_upstream(
         &state,
-        body,
+        &body,
         "req-1",
         "client-1",
         &"127.0.0.1".parse().unwrap(),
@@ -14363,6 +14399,7 @@ async fn try_fallback_upstream_rotates_on_500() {
         "claude-opus-4-7",
         0,
         Instant::now(),
+        false,
         false,
     )
     .await;
@@ -14390,10 +14427,11 @@ async fn try_fallback_upstream_transport_error_is_transient_and_counted() {
     ep.base_url = url;
     Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
 
-    let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+    let body =
+        bytes::Bytes::from_static(br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#);
     let result = try_fallback_upstream(
         &state,
-        body,
+        &body,
         "req-1",
         "client-1",
         &"127.0.0.1".parse().unwrap(),
@@ -14402,6 +14440,7 @@ async fn try_fallback_upstream_transport_error_is_transient_and_counted() {
         "claude-opus-4-7",
         0,
         Instant::now(),
+        false,
         false,
     )
     .await;
@@ -14462,10 +14501,11 @@ async fn try_fallback_upstream_records_usage_and_budget() {
 
     assert!(state.check_budget("client-1").await.is_ok());
 
-    let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+    let body =
+        bytes::Bytes::from_static(br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#);
     let result = try_fallback_upstream(
         &state,
-        body,
+        &body,
         "req-1",
         "client-1",
         &"127.0.0.1".parse().unwrap(),
@@ -14475,6 +14515,7 @@ async fn try_fallback_upstream_records_usage_and_budget() {
         0,
         Instant::now(),
         true,
+        false,
     )
     .await;
     assert!(matches!(result, ForwardOutcome::Done(_)));
@@ -14561,41 +14602,11 @@ async fn openai_chat_handler_routes_to_unified_anthropic_endpoint() {
 async fn proxy_handler_translates_to_openai_endpoint() {
     // Mock OpenAI upstream: capture the request body to assert it was
     // translated to OpenAI shape, then return an OpenAI-format response.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(1);
-    let app = Router::new().fallback(any(move |req: Request<Body>| {
-        let tx = tx.clone();
-        async move {
-            let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            let _ = tx.send(v).await;
-            (
-                StatusCode::OK,
-                axum::Json(serde_json::json!({
-                    "id": "chatcmpl-x",
-                    "object": "chat.completion",
-                    "model": "claude-opus-4-7",
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "hi back"},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-                })),
-            )
-                .into_response()
-        }
-    }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let (url, mut rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
 
     let mut state = test_state_with(vec![]);
     let mut ep = make_endpoint("openai-gw", Protocol::OpenAI);
-    ep.base_url = format!("http://{}", upstream_addr);
+    ep.base_url = url;
     Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
 
     let proxy_app = Router::new().fallback(any(proxy_handler)).with_state(state);
@@ -14622,12 +14633,94 @@ async fn proxy_handler_translates_to_openai_endpoint() {
         .await
         .unwrap();
 
-    let received = rx.recv().await.expect("upstream must receive a request");
+    let received: serde_json::Value =
+        serde_json::from_slice(&rx.recv().await.expect("upstream must receive a request")).unwrap();
     assert!(
         received.get("messages").is_some(),
         "translated request must have OpenAI `messages` field"
     );
     assert_eq!(received["model"], "claude-opus-4-7");
+}
+
+/// LAB-716: request translation must run at most ONCE per request, not once
+/// per retry attempt. Two OpenAI endpoints; the preferred one 500s so the
+/// retry loop rotates to the second — both attempts must reuse one translated
+/// body (asserted byte-identical) with a single translate invocation.
+/// Relies on `#[tokio::test]`'s current-thread runtime: the handler runs on
+/// this test's thread, so the thread-local counter sees exactly this request.
+#[tokio::test]
+async fn proxy_handler_translates_once_across_endpoint_rotation() {
+    // Failing upstream 500s → rotate; healthy upstream serves a canned
+    // OpenAI completion. Both capture the raw wire body for comparison.
+    let (bad_url, mut bad_rx) =
+        spawn_capturing_upstream(StatusCode::INTERNAL_SERVER_ERROR, b"boom").await;
+    let (ok_url, mut ok_rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
+
+    // Priority 0 = failing endpoint picked first; priority 100 = healthy
+    // rotation target (deterministic ordering, same trick as LAB-365).
+    let mut state = test_state_with(vec![]);
+    let mut bad_ep = make_endpoint("bad-gw", Protocol::OpenAI);
+    bad_ep.base_url = bad_url;
+    let mut ok_ep = make_endpoint("ok-gw", Protocol::OpenAI);
+    ok_ep.base_url = ok_url;
+    ok_ep.priority = 100;
+    {
+        let s = Arc::get_mut(&mut state).unwrap();
+        s.endpoints.push(bad_ep);
+        s.endpoints.push(ok_ep);
+    }
+
+    let proxy_app = Router::new().fallback(any(proxy_handler)).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            proxy_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let calls_before = TRANSLATE_A2O_CALLS.with(|c| c.get());
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/v1/messages", proxy_addr))
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-7",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "rotation to the healthy endpoint must succeed"
+    );
+
+    let calls_after = TRANSLATE_A2O_CALLS.with(|c| c.get());
+    assert_eq!(
+        calls_after - calls_before,
+        1,
+        "translation must run exactly once for a 2-endpoint retry, not per attempt"
+    );
+
+    // Both attempts must send the SAME wire body (memoized Bytes reused).
+    let bad_body = bad_rx
+        .recv()
+        .await
+        .expect("failing endpoint got the request");
+    let ok_body = ok_rx
+        .recv()
+        .await
+        .expect("healthy endpoint got the rotation");
+    assert_eq!(
+        bad_body, ok_body,
+        "rotated attempt must reuse the identical serialized body"
+    );
 }
 
 // ── Connection resilience: synthetic SSE error on upstream disconnect ──
