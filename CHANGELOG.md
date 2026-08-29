@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.4](https://github.com/27b-io/anthropic-lb/compare/v0.2.3...v0.2.4) (2026-08-29)
+
+
+### Features
+
+* **LAB-2330:** per-client token usage by model ([#146](https://github.com/27b-io/anthropic-lb/issues/146)) ([de5d597](https://github.com/27b-io/anthropic-lb/commit/de5d59738bcfff42d03291254349c77597e088b6))
+
+
+### Bug Fixes
+
+* **LAB-1193:** keep valid auth live behind shared-IP throttle ([#140](https://github.com/27b-io/anthropic-lb/issues/140)) ([5dadee8](https://github.com/27b-io/anthropic-lb/commit/5dadee82b22c22b868d9a2a9254a1de314d17e17))
+* **LAB-1962:** stop erasing the shared budget counter on INCRBY failure ([#138](https://github.com/27b-io/anthropic-lb/issues/138)) ([6a1a75e](https://github.com/27b-io/anthropic-lb/commit/6a1a75eadd036339c6aafd6d45d530c43c77d40a))
+* **LAB-2214:** box large Err payloads for clippy 1.98 result_large_err ([#143](https://github.com/27b-io/anthropic-lb/issues/143)) ([15bb7f2](https://github.com/27b-io/anthropic-lb/commit/15bb7f23aef00b9a2cd7a7503d51fa6a00c99671))
+
+
+### Performance Improvements
+
+* **LAB-716:** build OpenAI-path request bodies once per request, not per retry attempt ([#130](https://github.com/27b-io/anthropic-lb/issues/130)) ([6e758f1](https://github.com/27b-io/anthropic-lb/commit/6e758f1beafd2b2f193d133a02e5849b3269c697))
+
 ## [0.2.3](https://github.com/27b-io/anthropic-lb/compare/v0.2.2...v0.2.3) (2026-08-08)
 
 
