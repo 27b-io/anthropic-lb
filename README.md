@@ -444,8 +444,10 @@ Requests rejected by a client's model allow-list are counted as
 past 64 distinct pairs lumps into a single global
 `client="_other",model="_other"` bucket (hard bound: 64 + 1 series).
 `_other` is a reserved client name: config validation rejects a
-`[[clients]]` entry named `_other`, and the legacy `x-client-id` header
-ignores it, so real traffic can never pre-claim the overflow key.
+`[[clients]]` entry or `client_names` value named `_other`, and a legacy
+`x-client-id: _other` header is ignored, so real traffic can never
+pre-claim the overflow key. `anthropic_client_model_token_usage_total`
+shares the same overflow scheme (bucket at 256 + 1 series).
 
 ### OpenAI JSON-mode compatibility
 

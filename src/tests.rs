@@ -16881,6 +16881,12 @@ fn validate_clients_rejects_bad_names_and_empty_keys() {
         // a real client with that name could pre-create the exact pair and
         // later overflow denials/usage would merge into it (CodeRabbit, #148).
         ("[[clients]]\nname = \"_other\"\nkey = \"k1\"\n", "_other"),
+        // The legacy client_names IP map is the third identity entry point
+        // (resolve_client_id's fallback) — its values must not claim a
+        // reserved sentinel either (expert-panel finding, #148 follow-up).
+        ("[client_names]\n\"10.0.0.5\" = \"-\"\n", "reserved"),
+        ("[client_names]\n\"10.0.0.5\" = \"_operator\"\n", "reserved"),
+        ("[client_names]\n\"10.0.0.5\" = \"_other\"\n", "reserved"),
         ("[[clients]]\nname = \"geo\"\nkey = \"\"\n", "key"),
         // Untrimmed: stored verbatim, so it would become a client_id matching
         // no client_budgets / operators / response_cache.clients key.

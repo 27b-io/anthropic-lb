@@ -12605,6 +12605,17 @@ fn validate_clients(config: &Config) -> Result<(), String> {
         seen_keys.push(&c.key);
     }
 
+    // The legacy `client_names` IP map is the third identity entry point
+    // (`resolve_client_id`'s fallback) — an IP mapped to a reserved sentinel
+    // would resolve real traffic to it, bypassing the header filter above.
+    for (ip, name) in &config.client_names {
+        if name == "-" || name == "_operator" || name == "_other" {
+            return Err(format!(
+                "client_names: \"{ip}\" maps to reserved name \"{name}\" (\"-\" = unknown-client sentinel, \"_operator\" = operator-aggregation label, \"_other\" = metrics overflow bucket)"
+            ));
+        }
+    }
+
     // One client registry, not five. Every one of these config surfaces keys on
     // a client name, and every one of them fails SILENTLY on a typo — in the
     // dangerous direction: `check_budget` and `check_utilization_limit` both
