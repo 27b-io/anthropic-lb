@@ -2090,8 +2090,10 @@ impl AppState {
             let id = id.trim();
             // "_operator" is the reserved operator-aggregation label on
             // /_stats and /metrics — a self-asserted claim to it would merge
-            // this caller's usage into the hidden operator bucket.
-            if !id.is_empty() && id != "-" && id != "_operator" {
+            // this caller's usage into the hidden operator bucket. "_other"
+            // is the reserved metrics overflow-bucket label (LAB-2330/2332) —
+            // claiming it would merge this caller into the overflow key.
+            if !id.is_empty() && id != "-" && id != "_operator" && id != "_other" {
                 return id.to_string();
             }
         }
@@ -12572,6 +12574,12 @@ fn validate_clients(config: &Config) -> Result<(), String> {
         if c.name == "_operator" {
             return Err(
                 "client: name must not be \"_operator\" (the reserved operator-aggregation label on /_stats and /metrics)"
+                    .to_string(),
+            );
+        }
+        if c.name == "_other" {
+            return Err(
+                "client: name must not be \"_other\" (the reserved metrics overflow-bucket label — a real client with this name would merge with, and take the warn-once flag of, the (\"_other\", \"_other\") overflow key)"
                     .to_string(),
             );
         }

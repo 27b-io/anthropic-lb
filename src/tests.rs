@@ -10395,6 +10395,20 @@ fn resolve_client_id_ignores_reserved_operator_header() {
 }
 
 #[test]
+fn resolve_client_id_ignores_reserved_other_header() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let ip: IpAddr = "192.168.1.100".parse().unwrap();
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("x-client-id", HeaderValue::from_static("_other"));
+
+    let resolved = state.resolve_client_id(&ip, &headers);
+    assert_eq!(
+        resolved, "-",
+        "a self-asserted _other identity must not merge into the metrics overflow bucket"
+    );
+}
+
+#[test]
 fn compute_pressure_status_operator_always_healthy() {
     let state = Arc::new(AppState {
         client: Client::new(),
@@ -16863,6 +16877,10 @@ fn validate_clients_rejects_bad_names_and_empty_keys() {
             "[[clients]]\nname = \"_operator\"\nkey = \"k1\"\n",
             "_operator",
         ),
+        // Reserved: the metrics overflow bucket is keyed ("_other", "_other");
+        // a real client with that name could pre-create the exact pair and
+        // later overflow denials/usage would merge into it (CodeRabbit, #148).
+        ("[[clients]]\nname = \"_other\"\nkey = \"k1\"\n", "_other"),
         ("[[clients]]\nname = \"geo\"\nkey = \"\"\n", "key"),
         // Untrimmed: stored verbatim, so it would become a client_id matching
         // no client_budgets / operators / response_cache.clients key.

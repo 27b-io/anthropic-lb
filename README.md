@@ -443,6 +443,9 @@ Requests rejected by a client's model allow-list are counted as
 `model` label is caller-controlled, so the label set is bounded — overflow
 past 64 distinct pairs lumps into a single global
 `client="_other",model="_other"` bucket (hard bound: 64 + 1 series).
+`_other` is a reserved client name: config validation rejects a
+`[[clients]]` entry named `_other`, and the legacy `x-client-id` header
+ignores it, so real traffic can never pre-claim the overflow key.
 
 ### OpenAI JSON-mode compatibility
 
