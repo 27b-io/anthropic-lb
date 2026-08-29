@@ -387,6 +387,7 @@ fn test_state_base() -> AppState {
         client_names: HashMap::new(),
         auto_cache: true,
         client_usage: Mutex::new(HashMap::new()),
+        client_model_usage: Mutex::new(HashMap::new()),
         shadow_log_tx: None,
         shadow_log_dropped: AtomicU64::new(0),
         client_budgets: HashMap::new(),
@@ -6449,7 +6450,12 @@ async fn record_usage_updates_account_and_client() {
         cache_read_input_tokens: 30,
     };
     state
-        .record_usage(&state.endpoints[0], "test-client", &usage)
+        .record_usage(
+            &state.endpoints[0],
+            "test-client",
+            "claude-sonnet-5",
+            &usage,
+        )
         .await;
 
     assert_eq!(state.endpoints[0].input_tokens.load(Ordering::Relaxed), 100);
@@ -6479,7 +6485,9 @@ async fn record_usage_ignores_anonymous() {
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
     };
-    state.record_usage(&state.endpoints[0], "-", &usage).await;
+    state
+        .record_usage(&state.endpoints[0], "-", "claude-sonnet-5", &usage)
+        .await;
 
     // Account gets updated
     assert_eq!(state.endpoints[0].input_tokens.load(Ordering::Relaxed), 100);
@@ -6518,7 +6526,12 @@ async fn client_usage_is_bounded() {
     };
     for i in 0..10_050 {
         state
-            .record_usage(&state.endpoints[0], &format!("c{i}"), &usage)
+            .record_usage(
+                &state.endpoints[0],
+                &format!("c{i}"),
+                "claude-sonnet-5",
+                &usage,
+            )
             .await;
     }
     let n = state.client_usage.lock().unwrap().len();
@@ -6526,6 +6539,134 @@ async fn client_usage_is_bounded() {
         n <= 10_000,
         "client_usage must be bounded against unbounded x-client-id values, got {n}"
     );
+}
+
+// ── LAB-2330: per-(client, model) usage accounting ─────────────
+
+#[tokio::test]
+async fn record_usage_tracks_per_model() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_creation_input_tokens: 2,
+        cache_read_input_tokens: 3,
+    };
+    for model in ["claude-sonnet-5", "claude-sonnet-5", "claude-haiku-4-5"] {
+        state
+            .record_usage(&state.endpoints[0], "c1", model, &usage)
+            .await;
+    }
+
+    let map = state.client_model_usage.lock().unwrap();
+    assert_eq!(
+        map.get(&("c1".to_string(), "claude-sonnet-5".to_string())),
+        Some(&[20, 10, 4, 6])
+    );
+    assert_eq!(
+        map.get(&("c1".to_string(), "claude-haiku-4-5".to_string())),
+        Some(&[10, 5, 2, 3])
+    );
+    // The per-client family stays the authoritative total across models.
+    assert_eq!(
+        state.client_usage.lock().unwrap().get("c1"),
+        Some(&[30, 15, 6, 9])
+    );
+}
+
+#[tokio::test]
+async fn record_usage_empty_model_records_unknown() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    state
+        .record_usage(&state.endpoints[0], "c1", "", &usage)
+        .await;
+    let map = state.client_model_usage.lock().unwrap();
+    assert!(map.contains_key(&("c1".to_string(), "unknown".to_string())));
+}
+
+#[tokio::test]
+async fn record_usage_truncates_model_label() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 1,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    let huge = "m".repeat(500);
+    state
+        .record_usage(&state.endpoints[0], "c1", &huge, &usage)
+        .await;
+    // The stored key must have gone through truncate_label (whose exact
+    // format is covered by its own unit tests).
+    let map = state.client_model_usage.lock().unwrap();
+    let (_, model) = map.keys().next().unwrap();
+    assert!(
+        model.chars().count() < huge.chars().count(),
+        "model label must be truncated before becoming a map key"
+    );
+}
+
+#[tokio::test]
+async fn client_model_usage_is_bounded() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 1,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    for i in 0..(MAX_CLIENT_MODEL_LABELS + 50) {
+        state
+            .record_usage(&state.endpoints[0], "c1", &format!("model-{i}"), &usage)
+            .await;
+    }
+    // Expert-panel finding (LAB-2330): rotating the caller-controlled client
+    // id past the cap must NOT mint per-client overflow keys — the bound has
+    // to hold on the client axis too.
+    for i in 0..50 {
+        state
+            .record_usage(
+                &state.endpoints[0],
+                &format!("evil-{i}"),
+                "claude-x",
+                &usage,
+            )
+            .await;
+    }
+    let map = state.client_model_usage.lock().unwrap();
+    assert!(
+        map.len() <= MAX_CLIENT_MODEL_LABELS + 1,
+        "client_model_usage must be hard-bounded, got {}",
+        map.len()
+    );
+    // Overflow tokens are not dropped — they land in the global bucket:
+    // 50 c1 overflow models + 50 rotated clients, 1 input token each.
+    let other = map
+        .get(&("_other".to_string(), "_other".to_string()))
+        .unwrap();
+    assert_eq!(other[0], 100);
+}
+
+#[test]
+fn sse_scanner_captures_response_model() {
+    let sse_text = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":150}}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":75}}\n\n";
+    let mut scanner = SseUsageScanner::default();
+    scanner.push(sse_text.as_bytes());
+    scanner.finish();
+    assert_eq!(scanner.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(scanner.usage.input_tokens, 150);
 }
 
 // ── Unit: model-based routing ──────────────────────────────────
@@ -12276,6 +12417,21 @@ async fn metrics_operator_hiding() {
         usage.insert("user-charlie".to_string(), [10, 20, 0, 0]);
     }
     {
+        let mut usage = state.client_model_usage.lock().unwrap();
+        usage.insert(
+            ("op-alice".to_string(), "claude-sonnet-5".to_string()),
+            [100, 200, 0, 0],
+        );
+        usage.insert(
+            ("op-bob".to_string(), "claude-sonnet-5".to_string()),
+            [50, 100, 0, 0],
+        );
+        usage.insert(
+            ("user-charlie".to_string(), "claude-haiku-4-5".to_string()),
+            [10, 20, 0, 0],
+        );
+    }
+    {
         let mut rates = state.client_request_rates.lock().unwrap();
         rates.insert(
             "op-alice".to_string(),
@@ -12348,6 +12504,20 @@ async fn metrics_operator_hiding() {
     assert!(
         body.contains("anthropic_client_requests_total{client=\"_operator\"} 8"),
         "operator requests should sum to 8:\n{body}"
+    );
+
+    // LAB-2330: per-model family aggregates operators the same way
+    assert!(
+        body.contains(
+            "anthropic_client_model_token_usage_total{client=\"_operator\",model=\"claude-sonnet-5\",type=\"input\"} 150"
+        ),
+        "operator per-model input tokens should sum to 150:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "anthropic_client_model_token_usage_total{client=\"user-charlie\",model=\"claude-haiku-4-5\",type=\"output\"} 20"
+        ),
+        "regular client per-model tokens should be emitted:\n{body}"
     );
 
     // Regular client should appear normally
@@ -16258,7 +16428,7 @@ fn distinct_client_keys_resolve_to_distinct_identities() {
     for (key, expected) in [("key-geo", "geo"), ("key-radar", "radar")] {
         let headers = hdrs(&[("x-api-key", key)]);
         let principal = state
-            .authenticate(&ip, &headers, false)
+            .authenticate(&headers, false)
             .expect("configured key must authenticate")
             .expect("a [[clients]] match must yield a principal");
         assert_eq!(principal.name, expected);
@@ -16275,7 +16445,7 @@ fn distinct_client_keys_resolve_to_distinct_identities() {
 fn unknown_client_key_is_rejected() {
     let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
     let resp = state
-        .authenticate(&test_ip(), &hdrs(&[("x-api-key", "key-wrong")]), false)
+        .authenticate(&hdrs(&[("x-api-key", "key-wrong")]), false)
         .expect_err("unknown key must not authenticate");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -16284,7 +16454,7 @@ fn unknown_client_key_is_rejected() {
 fn missing_credential_is_rejected_when_clients_configured() {
     let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
     let resp = state
-        .authenticate(&test_ip(), &hyper::HeaderMap::new(), false)
+        .authenticate(&hyper::HeaderMap::new(), false)
         .expect_err("absent credential must not authenticate");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -16297,7 +16467,7 @@ fn client_key_match_is_exact_not_prefix() {
     for wrong in ["key-ge", "key-geo ", "key-geox", "", "KEY-GEO"] {
         assert!(
             state
-                .authenticate(&test_ip(), &hdrs(&[("x-api-key", wrong)]), false)
+                .authenticate(&hdrs(&[("x-api-key", wrong)]), false)
                 .is_err(),
             "'{wrong}' must not authenticate as 'key-geo'"
         );
@@ -16309,18 +16479,17 @@ fn client_key_match_is_exact_not_prefix() {
 #[test]
 fn bearer_credential_accepted_only_where_enabled() {
     let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
-    let ip = test_ip();
     let headers = hdrs(&[("authorization", "Bearer key-geo")]);
 
     let principal = state
-        .authenticate(&ip, &headers, true)
+        .authenticate(&headers, true)
         .expect("bearer must authenticate where enabled")
         .expect("principal");
     assert_eq!(principal.name, "geo");
 
     // The native surface may carry the caller's OWN upstream token in
     // `Authorization` (passthrough endpoints), so bearer is not accepted there.
-    assert!(state.authenticate(&ip, &headers, false).is_err());
+    assert!(state.authenticate(&headers, false).is_err());
 }
 
 #[test]
@@ -16328,11 +16497,7 @@ fn bearer_scheme_match_is_case_insensitive() {
     let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
     let headers = hdrs(&[("authorization", "bEaReR key-geo")]);
     assert_eq!(
-        state
-            .authenticate(&test_ip(), &headers, true)
-            .unwrap()
-            .unwrap()
-            .name,
+        state.authenticate(&headers, true).unwrap().unwrap().name,
         "geo"
     );
 }
@@ -16348,7 +16513,7 @@ fn spoofed_x_client_id_is_ignored_under_clients_table() {
     let ip = test_ip();
     let headers = hdrs(&[("x-api-key", "key-alpha"), ("x-client-id", "bravo")]);
 
-    let principal = state.authenticate(&ip, &headers, false).unwrap().unwrap();
+    let principal = state.authenticate(&headers, false).unwrap().unwrap();
     assert_eq!(principal.name, "alpha");
 
     let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
@@ -16371,7 +16536,7 @@ fn client_names_ip_map_is_ignored_under_clients_table() {
     });
     let ip = test_ip();
     let headers = hdrs(&[("x-api-key", "key-alpha")]);
-    let principal = state.authenticate(&ip, &headers, false).unwrap().unwrap();
+    let principal = state.authenticate(&headers, false).unwrap().unwrap();
     let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
     assert_eq!(rctx.client_id, "alpha");
 }
@@ -16384,10 +16549,9 @@ fn legacy_proxy_key_still_authenticates_and_yields_no_principal() {
         proxy_key: Some("shared-secret".to_string()),
         ..test_state_base()
     });
-    let ip = test_ip();
 
     let principal = state
-        .authenticate(&ip, &hdrs(&[("x-api-key", "shared-secret")]), false)
+        .authenticate(&hdrs(&[("x-api-key", "shared-secret")]), false)
         .expect("correct legacy key must authenticate");
     assert!(
         principal.is_none(),
@@ -16395,11 +16559,9 @@ fn legacy_proxy_key_still_authenticates_and_yields_no_principal() {
     );
 
     assert!(state
-        .authenticate(&ip, &hdrs(&[("x-api-key", "nope")]), false)
+        .authenticate(&hdrs(&[("x-api-key", "nope")]), false)
         .is_err());
-    assert!(state
-        .authenticate(&ip, &hyper::HeaderMap::new(), false)
-        .is_err());
+    assert!(state.authenticate(&hyper::HeaderMap::new(), false).is_err());
 }
 
 #[test]
@@ -16410,7 +16572,7 @@ fn legacy_proxy_key_leaves_x_client_id_resolution_intact() {
     });
     let ip = test_ip();
     let headers = hdrs(&[("x-api-key", "shared-secret"), ("x-client-id", "gastown")]);
-    let principal = state.authenticate(&ip, &headers, false).unwrap();
+    let principal = state.authenticate(&headers, false).unwrap();
     let rctx = RequestContext::from_request(&state, &ip, &headers, principal);
     assert_eq!(
         rctx.client_id, "gastown",
@@ -16422,7 +16584,7 @@ fn legacy_proxy_key_leaves_x_client_id_resolution_intact() {
 fn open_proxy_authenticates_every_request() {
     let state = test_state_with(vec![]);
     assert!(state
-        .authenticate(&test_ip(), &hyper::HeaderMap::new(), false)
+        .authenticate(&hyper::HeaderMap::new(), false)
         .unwrap()
         .is_none());
 }
@@ -16903,7 +17065,7 @@ fn response_cache_tenant_follows_the_authenticated_principal() {
     ]);
     let ip = test_ip();
     let headers = hdrs(&[("x-api-key", "key-alpha"), ("x-client-id", "bravo")]);
-    let principal = state.authenticate(&ip, &headers, false).unwrap().unwrap();
+    let principal = state.authenticate(&headers, false).unwrap().unwrap();
     let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
 
     // The cache is keyed by this exact string (`rc.clients.get(&client_id)`),
@@ -19469,27 +19631,12 @@ fn auth_throttle_capacity_purges_expired_before_evicting() {
     assert!(entries.len() <= 2, "expired entries purged, capacity held");
 }
 
-/// A successful authentication clears the IP's failure state, so a client's
-/// own sporadic typos never drift toward a lockout (bug-hunter/security
-/// finding: shared-IP false lockout mitigation).
-#[test]
-fn auth_throttle_clear_resets_failures() {
-    let t = AuthThrottle::new(3, Duration::from_secs(60));
-    let ip: IpAddr = "203.0.113.7".parse().unwrap();
-    t.record_failure(ip);
-    t.record_failure(ip);
-    t.clear(&ip);
-    // Back to zero: two fresh failures still under the limit.
-    t.record_failure(ip);
-    t.record_failure(ip);
-    assert_eq!(t.check(&ip), None, "clear must reset the counter to zero");
-}
-
-/// The throttle fires BEFORE the key comparison: once tripped, even the
-/// CORRECT credential gets 429 until the window expires — the guessing
-/// surface (including its timing) closes entirely. Also pins the counter.
+/// A locked-out invalid caller must not deny service to a valid principal
+/// sharing its resolved IP (NAT, tailnet proxy, or load balancer). Invalid
+/// attempts remain throttled after the valid request, so success is a bypass
+/// for that authenticated request rather than a reset attackers can induce.
 #[tokio::test]
-async fn throttled_ip_gets_429_even_with_a_valid_key() {
+async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
     acct.base_url = mock_url.to_string();
@@ -19517,10 +19664,10 @@ async fn throttled_ip_gets_429_even_with_a_valid_key() {
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
 
-    // Valid credential, throttled IP: 429 with retry-after, before comparison.
+    // The next invalid credential is throttled with retry-after.
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
-        .header("x-api-key", "key-geo")
+        .header("x-api-key", "key-wrong")
         .body("{}")
         .send()
         .await
@@ -19536,17 +19683,34 @@ async fn throttled_ip_gets_429_even_with_a_valid_key() {
         .expect("retry-after must be whole seconds");
     assert!((1..=60).contains(&retry));
 
-    // Counter = 3 rejected credentials + the 1 throttle-429 = 4. The 429 path
-    // is counted too, so the metric keeps climbing through a sustained attack
-    // instead of plateauing at the limit.
-    assert_eq!(state.auth_failures.lock().unwrap().get("proxy"), Some(&4));
+    // A valid credential from the same IP must still reach the handler.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-geo")
+        .body(r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Success does not erase a shared IP's attack history: another invalid
+    // credential is still throttled, and only failures increment the metric.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-wrong")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(state.auth_failures.lock().unwrap().get("proxy"), Some(&5));
 }
 
-/// Reset-on-success through the real router: a client that fails a couple of
-/// times, then authenticates successfully, is NOT throttled by those earlier
-/// failures — its state was cleared. Mitigates shared-IP false lockouts.
+/// Successful traffic below the limit also leaves the shared IP's failure
+/// history intact. This keeps an authenticated neighbour from accidentally
+/// defeating the invalid-request throttle for an attacker behind the same NAT.
 #[tokio::test]
-async fn successful_auth_clears_prior_failures() {
+async fn successful_auth_does_not_clear_shared_ip_failures() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
     acct.base_url = mock_url.to_string();
@@ -19570,7 +19734,7 @@ async fn successful_auth_clears_prior_failures() {
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
-    // A successful auth clears the two failures.
+    // A successful auth is served but does not clear the two failures.
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
         .header("x-api-key", "key-geo")
@@ -19579,13 +19743,24 @@ async fn successful_auth_clears_prior_failures() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert!(
-        state
-            .auth_throttle
-            .check(&"127.0.0.1".parse().unwrap())
-            .is_none(),
-        "the client's own IP must not be throttled after a success reset it"
-    );
+    // The third bad request is still the threshold-reaching 401; the next is
+    // a 429. If success had cleared the state, both would be 401.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-wrong")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-wrong")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
 }
 
 /// A dual-stack listener delivers IPv4 peers as `::ffff:a.b.c.d`; a v4
