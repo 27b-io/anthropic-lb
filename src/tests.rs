@@ -2883,6 +2883,93 @@ fn translate_request_forwards_non_numeric_temperature_unchanged() {
     assert_eq!(result["temperature"], "0.7");
 }
 
+/// The Anthropic→OpenAI fallback translator gets the same LAB-798 guard as
+/// the forward shim: an OpenAI-protocol endpoint can front Claude ≥ 4.7.
+#[test]
+fn translate_a2o_drops_temperature_for_rejecting_model() {
+    let body = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": 64,
+        "temperature": 0.2,
+        "top_p": 0.9
+    });
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    assert!(result.get("temperature").is_none());
+    assert_eq!(result["top_p"], 0.9);
+}
+
+#[test]
+fn translate_a2o_keeps_default_temperature_for_rejecting_model() {
+    // Default 1 passes through (upstream accepts it); ≤ 4.6 models are
+    // covered by `translate_anthropic_request_basic`.
+    let body = serde_json::json!({
+        "model": "claude-fable-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 1
+    });
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    assert_eq!(result["temperature"], 1);
+}
+
+/// LAB-798 third path: `openai_chat_handler` forwards the raw request bytes
+/// to a `Protocol::OpenAI` endpoint without translation — the handler must
+/// strip a hard-rejected `temperature` from those bytes before forwarding.
+#[tokio::test]
+async fn openai_passthrough_strips_temperature_for_rejecting_model() {
+    let seen_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+    let seen_body_clone = seen_body.clone();
+    let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+        let seen_body = seen_body_clone.clone();
+        async move {
+            let bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES)
+                .await
+                .unwrap();
+            *seen_body.lock().unwrap() = Some(bytes.to_vec());
+            (
+                [("content-type", "application/json")],
+                OPENAI_OK_BODY.to_vec(),
+            )
+        }
+    }));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = format!("http://{mock_addr}");
+    let state = test_state_with(vec![gw]);
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"claude-sonnet-5","max_tokens":8,"temperature":0.2,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let captured = seen_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("gateway should receive request body");
+    let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    assert!(
+        forwarded.get("temperature").is_none(),
+        "raw passthrough must not forward a hard-rejected temperature: {forwarded}"
+    );
+    assert_eq!(
+        forwarded["top_p"], 0.9,
+        "other params must survive the strip"
+    );
+}
+
 #[test]
 fn translate_request_strips_name_field() {
     let req = serde_json::json!({

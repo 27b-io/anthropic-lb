@@ -3027,6 +3027,31 @@ fn model_rejects_temperature(model: &str) -> bool {
     (major, minor) >= (4, 7)
 }
 
+/// Decide whether a request's `temperature` must be dropped before
+/// forwarding, and log the operator-visible warn when it is. Shared by every
+/// path that builds an upstream body (LAB-798): the OpenAI→Anthropic shim,
+/// the Anthropic→OpenAI fallback translator, and the raw OpenAI passthrough —
+/// a `protocol = "openai"` endpoint can front Claude too, so all three must
+/// agree.
+///
+/// Only confirmed non-default numerics are dropped: the default (1) is still
+/// accepted upstream, and most OpenAI SDKs send it unprompted — warning on
+/// every default-sending request would be spam. Non-numeric junk ("0.7",
+/// null) forwards so it earns the same upstream type error it gets on ≤ 4.6
+/// models. The per-drop warn is deliberate: the client asked for sampling
+/// behavior it will not get, and that must stay visible to operators.
+fn drops_deprecated_temperature(model: &str, value: &serde_json::Value) -> bool {
+    if !model_rejects_temperature(model) || !matches!(value.as_f64(), Some(t) if t != 1.0) {
+        return false;
+    }
+    warn!(
+        model = %truncate_label(model),
+        temperature = %value,
+        "dropping `temperature`: deprecated and hard-rejected by this model"
+    );
+    true
+}
+
 /// Internal claim key for the Fable included-usage band. On Max plans Fable is
 /// included only up to 50% of the weekly limit; past that it bills as paid
 /// usage credits (support.claude.com article 15424964). Unlike other per-model
@@ -8345,7 +8370,9 @@ fn build_openai_fallback_body(body_bytes: &[u8]) -> FallbackBody {
 /// final wire body: `proxy_handler` pre-translates via
 /// `build_openai_fallback_body` and sets `translate = true` so the *response*
 /// is translated back to Anthropic format; `openai_chat_handler` passes the
-/// raw OpenAI-format bytes with `translate = false` (passthrough).
+/// client's OpenAI-format bytes (temperature-stripped per LAB-798 when the
+/// model hard-rejects it, otherwise verbatim) with `translate = false`
+/// (passthrough).
 ///
 /// Returns `ForwardOutcome` so the caller's retry loop applies the SAME
 /// round-gated policy as the Anthropic path (`apply_round_outcome`): a
@@ -10837,27 +10864,12 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
 
     // Direct passthrough params — except `temperature` on models that
     // hard-reject it as deprecated (Claude ≥ 4.7, LAB-798): forwarding it
-    // fails the whole request with a non-retryable 400, so drop it and warn.
-    // Only confirmed non-default numerics are dropped: the default (1) is
-    // still accepted upstream, and most OpenAI SDKs send it unprompted —
-    // warning on every default-sending request would be spam. Non-numeric
-    // junk ("0.7", null) forwards so it earns the same upstream type error
-    // it gets on ≤ 4.6 models. The per-request warn on genuine non-default
-    // values is deliberate: the client asked for sampling behavior it will
-    // not get, and that must stay visible to operators.
+    // fails the whole request with a non-retryable 400. Drop policy and
+    // rationale live in `drops_deprecated_temperature`.
     let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
-    let drops_temperature = model_rejects_temperature(model_name);
     for key in &["temperature", "top_p", "top_k", "stream"] {
         if let Some(v) = body.get(*key) {
-            if *key == "temperature"
-                && drops_temperature
-                && matches!(v.as_f64(), Some(t) if t != 1.0)
-            {
-                warn!(
-                    model = %truncate_label(model_name),
-                    temperature = %v,
-                    "dropping `temperature`: deprecated and hard-rejected by this model"
-                );
+            if *key == "temperature" && drops_deprecated_temperature(model_name, v) {
                 continue;
             }
             out.insert(key.to_string(), v.clone());
@@ -11468,9 +11480,16 @@ fn translate_anthropic_request_to_openai(
         out.insert("max_tokens".to_string(), mt.clone());
     }
 
-    // Passthrough params
+    // Passthrough params — same LAB-798 `temperature` guard as the forward
+    // translator: an OpenAI-protocol endpoint can front Claude ≥ 4.7 (empty
+    // `models` list serves everything), and the deprecated param 400s there
+    // too. Policy in `drops_deprecated_temperature`.
+    let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
     for key in &["temperature", "top_p", "stream"] {
         if let Some(v) = body.get(*key) {
+            if *key == "temperature" && drops_deprecated_temperature(model_name, v) {
+                continue;
+            }
             out.insert(key.to_string(), v.clone());
         }
     }
@@ -12389,12 +12408,12 @@ async fn openai_chat_handler(
         Err(resp) => return *resp,
     };
 
-    let body_bytes = match read_body_bounded(&state, body, &req_id).await {
+    let mut body_bytes = match read_body_bounded(&state, body, &req_id).await {
         Ok(b) => b,
         Err(resp) => return *resp,
     };
 
-    let openai_body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+    let mut openai_body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
             error!("failed to parse request JSON: {e}");
@@ -12412,6 +12431,35 @@ async fn openai_chat_handler(
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
+
+    // LAB-798: `Protocol::OpenAI` endpoints below forward `body_bytes`
+    // verbatim, so a hard-rejected `temperature` must be stripped here,
+    // before either wire body is built — the translated Anthropic arm then
+    // never sees it either, keeping the warn to once per request. Policy in
+    // `drops_deprecated_temperature`.
+    if openai_body
+        .get("temperature")
+        .is_some_and(|v| drops_deprecated_temperature(&model, v))
+    {
+        if let Some(obj) = openai_body.as_object_mut() {
+            obj.remove("temperature");
+        }
+        match serde_json::to_vec(&openai_body) {
+            Ok(b) => body_bytes = bytes::Bytes::from(b),
+            // Can't happen for a Value parsed from JSON (string keys only),
+            // but forwarding the original bytes would silently resend the
+            // rejected param — fail loudly instead, like the serialize arm
+            // below.
+            Err(e) => {
+                error!(req_id, error = %e, "failed to re-serialize request body after temperature strip");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "body serialization failed",
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // Pre-request gate: operator bypass, budget, utilization limit, emergency brake.
     // Note: budget + emergency don't need `model` and could run before body parsing,
