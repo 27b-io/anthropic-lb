@@ -2996,6 +2996,37 @@ fn model_family(model: &str) -> &str {
     }
 }
 
+/// Claude ≥ 4.7 hard-rejects sampling `temperature` — the API returns a
+/// non-retryable `invalid_request_error` ("`temperature` is deprecated for
+/// this model") for any value other than the default 1 (LAB-798, verified
+/// against the live API 2026-07-25). The version is the numeric segments
+/// after the family name: "claude-sonnet-4-5-20250929" → 4.5,
+/// "claude-fable-5[1m]" → 5.0. Old-style ids ("claude-3-5-sonnet-…") put the
+/// version before the family and parse as 0.0 → accepts, which is correct
+/// (all 3.x models take temperature). Unknown families also parse as
+/// accepting: forward unchanged and let the upstream decide.
+fn model_rejects_temperature(model: &str) -> bool {
+    let family = model_family(model);
+    if family.is_empty() {
+        return false;
+    }
+    let Some((_, rest)) = model.split_once(family) else {
+        return false;
+    };
+    let mut nums = rest.split('-').filter(|s| !s.is_empty()).map_while(|seg| {
+        let end = seg.find(|c: char| !c.is_ascii_digit()).unwrap_or(seg.len());
+        // 4+ digit runs are date stamps ("-20250929"), not version parts
+        if end == 0 || end >= 4 {
+            None
+        } else {
+            seg[..end].parse::<u32>().ok()
+        }
+    });
+    let major = nums.next().unwrap_or(0);
+    let minor = nums.next().unwrap_or(0);
+    (major, minor) >= (4, 7)
+}
+
 /// Internal claim key for the Fable included-usage band. On Max plans Fable is
 /// included only up to 50% of the weekly limit; past that it bills as paid
 /// usage credits (support.claude.com article 15424964). Unlike other per-model
@@ -10804,9 +10835,31 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
         .unwrap_or(serde_json::json!(4096));
     out.insert("max_tokens".to_string(), max_tokens);
 
-    // Direct passthrough params
+    // Direct passthrough params — except `temperature` on models that
+    // hard-reject it as deprecated (Claude ≥ 4.7, LAB-798): forwarding it
+    // fails the whole request with a non-retryable 400, so drop it and warn.
+    // Only confirmed non-default numerics are dropped: the default (1) is
+    // still accepted upstream, and most OpenAI SDKs send it unprompted —
+    // warning on every default-sending request would be spam. Non-numeric
+    // junk ("0.7", null) forwards so it earns the same upstream type error
+    // it gets on ≤ 4.6 models. The per-request warn on genuine non-default
+    // values is deliberate: the client asked for sampling behavior it will
+    // not get, and that must stay visible to operators.
+    let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
+    let drops_temperature = model_rejects_temperature(model_name);
     for key in &["temperature", "top_p", "top_k", "stream"] {
         if let Some(v) = body.get(*key) {
+            if *key == "temperature"
+                && drops_temperature
+                && matches!(v.as_f64(), Some(t) if t != 1.0)
+            {
+                warn!(
+                    model = %truncate_label(model_name),
+                    temperature = %v,
+                    "dropping `temperature`: deprecated and hard-rejected by this model"
+                );
+                continue;
+            }
             out.insert(key.to_string(), v.clone());
         }
     }

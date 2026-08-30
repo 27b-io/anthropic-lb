@@ -2824,6 +2824,66 @@ fn translate_request_passthrough_params() {
 }
 
 #[test]
+fn model_rejects_temperature_by_version() {
+    // Claude 5 family and ≥ 4.7 hard-reject (LAB-798)
+    assert!(model_rejects_temperature("claude-sonnet-5"));
+    assert!(model_rejects_temperature("claude-opus-5"));
+    assert!(model_rejects_temperature("claude-fable-5"));
+    assert!(model_rejects_temperature("claude-fable-5[1m]"));
+    assert!(model_rejects_temperature("claude-opus-4-8"));
+    assert!(model_rejects_temperature("claude-sonnet-4-7-20260101"));
+    // ≤ 4.6 still accepts
+    assert!(!model_rejects_temperature("claude-sonnet-4-6"));
+    assert!(!model_rejects_temperature("claude-sonnet-4-5-20250929"));
+    assert!(!model_rejects_temperature("claude-haiku-4-5-20251001"));
+    assert!(!model_rejects_temperature("claude-opus-4-1-20250805"));
+    assert!(!model_rejects_temperature("claude-opus-4-20250514"));
+    // old-style ids (version before family) and unknown families pass through
+    assert!(!model_rejects_temperature("claude-3-5-sonnet-20241022"));
+    assert!(!model_rejects_temperature("gpt-4o"));
+}
+
+#[test]
+fn translate_request_drops_temperature_for_rejecting_model() {
+    let req = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 0.2,
+        "top_p": 0.9
+    });
+    let result = translate_openai_to_anthropic(&req);
+    // temperature dropped (upstream hard-rejects it); other params untouched
+    assert!(result.get("temperature").is_none());
+    assert_eq!(result["top_p"], 0.9);
+}
+
+#[test]
+fn translate_request_keeps_default_temperature_for_rejecting_model() {
+    // temperature: 1 is the one value the API still accepts — pass it through
+    let req = serde_json::json!({
+        "model": "claude-fable-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 1
+    });
+    let result = translate_openai_to_anthropic(&req);
+    assert_eq!(result["temperature"], 1);
+}
+
+#[test]
+fn translate_request_forwards_non_numeric_temperature_unchanged() {
+    // Non-numeric junk is not a "confirmed non-default numeric" — forward it
+    // so the client gets the same upstream type error as on ≤ 4.6 models
+    // instead of the shim silently masking their bug.
+    let req = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": "0.7"
+    });
+    let result = translate_openai_to_anthropic(&req);
+    assert_eq!(result["temperature"], "0.7");
+}
+
+#[test]
 fn translate_request_strips_name_field() {
     let req = serde_json::json!({
         "model": "claude-sonnet-4-6",
