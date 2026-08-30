@@ -387,6 +387,7 @@ fn test_state_base() -> AppState {
         client_names: HashMap::new(),
         auto_cache: true,
         client_usage: Mutex::new(HashMap::new()),
+        client_model_usage: Mutex::new(HashMap::new()),
         shadow_log_tx: None,
         shadow_log_dropped: AtomicU64::new(0),
         client_budgets: HashMap::new(),
@@ -4802,6 +4803,39 @@ async fn spawn_status_then_ok_upstream(
     (format!("http://{addr}"), hits)
 }
 
+/// Axum mock upstream that captures each raw request body on the returned
+/// channel, then replies with `status` + `body`. For tests that must assert
+/// on the exact wire bytes an endpoint received — `spawn_mock_upstream()` is
+/// canned-Anthropic/always-200 and does not capture, and the raw-TCP mocks
+/// above only count hits.
+async fn spawn_capturing_upstream(
+    status: StatusCode,
+    body: &'static [u8],
+) -> (String, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+    let app = Router::new().fallback(any(move |req: Request<Body>| {
+        let tx = tx.clone();
+        async move {
+            let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let _ = tx.send(bytes).await;
+            (
+                status,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), rx)
+}
+
 /// GH #97 regression: a 429 from a `Protocol::OpenAI` endpoint must set a
 /// hard-limit cooldown (honouring `retry-after`) so a SUBSEQUENT request
 /// skips it at `pick_endpoint` instead of re-hammering an upstream that
@@ -6537,7 +6571,12 @@ async fn record_usage_updates_account_and_client() {
         cache_read_input_tokens: 30,
     };
     state
-        .record_usage(&state.endpoints[0], "test-client", &usage)
+        .record_usage(
+            &state.endpoints[0],
+            "test-client",
+            "claude-sonnet-5",
+            &usage,
+        )
         .await;
 
     assert_eq!(state.endpoints[0].input_tokens.load(Ordering::Relaxed), 100);
@@ -6567,7 +6606,9 @@ async fn record_usage_ignores_anonymous() {
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
     };
-    state.record_usage(&state.endpoints[0], "-", &usage).await;
+    state
+        .record_usage(&state.endpoints[0], "-", "claude-sonnet-5", &usage)
+        .await;
 
     // Account gets updated
     assert_eq!(state.endpoints[0].input_tokens.load(Ordering::Relaxed), 100);
@@ -6606,7 +6647,12 @@ async fn client_usage_is_bounded() {
     };
     for i in 0..10_050 {
         state
-            .record_usage(&state.endpoints[0], &format!("c{i}"), &usage)
+            .record_usage(
+                &state.endpoints[0],
+                &format!("c{i}"),
+                "claude-sonnet-5",
+                &usage,
+            )
             .await;
     }
     let n = state.client_usage.lock().unwrap().len();
@@ -6614,6 +6660,134 @@ async fn client_usage_is_bounded() {
         n <= 10_000,
         "client_usage must be bounded against unbounded x-client-id values, got {n}"
     );
+}
+
+// ── LAB-2330: per-(client, model) usage accounting ─────────────
+
+#[tokio::test]
+async fn record_usage_tracks_per_model() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_creation_input_tokens: 2,
+        cache_read_input_tokens: 3,
+    };
+    for model in ["claude-sonnet-5", "claude-sonnet-5", "claude-haiku-4-5"] {
+        state
+            .record_usage(&state.endpoints[0], "c1", model, &usage)
+            .await;
+    }
+
+    let map = state.client_model_usage.lock().unwrap();
+    assert_eq!(
+        map.get(&("c1".to_string(), "claude-sonnet-5".to_string())),
+        Some(&[20, 10, 4, 6])
+    );
+    assert_eq!(
+        map.get(&("c1".to_string(), "claude-haiku-4-5".to_string())),
+        Some(&[10, 5, 2, 3])
+    );
+    // The per-client family stays the authoritative total across models.
+    assert_eq!(
+        state.client_usage.lock().unwrap().get("c1"),
+        Some(&[30, 15, 6, 9])
+    );
+}
+
+#[tokio::test]
+async fn record_usage_empty_model_records_unknown() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    state
+        .record_usage(&state.endpoints[0], "c1", "", &usage)
+        .await;
+    let map = state.client_model_usage.lock().unwrap();
+    assert!(map.contains_key(&("c1".to_string(), "unknown".to_string())));
+}
+
+#[tokio::test]
+async fn record_usage_truncates_model_label() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 1,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    let huge = "m".repeat(500);
+    state
+        .record_usage(&state.endpoints[0], "c1", &huge, &usage)
+        .await;
+    // The stored key must have gone through truncate_label (whose exact
+    // format is covered by its own unit tests).
+    let map = state.client_model_usage.lock().unwrap();
+    let (_, model) = map.keys().next().unwrap();
+    assert!(
+        model.chars().count() < huge.chars().count(),
+        "model label must be truncated before becoming a map key"
+    );
+}
+
+#[tokio::test]
+async fn client_model_usage_is_bounded() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 1,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    for i in 0..(MAX_CLIENT_MODEL_LABELS + 50) {
+        state
+            .record_usage(&state.endpoints[0], "c1", &format!("model-{i}"), &usage)
+            .await;
+    }
+    // Expert-panel finding (LAB-2330): rotating the caller-controlled client
+    // id past the cap must NOT mint per-client overflow keys — the bound has
+    // to hold on the client axis too.
+    for i in 0..50 {
+        state
+            .record_usage(
+                &state.endpoints[0],
+                &format!("evil-{i}"),
+                "claude-x",
+                &usage,
+            )
+            .await;
+    }
+    let map = state.client_model_usage.lock().unwrap();
+    assert!(
+        map.len() <= MAX_CLIENT_MODEL_LABELS + 1,
+        "client_model_usage must be hard-bounded, got {}",
+        map.len()
+    );
+    // Overflow tokens are not dropped — they land in the global bucket:
+    // 50 c1 overflow models + 50 rotated clients, 1 input token each.
+    let other = map
+        .get(&("_other".to_string(), "_other".to_string()))
+        .unwrap();
+    assert_eq!(other[0], 100);
+}
+
+#[test]
+fn sse_scanner_captures_response_model() {
+    let sse_text = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":150}}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":75}}\n\n";
+    let mut scanner = SseUsageScanner::default();
+    scanner.push(sse_text.as_bytes());
+    scanner.finish();
+    assert_eq!(scanner.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(scanner.usage.input_tokens, 150);
 }
 
 // ── Unit: model-based routing ──────────────────────────────────
@@ -12364,6 +12538,21 @@ async fn metrics_operator_hiding() {
         usage.insert("user-charlie".to_string(), [10, 20, 0, 0]);
     }
     {
+        let mut usage = state.client_model_usage.lock().unwrap();
+        usage.insert(
+            ("op-alice".to_string(), "claude-sonnet-5".to_string()),
+            [100, 200, 0, 0],
+        );
+        usage.insert(
+            ("op-bob".to_string(), "claude-sonnet-5".to_string()),
+            [50, 100, 0, 0],
+        );
+        usage.insert(
+            ("user-charlie".to_string(), "claude-haiku-4-5".to_string()),
+            [10, 20, 0, 0],
+        );
+    }
+    {
         let mut rates = state.client_request_rates.lock().unwrap();
         rates.insert(
             "op-alice".to_string(),
@@ -12436,6 +12625,20 @@ async fn metrics_operator_hiding() {
     assert!(
         body.contains("anthropic_client_requests_total{client=\"_operator\"} 8"),
         "operator requests should sum to 8:\n{body}"
+    );
+
+    // LAB-2330: per-model family aggregates operators the same way
+    assert!(
+        body.contains(
+            "anthropic_client_model_token_usage_total{client=\"_operator\",model=\"claude-sonnet-5\",type=\"input\"} 150"
+        ),
+        "operator per-model input tokens should sum to 150:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "anthropic_client_model_token_usage_total{client=\"user-charlie\",model=\"claude-haiku-4-5\",type=\"output\"} 20"
+        ),
+        "regular client per-model tokens should be emitted:\n{body}"
     );
 
     // Regular client should appear normally
@@ -14330,10 +14533,11 @@ async fn try_fallback_upstream_rotates_on_429() {
     ep.base_url = format!("http://{}", addr);
     Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
 
-    let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+    let body =
+        bytes::Bytes::from_static(br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#);
     let result = try_fallback_upstream(
         &state,
-        body,
+        &body,
         "req-1",
         "client-1",
         &"127.0.0.1".parse().unwrap(),
@@ -14342,6 +14546,7 @@ async fn try_fallback_upstream_rotates_on_429() {
         "claude-opus-4-7",
         0,
         Instant::now(),
+        false,
         false,
     )
     .await;
@@ -14374,10 +14579,11 @@ async fn try_fallback_upstream_rotates_on_500() {
     ep.base_url = format!("http://{}", addr);
     Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
 
-    let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+    let body =
+        bytes::Bytes::from_static(br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#);
     let result = try_fallback_upstream(
         &state,
-        body,
+        &body,
         "req-1",
         "client-1",
         &"127.0.0.1".parse().unwrap(),
@@ -14386,6 +14592,7 @@ async fn try_fallback_upstream_rotates_on_500() {
         "claude-opus-4-7",
         0,
         Instant::now(),
+        false,
         false,
     )
     .await;
@@ -14413,10 +14620,11 @@ async fn try_fallback_upstream_transport_error_is_transient_and_counted() {
     ep.base_url = url;
     Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
 
-    let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+    let body =
+        bytes::Bytes::from_static(br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#);
     let result = try_fallback_upstream(
         &state,
-        body,
+        &body,
         "req-1",
         "client-1",
         &"127.0.0.1".parse().unwrap(),
@@ -14425,6 +14633,7 @@ async fn try_fallback_upstream_transport_error_is_transient_and_counted() {
         "claude-opus-4-7",
         0,
         Instant::now(),
+        false,
         false,
     )
     .await;
@@ -14485,10 +14694,11 @@ async fn try_fallback_upstream_records_usage_and_budget() {
 
     assert!(state.check_budget("client-1").await.is_ok());
 
-    let body = br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#;
+    let body =
+        bytes::Bytes::from_static(br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#);
     let result = try_fallback_upstream(
         &state,
-        body,
+        &body,
         "req-1",
         "client-1",
         &"127.0.0.1".parse().unwrap(),
@@ -14498,6 +14708,7 @@ async fn try_fallback_upstream_records_usage_and_budget() {
         0,
         Instant::now(),
         true,
+        false,
     )
     .await;
     assert!(matches!(result, ForwardOutcome::Done(_)));
@@ -14584,41 +14795,11 @@ async fn openai_chat_handler_routes_to_unified_anthropic_endpoint() {
 async fn proxy_handler_translates_to_openai_endpoint() {
     // Mock OpenAI upstream: capture the request body to assert it was
     // translated to OpenAI shape, then return an OpenAI-format response.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(1);
-    let app = Router::new().fallback(any(move |req: Request<Body>| {
-        let tx = tx.clone();
-        async move {
-            let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            let _ = tx.send(v).await;
-            (
-                StatusCode::OK,
-                axum::Json(serde_json::json!({
-                    "id": "chatcmpl-x",
-                    "object": "chat.completion",
-                    "model": "claude-opus-4-7",
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "hi back"},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-                })),
-            )
-                .into_response()
-        }
-    }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let (url, mut rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
 
     let mut state = test_state_with(vec![]);
     let mut ep = make_endpoint("openai-gw", Protocol::OpenAI);
-    ep.base_url = format!("http://{}", upstream_addr);
+    ep.base_url = url;
     Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
 
     let proxy_app = Router::new().fallback(any(proxy_handler)).with_state(state);
@@ -14645,12 +14826,94 @@ async fn proxy_handler_translates_to_openai_endpoint() {
         .await
         .unwrap();
 
-    let received = rx.recv().await.expect("upstream must receive a request");
+    let received: serde_json::Value =
+        serde_json::from_slice(&rx.recv().await.expect("upstream must receive a request")).unwrap();
     assert!(
         received.get("messages").is_some(),
         "translated request must have OpenAI `messages` field"
     );
     assert_eq!(received["model"], "claude-opus-4-7");
+}
+
+/// LAB-716: request translation must run at most ONCE per request, not once
+/// per retry attempt. Two OpenAI endpoints; the preferred one 500s so the
+/// retry loop rotates to the second — both attempts must reuse one translated
+/// body (asserted byte-identical) with a single translate invocation.
+/// Relies on `#[tokio::test]`'s current-thread runtime: the handler runs on
+/// this test's thread, so the thread-local counter sees exactly this request.
+#[tokio::test]
+async fn proxy_handler_translates_once_across_endpoint_rotation() {
+    // Failing upstream 500s → rotate; healthy upstream serves a canned
+    // OpenAI completion. Both capture the raw wire body for comparison.
+    let (bad_url, mut bad_rx) =
+        spawn_capturing_upstream(StatusCode::INTERNAL_SERVER_ERROR, b"boom").await;
+    let (ok_url, mut ok_rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
+
+    // Priority 0 = failing endpoint picked first; priority 100 = healthy
+    // rotation target (deterministic ordering, same trick as LAB-365).
+    let mut state = test_state_with(vec![]);
+    let mut bad_ep = make_endpoint("bad-gw", Protocol::OpenAI);
+    bad_ep.base_url = bad_url;
+    let mut ok_ep = make_endpoint("ok-gw", Protocol::OpenAI);
+    ok_ep.base_url = ok_url;
+    ok_ep.priority = 100;
+    {
+        let s = Arc::get_mut(&mut state).unwrap();
+        s.endpoints.push(bad_ep);
+        s.endpoints.push(ok_ep);
+    }
+
+    let proxy_app = Router::new().fallback(any(proxy_handler)).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            proxy_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let calls_before = TRANSLATE_A2O_CALLS.with(|c| c.get());
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/v1/messages", proxy_addr))
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-7",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "rotation to the healthy endpoint must succeed"
+    );
+
+    let calls_after = TRANSLATE_A2O_CALLS.with(|c| c.get());
+    assert_eq!(
+        calls_after - calls_before,
+        1,
+        "translation must run exactly once for a 2-endpoint retry, not per attempt"
+    );
+
+    // Both attempts must send the SAME wire body (memoized Bytes reused).
+    let bad_body = bad_rx
+        .recv()
+        .await
+        .expect("failing endpoint got the request");
+    let ok_body = ok_rx
+        .recv()
+        .await
+        .expect("healthy endpoint got the rotation");
+    assert_eq!(
+        bad_body, ok_body,
+        "rotated attempt must reuse the identical serialized body"
+    );
 }
 
 // ── Connection resilience: synthetic SSE error on upstream disconnect ──
@@ -16358,7 +16621,7 @@ fn distinct_client_keys_resolve_to_distinct_identities() {
     for (key, expected) in [("key-geo", "geo"), ("key-radar", "radar")] {
         let headers = hdrs(&[("x-api-key", key)]);
         let principal = state
-            .authenticate(&ip, &headers, false)
+            .authenticate(&headers, false)
             .expect("configured key must authenticate")
             .expect("a [[clients]] match must yield a principal");
         assert_eq!(principal.name, expected);
@@ -16375,7 +16638,7 @@ fn distinct_client_keys_resolve_to_distinct_identities() {
 fn unknown_client_key_is_rejected() {
     let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
     let resp = state
-        .authenticate(&test_ip(), &hdrs(&[("x-api-key", "key-wrong")]), false)
+        .authenticate(&hdrs(&[("x-api-key", "key-wrong")]), false)
         .expect_err("unknown key must not authenticate");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -16384,7 +16647,7 @@ fn unknown_client_key_is_rejected() {
 fn missing_credential_is_rejected_when_clients_configured() {
     let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
     let resp = state
-        .authenticate(&test_ip(), &hyper::HeaderMap::new(), false)
+        .authenticate(&hyper::HeaderMap::new(), false)
         .expect_err("absent credential must not authenticate");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -16397,7 +16660,7 @@ fn client_key_match_is_exact_not_prefix() {
     for wrong in ["key-ge", "key-geo ", "key-geox", "", "KEY-GEO"] {
         assert!(
             state
-                .authenticate(&test_ip(), &hdrs(&[("x-api-key", wrong)]), false)
+                .authenticate(&hdrs(&[("x-api-key", wrong)]), false)
                 .is_err(),
             "'{wrong}' must not authenticate as 'key-geo'"
         );
@@ -16409,18 +16672,17 @@ fn client_key_match_is_exact_not_prefix() {
 #[test]
 fn bearer_credential_accepted_only_where_enabled() {
     let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
-    let ip = test_ip();
     let headers = hdrs(&[("authorization", "Bearer key-geo")]);
 
     let principal = state
-        .authenticate(&ip, &headers, true)
+        .authenticate(&headers, true)
         .expect("bearer must authenticate where enabled")
         .expect("principal");
     assert_eq!(principal.name, "geo");
 
     // The native surface may carry the caller's OWN upstream token in
     // `Authorization` (passthrough endpoints), so bearer is not accepted there.
-    assert!(state.authenticate(&ip, &headers, false).is_err());
+    assert!(state.authenticate(&headers, false).is_err());
 }
 
 #[test]
@@ -16428,11 +16690,7 @@ fn bearer_scheme_match_is_case_insensitive() {
     let state = state_with_clients(vec![mk_client("geo", "key-geo", &[])]);
     let headers = hdrs(&[("authorization", "bEaReR key-geo")]);
     assert_eq!(
-        state
-            .authenticate(&test_ip(), &headers, true)
-            .unwrap()
-            .unwrap()
-            .name,
+        state.authenticate(&headers, true).unwrap().unwrap().name,
         "geo"
     );
 }
@@ -16448,7 +16706,7 @@ fn spoofed_x_client_id_is_ignored_under_clients_table() {
     let ip = test_ip();
     let headers = hdrs(&[("x-api-key", "key-alpha"), ("x-client-id", "bravo")]);
 
-    let principal = state.authenticate(&ip, &headers, false).unwrap().unwrap();
+    let principal = state.authenticate(&headers, false).unwrap().unwrap();
     assert_eq!(principal.name, "alpha");
 
     let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
@@ -16471,7 +16729,7 @@ fn client_names_ip_map_is_ignored_under_clients_table() {
     });
     let ip = test_ip();
     let headers = hdrs(&[("x-api-key", "key-alpha")]);
-    let principal = state.authenticate(&ip, &headers, false).unwrap().unwrap();
+    let principal = state.authenticate(&headers, false).unwrap().unwrap();
     let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
     assert_eq!(rctx.client_id, "alpha");
 }
@@ -16484,10 +16742,9 @@ fn legacy_proxy_key_still_authenticates_and_yields_no_principal() {
         proxy_key: Some("shared-secret".to_string()),
         ..test_state_base()
     });
-    let ip = test_ip();
 
     let principal = state
-        .authenticate(&ip, &hdrs(&[("x-api-key", "shared-secret")]), false)
+        .authenticate(&hdrs(&[("x-api-key", "shared-secret")]), false)
         .expect("correct legacy key must authenticate");
     assert!(
         principal.is_none(),
@@ -16495,11 +16752,9 @@ fn legacy_proxy_key_still_authenticates_and_yields_no_principal() {
     );
 
     assert!(state
-        .authenticate(&ip, &hdrs(&[("x-api-key", "nope")]), false)
+        .authenticate(&hdrs(&[("x-api-key", "nope")]), false)
         .is_err());
-    assert!(state
-        .authenticate(&ip, &hyper::HeaderMap::new(), false)
-        .is_err());
+    assert!(state.authenticate(&hyper::HeaderMap::new(), false).is_err());
 }
 
 #[test]
@@ -16510,7 +16765,7 @@ fn legacy_proxy_key_leaves_x_client_id_resolution_intact() {
     });
     let ip = test_ip();
     let headers = hdrs(&[("x-api-key", "shared-secret"), ("x-client-id", "gastown")]);
-    let principal = state.authenticate(&ip, &headers, false).unwrap();
+    let principal = state.authenticate(&headers, false).unwrap();
     let rctx = RequestContext::from_request(&state, &ip, &headers, principal);
     assert_eq!(
         rctx.client_id, "gastown",
@@ -16522,7 +16777,7 @@ fn legacy_proxy_key_leaves_x_client_id_resolution_intact() {
 fn open_proxy_authenticates_every_request() {
     let state = test_state_with(vec![]);
     assert!(state
-        .authenticate(&test_ip(), &hyper::HeaderMap::new(), false)
+        .authenticate(&hyper::HeaderMap::new(), false)
         .unwrap()
         .is_none());
 }
@@ -17003,7 +17258,7 @@ fn response_cache_tenant_follows_the_authenticated_principal() {
     ]);
     let ip = test_ip();
     let headers = hdrs(&[("x-api-key", "key-alpha"), ("x-client-id", "bravo")]);
-    let principal = state.authenticate(&ip, &headers, false).unwrap().unwrap();
+    let principal = state.authenticate(&headers, false).unwrap().unwrap();
     let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
 
     // The cache is keyed by this exact string (`rc.clients.get(&client_id)`),
@@ -18415,18 +18670,64 @@ mod redis_integration {
         );
     }
 
-    /// AC4 failure path: INCRBY against a poisoned (non-integer) key fails;
-    /// record_budget_usage must DELETE the key — unblocking future INCRBYs —
-    /// while local state keeps enforcing for as long as the redis read path
-    /// errors.
+    /// LAB-1962 Kody amendment: the poisoned-value classifier must match
+    /// only server-reported value errors (the verbatim WRONGTYPE /
+    /// non-integer frames Redis and Dragonfly emit) and never transport
+    /// failures — a transport match would reintroduce the F8 fleet-wide
+    /// counter erasure this ticket removed.
+    #[test]
+    fn budget_value_poisoned_classifies_server_value_errors_only() {
+        use fred::error::{RedisError, RedisErrorKind};
+        assert!(AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::InvalidArgument,
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+        )));
+        assert!(AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::Unknown,
+            "ERR value is not an integer or out of range",
+        )));
+        // Transport failures leave a valid counter behind — never delete.
+        assert!(!AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::IO,
+            "Connection reset by peer (os error 104)",
+        )));
+        assert!(!AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::Timeout,
+            "Request timed out",
+        )));
+        // Overflow means the counter holds a valid (huge) integer — GET
+        // still reads it and check_budget denies; that is real accounting,
+        // not poison.
+        assert!(!AppState::budget_value_poisoned(&RedisError::new(
+            RedisErrorKind::Unknown,
+            "ERR increment or decrement would overflow",
+        )));
+    }
+
+    /// LAB-1962 (panel F8) — reversal of the LAB-931 pin, which deliberately
+    /// deferred this: a transport-level INCRBY failure must NOT delete the
+    /// shared counter (one replica's failed write must never erase
+    /// fleet-wide accounting — see
+    /// budget_denies_after_incrby_lost_to_dead_backend_and_revival), and an
+    /// absent key with redis reachable falls through to the LOCAL floor
+    /// instead of authoritatively allowing. Amended by Kody review on
+    /// LAB-1962: a POISONED value (server-reported WRONGTYPE / non-integer)
+    /// is the one case that still deletes — such a key fails every INCRBY
+    /// and GET for its full 48h TTL, so leaving it wedges cross-replica
+    /// accounting for the day. A present under-limit counter remains
+    /// authoritative over larger local state — that pin stands.
     #[tokio::test]
-    async fn budget_incrby_failure_deletes_key_and_local_fallback_enforces() {
+    async fn budget_incrby_poisoned_key_self_heals_and_absent_key_uses_local_floor() {
         let Some((mut conn, fred)) = redis_test_conn(6).await else {
             return;
         };
         avoid_utc_midnight().await;
         let state = Arc::new(AppState {
-            client_budgets: [("poison-cli".to_string(), 100u64)].into(),
+            client_budgets: [
+                ("poison-cli".to_string(), 100u64),
+                ("fresh-cli".to_string(), 100u64),
+            ]
+            .into(),
             redis: Some(fred),
             ..test_state_base()
         });
@@ -18447,11 +18748,14 @@ mod redis_integration {
             "local fallback must enforce while the redis value is unreadable"
         );
 
-        // INCRBY fails on the poisoned key → key deleted, local still updated.
+        // INCRBY fails with a server-reported value error → the poisoned key
+        // is DELETED so the shared counter can rebuild (Kody amendment on
+        // LAB-1962). Only transport failures preserve the key.
         state.record_budget_usage("poison-cli", 10).await;
-        assert!(
-            !conn.exists::<_, bool>(&key).await.unwrap(),
-            "failed INCRBY must delete the poisoned key"
+        assert_eq!(
+            conn.get::<_, Option<String>>(&key).await.unwrap(),
+            None,
+            "poisoned budget key must self-heal via DEL so the counter can rebuild"
         );
         assert_eq!(
             state
@@ -18465,17 +18769,163 @@ mod redis_integration {
             "local accumulator must survive the redis failure"
         );
 
-        // With the poison gone, the next INCRBY starts clean.
+        // Absent key (just self-healed) + reachable redis + local over limit
+        // → the local floor gates. Under the pre-LAB-1962 contract Ok(None)
+        // was an authoritative allow — the enforcement bypass the panel
+        // flagged.
+        assert_eq!(
+            state.check_budget("poison-cli").await,
+            Err(0),
+            "absent key with redis reachable must fall through to the local floor and deny"
+        );
+
+        // Absent key + no local usage (genuine zero) → still allows.
+        assert!(
+            state.check_budget("fresh-cli").await.is_ok(),
+            "absent key with no local usage must still allow"
+        );
+
+        // A rebuilt under-limit shared counter is authoritative over larger
+        // local state — the surviving half of the LAB-931 pin.
         state.record_budget_usage("poison-cli", 5).await;
         assert_eq!(conn.get::<_, Option<u64>>(&key).await.unwrap(), Some(5));
-
-        // Current contract, pinned deliberately: with redis reachable and the
-        // key rebuilt (5 < 100), the shared counter is authoritative and
-        // check_budget passes even though local memory says 165. The local
-        // count only gates when the redis read path errors.
         assert!(
             state.check_budget("poison-cli").await.is_ok(),
             "deliberate pin: a reachable redis counter (5) is authoritative over larger local state (165)"
+        );
+
+        // The Lua guard is the race half of the fix: a DEL landing late
+        // (fred reconnect replay, or a second replica healing concurrently)
+        // must never erase a valid counter the fleet already rebuilt.
+        // Evaluated directly against the rebuilt numeric counter: refuses.
+        let refused: i64 = redis::cmd("EVAL")
+            .arg(AppState::BUDGET_DEL_IF_POISONED_SCRIPT)
+            .arg(1)
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(refused, 0, "guard must refuse to delete a numeric counter");
+        assert_eq!(
+            conn.get::<_, Option<u64>>(&key).await.unwrap(),
+            Some(5),
+            "a late guarded DEL must leave rebuilt accounting intact"
+        );
+
+        // tonumber()-gap regression (LAB-1962 review): values Lua's
+        // tonumber() accepts but INCRBY rejects ("1.5" was the reported
+        // wedge; exponent, hex, padded, and out-of-i64-range forms sit in
+        // the same gap) must still be deleted — such a key fails every
+        // INCRBY for its full TTL, which is the exact wedge the self-heal
+        // exists to clear.
+        for gap in ["1.5", "1e3", "0x10", " 1", "9223372036854775808"] {
+            let _: () = conn.set(&key, gap).await.unwrap();
+            let deleted: i64 = redis::cmd("EVAL")
+                .arg(AppState::BUDGET_DEL_IF_POISONED_SCRIPT)
+                .arg(1)
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(deleted, 1, "guard must delete tonumber-gap value {gap:?}");
+            assert_eq!(
+                conn.get::<_, Option<String>>(&key).await.unwrap(),
+                None,
+                "tonumber-gap value {gap:?} must not survive the guard"
+            );
+        }
+
+        // WRONGTYPE self-heal: the guard's INCRBY probe errors on non-string
+        // keys too — the removed TYPE branch must stay covered by a test,
+        // not just the doc comment's equivalence claim.
+        let _: () = conn.rpush(&key, "x").await.unwrap();
+        let deleted: i64 = redis::cmd("EVAL")
+            .arg(AppState::BUDGET_DEL_IF_POISONED_SCRIPT)
+            .arg(1)
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1, "guard must delete a WRONGTYPE (list) key");
+        assert!(
+            !conn.exists::<_, bool>(&key).await.unwrap(),
+            "WRONGTYPE key must not survive the guard"
+        );
+    }
+
+    /// LAB-1962 AC3: a kill-proxy-induced INCRBY failure loses the increment
+    /// from the shared counter, but the SAME replica keeps denying once over
+    /// limit — while the backend is dead (error fallback) AND after it
+    /// revives with the key absent (absent-key local floor). Under the
+    /// pre-LAB-1962 contract the revival half returned Ok: reachable redis +
+    /// absent key was an authoritative allow, so every replica granted
+    /// unlimited spend the moment the counter vanished.
+    #[tokio::test]
+    async fn budget_denies_after_incrby_lost_to_dead_backend_and_revival() {
+        let Some(base) = test_redis_url() else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let target = base
+            .trim_start_matches("redis://")
+            .trim_end_matches('/')
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let (proxy_addr, kill) = spawn_killable_proxy(target.clone()).await;
+        let url = format!("redis://{proxy_addr}/15");
+        drop(connect_and_flush(&url).await);
+        let fred = fred_test_client(&url).await;
+        // Independent assertion client, connected DIRECTLY to the backend so
+        // it can verify the increment really was lost (not buffered/replayed).
+        let mut direct = connect(&format!("{}/15", base.trim_end_matches('/'))).await;
+
+        let state = Arc::new(AppState {
+            client_budgets: [("lost-cli".to_string(), 100u64)].into(),
+            redis: Some(fred),
+            ..test_state_base()
+        });
+
+        kill_proxy(kill).await;
+
+        // The very first INCRBY fails (or is skipped once fred notices the
+        // outage) — the shared counter is never created. The local
+        // accumulator carries the only record of the spend (150 > 100).
+        state.record_budget_usage("lost-cli", 150).await;
+        assert_eq!(
+            state.check_budget("lost-cli").await,
+            Err(0),
+            "local fallback must deny while the backend is dead"
+        );
+
+        // Revive the backend at the SAME address; fred reconnects on its own.
+        let (revived_addr, _revived_kill) = spawn_killable_proxy_at(&proxy_addr, target).await;
+        assert_eq!(
+            revived_addr, proxy_addr,
+            "proxy must revive at its old address"
+        );
+        eventually("fred to reconnect after revival", || {
+            let r = state.redis.clone().unwrap();
+            async move { r.ping::<String>().await.is_ok() }
+        })
+        .await;
+
+        // The dead-window increment is lost for good: no key in the backend.
+        let today = AppState::now_epoch() / 86400;
+        let key = format!("alb:budget:lost-cli:{today}");
+        assert_eq!(
+            direct.get::<_, Option<u64>>(&key).await.unwrap(),
+            None,
+            "the dead-window INCRBY must be lost, not buffered and replayed"
+        );
+
+        // The money assertion: redis reachable + absent key must fall
+        // through to the local floor (150 >= 100) and DENY.
+        assert_eq!(
+            state.check_budget("lost-cli").await,
+            Err(0),
+            "absent key after revival must not bypass the local floor (LAB-1962/F8)"
         );
     }
 
@@ -18704,9 +19154,9 @@ mod redis_integration {
 
         kill_proxy(kill).await;
 
-        // Budget: INCRBY and the follow-up DEL both fail; the local
-        // accumulator still advances (50+60=110) and check_budget falls back
-        // to it, refusing over-limit spend with redis dead.
+        // Budget: the INCRBY fails; the local accumulator still advances
+        // (50+60=110) and check_budget falls back to it, refusing
+        // over-limit spend with redis dead.
         state.record_budget_usage("degrade-cli", 60).await;
         assert_eq!(
             state.check_budget("degrade-cli").await,
@@ -18772,8 +19222,8 @@ mod redis_integration {
 
         kill_proxy(kill).await;
 
-        // Dead: INCRBY and its follow-up DEL both fail; the local accumulator
-        // (50+60=110) enforces the 100 budget.
+        // Dead: the INCRBY fails; the local accumulator (50+60=110)
+        // enforces the 100 budget.
         state.record_budget_usage("recover-cli", 60).await;
         assert_eq!(
             state.check_budget("recover-cli").await,
@@ -18790,9 +19240,8 @@ mod redis_integration {
         );
 
         // Coordination resumes: the shared counter (still 50 — the
-        // dead-window INCRBY failed, and so did its delete-on-failure)
-        // becomes authoritative again, flipping check_budget from the local
-        // Err(0) back to Ok.
+        // dead-window INCRBY failed and was lost) becomes authoritative
+        // again, flipping check_budget from the local Err(0) back to Ok.
         eventually("coordination to resume after backend recovery", || {
             let s = state.clone();
             async move { s.check_budget("recover-cli").await.is_ok() }
@@ -19375,27 +19824,12 @@ fn auth_throttle_capacity_purges_expired_before_evicting() {
     assert!(entries.len() <= 2, "expired entries purged, capacity held");
 }
 
-/// A successful authentication clears the IP's failure state, so a client's
-/// own sporadic typos never drift toward a lockout (bug-hunter/security
-/// finding: shared-IP false lockout mitigation).
-#[test]
-fn auth_throttle_clear_resets_failures() {
-    let t = AuthThrottle::new(3, Duration::from_secs(60));
-    let ip: IpAddr = "203.0.113.7".parse().unwrap();
-    t.record_failure(ip);
-    t.record_failure(ip);
-    t.clear(&ip);
-    // Back to zero: two fresh failures still under the limit.
-    t.record_failure(ip);
-    t.record_failure(ip);
-    assert_eq!(t.check(&ip), None, "clear must reset the counter to zero");
-}
-
-/// The throttle fires BEFORE the key comparison: once tripped, even the
-/// CORRECT credential gets 429 until the window expires — the guessing
-/// surface (including its timing) closes entirely. Also pins the counter.
+/// A locked-out invalid caller must not deny service to a valid principal
+/// sharing its resolved IP (NAT, tailnet proxy, or load balancer). Invalid
+/// attempts remain throttled after the valid request, so success is a bypass
+/// for that authenticated request rather than a reset attackers can induce.
 #[tokio::test]
-async fn throttled_ip_gets_429_even_with_a_valid_key() {
+async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
     acct.base_url = mock_url.to_string();
@@ -19423,10 +19857,10 @@ async fn throttled_ip_gets_429_even_with_a_valid_key() {
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
 
-    // Valid credential, throttled IP: 429 with retry-after, before comparison.
+    // The next invalid credential is throttled with retry-after.
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
-        .header("x-api-key", "key-geo")
+        .header("x-api-key", "key-wrong")
         .body("{}")
         .send()
         .await
@@ -19442,17 +19876,34 @@ async fn throttled_ip_gets_429_even_with_a_valid_key() {
         .expect("retry-after must be whole seconds");
     assert!((1..=60).contains(&retry));
 
-    // Counter = 3 rejected credentials + the 1 throttle-429 = 4. The 429 path
-    // is counted too, so the metric keeps climbing through a sustained attack
-    // instead of plateauing at the limit.
-    assert_eq!(state.auth_failures.lock().unwrap().get("proxy"), Some(&4));
+    // A valid credential from the same IP must still reach the handler.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-geo")
+        .body(r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Success does not erase a shared IP's attack history: another invalid
+    // credential is still throttled, and only failures increment the metric.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-wrong")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(state.auth_failures.lock().unwrap().get("proxy"), Some(&5));
 }
 
-/// Reset-on-success through the real router: a client that fails a couple of
-/// times, then authenticates successfully, is NOT throttled by those earlier
-/// failures — its state was cleared. Mitigates shared-IP false lockouts.
+/// Successful traffic below the limit also leaves the shared IP's failure
+/// history intact. This keeps an authenticated neighbour from accidentally
+/// defeating the invalid-request throttle for an attacker behind the same NAT.
 #[tokio::test]
-async fn successful_auth_clears_prior_failures() {
+async fn successful_auth_does_not_clear_shared_ip_failures() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
     acct.base_url = mock_url.to_string();
@@ -19476,7 +19927,7 @@ async fn successful_auth_clears_prior_failures() {
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
-    // A successful auth clears the two failures.
+    // A successful auth is served but does not clear the two failures.
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
         .header("x-api-key", "key-geo")
@@ -19485,13 +19936,24 @@ async fn successful_auth_clears_prior_failures() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert!(
-        state
-            .auth_throttle
-            .check(&"127.0.0.1".parse().unwrap())
-            .is_none(),
-        "the client's own IP must not be throttled after a success reset it"
-    );
+    // The third bad request is still the threshold-reaching 401; the next is
+    // a 429. If success had cleared the state, both would be 401.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-wrong")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "key-wrong")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
 }
 
 /// A dual-stack listener delivers IPv4 peers as `::ffff:a.b.c.d`; a v4

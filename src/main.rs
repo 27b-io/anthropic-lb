@@ -71,9 +71,11 @@ struct Config {
     /// otherwise the peer address is used and the header is ignored entirely.
     /// Empty/absent = header never consulted (direct-connection behaviour).
     trusted_proxies: Option<Vec<String>>,
-    /// LAB-1192: failed-auth throttle — failures per client IP inside the
-    /// window before further requests from that IP get 429. 0 disables.
-    /// Default: 10.
+    /// LAB-1193 amendment: failed-auth throttle — failures per client IP
+    /// inside the window before further INVALID credentials from that IP get
+    /// 429; valid credentials always pass. Supersedes LAB-1192 AC-11's
+    /// pre-comparison ordering after the 2026-08-24 shared-IP outage.
+    /// 0 disables. Default: 10.
     auth_failure_limit: Option<u32>,
     /// LAB-1192: failed-auth throttle window in seconds. Default: 300.
     auth_failure_window_secs: Option<u64>,
@@ -474,6 +476,15 @@ const MAX_TRACKED_CLIENTS: usize = 10_000;
 /// The model half is caller-controlled; overflow buckets into `_other`.
 const MAX_MODEL_DENIED_LABELS: usize = 64;
 
+/// Cap on distinct (client, model) pairs in the per-model usage counter
+/// (LAB-2330). The model key is normally response-derived (upstream-validated),
+/// but the request-model fallback is caller-influenced and the client key is
+/// caller-controlled under legacy auth, so overflow lumps into a single
+/// global ("_other", "_other") bucket — a HARD bound of cap + 1 entries.
+/// Sized for the real fleet (tens of clients × a handful of models) with
+/// generous slack.
+const MAX_CLIENT_MODEL_LABELS: usize = 256;
+
 /// Max chars retained from a caller-controlled string used as a metric label
 /// or echoed in an error body. The model field is bounded only by the request
 /// body cap, so an untruncated copy would be retained for the process lifetime
@@ -720,6 +731,13 @@ struct AppState {
     auto_cache: bool,
     /// Per-client token usage: client_id → [input, output, cache_creation, cache_read]
     client_usage: Mutex<HashMap<String, [u64; 4]>>,
+    /// Per-(client, model) token usage (LAB-2330) — same [u64; 4] layout as
+    /// `client_usage`, which stays the authoritative per-client total. The
+    /// model key is response-derived and truncated; the pair count is hard-
+    /// bounded at `MAX_CLIENT_MODEL_LABELS` + 1 (overflow lumps into the
+    /// global ("_other", "_other") bucket), so callers cannot inflate the
+    /// label set on either axis.
+    client_model_usage: Mutex<HashMap<(String, String), [u64; 4]>>,
     /// Shadow log sender (fire-and-forget JSONL appends). None = disabled.
     shadow_log_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Count of shadow log entries dropped due to channel backpressure.
@@ -1596,10 +1614,11 @@ const MIN_KEY_LEN: usize = 32;
 /// Per-client-IP failed-authentication throttle (LAB-1192).
 ///
 /// Fixed window per IP: the first failure starts the window, subsequent
-/// failures increment the count, and once the count reaches `max_failures`
-/// every request from that IP gets `429 + retry-after` until the window
-/// expires — BEFORE any key comparison runs, so a guesser locked out of the
-/// timing surface stays locked out even when it eventually guesses right.
+/// failures increment the count, and once the count reaches `max_failures`,
+/// further INVALID credentials from that IP get `429 + retry-after` until the
+/// window expires. Valid credentials always pass: an IP may represent many
+/// callers behind a NAT or load balancer, so one bad caller must not lock out
+/// every authenticated neighbour sharing that address.
 struct AuthThrottle {
     /// Failures per window before throttling. 0 = throttle disabled.
     max_failures: u32,
@@ -1697,18 +1716,6 @@ impl AuthThrottle {
             }
         }
     }
-
-    /// Drop `ip`'s failure state — called after a SUCCESSFUL authentication so
-    /// a client's own sporadic typos never accumulate toward a lockout, and a
-    /// recovered client immediately stops counting against a shared source IP.
-    fn clear(&self, ip: &IpAddr) {
-        if self.max_failures == 0 {
-            return;
-        }
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.remove(ip);
-        }
-    }
 }
 
 impl AppState {
@@ -1777,14 +1784,12 @@ impl AppState {
     /// whole purpose is to narrow one.
     fn authenticate(
         &self,
-        client_ip: &IpAddr,
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
     ) -> Result<Option<&ClientConfig>, Box<Response>> {
         // Boxed Err, matching `reserve_request_body` — an inline `Response` is
         // 128+ bytes on the hot success path (clippy::result_large_err).
         let unauthorized = || -> Box<Response> {
-            warn!(client = %client_ip, "rejected: invalid or missing credential");
             Box::new((StatusCode::UNAUTHORIZED, "unauthorized").into_response())
         };
         let from_header = headers.get("x-api-key").and_then(|v| v.to_str().ok());
@@ -1828,19 +1833,24 @@ impl AppState {
         Ok(None)
     }
 
-    /// `authenticate` behind the failed-auth throttle (LAB-1192 AC-11).
+    /// Authenticate, then throttle failed credentials (LAB-1193).
     ///
-    /// A throttled IP gets `429 + retry-after` BEFORE the key comparison runs
-    /// — the guessing surface (including its timing) closes entirely, even
-    /// for a correct guess, until the window expires. Failures are recorded
-    /// against the AC-7 resolved client IP and counted per route in
-    /// `anthropic_auth_failures_total`; the 429 short-circuit is counted
-    /// separately so the metric keeps rising through a sustained attack
-    /// instead of plateauing at the limit.
+    /// This supersedes LAB-1192 AC-11's pre-comparison ordering after the
+    /// 2026-08-24 shared-IP outage. The key comparison deliberately runs
+    /// before the throttle decision.
+    /// Valid credentials always pass, even when the resolved IP has an active
+    /// failure window: behind NAT or an LB that IP may represent unrelated
+    /// callers, and rejecting a known-good principal turns ten bad requests
+    /// into a five-minute denial of service for every neighbour. Invalid
+    /// credentials still get `429 + retry-after` once the IP reaches the
+    /// limit, and successful traffic does NOT clear the shared failure state.
+    /// This trade relies on `MIN_KEY_LEN` keeping credential guessing
+    /// impractical; if the credential floor is lowered, restore AC-11's
+    /// pre-comparison ordering.
     ///
-    /// A SUCCESSFUL authentication clears the IP's failure state, so a client
-    /// whose own earlier typos accumulated does not drift toward a lockout,
-    /// and a recovered client stops counting against a shared source IP.
+    /// Every rejection is counted per route in
+    /// `anthropic_auth_failures_total`; throttle 429s keep the metric rising
+    /// through a sustained attack instead of plateauing at the limit.
     fn authenticate_throttled(
         &self,
         client_ip: &IpAddr,
@@ -1848,32 +1858,31 @@ impl AppState {
         allow_bearer: bool,
         route: &'static str,
     ) -> Result<Option<&ClientConfig>, Box<Response>> {
-        if let Some(retry_after) = self.auth_throttle.check(client_ip) {
-            warn!(
-                client = %client_ip,
-                route,
-                retry_after,
-                "rejected: failed-auth throttle active"
-            );
-            self.count_auth_failure(route);
-            let mut resp = (
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many failed authentication attempts",
-            )
-                .into_response();
-            resp.headers_mut()
-                .insert("retry-after", HeaderValue::from(retry_after));
-            return Err(Box::new(resp));
-        }
-        let result = self.authenticate(client_ip, headers, allow_bearer);
-        match &result {
-            Ok(_) => self.auth_throttle.clear(client_ip),
-            Err(_) => {
-                self.auth_throttle.record_failure(*client_ip);
+        match self.authenticate(headers, allow_bearer) {
+            Ok(principal) => Ok(principal),
+            Err(unauthorized) => {
                 self.count_auth_failure(route);
+                if let Some(retry_after) = self.auth_throttle.check(client_ip) {
+                    warn!(
+                        client = %client_ip,
+                        route,
+                        retry_after,
+                        "rejected: failed-auth throttle active"
+                    );
+                    let mut resp = (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "too many failed authentication attempts",
+                    )
+                        .into_response();
+                    resp.headers_mut()
+                        .insert("retry-after", HeaderValue::from(retry_after));
+                    return Err(Box::new(resp));
+                }
+                self.auth_throttle.record_failure(*client_ip);
+                warn!(client = %client_ip, route, "rejected: invalid or missing credential");
+                Err(unauthorized)
             }
         }
-        result
     }
 
     fn count_auth_failure(&self, route: &'static str) {
@@ -5144,8 +5153,10 @@ impl AppState {
             // applied some HINCRBYs, re-queuing can over-count by a few next
             // tick. For an error *counter* that bias is correct — a slight
             // over-report beats a silently missed egress fault. (Contrast
-            // record_budget_usage, which deletes-on-failure: over-counting a
-            // budget would wrongly throttle a client.) The deltas also stay
+            // record_budget_usage, which never retries a failed INCRBY:
+            // over-counting a budget would wrongly throttle a client, so the
+            // lost increment is covered by the local floor instead —
+            // LAB-1962.) The deltas also stay
             // visible via the local metrics fallback until Redis heals.
             warn!(error = %e, "redis HINCRBY failed for transport errors; re-queuing deltas locally");
             // Poison-recovering lock: an `if let Ok` here would silently DROP
@@ -5359,6 +5370,10 @@ const SSE_SCAN_MAX_LINE: usize = 64 * 1024;
 #[derive(Default)]
 struct SseUsageScanner {
     usage: TokenUsage,
+    /// Model reported by the upstream `message_start` event (LAB-2330) —
+    /// the response-derived model used for per-(client, model) accounting,
+    /// preferred over the caller-supplied request model.
+    model: Option<String>,
     /// Bytes of the current line seen so far, awaiting its `\n`.
     carry: Vec<u8>,
     /// Set when a line overflows `SSE_SCAN_MAX_LINE`; the rest of that line
@@ -5438,6 +5453,13 @@ impl SseUsageScanner {
         };
         match event.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "message_start" => {
+                if let Some(m) = event
+                    .pointer("/message/model")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    self.model = Some(m.to_owned());
+                }
                 if let Some(msg_usage) = event.get("message").and_then(|m| m.get("usage")) {
                     self.usage.input_tokens = msg_usage
                         .get("input_tokens")
@@ -5965,10 +5987,14 @@ async fn finalize_stream(
 ) {
     scanner.finish();
     let usage = &scanner.usage;
+    // Response-derived model (message_start) preferred; request model fallback.
+    let usage_model = scanner.model.as_deref().unwrap_or(model);
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
     if !usage.is_empty() {
-        state.record_usage(ep, client_id, usage).await;
-        log_usage(req_id, client_id, model, acct_name, usage);
+        state.record_usage(ep, client_id, usage_model, usage).await;
+        // Log the same model the metric records, so the usage log and
+        // anthropic_client_model_token_usage_total reconcile.
+        log_usage(req_id, client_id, usage_model, acct_name, usage);
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -6030,6 +6056,8 @@ async fn finalize_stream(
 }
 
 /// Finalize a non-streaming response: extract usage from JSON body, log, and shadow log.
+/// `response_model` is the model reported by the upstream response body
+/// (LAB-2330) — preferred over the request `model` for per-model accounting.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_non_stream(
     state: &AppState,
@@ -6037,6 +6065,7 @@ async fn finalize_non_stream(
     req_id: &str,
     client_id: &str,
     model: &str,
+    response_model: Option<&str>,
     acct_name: &str,
     client_ip: &str,
     agent: &str,
@@ -6049,8 +6078,11 @@ async fn finalize_non_stream(
     context_window: u64,
 ) {
     if !usage.is_empty() {
-        state.record_usage(ep, client_id, usage).await;
-        log_usage(req_id, client_id, model, acct_name, usage);
+        let usage_model = response_model.unwrap_or(model);
+        state.record_usage(ep, client_id, usage_model, usage).await;
+        // Log the same model the metric records, so the usage log and
+        // anthropic_client_model_token_usage_total reconcile.
+        log_usage(req_id, client_id, usage_model, acct_name, usage);
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -6088,8 +6120,12 @@ async fn finalize_non_stream(
 }
 
 impl AppState {
-    /// Record token usage for an endpoint and client.
-    async fn record_usage(&self, ep: &Endpoint, client_id: &str, usage: &TokenUsage) {
+    /// Record token usage for an endpoint and client. `model` feeds the
+    /// per-(client, model) counter (LAB-2330): callers pass the
+    /// response-derived model where available, falling back to the request
+    /// model — either way it is truncated and the pair-count is capped here,
+    /// so callers cannot inflate the label set.
+    async fn record_usage(&self, ep: &Endpoint, client_id: &str, model: &str, usage: &TokenUsage) {
         if usage.is_empty() {
             return;
         }
@@ -6118,6 +6154,33 @@ impl AppState {
                     entry[2] += usage.cache_creation_input_tokens;
                     entry[3] += usage.cache_read_input_tokens;
                 }
+            }
+            // Per-(client, model) accounting (LAB-2330). A usage record only
+            // exists when the upstream returned usage, so the model string was
+            // accepted upstream; truncation + the pair cap bound the label set
+            // regardless.
+            let model = if model.is_empty() {
+                "unknown".to_owned()
+            } else {
+                truncate_label(model)
+            };
+            if let Ok(mut map) = self.client_model_usage.lock() {
+                let key = (client_id.to_owned(), model);
+                let key = if map.len() < MAX_CLIENT_MODEL_LABELS || map.contains_key(&key) {
+                    key
+                } else {
+                    // Map full and this pair is new: lump into ONE global
+                    // overflow bucket — hard bound of MAX_CLIENT_MODEL_LABELS
+                    // + 1 entries. A per-client ("<client>", "_other") key
+                    // would let x-client-id rotation (legacy auth modes) grow
+                    // the map without bound (expert-panel finding, LAB-2330).
+                    ("_other".to_owned(), "_other".to_owned())
+                };
+                let entry = map.entry(key).or_insert([0; 4]);
+                entry[0] += usage.input_tokens;
+                entry[1] += usage.output_tokens;
+                entry[2] += usage.cache_creation_input_tokens;
+                entry[3] += usage.cache_read_input_tokens;
             }
             // Budget accounting
             self.record_budget_usage(client_id, total).await;
@@ -6162,7 +6225,11 @@ impl AppState {
     }
 
     /// Check if a client is within their daily token budget. Returns Ok(()) or Err with remaining.
-    /// When Redis is available, checks the global counter; falls back to local on error.
+    /// When Redis is available, a present counter is authoritative; an absent key or a read
+    /// error falls through to the local floor — an absent key may be a counter lost to a
+    /// failed INCRBY, or a poisoned key record_budget_usage deliberately deleted (LAB-1962).
+    /// The poison self-heal DEL is only safe because of this floor: relaxing the absent-key
+    /// path back to an authoritative allow would reopen the enforcement bypass.
     async fn check_budget(&self, client_id: &str) -> Result<(), u64> {
         let limit = match self.client_budgets.get(client_id) {
             Some(&limit) => limit,
@@ -6181,7 +6248,11 @@ impl AppState {
                 let key = format!("alb:budget:{client_id}:{today}");
                 match redis.get::<Option<u64>, _>(key.as_str()).await {
                     Ok(Some(used)) if used >= limit => return Err(0),
-                    Ok(_) => return Ok(()),
+                    Ok(Some(_)) => return Ok(()),
+                    // Absent key: fall through to the local floor. Treating
+                    // absence as an authoritative allow let a single failed
+                    // INCRBY widen the budget fleet-wide (LAB-1962/F8).
+                    Ok(None) => {}
                     Err(e) => {
                         warn!(error = %e, "redis budget check failed, falling back to local");
                     }
@@ -6202,9 +6273,58 @@ impl AppState {
         Ok(())
     }
 
+    /// Atomic check-and-delete for a poisoned budget key: deletes only if the
+    /// value STILL cannot be INCRBY'd at delete time. A bare DEL issued after
+    /// the INCRBY error can land late (concurrent replicas also healing, or
+    /// fred replaying it after a reconnect) and would erase a counter the
+    /// fleet already rebuilt. "Still poisoned" is decided by Redis's own
+    /// parser — a zero-increment INCRBY probe — NOT Lua's tonumber(), which
+    /// accepts values INCRBY rejects ("1.5", "1e3", hex, out-of-i64-range);
+    /// any value in that gap would wedge the counter for its full TTL
+    /// (LAB-1962 review). The probe also errors on WRONGTYPE keys, so no
+    /// separate TYPE check is needed; a zero increment on a valid counter
+    /// leaves its value and TTL untouched and cannot overflow. The EXISTS
+    /// gate stops the probe from creating the key at 0 — which check_budget
+    /// would treat as an authoritative fleet-wide allow. The probe error
+    /// must match the same value-error frames as budget_value_poisoned
+    /// (keep the two in lockstep): INCRBY can also fail for non-value
+    /// reasons — notably OOM at maxmemory, where DEL still succeeds — and
+    /// deleting a valid counter on such an error would be exactly the
+    /// erasure this guard exists to prevent.
+    const BUDGET_DEL_IF_POISONED_SCRIPT: &'static str = r#"
+        if redis.call('EXISTS', KEYS[1]) == 0 then
+            return 0
+        end
+        local probe = redis.pcall('INCRBY', KEYS[1], 0)
+        if type(probe) == 'table' and probe.err
+            and (probe.err:find('WRONGTYPE', 1, true) == 1
+                or probe.err:find('not an integer', 1, true)) then
+            return redis.call('DEL', KEYS[1])
+        end
+        return 0
+        "#;
+
+    /// True when a Redis error means the budget key's VALUE is unusable
+    /// (server-reported WRONGTYPE or non-integer), as opposed to a transport
+    /// failure. Server error frames arrive verbatim in `details()` — Redis
+    /// and Dragonfly both emit these exact strings — while IO/timeout errors
+    /// never do, so a poisoned key is safely distinguishable from a lost
+    /// write. BUDGET_DEL_IF_POISONED_SCRIPT matches the same two frames on
+    /// the Lua side — change them together or the guard and classifier
+    /// drift.
+    fn budget_value_poisoned(e: &fred::error::RedisError) -> bool {
+        let details = e.details();
+        details.starts_with("WRONGTYPE") || details.contains("not an integer")
+    }
+
     /// Record tokens against a client's daily budget.
     /// Updates local state synchronously; awaits Redis INCRBY inline to prevent TOCTOU races.
-    /// On Redis INCRBY failure, deletes the stale key so check_budget falls through to local.
+    /// On a transport-level INCRBY failure the increment is lost from the shared counter —
+    /// the key is left untouched so one replica's failed write never erases fleet-wide
+    /// accounting; the local accumulator (updated first, before any Redis I/O) keeps the
+    /// floor (LAB-1962). A server-reported poisoned value (WRONGTYPE / non-integer) is the
+    /// one case that still deletes: the key is unreadable garbage for its full TTL and
+    /// deleting it lets the shared counter rebuild.
     async fn record_budget_usage(&self, client_id: &str, tokens: u64) {
         if tokens == 0 || !self.client_budgets.contains_key(client_id) {
             return;
@@ -6223,11 +6343,9 @@ impl AppState {
         // Await Redis INCRBY (not fire-and-forget) so check_budget always sees
         // latest counter. Same is_connected rationale as check_budget: this
         // runs on the request path, and a reconnecting fred client would
-        // buffer the INCRBY (and the follow-up DEL on its error branch) for
-        // 2s each instead of failing fast. Skipping while down is equivalent
-        // to the old attempt-and-fail: local state above is already updated,
-        // and the DEL that failure would trigger could not reach the backend
-        // either.
+        // buffer the INCRBY for 2s instead of failing fast. Skipping while
+        // down is equivalent to attempt-and-fail: local state above is
+        // already updated, and the increment is lost either way.
         if let Some(redis) = &self.redis {
             if !redis.is_connected() {
                 trace!("redis disconnected, budget INCRBY skipped (local state updated)");
@@ -6244,10 +6362,39 @@ impl AppState {
                         tracing::warn!(error = %e, "redis EXPIRE failed for budget key");
                     }
                 }
+                Err(e) if Self::budget_value_poisoned(&e) => {
+                    // Poisoned value: delete so the counter can rebuild (see
+                    // fn doc). Safe only because check_budget's absent-key
+                    // local floor closes the old allow-bypass; the Lua guard
+                    // keeps a late DEL from erasing a rebuilt valid counter.
+                    tracing::warn!(
+                        error = %e,
+                        key = %key,
+                        "budget key holds a non-integer value, deleting so the shared counter can rebuild"
+                    );
+                    let del_result: Result<RedisValue, fred::error::RedisError> = redis
+                        .eval(
+                            Self::BUDGET_DEL_IF_POISONED_SCRIPT,
+                            vec![key.as_str()],
+                            Vec::<String>::new(),
+                        )
+                        .await;
+                    if let Err(del_err) = del_result {
+                        tracing::warn!(error = %del_err, key = %key, "failed to delete poisoned budget key");
+                    }
+                }
                 Err(e) => {
-                    // Delete stale key so check_budget falls through to local state
-                    tracing::warn!(error = %e, "redis INCRBY failed, deleting stale budget key");
-                    let _: Result<(), fred::error::RedisError> = redis.del(key.as_str()).await;
+                    // Transport failure: do NOT delete the shared counter —
+                    // erasing a valid counter on one replica's write failure
+                    // destroyed the fleet's day of accounting and, with the
+                    // old absent-key allow in check_budget, bypassed
+                    // enforcement entirely (LAB-1962/F8). The increment is
+                    // lost; check_budget's local floor covers this replica.
+                    tracing::warn!(
+                        error = %e,
+                        key = %key,
+                        "redis INCRBY failed, increment lost from shared budget counter"
+                    );
                 }
             }
         }
@@ -6352,8 +6499,10 @@ impl AppState {
     }
 
     /// Shared pre-request gate for all Anthropic-proxied requests.
-    /// Returns Ok(()) or an error Response (429).
-    async fn pre_request_gate(&self, client_id: &str, model: &str) -> Result<(), Response> {
+    /// Returns Ok(()) or an error Response (403/429).
+    ///
+    /// Boxed Err — see `ForwardOutcome` (clippy::result_large_err).
+    async fn pre_request_gate(&self, client_id: &str, model: &str) -> Result<(), Box<Response>> {
         if self.is_operator(client_id) {
             return Ok(()); // operator bypasses everything
         }
@@ -6377,15 +6526,15 @@ impl AppState {
                     truncate_label(model)
                 )
             };
-            return Err((StatusCode::FORBIDDEN, body).into_response());
+            return Err(Box::new((StatusCode::FORBIDDEN, body).into_response()));
         }
 
         // 1. Daily token budget (existing)
         if client_id != "-" && self.check_budget(client_id).await.is_err() {
             warn!(client_id = %client_id, "rejected: daily token budget exceeded");
-            return Err(
+            return Err(Box::new(
                 (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response(),
-            );
+            ));
         }
 
         // 2. Utilization limit (new)
@@ -6404,7 +6553,7 @@ impl AppState {
                 "retry-after",
                 HeaderValue::from_str(&retry_after.to_string()).unwrap(),
             );
-            return Err(resp);
+            return Err(Box::new(resp));
         }
 
         // 3. Emergency brake (new)
@@ -6413,11 +6562,13 @@ impl AppState {
                 client_id = %client_id,
                 "rejected: emergency brake active"
             );
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                "emergency: all accounts near exhaustion",
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "emergency: all accounts near exhaustion",
+                )
+                    .into_response(),
+            ));
         }
 
         Ok(())
@@ -6722,15 +6873,27 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 ///     429 while stashing the upstream's error response, so a model no OTHER
 ///     endpoint can serve still surfaces the real error — a nonexistent-model
 ///     404 must not morph into a synthetic 429 that invites retries.
+// Response payloads are boxed so the enum stays small (one word per payload):
+// it rides in the Err of `classify_retry_status`'s Result, where an inline
+// `Response` is 128+ bytes on the hot success path (clippy::result_large_err —
+// same pattern as `authenticate` / `reserve_request_body`).
 enum ForwardOutcome {
-    Done(Response),
-    RetryModelUnsupported(Response),
+    Done(Box<Response>),
+    RetryModelUnsupported(Box<Response>),
     Retry {
         saw_529: bool,
         push_skip: bool,
         transient: bool,
     },
 }
+
+/// Non-transient rotation: skip this endpoint and try the next candidate.
+/// Pre-dates the `ForwardOutcome` return type as a bare `None`.
+const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
+    saw_529: false,
+    push_skip: true,
+    transient: false,
+};
 
 /// True when an upstream error body says this ACCOUNT cannot serve the
 /// requested model — distinct from a malformed request (LAB-941). Matched
@@ -6872,7 +7035,7 @@ async fn classify_retry_status(
             })
         }
         .to_string();
-        return Err(ForwardOutcome::Done(
+        return Err(ForwardOutcome::Done(Box::new(
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .header("content-type", "application/json")
@@ -6880,7 +7043,7 @@ async fn classify_retry_status(
                 .unwrap_or_else(|_| {
                     (StatusCode::BAD_GATEWAY, "upstream redirect refused").into_response()
                 }),
-        ));
+        )));
     }
 
     // 429 → mark hard-limited and try next account
@@ -6955,12 +7118,12 @@ fn apply_round_outcome(
     model_unsupported_resp: &mut Option<Response>,
 ) -> RetryStep {
     match outcome {
-        ForwardOutcome::Done(resp) => RetryStep::Return(resp),
+        ForwardOutcome::Done(resp) => RetryStep::Return(*resp),
         // Model rejected by this endpoint: rotate immediately (another
         // account may serve it) but keep the upstream's error in hand for
         // the case where none does (LAB-941).
         ForwardOutcome::RetryModelUnsupported(resp) => {
-            *model_unsupported_resp = Some(resp);
+            *model_unsupported_resp = Some(*resp);
             skip.push(picked_idx);
             RetryStep::NextAttempt
         }
@@ -7501,7 +7664,7 @@ async fn forward_anthropic(
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
-        ForwardOutcome::Done(response)
+        ForwardOutcome::Done(Box::new(response))
     } else {
         // Non-streaming: buffer, extract usage, forward.
         //
@@ -7551,14 +7714,21 @@ async fn forward_anthropic(
                         }
                     }
                 }
-                return ForwardOutcome::Done(err_builder.body(Body::from(body)).unwrap_or_else(
-                    |_| (StatusCode::BAD_GATEWAY, "upstream body read failed").into_response(),
+                return ForwardOutcome::Done(Box::new(
+                    err_builder.body(Body::from(body)).unwrap_or_else(|_| {
+                        (StatusCode::BAD_GATEWAY, "upstream body read failed").into_response()
+                    }),
                 ));
             }
         };
         let mut usage = TokenUsage::default();
+        let mut response_model: Option<String> = None;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&resp_body_bytes) {
             usage = TokenUsage::from_response_body(&parsed);
+            response_model = parsed
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
             // Count + trace upstream context-window overflows (LAB-916). The
             // 400 itself is forwarded below byte-for-byte, as before.
             if status.as_u16() == 400 {
@@ -7577,7 +7747,7 @@ async fn forward_anthropic(
                     .unwrap_or_else(|_| {
                         (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                     });
-                return ForwardOutcome::RetryModelUnsupported(response);
+                return ForwardOutcome::RetryModelUnsupported(Box::new(response));
             }
         }
         finalize_non_stream(
@@ -7586,6 +7756,7 @@ async fn forward_anthropic(
             req_id,
             client_id,
             model,
+            response_model.as_deref(),
             endpoint_name,
             &client_ip.to_string(),
             agent_id,
@@ -7603,7 +7774,7 @@ async fn forward_anthropic(
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
-        ForwardOutcome::Done(response)
+        ForwardOutcome::Done(Box::new(response))
     }
 }
 
@@ -7902,7 +8073,7 @@ async fn proxy_handler(
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
     if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
-        return resp;
+        return *resp;
     }
 
     // LAB-933: serve an opted-in replay from the encrypted response cache.
@@ -7930,6 +8101,11 @@ async fn proxy_handler(
     // Upstream error from the most recent model-unsupported rejection —
     // returned verbatim if the pool exhausts on nothing but rejections.
     let mut model_unsupported_resp: Option<Response> = None;
+    // OpenAI-shape body, built lazily on the first OpenAI-endpoint attempt
+    // and reused across rotations/retries (LAB-716). Lazy so requests served
+    // entirely by Anthropic endpoints — the common case — never pay for the
+    // translation.
+    let mut openai_fallback_body: Option<FallbackBody> = None;
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
             let delay = round_backoff_delay(retry_round, last_saw_529);
@@ -7949,58 +8125,89 @@ async fn proxy_handler(
             // `forward_anthropic` (Anthropic) or `try_fallback_upstream`
             // (OpenAI). Both return a `ForwardOutcome` so the shared
             // round-gated policy in `apply_round_outcome` covers both.
-            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) =
-                match state.pick_endpoint(affinity, &model, &skip).await {
-                    Some(i) => {
-                        let ep = &state.endpoints[i];
-                        match ep.protocol {
-                            Protocol::Anthropic => {
-                                let out = forward_anthropic(
-                                    &state,
-                                    &parts,
-                                    &body_bytes,
-                                    &oauth_body_bytes,
-                                    ep,
-                                    i,
-                                    &req_id,
-                                    &client_id,
-                                    &client_ver,
-                                    &client_ip,
-                                    &agent_id,
-                                    &session_id,
-                                    &model,
-                                    affinity,
-                                    request_start,
-                                )
-                                .await;
-                                (out, i)
-                            }
-                            Protocol::OpenAI => {
-                                let out = try_fallback_upstream(
-                                    &state,
-                                    &body_bytes,
-                                    &req_id,
-                                    &client_id,
-                                    &client_ip,
-                                    &agent_id,
-                                    &session_id,
-                                    &model,
-                                    i,
-                                    request_start,
-                                    true,
-                                )
-                                .await;
-                                (out, i)
-                            }
+            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
+                .pick_endpoint(affinity, &model, &skip)
+                .await
+            {
+                Some(i) => {
+                    let ep = &state.endpoints[i];
+                    match ep.protocol {
+                        Protocol::Anthropic => {
+                            let out = forward_anthropic(
+                                &state,
+                                &parts,
+                                &body_bytes,
+                                &oauth_body_bytes,
+                                ep,
+                                i,
+                                &req_id,
+                                &client_id,
+                                &client_ver,
+                                &client_ip,
+                                &agent_id,
+                                &session_id,
+                                &model,
+                                affinity,
+                                request_start,
+                            )
+                            .await;
+                            (out, i)
+                        }
+                        Protocol::OpenAI => {
+                            let out = match openai_fallback_body
+                                .get_or_insert_with(|| build_openai_fallback_body(&body_bytes))
+                            {
+                                FallbackBody::Ready { body, is_streaming } => {
+                                    try_fallback_upstream(
+                                        &state,
+                                        body,
+                                        &req_id,
+                                        &client_id,
+                                        &client_ip,
+                                        &agent_id,
+                                        &session_id,
+                                        &model,
+                                        i,
+                                        request_start,
+                                        true,
+                                        *is_streaming,
+                                    )
+                                    .await
+                                }
+                                FallbackBody::Unparseable => {
+                                    warn!(
+                                            req_id,
+                                            upstream = ep.name,
+                                            "fallback: request JSON unparseable, skipping OpenAI endpoint"
+                                        );
+                                    ROTATE
+                                }
+                                FallbackBody::Untranslatable(msg) => {
+                                    warn!(
+                                        req_id,
+                                        upstream = ep.name,
+                                        error = %msg,
+                                        "fallback: request not representable in OpenAI format"
+                                    );
+                                    // Terminal, not a retry: the request itself
+                                    // is the problem, so rotating would fail the
+                                    // same way on every endpoint.
+                                    ForwardOutcome::Done(Box::new(untranslatable_request_response(
+                                        msg,
+                                    )))
+                                }
+                            };
+                            (out, i)
                         }
                     }
-                    // Candidates exhausted mid-round (all skipped / hard-limited /
-                    // model-filtered). Break to the round-end logic rather than
-                    // returning here, so a transient-only round still reaches the
-                    // transient-aware exhaustion status instead of short-circuiting
-                    // to a premature 429.
-                    None => break,
-                };
+                }
+                // Candidates exhausted mid-round (all skipped / hard-limited /
+                // model-filtered). Break to the round-end logic rather than
+                // returning here, so a transient-only round still reaches the
+                // transient-aware exhaustion status instead of short-circuiting
+                // to a premature 429.
+                None => break,
+            };
 
             match apply_round_outcome(
                 retry_round,
@@ -8058,10 +8265,56 @@ async fn proxy_handler(
 
 // ── Fallback upstream handler ────────────────────────────────────────
 
-/// Forward a request to a `Protocol::OpenAI` endpoint. For Anthropic-format
-/// callers (`proxy_handler`) it translates the request to OpenAI format and the
-/// response back (`translate = true`); for OpenAI-format callers
-/// (`openai_chat_handler`) it forwards directly (`translate = false`).
+/// Anthropic→OpenAI request body for `try_fallback_upstream`, built lazily by
+/// `proxy_handler` on the first OpenAI-endpoint attempt of a request and
+/// memoized across rotations/retries (LAB-716).
+enum FallbackBody {
+    /// Translated + serialized once; `is_streaming` read from the same parse.
+    Ready {
+        body: bytes::Bytes,
+        is_streaming: bool,
+    },
+    /// Request JSON didn't parse (or couldn't re-serialize) — rotate past
+    /// OpenAI endpoints; Anthropic endpoints still forward the raw bytes and
+    /// let the upstream reject them.
+    Unparseable,
+    /// Parsed but not representable in OpenAI format — terminal for the
+    /// request: rotating would fail identically on every endpoint.
+    Untranslatable(String),
+}
+
+fn build_openai_fallback_body(body_bytes: &[u8]) -> FallbackBody {
+    let parsed: serde_json::Value = match serde_json::from_slice(body_bytes) {
+        Ok(v) => v,
+        Err(_) => return FallbackBody::Unparseable,
+    };
+    let is_streaming = parsed
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    let openai_body = match translate_anthropic_request_to_openai(&parsed) {
+        Ok(v) => v,
+        Err(msg) => return FallbackBody::Untranslatable(msg),
+    };
+    match serde_json::to_vec(&openai_body) {
+        Ok(b) => FallbackBody::Ready {
+            body: b.into(),
+            is_streaming,
+        },
+        Err(e) => {
+            // Can't happen for a Value built from parsed JSON (string keys
+            // only) — but don't rotate invisibly if it somehow does.
+            warn!(error = %e, "fallback: translated body failed to serialize");
+            FallbackBody::Unparseable
+        }
+    }
+}
+
+/// Forward a request to a `Protocol::OpenAI` endpoint. Callers hand over the
+/// final wire body: `proxy_handler` pre-translates via
+/// `build_openai_fallback_body` and sets `translate = true` so the *response*
+/// is translated back to Anthropic format; `openai_chat_handler` passes the
+/// raw OpenAI-format bytes with `translate = false` (passthrough).
 ///
 /// Returns `ForwardOutcome` so the caller's retry loop applies the SAME
 /// round-gated policy as the Anthropic path (`apply_round_outcome`): a
@@ -8078,7 +8331,9 @@ async fn proxy_handler(
 #[allow(clippy::too_many_arguments)]
 async fn try_fallback_upstream(
     state: &AppState,
-    body_bytes: &[u8],
+    // Final wire body (already OpenAI-shaped), serialized once by the
+    // caller; each attempt clones the refcounted `Bytes`.
+    request_body: &bytes::Bytes,
     req_id: &str,
     client_id: &str,
     client_ip: &std::net::IpAddr,
@@ -8087,15 +8342,9 @@ async fn try_fallback_upstream(
     model: &str,
     endpoint_idx: usize,
     request_start: std::time::Instant,
-    translate: bool, // true = Anthropic↔OpenAI translation needed
+    translate: bool, // true = upstream response needs OpenAI→Anthropic translation
+    is_streaming: bool,
 ) -> ForwardOutcome {
-    // Non-transient rotation: skip this endpoint and try the next candidate.
-    // Pre-dates the ForwardOutcome return type as a bare `None`.
-    const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
-        saw_529: false,
-        push_skip: true,
-        transient: false,
-    };
     let ep = &state.endpoints[endpoint_idx];
 
     info!(
@@ -8109,40 +8358,6 @@ async fn try_fallback_upstream(
 
     ep.requests.fetch_add(1, Ordering::Relaxed);
 
-    // Parse once to extract streaming flag before potential translation
-    let parsed: serde_json::Value = match serde_json::from_slice(body_bytes) {
-        Ok(v) => v,
-        Err(_) => return ROTATE,
-    };
-    let is_streaming = parsed
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
-
-    // Build request body
-    let request_body = if translate {
-        let openai_body = match translate_anthropic_request_to_openai(&parsed) {
-            Ok(v) => v,
-            Err(msg) => {
-                warn!(
-                    req_id,
-                    upstream = ep.name,
-                    error = %msg,
-                    "fallback: request not representable in OpenAI format"
-                );
-                // Terminal, not a retry: the request itself is the problem, so
-                // rotating to another endpoint would just fail the same way.
-                return ForwardOutcome::Done(untranslatable_request_response(&msg));
-            }
-        };
-        match serde_json::to_vec(&openai_body) {
-            Ok(b) => b,
-            Err(_) => return ROTATE,
-        }
-    } else {
-        body_bytes.to_vec()
-    };
-
     let url = format!("{}/v1/chat/completions", ep.base_url);
 
     // Same non-streaming read_timeout exemption as forward_anthropic (LAB-718).
@@ -8155,7 +8370,7 @@ async fn try_fallback_upstream(
         .post(&url)
         .header("authorization", format!("Bearer {}", ep.token))
         .header("content-type", "application/json")
-        .body(request_body)
+        .body(request_body.clone())
         .send()
         .await
     {
@@ -8260,9 +8475,9 @@ async fn try_fallback_upstream(
         };
         if model_unsupported {
             state.note_model_unsupported(&ep.name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(response);
+            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
         }
-        return ForwardOutcome::Done(response);
+        return ForwardOutcome::Done(Box::new(response));
     }
 
     // Streaming response
@@ -8424,7 +8639,7 @@ async fn try_fallback_upstream(
             }
         });
 
-        return ForwardOutcome::Done(
+        return ForwardOutcome::Done(Box::new(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/event-stream")
@@ -8436,7 +8651,7 @@ async fn try_fallback_upstream(
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "fallback stream error").into_response()
                 }),
-        );
+        ));
     }
 
     // Non-streaming response
@@ -8476,6 +8691,7 @@ async fn try_fallback_upstream(
         req_id,
         client_id,
         model,
+        openai_resp.get("model").and_then(|v| v.as_str()),
         &ep.name,
         &client_ip.to_string(),
         agent_id,
@@ -8498,7 +8714,7 @@ async fn try_fallback_upstream(
             upstream = ep.name,
             "fallback: unified endpoint translated response"
         );
-        ForwardOutcome::Done(
+        ForwardOutcome::Done(Box::new(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
@@ -8506,14 +8722,14 @@ async fn try_fallback_upstream(
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
                 }),
-        )
+        ))
     } else {
         info!(
             req_id,
             upstream = ep.name,
             "fallback: unified endpoint forwarded response"
         );
-        ForwardOutcome::Done(
+        ForwardOutcome::Done(Box::new(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
@@ -8521,7 +8737,7 @@ async fn try_fallback_upstream(
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "fallback error").into_response()
                 }),
-        )
+        ))
     }
 }
 
@@ -9196,6 +9412,12 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.clone())
         .unwrap_or_default();
+    let client_model_usage: Vec<((String, String), [u64; 4])> = state
+        .client_model_usage
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
     let budget_usage = state
         .budget_usage
         .lock()
@@ -9781,6 +10003,46 @@ async fn metrics_handler(
                     tokens[i],
                 );
             }
+        }
+    }
+
+    // Per-(client, model) usage (LAB-2330). Sibling of the per-client family
+    // above — that one stays authoritative for per-client totals; this one
+    // adds the model dimension so per-model pricing can be applied downstream.
+    // Operators aggregate into `_operator` per model, matching the house
+    // pattern. Cardinality is bounded at record time (MAX_CLIENT_MODEL_LABELS).
+    prom_header(
+        &mut buf,
+        "anthropic_client_model_token_usage_total",
+        "counter",
+        "Per-client token usage by model and type",
+    );
+    let mut op_model_tokens: HashMap<&str, [u64; 4]> = HashMap::new();
+    for ((client, mdl), tokens) in &client_model_usage {
+        if state.is_operator(client) {
+            let e = op_model_tokens.entry(mdl.as_str()).or_insert([0; 4]);
+            for i in 0..4 {
+                e[i] += tokens[i];
+            }
+        } else {
+            for (i, t) in types.iter().enumerate() {
+                prom_counter(
+                    &mut buf,
+                    "anthropic_client_model_token_usage_total",
+                    &[("client", client), ("model", mdl), ("type", t)],
+                    tokens[i],
+                );
+            }
+        }
+    }
+    for (mdl, tokens) in &op_model_tokens {
+        for (i, t) in types.iter().enumerate() {
+            prom_counter(
+                &mut buf,
+                "anthropic_client_model_token_usage_total",
+                &[("client", "_operator"), ("model", mdl), ("type", t)],
+                tokens[i],
+            );
         }
     }
 
@@ -11015,12 +11277,24 @@ fn anthropic_user_blocks_to_openai_content(
     })
 }
 
+// Test-only invocation counter for `translate_anthropic_request_to_openai`
+// (LAB-716 AC: translation must run at most once per request, not per retry
+// attempt). Thread-local: `#[tokio::test]` defaults to a current-thread
+// runtime on the test's own thread, so parallel tests can't cross-pollute.
+#[cfg(test)]
+thread_local! {
+    static TRANSLATE_A2O_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Err (with a client-facing message) when a message contains an image this
 /// translator can't represent faithfully — the caller must surface a real
 /// error instead of silently forwarding a request with the image dropped.
 fn translate_anthropic_request_to_openai(
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    #[cfg(test)]
+    TRANSLATE_A2O_CALLS.with(|c| c.set(c.get() + 1));
+
     let mut out = serde_json::Map::new();
 
     if let Some(model) = body.get("model") {
@@ -11648,9 +11922,9 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
 }
 
 /// Forward one OpenAI-compat request to a single Anthropic-protocol `Endpoint`.
-/// The caller has already translated the OpenAI request into `anthropic_body`
-/// (plus the OAuth variant `oauth_anthropic_body`); this helper picks the right
-/// variant by token prefix, forwards to the endpoint, and translates the
+/// The caller has already translated the OpenAI request and serialized it once
+/// into `anthropic_body_bytes` (plus the OAuth variant); this helper picks the
+/// right variant by token prefix, forwards to the endpoint, and translates the
 /// Anthropic response back to OpenAI format. Structurally similar to
 /// `forward_anthropic`, but intentionally kept separate: it speaks OpenAI on
 /// both edges (request body already translated, response translated back).
@@ -11665,8 +11939,10 @@ async fn forward_openai_compat_anthropic(
     parts: &axum::http::request::Parts,
     ep: &Endpoint,
     endpoint_idx: usize,
-    anthropic_body: &serde_json::Value,
-    oauth_anthropic_body: &serde_json::Value,
+    // Translated Anthropic-shape bodies, serialized once by the caller
+    // (LAB-716); each attempt clones the refcounted `Bytes`.
+    anthropic_body_bytes: &bytes::Bytes,
+    oauth_anthropic_body_bytes: &bytes::Bytes,
     req_id: &str,
     client_id: &str,
     client_ver: &str,
@@ -11716,15 +11992,14 @@ async fn forward_openai_compat_anthropic(
 
     // Use OAuth variant (with CC system prompt) for OAuth tokens
     let req_body = if token.starts_with("sk-ant-oat") {
-        oauth_anthropic_body
+        oauth_anthropic_body_bytes
     } else {
-        anthropic_body
+        anthropic_body_bytes
     };
-    let body_str = req_body.to_string();
     debug!(
         account = endpoint_name,
         model = %model,
-        body_len = body_str.len(),
+        body_len = req_body.len(),
         "openai-compat: upstream request"
     );
 
@@ -11737,7 +12012,7 @@ async fn forward_openai_compat_anthropic(
     let upstream_req = http_client
         .request(reqwest::Method::POST, &url)
         .headers(headers)
-        .body(body_str);
+        .body(req_body.clone());
 
     let resp = match upstream_req.send().await {
         Ok(r) => r,
@@ -11914,9 +12189,9 @@ async fn forward_openai_compat_anthropic(
             });
         if model_unsupported {
             state.note_model_unsupported(endpoint_name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(response);
+            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
         }
-        return ForwardOutcome::Done(response);
+        return ForwardOutcome::Done(Box::new(response));
     }
 
     if is_streaming {
@@ -12080,7 +12355,7 @@ async fn forward_openai_compat_anthropic(
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
-        return ForwardOutcome::Done(response);
+        return ForwardOutcome::Done(Box::new(response));
     }
 
     // Non-streaming: buffer, translate, return
@@ -12088,9 +12363,9 @@ async fn forward_openai_compat_anthropic(
         Ok(b) => b,
         Err(e) => {
             error!("failed to read upstream response: {e}");
-            return ForwardOutcome::Done(
+            return ForwardOutcome::Done(Box::new(
                 (StatusCode::BAD_GATEWAY, "failed to read upstream response").into_response(),
-            );
+            ));
         }
     };
 
@@ -12105,7 +12380,7 @@ async fn forward_openai_compat_anthropic(
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                 });
-            return ForwardOutcome::Done(response);
+            return ForwardOutcome::Done(Box::new(response));
         }
     };
 
@@ -12119,6 +12394,7 @@ async fn forward_openai_compat_anthropic(
         req_id,
         client_id,
         model,
+        anthropic_resp.get("model").and_then(|v| v.as_str()),
         endpoint_name,
         &client_ip.to_string(),
         agent_id,
@@ -12142,7 +12418,7 @@ async fn forward_openai_compat_anthropic(
         .unwrap_or_else(|_| {
             (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
         });
-    ForwardOutcome::Done(response)
+    ForwardOutcome::Done(Box::new(response))
 }
 
 async fn openai_chat_handler(
@@ -12221,7 +12497,7 @@ async fn openai_chat_handler(
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
     if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
-        return resp;
+        return *resp;
     }
 
     let mut anthropic_body = translate_openai_to_anthropic(&openai_body);
@@ -12244,6 +12520,26 @@ async fn openai_chat_handler(
     // OAuth tokens (sk-ant-oat*) require this to access sonnet/opus models.
     let mut oauth_anthropic_body = anthropic_body.clone();
     inject_oauth_system_prompt(&mut oauth_anthropic_body);
+
+    // Serialize both variants once (LAB-716): the forward helper used to
+    // `to_string()` the JSON on every retry attempt; now each attempt clones
+    // a refcounted `Bytes`. Serializing a `Value` can only fail on a
+    // non-string map key, which JSON input can't produce — the 500 arm is a
+    // formality.
+    let (anthropic_body_bytes, oauth_body_bytes) = match (
+        serde_json::to_vec(&anthropic_body),
+        serde_json::to_vec(&oauth_anthropic_body),
+    ) {
+        (Ok(a), Ok(o)) => (bytes::Bytes::from(a), bytes::Bytes::from(o)),
+        _ => {
+            error!(req_id, "failed to serialize translated request body");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "body serialization failed",
+            )
+                .into_response();
+        }
+    };
 
     let n = state.endpoints.len();
     let mut last_saw_529 = false;
@@ -12280,8 +12576,8 @@ async fn openai_chat_handler(
                                     &parts,
                                     ep,
                                     i,
-                                    &anthropic_body,
-                                    &oauth_anthropic_body,
+                                    &anthropic_body_bytes,
+                                    &oauth_body_bytes,
                                     &req_id,
                                     &client_id,
                                     &client_ver,
@@ -12312,6 +12608,7 @@ async fn openai_chat_handler(
                                     i,
                                     request_start,
                                     false,
+                                    is_streaming,
                                 )
                                 .await;
                                 (out, i)
@@ -12760,14 +13057,17 @@ async fn main() {
         );
     } else if !config.clients.is_empty() || config.proxy_key.is_some() {
         // Credentials but no trusted_proxies: behind a load balancer every
-        // client collapses to the LB's peer IP, so the allowlist admits the
-        // LB (i.e. everything) and the failed-auth throttle can be tripped for
-        // ALL clients by one bad neighbour. Fine for a direct-exposed instance;
-        // a footgun the moment an LB is introduced. Warn loudly (LAB-1192).
+        // client collapses to the LB's peer IP, leaving one shared allowlist
+        // decision and one shared invalid-credential throttle bucket. Valid
+        // credentials still pass, but source attribution and per-client
+        // failure isolation are lost. Warn loudly (LAB-1192, amended by
+        // LAB-1193).
         warn!(
             "no trusted_proxies configured — if this instance sits behind a load balancer, \
-             all clients share the LB's peer IP for the allowlist and failed-auth throttle; \
-             set trusted_proxies to the LB's address range"
+             all clients share the LB's peer IP for the allowlist decision and one \
+             invalid-credential throttle bucket; valid credentials still pass, but \
+             per-client source attribution and failure isolation are lost; set \
+             trusted_proxies to the LB's address range"
         );
     }
 
@@ -12995,6 +13295,7 @@ async fn main() {
         client_names: config.client_names.clone(),
         auto_cache: config.auto_cache.unwrap_or(true),
         client_usage: Mutex::new(HashMap::new()),
+        client_model_usage: Mutex::new(HashMap::new()),
         shadow_log_tx,
         shadow_log_dropped: AtomicU64::new(0),
         client_budgets: config.client_budgets.clone(),
