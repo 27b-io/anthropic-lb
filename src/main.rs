@@ -2075,9 +2075,9 @@ impl AppState {
     ///
     /// `client_id` is truncated before becoming a map key (caller-controlled
     /// under legacy header auth), and past `MAX_CLIENT_REJECTION_LABELS`
-    /// entries new clients lump into the single global `_other` key — keeping
-    /// the reason label so overflow traffic still charts by cause. Callers
-    /// already log the rejection; this only feeds `/metrics`.
+    /// distinct clients NEW clients lump into the single global `_other` key
+    /// — keeping the reason label so overflow traffic still charts by cause.
+    /// Callers already log the rejection; this only feeds `/metrics`.
     fn note_client_rejection(&self, client_id: &str, reason: &'static str) {
         let Ok(mut counts) = self.client_rejections.lock() else {
             return;
@@ -2086,9 +2086,16 @@ impl AppState {
         // Tracked = the CLIENT has any entry, not this exact (client, reason)
         // pair: a tracked client's first rejection under a new reason must
         // not fall to `_other` just because the cap was crossed in between.
-        // O(cap) scan, only on the rejection path.
+        // The cap likewise bounds distinct CLIENTS, not (client, reason)
+        // entries — one client on all 3 reasons must burn one slot, not
+        // three. O(cap) scans, only on the rejection path.
         let tracked = counts.keys().any(|(c, _)| *c == key.0);
-        let key = if tracked || counts.len() < MAX_CLIENT_REJECTION_LABELS {
+        let distinct_clients = counts
+            .keys()
+            .map(|(c, _)| c.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let key = if tracked || distinct_clients < MAX_CLIENT_REJECTION_LABELS {
             key
         } else {
             ("_other".to_owned(), reason)

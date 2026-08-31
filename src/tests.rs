@@ -6918,7 +6918,24 @@ async fn gate_rejection_counted_by_client_and_reason() {
 #[test]
 fn rejection_counter_overflow_lumps_into_global_other() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
-    for i in 0..MAX_CLIENT_REJECTION_LABELS {
+    // The cap bounds distinct CLIENTS, not (client, reason) entries: 32
+    // clients on 2 reasons each is 64 entries but only 32 slots — a new
+    // client must still be admitted with its own key.
+    for i in 0..32 {
+        state.note_client_rejection(&format!("client-{i}"), "budget");
+        state.note_client_rejection(&format!("client-{i}"), "utilization");
+    }
+    state.note_client_rejection("client-32", "budget");
+    {
+        let counts = state.client_rejections.lock().unwrap();
+        assert_eq!(
+            counts.get(&("client-32".to_string(), "budget")),
+            Some(&1),
+            "entry count must not gate admission — only distinct clients do"
+        );
+    }
+    // Fill up to the distinct-client cap.
+    for i in 33..MAX_CLIENT_REJECTION_LABELS {
         state.note_client_rejection(&format!("client-{i}"), "budget");
     }
     // Over the cap: new clients bucket into ("_other", reason)…
