@@ -101,16 +101,14 @@ probe_interval_secs = 300
 # ("*" = suffix wildcard). Anything not listed is dropped (logged +
 # anthropic_beta_flag_dropped_total metric) — otherwise any caller could
 # activate arbitrary beta features against the operator's accounts. Omit to
-# use the built-in default (the flag families Claude Code sends + context-1m*).
+# use the built-in default (the flags the proxy needs, the flag families
+# Claude Code sends, context-1m*, fast-mode-*).
 # NOTE: a configured list REPLACES the default — it does not extend it. To
-# allow one extra flag, copy the defaults below and add yours:
+# allow one extra flag, copy every entry of DEFAULT_CLIENT_BETA_ALLOWLIST in
+# src/main.rs (the authoritative list) and add yours:
 # allowed_client_betas = [
-#   "oauth-2025-04-20",
-#   "claude-code-20250219",
-#   "interleaved-thinking-*",
-#   "fine-grained-tool-streaming-*",
-#   "prompt-caching-*",
-#   "context-1m*",
+#   # ...every DEFAULT_CLIENT_BETA_ALLOWLIST entry...
+#   "my-extra-beta-*",
 # ]
 
 # Redis/Valkey URL for distributed state (multi-replica coordination).
