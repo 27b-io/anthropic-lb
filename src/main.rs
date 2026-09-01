@@ -178,9 +178,10 @@ struct ClientConfig {
     models: Vec<String>,
     /// Endpoint names this client is pinned to (LAB-2636 / #151). While at
     /// least one is healthy (serves the model, not hard-limited, not
-    /// transport-unhealthy, under `soft_limit`), routing is restricted to
-    /// this set; otherwise the request spills to the full pool. Empty =
-    /// no pin, routing identical to a client without the field.
+    /// transport-unhealthy, under `soft_limit`, not serving via paid
+    /// overage), routing is restricted to this set; otherwise the request
+    /// spills to the full pool. Empty = no pin, routing identical to a
+    /// client without the field.
     #[serde(default)]
     preferred_endpoints: Vec<String>,
 }
@@ -4284,13 +4285,23 @@ impl AppState {
             .filter(|p| !p.is_empty())
     }
 
-    /// `pin` field for the `proxied` log lines: "pinned" when the serving
-    /// endpoint is in the client's preferred set, "spilled" when the client
-    /// has preferences but was served outside them, "-" for clients without
-    /// preferences.
+    /// Whether `endpoint_idx` is in a `preferred_endpoints` list. The ONE
+    /// membership predicate, shared by the pick-time filter and `pin_status`
+    /// — if they ever diverged, the `pin=` log field would lie about what the
+    /// picker actually did.
+    fn endpoint_is_preferred(&self, preferred: &[String], endpoint_idx: EndpointIdx) -> bool {
+        preferred
+            .iter()
+            .any(|p| *p == self.endpoints[endpoint_idx].name)
+    }
+
+    /// `pin` field for the per-request serving log lines: "pinned" when the
+    /// serving endpoint is in the client's preferred set, "spilled" when the
+    /// client has preferences but was served outside them, "-" for clients
+    /// without preferences.
     fn pin_status(&self, client_id: &str, endpoint_idx: EndpointIdx) -> &'static str {
         match self.client_preferred_endpoints(client_id) {
-            Some(p) if p.iter().any(|n| *n == self.endpoints[endpoint_idx].name) => "pinned",
+            Some(p) if self.endpoint_is_preferred(p, endpoint_idx) => "pinned",
             Some(_) => "spilled",
             None => "-",
         }
@@ -4313,12 +4324,18 @@ impl AppState {
     ///
     /// Per-client pinning (LAB-2636 / #151) runs first: if `client_id` names a
     /// `[[clients]]` entry with `preferred_endpoints` and at least one of them
-    /// is a healthy candidate (serves the model, not hard-limited, not
-    /// transport-unhealthy, not skipped, `gate < soft_limit`), the candidate
-    /// set is restricted to the preferred endpoints. The filter runs BEFORE
-    /// tier/affinity/weighted selection, so a prior affinity landing on a
-    /// non-preferred endpoint cannot defeat the pin. With no healthy preferred
-    /// candidate the full pool applies unchanged (spill-over).
+    /// is a healthy, undemoted candidate (serves the model, not hard-limited,
+    /// not transport-unhealthy, not skipped, `gate < soft_limit`, and not
+    /// priority-demoted for serving via paid overage / always-paid Fable), the
+    /// candidate set is restricted to the preferred endpoints. The filter runs
+    /// BEFORE tier/affinity/weighted selection, so a prior affinity landing on
+    /// a non-preferred endpoint cannot defeat the pin. Otherwise the full pool
+    /// applies unchanged (spill-over). The undemoted requirement matters: an
+    /// overage-covered account reports a LOW gate (the overage window
+    /// supersedes its exhausted subscription windows), so without it a pinned
+    /// client would keep billing paid overage forever instead of spilling to
+    /// free general-pool capacity — violating the free-before-paid guarantee
+    /// below, which the retain would otherwise bypass.
     ///
     /// Tiers are tried strictly in ascending priority order. Within a tier:
     /// healthy candidates (`gate < soft_limit`) are preferred; if none are healthy
@@ -4336,14 +4353,17 @@ impl AppState {
     ) -> Option<EndpointIdx> {
         let mut candidates = self.routing_candidates(model, skip).await;
         if let Some(preferred) = self.client_preferred_endpoints(client_id) {
-            let is_preferred = |c: &RoutingCandidate| {
-                preferred
-                    .iter()
-                    .any(|p| *p == self.endpoints[c.endpoint].name)
-            };
+            let is_preferred =
+                |c: &RoutingCandidate| self.endpoint_is_preferred(preferred, c.endpoint);
+            // Undemoted = candidate priority equals the configured priority.
+            // `routing_candidates` adds `overage_penalty` while an account
+            // serves via paid overage (or always-paid Fable) — that demotion
+            // is exactly the paid-capacity signal pinning must respect.
+            let undemoted =
+                |c: &RoutingCandidate| c.priority == self.endpoints[c.endpoint].priority;
             if candidates
                 .iter()
-                .any(|c| is_preferred(c) && c.gate < self.soft_limit)
+                .any(|c| is_preferred(c) && undemoted(c) && c.gate < self.soft_limit)
             {
                 candidates.retain(is_preferred);
             } else {
@@ -8429,6 +8449,7 @@ async fn try_fallback_upstream(
         model,
         upstream = ep.name,
         translate,
+        pin = state.pin_status(client_id, endpoint_idx),
         "fallback: routing to unified OpenAI endpoint"
     );
 

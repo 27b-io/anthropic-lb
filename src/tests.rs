@@ -20111,3 +20111,31 @@ async fn openai_compat_surface_pins_authenticated_client_to_preferred_endpoint()
         "the general account must serve none of the pinned client's requests"
     );
 }
+
+/// Spill: preferred endpoint serving via paid overage reports a LOW gate (the
+/// overage window supersedes its exhausted subscription windows) but is
+/// priority-demoted — the pin must NOT treat it as viable, or the pinned
+/// client would bill paid overage forever while free general-pool capacity
+/// sits idle (expert-panel CRIT on the initial LAB-2636 cut).
+#[tokio::test]
+async fn pinned_client_spills_when_preferred_endpoint_at_paid_overage() {
+    let state = pinned_test_state();
+    state.endpoints[0].rate_info.write().await.utilization = Some(0.1);
+    {
+        let mut info = state.endpoints[1].rate_info.write().await;
+        // Exhausted subscription covered by overage: raw utilization is
+        // irrelevant, compute_routing_weight gates on the (empty) overage
+        // window → gate ~0.0 < soft_limit, but priority is demoted by
+        // overage_penalty.
+        info.utilization_5h = Some(1.0);
+        info.overage_in_use = true;
+    }
+
+    assert_eq!(
+        state
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .await,
+        Some(0),
+        "an overage-covered preferred endpoint must spill to free general-pool capacity"
+    );
+}

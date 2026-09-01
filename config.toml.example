@@ -30,8 +30,9 @@ probe_interval_secs = 300
 #
 # preferred_endpoints pins a client to dedicated endpoint(s): while at least
 # one is healthy (serves the model, not hard-limited/unhealthy, under
-# soft_limit) the client routes ONLY there, spilling to the full pool
-# otherwise. Entries must name configured [[endpoints]] (checked at startup).
+# soft_limit, not serving via paid overage) the client routes ONLY there,
+# spilling to the full pool otherwise. Entries must name configured
+# [[endpoints]] (checked at startup).
 # [[clients]]
 # name = "passbolt"
 # key = "<from secret store: openssl rand -hex 32>"
