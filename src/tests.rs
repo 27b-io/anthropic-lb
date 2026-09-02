@@ -4812,19 +4812,21 @@ async fn openai_529_triggers_bebo_backoff_retry() {
 
 /// Anthropic-shaped 429 carrying `retry-after: 7`. `connection: close` makes
 /// the (empty) body EOF-delimited, matching the other raw-TCP heads here.
-const HEAD_429_FAST: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n";
+const HEAD_429_RETRY_AFTER_7: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n";
 
 /// Two Anthropic endpoints: priority-0 always 429s, priority-1 always 200s.
+/// Speed-agnostic — both the fast-mode test and its standard-speed control
+/// drive it; only the request body differs.
 /// Priority (not affinity hashing) forces the first attempt onto the 429
 /// endpoint, so the healthy endpoint's hit count is a clean "did we rotate?"
 /// probe. Same trick as `openai_429_sets_cooldown_and_next_request_skips_endpoint`.
-async fn fast_mode_429_fixture() -> (
+async fn two_endpoint_429_then_healthy() -> (
     Arc<AppState>,
     SocketAddr,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let (limited_url, _limited_hits) =
-        spawn_status_then_ok_upstream(usize::MAX, HEAD_429_FAST, ANTHROPIC_OK_BODY).await;
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_429_RETRY_AFTER_7, ANTHROPIC_OK_BODY).await;
     let (healthy_url, healthy_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
 
     let mut limited = make_endpoint("limited", Protocol::Anthropic);
@@ -4846,7 +4848,7 @@ async fn fast_mode_429_fixture() -> (
 #[tokio::test]
 async fn fast_mode_429_forwards_to_client_and_leaves_account_alone() {
     use std::sync::atomic::Ordering;
-    let (state, addr, healthy_hits) = fast_mode_429_fixture().await;
+    let (state, addr, healthy_hits) = two_endpoint_429_then_healthy().await;
 
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
@@ -4920,7 +4922,7 @@ async fn standard_speed_429_still_cools_account_and_rotates() {
         r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
         r#"{"model":"test","max_tokens":1,"speed":"standard","messages":[{"role":"user","content":"hi"}]}"#,
     ] {
-        let (state, addr, healthy_hits) = fast_mode_429_fixture().await;
+        let (state, addr, healthy_hits) = two_endpoint_429_then_healthy().await;
 
         let resp = reqwest::Client::new()
             .post(format!("http://{addr}/v1/messages"))
@@ -4951,6 +4953,98 @@ async fn standard_speed_429_still_cools_account_and_rotates() {
             "a standard-speed 429 must still poison remaining_* : {body}"
         );
     }
+}
+
+/// Panel finding (CRIT): the fast-mode exemption must NOT swallow a transient
+/// BURST 429 — `x-should-retry` with no `retry-after` and no rate headers.
+/// Burst limits are per-minute RPM/concurrency on the ACCOUNT, not on a rate
+/// bucket, so they are real evidence about the account whatever speed was
+/// asked for. Exempting them would be worse than the bug this commit fixes:
+/// `x-should-retry` is not reflected to callers, so the client would get a
+/// bare 429 with no transient hint AND no rotation, while standard traffic
+/// routed to the same still-bursting account would hard-limit it anyway.
+#[tokio::test]
+async fn fast_mode_burst_429_still_backs_off_and_rotates() {
+    use std::sync::atomic::Ordering;
+    const HEAD_429_BURST: &str = "HTTP/1.1 429 Too Many Requests\r\nx-should-retry: true\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n";
+    let (limited_url, _) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_429_BURST, ANTHROPIC_OK_BODY).await;
+    let (healthy_url, healthy_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let mut limited = make_endpoint("limited", Protocol::Anthropic);
+    limited.base_url = limited_url;
+    let mut healthy = make_endpoint("healthy", Protocol::Anthropic);
+    healthy.base_url = healthy_url;
+    healthy.priority = 1;
+    let state = test_state_with(vec![limited, healthy]);
+    let addr = serve(build_router(state.clone())).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"test","max_tokens":1,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a burst 429 must still rotate, even on a fast-mode request"
+    );
+    assert!(
+        healthy_hits.load(Ordering::SeqCst) >= 1,
+        "the request must reach the priority-1 endpoint"
+    );
+
+    let info = state.endpoints[0].rate_info.read().await;
+    assert_eq!(
+        info.consecutive_burst_429s, 1,
+        "the burst backoff ladder must still engage on a fast-mode request"
+    );
+    assert!(
+        info.hard_limited_until.is_some(),
+        "a burst 429 must still apply its (short) cooldown"
+    );
+    assert_eq!(
+        (info.remaining_requests, info.remaining_tokens),
+        (None, None),
+        "a burst 429 must not poison remaining_* — it is not capacity exhaustion"
+    );
+}
+
+/// `is_burst_429` is the single definition shared by `mark_hard_limited_for`'s
+/// backoff ladder and the fast-mode exemption; all three signals must agree
+/// before a 429 counts as burst.
+#[test]
+fn burst_429_needs_should_retry_and_no_capacity_evidence() {
+    let hdrs = |pairs: &[(&str, &str)]| {
+        let mut h = reqwest::header::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    };
+    assert!(is_burst_429(&hdrs(&[("x-should-retry", "true")])));
+    assert!(
+        !is_burst_429(&hdrs(&[("retry-after", "7")])),
+        "no x-should-retry: not a burst limit"
+    );
+    assert!(
+        !is_burst_429(&hdrs(&[("x-should-retry", "true"), ("retry-after", "7")])),
+        "retry-after means upstream told us the capacity window, not a burst"
+    );
+    assert!(
+        !is_burst_429(&hdrs(&[
+            ("x-should-retry", "true"),
+            ("anthropic-ratelimit-unified-status", "rejected")
+        ])),
+        "rate-limit headers are capacity evidence, not a burst"
+    );
 }
 
 /// The body predicate itself: only a top-level string `"fast"` counts. A

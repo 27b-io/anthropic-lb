@@ -561,6 +561,28 @@ const MAX_429_BODY_LOG_BYTES: usize = 512;
 const SENSITIVE_HEADER_SUBSTRINGS: &[&str] =
     &["auth", "cookie", "token", "key", "secret", "session"];
 
+/// True when a 429 is a transient BURST limit rather than capacity exhaustion:
+/// `x-should-retry` set, but no `retry-after` and no rate-limit headers.
+///
+/// This distinction is account-level and speed-blind. Anthropic applies burst
+/// (per-minute RPM / concurrency) limits to the ACCOUNT, not to a request's
+/// rate bucket, so a burst 429 is real evidence about the account even when
+/// the request asked for fast mode — which is why the fast-mode exemption in
+/// `classify_retry_status` defers to it (LAB-2675 panel finding). Shared with
+/// `mark_hard_limited_for`, which uses it to pick the backoff ladder over the
+/// capacity cooldown, so the two can never disagree on what "burst" means.
+fn is_burst_429(headers: &reqwest::header::HeaderMap) -> bool {
+    let has_rate_headers = headers.keys().any(|k| {
+        let name = k.as_str();
+        name.starts_with("anthropic-ratelimit-requests")
+            || name.starts_with("anthropic-ratelimit-tokens")
+            || name.starts_with("anthropic-ratelimit-unified-")
+            || name.starts_with("x-ratelimit-")
+    });
+    let should_retry = headers.get("x-should-retry").and_then(|v| v.to_str().ok()) == Some("true");
+    should_retry && !headers.contains_key("retry-after") && !has_rate_headers
+}
+
 /// Format 429 response headers and body for a single debug log line.
 /// Redacts sensitive headers, truncates body to MAX_429_BODY_LOG_BYTES.
 async fn log_429_details(account_name: &str, resp: reqwest::Response) {
@@ -4807,19 +4829,9 @@ impl AppState {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        // Detect transient burst 429: x-should-retry present but no retry-after
-        // and no rate-limit headers. These are per-minute burst limits, not
-        // capacity exhaustion — use exponential backoff and don't poison state.
-        let has_rate_headers = headers.keys().any(|k| {
-            let name = k.as_str();
-            name.starts_with("anthropic-ratelimit-requests")
-                || name.starts_with("anthropic-ratelimit-tokens")
-                || name.starts_with("anthropic-ratelimit-unified-")
-                || name.starts_with("x-ratelimit-")
-        });
-        let should_retry =
-            headers.get("x-should-retry").and_then(|v| v.to_str().ok()) == Some("true");
-        let is_burst_limit = should_retry && raw_retry_after.is_none() && !has_rate_headers;
+        // Transient burst 429 (per-minute RPM / concurrency) rather than capacity
+        // exhaustion: exponential backoff and don't poison state.
+        let is_burst_limit = is_burst_429(headers);
 
         let cooldown = if is_burst_limit {
             info.consecutive_burst_429s = info.consecutive_burst_429s.saturating_add(1);
@@ -7109,6 +7121,10 @@ fn describe_reqwest_error(e: &reqwest::Error) -> String {
 /// success or 4xx client error) it returns `Ok(resp)` — handing the
 /// response back so the caller can continue.
 ///
+/// One exception: a non-burst 429 on a `speed: "fast"` request returns
+/// `Ok(resp)` too, uncooled and unrotated — fast mode has its own rate
+/// bucket, so that 429 is not evidence about the account (LAB-2675).
+///
 /// `openai_error_shape` picks the error-body format for the terminal 3xx
 /// arm: callers whose downstream parses OpenAI errors (`/v1/chat/completions`
 /// passthrough) get `{"error":{...}}`, Anthropic-surface callers get
@@ -7121,7 +7137,12 @@ async fn classify_retry_status(
     endpoint_name: &str,
     resp: reqwest::Response,
     openai_error_shape: bool,
-    fast_mode: bool,
+    // `fast_mode_body`: the body actually sent upstream, for the fast-mode
+    // test — `None` when the protocol cannot express `speed`. Bytes rather
+    // than a pre-computed bool so the parse happens only on the 429 branch
+    // that needs it, and so no caller can hand this function a `false` that
+    // is only true for non-429 statuses.
+    fast_mode_body: Option<&bytes::Bytes>,
 ) -> Result<reqwest::Response, ForwardOutcome> {
     // 3xx → deliberate 502. The upstream client follows no redirects
     // (`Policy::none()`), because following one would re-send the account
@@ -7191,19 +7212,28 @@ async fn classify_retry_status(
         // Rotating fast requests with a per-account fast cooldown was rejected:
         // more state, and one client could still sweep every account's bucket.
         //
-        // What this does NOT buy: the ticket assumed an exhausted account
-        // would still be covered by the utilization ceilings here, because
-        // `update_rate_info_for` consumes the response's unified headers
-        // before classification. AC-5's live probe (2026-09-02) disproved
-        // that — a fast-mode response's `anthropic-ratelimit-unified-*`
-        // headers describe the FAST pool, not the account: representative
-        // claim `overage`, `overage-utilization: 0.0`, reset ~29d out, and
-        // NO `five_hour` claim at all. So the ceilings see nothing on a fast
-        // response, and ingesting those headers actively corrupts the
-        // account's standard view. That is a separate defect in
-        // `update_rate_info_for` (LAB-2693) — not fixable from this branch,
-        // which runs after the ingest has already happened.
-        if fast_mode {
+        // The exemption defers to `is_burst_429`. A burst 429 (`x-should-retry`,
+        // no `retry-after`, no rate headers) is a per-minute RPM/concurrency
+        // limit on the ACCOUNT, not on a rate bucket, so it is real evidence
+        // about the account whatever speed the request asked for. Exempting it
+        // would be worse than the bug: `x-should-retry` is not in
+        // `reflect_upstream_headers`'s allow-list, so the caller would get a
+        // bare 429 with no transient hint AND no rotation, while the account
+        // stayed pinned — and standard traffic routed to that same account
+        // would then burst-429 and hard-limit it, reinstating the denial via
+        // the victim's own requests (LAB-2675 panel finding).
+        //
+        // What this does NOT buy: the ticket assumed the utilization ceilings
+        // would still cover a fast request on an exhausted account, because
+        // `update_rate_info_for` consumes the unified headers before
+        // classification. AC-5's live probe disproved that — a fast-mode
+        // response's unified headers describe the fast pool, not the account
+        // — and ingesting them corrupts the account's standard view. Separate
+        // defect in `update_rate_info_for`, tracked as LAB-2693; not fixable
+        // from here, which runs after the ingest.
+        if !is_burst_429(resp.headers())
+            && fast_mode_body.is_some_and(|b| request_wants_fast_mode(b))
+        {
             state.note_fast_mode_429(endpoint_name, resp.headers());
             return Ok(resp);
         }
@@ -7695,10 +7725,10 @@ async fn forward_anthropic(
         rate_info,
         endpoint_name,
         resp,
-        false,
-        // Judged on the bytes actually sent upstream (the OAuth variant on
-        // OAuth tokens) — that body is what picks the rate bucket.
-        request_wants_fast_mode(req_body),
+        /* openai_error_shape */ false,
+        // The bytes actually sent upstream (the OAuth variant on OAuth
+        // tokens) — that body is what picks the rate bucket.
+        Some(req_body),
     )
     .await
     {
@@ -8618,9 +8648,9 @@ async fn try_fallback_upstream(
         &ep.rate_info,
         &ep.name,
         resp,
-        !translate,
+        /* openai_error_shape */ !translate,
         // The OpenAI request shape cannot express `speed` — never fast.
-        false,
+        None,
     )
     .await
     {
@@ -10486,10 +10516,11 @@ async fn metrics_handler(
         );
     }
 
-    // Fast-mode 429s by account (LAB-2675). Always exported so the zero line
-    // is a baseline: a non-zero value means a client is hitting the separate
-    // fast-mode bucket, which the proxy forwards rather than cooling the
-    // account for. Sustained growth is the trigger to revisit that policy.
+    // Fast-mode 429s by account (LAB-2675). A series appears once an account
+    // has served a fast-mode 429 — which the proxy forwards rather than
+    // cooling the account for — so any sample here means a client is hitting
+    // the separate fast bucket. Sustained growth is the trigger to revisit
+    // that policy.
     prom_header(
         &mut buf,
         "anthropic_fast_mode_429_total",
@@ -12181,9 +12212,9 @@ async fn forward_openai_compat_anthropic(
         rate_info,
         endpoint_name,
         resp,
-        true,
+        /* openai_error_shape */ true,
         // The OpenAI request shape cannot express `speed` — never fast.
-        false,
+        None,
     )
     .await
     {

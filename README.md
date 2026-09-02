@@ -400,7 +400,10 @@ can steer are locked down by default:
   with upstream's `retry-after`, exactly as a direct Anthropic client would.
   Without this, one client looping fast requests would hard-limit every
   account in turn and deny standard-speed traffic to everyone else. Occurrences
-  are counted as `anthropic_fast_mode_429_total{account}`.
+  are counted as `anthropic_fast_mode_429_total{account}`. Transient *burst*
+  `429`s (`x-should-retry` with no `retry-after` and no rate-limit headers) are
+  excluded: those are per-minute limits on the account itself, so they keep
+  their usual backoff and rotation whatever speed was requested.
 
 ### Known Limitations
 
