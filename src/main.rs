@@ -3609,8 +3609,8 @@ impl AppState {
         map.insert(endpoint_idx, Instant::now() + FAST_MODE_DISABLED_TTL);
     }
 
-    /// Endpoint indices currently fast-mode-disabled — the `skip` seed for a
-    /// `speed: "fast"` request's retry loop.
+    /// Live fast-mode-disabled endpoint indices — the `speed: "fast"` twin of
+    /// `unsupported_endpoints_for`.
     fn fast_mode_disabled_endpoints(&self) -> Vec<usize> {
         let now = Instant::now();
         match self.fast_mode_disabled.lock() {
@@ -4370,8 +4370,9 @@ impl AppState {
         }
     }
 
-    /// Test-only convenience: pick with no client identity, so no pinning
-    /// applies. Keeps the pre-LAB-2636 routing tests byte-identical.
+    /// Test-only convenience: pick with no client identity and standard
+    /// speed — no pinning, no fast-mode exclusion. Keeps the pre-LAB-2636
+    /// routing tests byte-identical.
     #[cfg(test)]
     async fn pick_endpoint(
         &self,
@@ -4379,7 +4380,7 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
     ) -> Option<EndpointIdx> {
-        self.pick_endpoint_for_client(affinity_key, model, skip, "")
+        self.pick_endpoint_for_client(affinity_key, model, skip, "", false)
             .await
     }
 
@@ -4400,6 +4401,10 @@ impl AppState {
     /// free general-pool capacity — violating the free-before-paid guarantee
     /// below, which the retain would otherwise bypass.
     ///
+    /// `fast` (LAB-2687): a `speed: "fast"` request also drops
+    /// `fast_mode_disabled` accounts BEFORE the pin filter, so a non-entitled
+    /// pin spills rather than serving.
+    ///
     /// Tiers are tried strictly in ascending priority order. Within a tier:
     /// healthy candidates (`gate < soft_limit`) are preferred; if none are healthy
     /// the tier degrades to its soft-limited candidates. Only when a tier has zero
@@ -4413,8 +4418,25 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
         client_id: &str,
+        fast: bool,
     ) -> Option<EndpointIdx> {
         let mut candidates = self.routing_candidates(model, skip).await;
+        let fast_disabled = if fast {
+            self.fast_mode_disabled_endpoints()
+        } else {
+            Vec::new()
+        };
+        candidates.retain(|c| {
+            if fast_disabled.contains(&c.endpoint) {
+                trace!(
+                    endpoint = self.endpoints[c.endpoint].name,
+                    model,
+                    "pick: skipping, fast mode disabled on endpoint"
+                );
+                return false;
+            }
+            true
+        });
         if let Some(preferred) = self.client_preferred_endpoints(client_id) {
             let is_preferred =
                 |c: &RoutingCandidate| self.endpoint_is_preferred(preferred, c.endpoint);
@@ -4434,7 +4456,11 @@ impl AppState {
                 // account(s) and will consume shared-pool cache/claims.
                 info!(
                     client_id,
-                    model, "pick: no preferred endpoint viable — spilling to general pool"
+                    model,
+                    fast_mode_disabled = fast_disabled
+                        .iter()
+                        .any(|&i| self.endpoint_is_preferred(preferred, i)),
+                    "pick: no preferred endpoint viable — spilling to general pool"
                 );
             }
         }
@@ -8314,15 +8340,7 @@ async fn proxy_handler(
             );
             tokio::time::sleep(delay).await;
         }
-        // A `speed: "fast"` request starts each round with the accounts whose
-        // org lacks fast mode already skipped (LAB-2687). `skip` is applied
-        // before the affinity hash, so a pinned session re-buckets onto an
-        // entitled account exactly as it does for an unsupported model.
-        let mut skip: Vec<EndpointIdx> = if fast {
-            state.fast_mode_disabled_endpoints()
-        } else {
-            Vec::new()
-        };
+        let mut skip: Vec<EndpointIdx> = Vec::new();
         let mut saw_529 = false;
         let mut saw_transient = false;
         for _attempt in 0..n {
@@ -8331,7 +8349,7 @@ async fn proxy_handler(
             // (OpenAI). Both return a `ForwardOutcome` so the shared
             // round-gated policy in `apply_round_outcome` covers both.
             let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
+                .pick_endpoint_for_client(affinity, &model, &skip, &client_id, fast)
                 .await
             {
                 Some(i) => {
@@ -12663,8 +12681,9 @@ async fn openai_chat_handler(
             // Pick the next endpoint and dispatch by protocol. Both forwards
             // return a `ForwardOutcome` so the shared round-gated policy in
             // `apply_round_outcome` covers both.
+            // OpenAI→Anthropic translation carries no `speed`: never fast.
             let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
+                .pick_endpoint_for_client(affinity, &model, &skip, &client_id, false)
                 .await
             {
                 Some(i) => {
