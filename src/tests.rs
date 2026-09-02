@@ -17990,7 +17990,25 @@ mod redis_integration {
         bind: &str,
         target: String,
     ) -> (String, tokio::sync::oneshot::Sender<()>) {
-        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+        // SO_REUSEADDR (via TcpSocket, not TcpListener::bind) lets the revive
+        // path rebind an address whose previous listener was just killed —
+        // without it, a lingering TIME_WAIT socket races the rebind and
+        // intermittently returns EADDRINUSE.
+        let bind_addr: SocketAddr = bind
+            .parse()
+            .unwrap_or_else(|e| panic!("spawn_killable_proxy_at: invalid bind addr {bind}: {e}"));
+        let socket = tokio::net::TcpSocket::new_v4().unwrap_or_else(|e| {
+            panic!("spawn_killable_proxy_at: failed to create socket for {bind}: {e}")
+        });
+        socket.set_reuseaddr(true).unwrap_or_else(|e| {
+            panic!("spawn_killable_proxy_at: failed to set SO_REUSEADDR for {bind}: {e}")
+        });
+        socket
+            .bind(bind_addr)
+            .unwrap_or_else(|e| panic!("spawn_killable_proxy_at: failed to bind {bind}: {e}"));
+        let listener = socket
+            .listen(1024)
+            .unwrap_or_else(|e| panic!("spawn_killable_proxy_at: failed to listen on {bind}: {e}"));
         let addr = listener.local_addr().unwrap();
         let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
