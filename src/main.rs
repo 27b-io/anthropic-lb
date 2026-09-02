@@ -176,6 +176,14 @@ struct ClientConfig {
     /// `EndpointConfig.models` semantics. Same exact + `*`-suffix matcher.
     #[serde(default)]
     models: Vec<String>,
+    /// Endpoint names this client is pinned to (LAB-2636 / #151). While at
+    /// least one is healthy (serves the model, not hard-limited, not
+    /// transport-unhealthy, under `soft_limit`, not serving via paid
+    /// overage), routing is restricted to this set; otherwise the request
+    /// spills to the full pool. Empty = no pin, routing identical to a
+    /// client without the field.
+    #[serde(default)]
+    preferred_endpoints: Vec<String>,
 }
 
 /// Hand-written, NOT derived: a derived `Debug` would print `key` verbatim into
@@ -188,6 +196,7 @@ impl std::fmt::Debug for ClientConfig {
             .field("name", &self.name)
             .field("key", &"<redacted>")
             .field("models", &self.models)
+            .field("preferred_endpoints", &self.preferred_endpoints)
             .finish()
     }
 }
@@ -4327,7 +4336,69 @@ impl AppState {
         picked.endpoint
     }
 
+    /// The client's non-empty `preferred_endpoints` list, if it has one.
+    /// Resolved through the authenticated `[[clients]]` registry only — on the
+    /// legacy `proxy_key` / open path `clients` is empty, so a spoofable
+    /// header-derived client id can never acquire another client's pin.
+    fn client_preferred_endpoints(&self, client_id: &str) -> Option<&[String]> {
+        self.clients
+            .iter()
+            .find(|c| c.name == client_id)
+            .map(|c| c.preferred_endpoints.as_slice())
+            .filter(|p| !p.is_empty())
+    }
+
+    /// Whether `endpoint_idx` is in a `preferred_endpoints` list. The ONE
+    /// membership predicate, shared by the pick-time filter and `pin_status`
+    /// — if they ever diverged, the `pin=` log field would lie about what the
+    /// picker actually did.
+    fn endpoint_is_preferred(&self, preferred: &[String], endpoint_idx: EndpointIdx) -> bool {
+        preferred
+            .iter()
+            .any(|p| *p == self.endpoints[endpoint_idx].name)
+    }
+
+    /// `pin` field for the per-request serving log lines: "pinned" when the
+    /// serving endpoint is in the client's preferred set, "spilled" when the
+    /// client has preferences but was served outside them, "-" for clients
+    /// without preferences.
+    fn pin_status(&self, client_id: &str, endpoint_idx: EndpointIdx) -> &'static str {
+        match self.client_preferred_endpoints(client_id) {
+            Some(p) if self.endpoint_is_preferred(p, endpoint_idx) => "pinned",
+            Some(_) => "spilled",
+            None => "-",
+        }
+    }
+
+    /// Test-only convenience: pick with no client identity, so no pinning
+    /// applies. Keeps the pre-LAB-2636 routing tests byte-identical.
+    #[cfg(test)]
+    async fn pick_endpoint(
+        &self,
+        affinity_key: Option<&str>,
+        model: &str,
+        skip: &[EndpointIdx],
+    ) -> Option<EndpointIdx> {
+        self.pick_endpoint_for_client(affinity_key, model, skip, "")
+            .await
+    }
+
     /// Pick the best available endpoint (account or fallback upstream).
+    ///
+    /// Per-client pinning (LAB-2636 / #151) runs first: if `client_id` names a
+    /// `[[clients]]` entry with `preferred_endpoints` and at least one of them
+    /// is a healthy, undemoted candidate (serves the model, not hard-limited,
+    /// not transport-unhealthy, not skipped, `gate < soft_limit`, and not
+    /// priority-demoted for serving via paid overage / always-paid Fable), the
+    /// candidate set is restricted to the preferred endpoints. The filter runs
+    /// BEFORE tier/affinity/weighted selection, so a prior affinity landing on
+    /// a non-preferred endpoint cannot defeat the pin. Otherwise the full pool
+    /// applies unchanged (spill-over). The undemoted requirement matters: an
+    /// overage-covered account reports a LOW gate (the overage window
+    /// supersedes its exhausted subscription windows), so without it a pinned
+    /// client would keep billing paid overage forever instead of spilling to
+    /// free general-pool capacity — violating the free-before-paid guarantee
+    /// below, which the retain would otherwise bypass.
     ///
     /// Tiers are tried strictly in ascending priority order. Within a tier:
     /// healthy candidates (`gate < soft_limit`) are preferred; if none are healthy
@@ -4336,13 +4407,37 @@ impl AppState {
     /// `soft_limit` is intra-tier load-shedding and never causes a tier jump. This
     /// guarantees free capacity is fully drained before any paid (overage/upstream)
     /// tier is touched.
-    async fn pick_endpoint(
+    async fn pick_endpoint_for_client(
         &self,
         affinity_key: Option<&str>,
         model: &str,
         skip: &[EndpointIdx],
+        client_id: &str,
     ) -> Option<EndpointIdx> {
-        let candidates = self.routing_candidates(model, skip).await;
+        let mut candidates = self.routing_candidates(model, skip).await;
+        if let Some(preferred) = self.client_preferred_endpoints(client_id) {
+            let is_preferred =
+                |c: &RoutingCandidate| self.endpoint_is_preferred(preferred, c.endpoint);
+            // Undemoted = candidate priority equals the configured priority.
+            // `routing_candidates` adds `overage_penalty` while an account
+            // serves via paid overage (or always-paid Fable) — that demotion
+            // is exactly the paid-capacity signal pinning must respect.
+            let undemoted =
+                |c: &RoutingCandidate| c.priority == self.endpoints[c.endpoint].priority;
+            if candidates
+                .iter()
+                .any(|c| is_preferred(c) && undemoted(c) && c.gate < self.soft_limit)
+            {
+                candidates.retain(is_preferred);
+            } else {
+                // Greppable spill marker — the request leaves its dedicated
+                // account(s) and will consume shared-pool cache/claims.
+                info!(
+                    client_id,
+                    model, "pick: no preferred endpoint viable — spilling to general pool"
+                );
+            }
+        }
         if candidates.is_empty() {
             debug!("pick: no available endpoints");
             return None;
@@ -7647,6 +7742,7 @@ async fn forward_anthropic(
             util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
             constraint,
             overage = info.overage_in_use,
+            pin = state.pin_status(client_id, endpoint_idx),
             total = ep.requests.load(Ordering::Relaxed),
             "proxied"
         );
@@ -8235,7 +8331,7 @@ async fn proxy_handler(
             // (OpenAI). Both return a `ForwardOutcome` so the shared
             // round-gated policy in `apply_round_outcome` covers both.
             let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint(affinity, &model, &skip)
+                .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
                 .await
             {
                 Some(i) => {
@@ -8464,6 +8560,7 @@ async fn try_fallback_upstream(
         model,
         upstream = ep.name,
         translate,
+        pin = state.pin_status(client_id, endpoint_idx),
         "fallback: routing to unified OpenAI endpoint"
     );
 
@@ -12129,6 +12226,7 @@ async fn forward_openai_compat_anthropic(
             util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
             util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
             constraint,
+            pin = state.pin_status(client_id, endpoint_idx),
             openai_compat = true,
             stream = is_streaming,
             "proxied (openai-compat)"
@@ -12565,63 +12663,65 @@ async fn openai_chat_handler(
             // Pick the next endpoint and dispatch by protocol. Both forwards
             // return a `ForwardOutcome` so the shared round-gated policy in
             // `apply_round_outcome` covers both.
-            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) =
-                match state.pick_endpoint(affinity, &model, &skip).await {
-                    Some(i) => {
-                        let ep = &state.endpoints[i];
-                        match ep.protocol {
-                            Protocol::Anthropic => {
-                                let out = forward_openai_compat_anthropic(
-                                    &state,
-                                    &parts,
-                                    ep,
-                                    i,
-                                    &anthropic_body_bytes,
-                                    &oauth_body_bytes,
-                                    &req_id,
-                                    &client_id,
-                                    &client_ver,
-                                    &client_ip,
-                                    &agent_id,
-                                    &session_id,
-                                    &model,
-                                    affinity,
-                                    is_streaming,
-                                    json_mode,
-                                    request_start,
-                                )
-                                .await;
-                                (out, i)
-                            }
-                            Protocol::OpenAI => {
-                                // The endpoint is OpenAI-native — forward the
-                                // original request body without translation.
-                                let out = try_fallback_upstream(
-                                    &state,
-                                    &body_bytes,
-                                    &req_id,
-                                    &client_id,
-                                    &client_ip,
-                                    &agent_id,
-                                    &session_id,
-                                    &model,
-                                    i,
-                                    request_start,
-                                    false,
-                                    is_streaming,
-                                )
-                                .await;
-                                (out, i)
-                            }
+            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
+                .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
+                .await
+            {
+                Some(i) => {
+                    let ep = &state.endpoints[i];
+                    match ep.protocol {
+                        Protocol::Anthropic => {
+                            let out = forward_openai_compat_anthropic(
+                                &state,
+                                &parts,
+                                ep,
+                                i,
+                                &anthropic_body_bytes,
+                                &oauth_body_bytes,
+                                &req_id,
+                                &client_id,
+                                &client_ver,
+                                &client_ip,
+                                &agent_id,
+                                &session_id,
+                                &model,
+                                affinity,
+                                is_streaming,
+                                json_mode,
+                                request_start,
+                            )
+                            .await;
+                            (out, i)
+                        }
+                        Protocol::OpenAI => {
+                            // The endpoint is OpenAI-native — forward the
+                            // original request body without translation.
+                            let out = try_fallback_upstream(
+                                &state,
+                                &body_bytes,
+                                &req_id,
+                                &client_id,
+                                &client_ip,
+                                &agent_id,
+                                &session_id,
+                                &model,
+                                i,
+                                request_start,
+                                false,
+                                is_streaming,
+                            )
+                            .await;
+                            (out, i)
                         }
                     }
-                    // Candidates exhausted mid-round (all skipped / hard-limited /
-                    // model-filtered). Break to the round-end logic rather than
-                    // returning here, so a transient-only round still reaches the
-                    // transient-aware exhaustion status instead of short-circuiting
-                    // to a premature 429.
-                    None => break,
-                };
+                }
+                // Candidates exhausted mid-round (all skipped / hard-limited /
+                // model-filtered). Break to the round-end logic rather than
+                // returning here, so a transient-only round still reaches the
+                // transient-aware exhaustion status instead of short-circuiting
+                // to a premature 429.
+                None => break,
+            };
 
             match apply_round_outcome(
                 retry_round,
@@ -12787,6 +12887,17 @@ fn validate_clients(config: &Config) -> Result<(), String> {
         // with the other posture checks. Both reference the shared const.
         if seen_names.contains(&c.name.as_str()) {
             return Err(format!("client '{}': duplicate name", c.name));
+        }
+        // preferred_endpoints must name configured endpoints — same posture as
+        // the registry cross-checks below: a typo would silently leave the
+        // client un-pinned, defeating the whole point of a dedicated account.
+        for pe in &c.preferred_endpoints {
+            if !config.endpoints.iter().any(|ep| ep.name == *pe) {
+                return Err(format!(
+                    "client '{}': preferred_endpoints entry '{}' does not match any configured endpoint",
+                    c.name, pe
+                ));
+            }
         }
         // Names, not keys, in the error — never log a credential.
         if seen_keys.contains(&c.key.as_str()) {
