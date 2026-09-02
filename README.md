@@ -400,8 +400,9 @@ can steer are locked down by default:
   to another account and marks the endpoint fast-mode-disabled for 15
   minutes (`anthropic_fast_mode_disabled_total{account}` on `/metrics`,
   `fast_mode_disabled_remaining_secs` on `/_stats`). Later fast requests skip
-  it; requests without `speed: "fast"` keep using it. The proxy never strips
-  `speed` on the client's behalf — if no eligible account is entitled, the
+  it — a client pinned to it via `preferred_endpoints` spills to the general
+  pool — while requests without `speed: "fast"` keep using it. The proxy
+  never strips `speed` on the client's behalf — if no eligible account is entitled, the
   client gets the upstream `400` verbatim rather than a silent downgrade or a
   synthetic `429`.
 
