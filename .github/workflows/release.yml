@@ -55,6 +55,9 @@ jobs:
             exit 1
           fi
 
+      # The "stable" ref only bootstraps rustup. Every cargo command below
+      # actually runs the version pinned in rust-toolchain.toml, which
+      # rustup resolves ahead of the default toolchain. CI is NOT unpinned.
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           components: rustfmt, clippy
