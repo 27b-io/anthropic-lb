@@ -801,6 +801,10 @@ struct AppState {
     /// Count of requests shed because the body was not fully received within
     /// `body_read_timeout`. Exposed as `anthropic_body_read_timeout_total`.
     body_read_timeout_total: AtomicU64,
+    /// Affinity overrides that migrated a session, indexed by `AffinityBind`
+    /// (the window that bound the sticky account). Exposed as
+    /// `anthropic_affinity_migrations_total{reason="loaded"|"spent"}`.
+    affinity_migrations: [AtomicU64; 2],
     /// Reflect upstream `anthropic-ratelimit-*` headers to callers (see
     /// `Config::expose_upstream_ratelimit_headers`). Default: false.
     expose_upstream_ratelimit_headers: bool,
@@ -996,6 +1000,10 @@ struct RoutingCandidate {
     gate_7d: f64,
     gate: f64,
     wr: f64,
+    /// Unused share of the model's weekly (7d) quota; 1.0 when unknown or
+    /// superseded by overage. Time-free — the affinity override reads this,
+    /// never `wr`/`weight` (see `affinity_headroom`).
+    unused_7d: f64,
     weight: f64,
     source: &'static str,
 }
@@ -2961,12 +2969,51 @@ fn beta_flag_allowed(allowed: &[String], flag: &str) -> bool {
 }
 
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
-/// weight is below 50% of the alternative, stickiness is broken immediately.
+/// `affinity_headroom` is below 50% of the alternative's, stickiness is broken.
 const LEGACY_AFFINITY_OVERRIDE_RATIO: f64 = 0.5;
 
-/// Sticky-weighted override threshold. Lower than the legacy algorithm to
-/// preserve cache locality and only break stickiness for egregious disparities.
+/// Sticky-weighted override threshold on `affinity_headroom`. Lower than the
+/// legacy algorithm to preserve cache locality and only break stickiness for
+/// egregious disparities.
 const STICKY_WEIGHTED_OVERRIDE_RATIO: f64 = 0.25;
+
+/// Which window bound the sticky account when an affinity override fired.
+/// Label value of `anthropic_affinity_migrations_total{reason}`; also indexes
+/// `AppState::affinity_migrations`.
+#[derive(Clone, Copy)]
+enum AffinityBind {
+    /// The effective gate (5h utilisation, status floors, overage) is tighter.
+    Loaded = 0,
+    /// Unused weekly quota is tighter.
+    Spent = 1,
+}
+
+impl AffinityBind {
+    const ALL: [Self; 2] = [Self::Loaded, Self::Spent];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::Spent => "spent",
+        }
+    }
+}
+
+/// Capacity a candidate has left to keep a sticky session, and which window
+/// binds it. Both terms are time-free. Deliberately NOT `weight`: weight =
+/// waste_risk × headroom, and waste_risk's denominator is time-to-weekly-reset,
+/// so an account that reset yesterday read ~8x "worse" than one resetting in
+/// hours at identical load — which migrated 25% of prod sessions off the
+/// FRESHEST accounts in the pool (GH#156). waste_risk stays in the bucket
+/// weights, where burning expiring quota first is the point.
+fn affinity_headroom(c: &RoutingCandidate) -> (f64, AffinityBind) {
+    let loaded = (1.0 - c.gate).max(0.0);
+    if c.unused_7d < loaded {
+        (c.unused_7d, AffinityBind::Spent)
+    } else {
+        (loaded, AffinityBind::Loaded)
+    }
+}
 
 /// Extract version string from User-Agent header.
 /// "claude-cli/2.1.68 (external, cli)" → "2.1.68"
@@ -3320,6 +3367,8 @@ struct RoutingWeight {
     gate_7d: f64,
     gate: f64,
     wr: f64,
+    /// See `RoutingCandidate::unused_7d`.
+    unused_7d: f64,
     weight: f64,
     source: &'static str,
     /// Account is serving via paid overage — caller demotes its priority tier.
@@ -3431,6 +3480,33 @@ fn compute_routing_weight(
         (gate_5h.max(gate_7d), wr_7d, source_7d)
     };
 
+    // Weekly headroom for the affinity override (`affinity_headroom`): 1.0 when
+    // unknown or superseded by overage, else the tighter of the primary claim
+    // and (Fable) the pool it draws from. Reuses the gate's near-reset ramp so
+    // quota expiring within NEAR_RESET_7D_SECS reads as headroom, not "spent":
+    // the bucket weights pull sessions ONTO expiring accounts and the override
+    // must not push them straight back off. Status floors are the gate's job
+    // (`None`). Deliberately not hedged under stale_after_hard_limit — a 429
+    // says nothing about how much of the week is spent.
+    // ponytail: 6h ramp; an account with ≤25% of its week left and 6h–~30h to
+    // reset still reads "spent" while the buckets favour it. Widen the ramp if
+    // that WARN band shows up in prod.
+    let unused_of = |c: &ClaimWindowData| {
+        let util =
+            time_adjusted_utilization(c.utilization, c.reset, None, NEAR_RESET_7D_SECS, now_epoch)
+                .unwrap_or(0.0);
+        (1.0 - util).max(0.0)
+    };
+    let unused_7d = if overage_active {
+        1.0
+    } else {
+        primary_7d.map_or(1.0, |c| {
+            pool_cap_7d
+                .iter()
+                .fold(unused_of(c), |u, p| u.min(unused_of(p)))
+        })
+    };
+
     let headroom = (1.0 - gate).max(0.01);
     let weight = if wr > 0.0 { wr * headroom } else { headroom };
     let weight = if gate >= 1.0 { 0.0 } else { weight };
@@ -3440,6 +3516,7 @@ fn compute_routing_weight(
         gate_7d,
         gate,
         wr,
+        unused_7d,
         weight,
         source,
         overage_active,
@@ -3629,6 +3706,7 @@ impl AppState {
                         gate_7d: 0.0,
                         gate: 0.0,
                         wr: 0.0,
+                        unused_7d: 1.0,
                         weight: 1.0,
                         source: "openai",
                     });
@@ -3700,6 +3778,7 @@ impl AppState {
                         gate_7d: rw.gate_7d,
                         gate: rw.gate,
                         wr: rw.wr,
+                        unused_7d: rw.unused_7d,
                         weight: rw.weight,
                         source: rw.source,
                     });
@@ -4143,19 +4222,23 @@ impl AppState {
             } else {
                 effective[0]
             };
-            if picked.weight < other.weight * LEGACY_AFFINITY_OVERRIDE_RATIO {
+            let (picked_headroom, bind) = affinity_headroom(picked);
+            let (other_headroom, _) = affinity_headroom(other);
+            if picked_headroom < other_headroom * LEGACY_AFFINITY_OVERRIDE_RATIO {
                 // Loud on purpose — see the StickyWeightedV2 override below for
                 // the cascade rationale. Breaking affinity is a pool-health
                 // warning sign, not routine.
+                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
                 warn!(
                     strategy = RoutingStrategy::DynamicCapacityV1.as_str(),
                     affinity = affinity_key.unwrap_or("-"),
+                    reason = bind.as_str(),
                     picked_account = self.endpoint_name(picked.endpoint),
-                    picked_weight = format!("{:.3}", picked.weight),
+                    picked_headroom = format!("{:.3}", picked_headroom),
                     other_account = self.endpoint_name(other.endpoint),
-                    other_weight = format!("{:.3}", other.weight),
-                    ratio = format!("{:.3}", picked.weight / other.weight),
-                    "affinity broken: sticky endpoint too loaded, migrating session (cascade risk)"
+                    other_headroom = format!("{:.3}", other_headroom),
+                    ratio = format!("{:.3}", picked_headroom / other_headroom),
+                    "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)"
                 );
                 picked = other;
             }
@@ -4178,15 +4261,16 @@ impl AppState {
         let mut picked = self.pick_weighted_bucket(effective, total_weight, affinity_key);
 
         if let Some(key) = affinity_key {
-            let best = effective
+            let (picked_headroom, bind) = affinity_headroom(picked);
+            let (best, best_headroom) = effective
                 .iter()
-                .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap())
-                .copied()
+                .map(|c| (*c, affinity_headroom(c).0))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
                 .unwrap();
             if best.endpoint != picked.endpoint
-                && picked.weight < best.weight * STICKY_WEIGHTED_OVERRIDE_RATIO
+                && picked_headroom < best_headroom * STICKY_WEIGHTED_OVERRIDE_RATIO
             {
-                // The sticky account is too loaded to keep this session. Do NOT
+                // The sticky account is out of headroom for this session. Do NOT
                 // migrate to `best` (the global argmax): that target rotates every
                 // request as utilizations drift, so a session chases it across the
                 // whole pool and pays a cold-cache `cache_creation` charge on every
@@ -4212,18 +4296,23 @@ impl AppState {
                 } else {
                     best
                 };
-                // Loud on purpose: sustained breaking means the pool is the
-                // bottleneck — add capacity, don't tune the ratio.
+                // Loud on purpose. Sustained breaking with reason="loaded" means
+                // the pool is the bottleneck — add capacity, don't tune the
+                // ratio. reason="spent" means one account's week is nearly gone
+                // while others are fresh; expect it to cluster before weekly
+                // resets and vanish after.
+                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
                 warn!(
                     strategy = RoutingStrategy::StickyWeightedV2.as_str(),
                     affinity = key,
+                    reason = bind.as_str(),
                     picked_account = self.endpoint_name(picked.endpoint),
-                    picked_weight = format!("{:.3}", picked.weight),
+                    picked_headroom = format!("{:.3}", picked_headroom),
                     replacement_account = self.endpoint_name(replacement.endpoint),
-                    replacement_weight = format!("{:.3}", replacement.weight),
+                    replacement_headroom = format!("{:.3}", affinity_headroom(replacement).0),
                     best_account = self.endpoint_name(best.endpoint),
-                    ratio = format!("{:.3}", picked.weight / best.weight),
-                    "affinity broken: sticky endpoint too loaded, migrating session to stable replacement"
+                    ratio = format!("{:.3}", picked_headroom / best_headroom),
+                    "affinity broken: sticky endpoint out of headroom, migrating session to stable replacement"
                 );
                 picked = replacement;
             }
@@ -10435,6 +10524,23 @@ async fn metrics_handler(
         state.body_read_timeout_total.load(Ordering::Relaxed),
     );
 
+    // Affinity overrides that migrated a session (GH#156), by the window that
+    // bound the sticky account — see the WARN in pick_sticky_weighted_v2.
+    prom_header(
+        &mut buf,
+        "anthropic_affinity_migrations_total",
+        "counter",
+        "Affinity overrides that migrated a session, by the window that bound the sticky account",
+    );
+    for bind in AffinityBind::ALL {
+        prom_counter(
+            &mut buf,
+            "anthropic_affinity_migrations_total",
+            &[("reason", bind.as_str())],
+            state.affinity_migrations[bind as usize].load(Ordering::Relaxed),
+        );
+    }
+
     // LAB-933/LAB-929 response cache counters (AC12 / LAB-929 AC4). Emitted
     // only when the cache is configured; `messages` and `count_tokens` are
     // separate series on the same metric names, distinguished by the
@@ -13203,6 +13309,7 @@ async fn main() {
                 .unwrap_or(DEFAULT_BODY_READ_TIMEOUT_SECS),
         ),
         body_read_timeout_total: AtomicU64::new(0),
+        affinity_migrations: Default::default(),
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: config
             .session_registry_max

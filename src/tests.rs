@@ -416,6 +416,7 @@ fn test_state_base() -> AppState {
         body_shed_total: AtomicU64::new(0),
         body_read_timeout: Duration::from_secs(DEFAULT_BODY_READ_TIMEOUT_SECS),
         body_read_timeout_total: AtomicU64::new(0),
+        affinity_migrations: Default::default(),
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: DEFAULT_SESSION_REGISTRY_MAX,
         session_registry_ttl_secs: DEFAULT_SESSION_REGISTRY_TTL_SECS,
@@ -1079,10 +1080,10 @@ async fn pick_does_not_bias_unknown_accounts() {
 
 #[tokio::test]
 async fn pick_sticky_same_affinity() {
-    // Same affinity key should always return the same account when weights
-    // are close enough. AFFINITY_OVERRIDE_RATIO (0.5) compares the picked
-    // account's weight to the best — affinity is preserved when the ratio
-    // exceeds the threshold, i.e. no single account is 2x better.
+    // Same affinity key should always return the same account when headroom
+    // is close enough. LEGACY_AFFINITY_OVERRIDE_RATIO (0.5) compares the picked
+    // account's affinity_headroom to the other's — affinity is preserved when
+    // the ratio exceeds the threshold, i.e. no single account has 2x the room.
     let state = test_state_with(vec![
         mk_endpoint("a", "sk-ant-api-a"),
         mk_endpoint("b", "sk-ant-api-b"),
@@ -1246,7 +1247,7 @@ async fn affinity_override_balanced_no_7d_data() {
 async fn affinity_override_moderate_7d_disparity() {
     // Scenario: similar 5h, moderate 7d difference → affinity preserved
     // Primary 5h=0.15, 7d=0.40 vs Jeff 5h=0.15, 7d=0.60
-    // waste_risk ratio isn't extreme enough to trigger override
+    // unused-7d headroom 0.60 vs 0.40 isn't extreme enough to trigger override
     let state = test_state_with(vec![
         mk_endpoint("primary", "sk-ant-api-a"),
         mk_endpoint("jeff", "sk-ant-api-b"),
@@ -1269,8 +1270,8 @@ async fn affinity_override_moderate_7d_disparity() {
 async fn affinity_override_massive_7d_disparity() {
     // Scenario: egregious disparity — one account nearly spent, other fresh
     // Primary 5h=0.10, 7d=0.10 vs Jeff 5h=0.10, 7d=0.95
-    // Primary's waste_risk is enormous, jeff's is near zero
-    // Weight ratio far below 0.25 → all traffic overridden to primary
+    // Jeff's unused-7d headroom (0.05) is far below 0.25× primary's (0.90)
+    // → all traffic overridden to primary
     let state = test_state_with(vec![
         mk_endpoint("primary", "sk-ant-api-a"),
         mk_endpoint("jeff", "sk-ant-api-b"),
@@ -1293,7 +1294,7 @@ async fn affinity_override_massive_7d_disparity() {
 async fn affinity_override_one_exhausted() {
     // Scenario: one account nearly spent on 7d budget
     // Primary 5h=0.10, 7d=0.10 vs Jeff 5h=0.10, 7d=0.90
-    // Extreme weight ratio → all traffic to primary
+    // Extreme headroom ratio → all traffic to primary
     let state = test_state_with(vec![
         mk_endpoint("primary", "sk-ant-api-a"),
         mk_endpoint("jeff", "sk-ant-api-b"),
@@ -1560,12 +1561,15 @@ async fn affinity_override_destination_independent_of_argmax() {
     );
     let mut dest_a = Vec::with_capacity(sessions.len());
     for s in &sessions {
-        dest_a.push(
-            state
-                .pick_endpoint(Some(s), "claude-opus-4-6", &[])
-                .await
-                .unwrap(),
+        let idx = state
+            .pick_endpoint(Some(s), "claude-opus-4-6", &[])
+            .await
+            .unwrap();
+        assert_ne!(
+            idx, 0,
+            "override must fire for a session hashed to the loaded account"
         );
+        dest_a.push(idx);
     }
 
     // Config B: swap h1 and h2 utilizations so h2 becomes best. The healthy
@@ -1579,6 +1583,7 @@ async fn affinity_override_destination_independent_of_argmax() {
             .pick_endpoint(Some(s), "claude-opus-4-6", &[])
             .await
             .unwrap();
+        assert_ne!(idx, 0, "override must still fire after the argmax flip");
         if idx != dest_a[k] {
             migrated += 1;
         }
@@ -1591,6 +1596,134 @@ async fn affinity_override_destination_independent_of_argmax() {
             sessions.len(),
             rate * 100.0,
         );
+}
+
+#[tokio::test]
+async fn affinity_override_ignores_reset_time_skew() {
+    // Regression (GH#156 / LAB-2684): two accounts under IDENTICAL load whose
+    // only difference is time-to-weekly-reset. `weight` carries waste_risk =
+    // unused / remaining_fraction_of_7d, so the account that reset yesterday
+    // (wr ≈ 1) weighs ~8x less than one resetting in 20h (wr ≈ 7.5). The old
+    // `picked.weight < best.weight * 0.25` override read that as "too loaded"
+    // and migrated every session off the FRESHEST accounts in the pool (25% of
+    // prod requests WARNed on accounts at ≤17% utilisation). Reset-time skew
+    // alone must never break affinity.
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("fresh", "sk-ant-api-a"),
+            mk_endpoint("expiring", "sk-ant-api-b"),
+        ],
+        RoutingStrategy::StickyWeightedV2,
+    );
+    let now = AppState::now_epoch();
+    let in_6_5_days = now + 6 * 86400 + 43200;
+    let in_20_hours = now + 20 * 3600;
+    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, in_6_5_days).await;
+    set_account_utilization(&state, 1, 0.10, 0.10, now + 10000, in_20_hours).await;
+
+    // A session whose sticky bucket is the fresh (low-waste-risk) account.
+    let key = keys_hashing_to(&state, 0, 1, 20000, "skew-session")
+        .await
+        .pop()
+        .expect("a key hashing to the fresh account");
+    for i in 0..500 {
+        let idx = state
+            .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            idx, 0,
+            "request {i}: reset-time skew alone migrated the session off its hashed account"
+        );
+    }
+}
+
+#[tokio::test]
+async fn affinity_override_spent_discounts_near_weekly_reset() {
+    // Panel finding on GH#156: an account at 90% weekly with 3h to reset gets
+    // the LARGEST bucket share (waste_risk ≈ 5.6 — burn expiring quota first),
+    // so a naive unused-7d comparison would migrate every session the buckets
+    // just placed there, on every request. Near the weekly reset, remaining
+    // quota is headroom, not "spent": the override must stay quiet.
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("fresh", "sk-ant-api-a"),
+            mk_endpoint("expiring", "sk-ant-api-b"),
+        ],
+        RoutingStrategy::StickyWeightedV2,
+    );
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.10, 0.90, now + 10000, now + 3 * 3600).await;
+
+    let key = keys_hashing_to(&state, 1, 1, 20000, "expiring-session")
+        .await
+        .pop()
+        .expect("a key hashing to the expiring account");
+    let idx = state
+        .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        idx, 1,
+        "session must stay on the expiring account it hashed to"
+    );
+    let [loaded, spent] = &state.affinity_migrations;
+    assert_eq!(spent.load(Ordering::Relaxed), 0, "spent counter");
+    assert_eq!(loaded.load(Ordering::Relaxed), 0, "loaded counter");
+}
+
+#[tokio::test]
+async fn affinity_migration_counter_names_the_binding_window() {
+    // `anthropic_affinity_migrations_total{reason}` must attribute each override
+    // to the window that actually bound the sticky account (GH#156 AC-5).
+    let now = AppState::now_epoch();
+
+    // reason="spent": identical 5h, the sticky account's WEEK is nearly gone.
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("fresh", "sk-ant-api-a"),
+            mk_endpoint("spent", "sk-ant-api-b"),
+        ],
+        RoutingStrategy::StickyWeightedV2,
+    );
+    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.10, 0.95, now + 10000, now + 300000).await;
+    let key = keys_hashing_to(&state, 1, 1, 20000, "spent-session")
+        .await
+        .pop()
+        .expect("a key hashing to the spent account");
+    let idx = state
+        .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
+        .await
+        .unwrap();
+    assert_eq!(idx, 0, "session must leave the spent account");
+    let [loaded, spent] = &state.affinity_migrations;
+    assert_eq!(spent.load(Ordering::Relaxed), 1, "spent counter");
+    assert_eq!(loaded.load(Ordering::Relaxed), 0, "loaded counter");
+
+    // reason="loaded": identical 7d, the sticky account's 5h gate is the limit.
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("idle", "sk-ant-api-a"),
+            mk_endpoint("busy", "sk-ant-api-b"),
+        ],
+        RoutingStrategy::StickyWeightedV2,
+    );
+    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.85, 0.10, now + 10000, now + 300000).await;
+    let key = keys_hashing_to(&state, 1, 1, 20000, "loaded-session")
+        .await
+        .pop()
+        .expect("a key hashing to the busy account");
+    let idx = state
+        .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
+        .await
+        .unwrap();
+    assert_eq!(idx, 0, "session must leave the busy account");
+    let [loaded, spent] = &state.affinity_migrations;
+    assert_eq!(loaded.load(Ordering::Relaxed), 1, "loaded counter");
+    assert_eq!(spent.load(Ordering::Relaxed), 0, "spent counter");
 }
 
 #[test]
