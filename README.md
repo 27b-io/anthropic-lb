@@ -386,7 +386,12 @@ can steer are locked down by default:
 - **Client beta flags are allow-listed.** On OAuth endpoints, client
   `anthropic-beta` values outside `allowed_client_betas` are dropped before
   forwarding, logged at `warn`, and counted in
-  `anthropic_beta_flag_dropped_total{flag}`.
+  `anthropic_beta_flag_dropped_total{flag}`. The built-in default covers the
+  flags the proxy itself needs, the flag families Claude Code sends, and
+  `fast-mode-*`; the authoritative list is `DEFAULT_CLIENT_BETA_ALLOWLIST`
+  in `src/main.rs`. Some families pair with a request-body field (`fast-mode-*`
+  with top-level `speed: "fast"`), and the body is forwarded verbatim — so
+  dropping the header alone is a hard upstream `400`, not a quiet downgrade.
 
 ### Known Limitations
 

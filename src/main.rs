@@ -2930,6 +2930,9 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     "fallback-credit-*",
     "redact-thinking-*",
     "afk-mode-*",
+    // Fast mode (LAB-2669): body-paired with top-level `speed` — same
+    // header-stripped/body-forwarded hard-400 shape as the families above.
+    "fast-mode-*",
 ];
 
 /// Cardinality bound for `beta_flags_dropped` — flag names are

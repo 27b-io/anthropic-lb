@@ -17486,8 +17486,8 @@ fn oauth_beta_filter_keeps_default_allowed_flags() {
 
 /// Regression (2026-08-01 incident): the full `anthropic-beta` set Claude
 /// Code 2.1.220 sends must survive the default allow-list. The first cut of
-/// `DEFAULT_CLIENT_BETA_ALLOWLIST` listed only six entries and dropped these
-/// ten, which 400'd every Claude Code request through the proxy —
+/// `DEFAULT_CLIENT_BETA_ALLOWLIST` listed only six entries and dropped the
+/// rest, which 400'd every Claude Code request through the proxy —
 /// `context-management` in particular has a body-side `context_management`
 /// object that the LB forwards verbatim, so dropping the header alone is a
 /// hard upstream rejection, not a silent feature downgrade.
@@ -17495,7 +17495,9 @@ fn oauth_beta_filter_keeps_default_allowed_flags() {
 /// This inventory came off `anthropic_beta_flag_dropped_total` on the live
 /// fleet. Date suffixes are deliberately concrete: the allow-list wildcards
 /// them, so a Claude Code date bump keeps passing while a genuinely new flag
-/// family still shows up as a drop.
+/// family still shows up as a drop. Body-paired families added later
+/// (fast-mode, LAB-2669) ride the same array: exact-token forwarding,
+/// negative control, date bump.
 #[test]
 fn oauth_beta_filter_keeps_claude_code_flag_set() {
     let claude_code_flags = [
@@ -17509,6 +17511,8 @@ fn oauth_beta_filter_keeps_claude_code_flag_set() {
         "redact-thinking-2026-02-12",
         "afk-mode-2026-01-31",
         "structured-outputs-2025-12-15",
+        // LAB-2669: body-paired (`speed`); not in the 2.1.220 inventory.
+        "fast-mode-2026-02-01",
     ];
     // Negative control: the point of the allow-list is that it still rejects.
     // Without this, widening the default to "*" would keep the test green.
