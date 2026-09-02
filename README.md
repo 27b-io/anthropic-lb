@@ -825,7 +825,7 @@ can fail code nobody touched, and with the pin that failure lands as a red
 red `main` that blocks every merge and the next release
 ([#142](https://github.com/27b-io/anthropic-lb/issues/142)). Fix new lints
 inside the bump PR; don't weaken `-Dwarnings`. Reproduce a bump locally with
-`rustup toolchain install <new-version> && RUSTFLAGS="-Dwarnings" cargo +<new-version> clippy --all-targets`.
+`rustup toolchain install <new-version> --profile minimal --component clippy && RUSTFLAGS="-Dwarnings" cargo +<new-version> clippy --all-targets`.
 If the lints can't be fixed right now, close the bump PR — `main` stays on the
 old pin and Renovate reopens it on the next run.
 
