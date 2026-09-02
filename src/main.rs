@@ -833,6 +833,14 @@ struct AppState {
     /// Upstream "prompt is too long" 400s by model (LAB-916). Exposed as
     /// `anthropic_prompt_too_long_total`; bounded via `_other` overflow.
     prompt_too_long: Mutex<HashMap<String, u64>>,
+    /// Upstream 429s on fast-mode requests, by account (LAB-2675). These are
+    /// forwarded to the caller instead of cooling the account — fast mode has
+    /// its own rate bucket — so this counter is the only operator-visible
+    /// trace of a client draining fast capacity. Exposed as
+    /// `anthropic_fast_mode_429_total{account}`. Account names come from
+    /// config, so the label set is bounded by the operator and needs no
+    /// `_other` overflow (unlike the caller-controlled `prompt_too_long` key).
+    fast_mode_429: Mutex<HashMap<String, u64>>,
     /// Per-client model-allowlist denials, keyed (client, model) (LAB-1083).
     /// Exposed as `anthropic_client_model_denied_total`. `client` is an
     /// authenticated principal so it is bounded by config, but `model` is
@@ -5963,6 +5971,26 @@ impl AppState {
         );
     }
 
+    /// Count + log an upstream 429 on a fast-mode request. The response is
+    /// forwarded to the caller unchanged by `classify_retry_status` (no
+    /// cooldown, no rotation — see the reasoning there); this is the operator
+    /// trace that makes a client looping `speed: "fast"` visible instead of
+    /// silent (LAB-2675).
+    fn note_fast_mode_429(&self, endpoint_name: &str, headers: &reqwest::header::HeaderMap) {
+        if let Ok(mut counts) = self.fast_mode_429.lock() {
+            *counts.entry(endpoint_name.to_owned()).or_insert(0) += 1;
+        }
+        let retry_after_raw = headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        warn!(
+            account = endpoint_name,
+            retry_after_raw,
+            "fast-mode 429 forwarded to caller — account NOT cooled (separate rate bucket)"
+        );
+    }
+
     /// Snapshot the session registry for `/_stats`: TTL-filtered, sorted by
     /// context-window % desc, capped to `SESSIONS_STATS_TOP_N`. Raw IPs and
     /// session ids never leave the registry — the label is a hash of the
@@ -7093,6 +7121,7 @@ async fn classify_retry_status(
     endpoint_name: &str,
     resp: reqwest::Response,
     openai_error_shape: bool,
+    fast_mode: bool,
 ) -> Result<reqwest::Response, ForwardOutcome> {
     // 3xx → deliberate 502. The upstream client follows no redirects
     // (`Policy::none()`), because following one would re-send the account
@@ -7146,6 +7175,38 @@ async fn classify_retry_status(
 
     // 429 → mark hard-limited and try next account
     if status == StatusCode::TOO_MANY_REQUESTS {
+        // …unless the request asked for fast mode. Fast mode has its own rate
+        // bucket, separate from the account's standard 5h/7d windows, so a
+        // fast-mode 429 is not evidence the account is exhausted. Cooling the
+        // account here would let one client looping `speed: "fast"` drain each
+        // account's (smaller) fast bucket in turn and deny STANDARD traffic for
+        // every other client until the cooldowns lapse — up to the emergency
+        // brake (LAB-2675, from the LAB-2669 security review).
+        //
+        // Instead the 429 is returned to the caller unchanged: the forward path
+        // reflects upstream's `retry-after` (`reflect_upstream_headers`), leaves
+        // `hard_limited_until` / `remaining_*` alone, and does not rotate. That
+        // is exactly what a direct Anthropic client sees, and the client — not
+        // the proxy — decides whether to back off or retry at standard speed.
+        // Rotating fast requests with a per-account fast cooldown was rejected:
+        // more state, and one client could still sweep every account's bucket.
+        //
+        // What this does NOT buy: the ticket assumed an exhausted account
+        // would still be covered by the utilization ceilings here, because
+        // `update_rate_info_for` consumes the response's unified headers
+        // before classification. AC-5's live probe (2026-09-02) disproved
+        // that — a fast-mode response's `anthropic-ratelimit-unified-*`
+        // headers describe the FAST pool, not the account: representative
+        // claim `overage`, `overage-utilization: 0.0`, reset ~29d out, and
+        // NO `five_hour` claim at all. So the ceilings see nothing on a fast
+        // response, and ingesting those headers actively corrupts the
+        // account's standard view. That is a separate defect in
+        // `update_rate_info_for` (LAB-2693) — not fixable from this branch,
+        // which runs after the ingest has already happened.
+        if fast_mode {
+            state.note_fast_mode_429(endpoint_name, resp.headers());
+            return Ok(resp);
+        }
         state
             .mark_hard_limited_for(rate_info, endpoint_name, resp.headers())
             .await;
@@ -7431,6 +7492,27 @@ fn body_wants_stream(body: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// True when the request body asks for fast mode (top-level `"speed":
+/// "fast"`, the body half of the `fast-mode-*` beta). Absent field or an
+/// unparseable body counts as standard speed — Anthropic's default.
+///
+/// Fast mode bills against a rate bucket that is SEPARATE from the account's
+/// standard 5h/7d windows, so a `429` on a fast request says nothing about
+/// the account's standard headroom (LAB-2675).
+fn request_wants_fast_mode(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .map(|v| body_wants_fast_mode(&v))
+        .unwrap_or(false)
+}
+
+/// The fast-mode predicate on an already-parsed body. Single definition,
+/// same split as `request_wants_stream` / `body_wants_stream`, so every
+/// fast-mode decision in the proxy agrees on what "fast" means.
+fn body_wants_fast_mode(body: &serde_json::Value) -> bool {
+    body.get("speed").and_then(|s| s.as_str()) == Some("fast")
+}
+
 /// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
 /// passes the picked endpoint and its pool index (used for `skip` and usage
 /// accounting).
@@ -7607,11 +7689,22 @@ async fn forward_anthropic(
     state.update_burn_rate(&ep.burn_rate, client_id);
 
     // Classify 429 / 529 / other 5xx into a retry decision (shared helper).
-    let mut resp =
-        match classify_retry_status(state, status, rate_info, endpoint_name, resp, false).await {
-            Ok(resp) => resp,
-            Err(outcome) => return outcome,
-        };
+    let mut resp = match classify_retry_status(
+        state,
+        status,
+        rate_info,
+        endpoint_name,
+        resp,
+        false,
+        // Judged on the bytes actually sent upstream (the OAuth variant on
+        // OAuth tokens) — that body is what picks the rate bucket.
+        request_wants_fast_mode(req_body),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(outcome) => return outcome,
+    };
 
     // Clear hard limit and burst counter only on a genuine 2xx success.
     // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
@@ -8519,12 +8612,21 @@ async fn try_fallback_upstream(
     // the still-rate-limited endpoint before rotating (GH #97).
     // Downstream parses OpenAI errors on the passthrough path
     // (translate = false); Anthropic errors when translating back.
-    let mut resp =
-        match classify_retry_status(state, status, &ep.rate_info, &ep.name, resp, !translate).await
-        {
-            Ok(resp) => resp,
-            Err(outcome) => return outcome,
-        };
+    let mut resp = match classify_retry_status(
+        state,
+        status,
+        &ep.rate_info,
+        &ep.name,
+        resp,
+        !translate,
+        // The OpenAI request shape cannot express `speed` — never fast.
+        false,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(outcome) => return outcome,
+    };
 
     if !status.is_success() {
         let err_body = resp
@@ -9507,6 +9609,12 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
+    let fast_mode_429: Vec<(String, u64)> = state
+        .fast_mode_429
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
     let model_denied: Vec<((String, String), u64)> = state
         .model_denied
         .lock()
@@ -10374,6 +10482,25 @@ async fn metrics_handler(
             &mut buf,
             "anthropic_prompt_too_long_total",
             &[("model", model.as_str())],
+            *n,
+        );
+    }
+
+    // Fast-mode 429s by account (LAB-2675). Always exported so the zero line
+    // is a baseline: a non-zero value means a client is hitting the separate
+    // fast-mode bucket, which the proxy forwards rather than cooling the
+    // account for. Sustained growth is the trigger to revisit that policy.
+    prom_header(
+        &mut buf,
+        "anthropic_fast_mode_429_total",
+        "counter",
+        "Upstream 429s on fast-mode requests, forwarded to the caller without cooling the account",
+    );
+    for (account, n) in &fast_mode_429 {
+        prom_counter(
+            &mut buf,
+            "anthropic_fast_mode_429_total",
+            &[("account", account.as_str())],
             *n,
         );
     }
@@ -12048,11 +12175,21 @@ async fn forward_openai_compat_anthropic(
     state.update_burn_rate(&ep.burn_rate, client_id);
 
     // Classify 429 / 529 / other 5xx into a retry decision (shared helper).
-    let mut resp =
-        match classify_retry_status(state, status, rate_info, endpoint_name, resp, true).await {
-            Ok(resp) => resp,
-            Err(outcome) => return outcome,
-        };
+    let mut resp = match classify_retry_status(
+        state,
+        status,
+        rate_info,
+        endpoint_name,
+        resp,
+        true,
+        // The OpenAI request shape cannot express `speed` — never fast.
+        false,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(outcome) => return outcome,
+    };
 
     // Clear hard limit and burst counter only on a genuine 2xx success.
     // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
@@ -13332,6 +13469,7 @@ async fn main() {
         }),
         beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
+        fast_mode_429: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache,

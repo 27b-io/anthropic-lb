@@ -426,6 +426,7 @@ fn test_state_base() -> AppState {
             .collect(),
         beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
+        fast_mode_429: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache: None,
@@ -4804,6 +4805,174 @@ async fn openai_529_triggers_bebo_backoff_retry() {
         hits.load(Ordering::SeqCst),
         2,
         "exactly one 529 then one successful retry"
+    );
+}
+
+// ── LAB-2675: a fast-mode 429 must not hard-limit the whole account ──
+
+/// Anthropic-shaped 429 carrying `retry-after: 7`. `connection: close` makes
+/// the (empty) body EOF-delimited, matching the other raw-TCP heads here.
+const HEAD_429_FAST: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n";
+
+/// Two Anthropic endpoints: priority-0 always 429s, priority-1 always 200s.
+/// Priority (not affinity hashing) forces the first attempt onto the 429
+/// endpoint, so the healthy endpoint's hit count is a clean "did we rotate?"
+/// probe. Same trick as `openai_429_sets_cooldown_and_next_request_skips_endpoint`.
+async fn fast_mode_429_fixture() -> (
+    Arc<AppState>,
+    SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (limited_url, _limited_hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_429_FAST, ANTHROPIC_OK_BODY).await;
+    let (healthy_url, healthy_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+
+    let mut limited = make_endpoint("limited", Protocol::Anthropic);
+    limited.base_url = limited_url;
+    let mut healthy = make_endpoint("healthy", Protocol::Anthropic);
+    healthy.base_url = healthy_url;
+    healthy.priority = 1;
+
+    let state = test_state_with(vec![limited, healthy]);
+    let addr = serve(build_router(state.clone())).await;
+    (state, addr, healthy_hits)
+}
+
+/// AC-1: fast mode bills against a rate bucket that is NOT the account's
+/// standard 5h/7d window, so a fast-mode 429 must reach the caller with
+/// upstream's `retry-after` and leave the account in rotation. Cooling the
+/// account here is the LAB-2669 security finding: one client looping
+/// `speed: "fast"` would deny standard traffic for every other client.
+#[tokio::test]
+async fn fast_mode_429_forwards_to_client_and_leaves_account_alone() {
+    use std::sync::atomic::Ordering;
+    let (state, addr, healthy_hits) = fast_mode_429_fixture().await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"test","max_tokens":1,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "a fast-mode 429 must be forwarded, not swallowed into a rotation"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("7"),
+        "upstream's retry-after must reach the client — it is how the caller backs off"
+    );
+
+    let info = state.endpoints[0].rate_info.read().await;
+    assert!(
+        info.hard_limited_until.is_none(),
+        "a fast-bucket 429 must not cool the account for STANDARD traffic"
+    );
+    assert_eq!(
+        (info.remaining_requests, info.remaining_tokens),
+        (None, None),
+        "a fast-bucket 429 must not poison the account's standard headroom view"
+    );
+    drop(info);
+
+    assert_eq!(
+        healthy_hits.load(Ordering::SeqCst),
+        0,
+        "a fast-mode 429 must not rotate — rotating just sweeps every account's fast bucket"
+    );
+
+    // AC-3: the forwarded 429 is silent unless it is counted, and a looping
+    // client is exactly what an operator needs to see.
+    let m = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        m.contains("anthropic_fast_mode_429_total{account=\"limited\"} 1"),
+        "fast-mode 429s must be visible on /metrics per account:\n{m}"
+    );
+}
+
+/// AC-2 negative control: the same upstream 429, on a body that does NOT ask
+/// for fast mode, keeps today's behaviour — hard-limit the account and rotate.
+/// Both the absent field and an explicit `"standard"` are standard speed.
+///
+/// (The ticket suggested extending `try_fallback_upstream_rotates_on_429`;
+/// that test drives the OpenAI fallback upstream, which cannot express
+/// `speed` at all, so it cannot control for this change. The control has to
+/// run through the same Anthropic handler path as AC-1.)
+#[tokio::test]
+async fn standard_speed_429_still_cools_account_and_rotates() {
+    use std::sync::atomic::Ordering;
+    for body in [
+        r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"test","max_tokens":1,"speed":"standard","messages":[{"role":"user","content":"hi"}]}"#,
+    ] {
+        let (state, addr, healthy_hits) = fast_mode_429_fixture().await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "a standard-speed 429 must still rotate to the healthy account: {body}"
+        );
+        assert!(
+            healthy_hits.load(Ordering::SeqCst) >= 1,
+            "the request must reach the priority-1 endpoint: {body}"
+        );
+
+        let info = state.endpoints[0].rate_info.read().await;
+        assert!(
+            info.hard_limited_until.is_some(),
+            "a standard-speed 429 must still hard-limit the account: {body}"
+        );
+        assert_eq!(
+            (info.remaining_requests, info.remaining_tokens),
+            (Some(0), Some(0)),
+            "a standard-speed 429 must still poison remaining_* : {body}"
+        );
+    }
+}
+
+/// The body predicate itself: only a top-level string `"fast"` counts. A
+/// nested `speed`, a non-string, or an unparseable body is standard speed —
+/// the fail-safe direction, since guessing "fast" wrongly would suppress a
+/// real account cooldown.
+#[test]
+fn fast_mode_body_predicate() {
+    let fast = br#"{"model":"m","speed":"fast"}"#;
+    assert!(request_wants_fast_mode(fast));
+    assert!(!request_wants_fast_mode(br#"{"model":"m"}"#));
+    assert!(!request_wants_fast_mode(
+        br#"{"model":"m","speed":"standard"}"#
+    ));
+    assert!(!request_wants_fast_mode(br#"{"model":"m","speed":true}"#));
+    assert!(
+        !request_wants_fast_mode(br#"{"model":"m","metadata":{"speed":"fast"}}"#),
+        "only the TOP-LEVEL speed field selects the fast rate bucket"
+    );
+    assert!(
+        !request_wants_fast_mode(b"not json"),
+        "an unparseable body must fall back to standard — never suppress a cooldown on a guess"
     );
 }
 
