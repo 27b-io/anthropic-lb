@@ -27,6 +27,16 @@ probe_interval_secs = 300
 # [[clients]]
 # name = "radar"
 # key = "<from secret store: openssl rand -hex 32>"
+#
+# preferred_endpoints pins a client to dedicated endpoint(s): while at least
+# one is healthy (serves the model, not hard-limited/unhealthy, under
+# soft_limit, not serving via paid overage) the client routes ONLY there,
+# spilling to the full pool otherwise. Entries must name configured
+# [[endpoints]] (checked at startup).
+# [[clients]]
+# name = "passbolt"
+# key = "<from secret store: openssl rand -hex 32>"
+# preferred_endpoints = ["passbolt"]
 
 # proxy_key — LEGACY single shared secret. Authenticates but does not identify.
 # Mutually exclusive with [[clients]]. Minimum 32 characters (openssl rand -hex 32).
