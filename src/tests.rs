@@ -17986,12 +17986,34 @@ mod redis_integration {
     /// Same as `spawn_killable_proxy`, but at a caller-chosen address — used
     /// to REVIVE a killed proxy at its old address so a reconnect policy can
     /// find the backend again.
+    ///
+    /// The port stays reserved for the rest of the test (LAB-2299): `hold` is
+    /// bound but never listens, so connects are still refused while the proxy
+    /// is dead, but the kernel will not hand the port to any concurrent
+    /// `bind(127.0.0.1:0)` (another test's mock server). Without it the dead
+    /// window leaves the port unowned and the revive races on `EADDRINUSE`.
+    /// `SO_REUSEADDR` on both sockets is what lets the listener — and later
+    /// the revive — bind over `hold`; a plain `TcpListener::bind` already sets
+    /// it, so that alone never was the missing piece. Two sockets on the same
+    /// exact addr:port with only `SO_REUSEADDR` is Linux behaviour (BSD/macOS
+    /// would need `SO_REUSEPORT` too) — CI and this opt-in suite are Linux.
     async fn spawn_killable_proxy_at(
         bind: &str,
         target: String,
     ) -> (String, tokio::sync::oneshot::Sender<()>) {
-        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        fn reusable_socket(addr: std::net::SocketAddr) -> tokio::net::TcpSocket {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.set_reuseaddr(true).unwrap();
+            socket
+                .bind(addr)
+                .unwrap_or_else(|e| panic!("killable proxy: bind {addr}: {e}"));
+            socket
+        }
+        let hold = reusable_socket(bind.parse().unwrap());
+        let addr = hold.local_addr().unwrap();
+        let listener = reusable_socket(addr)
+            .listen(1024)
+            .unwrap_or_else(|e| panic!("killable proxy: listen {addr}: {e}"));
         let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             let mut relays: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -18016,7 +18038,12 @@ mod redis_integration {
             for relay in relays {
                 relay.abort();
             }
-            // Listener drops here → further connects are refused.
+            // Further connects are refused from here on…
+            drop(listener);
+            // …but the port stays ours until the test's runtime tears this
+            // task down, so a revive at `addr` can never lose the bind race.
+            let _hold = hold;
+            std::future::pending::<()>().await;
         });
         (format!("127.0.0.1:{}", addr.port()), kill_tx)
     }
