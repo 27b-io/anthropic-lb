@@ -1598,22 +1598,21 @@ async fn affinity_override_destination_independent_of_argmax() {
         );
 }
 
-#[tokio::test]
-async fn affinity_override_ignores_reset_time_skew() {
-    // Regression (GH#156 / LAB-2684): two accounts under IDENTICAL load whose
-    // only difference is time-to-weekly-reset. `weight` carries waste_risk =
-    // unused / remaining_fraction_of_7d, so the account that reset yesterday
-    // (wr ≈ 1) weighs ~8x less than one resetting in 20h (wr ≈ 7.5). The old
-    // `picked.weight < best.weight * 0.25` override read that as "too loaded"
-    // and migrated every session off the FRESHEST accounts in the pool (25% of
-    // prod requests WARNed on accounts at ≤17% utilisation). Reset-time skew
-    // alone must never break affinity.
+/// Regression (GH#156 / LAB-2684): two accounts under IDENTICAL load whose
+/// only difference is time-to-weekly-reset. `weight` carries waste_risk =
+/// unused / remaining_fraction_of_7d, so the account that reset yesterday
+/// (wr ≈ 1) weighs ~8x less than one resetting in 20h (wr ≈ 7.5). The old
+/// `picked.weight < best.weight * ratio` override in BOTH strategies read that
+/// as "too loaded" and migrated every session off the FRESHEST accounts in the
+/// pool (25% of prod requests WARNed on accounts at ≤17% utilisation).
+/// Reset-time skew alone must never break affinity.
+async fn assert_reset_time_skew_keeps_affinity(strategy: RoutingStrategy) {
     let state = test_state_with_strategy(
         vec![
             mk_endpoint("fresh", "sk-ant-api-a"),
             mk_endpoint("expiring", "sk-ant-api-b"),
         ],
-        RoutingStrategy::StickyWeightedV2,
+        strategy,
     );
     let now = AppState::now_epoch();
     let in_6_5_days = now + 6 * 86400 + 43200;
@@ -1633,9 +1632,19 @@ async fn affinity_override_ignores_reset_time_skew() {
             .unwrap();
         assert_eq!(
             idx, 0,
-            "request {i}: reset-time skew alone migrated the session off its hashed account"
+            "{strategy:?} request {i}: reset-time skew alone migrated the session off its hashed account"
         );
     }
+}
+
+#[tokio::test]
+async fn affinity_override_ignores_reset_time_skew() {
+    assert_reset_time_skew_keeps_affinity(RoutingStrategy::StickyWeightedV2).await;
+}
+
+#[tokio::test]
+async fn affinity_override_ignores_reset_time_skew_legacy() {
+    assert_reset_time_skew_keeps_affinity(RoutingStrategy::DynamicCapacityV1).await;
 }
 
 #[tokio::test]

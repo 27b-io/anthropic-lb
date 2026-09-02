@@ -4265,7 +4265,7 @@ impl AppState {
             let (best, best_headroom) = effective
                 .iter()
                 .map(|c| (*c, affinity_headroom(c).0))
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap();
             if best.endpoint != picked.endpoint
                 && picked_headroom < best_headroom * STICKY_WEIGHTED_OVERRIDE_RATIO
