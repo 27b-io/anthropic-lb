@@ -27,6 +27,16 @@ probe_interval_secs = 300
 # [[clients]]
 # name = "radar"
 # key = "<from secret store: openssl rand -hex 32>"
+#
+# preferred_endpoints pins a client to dedicated endpoint(s): while at least
+# one is healthy (serves the model, not hard-limited/unhealthy, under
+# soft_limit, not serving via paid overage) the client routes ONLY there,
+# spilling to the full pool otherwise. Entries must name configured
+# [[endpoints]] (checked at startup).
+# [[clients]]
+# name = "passbolt"
+# key = "<from secret store: openssl rand -hex 32>"
+# preferred_endpoints = ["passbolt"]
 
 # proxy_key — LEGACY single shared secret. Authenticates but does not identify.
 # Mutually exclusive with [[clients]]. Minimum 32 characters (openssl rand -hex 32).
@@ -101,16 +111,17 @@ probe_interval_secs = 300
 # ("*" = suffix wildcard). Anything not listed is dropped (logged +
 # anthropic_beta_flag_dropped_total metric) — otherwise any caller could
 # activate arbitrary beta features against the operator's accounts. Omit to
-# use the built-in default (the flag families Claude Code sends + context-1m*).
-# NOTE: a configured list REPLACES the default — it does not extend it. To
-# allow one extra flag, copy the defaults below and add yours:
+# use the built-in default (the flags the proxy needs, the flag families
+# Claude Code sends, context-1m*, fast-mode-*).
+# NOTE: a configured list REPLACES the default — it does not extend it. Some
+# families also pair with a request-body field (fast-mode-* with top-level
+# speed: "fast"), and the body is forwarded verbatim, so dropping the header
+# alone is a hard upstream 400, not a quiet downgrade. To allow one extra
+# flag, copy every entry of DEFAULT_CLIENT_BETA_ALLOWLIST in src/main.rs (the
+# authoritative list) and add yours:
 # allowed_client_betas = [
-#   "oauth-2025-04-20",
-#   "claude-code-20250219",
-#   "interleaved-thinking-*",
-#   "fine-grained-tool-streaming-*",
-#   "prompt-caching-*",
-#   "context-1m*",
+#   # ...every DEFAULT_CLIENT_BETA_ALLOWLIST entry...
+#   "my-extra-beta-*",
 # ]
 
 # Redis/Valkey URL for distributed state (multi-replica coordination).
