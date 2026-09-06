@@ -420,6 +420,7 @@ fn test_state_base() -> AppState {
         session_registry_max: DEFAULT_SESSION_REGISTRY_MAX,
         session_registry_ttl_secs: DEFAULT_SESSION_REGISTRY_TTL_SECS,
         expose_upstream_ratelimit_headers: false,
+        forward_client_ip: false,
         allowed_client_betas: DEFAULT_CLIENT_BETA_ALLOWLIST
             .iter()
             .map(|s| s.to_string())
@@ -4713,6 +4714,140 @@ async fn spawn_capturing_upstream(
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), rx)
+}
+
+/// Axum mock upstream that captures the request headers of each hit and
+/// replies 200 + `body`. For asserting what the proxy relays upstream.
+async fn spawn_header_capturing_upstream(
+    body: &'static [u8],
+) -> (String, tokio::sync::mpsc::Receiver<axum::http::HeaderMap>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<axum::http::HeaderMap>(8);
+    let app = Router::new().fallback(any(move |req: Request<Body>| {
+        let tx = tx.clone();
+        async move {
+            let _ = tx.send(req.headers().clone()).await;
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), rx)
+}
+
+/// The caller-identity headers a fronting proxy sets for the LB's own
+/// `resolve_client_ip` (GH #168). Values are what a Cloudflare Worker /
+/// cloudflared hop would carry.
+const CALLER_IDENTITY_HEADERS: [(&str, &str); 4] = [
+    ("x-forwarded-for", "203.0.113.9, 10.0.0.1"),
+    ("x-real-ip", "203.0.113.9"),
+    ("forwarded", "for=203.0.113.9;proto=https"),
+    ("true-client-ip", "203.0.113.9"),
+];
+
+const MESSAGES_BODY: &str =
+    r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+const CHAT_BODY: &str = r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#;
+
+/// Send one request carrying every caller-identity header (plus an unrelated
+/// custom header) through the proxy to an Anthropic-protocol upstream and
+/// return the headers that upstream actually received.
+async fn upstream_headers_seen(path: &str, body: &str) -> axum::http::HeaderMap {
+    upstream_headers_seen_with(path, body, false).await
+}
+
+async fn upstream_headers_seen_with(
+    path: &str,
+    body: &str,
+    forward_client_ip: bool,
+) -> axum::http::HeaderMap {
+    let (url, mut seen) = spawn_header_capturing_upstream(ANTHROPIC_OK_BODY).await;
+    let mut ep = make_endpoint("ep", Protocol::Anthropic);
+    ep.base_url = url;
+    let mut state = test_state_with(vec![ep]);
+    Arc::get_mut(&mut state)
+        .expect("test fixture should be uniquely owned")
+        .forward_client_ip = forward_client_ip;
+    let addr = serve(build_router(state)).await;
+
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{addr}{path}"))
+        .header("content-type", "application/json")
+        .header("x-custom-trace", "keep-me");
+    for (name, value) in CALLER_IDENTITY_HEADERS {
+        req = req.header(name, value);
+    }
+    let resp = req.body(body.to_string()).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "request must reach upstream"
+    );
+    seen.recv().await.expect("upstream must have been hit once")
+}
+
+fn assert_identity_headers_absent(seen: &axum::http::HeaderMap) {
+    for (name, _) in CALLER_IDENTITY_HEADERS {
+        assert!(
+            !seen.contains_key(name),
+            "{name} must not reach the upstream by default (GH #168)"
+        );
+    }
+    assert_eq!(
+        seen.get("x-custom-trace").map(|v| v.to_str().unwrap()),
+        Some("keep-me"),
+        "unrelated headers must still be forwarded"
+    );
+}
+
+/// GH #168: `x-forwarded-for` and friends exist for the LB's own
+/// `resolve_client_ip`. Behind cloudflared / the Cloudflare Worker they carry
+/// the caller's real edge IP, so relaying them makes every pooled-account
+/// request upstream correlatable to the individual caller. The LB is the last
+/// hop that needs them.
+#[tokio::test]
+async fn messages_path_strips_caller_identity_headers_upstream_by_default() {
+    let seen = upstream_headers_seen("/v1/messages", MESSAGES_BODY).await;
+    assert_identity_headers_absent(&seen);
+}
+
+/// Same contract on the OpenAI-compat → Anthropic translation path, which
+/// clones the inbound headers independently of `forward_anthropic`.
+#[tokio::test]
+async fn chat_completions_path_strips_caller_identity_headers_upstream_by_default() {
+    let seen = upstream_headers_seen("/v1/chat/completions", CHAT_BODY).await;
+    assert_identity_headers_absent(&seen);
+}
+
+fn assert_identity_headers_relayed(seen: &axum::http::HeaderMap) {
+    for (name, value) in CALLER_IDENTITY_HEADERS {
+        assert_eq!(
+            seen.get(name).map(|v| v.to_str().unwrap()),
+            Some(value),
+            "{name} must be relayed unchanged when forward_client_ip = true"
+        );
+    }
+}
+
+/// The operator escape hatch: `forward_client_ip = true` relays the
+/// caller-identity headers upstream unchanged.
+#[tokio::test]
+async fn forward_client_ip_true_relays_caller_identity_headers_on_messages_path() {
+    let seen = upstream_headers_seen_with("/v1/messages", MESSAGES_BODY, true).await;
+    assert_identity_headers_relayed(&seen);
+}
+
+#[tokio::test]
+async fn forward_client_ip_true_relays_caller_identity_headers_on_chat_completions_path() {
+    let seen = upstream_headers_seen_with("/v1/chat/completions", CHAT_BODY, true).await;
+    assert_identity_headers_relayed(&seen);
 }
 
 /// GH #97 regression: a 429 from a `Protocol::OpenAI` endpoint must set a

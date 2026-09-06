@@ -180,6 +180,7 @@ token = "sk-ant-api03-..."
 | `allow_unauthenticated` | `bool` | `false` | The one escape hatch from default-deny: boot with no credentials at all. Trusted-network-only; incompatible with configured credentials |
 | `allowed_ips` | `[String]?` | `None` | IP/CIDR allowlist (unset = **allow all**) |
 | `trusted_proxies` | `[String]?` | `None` | IPs/CIDRs of load balancers whose `x-forwarded-for` is honoured (unset = header ignored) |
+| `forward_client_ip` | `bool` | `false` | Relay caller-identity headers (`x-forwarded-for`, `x-real-ip`, `forwarded`, `true-client-ip`) to the upstream. Off = stripped after the LB has resolved the client IP: the LB is the last hop that needs them, and relaying them makes every pooled-account request upstream correlatable to the individual caller |
 | `auth_failure_limit` | `u32` | `10` | Failed-auth attempts per client IP inside the window before further invalid credentials get 429; valid credentials always pass (0 = throttle off) |
 | `auth_failure_window_secs` | `u64` | `300` | Failed-auth throttle window |
 | `auto_cache` | `bool` | `true` | Inject prompt caching beta header |
@@ -343,6 +344,7 @@ It **fails closed** on a model it cannot read. The proxy takes the model from th
 | **Admin surfaces** | `operators = ["ops"]` | `/_stats` + `/metrics` need an operator credential (401/403) | no one can read them under `[[clients]]` |
 | **Failed-auth throttle** | `auth_failure_limit` / `auth_failure_window_secs` | Further invalid credentials get 429 + `retry-after` per client IP after repeated failures; valid credentials always pass | on (10 / 300s) |
 | **Trusted proxies** | `trusted_proxies = ["192.0.2.0/24"]` | Real client IP recovered from `x-forwarded-for` behind a listed LB | header ignored |
+| **Caller-IP privacy** | `forward_client_ip = false` | Caller-identity headers (`x-forwarded-for`, `x-real-ip`, `forwarded`, `true-client-ip`) are dropped before the upstream request | **stripped** |
 | **Model allow-list** | `clients[].models` | Rejects models outside a client's list (403) | all models |
 
 IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are compared in constant time, and startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`).
@@ -356,6 +358,8 @@ IP check runs first, then the credential check; failed credentials are subject t
 ### Real client IP behind a load balancer
 
 Behind a GCLB/Cloudflare/ingress, the TCP peer is the LB — without XFF handling, IP allowlists degenerate to "allow the LB", per-IP throttles rate-limit the LB, and every log line records the LB. Configure `trusted_proxies` with the LB's address range; the client IP then becomes the **rightmost `x-forwarded-for` entry not itself in `trusted_proxies`** — the last hop an attacker cannot append to. From any peer *not* in the list the header is ignored entirely (never trusted, never logged as authoritative), and malformed entries fall back to the peer address.
+
+Those headers stop here. Once the client IP is resolved, `x-forwarded-for`, `x-real-ip`, `forwarded` and `true-client-ip` are removed from the upstream request on every forward path (Anthropic and OpenAI-compat), so a pooled-account request upstream cannot be tied back to the individual caller behind the proxy. `forward_client_ip = true` restores relaying for operators who want the caller IP visible upstream. Edge-added headers such as `cf-*` are the ingress's to strip, not the proxy's ([#166](https://github.com/27b-io/anthropic-lb/issues/166)).
 
 > [!IMPORTANT]
 > Behind a load balancer, **`[[clients]]` credentials are the identity**. The `client_names` IP map is a lab-only convenience: it maps *source addresses*, and once traffic arrives through an LB the recovered XFF address is only as trustworthy as the LB's own header hygiene. Do not hang budgets or operator status on `client_names` on a public ingress.
