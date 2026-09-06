@@ -420,6 +420,7 @@ fn test_state_base() -> AppState {
         session_registry_max: DEFAULT_SESSION_REGISTRY_MAX,
         session_registry_ttl_secs: DEFAULT_SESSION_REGISTRY_TTL_SECS,
         expose_upstream_ratelimit_headers: false,
+        forward_caller_identity: false,
         allowed_client_betas: DEFAULT_CLIENT_BETA_ALLOWLIST
             .iter()
             .map(|s| s.to_string())
@@ -4682,23 +4683,27 @@ async fn spawn_status_then_ok_upstream(
     (format!("http://{addr}"), hits)
 }
 
-/// Axum mock upstream that captures each raw request body on the returned
-/// channel, then replies with `status` + `body`. For tests that must assert
-/// on the exact wire bytes an endpoint received — `spawn_mock_upstream()` is
+/// Axum mock upstream that captures each request's headers + raw body on the
+/// returned channel, then replies with `status` + `body`. For tests that must
+/// assert on the exact wire an endpoint received — `spawn_mock_upstream()` is
 /// canned-Anthropic/always-200 and does not capture, and the raw-TCP mocks
 /// above only count hits.
 async fn spawn_capturing_upstream(
     status: StatusCode,
     body: &'static [u8],
-) -> (String, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
-    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+) -> (
+    String,
+    tokio::sync::mpsc::Receiver<(axum::http::HeaderMap, bytes::Bytes)>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<(axum::http::HeaderMap, bytes::Bytes)>(8);
     let app = Router::new().fallback(any(move |req: Request<Body>| {
         let tx = tx.clone();
         async move {
+            let headers = req.headers().clone();
             let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
                 .await
                 .unwrap();
-            let _ = tx.send(bytes).await;
+            let _ = tx.send((headers, bytes)).await;
             (
                 status,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -4713,6 +4718,139 @@ async fn spawn_capturing_upstream(
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), rx)
+}
+
+/// Values a fronting hop / an LB-aware client sends for every entry in
+/// `CLIENT_IDENTITY_HEADERS` — an independent oracle, kept in lockstep by
+/// `identity_header_samples_cover_the_production_list`.
+const CLIENT_IDENTITY_HEADER_SAMPLES: &[(&str, &str)] = &[
+    ("x-forwarded-for", "203.0.113.9, 10.0.0.1"),
+    ("x-real-ip", "203.0.113.9"),
+    ("forwarded", "for=203.0.113.9;proto=https"),
+    ("true-client-ip", "203.0.113.9"),
+    ("x-client-id", "geo"),
+    ("x-agent-id", "agent-42"),
+    ("x-session-id", "sess-7"),
+];
+
+#[test]
+fn identity_header_samples_cover_the_production_list() {
+    let mut prod: Vec<&str> = CLIENT_IDENTITY_HEADERS.to_vec();
+    let mut samples: Vec<&str> = CLIENT_IDENTITY_HEADER_SAMPLES
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    prod.sort();
+    samples.sort();
+    assert_eq!(prod, samples, "extend both lists together");
+}
+
+/// Send one request carrying every caller-identity header (plus an unrelated
+/// custom header) through the proxy to an Anthropic-protocol upstream and
+/// return the headers that upstream actually received.
+async fn upstream_headers_seen(
+    path: &str,
+    body: &str,
+    forward_caller_identity: bool,
+) -> axum::http::HeaderMap {
+    let (url, mut seen) = spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
+    let mut ep = make_endpoint("ep", Protocol::Anthropic);
+    ep.base_url = url;
+    let mut state = test_state_with(vec![ep]);
+    Arc::get_mut(&mut state)
+        .expect("test fixture should be uniquely owned")
+        .forward_caller_identity = forward_caller_identity;
+    let addr = serve(build_router(state)).await;
+
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{addr}{path}"))
+        .header("content-type", "application/json")
+        .header("x-custom-trace", "keep-me");
+    for &(name, value) in CLIENT_IDENTITY_HEADER_SAMPLES {
+        req = req.header(name, value);
+    }
+    let resp = req.body(body.to_string()).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "request must reach upstream"
+    );
+    seen.recv()
+        .await
+        .expect("upstream must have been hit once")
+        .0
+}
+
+fn assert_identity_headers_absent(seen: &axum::http::HeaderMap) {
+    for &(name, _) in CLIENT_IDENTITY_HEADER_SAMPLES {
+        assert!(
+            !seen.contains_key(name),
+            "{name} must not reach the upstream by default (GH #168)"
+        );
+    }
+    assert_eq!(
+        seen.get("x-custom-trace").map(|v| v.to_str().unwrap()),
+        Some("keep-me"),
+        "unrelated headers must still be forwarded"
+    );
+}
+
+fn assert_identity_headers_relayed(seen: &axum::http::HeaderMap) {
+    for &(name, value) in CLIENT_IDENTITY_HEADER_SAMPLES {
+        assert_eq!(
+            seen.get(name).map(|v| v.to_str().unwrap()),
+            Some(value),
+            "{name} must be relayed unchanged when forward_caller_identity = true"
+        );
+    }
+}
+
+/// GH #168 — see `CLIENT_IDENTITY_HEADERS`.
+#[tokio::test]
+async fn messages_path_strips_caller_identity_headers_upstream_by_default() {
+    let seen = upstream_headers_seen(
+        "/v1/messages",
+        r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        false,
+    )
+    .await;
+    assert_identity_headers_absent(&seen);
+}
+
+/// Same contract on the OpenAI-compat → Anthropic translation path, which
+/// clones the inbound headers independently of `forward_anthropic`.
+#[tokio::test]
+async fn chat_completions_path_strips_caller_identity_headers_upstream_by_default() {
+    let seen = upstream_headers_seen(
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#,
+        false,
+    )
+    .await;
+    assert_identity_headers_absent(&seen);
+}
+
+/// The operator escape hatch relays every entry unchanged.
+#[tokio::test]
+async fn forward_caller_identity_true_relays_headers_on_messages_path() {
+    let seen = upstream_headers_seen(
+        "/v1/messages",
+        r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        true,
+    )
+    .await;
+    assert_identity_headers_relayed(&seen);
+}
+
+#[tokio::test]
+async fn forward_caller_identity_true_relays_headers_on_chat_completions_path() {
+    let seen = upstream_headers_seen(
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#,
+        true,
+    )
+    .await;
+    assert_identity_headers_relayed(&seen);
 }
 
 /// GH #97 regression: a 429 from a `Protocol::OpenAI` endpoint must set a
@@ -14634,7 +14772,8 @@ async fn proxy_handler_translates_to_openai_endpoint() {
         .unwrap();
 
     let received: serde_json::Value =
-        serde_json::from_slice(&rx.recv().await.expect("upstream must receive a request")).unwrap();
+        serde_json::from_slice(&rx.recv().await.expect("upstream must receive a request").1)
+            .unwrap();
     assert!(
         received.get("messages").is_some(),
         "translated request must have OpenAI `messages` field"
@@ -14712,11 +14851,13 @@ async fn proxy_handler_translates_once_across_endpoint_rotation() {
     let bad_body = bad_rx
         .recv()
         .await
-        .expect("failing endpoint got the request");
+        .expect("failing endpoint got the request")
+        .1;
     let ok_body = ok_rx
         .recv()
         .await
-        .expect("healthy endpoint got the rotation");
+        .expect("healthy endpoint got the rotation")
+        .1;
     assert_eq!(
         bad_body, ok_body,
         "rotated attempt must reuse the identical serialized body"
