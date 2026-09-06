@@ -420,6 +420,7 @@ fn test_state_base() -> AppState {
         session_registry_max: DEFAULT_SESSION_REGISTRY_MAX,
         session_registry_ttl_secs: DEFAULT_SESSION_REGISTRY_TTL_SECS,
         expose_upstream_ratelimit_headers: false,
+        forward_caller_identity: false,
         allowed_client_betas: DEFAULT_CLIENT_BETA_ALLOWLIST
             .iter()
             .map(|s| s.to_string())
@@ -2825,6 +2826,153 @@ fn translate_request_passthrough_params() {
 }
 
 #[test]
+fn model_rejects_temperature_by_version() {
+    // Claude 5 family and ≥ 4.7 hard-reject (LAB-798)
+    assert!(model_rejects_temperature("claude-sonnet-5"));
+    assert!(model_rejects_temperature("claude-opus-5"));
+    assert!(model_rejects_temperature("claude-fable-5"));
+    assert!(model_rejects_temperature("claude-fable-5[1m]"));
+    assert!(model_rejects_temperature("claude-opus-4-8"));
+    assert!(model_rejects_temperature("claude-sonnet-4-7-20260101"));
+    // ≤ 4.6 still accepts
+    assert!(!model_rejects_temperature("claude-sonnet-4-6"));
+    assert!(!model_rejects_temperature("claude-sonnet-4-5-20250929"));
+    assert!(!model_rejects_temperature("claude-haiku-4-5-20251001"));
+    assert!(!model_rejects_temperature("claude-opus-4-1-20250805"));
+    assert!(!model_rejects_temperature("claude-opus-4-20250514"));
+    // old-style ids (version before family) and unknown families pass through
+    assert!(!model_rejects_temperature("claude-3-5-sonnet-20241022"));
+    assert!(!model_rejects_temperature("gpt-4o"));
+}
+
+#[test]
+fn translate_request_drops_temperature_for_rejecting_model() {
+    let req = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 0.2,
+        "top_p": 0.9
+    });
+    let result = translate_openai_to_anthropic(&req);
+    // temperature dropped (upstream hard-rejects it); other params untouched
+    assert!(result.get("temperature").is_none());
+    assert_eq!(result["top_p"], 0.9);
+}
+
+#[test]
+fn translate_request_keeps_default_temperature_for_rejecting_model() {
+    // temperature: 1 is the one value the API still accepts — pass it through
+    let req = serde_json::json!({
+        "model": "claude-fable-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 1
+    });
+    let result = translate_openai_to_anthropic(&req);
+    assert_eq!(result["temperature"], 1);
+}
+
+#[test]
+fn translate_request_forwards_non_numeric_temperature_unchanged() {
+    // Non-numeric junk is not a "confirmed non-default numeric" — forward it
+    // so the client gets the same upstream type error as on ≤ 4.6 models
+    // instead of the shim silently masking their bug.
+    let req = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": "0.7"
+    });
+    let result = translate_openai_to_anthropic(&req);
+    assert_eq!(result["temperature"], "0.7");
+}
+
+/// The Anthropic→OpenAI fallback translator gets the same LAB-798 guard as
+/// the forward shim: an OpenAI-protocol endpoint can front Claude ≥ 4.7.
+#[test]
+fn translate_a2o_drops_temperature_for_rejecting_model() {
+    let body = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": 64,
+        "temperature": 0.2,
+        "top_p": 0.9
+    });
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    assert!(result.get("temperature").is_none());
+    assert_eq!(result["top_p"], 0.9);
+}
+
+#[test]
+fn translate_a2o_keeps_default_temperature_for_rejecting_model() {
+    // Default 1 passes through (upstream accepts it); ≤ 4.6 models are
+    // covered by `translate_anthropic_request_basic`.
+    let body = serde_json::json!({
+        "model": "claude-fable-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 1
+    });
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    assert_eq!(result["temperature"], 1);
+}
+
+/// LAB-798 third path: `openai_chat_handler` forwards the raw request bytes
+/// to a `Protocol::OpenAI` endpoint without translation — the handler must
+/// strip a hard-rejected `temperature` from those bytes before forwarding.
+#[tokio::test]
+async fn openai_passthrough_strips_temperature_for_rejecting_model() {
+    let seen_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+    let seen_body_clone = seen_body.clone();
+    let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+        let seen_body = seen_body_clone.clone();
+        async move {
+            let bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES)
+                .await
+                .unwrap();
+            *seen_body.lock().unwrap() = Some(bytes.to_vec());
+            (
+                [("content-type", "application/json")],
+                OPENAI_OK_BODY.to_vec(),
+            )
+        }
+    }));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = format!("http://{mock_addr}");
+    let state = test_state_with(vec![gw]);
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"claude-sonnet-5","max_tokens":8,"temperature":0.2,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let captured = seen_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("gateway should receive request body");
+    let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    assert!(
+        forwarded.get("temperature").is_none(),
+        "raw passthrough must not forward a hard-rejected temperature: {forwarded}"
+    );
+    assert_eq!(
+        forwarded["top_p"], 0.9,
+        "other params must survive the strip"
+    );
+}
+
+#[test]
 fn translate_request_strips_name_field() {
     let req = serde_json::json!({
         "model": "claude-sonnet-4-6",
@@ -4683,23 +4831,27 @@ async fn spawn_status_then_ok_upstream(
     (format!("http://{addr}"), hits)
 }
 
-/// Axum mock upstream that captures each raw request body on the returned
-/// channel, then replies with `status` + `body`. For tests that must assert
-/// on the exact wire bytes an endpoint received — `spawn_mock_upstream()` is
+/// Axum mock upstream that captures each request's headers + raw body on the
+/// returned channel, then replies with `status` + `body`. For tests that must
+/// assert on the exact wire an endpoint received — `spawn_mock_upstream()` is
 /// canned-Anthropic/always-200 and does not capture, and the raw-TCP mocks
 /// above only count hits.
 async fn spawn_capturing_upstream(
     status: StatusCode,
     body: &'static [u8],
-) -> (String, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
-    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+) -> (
+    String,
+    tokio::sync::mpsc::Receiver<(axum::http::HeaderMap, bytes::Bytes)>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<(axum::http::HeaderMap, bytes::Bytes)>(8);
     let app = Router::new().fallback(any(move |req: Request<Body>| {
         let tx = tx.clone();
         async move {
+            let headers = req.headers().clone();
             let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
                 .await
                 .unwrap();
-            let _ = tx.send(bytes).await;
+            let _ = tx.send((headers, bytes)).await;
             (
                 status,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -4714,6 +4866,139 @@ async fn spawn_capturing_upstream(
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), rx)
+}
+
+/// Values a fronting hop / an LB-aware client sends for every entry in
+/// `CLIENT_IDENTITY_HEADERS` — an independent oracle, kept in lockstep by
+/// `identity_header_samples_cover_the_production_list`.
+const CLIENT_IDENTITY_HEADER_SAMPLES: &[(&str, &str)] = &[
+    ("x-forwarded-for", "203.0.113.9, 10.0.0.1"),
+    ("x-real-ip", "203.0.113.9"),
+    ("forwarded", "for=203.0.113.9;proto=https"),
+    ("true-client-ip", "203.0.113.9"),
+    ("x-client-id", "geo"),
+    ("x-agent-id", "agent-42"),
+    ("x-session-id", "sess-7"),
+];
+
+#[test]
+fn identity_header_samples_cover_the_production_list() {
+    let mut prod: Vec<&str> = CLIENT_IDENTITY_HEADERS.to_vec();
+    let mut samples: Vec<&str> = CLIENT_IDENTITY_HEADER_SAMPLES
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    prod.sort();
+    samples.sort();
+    assert_eq!(prod, samples, "extend both lists together");
+}
+
+/// Send one request carrying every caller-identity header (plus an unrelated
+/// custom header) through the proxy to an Anthropic-protocol upstream and
+/// return the headers that upstream actually received.
+async fn upstream_headers_seen(
+    path: &str,
+    body: &str,
+    forward_caller_identity: bool,
+) -> axum::http::HeaderMap {
+    let (url, mut seen) = spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
+    let mut ep = make_endpoint("ep", Protocol::Anthropic);
+    ep.base_url = url;
+    let mut state = test_state_with(vec![ep]);
+    Arc::get_mut(&mut state)
+        .expect("test fixture should be uniquely owned")
+        .forward_caller_identity = forward_caller_identity;
+    let addr = serve(build_router(state)).await;
+
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{addr}{path}"))
+        .header("content-type", "application/json")
+        .header("x-custom-trace", "keep-me");
+    for &(name, value) in CLIENT_IDENTITY_HEADER_SAMPLES {
+        req = req.header(name, value);
+    }
+    let resp = req.body(body.to_string()).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "request must reach upstream"
+    );
+    seen.recv()
+        .await
+        .expect("upstream must have been hit once")
+        .0
+}
+
+fn assert_identity_headers_absent(seen: &axum::http::HeaderMap) {
+    for &(name, _) in CLIENT_IDENTITY_HEADER_SAMPLES {
+        assert!(
+            !seen.contains_key(name),
+            "{name} must not reach the upstream by default (GH #168)"
+        );
+    }
+    assert_eq!(
+        seen.get("x-custom-trace").map(|v| v.to_str().unwrap()),
+        Some("keep-me"),
+        "unrelated headers must still be forwarded"
+    );
+}
+
+fn assert_identity_headers_relayed(seen: &axum::http::HeaderMap) {
+    for &(name, value) in CLIENT_IDENTITY_HEADER_SAMPLES {
+        assert_eq!(
+            seen.get(name).map(|v| v.to_str().unwrap()),
+            Some(value),
+            "{name} must be relayed unchanged when forward_caller_identity = true"
+        );
+    }
+}
+
+/// GH #168 — see `CLIENT_IDENTITY_HEADERS`.
+#[tokio::test]
+async fn messages_path_strips_caller_identity_headers_upstream_by_default() {
+    let seen = upstream_headers_seen(
+        "/v1/messages",
+        r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        false,
+    )
+    .await;
+    assert_identity_headers_absent(&seen);
+}
+
+/// Same contract on the OpenAI-compat → Anthropic translation path, which
+/// clones the inbound headers independently of `forward_anthropic`.
+#[tokio::test]
+async fn chat_completions_path_strips_caller_identity_headers_upstream_by_default() {
+    let seen = upstream_headers_seen(
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#,
+        false,
+    )
+    .await;
+    assert_identity_headers_absent(&seen);
+}
+
+/// The operator escape hatch relays every entry unchanged.
+#[tokio::test]
+async fn forward_caller_identity_true_relays_headers_on_messages_path() {
+    let seen = upstream_headers_seen(
+        "/v1/messages",
+        r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        true,
+    )
+    .await;
+    assert_identity_headers_relayed(&seen);
+}
+
+#[tokio::test]
+async fn forward_caller_identity_true_relays_headers_on_chat_completions_path() {
+    let seen = upstream_headers_seen(
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#,
+        true,
+    )
+    .await;
+    assert_identity_headers_relayed(&seen);
 }
 
 /// GH #97 regression: a 429 from a `Protocol::OpenAI` endpoint must set a
@@ -14897,7 +15182,8 @@ async fn proxy_handler_translates_to_openai_endpoint() {
         .unwrap();
 
     let received: serde_json::Value =
-        serde_json::from_slice(&rx.recv().await.expect("upstream must receive a request")).unwrap();
+        serde_json::from_slice(&rx.recv().await.expect("upstream must receive a request").1)
+            .unwrap();
     assert!(
         received.get("messages").is_some(),
         "translated request must have OpenAI `messages` field"
@@ -14975,11 +15261,13 @@ async fn proxy_handler_translates_once_across_endpoint_rotation() {
     let bad_body = bad_rx
         .recv()
         .await
-        .expect("failing endpoint got the request");
+        .expect("failing endpoint got the request")
+        .1;
     let ok_body = ok_rx
         .recv()
         .await
-        .expect("healthy endpoint got the rotation");
+        .expect("healthy endpoint got the rotation")
+        .1;
     assert_eq!(
         bad_body, ok_body,
         "rotated attempt must reuse the identical serialized body"
@@ -18104,6 +18392,57 @@ async fn session_registry_window_matches_filtered_beta() {
         "session must be tracked at the window the upstream ran (flag was stripped)"
     );
 }
+// LAB-3026: a configured-but-unparseable `redis_url` must be reported as an
+// error from `start_coordination_redis` (the caller in `main` turns that
+// into a startup panic) rather than silently degrading to local-only.
+// Needs no live backend — parsing fails before any I/O. The
+// valid-but-unreachable case is covered by
+// `backend_down_at_startup_serves_local_only_then_attaches` below (still
+// `Ok`, still local-only-then-reconnect); the unset case is the untouched
+// `else { None }` arm in `main` and needs no test.
+#[test]
+fn start_coordination_redis_rejects_unparseable_url() {
+    // An unescaped '/' inside the password ends URL authority parsing early
+    // (everything after is read as path), leaving a garbage port — the
+    // rotated-password shape from the ticket. Verified against the `url`
+    // crate directly: unescaped '@' alone does NOT break parsing (the last
+    // '@' wins as the userinfo/host separator), but '/', '?', and '#' do.
+    let result = start_coordination_redis(
+        "redis://user:pa/ss@127.0.0.1:6379",
+        PerformanceConfig::default(),
+        ConnectionConfig::default(),
+        ReconnectPolicy::new_constant(0, 100),
+    );
+    assert!(
+        result.is_err(),
+        "malformed userinfo must fail to parse, not silently mis-route"
+    );
+}
+
+// LAB-3026 review follow-up: a reserved char could in principle swallow the
+// REAL host into the path while `Url::parse` still succeeds, if the bogus
+// "port" left behind (username:password-prefix) happens to be numeric —
+// e.g. `redis://user:12345/rest@127.0.0.1:6379` parses OK with host="user",
+// port=12345, silently discarding the real `127.0.0.1:6379`. That would be
+// a mis-route, not a startup failure, and the AC would be defeated. It
+// still can't reach `Ok` here: fred's `parse_url_db` (run right after) reads
+// the leftover path as the db-index segment and requires it parse as a u8
+// (0-255); a swallowed `@host:port` remainder never also satisfies that, so
+// this shape errors too — verified, not assumed.
+#[test]
+fn start_coordination_redis_rejects_numeric_password_prefix_mis_route() {
+    let result = start_coordination_redis(
+        "redis://user:12345/rest@127.0.0.1:6379",
+        PerformanceConfig::default(),
+        ConnectionConfig::default(),
+        ReconnectPolicy::new_constant(0, 100),
+    );
+    assert!(
+        result.is_err(),
+        "a numeric password-prefix must not silently mis-route to the wrong host"
+    );
+}
+
 // ── Real-Redis integration tests (LAB-931) ──────────────────────────
 //
 // Behavioural coverage for the cross-replica coordination layer against a
