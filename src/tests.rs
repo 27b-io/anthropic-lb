@@ -17841,6 +17841,33 @@ async fn session_registry_window_matches_filtered_beta() {
         "session must be tracked at the window the upstream ran (flag was stripped)"
     );
 }
+// LAB-3026: a configured-but-unparseable `redis_url` must be reported as an
+// error from `start_coordination_redis` (the caller in `main` turns that
+// into a startup panic) rather than silently degrading to local-only.
+// Needs no live backend — parsing fails before any I/O. The
+// valid-but-unreachable case is covered by
+// `backend_down_at_startup_serves_local_only_then_attaches` below (still
+// `Ok`, still local-only-then-reconnect); the unset case is the untouched
+// `else { None }` arm in `main` and needs no test.
+#[test]
+fn start_coordination_redis_rejects_unparseable_url() {
+    // An unescaped '/' inside the password ends URL authority parsing early
+    // (everything after is read as path), leaving a garbage port — the
+    // rotated-password shape from the ticket. Verified against the `url`
+    // crate directly: unescaped '@' alone does NOT break parsing (the last
+    // '@' wins as the userinfo/host separator), but '/', '?', and '#' do.
+    let result = start_coordination_redis(
+        "redis://user:pa/ss@127.0.0.1:6379",
+        PerformanceConfig::default(),
+        ConnectionConfig::default(),
+        ReconnectPolicy::new_constant(0, 100),
+    );
+    assert!(
+        result.is_err(),
+        "malformed userinfo must fail to parse, not silently mis-route"
+    );
+}
+
 // ── Real-Redis integration tests (LAB-931) ──────────────────────────
 //
 // Behavioural coverage for the cross-replica coordination layer against a
