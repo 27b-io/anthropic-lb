@@ -17868,6 +17868,30 @@ fn start_coordination_redis_rejects_unparseable_url() {
     );
 }
 
+// LAB-3026 review follow-up: a reserved char could in principle swallow the
+// REAL host into the path while `Url::parse` still succeeds, if the bogus
+// "port" left behind (username:password-prefix) happens to be numeric —
+// e.g. `redis://user:12345/rest@127.0.0.1:6379` parses OK with host="user",
+// port=12345, silently discarding the real `127.0.0.1:6379`. That would be
+// a mis-route, not a startup failure, and the AC would be defeated. It
+// still can't reach `Ok` here: fred's `parse_url_db` (run right after) reads
+// the leftover path as the db-index segment and requires it parse as a u8
+// (0-255); a swallowed `@host:port` remainder never also satisfies that, so
+// this shape errors too — verified, not assumed.
+#[test]
+fn start_coordination_redis_rejects_numeric_password_prefix_mis_route() {
+    let result = start_coordination_redis(
+        "redis://user:12345/rest@127.0.0.1:6379",
+        PerformanceConfig::default(),
+        ConnectionConfig::default(),
+        ReconnectPolicy::new_constant(0, 100),
+    );
+    assert!(
+        result.is_err(),
+        "a numeric password-prefix must not silently mis-route to the wrong host"
+    );
+}
+
 // ── Real-Redis integration tests (LAB-931) ──────────────────────────
 //
 // Behavioural coverage for the cross-replica coordination layer against a
