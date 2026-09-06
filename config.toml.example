@@ -61,9 +61,9 @@ probe_interval_secs = 300
 # trusted_proxies = ["10.128.0.0/20"]
 
 # Relay caller-identity headers (x-forwarded-for, x-real-ip, forwarded,
-# true-client-ip) to the upstream. Default false: they exist for this proxy's
-# own client-IP resolution and are stripped before the upstream request.
-# forward_client_ip = false
+# true-client-ip, x-client-id, x-agent-id, x-session-id) to the upstream.
+# Default false: the proxy has already used them and upstream has no consumer.
+# forward_caller_identity = false
 
 # Failed-auth throttle (LAB-1193, superseding LAB-1192 AC-11 after the
 # 2026-08-24 shared-IP outage): after auth_failure_limit failures from one
