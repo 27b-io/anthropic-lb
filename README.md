@@ -446,8 +446,14 @@ The 400 itself is forwarded to the client unchanged.
 
 Requests rejected by a client's model allow-list are counted as
 `anthropic_client_model_denied_total{client,model}` and logged at WARN. The
-`model` label is caller-controlled, so it is bounded — overflow past 64
-distinct pairs buckets into `model="_other"`.
+`model` label is caller-controlled, so the label set is bounded — overflow
+past 64 distinct pairs lumps into a single global
+`client="_other",model="_other"` bucket (hard bound: 64 + 1 series).
+`_other` is a reserved client name: config validation rejects a
+`[[clients]]` entry or `client_names` value named `_other`, and a legacy
+`x-client-id: _other` header is ignored, so real traffic can never
+pre-claim the overflow key. `anthropic_client_model_token_usage_total`
+shares the same overflow scheme (bucket at 256 + 1 series).
 
 ### OpenAI JSON-mode compatibility
 

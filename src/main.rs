@@ -482,7 +482,10 @@ const TAU_1H: f64 = 3600.0;
 const MAX_TRACKED_CLIENTS: usize = 10_000;
 
 /// Cap on distinct (client, model) labels in the allowlist-denial counter.
-/// The model half is caller-controlled; overflow buckets into `_other`.
+/// The model half is caller-controlled, and under legacy auth the client
+/// half is too (`x-client-id`), so overflow lumps into a single global
+/// ("_other", "_other") bucket — a HARD bound of cap + 1 entries (LAB-2332,
+/// mirroring the LAB-2330 fix to `client_model_usage`).
 const MAX_MODEL_DENIED_LABELS: usize = 64;
 
 /// Cap on distinct (client, model) pairs in the per-model usage counter
@@ -834,10 +837,12 @@ struct AppState {
     /// `anthropic_prompt_too_long_total`; bounded via `_other` overflow.
     prompt_too_long: Mutex<HashMap<String, u64>>,
     /// Per-client model-allowlist denials, keyed (client, model) (LAB-1083).
-    /// Exposed as `anthropic_client_model_denied_total`. `client` is an
-    /// authenticated principal so it is bounded by config, but `model` is
-    /// caller-controlled — bounded via the same `_other` overflow as
-    /// `prompt_too_long`.
+    /// Exposed as `anthropic_client_model_denied_total`. Under `[[clients]]`
+    /// auth `client` is a credential-bound principal, but under legacy
+    /// `proxy_key` / `allow_unauthenticated` it comes from the
+    /// caller-controlled `x-client-id` header — so overflow lumps into a
+    /// single global ("_other", "_other") bucket, hard-bounding the map at
+    /// `MAX_MODEL_DENIED_LABELS` + 1 entries (LAB-2332).
     model_denied: Mutex<HashMap<(String, String), u64>>,
     /// (endpoint idx, model) pairs an upstream rejected as unsupported — a
     /// gateway without the model, or a plan without access (LAB-941).
@@ -2024,14 +2029,18 @@ impl AppState {
     /// The model string is caller-controlled and bounded only by the request
     /// body cap, so it is truncated BEFORE becoming a map key: an untruncated
     /// label would be retained for the process lifetime and re-serialized into
-    /// the `/metrics` body on every scrape. Label COUNT is separately bounded
-    /// by `_other` overflow.
+    /// the `/metrics` body on every scrape. Label COUNT is separately
+    /// hard-bounded at `MAX_MODEL_DENIED_LABELS` + 1: once the cap is
+    /// reached, every new pair lumps into a single global
+    /// `("_other", "_other")` bucket.
     ///
     /// Logs at `warn` the first time a (client, model) pair is denied and at
     /// `debug` thereafter — a client hammering a denied model must not be able
-    /// to drive unbounded warn-level log volume. The counter still records
-    /// every denial. Mirrors the once-per-model pattern used for
-    /// unsupported-model warnings.
+    /// to drive unbounded warn-level log volume. Pairs lumped into the
+    /// overflow bucket share its first-seen flag (deliberate: client-id
+    /// rotation must not mint warns). The counter still records every denial.
+    /// Mirrors the once-per-model pattern used for unsupported-model
+    /// warnings.
     fn note_model_denied(&self, client_id: &str, model: &str) {
         let model = truncate_label(model);
         let mut first_time = true;
@@ -2040,7 +2049,13 @@ impl AppState {
             let label = if counts.len() < MAX_MODEL_DENIED_LABELS || counts.contains_key(&key) {
                 key
             } else {
-                (client_id.to_owned(), "_other".to_owned())
+                // Map full and this pair is new: lump into ONE global
+                // overflow bucket — hard bound of MAX_MODEL_DENIED_LABELS
+                // + 1 entries. A per-client ("<client>", "_other") key
+                // would let x-client-id rotation (legacy auth modes) grow
+                // the map without bound (expert-panel finding, LAB-2330;
+                // mirrored here by LAB-2332).
+                ("_other".to_owned(), "_other".to_owned())
             };
             let entry = counts.entry(label).or_insert(0);
             first_time = *entry == 0;
@@ -2084,8 +2099,10 @@ impl AppState {
             let id = id.trim();
             // "_operator" is the reserved operator-aggregation label on
             // /_stats and /metrics — a self-asserted claim to it would merge
-            // this caller's usage into the hidden operator bucket.
-            if !id.is_empty() && id != "-" && id != "_operator" {
+            // this caller's usage into the hidden operator bucket. "_other"
+            // is the reserved metrics overflow-bucket label (LAB-2330/2332) —
+            // claiming it would merge this caller into the overflow key.
+            if !id.is_empty() && id != "-" && id != "_operator" && id != "_other" {
                 return id.to_string();
             }
         }
@@ -12749,6 +12766,12 @@ fn validate_clients(config: &Config) -> Result<(), String> {
                     .to_string(),
             );
         }
+        if c.name == "_other" {
+            return Err(
+                "client: name must not be \"_other\" (the reserved metrics overflow-bucket label — a real client with this name would merge with, and take the warn-once flag of, the (\"_other\", \"_other\") overflow key)"
+                    .to_string(),
+            );
+        }
         if c.key.is_empty() {
             return Err(format!("client '{}': key must not be empty", c.name));
         }
@@ -12780,6 +12803,17 @@ fn validate_clients(config: &Config) -> Result<(), String> {
         }
         seen_names.push(&c.name);
         seen_keys.push(&c.key);
+    }
+
+    // The legacy `client_names` IP map is the third identity entry point
+    // (`resolve_client_id`'s fallback) — an IP mapped to a reserved sentinel
+    // would resolve real traffic to it, bypassing the header filter above.
+    for (ip, name) in &config.client_names {
+        if name == "-" || name == "_operator" || name == "_other" {
+            return Err(format!(
+                "client_names: \"{ip}\" maps to reserved name \"{name}\" (\"-\" = unknown-client sentinel, \"_operator\" = operator-aggregation label, \"_other\" = metrics overflow bucket)"
+            ));
+        }
     }
 
     // One client registry, not five. Every one of these config surfaces keys on

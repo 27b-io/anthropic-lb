@@ -10428,6 +10428,20 @@ fn resolve_client_id_ignores_reserved_operator_header() {
 }
 
 #[test]
+fn resolve_client_id_ignores_reserved_other_header() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let ip: IpAddr = "192.168.1.100".parse().unwrap();
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("x-client-id", HeaderValue::from_static("_other"));
+
+    let resolved = state.resolve_client_id(&ip, &headers);
+    assert_eq!(
+        resolved, "-",
+        "a self-asserted _other identity must not merge into the metrics overflow bucket"
+    );
+}
+
+#[test]
 fn compute_pressure_status_operator_always_healthy() {
     let state = Arc::new(AppState {
         client: Client::new(),
@@ -16845,16 +16859,24 @@ fn model_denial_labels_are_bounded_by_other_overflow() {
     for i in 0..(MAX_MODEL_DENIED_LABELS + 25) {
         state.note_model_denied("limited", &format!("junk-model-{i}"));
     }
+    // Expert-panel finding (LAB-2330, mirrored by LAB-2332): rotating the
+    // caller-controlled client id past the cap must NOT mint per-client
+    // overflow keys — the bound has to hold on the client axis too.
+    for i in 0..50 {
+        state.note_model_denied(&format!("evil-{i}"), "claude-x");
+    }
     let counts = state.model_denied.lock().unwrap();
     assert!(
         counts.len() <= MAX_MODEL_DENIED_LABELS + 1,
         "label map grew unbounded: {} entries",
         counts.len()
     );
+    // Overflow denials are not dropped — they land in the ONE global bucket:
+    // 25 "limited" overflow models + 50 rotated clients.
     assert_eq!(
-        counts.get(&("limited".to_string(), "_other".to_string())),
-        Some(&25),
-        "overflow must land in the _other bucket, not be dropped"
+        counts.get(&("_other".to_string(), "_other".to_string())),
+        Some(&75),
+        "overflow must land in the global _other bucket, not be dropped"
     );
 }
 
@@ -16957,6 +16979,16 @@ fn validate_clients_rejects_bad_names_and_empty_keys() {
             "[[clients]]\nname = \"_operator\"\nkey = \"k1\"\n",
             "_operator",
         ),
+        // Reserved: the metrics overflow bucket is keyed ("_other", "_other");
+        // a real client with that name could pre-create the exact pair and
+        // later overflow denials/usage would merge into it (CodeRabbit, #148).
+        ("[[clients]]\nname = \"_other\"\nkey = \"k1\"\n", "_other"),
+        // The legacy client_names IP map is the third identity entry point
+        // (resolve_client_id's fallback) — its values must not claim a
+        // reserved sentinel either (expert-panel finding, #148 follow-up).
+        ("[client_names]\n\"10.0.0.5\" = \"-\"\n", "reserved"),
+        ("[client_names]\n\"10.0.0.5\" = \"_operator\"\n", "reserved"),
+        ("[client_names]\n\"10.0.0.5\" = \"_other\"\n", "reserved"),
         ("[[clients]]\nname = \"geo\"\nkey = \"\"\n", "key"),
         // Untrimmed: stored verbatim, so it would become a client_id matching
         // no client_budgets / operators / response_cache.clients key.
