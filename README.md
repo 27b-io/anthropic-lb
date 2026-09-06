@@ -812,6 +812,23 @@ WantedBy=multi-user.target
 
 ## Testing
 
+The Rust toolchain is pinned in `rust-toolchain.toml`, so local builds, CI,
+and the Docker image all use the same compiler — rustup reads the file
+automatically and installs that version on first `cargo` invocation. (CI's
+toolchain action only bootstraps `stable`; every `cargo` command still
+resolves through the pin via rustup's toolchain-file override, and the
+Dockerfile copies the file into the builder stage.) Toolchain updates arrive as Renovate PRs
+and are never automerged (CI infra has a wide blast radius). This matters
+because CI runs with `-Dwarnings`: a new stable Rust ships new clippy lints that
+can fail code nobody touched, and with the pin that failure lands as a red
+*bump PR* — reviewable, with the lint fixes in the same branch — instead of a
+red `main` that blocks every merge and the next release
+([#142](https://github.com/27b-io/anthropic-lb/issues/142)). Fix new lints
+inside the bump PR; don't weaken `-Dwarnings`. Reproduce a bump locally with
+`rustup toolchain install <new-version> --profile minimal --component clippy && RUSTFLAGS="-Dwarnings" cargo +<new-version> clippy --all-targets`.
+If the lints can't be fixed right now, close the bump PR — `main` stays on the
+old pin and Renovate reopens it on the next run.
+
 ```bash
 # Run all tests
 cargo test
