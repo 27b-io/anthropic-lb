@@ -393,6 +393,17 @@ can steer are locked down by default:
   in `src/main.rs`. Some families pair with a request-body field (`fast-mode-*`
   with top-level `speed: "fast"`), and the body is forwarded verbatim — so
   dropping the header alone is a hard upstream `400`, not a quiet downgrade.
+- **A fast-mode `429` is forwarded to the caller, not treated as account
+  exhaustion.** Fast mode (`speed: "fast"`) bills against its own rate bucket,
+  separate from the account's 5h/7d windows, so a `429` on a fast request does
+  not cool the account or rotate to another one — the caller gets the `429`
+  with upstream's `retry-after`, exactly as a direct Anthropic client would.
+  Without this, one client looping fast requests would hard-limit every
+  account in turn and deny standard-speed traffic to everyone else. Occurrences
+  are counted as `anthropic_fast_mode_429_total{account}`. Transient *burst*
+  `429`s (`x-should-retry` with no `retry-after` and no rate-limit headers) are
+  excluded: those are per-minute limits on the account itself, so they keep
+  their usual backoff and rotation whatever speed was requested.
 
 ### Known Limitations
 
