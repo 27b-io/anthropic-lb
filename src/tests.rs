@@ -300,6 +300,7 @@ fn mk_endpoint(name: &str, token: &str) -> Endpoint {
         priority: 0,
         fable_included: true,
         requests: AtomicU64::new(0),
+        fast_mode_disabled_total: AtomicU64::new(0),
         rate_info: RwLock::new(RateLimitInfo::default()),
         burn_rate: Mutex::new(BurnRate::new()),
         input_tokens: AtomicU64::new(0),
@@ -337,6 +338,7 @@ fn make_endpoint(name: &str, protocol: Protocol) -> Endpoint {
         priority: 0,
         fable_included: true,
         requests: AtomicU64::new(0),
+        fast_mode_disabled_total: AtomicU64::new(0),
         rate_info: RwLock::new(RateLimitInfo::default()),
         burn_rate: Mutex::new(BurnRate::new()),
         input_tokens: AtomicU64::new(0),
@@ -428,6 +430,7 @@ fn test_state_base() -> AppState {
         prompt_too_long: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
+        fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache: None,
     }
 }
@@ -5085,6 +5088,329 @@ async fn model_unsupported_everywhere_openai_handler_returns_openai_shaped_404()
             .is_some_and(|m| m.contains("claude-nope-1")),
         "message must name the rejected model, got: {body}"
     );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the warm-cache request must not touch the upstream at all"
+    );
+}
+
+// ── LAB-2687: org-level fast-mode entitlement ───────────────────────
+
+/// Exact upstream wire bytes observed 2026-09-02 from a non-entitled org.
+const HEAD_400_FAST_MODE: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Fast mode is not enabled for your organization. An organization admin must enable this feature.\"}}";
+
+const FAST_BODY: &str = r#"{"model":"claude-opus-5","max_tokens":1,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#;
+const STANDARD_BODY: &str =
+    r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+
+/// AC-1: only the org-entitlement 400 matches. The proxy-induced
+/// `speed: Extra inputs are not permitted` 400 (beta header stripped, body
+/// forwarded — LAB-2669's failure shape), model-not-found 404s and 429s must
+/// not: rotating fixes none of those.
+#[test]
+fn fast_mode_not_enabled_error_detection() {
+    let not_enabled = serde_json::json!({
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": "Fast mode is not enabled for your organization. An organization admin must enable this feature."}
+    });
+    assert!(is_fast_mode_not_enabled_error(
+        StatusCode::BAD_REQUEST,
+        &not_enabled
+    ));
+    assert!(
+        !is_fast_mode_not_enabled_error(StatusCode::TOO_MANY_REQUESTS, &not_enabled),
+        "status gate: only a 400 is an entitlement rejection"
+    );
+
+    let extra_inputs = serde_json::json!({
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": "speed: Extra inputs are not permitted"}
+    });
+    assert!(
+        !is_fast_mode_not_enabled_error(StatusCode::BAD_REQUEST, &extra_inputs),
+        "the proxy-induced header/body mismatch 400 is not an entitlement rejection"
+    );
+
+    let model_404 = serde_json::json!({
+        "type": "error",
+        "error": {"type": "not_found_error", "message": "model: claude-nope-1"}
+    });
+    assert!(!is_fast_mode_not_enabled_error(
+        StatusCode::NOT_FOUND,
+        &model_404
+    ));
+
+    let rate_limited = serde_json::json!({
+        "type": "error",
+        "error": {"type": "rate_limit_error", "message": "This request would exceed the rate limit for your organization"}
+    });
+    assert!(!is_fast_mode_not_enabled_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        &rate_limited
+    ));
+}
+
+/// AC-3/AC-4: a marked endpoint leaves the pool for fast requests only —
+/// affinity or not — standard requests still see it, and an expired mark
+/// restores it without a restart.
+#[tokio::test]
+async fn fast_mode_disabled_filters_fast_routing_until_expiry() {
+    let state = test_state_with(vec![
+        mk_endpoint("a", "sk-ant-api-a"),
+        mk_endpoint("b", "sk-ant-api-b"),
+    ]);
+    assert!(state.fast_mode_disabled_endpoints().is_empty());
+    assert_eq!(state.fast_mode_disabled_remaining_secs(0), None);
+
+    state.note_fast_mode_disabled("a", 0);
+
+    assert_eq!(state.fast_mode_disabled_endpoints(), vec![0]);
+    for _ in 0..8 {
+        assert_eq!(
+            state
+                .pick_endpoint_for_client(None, "claude-opus-5", &[], "", true)
+                .await,
+            Some(1),
+            "a fast request must never route to the non-entitled endpoint"
+        );
+    }
+    // Session affinity re-buckets too: the sticky hash only sees candidates.
+    assert_eq!(
+        state
+            .pick_endpoint_for_client(Some("client:sess:1"), "claude-opus-5", &[], "", true)
+            .await,
+        Some(1),
+        "an affinity-pinned fast session must migrate off the non-entitled endpoint"
+    );
+    // A standard request sees the full pool.
+    assert_eq!(
+        state.routing_candidates("claude-opus-5", &[]).await.len(),
+        2,
+        "standard requests must keep using the non-entitled endpoint"
+    );
+    assert!(
+        state
+            .fast_mode_disabled_remaining_secs(0)
+            .is_some_and(|s| s > FAST_MODE_DISABLED_TTL.as_secs() - 5),
+        "/_stats must expose the remaining TTL"
+    );
+    assert!(!state.pool_cannot_serve("claude-opus-5", true));
+
+    // Mark the other account too: the FAST pool is now unservable, the
+    // standard pool is untouched.
+    state.note_fast_mode_disabled("b", 1);
+    assert!(state.pool_cannot_serve("claude-opus-5", true));
+    assert!(
+        !state.pool_cannot_serve("claude-opus-5", false),
+        "fast-mode marks must not count against a standard request"
+    );
+
+    // Force-expire the entries: both endpoints rejoin the fast pool, and the
+    // mark counter survives expiry for the metric.
+    for expiry in state.fast_mode_disabled.lock().unwrap().values_mut() {
+        *expiry = Instant::now();
+    }
+    assert!(
+        state.fast_mode_disabled_endpoints().is_empty(),
+        "expired entry must not filter routing"
+    );
+    assert_eq!(state.fast_mode_disabled_remaining_secs(0), None);
+    assert_eq!(
+        state.endpoints[0]
+            .fast_mode_disabled_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+/// Mixed negative caches: one account can't serve the model, the other can't
+/// serve fast. A fast request has nowhere to go (upstream error, not a 429);
+/// a standard request still has the fast-disabled account.
+#[test]
+fn pool_cannot_serve_unions_negative_caches() {
+    let state = test_state_with(vec![
+        mk_endpoint("a", "sk-ant-api-a"),
+        mk_endpoint("b", "sk-ant-api-b"),
+    ]);
+    state.note_model_unsupported("a", 0, "claude-opus-5");
+    state.note_fast_mode_disabled("b", 1);
+    assert!(state.pool_cannot_serve("claude-opus-5", true));
+    assert!(!state.pool_cannot_serve("claude-opus-5", false));
+    assert!(!state.pool_cannot_serve("claude-sonnet-5", true));
+}
+
+/// AC-2 native path: the first entitlement 400 rotates within the request
+/// (client sees the 200 from the entitled account), the NEXT fast request
+/// skips the non-entitled account outright, and a standard request on the
+/// same pool still routes to it.
+#[tokio::test]
+async fn fast_mode_disabled_rotates_and_next_fast_request_skips_account() {
+    use std::sync::atomic::Ordering;
+    let (reject_url, reject_hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_400_FAST_MODE, b"{}").await;
+    let (ok_url, _h) = spawn_mock_upstream().await;
+
+    let reject = mk_endpoint_at("reject", "sk-ant-api-r", &reject_url);
+    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+    // Priority forces routing to try `reject` first — deterministic without
+    // depending on affinity hashing.
+    healthy.priority = 1;
+    let state = test_state_with(vec![reject, healthy]);
+    let addr = serve(build_router(state)).await;
+
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(FAST_BODY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "both fast requests must succeed via the entitled account"
+        );
+    }
+    assert_eq!(
+        reject_hits.load(Ordering::SeqCst),
+        1,
+        "the second fast request must skip the non-entitled account, not retry it"
+    );
+
+    // AC-6: the mark is visible on /_stats and /metrics.
+    let stats: serde_json::Value = client
+        .get(format!("http://{addr}/_stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let eps = stats["endpoints"].as_array().unwrap();
+    assert!(
+        eps[0]["fast_mode_disabled_remaining_secs"]
+            .as_u64()
+            .is_some(),
+        "marked account must report remaining secs, got: {}",
+        eps[0]
+    );
+    assert!(
+        eps[1]["fast_mode_disabled_remaining_secs"].is_null(),
+        "unmarked account must report null, got: {}",
+        eps[1]
+    );
+    let metrics = client
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("anthropic_fast_mode_disabled_total{account=\"reject\"} 1"),
+        "one increment per entitlement 400, got:\n{metrics}"
+    );
+    assert!(
+        metrics.contains("anthropic_fast_mode_disabled_total{account=\"healthy\"} 0"),
+        "unmarked account must still emit a zero counter, got:\n{metrics}"
+    );
+
+    // A standard request is unaffected by the mark: priority sends it to
+    // `reject` — the hit count, not the status, is the assertion (the mock
+    // 400s every body, so the matcher rotates this one too).
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(STANDARD_BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        reject_hits.load(Ordering::SeqCst),
+        2,
+        "a standard request must still route to the fast-mode-disabled account"
+    );
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+/// Panel finding: a rejection on ONE account while the rest of the pool is
+/// merely rate-limited is a rate-limited pool. The stashed non-retryable 400
+/// must not surface — SDKs would give up on a request that will succeed
+/// once the cooldown lifts.
+#[tokio::test]
+async fn fast_mode_rejection_plus_rate_limited_pool_stays_retryable() {
+    let (reject_url, _hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_400_FAST_MODE, b"{}").await;
+    let state = test_state_with(vec![
+        mk_endpoint_at("reject", "sk-ant-api-r", &reject_url),
+        mk_endpoint("limited", "sk-ant-api-l"),
+    ]);
+    state.endpoints[1]
+        .rate_info
+        .write()
+        .await
+        .hard_limited_until = Some(Instant::now() + Duration::from_secs(60));
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(FAST_BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "one non-entitled account plus a rate-limited rest must stay retryable, not 400"
+    );
+}
+
+/// AC-5: when NO eligible account's org has fast mode, the upstream's own 400
+/// surfaces — not a synthetic 429 that invites retries. A SECOND fast request
+/// hits the warm negative cache (pool empties before any forward, nothing is
+/// stashed) and must still get the same 400, replayed, without touching the
+/// upstream again.
+#[tokio::test]
+async fn fast_mode_disabled_everywhere_returns_upstream_400_not_429() {
+    use std::sync::atomic::Ordering;
+    let (url, hits) = spawn_status_then_ok_upstream(usize::MAX, HEAD_400_FAST_MODE, b"{}").await;
+    let state = test_state_with(vec![mk_endpoint_at("only", "sk-ant-api-o", &url)]);
+    let addr = serve(build_router(state)).await;
+
+    let client = reqwest::Client::new();
+    for pass in [
+        "cold cache (real upstream 400)",
+        "warm cache (replayed 400)",
+    ] {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(FAST_BODY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{pass}: fast mode disabled everywhere must return 400, not 429"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.pointer("/error/type").and_then(|v| v.as_str()),
+            Some("invalid_request_error"),
+            "{pass}: envelope type, got: {body}"
+        );
+        assert_eq!(
+            body.pointer("/error/message").and_then(|v| v.as_str()),
+            Some(FAST_MODE_NOT_ENABLED_MSG),
+            "{pass}: message must be the upstream's own text, got: {body}"
+        );
+    }
     assert_eq!(
         hits.load(Ordering::SeqCst),
         1,
@@ -19936,7 +20262,7 @@ async fn pinned_client_always_routes_to_preferred_endpoint() {
     for i in 0..100 {
         let key = format!("client:sess:{i}");
         if state
-            .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[], "other")
+            .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[], "other", false)
             .await
             == Some(0)
         {
@@ -19944,7 +20270,7 @@ async fn pinned_client_always_routes_to_preferred_endpoint() {
         }
         assert_eq!(
             state
-                .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[], "passbolt")
+                .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[], "passbolt", false)
                 .await,
             Some(1),
             "pinned client must land on 'dedicated' for every affinity key"
@@ -19966,7 +20292,7 @@ async fn pinned_client_spills_on_soft_limit_overage() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
             .await,
         Some(0),
         "soft-limited preferred endpoint must spill to the general pool"
@@ -19986,7 +20312,7 @@ async fn pinned_client_spills_on_hard_limit() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
             .await,
         Some(0),
         "hard-limited preferred endpoint must spill to the general pool"
@@ -20006,7 +20332,7 @@ async fn pinned_client_spills_on_transport_unhealthy() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
             .await,
         Some(0),
         "transport-unhealthy preferred endpoint must spill to the general pool"
@@ -20027,7 +20353,7 @@ async fn pinned_client_spills_on_model_mismatch() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
             .await,
         Some(0),
         "model not served by the preferred endpoint must spill to the general pool"
@@ -20035,9 +20361,46 @@ async fn pinned_client_spills_on_model_mismatch() {
     // Sanity: a model the pin DOES serve stays pinned.
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-haiku-4-5", &[], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-haiku-4-5", &[], "passbolt", false)
             .await,
         Some(1)
+    );
+}
+
+/// AC-11 (LAB-2687): a pinned account whose org lacks fast mode is not a
+/// viable preferred candidate for a `speed: "fast"` request — the exclusion
+/// runs before the pin filter, so the request spills to the general pool.
+#[tokio::test]
+async fn pinned_client_fast_request_spills_when_pin_is_fast_mode_disabled() {
+    let state = pinned_test_state();
+    state.endpoints[0].rate_info.write().await.utilization = Some(0.1);
+    state.endpoints[1].rate_info.write().await.utilization = Some(0.1);
+    state.note_fast_mode_disabled("dedicated", 1);
+
+    assert_eq!(
+        state
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", true)
+            .await,
+        Some(0),
+        "fast request must spill off a fast-mode-disabled pin"
+    );
+}
+
+/// AC-11 (LAB-2687): the same pin, same client, standard request — the
+/// fast-mode mark is irrelevant and the pin holds.
+#[tokio::test]
+async fn pinned_client_standard_request_keeps_fast_mode_disabled_pin() {
+    let state = pinned_test_state();
+    state.endpoints[0].rate_info.write().await.utilization = Some(0.1);
+    state.endpoints[1].rate_info.write().await.utilization = Some(0.1);
+    state.note_fast_mode_disabled("dedicated", 1);
+
+    assert_eq!(
+        state
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
+            .await,
+        Some(1),
+        "standard request must stay pinned despite the fast-mode mark"
     );
 }
 
@@ -20063,7 +20426,7 @@ async fn pinned_client_rotation_prefers_remaining_preferred_then_spills() {
         let key = format!("client:sess:{i}");
         assert_eq!(
             state
-                .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[1], "passbolt")
+                .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[1], "passbolt", false)
                 .await,
             Some(2),
             "with one preferred endpoint skipped, the remaining one must serve"
@@ -20072,7 +20435,7 @@ async fn pinned_client_rotation_prefers_remaining_preferred_then_spills() {
     // Both preferred endpoints skipped → spill to the general pool.
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[1, 2], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[1, 2], "passbolt", false)
             .await,
         Some(0),
         "with all preferred endpoints skipped, the general pool must serve"
@@ -20188,7 +20551,7 @@ async fn pinned_client_spills_when_preferred_endpoint_at_paid_overage() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
             .await,
         Some(0),
         "an overage-covered preferred endpoint must spill to free general-pool capacity"

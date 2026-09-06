@@ -393,6 +393,18 @@ can steer are locked down by default:
   in `src/main.rs`. Some families pair with a request-body field (`fast-mode-*`
   with top-level `speed: "fast"`), and the body is forwarded verbatim — so
   dropping the header alone is a hard upstream `400`, not a quiet downgrade.
+- **Fast mode routes around non-entitled orgs.** Fast mode is an
+  org-level entitlement, and a pool can span several Anthropic orgs. When an
+  account answers a `speed: "fast"` request with the upstream `400` "Fast
+  mode is not enabled for your organization", the proxy rotates that request
+  to another account and marks the endpoint fast-mode-disabled for 15
+  minutes (`anthropic_fast_mode_disabled_total{account}` on `/metrics`,
+  `fast_mode_disabled_remaining_secs` on `/_stats`). Later fast requests skip
+  it — a client pinned to it via `preferred_endpoints` spills to the general
+  pool — while requests without `speed: "fast"` keep using it. The proxy
+  never strips `speed` on the client's behalf — if no eligible account is entitled, the
+  client gets the upstream `400` verbatim rather than a silent downgrade or a
+  synthetic `429`.
 
 ### Known Limitations
 

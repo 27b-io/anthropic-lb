@@ -659,6 +659,9 @@ struct Endpoint {
     /// here (Pro plan) → Fable requests demote this endpoint by `overage_penalty`.
     fable_included: bool,
     requests: AtomicU64,
+    /// `anthropic_fast_mode_disabled_total`: upstream "Fast mode is not
+    /// enabled for your organization" 400s this account returned (LAB-2687).
+    fast_mode_disabled_total: AtomicU64,
     rate_info: RwLock<RateLimitInfo>,
     burn_rate: Mutex<BurnRate>,
     input_tokens: AtomicU64,
@@ -847,6 +850,13 @@ struct AppState {
     /// mutex, never held across `.await`; bounded by UNSUPPORTED_MODEL_MAX
     /// + TTL eviction. Per-replica: a fresh replica re-learns in one attempt.
     unsupported_models: Mutex<HashMap<(usize, String), Instant>>,
+    /// Endpoint idx → expiry for accounts whose org has fast mode disabled,
+    /// learned from the upstream's own 400 (LAB-2687). Only `speed: "fast"`
+    /// requests skip them. Kept apart from `unsupported_models` so a client
+    /// spraying junk model names can't fill that cap and starve this learn;
+    /// keyed by endpoint index, so bounded by config. Sync mutex, never held
+    /// across `.await`; per-replica like `unsupported_models`.
+    fast_mode_disabled: Mutex<HashMap<usize, Instant>>,
     /// Opt-in encrypted response cache on non-streaming /v1/messages
     /// (LAB-933). None = feature off — the no-config case is byte-identical
     /// to pre-cache behaviour (AC1).
@@ -2761,6 +2771,11 @@ const UNSUPPORTED_MODEL_TTL: Duration = Duration::from_secs(900);
 /// costs the pre-LAB-941 behaviour) and TTL expiry drains the map.
 const UNSUPPORTED_MODEL_MAX: usize = 256;
 
+/// Fast-mode-disabled hold (LAB-2687): same hold as the model cache — the
+/// entitlement flips only by org-admin action; expiry is the self-heal and
+/// costs one wasted upstream 400 that trips no cooldown.
+const FAST_MODE_DISABLED_TTL: Duration = UNSUPPORTED_MODEL_TTL;
+
 /// Sentinel value written to `alb:hard:{account}` when a replica has observed
 /// recovery from a hard rate limit. Other replicas interpret this as an
 /// instruction to proactively clear their local `hard_limited_until`, which
@@ -3546,30 +3561,75 @@ impl AppState {
     }
 
     /// True when EVERY endpoint whose config allows `model` carries a live
-    /// unsupported-model entry — the pool cannot serve the model at all,
-    /// regardless of capacity. Used at exhaustion: on a warm negative cache
-    /// the candidate pool empties before any forward attempt runs, so there
-    /// is no stashed upstream 404 — this check lets the handler synthesize
-    /// one instead of degrading to a retryable 429 (LAB-941 follow-up).
-    /// Endpoints excluded by their config `models` allowlist never serve the
-    /// model and don't count; false when no endpoint could ever serve it
-    /// (config-only exclusion keeps its pre-existing 429 semantics).
-    fn model_unsupported_everywhere(&self, model: &str) -> bool {
+    /// negative-cache entry — unsupported model (LAB-941) or, for a
+    /// `speed: "fast"` request, fast mode disabled on its org (LAB-2687) — so
+    /// no rotation can help. Gates the exhaustion reply: only then is a
+    /// stashed upstream 4xx returned (or synthesized on the warm path, where
+    /// the pool emptied before any forward ran). A rejection on one account
+    /// plus rate limits on the rest is a rate-limited pool, and the
+    /// retryable 429 stays the truth. Endpoints excluded by their config
+    /// `models` allowlist never serve the model and don't count; false when
+    /// no endpoint could ever serve it (config-only exclusion keeps its
+    /// pre-existing 429 semantics).
+    fn pool_cannot_serve(&self, model: &str, fast: bool) -> bool {
         if model.is_empty() {
             return false;
         }
-        let unsupported = self.unsupported_endpoints_for(model);
+        let mut excluded = self.unsupported_endpoints_for(model);
+        if fast {
+            excluded.extend(self.fast_mode_disabled_endpoints());
+        }
         let mut eligible = 0usize;
         for (i, ep) in self.endpoints.iter().enumerate() {
             if !ep.serves_model(model) {
                 continue;
             }
             eligible += 1;
-            if !unsupported.contains(&i) {
+            if !excluded.contains(&i) {
                 return false;
             }
         }
         eligible > 0
+    }
+
+    /// Record that `endpoint_idx`'s org has fast mode disabled — the upstream
+    /// itself said so (LAB-2687). Fast requests skip it for FAST_MODE_DISABLED_TTL.
+    fn note_fast_mode_disabled(&self, endpoint_name: &str, endpoint_idx: usize) {
+        self.endpoints[endpoint_idx]
+            .fast_mode_disabled_total
+            .fetch_add(1, Ordering::Relaxed);
+        let Ok(mut map) = self.fast_mode_disabled.lock() else {
+            return;
+        };
+        warn!(
+            account = endpoint_name,
+            cooldown_secs = FAST_MODE_DISABLED_TTL.as_secs(),
+            "fast mode not enabled on account's org, routing fast requests away"
+        );
+        map.insert(endpoint_idx, Instant::now() + FAST_MODE_DISABLED_TTL);
+    }
+
+    /// Live fast-mode-disabled endpoint indices — the `speed: "fast"` twin of
+    /// `unsupported_endpoints_for`.
+    fn fast_mode_disabled_endpoints(&self) -> Vec<usize> {
+        let now = Instant::now();
+        match self.fast_mode_disabled.lock() {
+            Ok(map) => map
+                .iter()
+                .filter(|(_, expiry)| **expiry > now)
+                .map(|(idx, _)| *idx)
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Seconds left on `endpoint_idx`'s fast-mode-disabled entry; None when
+    /// unmarked or expired (`/_stats`, shaped like `hard_limited_remaining_secs`).
+    fn fast_mode_disabled_remaining_secs(&self, endpoint_idx: usize) -> Option<u64> {
+        let map = self.fast_mode_disabled.lock().ok()?;
+        map.get(&endpoint_idx)?
+            .checked_duration_since(Instant::now())
+            .map(|d| d.as_secs())
     }
 
     async fn routing_candidates(&self, model: &str, skip: &[EndpointIdx]) -> Vec<RoutingCandidate> {
@@ -4310,8 +4370,9 @@ impl AppState {
         }
     }
 
-    /// Test-only convenience: pick with no client identity, so no pinning
-    /// applies. Keeps the pre-LAB-2636 routing tests byte-identical.
+    /// Test-only convenience: pick with no client identity and standard
+    /// speed — no pinning, no fast-mode exclusion. Keeps the pre-LAB-2636
+    /// routing tests byte-identical.
     #[cfg(test)]
     async fn pick_endpoint(
         &self,
@@ -4319,7 +4380,7 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
     ) -> Option<EndpointIdx> {
-        self.pick_endpoint_for_client(affinity_key, model, skip, "")
+        self.pick_endpoint_for_client(affinity_key, model, skip, "", false)
             .await
     }
 
@@ -4340,6 +4401,10 @@ impl AppState {
     /// free general-pool capacity — violating the free-before-paid guarantee
     /// below, which the retain would otherwise bypass.
     ///
+    /// `fast` (LAB-2687): a `speed: "fast"` request also drops
+    /// `fast_mode_disabled` accounts BEFORE the pin filter, so a non-entitled
+    /// pin spills rather than serving.
+    ///
     /// Tiers are tried strictly in ascending priority order. Within a tier:
     /// healthy candidates (`gate < soft_limit`) are preferred; if none are healthy
     /// the tier degrades to its soft-limited candidates. Only when a tier has zero
@@ -4353,8 +4418,25 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
         client_id: &str,
+        fast: bool,
     ) -> Option<EndpointIdx> {
         let mut candidates = self.routing_candidates(model, skip).await;
+        let fast_disabled = if fast {
+            self.fast_mode_disabled_endpoints()
+        } else {
+            Vec::new()
+        };
+        candidates.retain(|c| {
+            if fast_disabled.contains(&c.endpoint) {
+                trace!(
+                    endpoint = self.endpoints[c.endpoint].name,
+                    model,
+                    "pick: skipping, fast mode disabled on endpoint"
+                );
+                return false;
+            }
+            true
+        });
         if let Some(preferred) = self.client_preferred_endpoints(client_id) {
             let is_preferred =
                 |c: &RoutingCandidate| self.endpoint_is_preferred(preferred, c.endpoint);
@@ -4374,7 +4456,11 @@ impl AppState {
                 // account(s) and will consume shared-pool cache/claims.
                 info!(
                     client_id,
-                    model, "pick: no preferred endpoint viable — spilling to general pool"
+                    model,
+                    fast_mode_disabled = fast_disabled
+                        .iter()
+                        .any(|&i| self.endpoint_is_preferred(preferred, i)),
+                    "pick: no preferred endpoint viable — spilling to general pool"
                 );
             }
         }
@@ -6965,10 +7051,11 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 ///     (ETIMEDOUT/reset/closed/DNS) — the loop treats these with round-gated
 ///     rotation (retry the affinity/cache-warm endpoint in place on round 0,
 ///     rotate only on later rounds) and a transient-aware exhaustion status.
-///   - `RetryModelUnsupported(resp)`: the endpoint rejected the request's
-///     MODEL, not the request itself (LAB-941). The forward path has already
-///     negative-cached the (endpoint, model) pair; the loop rotates like a
-///     429 while stashing the upstream's error response, so a model no OTHER
+///   - `RetryRejectedByAccount(resp)`: the ACCOUNT rejected the request, not
+///     the request itself — its plan lacks the model (LAB-941) or its org
+///     lacks fast mode (LAB-2687). The forward path has already
+///     negative-cached the endpoint; the loop rotates like a 429 while
+///     stashing the upstream's error response, so a request no OTHER
 ///     endpoint can serve still surfaces the real error — a nonexistent-model
 ///     404 must not morph into a synthetic 429 that invites retries.
 // Response payloads are boxed so the enum stays small (one word per payload):
@@ -6977,7 +7064,7 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 // same pattern as `authenticate` / `reserve_request_body`).
 enum ForwardOutcome {
     Done(Box<Response>),
-    RetryModelUnsupported(Box<Response>),
+    RetryRejectedByAccount(Box<Response>),
     Retry {
         saw_529: bool,
         push_skip: bool,
@@ -7020,6 +7107,29 @@ fn is_model_unsupported_error(status: StatusCode, body: &serde_json::Value) -> b
         return true;
     }
     msg.to_ascii_lowercase().contains("invalid model name")
+}
+
+/// Exact upstream text of the org-level fast-mode entitlement 400 (observed
+/// 2026-09-02, LAB-2687), replayed on the warm negative-cache path where no
+/// upstream response exists. The matcher keys on its "for your organization"
+/// clause, not the whole string, so trailing wording drift still rotates.
+const FAST_MODE_NOT_ENABLED_MSG: &str =
+    "Fast mode is not enabled for your organization. An organization admin must enable this feature.";
+
+/// True when an upstream 400 says this ACCOUNT's org has fast mode disabled
+/// (LAB-2687): 400 `{"type":"error","error":{"type":"invalid_request_error",
+/// "message":"Fast mode is not enabled for your organization. ..."}}`.
+/// Anchored on the org clause so a hypothetical per-model "Fast mode is not
+/// enabled for <model>" 400 can't mark an entitled account. The proxy-induced
+/// `speed: Extra inputs are not permitted` 400 must NOT match either —
+/// rotating cannot fix a request the proxy itself broke.
+fn is_fast_mode_not_enabled_error(status: StatusCode, body: &serde_json::Value) -> bool {
+    status == StatusCode::BAD_REQUEST
+        && body.pointer("/error/type").and_then(|v| v.as_str()) == Some("invalid_request_error")
+        && body
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m.contains("Fast mode is not enabled for your organization"))
 }
 
 /// Surface the real cause of a `reqwest::Error`. The Display form only shows
@@ -7213,15 +7323,15 @@ fn apply_round_outcome(
     skip: &mut Vec<EndpointIdx>,
     saw_529: &mut bool,
     saw_transient: &mut bool,
-    model_unsupported_resp: &mut Option<Response>,
+    rejected_resp: &mut Option<Response>,
 ) -> RetryStep {
     match outcome {
         ForwardOutcome::Done(resp) => RetryStep::Return(*resp),
-        // Model rejected by this endpoint: rotate immediately (another
-        // account may serve it) but keep the upstream's error in hand for
-        // the case where none does (LAB-941).
-        ForwardOutcome::RetryModelUnsupported(resp) => {
-            *model_unsupported_resp = Some(*resp);
+        // Account-level rejection (model outside its plan, LAB-941; org lacks
+        // fast mode, LAB-2687): rotate immediately (another account may serve
+        // it) but keep the upstream's error in hand for the case where none does.
+        ForwardOutcome::RetryRejectedByAccount(resp) => {
+            *rejected_resp = Some(*resp);
             skip.push(picked_idx);
             RetryStep::NextAttempt
         }
@@ -7336,12 +7446,13 @@ fn model_unsupported_response(model: &str, openai_shape: bool) -> Response {
         .into_response()
 }
 
-/// 400 in Anthropic's error envelope when an Anthropic request can't be
-/// faithfully translated for an OpenAI-compat fallback endpoint (e.g. an
-/// image source type the translator doesn't support). The caller's request
-/// was Anthropic Messages API shaped, so the error response matches that,
-/// regardless of which protocol the fallback endpoint speaks.
-fn untranslatable_request_response(message: &str) -> Response {
+/// 400 in Anthropic's `invalid_request_error` envelope. Used when an
+/// Anthropic request can't be faithfully translated for an OpenAI-compat
+/// fallback endpoint (e.g. an image source type the translator doesn't
+/// support), and to replay the fast-mode entitlement 400 on the warm
+/// negative-cache path (LAB-2687). The caller's request was Anthropic
+/// Messages API shaped, so the error response matches that.
+fn invalid_request_response(message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
         [("content-type", "application/json")],
@@ -7835,18 +7946,27 @@ async fn forward_anthropic(
                     state.note_prompt_too_long(req_id, model, session_key, msg);
                 }
             }
-            // Model unsupported on THIS account (e.g. outside its plan):
-            // negative-cache the pair and rotate — another account may serve
-            // it. Forwarding the 404 as-is wedges affinity-pinned clients
-            // into a permanent retry loop against this account (LAB-941).
-            if is_model_unsupported_error(status, &parsed) {
+            // THIS account rejected the request — model outside its plan
+            // (LAB-941) or fast mode not enabled on its org (LAB-2687):
+            // negative-cache it and rotate — another account may serve it.
+            // Forwarding the 4xx as-is wedges affinity-pinned clients into a
+            // permanent retry loop against this account.
+            let rejected = if is_model_unsupported_error(status, &parsed) {
                 state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                true
+            } else if is_fast_mode_not_enabled_error(status, &parsed) {
+                state.note_fast_mode_disabled(endpoint_name, endpoint_idx);
+                true
+            } else {
+                false
+            };
+            if rejected {
                 let response = builder
                     .body(Body::from(resp_body_bytes))
                     .unwrap_or_else(|_| {
                         (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                     });
-                return ForwardOutcome::RetryModelUnsupported(Box::new(response));
+                return ForwardOutcome::RetryRejectedByAccount(Box::new(response));
             }
         }
         finalize_non_stream(
@@ -8016,13 +8136,16 @@ async fn proxy_handler(
     };
 
     // Parse body once for model extraction and optional cache injection
-    let (body_bytes, oauth_body_bytes, model, fp, cache_key) =
+    let (body_bytes, oauth_body_bytes, model, fast, fp, cache_key) =
         if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             let model = parsed
                 .get("model")
                 .and_then(|m| m.as_str())
                 .unwrap_or("")
                 .to_string();
+            // Fast mode is an org-level entitlement: only requests that ask
+            // for it must avoid accounts whose org lacks it (LAB-2687).
+            let fast = parsed.get("speed").and_then(|v| v.as_str()) == Some("fast");
             let mut mutated = false;
 
             // Privacy-safe fingerprint instrumentation (digests only, no body
@@ -8146,12 +8269,13 @@ async fn proxy_handler(
                 bytes::Bytes::from(bytes),
                 bytes::Bytes::from(oauth_bytes),
                 model,
+                fast,
                 Some(fp),
                 cache_key,
             )
         } else {
             let clone = body_bytes.clone();
-            (body_bytes, clone, String::new(), None, None)
+            (body_bytes, clone, String::new(), false, None, None)
         };
 
     // Build the affinity key now that fp is known. fp is the finest routing
@@ -8197,9 +8321,9 @@ async fn proxy_handler(
     let n = state.endpoints.len();
     let mut last_saw_529 = false;
     let mut last_saw_transient = false;
-    // Upstream error from the most recent model-unsupported rejection —
+    // Upstream error from the most recent account-level rejection —
     // returned verbatim if the pool exhausts on nothing but rejections.
-    let mut model_unsupported_resp: Option<Response> = None;
+    let mut rejected_resp: Option<Response> = None;
     // OpenAI-shape body, built lazily on the first OpenAI-endpoint attempt
     // and reused across rotations/retries (LAB-716). Lazy so requests served
     // entirely by Anthropic endpoints — the common case — never pay for the
@@ -8225,7 +8349,7 @@ async fn proxy_handler(
             // (OpenAI). Both return a `ForwardOutcome` so the shared
             // round-gated policy in `apply_round_outcome` covers both.
             let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
+                .pick_endpoint_for_client(affinity, &model, &skip, &client_id, fast)
                 .await
             {
                 Some(i) => {
@@ -8291,9 +8415,7 @@ async fn proxy_handler(
                                     // Terminal, not a retry: the request itself
                                     // is the problem, so rotating would fail the
                                     // same way on every endpoint.
-                                    ForwardOutcome::Done(Box::new(untranslatable_request_response(
-                                        msg,
-                                    )))
+                                    ForwardOutcome::Done(Box::new(invalid_request_response(msg)))
                                 }
                             };
                             (out, i)
@@ -8315,7 +8437,7 @@ async fn proxy_handler(
                 &mut skip,
                 &mut saw_529,
                 &mut saw_transient,
-                &mut model_unsupported_resp,
+                &mut rejected_resp,
             ) {
                 // LAB-933: the single success seam — every proxied response
                 // (Anthropic or translated OpenAI) exits proxy_handler here,
@@ -8341,23 +8463,27 @@ async fn proxy_handler(
         }
     }
 
-    // A pool exhausted purely by model rejections (no 529/transient in the
-    // final round) returns the upstream's own error — truthful when the model
-    // exists nowhere. Overload/transient exhaustion keeps its retryable
-    // status; the negative cache already routes follow-up requests away from
-    // the rejecting endpoints (LAB-941).
-    if !last_saw_529 && !last_saw_transient {
-        if let Some(resp) = model_unsupported_resp {
+    // A pool exhausted by account-level rejections alone (no 529/transient
+    // in the final round, and the negative caches agree EVERY eligible
+    // account rejects) returns the upstream's own error — truthful when no
+    // account can serve the request, where a 429 would invite retries of a
+    // permanently-failing request (LAB-941, LAB-2687). Anything short of that
+    // — one rejection plus rate limits on the rest — is a rate-limited pool
+    // and keeps the retryable status.
+    if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, fast) {
+        if let Some(resp) = rejected_resp {
             return resp;
         }
-        // Warm-cache path: every eligible endpoint was filtered by the
-        // negative cache BEFORE any forward ran, so nothing was stashed.
-        // Synthesize the same truthful 404 the first request returned —
-        // a 429 here would invite retries of a permanently-failing model.
-        if state.model_unsupported_everywhere(&model) {
-            warn!(model, "model unsupported on all eligible endpoints");
-            return model_unsupported_response(&model, false);
+        // Warm-cache path: the pool emptied BEFORE any forward ran, so
+        // nothing was stashed — synthesize the error the first request got.
+        // A fast request refused by a fast-disabled account was refused for
+        // its speed, not its model.
+        if fast && !state.fast_mode_disabled_endpoints().is_empty() {
+            warn!(model, "fast mode not enabled on any eligible endpoint");
+            return invalid_request_response(FAST_MODE_NOT_ENABLED_MSG);
         }
+        warn!(model, "model unsupported on all eligible endpoints");
+        return model_unsupported_response(&model, false);
     }
     exhaustion_response(last_saw_transient, last_saw_529)
 }
@@ -8575,7 +8701,7 @@ async fn try_fallback_upstream(
         };
         if model_unsupported {
             state.note_model_unsupported(&ep.name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
+            return ForwardOutcome::RetryRejectedByAccount(Box::new(response));
         }
         return ForwardOutcome::Done(Box::new(response));
     }
@@ -8832,6 +8958,7 @@ async fn build_stats_entry(
     burn_rate: &Mutex<BurnRate>,
     requests: &AtomicU64,
     token_counters: [&AtomicU64; 4],
+    fast_mode_disabled_secs: Option<u64>,
     now_epoch: u64,
     total_headroom: &mut Option<u64>,
 ) -> serde_json::Value {
@@ -8925,6 +9052,7 @@ async fn build_stats_entry(
         "limit_requests": info.limit_requests,
         "limit_tokens": info.limit_tokens,
         "hard_limited_remaining_secs": hard_limited,
+        "fast_mode_disabled_remaining_secs": fast_mode_disabled_secs,
         "burn_rate": {
             "last_5m": (br_5m * 100.0).round() / 100.0,
             "last_1h": (br_1h * 100.0).round() / 100.0,
@@ -8964,7 +9092,7 @@ async fn stats_handler(
     let now_epoch = AppState::now_epoch();
     let mut total_headroom: Option<u64> = Some(0);
     let mut endpoint_stats = Vec::new();
-    for ep in &state.endpoints {
+    for (i, ep) in state.endpoints.iter().enumerate() {
         let protocol = match ep.protocol {
             Protocol::Anthropic => "anthropic",
             Protocol::OpenAI => "openai",
@@ -8984,6 +9112,7 @@ async fn stats_handler(
                     &ep.cache_creation_tokens,
                     &ep.cache_read_tokens,
                 ],
+                state.fast_mode_disabled_remaining_secs(i),
                 now_epoch,
                 &mut total_headroom,
             )
@@ -9779,6 +9908,24 @@ async fn metrics_handler(
             "anthropic_account_hard_limited_remaining_seconds",
             &[("account", &s.name)],
             s.hard_limited_secs,
+        );
+    }
+
+    // Org-level fast-mode entitlement marks (LAB-2687): one increment per
+    // "Fast mode is not enabled" 400 an account returned. Non-zero on an
+    // account means its org needs fast mode enabled — an operator action.
+    prom_header(
+        &mut buf,
+        "anthropic_fast_mode_disabled_total",
+        "counter",
+        "Upstream 'Fast mode is not enabled for your organization' 400 responses by account",
+    );
+    for ep in &state.endpoints {
+        prom_counter(
+            &mut buf,
+            "anthropic_fast_mode_disabled_total",
+            &[("account", &ep.name)],
+            ep.fast_mode_disabled_total.load(Ordering::Relaxed),
         );
     }
 
@@ -12178,7 +12325,7 @@ async fn forward_openai_compat_anthropic(
             });
         if model_unsupported {
             state.note_model_unsupported(endpoint_name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
+            return ForwardOutcome::RetryRejectedByAccount(Box::new(response));
         }
         return ForwardOutcome::Done(Box::new(response));
     }
@@ -12513,9 +12660,9 @@ async fn openai_chat_handler(
     let n = state.endpoints.len();
     let mut last_saw_529 = false;
     let mut last_saw_transient = false;
-    // Upstream error from the most recent model-unsupported rejection —
+    // Upstream error from the most recent account-level rejection —
     // returned verbatim if the pool exhausts on nothing but rejections.
-    let mut model_unsupported_resp: Option<Response> = None;
+    let mut rejected_resp: Option<Response> = None;
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
             let delay = round_backoff_delay(retry_round, last_saw_529);
@@ -12534,8 +12681,9 @@ async fn openai_chat_handler(
             // Pick the next endpoint and dispatch by protocol. Both forwards
             // return a `ForwardOutcome` so the shared round-gated policy in
             // `apply_round_outcome` covers both.
+            // OpenAI→Anthropic translation carries no `speed`: never fast.
             let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
+                .pick_endpoint_for_client(affinity, &model, &skip, &client_id, false)
                 .await
             {
                 Some(i) => {
@@ -12601,7 +12749,7 @@ async fn openai_chat_handler(
                 &mut skip,
                 &mut saw_529,
                 &mut saw_transient,
-                &mut model_unsupported_resp,
+                &mut rejected_resp,
             ) {
                 RetryStep::Return(resp) => return resp,
                 RetryStep::NextAttempt => continue,
@@ -12615,16 +12763,15 @@ async fn openai_chat_handler(
         }
     }
 
-    // Same model-rejection exhaustion rule as `proxy_handler` (LAB-941),
-    // in the OpenAI error shape this handler's clients parse.
-    if !last_saw_529 && !last_saw_transient {
-        if let Some(resp) = model_unsupported_resp {
+    // Same rejection-exhaustion rule as `proxy_handler` (LAB-941), in the
+    // OpenAI error shape this handler's clients parse. Never `fast`: the
+    // OpenAI→Anthropic translation carries no `speed`.
+    if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, false) {
+        if let Some(resp) = rejected_resp {
             return resp;
         }
-        if state.model_unsupported_everywhere(&model) {
-            warn!(model, "model unsupported on all eligible endpoints");
-            return model_unsupported_response(&model, true);
-        }
+        warn!(model, "model unsupported on all eligible endpoints");
+        return model_unsupported_response(&model, true);
     }
     exhaustion_response(last_saw_transient, last_saw_529)
 }
@@ -13098,6 +13245,7 @@ async fn main() {
                 priority: ec.priority,
                 fable_included: ec.fable_included.unwrap_or(true),
                 requests: AtomicU64::new(0),
+                fast_mode_disabled_total: AtomicU64::new(0),
                 rate_info: RwLock::new(RateLimitInfo::default()),
                 burn_rate: Mutex::new(BurnRate::new()),
                 input_tokens: AtomicU64::new(0),
@@ -13337,6 +13485,7 @@ async fn main() {
         prompt_too_long: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
+        fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache,
     });
 
