@@ -180,6 +180,7 @@ token = "sk-ant-api03-..."
 | `allow_unauthenticated` | `bool` | `false` | The one escape hatch from default-deny: boot with no credentials at all. Trusted-network-only; incompatible with configured credentials |
 | `allowed_ips` | `[String]?` | `None` | IP/CIDR allowlist (unset = **allow all**) |
 | `trusted_proxies` | `[String]?` | `None` | IPs/CIDRs of load balancers whose `x-forwarded-for` is honoured (unset = header ignored) |
+| `forward_caller_identity` | `bool` | `false` | Relay caller-identity headers (`x-forwarded-for`, `x-real-ip`, `forwarded`, `true-client-ip`, `x-client-id`, `x-agent-id`, `x-session-id`) to the upstream; off = stripped once the proxy has used them (see *Real client IP behind a load balancer*) |
 | `auth_failure_limit` | `u32` | `10` | Failed-auth attempts per client IP inside the window before further invalid credentials get 429; valid credentials always pass (0 = throttle off) |
 | `auth_failure_window_secs` | `u64` | `300` | Failed-auth throttle window |
 | `auto_cache` | `bool` | `true` | Inject prompt caching beta header |
@@ -343,6 +344,7 @@ It **fails closed** on a model it cannot read. The proxy takes the model from th
 | **Admin surfaces** | `operators = ["ops"]` | `/_stats` + `/metrics` need an operator credential (401/403) | no one can read them under `[[clients]]` |
 | **Failed-auth throttle** | `auth_failure_limit` / `auth_failure_window_secs` | Further invalid credentials get 429 + `retry-after` per client IP after repeated failures; valid credentials always pass | on (10 / 300s) |
 | **Trusted proxies** | `trusted_proxies = ["192.0.2.0/24"]` | Real client IP recovered from `x-forwarded-for` behind a listed LB | header ignored |
+| **Caller-identity privacy** | `forward_caller_identity = false` | Caller IP and `x-client-id`/`x-agent-id`/`x-session-id` headers dropped before the upstream request | **stripped** |
 | **Model allow-list** | `clients[].models` | Rejects models outside a client's list (403) | all models |
 
 IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are compared in constant time, and startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`).
@@ -356,6 +358,8 @@ IP check runs first, then the credential check; failed credentials are subject t
 ### Real client IP behind a load balancer
 
 Behind a GCLB/Cloudflare/ingress, the TCP peer is the LB — without XFF handling, IP allowlists degenerate to "allow the LB", per-IP throttles rate-limit the LB, and every log line records the LB. Configure `trusted_proxies` with the LB's address range; the client IP then becomes the **rightmost `x-forwarded-for` entry not itself in `trusted_proxies`** — the last hop an attacker cannot append to. From any peer *not* in the list the header is ignored entirely (never trusted, never logged as authoritative), and malformed entries fall back to the peer address.
+
+Those headers stop here. Once the client IP is resolved, the proxy drops `x-forwarded-for`, `x-real-ip`, `forwarded`, `true-client-ip` and its own `x-client-id`, `x-agent-id`, `x-session-id` from the upstream request on both forward paths, so a pooled-account request upstream is not labelled with the caller behind the proxy. `forward_caller_identity = true` restores relaying. Two things this does not cover. Edge-added `cf-*` headers (`cf-connecting-ip` carries the same caller IP) are the ingress's to strip, not the proxy's ([#166](https://github.com/27b-io/anthropic-lb/issues/166)): the Cloudflare Worker does, a plain cloudflared tunnel does not, so on that path the caller IP still reaches the upstream. And Claude Code's native `x-claude-code-session-id` passes through untouched pending [#171](https://github.com/27b-io/anthropic-lb/issues/171).
 
 > [!IMPORTANT]
 > Behind a load balancer, **`[[clients]]` credentials are the identity**. The `client_names` IP map is a lab-only convenience: it maps *source addresses*, and once traffic arrives through an LB the recovered XFF address is only as trustworthy as the LB's own header hygiene. Do not hang budgets or operator status on `client_names` on a public ingress.

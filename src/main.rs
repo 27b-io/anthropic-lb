@@ -148,6 +148,9 @@ struct Config {
     /// They reveal the pooled capacity of every account behind the proxy, so
     /// this is trusted-network-only. Default: false (LAB-1191).
     expose_upstream_ratelimit_headers: Option<bool>,
+    /// Relay the caller-identity headers (`CLIENT_IDENTITY_HEADERS`) to the
+    /// upstream. Default: false = stripped once the proxy has used them (GH #168).
+    forward_caller_identity: Option<bool>,
     /// Client-supplied `anthropic-beta` flags forwarded upstream on OAuth
     /// endpoints ("*" suffix wildcards, like `endpoints[].models`). Absent =
     /// built-in default (`DEFAULT_CLIENT_BETA_ALLOWLIST`); a configured
@@ -813,6 +816,9 @@ struct AppState {
     /// Reflect upstream `anthropic-ratelimit-*` headers to callers (see
     /// `Config::expose_upstream_ratelimit_headers`). Default: false.
     expose_upstream_ratelimit_headers: bool,
+    /// Relay caller-identity headers upstream (see
+    /// `Config::forward_caller_identity`). Default: false = stripped.
+    forward_caller_identity: bool,
     /// `anthropic-beta` flags a client may forward upstream on OAuth
     /// endpoints ("*" suffix wildcards). Flags outside the list are dropped.
     allowed_client_betas: Vec<String>,
@@ -7487,6 +7493,31 @@ fn body_wants_stream(body: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Caller-identity headers that must not leave this proxy. The IP set is what
+/// fronting hops (cloudflared, the Cloudflare Worker, nginx-ingress) carry the
+/// caller's address in — `resolve_client_ip` reads only `x-forwarded-for`; the
+/// rest are stripped so they cannot leak either. The `x-*-id` set is this
+/// proxy's own client/agent/session vocabulary. Relayed upstream, any of them
+/// ties a pooled-account request to the individual caller behind the proxy
+/// (GH #168). Deliberately absent: Claude Code's native
+/// `x-claude-code-session-id` (GH #171, operator decision) and edge-added
+/// `cf-*`, which the ingress strips (GH #166).
+const CLIENT_IDENTITY_HEADERS: &[&str] = &[
+    "x-forwarded-for",
+    "x-real-ip",
+    "forwarded",
+    "true-client-ip",
+    "x-client-id",
+    "x-agent-id",
+    "x-session-id",
+];
+
+fn strip_client_identity_headers(headers: &mut axum::http::HeaderMap) {
+    for name in CLIENT_IDENTITY_HEADERS {
+        headers.remove(*name);
+    }
+}
+
 /// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
 /// passes the picked endpoint and its pool index (used for `skip` and usage
 /// accounting).
@@ -7542,6 +7573,9 @@ async fn forward_anthropic(
     headers.remove("host");
     headers.remove("content-length"); // body size may change after cache injection
     headers.remove("accept-encoding"); // need plaintext SSE to extract token usage
+    if !state.forward_caller_identity {
+        strip_client_identity_headers(&mut headers);
+    }
 
     // Default anthropic-version if client didn't set it
     if !headers.contains_key("anthropic-version") {
@@ -12029,6 +12063,9 @@ async fn forward_openai_compat_anthropic(
     }
     headers.remove("content-length"); // body size changes after translation
     headers.remove("accept-encoding"); // we need plaintext to translate the response
+    if !state.forward_caller_identity {
+        strip_client_identity_headers(&mut headers);
+    }
 
     // Inject required Anthropic headers
     headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -13428,6 +13465,7 @@ async fn main() {
         expose_upstream_ratelimit_headers: config
             .expose_upstream_ratelimit_headers
             .unwrap_or(false),
+        forward_caller_identity: config.forward_caller_identity.unwrap_or(false),
         allowed_client_betas: config.allowed_client_betas.clone().unwrap_or_else(|| {
             DEFAULT_CLIENT_BETA_ALLOWLIST
                 .iter()
