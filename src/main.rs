@@ -13281,10 +13281,13 @@ async fn main() {
     // unreachable backend. A process that boots during a backend outage
     // serves local-only (coordination ops gated off via
     // `coordination_redis`) and attaches automatically when the backend
-    // becomes reachable; `None` here means a config error (unparseable URL),
-    // which stays local-only for the process lifetime. Mid-run outage
-    // behaviour is unchanged from LAB-932 AC5: once connected, drops
-    // reconnect with capped exponential backoff.
+    // becomes reachable. A config error (unparseable URL) is different —
+    // LAB-3026: an operator who set `redis_url` has said shared state is
+    // required, so a URL that fails to parse (e.g. a password with an
+    // unescaped `@`/`/`/`?`/`#`/`:`) fails startup outright instead of
+    // silently downgrading to local-only, matching the `response_cache`
+    // config gate below. Mid-run outage behaviour is unchanged from LAB-932
+    // AC5: once connected, drops reconnect with capped exponential backoff.
     let redis = if let Some(ref url) = config.redis_url {
         let perf = PerformanceConfig {
             default_command_timeout: REDIS_COMMAND_TIMEOUT,
@@ -13301,10 +13304,10 @@ async fn main() {
         let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
         match start_coordination_redis(url.as_str(), perf, conn_config, policy) {
             Ok(client) => Some(client),
-            Err(e) => {
-                warn!(error = %e, "invalid redis_url — running in local-only mode");
-                None
-            }
+            // Log only `kind()` (a fixed enum, e.g. `Url`/`Config`) — never
+            // the error's `Display`/`details()`, which for a malformed URL
+            // can echo the offending fragment back, credential included.
+            Err(e) => panic!("redis_url: failed to parse ({:?})", e.kind()),
         }
     } else {
         None
