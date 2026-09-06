@@ -427,6 +427,7 @@ fn test_state_base() -> AppState {
         beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
+        client_rejections: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache: None,
     }
@@ -6876,6 +6877,156 @@ async fn budget_check_within_limit() {
 
     // Unknown client has no budget, always ok
     assert!(state.check_budget("unknown").await.is_ok());
+}
+
+// ── Unit: pre-request-gate rejection counter (LAB-2551) ────────
+
+/// A budget-exhausted request must both 429 and increment the rejection
+/// counter under its (client, reason) key — the counter is the only
+/// machine-readable record of a gate rejection (the warn! log is not
+/// chartable).
+#[tokio::test]
+async fn gate_rejection_counted_by_client_and_reason() {
+    let mut budgets = HashMap::new();
+    budgets.insert("client-a".to_string(), 100u64);
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        client_budgets: budgets,
+        ..test_state_base()
+    });
+    state.record_budget_usage("client-a", 200).await;
+
+    for expected in [1u64, 2] {
+        let resp = state
+            .pre_request_gate("client-a", "claude-sonnet-4-6")
+            .await
+            .expect_err("exhausted budget must reject");
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let counts = state.client_rejections.lock().unwrap();
+        assert_eq!(
+            counts.get(&("client-a".to_string(), "budget")),
+            Some(&expected),
+            "each rejection must increment the (client, budget) key"
+        );
+    }
+}
+
+/// Past the cap, rejections for NEW clients must lump into the single global
+/// `_other` key (keeping the reason label) — a per-client overflow key would
+/// be unbounded on the client axis under legacy header auth (CWE-770, the
+/// LAB-2332 lesson). Existing keys keep counting past the cap.
+#[test]
+fn rejection_counter_overflow_lumps_into_global_other() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    // The cap bounds distinct CLIENTS, not (client, reason) entries: 32
+    // clients on 2 reasons each is 64 entries but only 32 slots — a new
+    // client must still be admitted with its own key.
+    for i in 0..32 {
+        state.note_client_rejection(&format!("client-{i}"), "budget");
+        state.note_client_rejection(&format!("client-{i}"), "utilization");
+    }
+    state.note_client_rejection("client-32", "budget");
+    {
+        let counts = state.client_rejections.lock().unwrap();
+        assert_eq!(
+            counts.get(&("client-32".to_string(), "budget")),
+            Some(&1),
+            "entry count must not gate admission — only distinct clients do"
+        );
+    }
+    // Fill up to the distinct-client cap.
+    for i in 33..MAX_CLIENT_REJECTION_LABELS {
+        state.note_client_rejection(&format!("client-{i}"), "budget");
+    }
+    // Over the cap: new clients bucket into ("_other", reason)…
+    state.note_client_rejection("fresh-1", "budget");
+    state.note_client_rejection("fresh-2", "brake");
+    // …while an existing key still counts…
+    state.note_client_rejection("client-0", "budget");
+    // …and a TRACKED client's first hit on a NEW reason keeps its own key —
+    // a brake event stamps every active client at once, so crossing the cap
+    // mid-incident must not split a tracked client's attribution.
+    state.note_client_rejection("client-0", "brake");
+
+    let counts = state.client_rejections.lock().unwrap();
+    assert_eq!(counts.get(&("_other".to_string(), "budget")), Some(&1));
+    assert_eq!(counts.get(&("_other".to_string(), "brake")), Some(&1));
+    assert_eq!(counts.get(&("client-0".to_string(), "budget")), Some(&2));
+    assert_eq!(counts.get(&("client-0".to_string(), "brake")), Some(&1));
+    assert!(
+        counts.len() <= 3 * (MAX_CLIENT_REJECTION_LABELS + 1),
+        "map must stay hard-bounded at reasons × (tracked clients + _other)"
+    );
+}
+
+/// The client id is caller-controlled under legacy header auth: an oversized
+/// value must be truncated BEFORE becoming a map key, or it is retained for
+/// the process lifetime and re-serialized on every /metrics scrape.
+#[test]
+fn rejection_counter_truncates_client_label() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let huge = "x".repeat(4096);
+    state.note_client_rejection(&huge, "brake");
+    let counts = state.client_rejections.lock().unwrap();
+    let (client, _) = counts.keys().next().expect("one entry recorded");
+    assert!(
+        client.chars().count() <= MAX_LABEL_CHARS + 1,
+        "client label must be truncated (got {} chars)",
+        client.chars().count()
+    );
+}
+
+/// End to end: a budget-429 through the router must surface as
+/// `anthropic_client_rejections_total{client,reason}` on /metrics, and the
+/// family header must be present even before that (discoverability at zero).
+#[tokio::test]
+async fn metrics_expose_client_rejections() {
+    let mut budgets = HashMap::new();
+    budgets.insert("client-a".to_string(), 100u64);
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        client_budgets: budgets,
+        ..test_state_base()
+    });
+    state.record_budget_usage("client-a", 200).await;
+    let addr = serve(build_router(state)).await;
+    let c = reqwest::Client::new();
+
+    let m = c
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        m.contains("# TYPE anthropic_client_rejections_total counter"),
+        "family header must be exported before any rejection:\n{m}"
+    );
+
+    let resp = c
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-client-id", "client-a")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+    let m = c
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        m.contains(r#"anthropic_client_rejections_total{client="client-a",reason="budget"} 1"#),
+        "budget 429 must increment the labelled counter:\n{m}"
+    );
 }
 
 // ── Integration: 5xx retry ─────────────────────────────────────

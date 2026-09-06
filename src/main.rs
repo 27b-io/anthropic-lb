@@ -485,6 +485,17 @@ const MAX_TRACKED_CLIENTS: usize = 10_000;
 /// The model half is caller-controlled; overflow buckets into `_other`.
 const MAX_MODEL_DENIED_LABELS: usize = 64;
 
+/// Cap on distinct clients in the pre-request-gate rejection counter
+/// (LAB-2551). Past the cap, rejections for NEW clients lump into a single
+/// global `_other` client key (never per-client overflow keys — the CWE-770
+/// shape), while already-tracked clients may still add entries under new
+/// reasons — a brake event stamps every active client at once, so crossing
+/// the cap mid-incident must not split a tracked client's attribution. The
+/// reason axis is a closed static set of 3, so entries are hard-bounded at
+/// 3 × (cap + 1). Real deployments have tens of clients; only caller-minted
+/// ids under legacy header auth can approach this.
+const MAX_CLIENT_REJECTION_LABELS: usize = 64;
+
 /// Cap on distinct (client, model) pairs in the per-model usage counter
 /// (LAB-2330). The model key is normally response-derived (upstream-validated),
 /// but the request-model fallback is caller-influenced and the client key is
@@ -839,6 +850,14 @@ struct AppState {
     /// caller-controlled — bounded via the same `_other` overflow as
     /// `prompt_too_long`.
     model_denied: Mutex<HashMap<(String, String), u64>>,
+    /// Pre-request-gate 429 rejections, keyed (client, reason) (LAB-2551).
+    /// Exposed as `anthropic_client_rejections_total`. `reason` is the closed
+    /// static set budget / utilization / brake — the three capacity denials in
+    /// `pre_request_gate`; 403 policy denials stay on `model_denied`. `client`
+    /// is caller-controlled under legacy header auth, so it is truncated and
+    /// the map is bounded via a global `_other` overflow
+    /// (`MAX_CLIENT_REJECTION_LABELS`).
+    client_rejections: Mutex<HashMap<(String, &'static str), u64>>,
     /// (endpoint idx, model) pairs an upstream rejected as unsupported — a
     /// gateway without the model, or a plan without access (LAB-941).
     /// `routing_candidates` skips these until the entry expires; because
@@ -2059,6 +2078,38 @@ impl AppState {
                 "rejected: model not in client allow-list"
             );
         }
+    }
+
+    /// Count a pre-request-gate 429 rejection (LAB-2551).
+    ///
+    /// `client_id` is truncated before becoming a map key (caller-controlled
+    /// under legacy header auth), and past `MAX_CLIENT_REJECTION_LABELS`
+    /// distinct clients NEW clients lump into the single global `_other` key
+    /// — keeping the reason label so overflow traffic still charts by cause.
+    /// Callers already log the rejection; this only feeds `/metrics`.
+    fn note_client_rejection(&self, client_id: &str, reason: &'static str) {
+        let Ok(mut counts) = self.client_rejections.lock() else {
+            return;
+        };
+        let key = (truncate_label(client_id), reason);
+        // Tracked = the CLIENT has any entry, not this exact (client, reason)
+        // pair: a tracked client's first rejection under a new reason must
+        // not fall to `_other` just because the cap was crossed in between.
+        // The cap likewise bounds distinct CLIENTS, not (client, reason)
+        // entries — one client on all 3 reasons must burn one slot, not
+        // three. O(cap) scans, only on the rejection path.
+        let tracked = counts.keys().any(|(c, _)| *c == key.0);
+        let distinct_clients = counts
+            .keys()
+            .map(|(c, _)| c.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let key = if tracked || distinct_clients < MAX_CLIENT_REJECTION_LABELS {
+            key
+        } else {
+            ("_other".to_owned(), reason)
+        };
+        *counts.entry(key).or_insert(0) += 1;
     }
 
     /// Resolve client identity: x-client-id header → IP map fallback → "-"
@@ -6629,6 +6680,7 @@ impl AppState {
 
         // 1. Daily token budget (existing)
         if client_id != "-" && self.check_budget(client_id).await.is_err() {
+            self.note_client_rejection(client_id, "budget");
             warn!(client_id = %client_id, "rejected: daily token budget exceeded");
             return Err(Box::new(
                 (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response(),
@@ -6637,6 +6689,7 @@ impl AppState {
 
         // 2. Utilization limit (new)
         if let Err(retry_after) = self.check_utilization_limit(client_id, model).await {
+            self.note_client_rejection(client_id, "utilization");
             warn!(
                 client_id = %client_id,
                 retry_after = retry_after,
@@ -6656,6 +6709,7 @@ impl AppState {
 
         // 3. Emergency brake (new)
         if self.is_emergency_brake_active().await {
+            self.note_client_rejection(client_id, "brake");
             warn!(
                 client_id = %client_id,
                 "rejected: emergency brake active"
@@ -9513,6 +9567,12 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
+    let client_rejections: Vec<((String, &'static str), u64)> = state
+        .client_rejections
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
     let beta_flags_dropped: Vec<(String, u64)> = state
         .beta_flags_dropped
         .lock()
@@ -10392,6 +10452,25 @@ async fn metrics_handler(
             &mut buf,
             "anthropic_client_model_denied_total",
             &[("client", client.as_str()), ("model", model.as_str())],
+            *n,
+        );
+    }
+
+    // Pre-request-gate 429 rejections (LAB-2551). Per-replica, in-memory —
+    // dashboards must rate() before summing across pods. The header is
+    // emitted even at zero series so the family is discoverable before the
+    // first rejection.
+    prom_header(
+        &mut buf,
+        "anthropic_client_rejections_total",
+        "counter",
+        "Requests rejected (429) by the pre-request gate, by client and reason (budget/utilization/brake)",
+    );
+    for ((client, reason), n) in &client_rejections {
+        prom_counter(
+            &mut buf,
+            "anthropic_client_rejections_total",
+            &[("client", client.as_str()), ("reason", reason)],
             *n,
         );
     }
@@ -13336,6 +13415,7 @@ async fn main() {
         beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
+        client_rejections: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache,
     });
