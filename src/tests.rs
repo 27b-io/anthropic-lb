@@ -7220,6 +7220,122 @@ async fn proxy_retries_on_server_error() {
     assert_eq!(call_count.load(Ordering::Relaxed), 2);
 }
 
+// ── LAB-3214: one INFO line per proxied request ─────────────────
+
+/// `MakeWriter` over a shared buffer, so a test can capture what the stderr
+/// layer would have written and inspect it after the request completes.
+#[derive(Clone)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Install the capturing subscriber exactly once for the whole test binary.
+/// A scope-local `tracing::subscriber::set_default` is unreliable here:
+/// `tracing`'s per-callsite `Interest` cache is process-global, and hundreds
+/// of other tests exercise these same log callsites concurrently with no
+/// subscriber at all — that races the cache to "not interested" before a
+/// scoped override ever gets a chance (a documented `tracing` limitation,
+/// not specific to this crate: see the "Rebuilding Cached Interest" section
+/// of `tracing_core::callsite`). A single global subscriber captures every
+/// concurrent test's output into one buffer; callers filter by a marker
+/// unique to their own request instead of relying on line count alone.
+fn log_capture_buf() -> Arc<Mutex<Vec<u8>>> {
+    static BUF: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    BUF.get_or_init(|| {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturedLog(buf.clone()))
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new("anthropic_lb=info"))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("log_capture_buf: global default already set by another test");
+        buf
+    })
+    .clone()
+}
+
+/// Regression guard for the `proxied`+`usage` merge (LAB-3214): at the
+/// production default filter (`anthropic_lb=info`), a successful
+/// non-streaming `/v1/messages` request must produce exactly one INFO line
+/// for that request, carrying both routing context and token usage, and no
+/// `fingerprint` detail (that's DEBUG-only). Filters the shared capture
+/// buffer by a client-id marker unique to this test so concurrently running
+/// tests' own log lines can't be mistaken for this request's.
+#[tokio::test]
+async fn single_info_line_per_proxied_request() {
+    let buf = log_capture_buf();
+
+    // Mock upstream that returns usage (mock_anthropic_handler carries
+    // `"usage": {"input_tokens": 10, "output_tokens": 5}`), so the merged
+    // line's token fields are exercised, not just left at zero.
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            mock_listener,
+            Router::new().fallback(any(mock_anthropic_handler)),
+        )
+        .await
+        .unwrap();
+    });
+
+    let (app, _state) = test_app(&format!("http://{mock_addr}"), None);
+    let app_addr = serve(app).await;
+
+    let marker = "lab3214-single-info-line-marker";
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{app_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "any")
+        .header("x-client-id", marker)
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let my_lines: Vec<&str> = output.lines().filter(|l| l.contains(marker)).collect();
+    assert_eq!(
+        my_lines.len(),
+        1,
+        "expected exactly one log line for this request, got:\n{}",
+        my_lines.join("\n")
+    );
+    assert!(
+        my_lines[0].contains(" INFO ") && my_lines[0].contains("proxied"),
+        "the single line should be the merged INFO `proxied` line, got: {}",
+        my_lines[0]
+    );
+    assert!(
+        my_lines[0].contains("input=10") && my_lines[0].contains("output=5"),
+        "merged line should carry token usage, got: {}",
+        my_lines[0]
+    );
+    assert!(
+        !my_lines[0].contains("fingerprint"),
+        "fingerprint detail must not appear for this request at the default (INFO) filter, got: {}",
+        my_lines[0]
+    );
+}
+
 // ── time_adjusted_utilization unit tests ────────────────────────
 
 #[test]

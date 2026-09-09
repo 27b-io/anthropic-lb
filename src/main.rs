@@ -6102,14 +6102,13 @@ impl AppState {
     }
 }
 
+/// Usage-only log line for the unified-OpenAI-endpoint fallback path
+/// (`try_fallback_upstream`), which has no routing/utilization snapshot to
+/// merge with (OpenAI endpoints carry stub `RateLimitInfo`). Kept separate
+/// from `log_proxied` below — LAB-3214 folded the native and openai-compat
+/// paths' `proxied` + `usage` lines into one; this path never had a
+/// `proxied` line to fold into, so its usage echo stays as its own line.
 fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &TokenUsage) {
-    // INFO (temporarily): surfaces per-request cache_read vs cache_write so we can
-    // join it to the `fingerprint` line by req_id and learn whether fan-out agents
-    // share a cacheable preamble (reads) or are independent (creates) — and whether
-    // a real multi-turn session keeps getting reads after fp-keying (the fp
-    // stability check). Revert to debug! once that question is answered. Token
-    // accounting is independent of log level (Prometheus counters + optional
-    // shadow-log); this line is only the human-readable echo.
     info!(
         req_id,
         client_id,
@@ -6121,6 +6120,122 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
         cache_write = usage.cache_creation_input_tokens,
         "usage"
     );
+}
+
+/// Routing/utilization snapshot captured when upstream response headers
+/// arrive (the former standalone `proxied` / `proxied (openai-compat)` INFO
+/// lines), carried through to `finalize_stream` / `finalize_non_stream` so it
+/// can be logged on the SAME line as token usage — known only once the body
+/// or stream completes (LAB-3214: one INFO line per request, not two).
+enum ProxiedCtx {
+    Anthropic {
+        client_ver: String,
+        utilization: String,
+        util_5h: String,
+        util_7d: String,
+        constraint: &'static str,
+        overage: bool,
+        pin: &'static str,
+        total: u64,
+    },
+    OpenaiCompat {
+        client_ver: String,
+        utilization: String,
+        util_5h: String,
+        util_7d: String,
+        constraint: &'static str,
+        pin: &'static str,
+        stream: bool,
+    },
+}
+
+/// Emit the single per-request INFO line merging routing context with token
+/// usage. Usage fields are simply zero when nothing was extracted (error
+/// response, client disconnect, upstream failure) — still exactly one line,
+/// still carrying req_id/account/status (AC4), so no separate branch is
+/// needed for the no-usage case.
+#[allow(clippy::too_many_arguments)]
+fn log_proxied(
+    req_id: &str,
+    client_id: &str,
+    model: &str,
+    account: &str,
+    client_ip: &str,
+    agent: &str,
+    session: &str,
+    status_code: u16,
+    ctx: &ProxiedCtx,
+    usage: &TokenUsage,
+) {
+    match ctx {
+        ProxiedCtx::Anthropic {
+            client_ver,
+            utilization,
+            util_5h,
+            util_7d,
+            constraint,
+            overage,
+            pin,
+            total,
+        } => {
+            info!(
+                req_id,
+                client = %client_ip,
+                client_id,
+                ver = %client_ver,
+                agent,
+                session,
+                model,
+                account,
+                status = status_code,
+                utilization = %utilization,
+                util_5h = %util_5h,
+                util_7d = %util_7d,
+                constraint = *constraint,
+                overage,
+                pin = *pin,
+                total,
+                input = usage.input_tokens,
+                output = usage.output_tokens,
+                cached = usage.cache_read_input_tokens,
+                cache_write = usage.cache_creation_input_tokens,
+                "proxied"
+            );
+        }
+        ProxiedCtx::OpenaiCompat {
+            client_ver,
+            utilization,
+            util_5h,
+            util_7d,
+            constraint,
+            pin,
+            stream,
+        } => {
+            info!(
+                req_id,
+                client = %client_ip,
+                client_id,
+                ver = %client_ver,
+                agent,
+                session,
+                model,
+                account,
+                status = status_code,
+                utilization = %utilization,
+                util_5h = %util_5h,
+                util_7d = %util_7d,
+                constraint = *constraint,
+                pin = *pin,
+                openai_compat = true,
+                stream,
+                input = usage.input_tokens,
+                output = usage.output_tokens,
+                cached = usage.cache_read_input_tokens,
+                cache_write = usage.cache_creation_input_tokens,
+                "proxied (openai-compat)"
+            );
+        }
+    }
 }
 
 /// Finalize a streaming response: extract usage, log, and shadow log.
@@ -6137,6 +6252,7 @@ async fn finalize_stream(
     agent: &str,
     session: &str,
     status_code: u16,
+    ctx: ProxiedCtx,
     mut scanner: SseUsageScanner,
     request_start: std::time::Instant,
     client_disconnected: bool,
@@ -6152,9 +6268,6 @@ async fn finalize_stream(
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
     if !usage.is_empty() {
         state.record_usage(ep, client_id, usage_model, usage).await;
-        // Log the same model the metric records, so the usage log and
-        // anthropic_client_model_token_usage_total reconcile.
-        log_usage(req_id, client_id, usage_model, acct_name, usage);
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -6183,6 +6296,7 @@ async fn finalize_stream(
             client_id,
             model,
             account = acct_name,
+            status = status_code,
             reason,
             elapsed_ms,
             sse_bytes = scanner.bytes_seen,
@@ -6192,6 +6306,23 @@ async fn finalize_stream(
             "stream_end_no_usage"
         );
     }
+    // Single terminal line for this request (LAB-3214), routing context
+    // merged with usage — zero-valued when none was captured. `usage_model`
+    // (not `model`) so this reconciles with
+    // `anthropic_client_model_token_usage_total`, which records against the
+    // same response-derived model.
+    log_proxied(
+        req_id,
+        client_id,
+        usage_model,
+        acct_name,
+        client_ip,
+        agent,
+        session,
+        status_code,
+        &ctx,
+        usage,
+    );
     let mut log = serde_json::json!({
         "ts": AppState::now_epoch(),
         "client": client_ip,
@@ -6236,13 +6367,11 @@ async fn finalize_non_stream(
     openai_compat: bool,
     session_key: Option<&str>,
     context_window: u64,
+    ctx: Option<ProxiedCtx>,
 ) {
+    let usage_model = response_model.unwrap_or(model);
     if !usage.is_empty() {
-        let usage_model = response_model.unwrap_or(model);
         state.record_usage(ep, client_id, usage_model, usage).await;
-        // Log the same model the metric records, so the usage log and
-        // anthropic_client_model_token_usage_total reconcile.
-        log_usage(req_id, client_id, usage_model, acct_name, usage);
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -6255,6 +6384,29 @@ async fn finalize_non_stream(
                 context_window,
                 AppState::now_epoch(),
             );
+        }
+    }
+    // Single terminal INFO line for this request (AC1/AC2/AC3/AC4) — merged
+    // routing + usage where a routing snapshot exists. The unified-OpenAI-
+    // endpoint fallback path (no snapshot) keeps its own usage-only echo,
+    // fired only when usage was actually captured (unchanged behavior).
+    match &ctx {
+        Some(c) => log_proxied(
+            req_id,
+            client_id,
+            usage_model,
+            acct_name,
+            client_ip,
+            agent,
+            session,
+            status_code,
+            c,
+            usage,
+        ),
+        None => {
+            if !usage.is_empty() {
+                log_usage(req_id, client_id, usage_model, acct_name, usage);
+            }
         }
     }
     let mut log = serde_json::json!({
@@ -7727,31 +7879,31 @@ async fn forward_anthropic(
         state.signal_hard_limit_recovery(endpoint_name).await;
     }
 
-    // Log with capacity info + inject budget status header
-    let budget_status = {
+    // Capture the routing/utilization snapshot + inject budget status header.
+    // The `proxied` line itself is deferred to `finalize_stream`/
+    // `finalize_non_stream`, which merge it with token usage once known
+    // (LAB-3214: one INFO line per request, not two).
+    let (budget_status, ctx) = {
         let info = rate_info.read().await;
         let (eff_util, constraint, _adj_5h, _adj_7d) =
             effective_utilization(&info, AppState::now_epoch(), model);
-        info!(
-            req_id,
-            client = %client_ip,
-            client_id = %client_id,
-            ver = %client_ver,
-            agent = %agent_id,
-            session = %session_id,
-            model = %model,
-            account = endpoint_name,
-            status = status.as_u16(),
-            utilization = format_args!("{eff_util:.2}"),
-            util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-            util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+        let ctx = ProxiedCtx::Anthropic {
+            client_ver: client_ver.to_owned(),
+            utilization: format!("{eff_util:.2}"),
+            util_5h: info
+                .utilization_5h
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
+            util_7d: info
+                .utilization_7d
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
             constraint,
-            overage = info.overage_in_use,
-            pin = state.pin_status(client_id, endpoint_idx),
-            total = ep.requests.load(Ordering::Relaxed),
-            "proxied"
-        );
-        compute_pressure_status(eff_util, client_id, state)
+            overage: info.overage_in_use,
+            pin: state.pin_status(client_id, endpoint_idx),
+            total: ep.requests.load(Ordering::Relaxed),
+        };
+        (compute_pressure_status(eff_util, client_id, state), ctx)
     };
 
     let latency_ms = request_start.elapsed().as_millis() as u64;
@@ -7836,6 +7988,7 @@ async fn forward_anthropic(
                 &agent_clone,
                 &session_clone,
                 status_code,
+                ctx,
                 scanner,
                 request_start,
                 client_disconnected,
@@ -7956,6 +8109,7 @@ async fn forward_anthropic(
             false,
             session_key,
             context_window,
+            Some(ctx),
         )
         .await;
         let response = builder
@@ -8189,24 +8343,31 @@ async fn proxy_handler(
             // cache order, for prize-sizing. Computed AFTER auto-injection so it
             // reflects the breakpoints actually forwarded upstream (covers the
             // headerless fleet that relies on the proxy's injected breakpoints).
-            // model is included because caches are per-model. Join to `usage`
-            // (cache_read/write) and `proxied` (account) by req_id offline.
-            let bps = prefix_breakpoint_hashes(&parsed)
-                .into_iter()
-                .map(|(pos, h)| format!("{pos}:{h}"))
-                .collect::<Vec<_>>()
-                .join("|");
-            info!(
-                req_id,
-                client_id = %client_id,
-                session = %session_id,
-                agent = %agent_id,
-                model = %model,
-                fp = %fp,
-                fps = %fps,
-                bps = %bps,
-                "fingerprint"
-            );
+            // model is included because caches are per-model. Join to `proxied`
+            // (account + token usage) by req_id offline.
+            //
+            // DEBUG only (LAB-3214): per-request detail, not the default INFO
+            // line. `bps` is unbounded length, so skip building it entirely
+            // when debug isn't enabled — it's otherwise unused (fp/fps still
+            // feed routing above regardless of log level).
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let bps = prefix_breakpoint_hashes(&parsed)
+                    .into_iter()
+                    .map(|(pos, h)| format!("{pos}:{h}"))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                debug!(
+                    req_id,
+                    client_id = %client_id,
+                    session = %session_id,
+                    agent = %agent_id,
+                    model = %model,
+                    fp = %fp,
+                    fps = %fps,
+                    bps = %bps,
+                    "fingerprint"
+                );
+            }
 
             // Re-serialize. The `preserve_order` feature on serde_json is critical:
             // without it, serde uses BTreeMap which reorders JSON keys alphabetically,
@@ -8872,6 +9033,9 @@ async fn try_fallback_upstream(
         // the session registry (LAB-916) tracks Anthropic-bound traffic only.
         None,
         0,
+        // OpenAI endpoints carry stub RateLimitInfo — no routing snapshot to
+        // merge with; this path keeps its own usage-only log line (LAB-3214).
+        None,
     )
     .await;
 
@@ -12187,31 +12351,35 @@ async fn forward_openai_compat_anthropic(
         state.signal_hard_limit_recovery(endpoint_name).await;
     }
 
-    // Compute budget pressure status for response header + log
-    let budget_status = {
+    // Capture the routing/utilization snapshot + inject budget status header.
+    // The `proxied (openai-compat)` line is deferred to `finalize_stream`/
+    // `finalize_non_stream`, which merge it with token usage once known
+    // (LAB-3214: one INFO line per request, not two).
+    // Named `proxied_ctx` (not `ctx`) — this function's streaming branch
+    // already has a local `ctx: StreamContext` for SSE translation.
+    let (budget_status, proxied_ctx) = {
         let info = rate_info.read().await;
         let (eff_util, constraint, _adj_5h, _adj_7d) =
             effective_utilization(&info, AppState::now_epoch(), model);
-        info!(
-            req_id,
-            client = %client_ip,
-            client_id = %client_id,
-            ver = %client_ver,
-            agent = %agent_id,
-            session = %session_id,
-            model = %model,
-            account = endpoint_name,
-            status = status.as_u16(),
-            utilization = format_args!("{eff_util:.2}"),
-            util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-            util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+        let proxied_ctx = ProxiedCtx::OpenaiCompat {
+            client_ver: client_ver.to_owned(),
+            utilization: format!("{eff_util:.2}"),
+            util_5h: info
+                .utilization_5h
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
+            util_7d: info
+                .utilization_7d
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
             constraint,
-            pin = state.pin_status(client_id, endpoint_idx),
-            openai_compat = true,
-            stream = is_streaming,
-            "proxied (openai-compat)"
-        );
-        compute_pressure_status(eff_util, client_id, state)
+            pin: state.pin_status(client_id, endpoint_idx),
+            stream: is_streaming,
+        };
+        (
+            compute_pressure_status(eff_util, client_id, state),
+            proxied_ctx,
+        )
     };
 
     // Non-2xx: log error detail, translate to OpenAI error format, return
@@ -12412,6 +12580,7 @@ async fn forward_openai_compat_anthropic(
                 &agent_clone,
                 &session_clone,
                 status_code,
+                proxied_ctx,
                 scanner,
                 request_start,
                 client_gone,
@@ -12483,6 +12652,7 @@ async fn forward_openai_compat_anthropic(
         true,
         session_key,
         context_window,
+        Some(proxied_ctx),
     )
     .await;
 

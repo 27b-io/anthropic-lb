@@ -185,6 +185,7 @@ token = "sk-ant-api03-..."
 | `auth_failure_window_secs` | `u64` | `300` | Failed-auth throttle window |
 | `auto_cache` | `bool` | `true` | Inject prompt caching beta header |
 | `shadow_log` | `String?` | `None` | Path to JSONL shadow log file |
+| `debug_log` | `String?` | `None` | Path to an additional `debug`-level `tracing` log file (see [Logging](#logging)); the stderr stream stays at `info` regardless |
 | `soft_limit` | `f64` | `0.90` | Utilization ceiling — accounts above are excluded from routing |
 | `client_names` | `{IP: name}` | `{}` | IP → client ID mapping |
 | `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
@@ -599,6 +600,20 @@ The configured `token` is injected as `Authorization: Bearer`, and the request i
 
 > [!TIP]
 > The proxy reads Anthropic's `anthropic-ratelimit-unified-*` headers to track real utilization per rate-limit window (5h, 7d) and per-model claim (e.g. Sonnet vs Opus sub-budgets). Near window resets, utilization is time-discounted so accounts about to reset aren't unnecessarily avoided. API status signals (`allowed_warning`, `throttled`, `rejected`) enforce utilization floors regardless of the reported number.
+
+---
+
+## Logging
+
+Structured `tracing` logs go to stderr at `info` level by default (one line
+per request that reaches upstream, carrying routing context — client, model,
+account, status, utilization — and token usage together). Override the
+filter with `RUST_LOG` (e.g. `RUST_LOG=anthropic_lb=debug`), or set
+`debug_log = "/path/to/file.log"` in the config to additionally write a
+`debug`-level file log alongside the `info`-level stderr stream. At `debug`,
+per-request content fingerprinting (`fingerprint`: `fp`/`fps`/`bps`) becomes
+visible — useful for diagnosing routing-affinity stickiness, but too
+high-volume for the default filter.
 
 ---
 
