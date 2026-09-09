@@ -11658,6 +11658,64 @@ async fn record_budget_usage_skips_unknown_client() {
     assert!(map.is_empty());
 }
 
+/// LAB-3217: the sync-tick fold seeds an empty mirror, never lowers a higher
+/// one (the LAB-1962 floor), replaces a stale day instead of summing it,
+/// leaves a mirror that already rolled past the fetched day alone, and skips
+/// zero/absent counters. Pure; the Redis-backed half lives in
+/// `redis_integration::sync_from_redis_seeds_budget_mirror_from_shared_counter`.
+#[tokio::test]
+async fn fold_budget_mirror_seeds_floors_and_replaces_stale_day() {
+    let today = AppState::now_epoch() / 86400;
+    let state = Arc::new(AppState {
+        budget_usage: Mutex::new(
+            [
+                ("floor".to_string(), (today, 500u64)),
+                ("stale".to_string(), (today - 1, 900)),
+                ("ahead".to_string(), (today + 1, 70)),
+            ]
+            .into(),
+        ),
+        ..test_state_base()
+    });
+
+    state.fold_budget_mirror(
+        today,
+        [
+            ("seed", 300u64),
+            ("floor", 200),
+            ("stale", 100),
+            ("ahead", 999),
+            ("zero", 0),
+        ],
+    );
+
+    let map = state.budget_usage.lock().unwrap();
+    assert_eq!(
+        map["seed"],
+        (today, 300),
+        "empty mirror seeds from the shared counter"
+    );
+    assert_eq!(
+        map["floor"],
+        (today, 500),
+        "a higher local floor is never lowered"
+    );
+    assert_eq!(
+        map["stale"],
+        (today, 100),
+        "a stale day is replaced, not summed"
+    );
+    assert_eq!(
+        map["ahead"],
+        (today + 1, 70),
+        "a mirror already past the fetched day is left alone"
+    );
+    assert!(
+        !map.contains_key("zero"),
+        "a zero/absent counter folds nothing"
+    );
+}
+
 // ── Config deserialization (real struct, not toml::Value) ─────
 
 #[test]
@@ -18826,6 +18884,93 @@ mod redis_integration {
         assert!(
             roll.check_budget("roll-cli").await.is_ok(),
             "yesterday's counter must not gate today"
+        );
+    }
+
+    /// LAB-3217 AC1/AC2: a fresh replica's empty budget mirror is seeded from
+    /// the shared `alb:budget:{client}:{today}` counter on its first sync
+    /// tick, so `/_stats` `used_today`/`remaining` and the
+    /// `anthropic_client_budget_*` gauges equal the fleet total after a
+    /// restart — and a later tick whose counter is BEHIND the local mirror
+    /// never lowers it (the LAB-1962 floor). Pairs with the pure
+    /// `fold_budget_mirror_seeds_floors_and_replaces_stale_day`.
+    #[tokio::test]
+    async fn sync_from_redis_seeds_budget_mirror_from_shared_counter() {
+        let Some((mut conn, fred)) = redis_test_conn(11).await else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let today = AppState::now_epoch() / 86400;
+        let key = format!("alb:budget:seed-cli:{today}");
+        // The fleet spent this much before the replica under test started.
+        let _: () = conn.set(&key, 1_516_491u64).await.unwrap();
+
+        let state = Arc::new(AppState {
+            endpoints: vec![make_endpoint("seed-ep", Protocol::Anthropic)],
+            client_budgets: [("seed-cli".to_string(), 2_000_000u64)].into(),
+            redis: Some(fred),
+            ..test_state_base()
+        });
+        assert!(
+            state.budget_usage.lock().unwrap().is_empty(),
+            "a fresh replica starts with an empty mirror"
+        );
+
+        state.sync_from_redis().await;
+
+        assert_eq!(
+            state.budget_usage.lock().unwrap().get("seed-cli").copied(),
+            Some((today, 1_516_491)),
+            "first sync tick must seed the mirror from the shared counter"
+        );
+
+        let app = build_router(state.clone());
+        let addr = serve(app).await;
+        let client = Client::new();
+        let stats: serde_json::Value = serde_json::from_str(
+            &client
+                .get(format!("http://{addr}/_stats"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stats["client_budgets"]["seed-cli"]["used_today"], 1_516_491,
+            "/_stats used_today must equal the shared counter"
+        );
+        assert_eq!(
+            stats["client_budgets"]["seed-cli"]["remaining"], 483_509,
+            "/_stats remaining must be limit − shared counter"
+        );
+        let metrics = client
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            metrics.contains("anthropic_client_budget_used{client=\"seed-cli\"} 1516491"),
+            "budget_used gauge must equal the shared counter:\n{metrics}"
+        );
+        assert!(
+            metrics.contains("anthropic_client_budget_remaining{client=\"seed-cli\"} 483509"),
+            "budget_remaining gauge must be limit − shared counter:\n{metrics}"
+        );
+
+        // AC2: a counter that fell BEHIND the mirror (an INCRBY lost while
+        // Redis was away) must not lower the enforcement floor.
+        let _: () = conn.set(&key, 1_000u64).await.unwrap();
+        state.sync_from_redis().await;
+        assert_eq!(
+            state.budget_usage.lock().unwrap().get("seed-cli").copied(),
+            Some((today, 1_516_491)),
+            "a lagging shared counter must never lower the local floor"
         );
     }
 
