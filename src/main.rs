@@ -8014,8 +8014,7 @@ async fn forward_anthropic(
         // previous `unwrap_or_default()` turned a mid-body connection reset into
         // an empty body forwarded under the upstream's 2xx status — the caller
         // (Claude Code) then saw a truncated "success" and reported it as a
-        // socket error, while our logs showed a clean `proxied status=200`
-        // (that line is emitted above, before the body is read). Log loudly and
+        // socket error, while our logs showed no trace of it. Log loudly and
         // return a real 502 so the failure is visible and the SDK gets a
         // well-formed error frame instead of a silent corruption. Mirrors the
         // error-detection structure of the sibling body-read sites
@@ -8031,6 +8030,21 @@ async fn forward_anthropic(
                     status = status.as_u16(),
                     error = %e,
                     "upstream response body read failed mid-stream"
+                );
+                // This branch returns before `finalize_non_stream` — log the
+                // merged line here too (no usage: the body never arrived), so
+                // the routing/utilization snapshot still lands at INFO (AC4).
+                log_proxied(
+                    req_id,
+                    client_id,
+                    model,
+                    endpoint_name,
+                    &client_ip.to_string(),
+                    agent_id,
+                    session_id,
+                    status.as_u16(),
+                    &ctx,
+                    &TokenUsage::default(),
                 );
                 let body = serde_json::json!({
                     "type": "error",
@@ -8084,6 +8098,22 @@ async fn forward_anthropic(
             // into a permanent retry loop against this account (LAB-941).
             if is_model_unsupported_error(status, &parsed) {
                 state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                // This branch returns before `finalize_non_stream` — log the
+                // merged line here too, so a model-unsupported rejection
+                // still gets the routing/utilization snapshot at INFO, same
+                // as the old unconditional `proxied` line did (AC4).
+                log_proxied(
+                    req_id,
+                    client_id,
+                    model,
+                    endpoint_name,
+                    &client_ip.to_string(),
+                    agent_id,
+                    session_id,
+                    status.as_u16(),
+                    &ctx,
+                    &usage,
+                );
                 let response = builder
                     .body(Body::from(resp_body_bytes))
                     .unwrap_or_else(|_| {
@@ -12399,6 +12429,22 @@ async fn forward_openai_compat_anthropic(
             error_message = ?error_msg,
             "openai-compat: upstream error"
         );
+        // This branch returns before `finalize_non_stream` — log the merged
+        // line here too (zero usage), so an upstream error still gets the
+        // routing/utilization snapshot at INFO, same as the old unconditional
+        // `proxied (openai-compat)` line did (AC4).
+        log_proxied(
+            req_id,
+            client_id,
+            model,
+            endpoint_name,
+            &client_ip.to_string(),
+            agent_id,
+            session_id,
+            status.as_u16(),
+            &proxied_ctx,
+            &TokenUsage::default(),
+        );
 
         // Translate Anthropic error to OpenAI error format so clients
         // (LiteLLM, etc.) can parse the actual error message.
@@ -12610,6 +12656,21 @@ async fn forward_openai_compat_anthropic(
         Ok(b) => b,
         Err(e) => {
             error!("failed to read upstream response: {e}");
+            // This branch returns before `finalize_non_stream` — log the
+            // merged line here too (no usage: the body never arrived), so
+            // the routing/utilization snapshot still lands at INFO (AC4).
+            log_proxied(
+                req_id,
+                client_id,
+                model,
+                endpoint_name,
+                &client_ip.to_string(),
+                agent_id,
+                session_id,
+                status.as_u16(),
+                &proxied_ctx,
+                &TokenUsage::default(),
+            );
             return ForwardOutcome::Done(Box::new(
                 (StatusCode::BAD_GATEWAY, "failed to read upstream response").into_response(),
             ));
@@ -12619,6 +12680,20 @@ async fn forward_openai_compat_anthropic(
     let anthropic_resp: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
         Ok(v) => v,
         Err(_) => {
+            // Same as above: malformed upstream body means we never reach
+            // `finalize_non_stream`, so log the routing snapshot here.
+            log_proxied(
+                req_id,
+                client_id,
+                model,
+                endpoint_name,
+                &client_ip.to_string(),
+                agent_id,
+                session_id,
+                status.as_u16(),
+                &proxied_ctx,
+                &TokenUsage::default(),
+            );
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")

@@ -7254,6 +7254,9 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
 /// of `tracing_core::callsite`). A single global subscriber captures every
 /// concurrent test's output into one buffer; callers filter by a marker
 /// unique to their own request instead of relying on line count alone.
+/// Note for a future second caller: the buffer is never cleared and every
+/// `anthropic_lb`-target INFO line from every test logs into it for the rest
+/// of the run — fine for a couple of callers, not a general-purpose fixture.
 fn log_capture_buf() -> Arc<Mutex<Vec<u8>>> {
     static BUF: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
     BUF.get_or_init(|| {
@@ -7332,6 +7335,70 @@ async fn single_info_line_per_proxied_request() {
     assert!(
         !my_lines[0].contains("fingerprint"),
         "fingerprint detail must not appear for this request at the default (INFO) filter, got: {}",
+        my_lines[0]
+    );
+}
+
+/// Regression guard for a gap the LAB-3214 merge introduced and then fixed:
+/// `forward_openai_compat_anthropic` returns early on a non-2xx upstream
+/// status, before ever reaching `finalize_non_stream` — the merged `proxied
+/// (openai-compat)` line must still be logged from that early-return branch
+/// (previously it fired unconditionally, before the status check even ran).
+#[tokio::test]
+async fn proxied_line_still_logged_on_openai_compat_upstream_error() {
+    let buf = log_capture_buf();
+
+    async fn mock_400(_req: Request<Body>) -> Response {
+        (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "bad request"}
+            })),
+        )
+            .into_response()
+    }
+
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, Router::new().fallback(any(mock_400)))
+            .await
+            .unwrap();
+    });
+
+    let (app, _state) = test_openai_app(&format!("http://{mock_addr}"), None);
+    let app_addr = serve(app).await;
+
+    let marker = "lab3214-compat-error-marker";
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{app_addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "any")
+        .header("x-client-id", marker)
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let my_lines: Vec<&str> = output.lines().filter(|l| l.contains(marker)).collect();
+    assert_eq!(
+        my_lines.len(),
+        1,
+        "expected exactly one log line for this errored request, got:\n{}",
+        my_lines.join("\n")
+    );
+    assert!(
+        my_lines[0].contains(" INFO ") && my_lines[0].contains("proxied (openai-compat)"),
+        "the errored request must still get the merged INFO proxied line, got: {}",
+        my_lines[0]
+    );
+    assert!(
+        my_lines[0].contains("status=400"),
+        "merged line should carry the upstream status, got: {}",
         my_lines[0]
     );
 }
