@@ -6503,6 +6503,10 @@ impl AppState {
         // Always update local state (for stats + fallback)
         if let Ok(mut map) = self.budget_usage.lock() {
             let entry = map.entry(client_id.to_owned()).or_insert((today, 0));
+            // `!= today` is right HERE because this `today` is fresh. Do not
+            // unify with fold_budget_mirror's stricter `<` / `>` day rule —
+            // that fold receives a `today` fetched earlier and must not
+            // clobber an entry that already rolled past it (LAB-3217).
             if entry.0 != today {
                 *entry = (today, 0); // reset on new day
             }
