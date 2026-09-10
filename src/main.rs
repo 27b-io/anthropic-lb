@@ -6235,6 +6235,10 @@ enum ProxiedCtx {
         overage: bool,
         pin: &'static str,
         total: u64,
+        /// Content fingerprint (12 hex, `content_fingerprints`) joining this
+        /// line to the DEBUG `fingerprint` line by req_id; `"-"` when the
+        /// request body was unparseable.
+        fp: String,
     },
     OpenaiCompat {
         client_ver: String,
@@ -6275,6 +6279,7 @@ fn log_proxied(
             overage,
             pin,
             total,
+            fp,
         } => {
             info!(
                 req_id,
@@ -6293,6 +6298,7 @@ fn log_proxied(
                 overage,
                 pin = *pin,
                 total,
+                fp = %fp,
                 input = usage.input_tokens,
                 output = usage.output_tokens,
                 cached = usage.cache_read_input_tokens,
@@ -7831,6 +7837,7 @@ async fn forward_anthropic(
     agent_id: &str,
     session_id: &str,
     model: &str,
+    fp: Option<&str>,
     session_key: Option<&str>,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
@@ -8040,6 +8047,7 @@ async fn forward_anthropic(
             overage: info.overage_in_use,
             pin: state.pin_status(client_id, endpoint_idx),
             total: ep.requests.load(Ordering::Relaxed),
+            fp: fp.unwrap_or("-").to_string(),
         };
         (compute_pressure_status(eff_util, client_id, state), ctx)
     };
@@ -8665,6 +8673,7 @@ async fn proxy_handler(
                                 &agent_id,
                                 &session_id,
                                 &model,
+                                fp.as_deref(),
                                 affinity,
                                 request_start,
                             )
