@@ -7,6 +7,9 @@ license = "MIT"
 repository = "https://github.com/27b-io/anthropic-lb"
 keywords = ["anthropic", "proxy", "load-balancer", "api", "claude"]
 categories = ["network-programming", "web-programming"]
+# The toolchain pin is a repo-dev concern; shipping it in the crate would make
+# `cargo install anthropic-lb` force-download that exact toolchain on consumers.
+exclude = ["rust-toolchain.toml"]
 
 [dependencies]
 axum = "0.8"
