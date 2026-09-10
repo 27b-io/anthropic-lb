@@ -607,13 +607,15 @@ The configured `token` is injected as `Authorization: Bearer`, and the request i
 
 Structured `tracing` logs go to stderr at `info` level by default (one line
 per request that reaches upstream, carrying routing context — client, model,
-account, status, utilization — and token usage together). Override the
-filter with `RUST_LOG` (e.g. `RUST_LOG=anthropic_lb=debug`), or set
-`debug_log = "/path/to/file.log"` in the config to additionally write a
-`debug`-level file log alongside the `info`-level stderr stream. At `debug`,
-per-request content fingerprinting (`fingerprint`: `fp`/`fps`/`bps`) becomes
-visible — useful for diagnosing routing-affinity stickiness, but too
-high-volume for the default filter.
+account, status, utilization — and token usage together; on the native
+`/v1/messages` path the line also carries `fp`, the content fingerprint, `-`
+when the body was unparseable). Override the filter with `RUST_LOG` (e.g.
+`RUST_LOG=anthropic_lb=debug`), or set `debug_log = "/path/to/file.log"` in
+the config to additionally write a `debug`-level file log alongside the
+`info`-level stderr stream. At `debug`, the full per-request content
+fingerprinting detail (`fingerprint`: `fp`/`fps`/`bps`) becomes visible —
+useful for diagnosing routing-affinity stickiness, but too high-volume for
+the default filter.
 
 ---
 

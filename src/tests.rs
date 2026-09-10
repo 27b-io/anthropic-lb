@@ -7333,6 +7333,11 @@ async fn single_info_line_per_proxied_request() {
         my_lines[0]
     );
     assert!(
+        my_lines[0].contains("fp="),
+        "merged line should carry the fp content-fingerprint field, got: {}",
+        my_lines[0]
+    );
+    assert!(
         !my_lines[0].contains("fingerprint"),
         "fingerprint detail must not appear for this request at the default (INFO) filter, got: {}",
         my_lines[0]
