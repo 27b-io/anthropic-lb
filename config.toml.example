@@ -27,6 +27,16 @@ probe_interval_secs = 300
 # [[clients]]
 # name = "radar"
 # key = "<from secret store: openssl rand -hex 32>"
+#
+# preferred_endpoints pins a client to dedicated endpoint(s): while at least
+# one is healthy (serves the model, not hard-limited/unhealthy, under
+# soft_limit, not serving via paid overage) the client routes ONLY there,
+# spilling to the full pool otherwise. Entries must name configured
+# [[endpoints]] (checked at startup).
+# [[clients]]
+# name = "passbolt"
+# key = "<from secret store: openssl rand -hex 32>"
+# preferred_endpoints = ["passbolt"]
 
 # proxy_key — LEGACY single shared secret. Authenticates but does not identify.
 # Mutually exclusive with [[clients]]. Minimum 32 characters (openssl rand -hex 32).
@@ -49,6 +59,11 @@ probe_interval_secs = 300
 # not itself in the list; from any other peer the header is IGNORED. Behind an
 # LB, [[clients]] credentials are the identity — client_names is lab-only.
 # trusted_proxies = ["10.128.0.0/20"]
+
+# Relay caller-identity headers (x-forwarded-for, x-real-ip, forwarded,
+# true-client-ip, x-client-id, x-agent-id, x-session-id) to the upstream.
+# Default false: the proxy has already used them and upstream has no consumer.
+# forward_caller_identity = false
 
 # Failed-auth throttle (LAB-1193, superseding LAB-1192 AC-11 after the
 # 2026-08-24 shared-IP outage): after auth_failure_limit failures from one

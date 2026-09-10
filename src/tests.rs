@@ -421,6 +421,7 @@ fn test_state_base() -> AppState {
         session_registry_max: DEFAULT_SESSION_REGISTRY_MAX,
         session_registry_ttl_secs: DEFAULT_SESSION_REGISTRY_TTL_SECS,
         expose_upstream_ratelimit_headers: false,
+        forward_caller_identity: false,
         allowed_client_betas: DEFAULT_CLIENT_BETA_ALLOWLIST
             .iter()
             .map(|s| s.to_string())
@@ -2966,6 +2967,153 @@ fn translate_request_passthrough_params() {
 }
 
 #[test]
+fn model_rejects_temperature_by_version() {
+    // Claude 5 family and ≥ 4.7 hard-reject (LAB-798)
+    assert!(model_rejects_temperature("claude-sonnet-5"));
+    assert!(model_rejects_temperature("claude-opus-5"));
+    assert!(model_rejects_temperature("claude-fable-5"));
+    assert!(model_rejects_temperature("claude-fable-5[1m]"));
+    assert!(model_rejects_temperature("claude-opus-4-8"));
+    assert!(model_rejects_temperature("claude-sonnet-4-7-20260101"));
+    // ≤ 4.6 still accepts
+    assert!(!model_rejects_temperature("claude-sonnet-4-6"));
+    assert!(!model_rejects_temperature("claude-sonnet-4-5-20250929"));
+    assert!(!model_rejects_temperature("claude-haiku-4-5-20251001"));
+    assert!(!model_rejects_temperature("claude-opus-4-1-20250805"));
+    assert!(!model_rejects_temperature("claude-opus-4-20250514"));
+    // old-style ids (version before family) and unknown families pass through
+    assert!(!model_rejects_temperature("claude-3-5-sonnet-20241022"));
+    assert!(!model_rejects_temperature("gpt-4o"));
+}
+
+#[test]
+fn translate_request_drops_temperature_for_rejecting_model() {
+    let req = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 0.2,
+        "top_p": 0.9
+    });
+    let result = translate_openai_to_anthropic(&req);
+    // temperature dropped (upstream hard-rejects it); other params untouched
+    assert!(result.get("temperature").is_none());
+    assert_eq!(result["top_p"], 0.9);
+}
+
+#[test]
+fn translate_request_keeps_default_temperature_for_rejecting_model() {
+    // temperature: 1 is the one value the API still accepts — pass it through
+    let req = serde_json::json!({
+        "model": "claude-fable-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 1
+    });
+    let result = translate_openai_to_anthropic(&req);
+    assert_eq!(result["temperature"], 1);
+}
+
+#[test]
+fn translate_request_forwards_non_numeric_temperature_unchanged() {
+    // Non-numeric junk is not a "confirmed non-default numeric" — forward it
+    // so the client gets the same upstream type error as on ≤ 4.6 models
+    // instead of the shim silently masking their bug.
+    let req = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": "0.7"
+    });
+    let result = translate_openai_to_anthropic(&req);
+    assert_eq!(result["temperature"], "0.7");
+}
+
+/// The Anthropic→OpenAI fallback translator gets the same LAB-798 guard as
+/// the forward shim: an OpenAI-protocol endpoint can front Claude ≥ 4.7.
+#[test]
+fn translate_a2o_drops_temperature_for_rejecting_model() {
+    let body = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": 64,
+        "temperature": 0.2,
+        "top_p": 0.9
+    });
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    assert!(result.get("temperature").is_none());
+    assert_eq!(result["top_p"], 0.9);
+}
+
+#[test]
+fn translate_a2o_keeps_default_temperature_for_rejecting_model() {
+    // Default 1 passes through (upstream accepts it); ≤ 4.6 models are
+    // covered by `translate_anthropic_request_basic`.
+    let body = serde_json::json!({
+        "model": "claude-fable-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 1
+    });
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    assert_eq!(result["temperature"], 1);
+}
+
+/// LAB-798 third path: `openai_chat_handler` forwards the raw request bytes
+/// to a `Protocol::OpenAI` endpoint without translation — the handler must
+/// strip a hard-rejected `temperature` from those bytes before forwarding.
+#[tokio::test]
+async fn openai_passthrough_strips_temperature_for_rejecting_model() {
+    let seen_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+    let seen_body_clone = seen_body.clone();
+    let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+        let seen_body = seen_body_clone.clone();
+        async move {
+            let bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES)
+                .await
+                .unwrap();
+            *seen_body.lock().unwrap() = Some(bytes.to_vec());
+            (
+                [("content-type", "application/json")],
+                OPENAI_OK_BODY.to_vec(),
+            )
+        }
+    }));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = format!("http://{mock_addr}");
+    let state = test_state_with(vec![gw]);
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"claude-sonnet-5","max_tokens":8,"temperature":0.2,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let captured = seen_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("gateway should receive request body");
+    let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    assert!(
+        forwarded.get("temperature").is_none(),
+        "raw passthrough must not forward a hard-rejected temperature: {forwarded}"
+    );
+    assert_eq!(
+        forwarded["top_p"], 0.9,
+        "other params must survive the strip"
+    );
+}
+
+#[test]
 fn translate_request_strips_name_field() {
     let req = serde_json::json!({
         "model": "claude-sonnet-4-6",
@@ -4824,23 +4972,27 @@ async fn spawn_status_then_ok_upstream(
     (format!("http://{addr}"), hits)
 }
 
-/// Axum mock upstream that captures each raw request body on the returned
-/// channel, then replies with `status` + `body`. For tests that must assert
-/// on the exact wire bytes an endpoint received — `spawn_mock_upstream()` is
+/// Axum mock upstream that captures each request's headers + raw body on the
+/// returned channel, then replies with `status` + `body`. For tests that must
+/// assert on the exact wire an endpoint received — `spawn_mock_upstream()` is
 /// canned-Anthropic/always-200 and does not capture, and the raw-TCP mocks
 /// above only count hits.
 async fn spawn_capturing_upstream(
     status: StatusCode,
     body: &'static [u8],
-) -> (String, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
-    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+) -> (
+    String,
+    tokio::sync::mpsc::Receiver<(axum::http::HeaderMap, bytes::Bytes)>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<(axum::http::HeaderMap, bytes::Bytes)>(8);
     let app = Router::new().fallback(any(move |req: Request<Body>| {
         let tx = tx.clone();
         async move {
+            let headers = req.headers().clone();
             let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
                 .await
                 .unwrap();
-            let _ = tx.send(bytes).await;
+            let _ = tx.send((headers, bytes)).await;
             (
                 status,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -4855,6 +5007,139 @@ async fn spawn_capturing_upstream(
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), rx)
+}
+
+/// Values a fronting hop / an LB-aware client sends for every entry in
+/// `CLIENT_IDENTITY_HEADERS` — an independent oracle, kept in lockstep by
+/// `identity_header_samples_cover_the_production_list`.
+const CLIENT_IDENTITY_HEADER_SAMPLES: &[(&str, &str)] = &[
+    ("x-forwarded-for", "203.0.113.9, 10.0.0.1"),
+    ("x-real-ip", "203.0.113.9"),
+    ("forwarded", "for=203.0.113.9;proto=https"),
+    ("true-client-ip", "203.0.113.9"),
+    ("x-client-id", "geo"),
+    ("x-agent-id", "agent-42"),
+    ("x-session-id", "sess-7"),
+];
+
+#[test]
+fn identity_header_samples_cover_the_production_list() {
+    let mut prod: Vec<&str> = CLIENT_IDENTITY_HEADERS.to_vec();
+    let mut samples: Vec<&str> = CLIENT_IDENTITY_HEADER_SAMPLES
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    prod.sort();
+    samples.sort();
+    assert_eq!(prod, samples, "extend both lists together");
+}
+
+/// Send one request carrying every caller-identity header (plus an unrelated
+/// custom header) through the proxy to an Anthropic-protocol upstream and
+/// return the headers that upstream actually received.
+async fn upstream_headers_seen(
+    path: &str,
+    body: &str,
+    forward_caller_identity: bool,
+) -> axum::http::HeaderMap {
+    let (url, mut seen) = spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
+    let mut ep = make_endpoint("ep", Protocol::Anthropic);
+    ep.base_url = url;
+    let mut state = test_state_with(vec![ep]);
+    Arc::get_mut(&mut state)
+        .expect("test fixture should be uniquely owned")
+        .forward_caller_identity = forward_caller_identity;
+    let addr = serve(build_router(state)).await;
+
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{addr}{path}"))
+        .header("content-type", "application/json")
+        .header("x-custom-trace", "keep-me");
+    for &(name, value) in CLIENT_IDENTITY_HEADER_SAMPLES {
+        req = req.header(name, value);
+    }
+    let resp = req.body(body.to_string()).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "request must reach upstream"
+    );
+    seen.recv()
+        .await
+        .expect("upstream must have been hit once")
+        .0
+}
+
+fn assert_identity_headers_absent(seen: &axum::http::HeaderMap) {
+    for &(name, _) in CLIENT_IDENTITY_HEADER_SAMPLES {
+        assert!(
+            !seen.contains_key(name),
+            "{name} must not reach the upstream by default (GH #168)"
+        );
+    }
+    assert_eq!(
+        seen.get("x-custom-trace").map(|v| v.to_str().unwrap()),
+        Some("keep-me"),
+        "unrelated headers must still be forwarded"
+    );
+}
+
+fn assert_identity_headers_relayed(seen: &axum::http::HeaderMap) {
+    for &(name, value) in CLIENT_IDENTITY_HEADER_SAMPLES {
+        assert_eq!(
+            seen.get(name).map(|v| v.to_str().unwrap()),
+            Some(value),
+            "{name} must be relayed unchanged when forward_caller_identity = true"
+        );
+    }
+}
+
+/// GH #168 — see `CLIENT_IDENTITY_HEADERS`.
+#[tokio::test]
+async fn messages_path_strips_caller_identity_headers_upstream_by_default() {
+    let seen = upstream_headers_seen(
+        "/v1/messages",
+        r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        false,
+    )
+    .await;
+    assert_identity_headers_absent(&seen);
+}
+
+/// Same contract on the OpenAI-compat → Anthropic translation path, which
+/// clones the inbound headers independently of `forward_anthropic`.
+#[tokio::test]
+async fn chat_completions_path_strips_caller_identity_headers_upstream_by_default() {
+    let seen = upstream_headers_seen(
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#,
+        false,
+    )
+    .await;
+    assert_identity_headers_absent(&seen);
+}
+
+/// The operator escape hatch relays every entry unchanged.
+#[tokio::test]
+async fn forward_caller_identity_true_relays_headers_on_messages_path() {
+    let seen = upstream_headers_seen(
+        "/v1/messages",
+        r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        true,
+    )
+    .await;
+    assert_identity_headers_relayed(&seen);
+}
+
+#[tokio::test]
+async fn forward_caller_identity_true_relays_headers_on_chat_completions_path() {
+    let seen = upstream_headers_seen(
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#,
+        true,
+    )
+    .await;
+    assert_identity_headers_relayed(&seen);
 }
 
 /// GH #97 regression: a 429 from a `Protocol::OpenAI` endpoint must set a
@@ -7075,6 +7360,189 @@ async fn proxy_retries_on_server_error() {
     assert_eq!(resp.status(), 200);
     // Two calls to upstream (500 + 200)
     assert_eq!(call_count.load(Ordering::Relaxed), 2);
+}
+
+// ── LAB-3214: one INFO line per proxied request ─────────────────
+
+/// `MakeWriter` over a shared buffer, so a test can capture what the stderr
+/// layer would have written and inspect it after the request completes.
+#[derive(Clone)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Install the capturing subscriber exactly once for the whole test binary.
+/// A scope-local `tracing::subscriber::set_default` is unreliable here:
+/// `tracing`'s per-callsite `Interest` cache is process-global, and hundreds
+/// of other tests exercise these same log callsites concurrently with no
+/// subscriber at all — that races the cache to "not interested" before a
+/// scoped override ever gets a chance (a documented `tracing` limitation,
+/// not specific to this crate: see the "Rebuilding Cached Interest" section
+/// of `tracing_core::callsite`). A single global subscriber captures every
+/// concurrent test's output into one buffer; callers filter by a marker
+/// unique to their own request instead of relying on line count alone.
+/// Note for a future second caller: the buffer is never cleared and every
+/// `anthropic_lb`-target INFO line from every test logs into it for the rest
+/// of the run — fine for a couple of callers, not a general-purpose fixture.
+fn log_capture_buf() -> Arc<Mutex<Vec<u8>>> {
+    static BUF: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    BUF.get_or_init(|| {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturedLog(buf.clone()))
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new("anthropic_lb=info"))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("log_capture_buf: global default already set by another test");
+        buf
+    })
+    .clone()
+}
+
+/// Regression guard for the `proxied`+`usage` merge (LAB-3214): at the
+/// production default filter (`anthropic_lb=info`), a successful
+/// non-streaming `/v1/messages` request must produce exactly one INFO line
+/// for that request, carrying both routing context and token usage, and no
+/// `fingerprint` detail (that's DEBUG-only). Filters the shared capture
+/// buffer by a client-id marker unique to this test so concurrently running
+/// tests' own log lines can't be mistaken for this request's.
+#[tokio::test]
+async fn single_info_line_per_proxied_request() {
+    let buf = log_capture_buf();
+
+    // Mock upstream that returns usage (mock_anthropic_handler carries
+    // `"usage": {"input_tokens": 10, "output_tokens": 5}`), so the merged
+    // line's token fields are exercised, not just left at zero.
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            mock_listener,
+            Router::new().fallback(any(mock_anthropic_handler)),
+        )
+        .await
+        .unwrap();
+    });
+
+    let (app, _state) = test_app(&format!("http://{mock_addr}"), None);
+    let app_addr = serve(app).await;
+
+    let marker = "lab3214-single-info-line-marker";
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{app_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "any")
+        .header("x-client-id", marker)
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let my_lines: Vec<&str> = output.lines().filter(|l| l.contains(marker)).collect();
+    assert_eq!(
+        my_lines.len(),
+        1,
+        "expected exactly one log line for this request, got:\n{}",
+        my_lines.join("\n")
+    );
+    assert!(
+        my_lines[0].contains(" INFO ") && my_lines[0].contains("proxied"),
+        "the single line should be the merged INFO `proxied` line, got: {}",
+        my_lines[0]
+    );
+    assert!(
+        my_lines[0].contains("input=10") && my_lines[0].contains("output=5"),
+        "merged line should carry token usage, got: {}",
+        my_lines[0]
+    );
+    assert!(
+        !my_lines[0].contains("fingerprint"),
+        "fingerprint detail must not appear for this request at the default (INFO) filter, got: {}",
+        my_lines[0]
+    );
+}
+
+/// Regression guard for a gap the LAB-3214 merge introduced and then fixed:
+/// `forward_openai_compat_anthropic` returns early on a non-2xx upstream
+/// status, before ever reaching `finalize_non_stream` — the merged `proxied
+/// (openai-compat)` line must still be logged from that early-return branch
+/// (previously it fired unconditionally, before the status check even ran).
+#[tokio::test]
+async fn proxied_line_still_logged_on_openai_compat_upstream_error() {
+    let buf = log_capture_buf();
+
+    async fn mock_400(_req: Request<Body>) -> Response {
+        (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "bad request"}
+            })),
+        )
+            .into_response()
+    }
+
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, Router::new().fallback(any(mock_400)))
+            .await
+            .unwrap();
+    });
+
+    let (app, _state) = test_openai_app(&format!("http://{mock_addr}"), None);
+    let app_addr = serve(app).await;
+
+    let marker = "lab3214-compat-error-marker";
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{app_addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "any")
+        .header("x-client-id", marker)
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let my_lines: Vec<&str> = output.lines().filter(|l| l.contains(marker)).collect();
+    assert_eq!(
+        my_lines.len(),
+        1,
+        "expected exactly one log line for this errored request, got:\n{}",
+        my_lines.join("\n")
+    );
+    assert!(
+        my_lines[0].contains(" INFO ") && my_lines[0].contains("proxied (openai-compat)"),
+        "the errored request must still get the merged INFO proxied line, got: {}",
+        my_lines[0]
+    );
+    assert!(
+        my_lines[0].contains("status=400"),
+        "merged line should carry the upstream status, got: {}",
+        my_lines[0]
+    );
 }
 
 // ── time_adjusted_utilization unit tests ────────────────────────
@@ -11515,6 +11983,64 @@ async fn record_budget_usage_skips_unknown_client() {
     assert!(map.is_empty());
 }
 
+/// LAB-3217: the sync-tick fold seeds an empty mirror, never lowers a higher
+/// one (the LAB-1962 floor), replaces a stale day instead of summing it,
+/// leaves a mirror that already rolled past the fetched day alone, and skips
+/// zero/absent counters. Pure; the Redis-backed half lives in
+/// `redis_integration::sync_from_redis_seeds_budget_mirror_from_shared_counter`.
+#[tokio::test]
+async fn fold_budget_mirror_seeds_floors_and_replaces_stale_day() {
+    let today = AppState::now_epoch() / 86400;
+    let state = Arc::new(AppState {
+        budget_usage: Mutex::new(
+            [
+                ("floor".to_string(), (today, 500u64)),
+                ("stale".to_string(), (today - 1, 900)),
+                ("ahead".to_string(), (today + 1, 70)),
+            ]
+            .into(),
+        ),
+        ..test_state_base()
+    });
+
+    state.fold_budget_mirror(
+        today,
+        [
+            ("seed", 300u64),
+            ("floor", 200),
+            ("stale", 100),
+            ("ahead", 999),
+            ("zero", 0),
+        ],
+    );
+
+    let map = state.budget_usage.lock().unwrap();
+    assert_eq!(
+        map["seed"],
+        (today, 300),
+        "empty mirror seeds from the shared counter"
+    );
+    assert_eq!(
+        map["floor"],
+        (today, 500),
+        "a higher local floor is never lowered"
+    );
+    assert_eq!(
+        map["stale"],
+        (today, 100),
+        "a stale day is replaced, not summed"
+    );
+    assert_eq!(
+        map["ahead"],
+        (today + 1, 70),
+        "a mirror already past the fetched day is left alone"
+    );
+    assert!(
+        !map.contains_key("zero"),
+        "a zero/absent counter folds nothing"
+    );
+}
+
 // ── Config deserialization (real struct, not toml::Value) ─────
 
 #[test]
@@ -14776,7 +15302,8 @@ async fn proxy_handler_translates_to_openai_endpoint() {
         .unwrap();
 
     let received: serde_json::Value =
-        serde_json::from_slice(&rx.recv().await.expect("upstream must receive a request")).unwrap();
+        serde_json::from_slice(&rx.recv().await.expect("upstream must receive a request").1)
+            .unwrap();
     assert!(
         received.get("messages").is_some(),
         "translated request must have OpenAI `messages` field"
@@ -14854,11 +15381,13 @@ async fn proxy_handler_translates_once_across_endpoint_rotation() {
     let bad_body = bad_rx
         .recv()
         .await
-        .expect("failing endpoint got the request");
+        .expect("failing endpoint got the request")
+        .1;
     let ok_body = ok_rx
         .recv()
         .await
-        .expect("healthy endpoint got the rotation");
+        .expect("healthy endpoint got the rotation")
+        .1;
     assert_eq!(
         bad_body, ok_body,
         "rotated attempt must reuse the identical serialized body"
@@ -16530,6 +17059,15 @@ fn mk_client(name: &str, key: &str, models: &[&str]) -> ClientConfig {
         name: name.to_string(),
         key: key.to_string(),
         models: models.iter().map(|s| s.to_string()).collect(),
+        preferred_endpoints: vec![],
+    }
+}
+
+/// `mk_client` with a `preferred_endpoints` pin (LAB-2636).
+fn mk_pinned_client(name: &str, key: &str, preferred: &[&str]) -> ClientConfig {
+    ClientConfig {
+        preferred_endpoints: preferred.iter().map(|s| s.to_string()).collect(),
+        ..mk_client(name, key, &[])
     }
 }
 
@@ -17974,6 +18512,57 @@ async fn session_registry_window_matches_filtered_beta() {
         "session must be tracked at the window the upstream ran (flag was stripped)"
     );
 }
+// LAB-3026: a configured-but-unparseable `redis_url` must be reported as an
+// error from `start_coordination_redis` (the caller in `main` turns that
+// into a startup panic) rather than silently degrading to local-only.
+// Needs no live backend — parsing fails before any I/O. The
+// valid-but-unreachable case is covered by
+// `backend_down_at_startup_serves_local_only_then_attaches` below (still
+// `Ok`, still local-only-then-reconnect); the unset case is the untouched
+// `else { None }` arm in `main` and needs no test.
+#[test]
+fn start_coordination_redis_rejects_unparseable_url() {
+    // An unescaped '/' inside the password ends URL authority parsing early
+    // (everything after is read as path), leaving a garbage port — the
+    // rotated-password shape from the ticket. Verified against the `url`
+    // crate directly: unescaped '@' alone does NOT break parsing (the last
+    // '@' wins as the userinfo/host separator), but '/', '?', and '#' do.
+    let result = start_coordination_redis(
+        "redis://user:pa/ss@127.0.0.1:6379",
+        PerformanceConfig::default(),
+        ConnectionConfig::default(),
+        ReconnectPolicy::new_constant(0, 100),
+    );
+    assert!(
+        result.is_err(),
+        "malformed userinfo must fail to parse, not silently mis-route"
+    );
+}
+
+// LAB-3026 review follow-up: a reserved char could in principle swallow the
+// REAL host into the path while `Url::parse` still succeeds, if the bogus
+// "port" left behind (username:password-prefix) happens to be numeric —
+// e.g. `redis://user:12345/rest@127.0.0.1:6379` parses OK with host="user",
+// port=12345, silently discarding the real `127.0.0.1:6379`. That would be
+// a mis-route, not a startup failure, and the AC would be defeated. It
+// still can't reach `Ok` here: fred's `parse_url_db` (run right after) reads
+// the leftover path as the db-index segment and requires it parse as a u8
+// (0-255); a swallowed `@host:port` remainder never also satisfies that, so
+// this shape errors too — verified, not assumed.
+#[test]
+fn start_coordination_redis_rejects_numeric_password_prefix_mis_route() {
+    let result = start_coordination_redis(
+        "redis://user:12345/rest@127.0.0.1:6379",
+        PerformanceConfig::default(),
+        ConnectionConfig::default(),
+        ReconnectPolicy::new_constant(0, 100),
+    );
+    assert!(
+        result.is_err(),
+        "a numeric password-prefix must not silently mis-route to the wrong host"
+    );
+}
+
 // ── Real-Redis integration tests (LAB-931) ──────────────────────────
 //
 // Behavioural coverage for the cross-replica coordination layer against a
@@ -18620,6 +19209,93 @@ mod redis_integration {
         assert!(
             roll.check_budget("roll-cli").await.is_ok(),
             "yesterday's counter must not gate today"
+        );
+    }
+
+    /// LAB-3217 AC1/AC2: a fresh replica's empty budget mirror is seeded from
+    /// the shared `alb:budget:{client}:{today}` counter on its first sync
+    /// tick, so `/_stats` `used_today`/`remaining` and the
+    /// `anthropic_client_budget_*` gauges equal the fleet total after a
+    /// restart — and a later tick whose counter is BEHIND the local mirror
+    /// never lowers it (the LAB-1962 floor). Pairs with the pure
+    /// `fold_budget_mirror_seeds_floors_and_replaces_stale_day`.
+    #[tokio::test]
+    async fn sync_from_redis_seeds_budget_mirror_from_shared_counter() {
+        let Some((mut conn, fred)) = redis_test_conn(11).await else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let today = AppState::now_epoch() / 86400;
+        let key = format!("alb:budget:seed-cli:{today}");
+        // The fleet spent this much before the replica under test started.
+        let _: () = conn.set(&key, 1_516_491u64).await.unwrap();
+
+        let state = Arc::new(AppState {
+            endpoints: vec![make_endpoint("seed-ep", Protocol::Anthropic)],
+            client_budgets: [("seed-cli".to_string(), 2_000_000u64)].into(),
+            redis: Some(fred),
+            ..test_state_base()
+        });
+        assert!(
+            state.budget_usage.lock().unwrap().is_empty(),
+            "a fresh replica starts with an empty mirror"
+        );
+
+        state.sync_from_redis().await;
+
+        assert_eq!(
+            state.budget_usage.lock().unwrap().get("seed-cli").copied(),
+            Some((today, 1_516_491)),
+            "first sync tick must seed the mirror from the shared counter"
+        );
+
+        let app = build_router(state.clone());
+        let addr = serve(app).await;
+        let client = Client::new();
+        let stats: serde_json::Value = serde_json::from_str(
+            &client
+                .get(format!("http://{addr}/_stats"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stats["client_budgets"]["seed-cli"]["used_today"], 1_516_491,
+            "/_stats used_today must equal the shared counter"
+        );
+        assert_eq!(
+            stats["client_budgets"]["seed-cli"]["remaining"], 483_509,
+            "/_stats remaining must be limit − shared counter"
+        );
+        let metrics = client
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            metrics.contains("anthropic_client_budget_used{client=\"seed-cli\"} 1516491"),
+            "budget_used gauge must equal the shared counter:\n{metrics}"
+        );
+        assert!(
+            metrics.contains("anthropic_client_budget_remaining{client=\"seed-cli\"} 483509"),
+            "budget_remaining gauge must be limit − shared counter:\n{metrics}"
+        );
+
+        // AC2: a counter that fell BEHIND the mirror (an INCRBY lost while
+        // Redis was away) must not lower the enforcement floor.
+        let _: () = conn.set(&key, 1_000u64).await.unwrap();
+        state.sync_from_redis().await;
+        assert_eq!(
+            state.budget_usage.lock().unwrap().get("seed-cli").copied(),
+            Some((today, 1_516_491)),
+            "a lagging shared counter must never lower the local floor"
         );
     }
 
@@ -19953,5 +20629,326 @@ async fn metrics_expose_auth_failures_by_route() {
     assert!(
         body.contains("anthropic_auth_failures_total{route=\"stats\"} 1"),
         "missing auth-failure counter in:\n{body}"
+    );
+}
+
+// ── LAB-2636 / #151: per-client endpoint pinning (preferred_endpoints) ──
+
+/// Two-endpoint pool with a client pinned to "dedicated". `soft_limit` at the
+/// production 0.90 so the healthy/spill boundary is exercised for real.
+fn pinned_test_state() -> Arc<AppState> {
+    Arc::new(AppState {
+        endpoints: vec![
+            mk_endpoint("general", "sk-ant-api-gen"),
+            mk_endpoint("dedicated", "sk-ant-api-ded"),
+        ],
+        clients: vec![mk_pinned_client("passbolt", "key-pb", &["dedicated"])],
+        soft_limit: 0.90,
+        ..test_state_base()
+    })
+}
+
+#[test]
+fn client_config_preferred_endpoints_parses_and_defaults_empty() {
+    let c = cfg(
+        "[[endpoints]]\nname = \"ded\"\ntoken = \"sk-ant-api-x\"\n\n[[clients]]\nname = \"pin\"\nkey = \"k1\"\npreferred_endpoints = [\"ded\"]\n\n[[clients]]\nname = \"plain\"\nkey = \"k2\"\n",
+    );
+    assert_eq!(c.clients[0].preferred_endpoints, vec!["ded".to_string()]);
+    assert!(
+        c.clients[1].preferred_endpoints.is_empty(),
+        "omitted preferred_endpoints must default to empty (= no pin)"
+    );
+}
+
+#[test]
+fn validate_clients_rejects_unknown_preferred_endpoint() {
+    let err = validate_clients(&cfg(
+        "[[endpoints]]\nname = \"real\"\ntoken = \"sk-ant-api-x\"\n\n[[clients]]\nname = \"pin\"\nkey = \"k1\"\npreferred_endpoints = [\"typo\"]\n",
+    ))
+    .unwrap_err();
+    assert!(
+        err.contains("preferred_endpoints") && err.contains("typo") && err.contains("pin"),
+        "error must name the client and the bad entry: {err}"
+    );
+}
+
+#[test]
+fn validate_clients_accepts_known_preferred_endpoint() {
+    assert!(validate_clients(&cfg(
+        "[[endpoints]]\nname = \"real\"\ntoken = \"sk-ant-api-x\"\n\n[[clients]]\nname = \"pin\"\nkey = \"k1\"\npreferred_endpoints = [\"real\"]\n",
+    ))
+    .is_ok());
+}
+
+/// Pin: the client routes to its preferred endpoint on EVERY pick, even though
+/// the general endpoint has far more headroom and attracts unpinned traffic —
+/// and even for affinity keys that land unpinned traffic on the general
+/// endpoint (the filter runs before affinity/weighted selection).
+#[tokio::test]
+async fn pinned_client_always_routes_to_preferred_endpoint() {
+    let state = pinned_test_state();
+    state.endpoints[0].rate_info.write().await.utilization = Some(0.1);
+    state.endpoints[1].rate_info.write().await.utilization = Some(0.8);
+
+    let mut unpinned_landed_general = false;
+    for i in 0..100 {
+        let key = format!("client:sess:{i}");
+        if state
+            .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[], "other")
+            .await
+            == Some(0)
+        {
+            unpinned_landed_general = true;
+        }
+        assert_eq!(
+            state
+                .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[], "passbolt")
+                .await,
+            Some(1),
+            "pinned client must land on 'dedicated' for every affinity key"
+        );
+    }
+    assert!(
+        unpinned_landed_general,
+        "fixture must attract unpinned traffic to 'general' or the pin assert proves nothing"
+    );
+}
+
+/// Spill: preferred endpoint over the soft limit (still a candidate, but not
+/// healthy) → the full pool applies and the healthy general endpoint serves.
+#[tokio::test]
+async fn pinned_client_spills_on_soft_limit_overage() {
+    let state = pinned_test_state();
+    state.endpoints[0].rate_info.write().await.utilization = Some(0.1);
+    state.endpoints[1].rate_info.write().await.utilization = Some(0.95);
+
+    assert_eq!(
+        state
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .await,
+        Some(0),
+        "soft-limited preferred endpoint must spill to the general pool"
+    );
+}
+
+/// Spill: preferred endpoint hard-limited (429) → general pool serves.
+#[tokio::test]
+async fn pinned_client_spills_on_hard_limit() {
+    let state = pinned_test_state();
+    state.endpoints[0].rate_info.write().await.utilization = Some(0.1);
+    {
+        let mut info = state.endpoints[1].rate_info.write().await;
+        info.utilization = Some(0.1);
+        info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+    }
+
+    assert_eq!(
+        state
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .await,
+        Some(0),
+        "hard-limited preferred endpoint must spill to the general pool"
+    );
+}
+
+/// Spill: preferred endpoint transport-circuit-broken → general pool serves.
+#[tokio::test]
+async fn pinned_client_spills_on_transport_unhealthy() {
+    let state = pinned_test_state();
+    state.endpoints[0].rate_info.write().await.utilization = Some(0.1);
+    {
+        let mut info = state.endpoints[1].rate_info.write().await;
+        info.utilization = Some(0.1);
+        info.transport_unhealthy_until = Some(Instant::now() + Duration::from_secs(3600));
+    }
+
+    assert_eq!(
+        state
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .await,
+        Some(0),
+        "transport-unhealthy preferred endpoint must spill to the general pool"
+    );
+}
+
+/// Spill: preferred endpoint doesn't serve the requested model → general pool.
+#[tokio::test]
+async fn pinned_client_spills_on_model_mismatch() {
+    let mut dedicated = mk_endpoint("dedicated", "sk-ant-api-ded");
+    dedicated.models = vec!["claude-haiku-*".to_string()];
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("general", "sk-ant-api-gen"), dedicated],
+        clients: vec![mk_pinned_client("passbolt", "key-pb", &["dedicated"])],
+        soft_limit: 0.90,
+        ..test_state_base()
+    });
+
+    assert_eq!(
+        state
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .await,
+        Some(0),
+        "model not served by the preferred endpoint must spill to the general pool"
+    );
+    // Sanity: a model the pin DOES serve stays pinned.
+    assert_eq!(
+        state
+            .pick_endpoint_for_client(Some("s"), "claude-haiku-4-5", &[], "passbolt")
+            .await,
+        Some(1)
+    );
+}
+
+/// Rotation: a preferred endpoint entering the skip list mid-request (5xx
+/// rotation) re-applies the rule — remaining preferred endpoints while any is
+/// viable, full pool once none is.
+#[tokio::test]
+async fn pinned_client_rotation_prefers_remaining_preferred_then_spills() {
+    let state = Arc::new(AppState {
+        endpoints: vec![
+            mk_endpoint("general", "sk-ant-api-gen"),
+            mk_endpoint("ded-a", "sk-ant-api-a"),
+            mk_endpoint("ded-b", "sk-ant-api-b"),
+        ],
+        clients: vec![mk_pinned_client("passbolt", "key-pb", &["ded-a", "ded-b"])],
+        soft_limit: 0.90,
+        ..test_state_base()
+    });
+
+    // ded-a failed and was skipped → the OTHER preferred endpoint must serve,
+    // never the general pool.
+    for i in 0..50 {
+        let key = format!("client:sess:{i}");
+        assert_eq!(
+            state
+                .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[1], "passbolt")
+                .await,
+            Some(2),
+            "with one preferred endpoint skipped, the remaining one must serve"
+        );
+    }
+    // Both preferred endpoints skipped → spill to the general pool.
+    assert_eq!(
+        state
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[1, 2], "passbolt")
+            .await,
+        Some(0),
+        "with all preferred endpoints skipped, the general pool must serve"
+    );
+}
+
+/// Native Anthropic surface end-to-end: the authenticated pinned client is
+/// served by its preferred account on every request, despite the general
+/// account having far more headroom.
+#[tokio::test]
+async fn native_surface_pins_authenticated_client_to_preferred_endpoint() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![
+            mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &mock_url),
+            mk_endpoint_at("acct-b", "sk-ant-api-test-bbb", &mock_url),
+        ],
+        clients: vec![mk_pinned_client("passbolt", "key-pb", &["acct-b"])],
+        soft_limit: 0.90,
+        ..test_state_base()
+    });
+    state.endpoints[0].rate_info.write().await.utilization = Some(0.05);
+    state.endpoints[1].rate_info.write().await.utilization = Some(0.5);
+    let addr = serve(build_router(state.clone())).await;
+    let client = Client::new();
+
+    for i in 0..10 {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .header("x-api-key", "key-pb")
+            .header("x-session-id", format!("sess-{i}"))
+            .body(r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+    assert_eq!(
+        state.endpoints[1].requests.load(Ordering::Relaxed),
+        10,
+        "every request must be served by the preferred account"
+    );
+    assert_eq!(
+        state.endpoints[0].requests.load(Ordering::Relaxed),
+        0,
+        "the general account must serve none of the pinned client's requests"
+    );
+}
+
+/// OpenAI-compat surface end-to-end: same pin, authenticated via
+/// `Authorization: Bearer`, proving client identity reaches the picker on the
+/// second protocol surface too.
+#[tokio::test]
+async fn openai_compat_surface_pins_authenticated_client_to_preferred_endpoint() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![
+            mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &mock_url),
+            mk_endpoint_at("acct-b", "sk-ant-api-test-bbb", &mock_url),
+        ],
+        clients: vec![mk_pinned_client("passbolt", "key-pb", &["acct-b"])],
+        soft_limit: 0.90,
+        ..test_state_base()
+    });
+    state.endpoints[0].rate_info.write().await.utilization = Some(0.05);
+    state.endpoints[1].rate_info.write().await.utilization = Some(0.5);
+    let addr = serve(build_router(state.clone())).await;
+    let client = Client::new();
+
+    for i in 0..10 {
+        let resp = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer key-pb")
+            .header("x-session-id", format!("sess-{i}"))
+            .body(r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+    assert_eq!(
+        state.endpoints[1].requests.load(Ordering::Relaxed),
+        10,
+        "every request must be served by the preferred account"
+    );
+    assert_eq!(
+        state.endpoints[0].requests.load(Ordering::Relaxed),
+        0,
+        "the general account must serve none of the pinned client's requests"
+    );
+}
+
+/// Spill: preferred endpoint serving via paid overage reports a LOW gate (the
+/// overage window supersedes its exhausted subscription windows) but is
+/// priority-demoted — the pin must NOT treat it as viable, or the pinned
+/// client would bill paid overage forever while free general-pool capacity
+/// sits idle (expert-panel CRIT on the initial LAB-2636 cut).
+#[tokio::test]
+async fn pinned_client_spills_when_preferred_endpoint_at_paid_overage() {
+    let state = pinned_test_state();
+    state.endpoints[0].rate_info.write().await.utilization = Some(0.1);
+    {
+        let mut info = state.endpoints[1].rate_info.write().await;
+        // Exhausted subscription covered by overage: raw utilization is
+        // irrelevant, compute_routing_weight gates on the (empty) overage
+        // window → gate ~0.0 < soft_limit, but priority is demoted by
+        // overage_penalty.
+        info.utilization_5h = Some(1.0);
+        info.overage_in_use = true;
+    }
+
+    assert_eq!(
+        state
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .await,
+        Some(0),
+        "an overage-covered preferred endpoint must spill to free general-pool capacity"
     );
 }

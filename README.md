@@ -175,14 +175,17 @@ token = "sk-ant-api03-..."
 | `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id` |
 | `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`) |
 | `clients[].models` | `[String]` | `[]` | Models this client may request (empty = all; `*` suffix wildcards) |
+| `clients[].preferred_endpoints` | `[String]` | `[]` | Pin this client to named endpoint(s); spills to the full pool when none is healthy (incl. at paid overage). Names are startup-validated |
 | `proxy_key` | `String?` | `None` | **Legacy** shared secret. Mutually exclusive with `[[clients]]` |
 | `allow_unauthenticated` | `bool` | `false` | The one escape hatch from default-deny: boot with no credentials at all. Trusted-network-only; incompatible with configured credentials |
 | `allowed_ips` | `[String]?` | `None` | IP/CIDR allowlist (unset = **allow all**) |
 | `trusted_proxies` | `[String]?` | `None` | IPs/CIDRs of load balancers whose `x-forwarded-for` is honoured (unset = header ignored) |
+| `forward_caller_identity` | `bool` | `false` | Relay caller-identity headers (`x-forwarded-for`, `x-real-ip`, `forwarded`, `true-client-ip`, `x-client-id`, `x-agent-id`, `x-session-id`) to the upstream; off = stripped once the proxy has used them (see *Real client IP behind a load balancer*) |
 | `auth_failure_limit` | `u32` | `10` | Failed-auth attempts per client IP inside the window before further invalid credentials get 429; valid credentials always pass (0 = throttle off) |
 | `auth_failure_window_secs` | `u64` | `300` | Failed-auth throttle window |
 | `auto_cache` | `bool` | `true` | Inject prompt caching beta header |
 | `shadow_log` | `String?` | `None` | Path to JSONL shadow log file |
+| `debug_log` | `String?` | `None` | Path to an additional `debug`-level `tracing` log file (see [Logging](#logging)); the stderr stream stays at `info` regardless |
 | `soft_limit` | `f64` | `0.90` | Utilization ceiling — accounts above are excluded from routing |
 | `client_names` | `{IP: name}` | `{}` | IP → client ID mapping |
 | `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
@@ -342,6 +345,7 @@ It **fails closed** on a model it cannot read. The proxy takes the model from th
 | **Admin surfaces** | `operators = ["ops"]` | `/_stats` + `/metrics` need an operator credential (401/403) | no one can read them under `[[clients]]` |
 | **Failed-auth throttle** | `auth_failure_limit` / `auth_failure_window_secs` | Further invalid credentials get 429 + `retry-after` per client IP after repeated failures; valid credentials always pass | on (10 / 300s) |
 | **Trusted proxies** | `trusted_proxies = ["192.0.2.0/24"]` | Real client IP recovered from `x-forwarded-for` behind a listed LB | header ignored |
+| **Caller-identity privacy** | `forward_caller_identity = false` | Caller IP and `x-client-id`/`x-agent-id`/`x-session-id` headers dropped before the upstream request | **stripped** |
 | **Model allow-list** | `clients[].models` | Rejects models outside a client's list (403) | all models |
 
 IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are compared in constant time, and startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`).
@@ -355,6 +359,8 @@ IP check runs first, then the credential check; failed credentials are subject t
 ### Real client IP behind a load balancer
 
 Behind a GCLB/Cloudflare/ingress, the TCP peer is the LB — without XFF handling, IP allowlists degenerate to "allow the LB", per-IP throttles rate-limit the LB, and every log line records the LB. Configure `trusted_proxies` with the LB's address range; the client IP then becomes the **rightmost `x-forwarded-for` entry not itself in `trusted_proxies`** — the last hop an attacker cannot append to. From any peer *not* in the list the header is ignored entirely (never trusted, never logged as authoritative), and malformed entries fall back to the peer address.
+
+Those headers stop here. Once the client IP is resolved, the proxy drops `x-forwarded-for`, `x-real-ip`, `forwarded`, `true-client-ip` and its own `x-client-id`, `x-agent-id`, `x-session-id` from the upstream request on both forward paths, so a pooled-account request upstream is not labelled with the caller behind the proxy. `forward_caller_identity = true` restores relaying. Two things this does not cover. Edge-added `cf-*` headers (`cf-connecting-ip` carries the same caller IP) are the ingress's to strip, not the proxy's ([#166](https://github.com/27b-io/anthropic-lb/issues/166)): the Cloudflare Worker does, a plain cloudflared tunnel does not, so on that path the caller IP still reaches the upstream. And Claude Code's native `x-claude-code-session-id` passes through untouched pending [#171](https://github.com/27b-io/anthropic-lb/issues/171).
 
 > [!IMPORTANT]
 > Behind a load balancer, **`[[clients]]` credentials are the identity**. The `client_names` IP map is a lab-only convenience: it maps *source addresses*, and once traffic arrives through an LB the recovered XFF address is only as trustworthy as the LB's own header hygiene. Do not hang budgets or operator status on `client_names` on a public ingress.
@@ -597,6 +603,20 @@ The configured `token` is injected as `Authorization: Bearer`, and the request i
 
 ---
 
+## Logging
+
+Structured `tracing` logs go to stderr at `info` level by default (one line
+per request that reaches upstream, carrying routing context — client, model,
+account, status, utilization — and token usage together). Override the
+filter with `RUST_LOG` (e.g. `RUST_LOG=anthropic_lb=debug`), or set
+`debug_log = "/path/to/file.log"` in the config to additionally write a
+`debug`-level file log alongside the `info`-level stderr stream. At `debug`,
+per-request content fingerprinting (`fingerprint`: `fp`/`fps`/`bps`) becomes
+visible — useful for diagnosing routing-affinity stickiness, but too
+high-volume for the default filter.
+
+---
+
 ## Shadow Logging
 
 When `shadow_log` is set, every request writes a JSONL entry with:
@@ -637,7 +657,7 @@ redis_url = "redis://redis.example.com:6379"
 | **Rate info** | JSON blob per account | ~5s (background sync) |
 | **Replica heartbeats** | `SET EX 30` per instance | ~5s |
 
-**Fail-open**: All Redis operations degrade gracefully. If Redis is unavailable, each replica falls back to local-only state. No request is ever blocked by a Redis error.
+**Fail-open**: All Redis *operations* degrade gracefully. If a syntactically valid `redis_url` is unreachable, each replica falls back to local-only state and reconnects in the background. No request is ever blocked by a Redis error. A `redis_url` that fails to *parse* (e.g. a rotated password containing an unescaped `/`, `?`, or `#`) is a config error, not a connectivity one — it fails startup outright rather than silently running without the shared state an operator asked for.
 
 **Key schema** (all keys auto-expire via TTL):
 
@@ -648,7 +668,7 @@ alb:rate:{account_name}             →  JSON   (reset-based TTL)
 alb:heartbeat:{instance_id}         →  u64    (30s TTL)
 ```
 
-When Redis is connected, `/_stats` includes a `cluster` section with replica count and cross-replica budget usage.
+When Redis is connected, `/_stats` includes a `cluster` section with replica count and cross-replica budget usage. The per-client `client_budgets` block and the `anthropic_client_budget_*` gauges are also re-seeded from the shared counter every ~5s, so a freshly restarted replica reports the fleet's spend for the day rather than only what it has seen itself.
 
 > [!NOTE]
 > `redis_url` is entirely optional. Omit it for single-instance deployments — behavior is identical to running without Redis.
