@@ -668,7 +668,7 @@ alb:rate:{account_name}             →  JSON   (reset-based TTL)
 alb:heartbeat:{instance_id}         →  u64    (30s TTL)
 ```
 
-When Redis is connected, `/_stats` includes a `cluster` section with replica count and cross-replica budget usage.
+When Redis is connected, `/_stats` includes a `cluster` section with replica count and cross-replica budget usage. The per-client `client_budgets` block and the `anthropic_client_budget_*` gauges are also re-seeded from the shared counter every ~5s, so a freshly restarted replica reports the fleet's spend for the day rather than only what it has seen itself.
 
 > [!NOTE]
 > `redis_url` is entirely optional. Omit it for single-instance deployments — behavior is identical to running without Redis.

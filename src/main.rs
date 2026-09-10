@@ -757,6 +757,8 @@ struct AppState {
     /// Per-client daily token budgets: client_id → max tokens per day.
     client_budgets: HashMap<String, u64>,
     /// Budget tracking: client_id → (epoch_day, tokens_used). Resets on new day.
+    /// Process-local; with Redis it is re-seeded from the shared counter every
+    /// sync tick (`fold_budget_mirror`, LAB-3217) so it survives restarts.
     budget_usage: Mutex<HashMap<String, (u64, u64)>>,
     /// Per-client utilization limits: client_id → max effective utilization.
     client_utilization_limits: HashMap<String, f64>,
@@ -5375,7 +5377,9 @@ impl AppState {
             }
         }
 
-        // Aggregate budget usage from Redis (batch MGET)
+        // Aggregate budget usage from Redis (batch MGET). The same fetch
+        // re-seeds this replica's local `budget_usage` mirror (LAB-3217) —
+        // see fold_budget_mirror for why it must receive THIS `today`.
         let mut redis_budgets = serde_json::Map::new();
         if redis_ok && !self.client_budgets.is_empty() {
             let today = Self::now_epoch() / 86400;
@@ -5386,14 +5390,19 @@ impl AppState {
                 .collect();
             match redis.mget::<Vec<Option<u64>>, _>(budget_keys).await {
                 Ok(values) => {
-                    for (i, client_id) in client_ids.iter().enumerate() {
-                        let used = values.get(i).copied().flatten().unwrap_or(0);
-                        let limit = self.client_budgets[*client_id];
+                    let used_by_client: Vec<(&str, u64)> = client_ids
+                        .iter()
+                        .enumerate()
+                        .map(|(i, id)| (id.as_str(), values.get(i).copied().flatten().unwrap_or(0)))
+                        .collect();
+                    for &(client_id, used) in &used_by_client {
+                        let limit = self.client_budgets[client_id];
                         redis_budgets.insert(
-                            (*client_id).clone(),
+                            client_id.to_owned(),
                             serde_json::json!({ "limit": limit, "used": used }),
                         );
                     }
+                    self.fold_budget_mirror(today, used_by_client);
                 }
                 Err(e) => {
                     warn!(error = %e, "redis MGET failed for budget aggregation");
@@ -6646,6 +6655,10 @@ impl AppState {
         // Always update local state (for stats + fallback)
         if let Ok(mut map) = self.budget_usage.lock() {
             let entry = map.entry(client_id.to_owned()).or_insert((today, 0));
+            // `!= today` is right HERE because this `today` is fresh. Do not
+            // unify with fold_budget_mirror's stricter `<` / `>` day rule —
+            // that fold receives a `today` fetched earlier and must not
+            // clobber an entry that already rolled past it (LAB-3217).
             if entry.0 != today {
                 *entry = (today, 0); // reset on new day
             }
@@ -6709,6 +6722,42 @@ impl AppState {
                     );
                 }
             }
+        }
+    }
+
+    /// Fold the fleet-wide `alb:budget:{client}:{day}` counters into the local
+    /// `budget_usage` mirror so `/_stats` and the `anthropic_client_budget_*`
+    /// gauges report the shared total on every replica — including one that
+    /// just restarted with an empty mirror (LAB-3217). Runs on every sync tick
+    /// with the values `cluster_info` already MGETs; it touches no Redis key,
+    /// so enforcement (`check_budget` / `record_budget_usage`) is unchanged.
+    ///
+    /// `max`, never overwrite: the local accumulator is also the enforcement
+    /// floor for increments lost to a failed INCRBY (LAB-1962), so a counter
+    /// that is behind must not lower it. A stale (previous-day) entry is
+    /// replaced by today's value, never summed with it; an entry that already
+    /// rolled PAST the fetched day is left alone. `today` MUST be the
+    /// epoch-day the counters were fetched under, not re-derived here: across
+    /// a UTC midnight a re-read would file yesterday's total under today, and
+    /// `max` would then pin that over-report for the whole day. A zero/absent
+    /// counter carries nothing the mirror lacks and is skipped, so the sync
+    /// alone never materialises entries for idle clients.
+    fn fold_budget_mirror<'a>(&self, today: u64, remote: impl IntoIterator<Item = (&'a str, u64)>) {
+        let Ok(mut map) = self.budget_usage.lock() else {
+            return;
+        };
+        for (client_id, used) in remote {
+            if used == 0 {
+                continue;
+            }
+            let entry = map.entry(client_id.to_owned()).or_insert((today, 0));
+            if entry.0 > today {
+                continue;
+            }
+            if entry.0 < today {
+                *entry = (today, 0);
+            }
+            entry.1 = entry.1.max(used);
         }
     }
 
