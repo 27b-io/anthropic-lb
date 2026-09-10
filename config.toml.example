@@ -4,7 +4,7 @@ listen = "127.0.0.1:8082"
 # - "dynamic-capacity" / "dynamic-capacity-v1": legacy weighted routing with
 #   the older 0.5 affinity override threshold
 # - "sticky-weighted-v2": stronger session stickiness, only breaks on egregious
-#   weight disparities
+#   headroom disparities (min of gate headroom and unused weekly quota)
 strategy = "dynamic-capacity-v1"
 rate_limit_cooldown_secs = 60
 probe_interval_secs = 300
