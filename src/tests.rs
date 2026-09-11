@@ -418,10 +418,12 @@ fn test_state_base() -> AppState {
         body_shed_total: AtomicU64::new(0),
         body_read_timeout: Duration::from_secs(DEFAULT_BODY_READ_TIMEOUT_SECS),
         body_read_timeout_total: AtomicU64::new(0),
+        affinity_migrations: Default::default(),
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: DEFAULT_SESSION_REGISTRY_MAX,
         session_registry_ttl_secs: DEFAULT_SESSION_REGISTRY_TTL_SECS,
         expose_upstream_ratelimit_headers: false,
+        forward_caller_identity: false,
         allowed_client_betas: DEFAULT_CLIENT_BETA_ALLOWLIST
             .iter()
             .map(|s| s.to_string())
@@ -1082,10 +1084,10 @@ async fn pick_does_not_bias_unknown_accounts() {
 
 #[tokio::test]
 async fn pick_sticky_same_affinity() {
-    // Same affinity key should always return the same account when weights
-    // are close enough. AFFINITY_OVERRIDE_RATIO (0.5) compares the picked
-    // account's weight to the best — affinity is preserved when the ratio
-    // exceeds the threshold, i.e. no single account is 2x better.
+    // Same affinity key should always return the same account when headroom
+    // is close enough. LEGACY_AFFINITY_OVERRIDE_RATIO (0.5) compares the picked
+    // account's affinity_headroom to the other's — affinity is preserved when
+    // the ratio exceeds the threshold, i.e. no single account has 2x the room.
     let state = test_state_with(vec![
         mk_endpoint("a", "sk-ant-api-a"),
         mk_endpoint("b", "sk-ant-api-b"),
@@ -1249,7 +1251,7 @@ async fn affinity_override_balanced_no_7d_data() {
 async fn affinity_override_moderate_7d_disparity() {
     // Scenario: similar 5h, moderate 7d difference → affinity preserved
     // Primary 5h=0.15, 7d=0.40 vs Jeff 5h=0.15, 7d=0.60
-    // waste_risk ratio isn't extreme enough to trigger override
+    // unused-7d headroom 0.60 vs 0.40 isn't extreme enough to trigger override
     let state = test_state_with(vec![
         mk_endpoint("primary", "sk-ant-api-a"),
         mk_endpoint("jeff", "sk-ant-api-b"),
@@ -1272,8 +1274,8 @@ async fn affinity_override_moderate_7d_disparity() {
 async fn affinity_override_massive_7d_disparity() {
     // Scenario: egregious disparity — one account nearly spent, other fresh
     // Primary 5h=0.10, 7d=0.10 vs Jeff 5h=0.10, 7d=0.95
-    // Primary's waste_risk is enormous, jeff's is near zero
-    // Weight ratio far below 0.25 → all traffic overridden to primary
+    // Jeff's unused-7d headroom (0.05) is far below 0.25× primary's (0.90)
+    // → all traffic overridden to primary
     let state = test_state_with(vec![
         mk_endpoint("primary", "sk-ant-api-a"),
         mk_endpoint("jeff", "sk-ant-api-b"),
@@ -1296,7 +1298,7 @@ async fn affinity_override_massive_7d_disparity() {
 async fn affinity_override_one_exhausted() {
     // Scenario: one account nearly spent on 7d budget
     // Primary 5h=0.10, 7d=0.10 vs Jeff 5h=0.10, 7d=0.90
-    // Extreme weight ratio → all traffic to primary
+    // Extreme headroom ratio → all traffic to primary
     let state = test_state_with(vec![
         mk_endpoint("primary", "sk-ant-api-a"),
         mk_endpoint("jeff", "sk-ant-api-b"),
@@ -1563,12 +1565,15 @@ async fn affinity_override_destination_independent_of_argmax() {
     );
     let mut dest_a = Vec::with_capacity(sessions.len());
     for s in &sessions {
-        dest_a.push(
-            state
-                .pick_endpoint(Some(s), "claude-opus-4-6", &[])
-                .await
-                .unwrap(),
+        let idx = state
+            .pick_endpoint(Some(s), "claude-opus-4-6", &[])
+            .await
+            .unwrap();
+        assert_ne!(
+            idx, 0,
+            "override must fire for a session hashed to the loaded account"
         );
+        dest_a.push(idx);
     }
 
     // Config B: swap h1 and h2 utilizations so h2 becomes best. The healthy
@@ -1582,6 +1587,7 @@ async fn affinity_override_destination_independent_of_argmax() {
             .pick_endpoint(Some(s), "claude-opus-4-6", &[])
             .await
             .unwrap();
+        assert_ne!(idx, 0, "override must still fire after the argmax flip");
         if idx != dest_a[k] {
             migrated += 1;
         }
@@ -1594,6 +1600,143 @@ async fn affinity_override_destination_independent_of_argmax() {
             sessions.len(),
             rate * 100.0,
         );
+}
+
+/// Regression (GH#156 / LAB-2684): two accounts under IDENTICAL load whose
+/// only difference is time-to-weekly-reset. `weight` carries waste_risk =
+/// unused / remaining_fraction_of_7d, so the account that reset yesterday
+/// (wr ≈ 1) weighs ~8x less than one resetting in 20h (wr ≈ 7.5). The old
+/// `picked.weight < best.weight * ratio` override in BOTH strategies read that
+/// as "too loaded" and migrated every session off the FRESHEST accounts in the
+/// pool (25% of prod requests WARNed on accounts at ≤17% utilisation).
+/// Reset-time skew alone must never break affinity.
+async fn assert_reset_time_skew_keeps_affinity(strategy: RoutingStrategy) {
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("fresh", "sk-ant-api-a"),
+            mk_endpoint("expiring", "sk-ant-api-b"),
+        ],
+        strategy,
+    );
+    let now = AppState::now_epoch();
+    let in_6_5_days = now + 6 * 86400 + 43200;
+    let in_20_hours = now + 20 * 3600;
+    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, in_6_5_days).await;
+    set_account_utilization(&state, 1, 0.10, 0.10, now + 10000, in_20_hours).await;
+
+    // A session whose sticky bucket is the fresh (low-waste-risk) account.
+    let key = keys_hashing_to(&state, 0, 1, 20000, "skew-session")
+        .await
+        .pop()
+        .expect("a key hashing to the fresh account");
+    for i in 0..500 {
+        let idx = state
+            .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            idx, 0,
+            "{strategy:?} request {i}: reset-time skew alone migrated the session off its hashed account"
+        );
+    }
+}
+
+#[tokio::test]
+async fn affinity_override_ignores_reset_time_skew() {
+    assert_reset_time_skew_keeps_affinity(RoutingStrategy::StickyWeightedV2).await;
+}
+
+#[tokio::test]
+async fn affinity_override_ignores_reset_time_skew_legacy() {
+    assert_reset_time_skew_keeps_affinity(RoutingStrategy::DynamicCapacityV1).await;
+}
+
+#[tokio::test]
+async fn affinity_override_spent_discounts_near_weekly_reset() {
+    // Panel finding on GH#156: an account at 90% weekly with 3h to reset gets
+    // the LARGEST bucket share (waste_risk ≈ 5.6 — burn expiring quota first),
+    // so a naive unused-7d comparison would migrate every session the buckets
+    // just placed there, on every request. Near the weekly reset, remaining
+    // quota is headroom, not "spent": the override must stay quiet.
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("fresh", "sk-ant-api-a"),
+            mk_endpoint("expiring", "sk-ant-api-b"),
+        ],
+        RoutingStrategy::StickyWeightedV2,
+    );
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.10, 0.90, now + 10000, now + 3 * 3600).await;
+
+    let key = keys_hashing_to(&state, 1, 1, 20000, "expiring-session")
+        .await
+        .pop()
+        .expect("a key hashing to the expiring account");
+    let idx = state
+        .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        idx, 1,
+        "session must stay on the expiring account it hashed to"
+    );
+    let [loaded, spent] = &state.affinity_migrations;
+    assert_eq!(spent.load(Ordering::Relaxed), 0, "spent counter");
+    assert_eq!(loaded.load(Ordering::Relaxed), 0, "loaded counter");
+}
+
+#[tokio::test]
+async fn affinity_migration_counter_names_the_binding_window() {
+    // `anthropic_affinity_migrations_total{reason}` must attribute each override
+    // to the window that actually bound the sticky account (GH#156 AC-5).
+    let now = AppState::now_epoch();
+
+    // reason="spent": identical 5h, the sticky account's WEEK is nearly gone.
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("fresh", "sk-ant-api-a"),
+            mk_endpoint("spent", "sk-ant-api-b"),
+        ],
+        RoutingStrategy::StickyWeightedV2,
+    );
+    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.10, 0.95, now + 10000, now + 300000).await;
+    let key = keys_hashing_to(&state, 1, 1, 20000, "spent-session")
+        .await
+        .pop()
+        .expect("a key hashing to the spent account");
+    let idx = state
+        .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
+        .await
+        .unwrap();
+    assert_eq!(idx, 0, "session must leave the spent account");
+    let [loaded, spent] = &state.affinity_migrations;
+    assert_eq!(spent.load(Ordering::Relaxed), 1, "spent counter");
+    assert_eq!(loaded.load(Ordering::Relaxed), 0, "loaded counter");
+
+    // reason="loaded": identical 7d, the sticky account's 5h gate is the limit.
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("idle", "sk-ant-api-a"),
+            mk_endpoint("busy", "sk-ant-api-b"),
+        ],
+        RoutingStrategy::StickyWeightedV2,
+    );
+    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.85, 0.10, now + 10000, now + 300000).await;
+    let key = keys_hashing_to(&state, 1, 1, 20000, "loaded-session")
+        .await
+        .pop()
+        .expect("a key hashing to the busy account");
+    let idx = state
+        .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
+        .await
+        .unwrap();
+    assert_eq!(idx, 0, "session must leave the busy account");
+    let [loaded, spent] = &state.affinity_migrations;
+    assert_eq!(loaded.load(Ordering::Relaxed), 1, "loaded counter");
+    assert_eq!(spent.load(Ordering::Relaxed), 0, "spent counter");
 }
 
 #[test]
@@ -2824,6 +2967,153 @@ fn translate_request_passthrough_params() {
     assert_eq!(result["temperature"], 0.7);
     assert_eq!(result["top_p"], 0.9);
     assert_eq!(result["stream"], true);
+}
+
+#[test]
+fn model_rejects_temperature_by_version() {
+    // Claude 5 family and ≥ 4.7 hard-reject (LAB-798)
+    assert!(model_rejects_temperature("claude-sonnet-5"));
+    assert!(model_rejects_temperature("claude-opus-5"));
+    assert!(model_rejects_temperature("claude-fable-5"));
+    assert!(model_rejects_temperature("claude-fable-5[1m]"));
+    assert!(model_rejects_temperature("claude-opus-4-8"));
+    assert!(model_rejects_temperature("claude-sonnet-4-7-20260101"));
+    // ≤ 4.6 still accepts
+    assert!(!model_rejects_temperature("claude-sonnet-4-6"));
+    assert!(!model_rejects_temperature("claude-sonnet-4-5-20250929"));
+    assert!(!model_rejects_temperature("claude-haiku-4-5-20251001"));
+    assert!(!model_rejects_temperature("claude-opus-4-1-20250805"));
+    assert!(!model_rejects_temperature("claude-opus-4-20250514"));
+    // old-style ids (version before family) and unknown families pass through
+    assert!(!model_rejects_temperature("claude-3-5-sonnet-20241022"));
+    assert!(!model_rejects_temperature("gpt-4o"));
+}
+
+#[test]
+fn translate_request_drops_temperature_for_rejecting_model() {
+    let req = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 0.2,
+        "top_p": 0.9
+    });
+    let result = translate_openai_to_anthropic(&req);
+    // temperature dropped (upstream hard-rejects it); other params untouched
+    assert!(result.get("temperature").is_none());
+    assert_eq!(result["top_p"], 0.9);
+}
+
+#[test]
+fn translate_request_keeps_default_temperature_for_rejecting_model() {
+    // temperature: 1 is the one value the API still accepts — pass it through
+    let req = serde_json::json!({
+        "model": "claude-fable-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 1
+    });
+    let result = translate_openai_to_anthropic(&req);
+    assert_eq!(result["temperature"], 1);
+}
+
+#[test]
+fn translate_request_forwards_non_numeric_temperature_unchanged() {
+    // Non-numeric junk is not a "confirmed non-default numeric" — forward it
+    // so the client gets the same upstream type error as on ≤ 4.6 models
+    // instead of the shim silently masking their bug.
+    let req = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": "0.7"
+    });
+    let result = translate_openai_to_anthropic(&req);
+    assert_eq!(result["temperature"], "0.7");
+}
+
+/// The Anthropic→OpenAI fallback translator gets the same LAB-798 guard as
+/// the forward shim: an OpenAI-protocol endpoint can front Claude ≥ 4.7.
+#[test]
+fn translate_a2o_drops_temperature_for_rejecting_model() {
+    let body = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": 64,
+        "temperature": 0.2,
+        "top_p": 0.9
+    });
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    assert!(result.get("temperature").is_none());
+    assert_eq!(result["top_p"], 0.9);
+}
+
+#[test]
+fn translate_a2o_keeps_default_temperature_for_rejecting_model() {
+    // Default 1 passes through (upstream accepts it); ≤ 4.6 models are
+    // covered by `translate_anthropic_request_basic`.
+    let body = serde_json::json!({
+        "model": "claude-fable-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 1
+    });
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    assert_eq!(result["temperature"], 1);
+}
+
+/// LAB-798 third path: `openai_chat_handler` forwards the raw request bytes
+/// to a `Protocol::OpenAI` endpoint without translation — the handler must
+/// strip a hard-rejected `temperature` from those bytes before forwarding.
+#[tokio::test]
+async fn openai_passthrough_strips_temperature_for_rejecting_model() {
+    let seen_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+    let seen_body_clone = seen_body.clone();
+    let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+        let seen_body = seen_body_clone.clone();
+        async move {
+            let bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES)
+                .await
+                .unwrap();
+            *seen_body.lock().unwrap() = Some(bytes.to_vec());
+            (
+                [("content-type", "application/json")],
+                OPENAI_OK_BODY.to_vec(),
+            )
+        }
+    }));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = format!("http://{mock_addr}");
+    let state = test_state_with(vec![gw]);
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"claude-sonnet-5","max_tokens":8,"temperature":0.2,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let captured = seen_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("gateway should receive request body");
+    let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    assert!(
+        forwarded.get("temperature").is_none(),
+        "raw passthrough must not forward a hard-rejected temperature: {forwarded}"
+    );
+    assert_eq!(
+        forwarded["top_p"], 0.9,
+        "other params must survive the strip"
+    );
 }
 
 #[test]
@@ -4685,23 +4975,27 @@ async fn spawn_status_then_ok_upstream(
     (format!("http://{addr}"), hits)
 }
 
-/// Axum mock upstream that captures each raw request body on the returned
-/// channel, then replies with `status` + `body`. For tests that must assert
-/// on the exact wire bytes an endpoint received — `spawn_mock_upstream()` is
+/// Axum mock upstream that captures each request's headers + raw body on the
+/// returned channel, then replies with `status` + `body`. For tests that must
+/// assert on the exact wire an endpoint received — `spawn_mock_upstream()` is
 /// canned-Anthropic/always-200 and does not capture, and the raw-TCP mocks
 /// above only count hits.
 async fn spawn_capturing_upstream(
     status: StatusCode,
     body: &'static [u8],
-) -> (String, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
-    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+) -> (
+    String,
+    tokio::sync::mpsc::Receiver<(axum::http::HeaderMap, bytes::Bytes)>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<(axum::http::HeaderMap, bytes::Bytes)>(8);
     let app = Router::new().fallback(any(move |req: Request<Body>| {
         let tx = tx.clone();
         async move {
+            let headers = req.headers().clone();
             let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
                 .await
                 .unwrap();
-            let _ = tx.send(bytes).await;
+            let _ = tx.send((headers, bytes)).await;
             (
                 status,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -4716,6 +5010,139 @@ async fn spawn_capturing_upstream(
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), rx)
+}
+
+/// Values a fronting hop / an LB-aware client sends for every entry in
+/// `CLIENT_IDENTITY_HEADERS` — an independent oracle, kept in lockstep by
+/// `identity_header_samples_cover_the_production_list`.
+const CLIENT_IDENTITY_HEADER_SAMPLES: &[(&str, &str)] = &[
+    ("x-forwarded-for", "203.0.113.9, 10.0.0.1"),
+    ("x-real-ip", "203.0.113.9"),
+    ("forwarded", "for=203.0.113.9;proto=https"),
+    ("true-client-ip", "203.0.113.9"),
+    ("x-client-id", "geo"),
+    ("x-agent-id", "agent-42"),
+    ("x-session-id", "sess-7"),
+];
+
+#[test]
+fn identity_header_samples_cover_the_production_list() {
+    let mut prod: Vec<&str> = CLIENT_IDENTITY_HEADERS.to_vec();
+    let mut samples: Vec<&str> = CLIENT_IDENTITY_HEADER_SAMPLES
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    prod.sort();
+    samples.sort();
+    assert_eq!(prod, samples, "extend both lists together");
+}
+
+/// Send one request carrying every caller-identity header (plus an unrelated
+/// custom header) through the proxy to an Anthropic-protocol upstream and
+/// return the headers that upstream actually received.
+async fn upstream_headers_seen(
+    path: &str,
+    body: &str,
+    forward_caller_identity: bool,
+) -> axum::http::HeaderMap {
+    let (url, mut seen) = spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
+    let mut ep = make_endpoint("ep", Protocol::Anthropic);
+    ep.base_url = url;
+    let mut state = test_state_with(vec![ep]);
+    Arc::get_mut(&mut state)
+        .expect("test fixture should be uniquely owned")
+        .forward_caller_identity = forward_caller_identity;
+    let addr = serve(build_router(state)).await;
+
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{addr}{path}"))
+        .header("content-type", "application/json")
+        .header("x-custom-trace", "keep-me");
+    for &(name, value) in CLIENT_IDENTITY_HEADER_SAMPLES {
+        req = req.header(name, value);
+    }
+    let resp = req.body(body.to_string()).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "request must reach upstream"
+    );
+    seen.recv()
+        .await
+        .expect("upstream must have been hit once")
+        .0
+}
+
+fn assert_identity_headers_absent(seen: &axum::http::HeaderMap) {
+    for &(name, _) in CLIENT_IDENTITY_HEADER_SAMPLES {
+        assert!(
+            !seen.contains_key(name),
+            "{name} must not reach the upstream by default (GH #168)"
+        );
+    }
+    assert_eq!(
+        seen.get("x-custom-trace").map(|v| v.to_str().unwrap()),
+        Some("keep-me"),
+        "unrelated headers must still be forwarded"
+    );
+}
+
+fn assert_identity_headers_relayed(seen: &axum::http::HeaderMap) {
+    for &(name, value) in CLIENT_IDENTITY_HEADER_SAMPLES {
+        assert_eq!(
+            seen.get(name).map(|v| v.to_str().unwrap()),
+            Some(value),
+            "{name} must be relayed unchanged when forward_caller_identity = true"
+        );
+    }
+}
+
+/// GH #168 — see `CLIENT_IDENTITY_HEADERS`.
+#[tokio::test]
+async fn messages_path_strips_caller_identity_headers_upstream_by_default() {
+    let seen = upstream_headers_seen(
+        "/v1/messages",
+        r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        false,
+    )
+    .await;
+    assert_identity_headers_absent(&seen);
+}
+
+/// Same contract on the OpenAI-compat → Anthropic translation path, which
+/// clones the inbound headers independently of `forward_anthropic`.
+#[tokio::test]
+async fn chat_completions_path_strips_caller_identity_headers_upstream_by_default() {
+    let seen = upstream_headers_seen(
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#,
+        false,
+    )
+    .await;
+    assert_identity_headers_absent(&seen);
+}
+
+/// The operator escape hatch relays every entry unchanged.
+#[tokio::test]
+async fn forward_caller_identity_true_relays_headers_on_messages_path() {
+    let seen = upstream_headers_seen(
+        "/v1/messages",
+        r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        true,
+    )
+    .await;
+    assert_identity_headers_relayed(&seen);
+}
+
+#[tokio::test]
+async fn forward_caller_identity_true_relays_headers_on_chat_completions_path() {
+    let seen = upstream_headers_seen(
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#,
+        true,
+    )
+    .await;
+    assert_identity_headers_relayed(&seen);
 }
 
 /// GH #97 regression: a 429 from a `Protocol::OpenAI` endpoint must set a
@@ -7259,6 +7686,194 @@ async fn proxy_retries_on_server_error() {
     assert_eq!(resp.status(), 200);
     // Two calls to upstream (500 + 200)
     assert_eq!(call_count.load(Ordering::Relaxed), 2);
+}
+
+// ── LAB-3214: one INFO line per proxied request ─────────────────
+
+/// `MakeWriter` over a shared buffer, so a test can capture what the stderr
+/// layer would have written and inspect it after the request completes.
+#[derive(Clone)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Install the capturing subscriber exactly once for the whole test binary.
+/// A scope-local `tracing::subscriber::set_default` is unreliable here:
+/// `tracing`'s per-callsite `Interest` cache is process-global, and hundreds
+/// of other tests exercise these same log callsites concurrently with no
+/// subscriber at all — that races the cache to "not interested" before a
+/// scoped override ever gets a chance (a documented `tracing` limitation,
+/// not specific to this crate: see the "Rebuilding Cached Interest" section
+/// of `tracing_core::callsite`). A single global subscriber captures every
+/// concurrent test's output into one buffer; callers filter by a marker
+/// unique to their own request instead of relying on line count alone.
+/// Note for a future second caller: the buffer is never cleared and every
+/// `anthropic_lb`-target INFO line from every test logs into it for the rest
+/// of the run — fine for a couple of callers, not a general-purpose fixture.
+fn log_capture_buf() -> Arc<Mutex<Vec<u8>>> {
+    static BUF: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    BUF.get_or_init(|| {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturedLog(buf.clone()))
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new("anthropic_lb=info"))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("log_capture_buf: global default already set by another test");
+        buf
+    })
+    .clone()
+}
+
+/// Regression guard for the `proxied`+`usage` merge (LAB-3214): at the
+/// production default filter (`anthropic_lb=info`), a successful
+/// non-streaming `/v1/messages` request must produce exactly one INFO line
+/// for that request, carrying both routing context and token usage, and no
+/// `fingerprint` detail (that's DEBUG-only). Filters the shared capture
+/// buffer by a client-id marker unique to this test so concurrently running
+/// tests' own log lines can't be mistaken for this request's.
+#[tokio::test]
+async fn single_info_line_per_proxied_request() {
+    let buf = log_capture_buf();
+
+    // Mock upstream that returns usage (mock_anthropic_handler carries
+    // `"usage": {"input_tokens": 10, "output_tokens": 5}`), so the merged
+    // line's token fields are exercised, not just left at zero.
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            mock_listener,
+            Router::new().fallback(any(mock_anthropic_handler)),
+        )
+        .await
+        .unwrap();
+    });
+
+    let (app, _state) = test_app(&format!("http://{mock_addr}"), None);
+    let app_addr = serve(app).await;
+
+    let marker = "lab3214-single-info-line-marker";
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{app_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "any")
+        .header("x-client-id", marker)
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let my_lines: Vec<&str> = output.lines().filter(|l| l.contains(marker)).collect();
+    assert_eq!(
+        my_lines.len(),
+        1,
+        "expected exactly one log line for this request, got:\n{}",
+        my_lines.join("\n")
+    );
+    assert!(
+        my_lines[0].contains(" INFO ") && my_lines[0].contains("proxied"),
+        "the single line should be the merged INFO `proxied` line, got: {}",
+        my_lines[0]
+    );
+    assert!(
+        my_lines[0].contains("input=10") && my_lines[0].contains("output=5"),
+        "merged line should carry token usage, got: {}",
+        my_lines[0]
+    );
+    assert!(
+        my_lines[0].contains("fp="),
+        "merged line should carry the fp content-fingerprint field, got: {}",
+        my_lines[0]
+    );
+    assert!(
+        !my_lines[0].contains("fingerprint"),
+        "fingerprint detail must not appear for this request at the default (INFO) filter, got: {}",
+        my_lines[0]
+    );
+}
+
+/// Regression guard for a gap the LAB-3214 merge introduced and then fixed:
+/// `forward_openai_compat_anthropic` returns early on a non-2xx upstream
+/// status, before ever reaching `finalize_non_stream` — the merged `proxied
+/// (openai-compat)` line must still be logged from that early-return branch
+/// (previously it fired unconditionally, before the status check even ran).
+#[tokio::test]
+async fn proxied_line_still_logged_on_openai_compat_upstream_error() {
+    let buf = log_capture_buf();
+
+    async fn mock_400(_req: Request<Body>) -> Response {
+        (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "bad request"}
+            })),
+        )
+            .into_response()
+    }
+
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, Router::new().fallback(any(mock_400)))
+            .await
+            .unwrap();
+    });
+
+    let (app, _state) = test_openai_app(&format!("http://{mock_addr}"), None);
+    let app_addr = serve(app).await;
+
+    let marker = "lab3214-compat-error-marker";
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{app_addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "any")
+        .header("x-client-id", marker)
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let my_lines: Vec<&str> = output.lines().filter(|l| l.contains(marker)).collect();
+    assert_eq!(
+        my_lines.len(),
+        1,
+        "expected exactly one log line for this errored request, got:\n{}",
+        my_lines.join("\n")
+    );
+    assert!(
+        my_lines[0].contains(" INFO ") && my_lines[0].contains("proxied (openai-compat)"),
+        "the errored request must still get the merged INFO proxied line, got: {}",
+        my_lines[0]
+    );
+    assert!(
+        my_lines[0].contains("status=400"),
+        "merged line should carry the upstream status, got: {}",
+        my_lines[0]
+    );
 }
 
 // ── time_adjusted_utilization unit tests ────────────────────────
@@ -11699,6 +12314,64 @@ async fn record_budget_usage_skips_unknown_client() {
     assert!(map.is_empty());
 }
 
+/// LAB-3217: the sync-tick fold seeds an empty mirror, never lowers a higher
+/// one (the LAB-1962 floor), replaces a stale day instead of summing it,
+/// leaves a mirror that already rolled past the fetched day alone, and skips
+/// zero/absent counters. Pure; the Redis-backed half lives in
+/// `redis_integration::sync_from_redis_seeds_budget_mirror_from_shared_counter`.
+#[tokio::test]
+async fn fold_budget_mirror_seeds_floors_and_replaces_stale_day() {
+    let today = AppState::now_epoch() / 86400;
+    let state = Arc::new(AppState {
+        budget_usage: Mutex::new(
+            [
+                ("floor".to_string(), (today, 500u64)),
+                ("stale".to_string(), (today - 1, 900)),
+                ("ahead".to_string(), (today + 1, 70)),
+            ]
+            .into(),
+        ),
+        ..test_state_base()
+    });
+
+    state.fold_budget_mirror(
+        today,
+        [
+            ("seed", 300u64),
+            ("floor", 200),
+            ("stale", 100),
+            ("ahead", 999),
+            ("zero", 0),
+        ],
+    );
+
+    let map = state.budget_usage.lock().unwrap();
+    assert_eq!(
+        map["seed"],
+        (today, 300),
+        "empty mirror seeds from the shared counter"
+    );
+    assert_eq!(
+        map["floor"],
+        (today, 500),
+        "a higher local floor is never lowered"
+    );
+    assert_eq!(
+        map["stale"],
+        (today, 100),
+        "a stale day is replaced, not summed"
+    );
+    assert_eq!(
+        map["ahead"],
+        (today + 1, 70),
+        "a mirror already past the fetched day is left alone"
+    );
+    assert!(
+        !map.contains_key("zero"),
+        "a zero/absent counter folds nothing"
+    );
+}
+
 // ── Config deserialization (real struct, not toml::Value) ─────
 
 #[test]
@@ -14960,7 +15633,8 @@ async fn proxy_handler_translates_to_openai_endpoint() {
         .unwrap();
 
     let received: serde_json::Value =
-        serde_json::from_slice(&rx.recv().await.expect("upstream must receive a request")).unwrap();
+        serde_json::from_slice(&rx.recv().await.expect("upstream must receive a request").1)
+            .unwrap();
     assert!(
         received.get("messages").is_some(),
         "translated request must have OpenAI `messages` field"
@@ -15038,11 +15712,13 @@ async fn proxy_handler_translates_once_across_endpoint_rotation() {
     let bad_body = bad_rx
         .recv()
         .await
-        .expect("failing endpoint got the request");
+        .expect("failing endpoint got the request")
+        .1;
     let ok_body = ok_rx
         .recv()
         .await
-        .expect("healthy endpoint got the rotation");
+        .expect("healthy endpoint got the rotation")
+        .1;
     assert_eq!(
         bad_body, ok_body,
         "rotated attempt must reuse the identical serialized body"
@@ -18167,6 +18843,57 @@ async fn session_registry_window_matches_filtered_beta() {
         "session must be tracked at the window the upstream ran (flag was stripped)"
     );
 }
+// LAB-3026: a configured-but-unparseable `redis_url` must be reported as an
+// error from `start_coordination_redis` (the caller in `main` turns that
+// into a startup panic) rather than silently degrading to local-only.
+// Needs no live backend — parsing fails before any I/O. The
+// valid-but-unreachable case is covered by
+// `backend_down_at_startup_serves_local_only_then_attaches` below (still
+// `Ok`, still local-only-then-reconnect); the unset case is the untouched
+// `else { None }` arm in `main` and needs no test.
+#[test]
+fn start_coordination_redis_rejects_unparseable_url() {
+    // An unescaped '/' inside the password ends URL authority parsing early
+    // (everything after is read as path), leaving a garbage port — the
+    // rotated-password shape from the ticket. Verified against the `url`
+    // crate directly: unescaped '@' alone does NOT break parsing (the last
+    // '@' wins as the userinfo/host separator), but '/', '?', and '#' do.
+    let result = start_coordination_redis(
+        "redis://user:pa/ss@127.0.0.1:6379",
+        PerformanceConfig::default(),
+        ConnectionConfig::default(),
+        ReconnectPolicy::new_constant(0, 100),
+    );
+    assert!(
+        result.is_err(),
+        "malformed userinfo must fail to parse, not silently mis-route"
+    );
+}
+
+// LAB-3026 review follow-up: a reserved char could in principle swallow the
+// REAL host into the path while `Url::parse` still succeeds, if the bogus
+// "port" left behind (username:password-prefix) happens to be numeric —
+// e.g. `redis://user:12345/rest@127.0.0.1:6379` parses OK with host="user",
+// port=12345, silently discarding the real `127.0.0.1:6379`. That would be
+// a mis-route, not a startup failure, and the AC would be defeated. It
+// still can't reach `Ok` here: fred's `parse_url_db` (run right after) reads
+// the leftover path as the db-index segment and requires it parse as a u8
+// (0-255); a swallowed `@host:port` remainder never also satisfies that, so
+// this shape errors too — verified, not assumed.
+#[test]
+fn start_coordination_redis_rejects_numeric_password_prefix_mis_route() {
+    let result = start_coordination_redis(
+        "redis://user:12345/rest@127.0.0.1:6379",
+        PerformanceConfig::default(),
+        ConnectionConfig::default(),
+        ReconnectPolicy::new_constant(0, 100),
+    );
+    assert!(
+        result.is_err(),
+        "a numeric password-prefix must not silently mis-route to the wrong host"
+    );
+}
+
 // ── Real-Redis integration tests (LAB-931) ──────────────────────────
 //
 // Behavioural coverage for the cross-replica coordination layer against a
@@ -18813,6 +19540,93 @@ mod redis_integration {
         assert!(
             roll.check_budget("roll-cli").await.is_ok(),
             "yesterday's counter must not gate today"
+        );
+    }
+
+    /// LAB-3217 AC1/AC2: a fresh replica's empty budget mirror is seeded from
+    /// the shared `alb:budget:{client}:{today}` counter on its first sync
+    /// tick, so `/_stats` `used_today`/`remaining` and the
+    /// `anthropic_client_budget_*` gauges equal the fleet total after a
+    /// restart — and a later tick whose counter is BEHIND the local mirror
+    /// never lowers it (the LAB-1962 floor). Pairs with the pure
+    /// `fold_budget_mirror_seeds_floors_and_replaces_stale_day`.
+    #[tokio::test]
+    async fn sync_from_redis_seeds_budget_mirror_from_shared_counter() {
+        let Some((mut conn, fred)) = redis_test_conn(11).await else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let today = AppState::now_epoch() / 86400;
+        let key = format!("alb:budget:seed-cli:{today}");
+        // The fleet spent this much before the replica under test started.
+        let _: () = conn.set(&key, 1_516_491u64).await.unwrap();
+
+        let state = Arc::new(AppState {
+            endpoints: vec![make_endpoint("seed-ep", Protocol::Anthropic)],
+            client_budgets: [("seed-cli".to_string(), 2_000_000u64)].into(),
+            redis: Some(fred),
+            ..test_state_base()
+        });
+        assert!(
+            state.budget_usage.lock().unwrap().is_empty(),
+            "a fresh replica starts with an empty mirror"
+        );
+
+        state.sync_from_redis().await;
+
+        assert_eq!(
+            state.budget_usage.lock().unwrap().get("seed-cli").copied(),
+            Some((today, 1_516_491)),
+            "first sync tick must seed the mirror from the shared counter"
+        );
+
+        let app = build_router(state.clone());
+        let addr = serve(app).await;
+        let client = Client::new();
+        let stats: serde_json::Value = serde_json::from_str(
+            &client
+                .get(format!("http://{addr}/_stats"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stats["client_budgets"]["seed-cli"]["used_today"], 1_516_491,
+            "/_stats used_today must equal the shared counter"
+        );
+        assert_eq!(
+            stats["client_budgets"]["seed-cli"]["remaining"], 483_509,
+            "/_stats remaining must be limit − shared counter"
+        );
+        let metrics = client
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            metrics.contains("anthropic_client_budget_used{client=\"seed-cli\"} 1516491"),
+            "budget_used gauge must equal the shared counter:\n{metrics}"
+        );
+        assert!(
+            metrics.contains("anthropic_client_budget_remaining{client=\"seed-cli\"} 483509"),
+            "budget_remaining gauge must be limit − shared counter:\n{metrics}"
+        );
+
+        // AC2: a counter that fell BEHIND the mirror (an INCRBY lost while
+        // Redis was away) must not lower the enforcement floor.
+        let _: () = conn.set(&key, 1_000u64).await.unwrap();
+        state.sync_from_redis().await;
+        assert_eq!(
+            state.budget_usage.lock().unwrap().get("seed-cli").copied(),
+            Some((today, 1_516_491)),
+            "a lagging shared counter must never lower the local floor"
         );
     }
 

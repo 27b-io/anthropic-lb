@@ -4,7 +4,7 @@ listen = "127.0.0.1:8082"
 # - "dynamic-capacity" / "dynamic-capacity-v1": legacy weighted routing with
 #   the older 0.5 affinity override threshold
 # - "sticky-weighted-v2": stronger session stickiness, only breaks on egregious
-#   weight disparities
+#   headroom disparities (min of gate headroom and unused weekly quota)
 strategy = "dynamic-capacity-v1"
 rate_limit_cooldown_secs = 60
 probe_interval_secs = 300
@@ -59,6 +59,11 @@ probe_interval_secs = 300
 # not itself in the list; from any other peer the header is IGNORED. Behind an
 # LB, [[clients]] credentials are the identity — client_names is lab-only.
 # trusted_proxies = ["10.128.0.0/20"]
+
+# Relay caller-identity headers (x-forwarded-for, x-real-ip, forwarded,
+# true-client-ip, x-client-id, x-agent-id, x-session-id) to the upstream.
+# Default false: the proxy has already used them and upstream has no consumer.
+# forward_caller_identity = false
 
 # Failed-auth throttle (LAB-1193, superseding LAB-1192 AC-11 after the
 # 2026-08-24 shared-IP outage): after auth_failure_limit failures from one
