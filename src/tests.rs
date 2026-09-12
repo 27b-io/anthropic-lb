@@ -1314,6 +1314,183 @@ async fn affinity_override_one_exhausted() {
     .await;
 }
 
+// ── LAB-3295: status-floor-bound migrations log at INFO with reason="floored" ──
+
+/// Pin ONE sticky key that hashes to `sticky_idx` (via `keys_hashing_to`, the
+/// same idiom the GH#156 counter tests use), route it once, and return the
+/// per-reason affinity-migration counter (`[loaded, spent, floored]`) plus the
+/// capture buffer's log lines mentioning `marker`. Deterministic: the key lands
+/// on the sticky account, so the override fires exactly once. The counter is
+/// per-`state`; the log buffer is process-global, so we filter by the unique
+/// `marker` the key carries verbatim into the override line's `affinity=` field.
+async fn migrate_one_sticky(
+    state: &AppState,
+    sticky_idx: usize,
+    marker: &str,
+) -> ([u64; 3], Vec<String>) {
+    let buf = log_capture_buf();
+    let key = keys_hashing_to(state, sticky_idx, 1, 50_000, marker)
+        .await
+        .pop()
+        .expect("a key hashing to the sticky account");
+    let picked = state
+        .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
+        .await
+        .unwrap();
+    assert_ne!(
+        picked, sticky_idx,
+        "the override must migrate the session off the sticky account"
+    );
+    let counts = [
+        state.affinity_migrations[AffinityBind::Loaded as usize].load(Ordering::Relaxed),
+        state.affinity_migrations[AffinityBind::Spent as usize].load(Ordering::Relaxed),
+        state.affinity_migrations[AffinityBind::Floored as usize].load(Ordering::Relaxed),
+    ];
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let lines = output
+        .lines()
+        .filter(|l| l.contains(marker))
+        .map(str::to_string)
+        .collect();
+    (counts, lines)
+}
+
+/// Set a status floor on account `idx`'s general `seven_day` claim (the claim
+/// that gates opus), so its gate is bound by an Anthropic status flag rather
+/// than raw utilisation — the LAB-3295 floor-bound case.
+async fn set_7d_status(state: &AppState, idx: usize, status: &str) {
+    let mut info = state.endpoints[idx].rate_info.write().await;
+    info.claims_7d
+        .get_mut("seven_day")
+        .expect("set_account_utilization populates seven_day")
+        .status = Some(status.to_string());
+}
+
+/// AC-5(a), StickyWeightedV2: the sticky account is fresh on raw utilisation
+/// (5h/7d both 0.10) but Anthropic has flagged its weekly window
+/// (`allowed_warning` → 0.80 gate floor). The override still fires — routing is
+/// unchanged — but the migration is a routine status-floor move, so it logs at
+/// INFO with `reason="floored"` and increments only the floored counter. No
+/// `affinity broken` WARN is emitted.
+#[tokio::test]
+async fn affinity_floor_bound_migration_logs_info_v2() {
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("sticky", "sk-ant-api-a"),
+            mk_endpoint("fresh", "sk-ant-api-b"),
+        ],
+        RoutingStrategy::StickyWeightedV2,
+    );
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_7d_status(&state, 0, "allowed_warning").await;
+
+    let marker = "lab3295-floored-v2";
+    let (counts, lines) = migrate_one_sticky(&state, 0, marker).await;
+
+    assert_eq!(
+        counts,
+        [0, 0, 1],
+        "a status-floor migration counts only as floored, got [loaded,spent,floored]={counts:?}"
+    );
+    assert!(
+        !lines.is_empty(),
+        "expected at least one override log line for marker {marker}"
+    );
+    for l in &lines {
+        assert!(
+            l.contains(" INFO ") && !l.contains(" WARN "),
+            "floor-bound migration must log at INFO, not WARN: {l}"
+        );
+        assert!(
+            l.contains("reason=\"floored\"") && l.contains("affinity migrated"),
+            "line must carry reason=\"floored\" and the routine message: {l}"
+        );
+        assert!(
+            !l.contains("affinity broken"),
+            "the `affinity broken` WARN text must not appear for a floor-bound migration: {l}"
+        );
+    }
+}
+
+/// AC-5(a), legacy DynamicCapacityV1: same floor-bound scenario at the other
+/// override site — it too logs at INFO with `reason="floored"`.
+#[tokio::test]
+async fn affinity_floor_bound_migration_logs_info_legacy() {
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("sticky", "sk-ant-api-a"),
+            mk_endpoint("fresh", "sk-ant-api-b"),
+        ],
+        RoutingStrategy::DynamicCapacityV1,
+    );
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_7d_status(&state, 0, "allowed_warning").await;
+
+    let marker = "lab3295-floored-legacy";
+    let (counts, lines) = migrate_one_sticky(&state, 0, marker).await;
+
+    assert_eq!(
+        counts,
+        [0, 0, 1],
+        "legacy site: only floored migrations expected, got {counts:?}"
+    );
+    assert!(
+        !lines.is_empty(),
+        "expected override log lines for {marker}"
+    );
+    for l in &lines {
+        assert!(
+            l.contains(" INFO ")
+                && l.contains("reason=\"floored\"")
+                && !l.contains("affinity broken"),
+            "legacy floor-bound migration must log INFO/floored, not the WARN: {l}"
+        );
+    }
+}
+
+/// AC-5(b): the sticky account is genuinely load-bound — raw 5h utilisation
+/// 0.80, status `allowed` (no floor). The migration stays a WARN with
+/// `reason="loaded"` and the unchanged `affinity broken` message.
+#[tokio::test]
+async fn affinity_raw_load_migration_stays_warn() {
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("sticky", "sk-ant-api-a"),
+            mk_endpoint("fresh", "sk-ant-api-b"),
+        ],
+        RoutingStrategy::StickyWeightedV2,
+    );
+    let now = AppState::now_epoch();
+    // Raw 5h load of 0.80 → gate 0.80 with no status floor involved.
+    set_account_utilization(&state, 0, 0.80, 0.10, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.10, 0.10, now + 10000, now + 300000).await;
+
+    let marker = "lab3295-loaded";
+    let (counts, lines) = migrate_one_sticky(&state, 0, marker).await;
+
+    assert_eq!(
+        counts,
+        [1, 0, 0],
+        "raw-load migration counts only as loaded, never floored, got {counts:?}"
+    );
+    assert!(
+        !lines.is_empty(),
+        "expected override log lines for {marker}"
+    );
+    for l in &lines {
+        assert!(
+            l.contains(" WARN ")
+                && l.contains("reason=\"loaded\"")
+                && l.contains("affinity broken"),
+            "raw-load migration must stay a WARN with the unchanged message: {l}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn affinity_override_both_rough() {
     // Scenario: both accounts in bad shape — affinity preserved
@@ -1678,9 +1855,10 @@ async fn affinity_override_spent_discounts_near_weekly_reset() {
         idx, 1,
         "session must stay on the expiring account it hashed to"
     );
-    let [loaded, spent] = &state.affinity_migrations;
+    let [loaded, spent, floored] = &state.affinity_migrations;
     assert_eq!(spent.load(Ordering::Relaxed), 0, "spent counter");
     assert_eq!(loaded.load(Ordering::Relaxed), 0, "loaded counter");
+    assert_eq!(floored.load(Ordering::Relaxed), 0, "floored counter");
 }
 
 #[tokio::test]
@@ -1708,9 +1886,10 @@ async fn affinity_migration_counter_names_the_binding_window() {
         .await
         .unwrap();
     assert_eq!(idx, 0, "session must leave the spent account");
-    let [loaded, spent] = &state.affinity_migrations;
+    let [loaded, spent, floored] = &state.affinity_migrations;
     assert_eq!(spent.load(Ordering::Relaxed), 1, "spent counter");
     assert_eq!(loaded.load(Ordering::Relaxed), 0, "loaded counter");
+    assert_eq!(floored.load(Ordering::Relaxed), 0, "floored counter");
 
     // reason="loaded": identical 7d, the sticky account's 5h gate is the limit.
     let state = test_state_with_strategy(
@@ -1731,9 +1910,10 @@ async fn affinity_migration_counter_names_the_binding_window() {
         .await
         .unwrap();
     assert_eq!(idx, 0, "session must leave the busy account");
-    let [loaded, spent] = &state.affinity_migrations;
+    let [loaded, spent, floored] = &state.affinity_migrations;
     assert_eq!(loaded.load(Ordering::Relaxed), 1, "loaded counter");
     assert_eq!(spent.load(Ordering::Relaxed), 0, "spent counter");
+    assert_eq!(floored.load(Ordering::Relaxed), 0, "floored counter");
 }
 
 #[test]

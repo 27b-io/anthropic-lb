@@ -816,9 +816,9 @@ struct AppState {
     /// `body_read_timeout`. Exposed as `anthropic_body_read_timeout_total`.
     body_read_timeout_total: AtomicU64,
     /// Affinity overrides that migrated a session, indexed by `AffinityBind`
-    /// (the window that bound the sticky account). Exposed as
-    /// `anthropic_affinity_migrations_total{reason="loaded"|"spent"}`.
-    affinity_migrations: [AtomicU64; 2],
+    /// (what bound the sticky account). Exposed as
+    /// `anthropic_affinity_migrations_total{reason="loaded"|"spent"|"floored"}`.
+    affinity_migrations: [AtomicU64; 3],
     /// Reflect upstream `anthropic-ratelimit-*` headers to callers (see
     /// `Config::expose_upstream_ratelimit_headers`). Default: false.
     expose_upstream_ratelimit_headers: bool,
@@ -1022,6 +1022,11 @@ struct RoutingCandidate {
     /// never `wr`/`weight` (see `affinity_headroom`).
     unused_7d: f64,
     weight: f64,
+    /// The effective `gate` is set by an Anthropic status floor
+    /// (`status_to_floor`) that exceeds raw utilisation, not by raw load or
+    /// overage. Drives `affinity_headroom`'s `Floored` classification so a
+    /// routine status-floor migration logs at INFO, not WARN (LAB-3295).
+    gate_floor_bound: bool,
     source: &'static str,
 }
 
@@ -2999,19 +3004,26 @@ const STICKY_WEIGHTED_OVERRIDE_RATIO: f64 = 0.25;
 /// `AppState::affinity_migrations`.
 #[derive(Clone, Copy)]
 enum AffinityBind {
-    /// The effective gate (5h utilisation, status floors, overage) is tighter.
+    /// The effective gate is tighter, bound by raw (time-adjusted) 5h
+    /// utilisation or overage — the pool is the bottleneck (operator-actionable).
     Loaded = 0,
-    /// Unused weekly quota is tighter.
+    /// Unused weekly quota is tighter — one account's week is nearly spent.
     Spent = 1,
+    /// The gate is tighter, but set by an Anthropic status floor
+    /// (`status_to_floor`) that exceeds raw utilisation — the LB is moving the
+    /// session off an account Anthropic flagged, onto fresh capacity. Routine,
+    /// not a pool-health signal: logged at INFO, not WARN (LAB-3295).
+    Floored = 2,
 }
 
 impl AffinityBind {
-    const ALL: [Self; 2] = [Self::Loaded, Self::Spent];
+    const ALL: [Self; 3] = [Self::Loaded, Self::Spent, Self::Floored];
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Loaded => "loaded",
             Self::Spent => "spent",
+            Self::Floored => "floored",
         }
     }
 }
@@ -3027,6 +3039,12 @@ fn affinity_headroom(c: &RoutingCandidate) -> (f64, AffinityBind) {
     let loaded = (1.0 - c.gate).max(0.0);
     if c.unused_7d < loaded {
         (c.unused_7d, AffinityBind::Spent)
+    } else if c.gate_floor_bound {
+        // Same headroom value as `Loaded` — routing decision unchanged — but a
+        // distinct reason so a status-floor-forced migration is not mistaken
+        // for pool exhaustion (LAB-3295). Only when the gate (not weekly quota)
+        // binds; a genuinely spent week is `Spent` above and stays WARN.
+        (loaded, AffinityBind::Floored)
     } else {
         (loaded, AffinityBind::Loaded)
     }
@@ -3443,6 +3461,8 @@ struct RoutingWeight {
     /// See `RoutingCandidate::unused_7d`.
     unused_7d: f64,
     weight: f64,
+    /// See `RoutingCandidate::gate_floor_bound`.
+    gate_floor_bound: bool,
     source: &'static str,
     /// Account is serving via paid overage — caller demotes its priority tier.
     overage_active: bool,
@@ -3481,6 +3501,25 @@ fn compute_routing_weight(
             }
         })
     };
+
+    // Whether a status floor (`status_to_floor` inside `time_adjusted_utilization`)
+    // raised `gate_5h` above its raw time-adjusted utilisation. Compared against
+    // the ALREADY-computed `gate_5h` — not a second status-bearing call — so the
+    // two can't drift AND `status_to_floor` is evaluated only once: a duplicate
+    // status-bearing call would re-emit its unknown-status WARN, the very noise
+    // this ticket removes (CodeRabbit on #175). The floor-free call shares
+    // `gate_5h`'s inputs, so it is `None` exactly on `gate_5h`'s fallback path,
+    // where no floor applies → not floor-bound. False under staleness (gate is a
+    // fixed 0.5). Feeds `AffinityBind::Floored` (LAB-3295).
+    let gate_5h_floor_bound = !stale_after_hard_limit
+        && time_adjusted_utilization(
+            info.utilization_5h,
+            info.reset_5h,
+            None,
+            NEAR_RESET_5H_SECS,
+            now_epoch,
+        )
+        .is_some_and(|unfloored| gate_5h > unfloored);
 
     // 7d model-specific gate and waste risk. For Fable both the band claim and
     // the general weekly claim constrain (headroom = min of the two remainders);
@@ -3580,6 +3619,24 @@ fn compute_routing_weight(
         })
     };
 
+    // Floor-bound: the effective `gate` is set by an Anthropic status floor that
+    // exceeds raw utilisation, not by raw load or overage. Routine — Anthropic
+    // flagged the account and the LB is migrating the session off it — so the
+    // affinity override logs it at INFO, not a pool-health WARN (LAB-3295).
+    // The 7d gate is a pure status floor (`gate_of` forces util=0), so its
+    // winning over gate_5h (which is >= 0) means a non-zero floor bound the gate;
+    // the 5h case is `gate_5h_floor_bound`. Overage never floors (its gate comes
+    // from the overage window); staleness is already excluded by both terms.
+    //
+    // ponytail: `Floored` covers EVERY status floor, not just `allowed_warning`
+    // (0.80) — `throttled` (0.98) and `rejected` (1.0) too. That is intended
+    // (AC-1: "status_to_floor is non-zero and set the gate"): a `rejected`
+    // account has weight 0 so it is never the sticky pick and never reaches
+    // here, and a lone `throttled` account with a healthy alternative is the
+    // same single-account-flagged case, not pool exhaustion. If throttled/
+    // rejected migrations ever need to stay loud, split on the floor tier here.
+    let gate_floor_bound = !overage_active && (gate_7d > gate_5h || gate_5h_floor_bound);
+
     let headroom = (1.0 - gate).max(0.01);
     let weight = if wr > 0.0 { wr * headroom } else { headroom };
     let weight = if gate >= 1.0 { 0.0 } else { weight };
@@ -3590,6 +3647,7 @@ fn compute_routing_weight(
         gate,
         wr,
         unused_7d,
+        gate_floor_bound,
         weight,
         source,
         overage_active,
@@ -3781,6 +3839,7 @@ impl AppState {
                         wr: 0.0,
                         unused_7d: 1.0,
                         weight: 1.0,
+                        gate_floor_bound: false,
                         source: "openai",
                     });
                 }
@@ -3853,6 +3912,7 @@ impl AppState {
                         wr: rw.wr,
                         unused_7d: rw.unused_7d,
                         weight: rw.weight,
+                        gate_floor_bound: rw.gate_floor_bound,
                         source: rw.source,
                     });
                 }
@@ -4298,21 +4358,36 @@ impl AppState {
             let (picked_headroom, bind) = affinity_headroom(picked);
             let (other_headroom, _) = affinity_headroom(other);
             if picked_headroom < other_headroom * LEGACY_AFFINITY_OVERRIDE_RATIO {
+                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
                 // Loud on purpose — see the StickyWeightedV2 override below for
                 // the cascade rationale. Breaking affinity is a pool-health
-                // warning sign, not routine.
-                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    strategy = RoutingStrategy::DynamicCapacityV1.as_str(),
-                    affinity = affinity_key.unwrap_or("-"),
-                    reason = bind.as_str(),
-                    picked_account = self.endpoint_name(picked.endpoint),
-                    picked_headroom = format!("{:.3}", picked_headroom),
-                    other_account = self.endpoint_name(other.endpoint),
-                    other_headroom = format!("{:.3}", other_headroom),
-                    ratio = format!("{:.3}", picked_headroom / other_headroom),
-                    "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)"
-                );
+                // warning sign, NOT routine — EXCEPT when a status floor bound
+                // the sticky account (`Floored`): Anthropic flagged it and we're
+                // moving the session onto fresh capacity, which is what the
+                // floor exists for. That case logs at INFO (LAB-3295); the
+                // counter still records every migration by reason. The field set
+                // is identical across levels — only tracing's compile-time level
+                // forces the two arms — so it lives once in this local macro.
+                macro_rules! log_migration {
+                    ($lvl:ident, $msg:literal) => {
+                        $lvl!(
+                            strategy = RoutingStrategy::DynamicCapacityV1.as_str(),
+                            affinity = affinity_key.unwrap_or("-"),
+                            reason = bind.as_str(),
+                            picked_account = self.endpoint_name(picked.endpoint),
+                            picked_headroom = format!("{:.3}", picked_headroom),
+                            other_account = self.endpoint_name(other.endpoint),
+                            other_headroom = format!("{:.3}", other_headroom),
+                            ratio = format!("{:.3}", picked_headroom / other_headroom),
+                            $msg
+                        )
+                    };
+                }
+                if matches!(bind, AffinityBind::Floored) {
+                    log_migration!(info, "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)");
+                } else {
+                    log_migration!(warn, "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)");
+                }
                 picked = other;
             }
             // NOTE: Request-balance override intentionally disabled. The previous
@@ -4369,24 +4444,40 @@ impl AppState {
                 } else {
                     best
                 };
+                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
                 // Loud on purpose. Sustained breaking with reason="loaded" means
                 // the pool is the bottleneck — add capacity, don't tune the
                 // ratio. reason="spent" means one account's week is nearly gone
                 // while others are fresh; expect it to cluster before weekly
-                // resets and vanish after.
-                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    strategy = RoutingStrategy::StickyWeightedV2.as_str(),
-                    affinity = key,
-                    reason = bind.as_str(),
-                    picked_account = self.endpoint_name(picked.endpoint),
-                    picked_headroom = format!("{:.3}", picked_headroom),
-                    replacement_account = self.endpoint_name(replacement.endpoint),
-                    replacement_headroom = format!("{:.3}", affinity_headroom(replacement).0),
-                    best_account = self.endpoint_name(best.endpoint),
-                    ratio = format!("{:.3}", picked_headroom / best_headroom),
-                    "affinity broken: sticky endpoint out of headroom, migrating session to stable replacement"
-                );
+                // resets and vanish after. reason="floored" is neither: Anthropic
+                // put a status floor on the sticky account and we're moving the
+                // session onto fresh capacity — the floor doing its job, not a
+                // pool problem. It logs at INFO so the WARN stays a real signal
+                // (LAB-3295); the counter records all three. Field set is
+                // identical across levels — tracing's compile-time level forces
+                // the two arms — so it lives once in this local macro.
+                macro_rules! log_migration {
+                    ($lvl:ident, $msg:literal) => {
+                        $lvl!(
+                            strategy = RoutingStrategy::StickyWeightedV2.as_str(),
+                            affinity = key,
+                            reason = bind.as_str(),
+                            picked_account = self.endpoint_name(picked.endpoint),
+                            picked_headroom = format!("{:.3}", picked_headroom),
+                            replacement_account = self.endpoint_name(replacement.endpoint),
+                            replacement_headroom =
+                                format!("{:.3}", affinity_headroom(replacement).0),
+                            best_account = self.endpoint_name(best.endpoint),
+                            ratio = format!("{:.3}", picked_headroom / best_headroom),
+                            $msg
+                        )
+                    };
+                }
+                if matches!(bind, AffinityBind::Floored) {
+                    log_migration!(info, "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)");
+                } else {
+                    log_migration!(warn, "affinity broken: sticky endpoint out of headroom, migrating session to stable replacement");
+                }
                 picked = replacement;
             }
         }
