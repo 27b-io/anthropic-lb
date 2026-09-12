@@ -3503,26 +3503,23 @@ fn compute_routing_weight(
     };
 
     // Whether a status floor (`status_to_floor` inside `time_adjusted_utilization`)
-    // raised `gate_5h` above its raw time-adjusted utilisation — kept next to
-    // `gate_5h` so the two can't silently drift. Same inputs, so both calls
-    // return Some or None together; `floored > unfloored` is therefore exactly
-    // "the floor set the gate". False under staleness (the gate is a fixed 0.5
-    // then) and on the floor-free fallback path (both calls None). Feeds
-    // `AffinityBind::Floored` (LAB-3295).
+    // raised `gate_5h` above its raw time-adjusted utilisation. Compared against
+    // the ALREADY-computed `gate_5h` — not a second status-bearing call — so the
+    // two can't drift AND `status_to_floor` is evaluated only once: a duplicate
+    // status-bearing call would re-emit its unknown-status WARN, the very noise
+    // this ticket removes (CodeRabbit on #175). The floor-free call shares
+    // `gate_5h`'s inputs, so it is `None` exactly on `gate_5h`'s fallback path,
+    // where no floor applies → not floor-bound. False under staleness (gate is a
+    // fixed 0.5). Feeds `AffinityBind::Floored` (LAB-3295).
     let gate_5h_floor_bound = !stale_after_hard_limit
         && time_adjusted_utilization(
-            info.utilization_5h,
-            info.reset_5h,
-            info.status_5h.as_deref(),
-            NEAR_RESET_5H_SECS,
-            now_epoch,
-        ) > time_adjusted_utilization(
             info.utilization_5h,
             info.reset_5h,
             None,
             NEAR_RESET_5H_SECS,
             now_epoch,
-        );
+        )
+        .is_some_and(|unfloored| gate_5h > unfloored);
 
     // 7d model-specific gate and waste risk. For Fable both the band claim and
     // the general weekly claim constrain (headroom = min of the two remainders);
