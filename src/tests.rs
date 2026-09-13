@@ -5845,6 +5845,41 @@ async fn fast_mode_disabled_everywhere_returns_upstream_400_not_429() {
     );
 }
 
+/// Warm-path attribution: the synthesized exhaustion error must name the
+/// cause whose removal would unblock the request. The one endpoint that
+/// serves the model carries BOTH marks; the other fast-disabled endpoint's
+/// allow-list never served it — dropping `speed: "fast"` would not help, so
+/// the reply is the model 404, not the fast-mode 400 (a fast-mark filter by
+/// `serves_model` alone would still say 400 here).
+#[tokio::test]
+async fn warm_path_fast_request_names_model_not_fast_when_fast_mark_is_ineligible() {
+    let mut haiku_only = mk_endpoint("b", "sk-ant-api-b");
+    haiku_only.models = vec!["claude-haiku-*".to_string()];
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a"), haiku_only]);
+    state.note_model_unsupported("a", 0, "claude-opus-5");
+    state.note_fast_mode_disabled("a", 0);
+    state.note_fast_mode_disabled("b", 1);
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(FAST_BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "fast mark on an endpoint that never served the model must not claim the rejection"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("not_found_error") && body.contains("claude-opus-5"),
+        "error body must carry the model rejection, got: {body}"
+    );
+}
+
 /// LAB-941 incident shape (observed live 2026-07-27): an OpenAI-protocol
 /// gateway without the requested model returns 400 "Invalid model name"; the
 /// LB must rotate to an account that serves it and route the NEXT request

@@ -8904,9 +8904,10 @@ async fn proxy_handler(
         }
         // Warm-cache path: the pool emptied BEFORE any forward ran, so
         // nothing was stashed — synthesize the error the first request got.
-        // A fast request refused by a fast-disabled account was refused for
-        // its speed, not its model.
-        if fast && !state.fast_mode_disabled_endpoints().is_empty() {
+        // Name the cause whose removal would unblock the request: if the
+        // pool serves the model at standard speed, only fast-mode marks
+        // stand in the way; otherwise the model itself is unservable.
+        if fast && !state.pool_cannot_serve(&model, false) {
             warn!(model, "fast mode not enabled on any eligible endpoint");
             return invalid_request_response(FAST_MODE_NOT_ENABLED_MSG);
         }
