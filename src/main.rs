@@ -148,6 +148,9 @@ struct Config {
     /// They reveal the pooled capacity of every account behind the proxy, so
     /// this is trusted-network-only. Default: false (LAB-1191).
     expose_upstream_ratelimit_headers: Option<bool>,
+    /// Relay the caller-identity headers (`CLIENT_IDENTITY_HEADERS`) to the
+    /// upstream. Default: false = stripped once the proxy has used them (GH #168).
+    forward_caller_identity: Option<bool>,
     /// Client-supplied `anthropic-beta` flags forwarded upstream on OAuth
     /// endpoints ("*" suffix wildcards, like `endpoints[].models`). Absent =
     /// built-in default (`DEFAULT_CLIENT_BETA_ALLOWLIST`); a configured
@@ -176,6 +179,14 @@ struct ClientConfig {
     /// `EndpointConfig.models` semantics. Same exact + `*`-suffix matcher.
     #[serde(default)]
     models: Vec<String>,
+    /// Endpoint names this client is pinned to (LAB-2636 / #151). While at
+    /// least one is healthy (serves the model, not hard-limited, not
+    /// transport-unhealthy, under `soft_limit`, not serving via paid
+    /// overage), routing is restricted to this set; otherwise the request
+    /// spills to the full pool. Empty = no pin, routing identical to a
+    /// client without the field.
+    #[serde(default)]
+    preferred_endpoints: Vec<String>,
 }
 
 /// Hand-written, NOT derived: a derived `Debug` would print `key` verbatim into
@@ -188,6 +199,7 @@ impl std::fmt::Debug for ClientConfig {
             .field("name", &self.name)
             .field("key", &"<redacted>")
             .field("models", &self.models)
+            .field("preferred_endpoints", &self.preferred_endpoints)
             .finish()
     }
 }
@@ -748,6 +760,8 @@ struct AppState {
     /// Per-client daily token budgets: client_id → max tokens per day.
     client_budgets: HashMap<String, u64>,
     /// Budget tracking: client_id → (epoch_day, tokens_used). Resets on new day.
+    /// Process-local; with Redis it is re-seeded from the shared counter every
+    /// sync tick (`fold_budget_mirror`, LAB-3217) so it survives restarts.
     budget_usage: Mutex<HashMap<String, (u64, u64)>>,
     /// Per-client utilization limits: client_id → max effective utilization.
     client_utilization_limits: HashMap<String, f64>,
@@ -804,9 +818,16 @@ struct AppState {
     /// Count of requests shed because the body was not fully received within
     /// `body_read_timeout`. Exposed as `anthropic_body_read_timeout_total`.
     body_read_timeout_total: AtomicU64,
+    /// Affinity overrides that migrated a session, indexed by `AffinityBind`
+    /// (the window that bound the sticky account). Exposed as
+    /// `anthropic_affinity_migrations_total{reason="loaded"|"spent"}`.
+    affinity_migrations: [AtomicU64; 2],
     /// Reflect upstream `anthropic-ratelimit-*` headers to callers (see
     /// `Config::expose_upstream_ratelimit_headers`). Default: false.
     expose_upstream_ratelimit_headers: bool,
+    /// Relay caller-identity headers upstream (see
+    /// `Config::forward_caller_identity`). Default: false = stripped.
+    forward_caller_identity: bool,
     /// `anthropic-beta` flags a client may forward upstream on OAuth
     /// endpoints ("*" suffix wildcards). Flags outside the list are dropped.
     allowed_client_betas: Vec<String>,
@@ -1001,6 +1022,10 @@ struct RoutingCandidate {
     gate_7d: f64,
     gate: f64,
     wr: f64,
+    /// Unused share of the model's weekly (7d) quota; 1.0 when unknown or
+    /// superseded by overage. Time-free — the affinity override reads this,
+    /// never `wr`/`weight` (see `affinity_headroom`).
+    unused_7d: f64,
     weight: f64,
     source: &'static str,
 }
@@ -2947,6 +2972,9 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     "fallback-credit-*",
     "redact-thinking-*",
     "afk-mode-*",
+    // Fast mode (LAB-2669): body-paired with top-level `speed` — same
+    // header-stripped/body-forwarded hard-400 shape as the families above.
+    "fast-mode-*",
 ];
 
 /// Cardinality bound for `beta_flags_dropped` — flag names are
@@ -2975,12 +3003,51 @@ fn beta_flag_allowed(allowed: &[String], flag: &str) -> bool {
 }
 
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
-/// weight is below 50% of the alternative, stickiness is broken immediately.
+/// `affinity_headroom` is below 50% of the alternative's, stickiness is broken.
 const LEGACY_AFFINITY_OVERRIDE_RATIO: f64 = 0.5;
 
-/// Sticky-weighted override threshold. Lower than the legacy algorithm to
-/// preserve cache locality and only break stickiness for egregious disparities.
+/// Sticky-weighted override threshold on `affinity_headroom`. Lower than the
+/// legacy algorithm to preserve cache locality and only break stickiness for
+/// egregious disparities.
 const STICKY_WEIGHTED_OVERRIDE_RATIO: f64 = 0.25;
+
+/// Which window bound the sticky account when an affinity override fired.
+/// Label value of `anthropic_affinity_migrations_total{reason}`; also indexes
+/// `AppState::affinity_migrations`.
+#[derive(Clone, Copy)]
+enum AffinityBind {
+    /// The effective gate (5h utilisation, status floors, overage) is tighter.
+    Loaded = 0,
+    /// Unused weekly quota is tighter.
+    Spent = 1,
+}
+
+impl AffinityBind {
+    const ALL: [Self; 2] = [Self::Loaded, Self::Spent];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::Spent => "spent",
+        }
+    }
+}
+
+/// Capacity a candidate has left to keep a sticky session, and which window
+/// binds it. Both terms are time-free. Deliberately NOT `weight`: weight =
+/// waste_risk × headroom, and waste_risk's denominator is time-to-weekly-reset,
+/// so an account that reset yesterday read ~8x "worse" than one resetting in
+/// hours at identical load — which migrated 25% of prod sessions off the
+/// FRESHEST accounts in the pool (GH#156). waste_risk stays in the bucket
+/// weights, where burning expiring quota first is the point.
+fn affinity_headroom(c: &RoutingCandidate) -> (f64, AffinityBind) {
+    let loaded = (1.0 - c.gate).max(0.0);
+    if c.unused_7d < loaded {
+        (c.unused_7d, AffinityBind::Spent)
+    } else {
+        (loaded, AffinityBind::Loaded)
+    }
+}
 
 /// Extract version string from User-Agent header.
 /// "claude-cli/2.1.68 (external, cli)" → "2.1.68"
@@ -3011,6 +3078,62 @@ fn model_family(model: &str) -> &str {
     } else {
         ""
     }
+}
+
+/// Claude ≥ 4.7 hard-rejects sampling `temperature` — the API returns a
+/// non-retryable `invalid_request_error` ("`temperature` is deprecated for
+/// this model") for any value other than the default 1 (LAB-798, verified
+/// against the live API 2026-07-25). The version is the numeric segments
+/// after the family name: "claude-sonnet-4-5-20250929" → 4.5,
+/// "claude-fable-5[1m]" → 5.0. Old-style ids ("claude-3-5-sonnet-…") put the
+/// version before the family and parse as 0.0 → accepts, which is correct
+/// (all 3.x models take temperature). Unknown families also parse as
+/// accepting: forward unchanged and let the upstream decide.
+fn model_rejects_temperature(model: &str) -> bool {
+    let family = model_family(model);
+    if family.is_empty() {
+        return false;
+    }
+    let Some((_, rest)) = model.split_once(family) else {
+        return false;
+    };
+    let mut nums = rest.split('-').filter(|s| !s.is_empty()).map_while(|seg| {
+        let end = seg.find(|c: char| !c.is_ascii_digit()).unwrap_or(seg.len());
+        // 4+ digit runs are date stamps ("-20250929"), not version parts
+        if end == 0 || end >= 4 {
+            None
+        } else {
+            seg[..end].parse::<u32>().ok()
+        }
+    });
+    let major = nums.next().unwrap_or(0);
+    let minor = nums.next().unwrap_or(0);
+    (major, minor) >= (4, 7)
+}
+
+/// Decide whether a request's `temperature` must be dropped before
+/// forwarding, and log the operator-visible warn when it is. Shared by every
+/// path that builds an upstream body (LAB-798): the OpenAI→Anthropic shim,
+/// the Anthropic→OpenAI fallback translator, and the raw OpenAI passthrough —
+/// a `protocol = "openai"` endpoint can front Claude too, so all three must
+/// agree.
+///
+/// Only confirmed non-default numerics are dropped: the default (1) is still
+/// accepted upstream, and most OpenAI SDKs send it unprompted — warning on
+/// every default-sending request would be spam. Non-numeric junk ("0.7",
+/// null) forwards so it earns the same upstream type error it gets on ≤ 4.6
+/// models. The per-drop warn is deliberate: the client asked for sampling
+/// behavior it will not get, and that must stay visible to operators.
+fn drops_deprecated_temperature(model: &str, value: &serde_json::Value) -> bool {
+    if !model_rejects_temperature(model) || !matches!(value.as_f64(), Some(t) if t != 1.0) {
+        return false;
+    }
+    warn!(
+        model = %truncate_label(model),
+        temperature = %value,
+        "dropping `temperature`: deprecated and hard-rejected by this model"
+    );
+    true
 }
 
 /// Internal claim key for the Fable included-usage band. On Max plans Fable is
@@ -3334,6 +3457,8 @@ struct RoutingWeight {
     gate_7d: f64,
     gate: f64,
     wr: f64,
+    /// See `RoutingCandidate::unused_7d`.
+    unused_7d: f64,
     weight: f64,
     source: &'static str,
     /// Account is serving via paid overage — caller demotes its priority tier.
@@ -3445,6 +3570,33 @@ fn compute_routing_weight(
         (gate_5h.max(gate_7d), wr_7d, source_7d)
     };
 
+    // Weekly headroom for the affinity override (`affinity_headroom`): 1.0 when
+    // unknown or superseded by overage, else the tighter of the primary claim
+    // and (Fable) the pool it draws from. Reuses the gate's near-reset ramp so
+    // quota expiring within NEAR_RESET_7D_SECS reads as headroom, not "spent":
+    // the bucket weights pull sessions ONTO expiring accounts and the override
+    // must not push them straight back off. Status floors are the gate's job
+    // (`None`). Deliberately not hedged under stale_after_hard_limit — a 429
+    // says nothing about how much of the week is spent.
+    // ponytail: 6h ramp; an account with ≤25% of its week left and 6h–~30h to
+    // reset still reads "spent" while the buckets favour it. Widen the ramp if
+    // that WARN band shows up in prod.
+    let unused_of = |c: &ClaimWindowData| {
+        let util =
+            time_adjusted_utilization(c.utilization, c.reset, None, NEAR_RESET_7D_SECS, now_epoch)
+                .unwrap_or(0.0);
+        (1.0 - util).max(0.0)
+    };
+    let unused_7d = if overage_active {
+        1.0
+    } else {
+        primary_7d.map_or(1.0, |c| {
+            pool_cap_7d
+                .iter()
+                .fold(unused_of(c), |u, p| u.min(unused_of(p)))
+        })
+    };
+
     let headroom = (1.0 - gate).max(0.01);
     let weight = if wr > 0.0 { wr * headroom } else { headroom };
     let weight = if gate >= 1.0 { 0.0 } else { weight };
@@ -3454,6 +3606,7 @@ fn compute_routing_weight(
         gate_7d,
         gate,
         wr,
+        unused_7d,
         weight,
         source,
         overage_active,
@@ -3643,6 +3796,7 @@ impl AppState {
                         gate_7d: 0.0,
                         gate: 0.0,
                         wr: 0.0,
+                        unused_7d: 1.0,
                         weight: 1.0,
                         source: "openai",
                     });
@@ -3714,6 +3868,7 @@ impl AppState {
                         gate_7d: rw.gate_7d,
                         gate: rw.gate,
                         wr: rw.wr,
+                        unused_7d: rw.unused_7d,
                         weight: rw.weight,
                         source: rw.source,
                     });
@@ -4157,19 +4312,23 @@ impl AppState {
             } else {
                 effective[0]
             };
-            if picked.weight < other.weight * LEGACY_AFFINITY_OVERRIDE_RATIO {
+            let (picked_headroom, bind) = affinity_headroom(picked);
+            let (other_headroom, _) = affinity_headroom(other);
+            if picked_headroom < other_headroom * LEGACY_AFFINITY_OVERRIDE_RATIO {
                 // Loud on purpose — see the StickyWeightedV2 override below for
                 // the cascade rationale. Breaking affinity is a pool-health
                 // warning sign, not routine.
+                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
                 warn!(
                     strategy = RoutingStrategy::DynamicCapacityV1.as_str(),
                     affinity = affinity_key.unwrap_or("-"),
+                    reason = bind.as_str(),
                     picked_account = self.endpoint_name(picked.endpoint),
-                    picked_weight = format!("{:.3}", picked.weight),
+                    picked_headroom = format!("{:.3}", picked_headroom),
                     other_account = self.endpoint_name(other.endpoint),
-                    other_weight = format!("{:.3}", other.weight),
-                    ratio = format!("{:.3}", picked.weight / other.weight),
-                    "affinity broken: sticky endpoint too loaded, migrating session (cascade risk)"
+                    other_headroom = format!("{:.3}", other_headroom),
+                    ratio = format!("{:.3}", picked_headroom / other_headroom),
+                    "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)"
                 );
                 picked = other;
             }
@@ -4192,15 +4351,16 @@ impl AppState {
         let mut picked = self.pick_weighted_bucket(effective, total_weight, affinity_key);
 
         if let Some(key) = affinity_key {
-            let best = effective
+            let (picked_headroom, bind) = affinity_headroom(picked);
+            let (best, best_headroom) = effective
                 .iter()
-                .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap())
-                .copied()
+                .map(|c| (*c, affinity_headroom(c).0))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap();
             if best.endpoint != picked.endpoint
-                && picked.weight < best.weight * STICKY_WEIGHTED_OVERRIDE_RATIO
+                && picked_headroom < best_headroom * STICKY_WEIGHTED_OVERRIDE_RATIO
             {
-                // The sticky account is too loaded to keep this session. Do NOT
+                // The sticky account is out of headroom for this session. Do NOT
                 // migrate to `best` (the global argmax): that target rotates every
                 // request as utilizations drift, so a session chases it across the
                 // whole pool and pays a cold-cache `cache_creation` charge on every
@@ -4226,18 +4386,23 @@ impl AppState {
                 } else {
                     best
                 };
-                // Loud on purpose: sustained breaking means the pool is the
-                // bottleneck — add capacity, don't tune the ratio.
+                // Loud on purpose. Sustained breaking with reason="loaded" means
+                // the pool is the bottleneck — add capacity, don't tune the
+                // ratio. reason="spent" means one account's week is nearly gone
+                // while others are fresh; expect it to cluster before weekly
+                // resets and vanish after.
+                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
                 warn!(
                     strategy = RoutingStrategy::StickyWeightedV2.as_str(),
                     affinity = key,
+                    reason = bind.as_str(),
                     picked_account = self.endpoint_name(picked.endpoint),
-                    picked_weight = format!("{:.3}", picked.weight),
+                    picked_headroom = format!("{:.3}", picked_headroom),
                     replacement_account = self.endpoint_name(replacement.endpoint),
-                    replacement_weight = format!("{:.3}", replacement.weight),
+                    replacement_headroom = format!("{:.3}", affinity_headroom(replacement).0),
                     best_account = self.endpoint_name(best.endpoint),
-                    ratio = format!("{:.3}", picked.weight / best.weight),
-                    "affinity broken: sticky endpoint too loaded, migrating session to stable replacement"
+                    ratio = format!("{:.3}", picked_headroom / best_headroom),
+                    "affinity broken: sticky endpoint out of headroom, migrating session to stable replacement"
                 );
                 picked = replacement;
             }
@@ -4281,7 +4446,69 @@ impl AppState {
         picked.endpoint
     }
 
+    /// The client's non-empty `preferred_endpoints` list, if it has one.
+    /// Resolved through the authenticated `[[clients]]` registry only — on the
+    /// legacy `proxy_key` / open path `clients` is empty, so a spoofable
+    /// header-derived client id can never acquire another client's pin.
+    fn client_preferred_endpoints(&self, client_id: &str) -> Option<&[String]> {
+        self.clients
+            .iter()
+            .find(|c| c.name == client_id)
+            .map(|c| c.preferred_endpoints.as_slice())
+            .filter(|p| !p.is_empty())
+    }
+
+    /// Whether `endpoint_idx` is in a `preferred_endpoints` list. The ONE
+    /// membership predicate, shared by the pick-time filter and `pin_status`
+    /// — if they ever diverged, the `pin=` log field would lie about what the
+    /// picker actually did.
+    fn endpoint_is_preferred(&self, preferred: &[String], endpoint_idx: EndpointIdx) -> bool {
+        preferred
+            .iter()
+            .any(|p| *p == self.endpoints[endpoint_idx].name)
+    }
+
+    /// `pin` field for the per-request serving log lines: "pinned" when the
+    /// serving endpoint is in the client's preferred set, "spilled" when the
+    /// client has preferences but was served outside them, "-" for clients
+    /// without preferences.
+    fn pin_status(&self, client_id: &str, endpoint_idx: EndpointIdx) -> &'static str {
+        match self.client_preferred_endpoints(client_id) {
+            Some(p) if self.endpoint_is_preferred(p, endpoint_idx) => "pinned",
+            Some(_) => "spilled",
+            None => "-",
+        }
+    }
+
+    /// Test-only convenience: pick with no client identity, so no pinning
+    /// applies. Keeps the pre-LAB-2636 routing tests byte-identical.
+    #[cfg(test)]
+    async fn pick_endpoint(
+        &self,
+        affinity_key: Option<&str>,
+        model: &str,
+        skip: &[EndpointIdx],
+    ) -> Option<EndpointIdx> {
+        self.pick_endpoint_for_client(affinity_key, model, skip, "")
+            .await
+    }
+
     /// Pick the best available endpoint (account or fallback upstream).
+    ///
+    /// Per-client pinning (LAB-2636 / #151) runs first: if `client_id` names a
+    /// `[[clients]]` entry with `preferred_endpoints` and at least one of them
+    /// is a healthy, undemoted candidate (serves the model, not hard-limited,
+    /// not transport-unhealthy, not skipped, `gate < soft_limit`, and not
+    /// priority-demoted for serving via paid overage / always-paid Fable), the
+    /// candidate set is restricted to the preferred endpoints. The filter runs
+    /// BEFORE tier/affinity/weighted selection, so a prior affinity landing on
+    /// a non-preferred endpoint cannot defeat the pin. Otherwise the full pool
+    /// applies unchanged (spill-over). The undemoted requirement matters: an
+    /// overage-covered account reports a LOW gate (the overage window
+    /// supersedes its exhausted subscription windows), so without it a pinned
+    /// client would keep billing paid overage forever instead of spilling to
+    /// free general-pool capacity — violating the free-before-paid guarantee
+    /// below, which the retain would otherwise bypass.
     ///
     /// Tiers are tried strictly in ascending priority order. Within a tier:
     /// healthy candidates (`gate < soft_limit`) are preferred; if none are healthy
@@ -4290,13 +4517,37 @@ impl AppState {
     /// `soft_limit` is intra-tier load-shedding and never causes a tier jump. This
     /// guarantees free capacity is fully drained before any paid (overage/upstream)
     /// tier is touched.
-    async fn pick_endpoint(
+    async fn pick_endpoint_for_client(
         &self,
         affinity_key: Option<&str>,
         model: &str,
         skip: &[EndpointIdx],
+        client_id: &str,
     ) -> Option<EndpointIdx> {
-        let candidates = self.routing_candidates(model, skip).await;
+        let mut candidates = self.routing_candidates(model, skip).await;
+        if let Some(preferred) = self.client_preferred_endpoints(client_id) {
+            let is_preferred =
+                |c: &RoutingCandidate| self.endpoint_is_preferred(preferred, c.endpoint);
+            // Undemoted = candidate priority equals the configured priority.
+            // `routing_candidates` adds `overage_penalty` while an account
+            // serves via paid overage (or always-paid Fable) — that demotion
+            // is exactly the paid-capacity signal pinning must respect.
+            let undemoted =
+                |c: &RoutingCandidate| c.priority == self.endpoints[c.endpoint].priority;
+            if candidates
+                .iter()
+                .any(|c| is_preferred(c) && undemoted(c) && c.gate < self.soft_limit)
+            {
+                candidates.retain(is_preferred);
+            } else {
+                // Greppable spill marker — the request leaves its dedicated
+                // account(s) and will consume shared-pool cache/claims.
+                info!(
+                    client_id,
+                    model, "pick: no preferred endpoint viable — spilling to general pool"
+                );
+            }
+        }
         if candidates.is_empty() {
             debug!("pick: no available endpoints");
             return None;
@@ -5232,7 +5483,9 @@ impl AppState {
             }
         }
 
-        // Aggregate budget usage from Redis (batch MGET)
+        // Aggregate budget usage from Redis (batch MGET). The same fetch
+        // re-seeds this replica's local `budget_usage` mirror (LAB-3217) —
+        // see fold_budget_mirror for why it must receive THIS `today`.
         let mut redis_budgets = serde_json::Map::new();
         if redis_ok && !self.client_budgets.is_empty() {
             let today = Self::now_epoch() / 86400;
@@ -5243,14 +5496,19 @@ impl AppState {
                 .collect();
             match redis.mget::<Vec<Option<u64>>, _>(budget_keys).await {
                 Ok(values) => {
-                    for (i, client_id) in client_ids.iter().enumerate() {
-                        let used = values.get(i).copied().flatten().unwrap_or(0);
-                        let limit = self.client_budgets[*client_id];
+                    let used_by_client: Vec<(&str, u64)> = client_ids
+                        .iter()
+                        .enumerate()
+                        .map(|(i, id)| (id.as_str(), values.get(i).copied().flatten().unwrap_or(0)))
+                        .collect();
+                    for &(client_id, used) in &used_by_client {
+                        let limit = self.client_budgets[client_id];
                         redis_budgets.insert(
-                            (*client_id).clone(),
+                            client_id.to_owned(),
                             serde_json::json!({ "limit": limit, "used": used }),
                         );
                     }
+                    self.fold_budget_mirror(today, used_by_client);
                 }
                 Err(e) => {
                     warn!(error = %e, "redis MGET failed for budget aggregation");
@@ -5959,14 +6217,13 @@ impl AppState {
     }
 }
 
+/// Usage-only log line for the unified-OpenAI-endpoint fallback path
+/// (`try_fallback_upstream`), which has no routing/utilization snapshot to
+/// merge with (OpenAI endpoints carry stub `RateLimitInfo`). Kept separate
+/// from `log_proxied` below — LAB-3214 folded the native and openai-compat
+/// paths' `proxied` + `usage` lines into one; this path never had a
+/// `proxied` line to fold into, so its usage echo stays as its own line.
 fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &TokenUsage) {
-    // INFO (temporarily): surfaces per-request cache_read vs cache_write so we can
-    // join it to the `fingerprint` line by req_id and learn whether fan-out agents
-    // share a cacheable preamble (reads) or are independent (creates) — and whether
-    // a real multi-turn session keeps getting reads after fp-keying (the fp
-    // stability check). Revert to debug! once that question is answered. Token
-    // accounting is independent of log level (Prometheus counters + optional
-    // shadow-log); this line is only the human-readable echo.
     info!(
         req_id,
         client_id,
@@ -5978,6 +6235,128 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
         cache_write = usage.cache_creation_input_tokens,
         "usage"
     );
+}
+
+/// Routing/utilization snapshot captured when upstream response headers
+/// arrive (the former standalone `proxied` / `proxied (openai-compat)` INFO
+/// lines), carried through to `finalize_stream` / `finalize_non_stream` so it
+/// can be logged on the SAME line as token usage — known only once the body
+/// or stream completes (LAB-3214: one INFO line per request, not two).
+enum ProxiedCtx {
+    Anthropic {
+        client_ver: String,
+        utilization: String,
+        util_5h: String,
+        util_7d: String,
+        constraint: &'static str,
+        overage: bool,
+        pin: &'static str,
+        total: u64,
+        /// Content fingerprint (12 hex, `content_fingerprints`) joining this
+        /// line to the DEBUG `fingerprint` line by req_id; `"-"` when the
+        /// request body was unparseable.
+        fp: String,
+    },
+    OpenaiCompat {
+        client_ver: String,
+        utilization: String,
+        util_5h: String,
+        util_7d: String,
+        constraint: &'static str,
+        pin: &'static str,
+        stream: bool,
+    },
+}
+
+/// Emit the single per-request INFO line merging routing context with token
+/// usage. Usage fields are simply zero when nothing was extracted (error
+/// response, client disconnect, upstream failure) — still exactly one line,
+/// still carrying req_id/account/status (AC4), so no separate branch is
+/// needed for the no-usage case.
+#[allow(clippy::too_many_arguments)]
+fn log_proxied(
+    req_id: &str,
+    client_id: &str,
+    model: &str,
+    account: &str,
+    client_ip: &str,
+    agent: &str,
+    session: &str,
+    status_code: u16,
+    ctx: &ProxiedCtx,
+    usage: &TokenUsage,
+) {
+    match ctx {
+        ProxiedCtx::Anthropic {
+            client_ver,
+            utilization,
+            util_5h,
+            util_7d,
+            constraint,
+            overage,
+            pin,
+            total,
+            fp,
+        } => {
+            info!(
+                req_id,
+                client = %client_ip,
+                client_id,
+                ver = %client_ver,
+                agent,
+                session,
+                model,
+                account,
+                status = status_code,
+                utilization = %utilization,
+                util_5h = %util_5h,
+                util_7d = %util_7d,
+                constraint = *constraint,
+                overage,
+                pin = *pin,
+                total,
+                fp = %fp,
+                input = usage.input_tokens,
+                output = usage.output_tokens,
+                cached = usage.cache_read_input_tokens,
+                cache_write = usage.cache_creation_input_tokens,
+                "proxied"
+            );
+        }
+        ProxiedCtx::OpenaiCompat {
+            client_ver,
+            utilization,
+            util_5h,
+            util_7d,
+            constraint,
+            pin,
+            stream,
+        } => {
+            info!(
+                req_id,
+                client = %client_ip,
+                client_id,
+                ver = %client_ver,
+                agent,
+                session,
+                model,
+                account,
+                status = status_code,
+                utilization = %utilization,
+                util_5h = %util_5h,
+                util_7d = %util_7d,
+                constraint = *constraint,
+                pin = *pin,
+                openai_compat = true,
+                stream,
+                input = usage.input_tokens,
+                output = usage.output_tokens,
+                cached = usage.cache_read_input_tokens,
+                cache_write = usage.cache_creation_input_tokens,
+                "proxied (openai-compat)"
+            );
+        }
+    }
 }
 
 /// Finalize a streaming response: extract usage, log, and shadow log.
@@ -5994,6 +6373,7 @@ async fn finalize_stream(
     agent: &str,
     session: &str,
     status_code: u16,
+    ctx: ProxiedCtx,
     mut scanner: SseUsageScanner,
     request_start: std::time::Instant,
     client_disconnected: bool,
@@ -6009,9 +6389,6 @@ async fn finalize_stream(
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
     if !usage.is_empty() {
         state.record_usage(ep, client_id, usage_model, usage).await;
-        // Log the same model the metric records, so the usage log and
-        // anthropic_client_model_token_usage_total reconcile.
-        log_usage(req_id, client_id, usage_model, acct_name, usage);
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -6040,6 +6417,7 @@ async fn finalize_stream(
             client_id,
             model,
             account = acct_name,
+            status = status_code,
             reason,
             elapsed_ms,
             sse_bytes = scanner.bytes_seen,
@@ -6049,6 +6427,23 @@ async fn finalize_stream(
             "stream_end_no_usage"
         );
     }
+    // Single terminal line for this request (LAB-3214), routing context
+    // merged with usage — zero-valued when none was captured. `usage_model`
+    // (not `model`) so this reconciles with
+    // `anthropic_client_model_token_usage_total`, which records against the
+    // same response-derived model.
+    log_proxied(
+        req_id,
+        client_id,
+        usage_model,
+        acct_name,
+        client_ip,
+        agent,
+        session,
+        status_code,
+        &ctx,
+        usage,
+    );
     let mut log = serde_json::json!({
         "ts": AppState::now_epoch(),
         "client": client_ip,
@@ -6093,13 +6488,11 @@ async fn finalize_non_stream(
     openai_compat: bool,
     session_key: Option<&str>,
     context_window: u64,
+    ctx: Option<ProxiedCtx>,
 ) {
+    let usage_model = response_model.unwrap_or(model);
     if !usage.is_empty() {
-        let usage_model = response_model.unwrap_or(model);
         state.record_usage(ep, client_id, usage_model, usage).await;
-        // Log the same model the metric records, so the usage log and
-        // anthropic_client_model_token_usage_total reconcile.
-        log_usage(req_id, client_id, usage_model, acct_name, usage);
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -6112,6 +6505,29 @@ async fn finalize_non_stream(
                 context_window,
                 AppState::now_epoch(),
             );
+        }
+    }
+    // Single terminal INFO line for this request (AC1/AC2/AC3/AC4) — merged
+    // routing + usage where a routing snapshot exists. The unified-OpenAI-
+    // endpoint fallback path (no snapshot) keeps its own usage-only echo,
+    // fired only when usage was actually captured (unchanged behavior).
+    match &ctx {
+        Some(c) => log_proxied(
+            req_id,
+            client_id,
+            usage_model,
+            acct_name,
+            client_ip,
+            agent,
+            session,
+            status_code,
+            c,
+            usage,
+        ),
+        None => {
+            if !usage.is_empty() {
+                log_usage(req_id, client_id, usage_model, acct_name, usage);
+            }
         }
     }
     let mut log = serde_json::json!({
@@ -6351,6 +6767,10 @@ impl AppState {
         // Always update local state (for stats + fallback)
         if let Ok(mut map) = self.budget_usage.lock() {
             let entry = map.entry(client_id.to_owned()).or_insert((today, 0));
+            // `!= today` is right HERE because this `today` is fresh. Do not
+            // unify with fold_budget_mirror's stricter `<` / `>` day rule —
+            // that fold receives a `today` fetched earlier and must not
+            // clobber an entry that already rolled past it (LAB-3217).
             if entry.0 != today {
                 *entry = (today, 0); // reset on new day
             }
@@ -6414,6 +6834,42 @@ impl AppState {
                     );
                 }
             }
+        }
+    }
+
+    /// Fold the fleet-wide `alb:budget:{client}:{day}` counters into the local
+    /// `budget_usage` mirror so `/_stats` and the `anthropic_client_budget_*`
+    /// gauges report the shared total on every replica — including one that
+    /// just restarted with an empty mirror (LAB-3217). Runs on every sync tick
+    /// with the values `cluster_info` already MGETs; it touches no Redis key,
+    /// so enforcement (`check_budget` / `record_budget_usage`) is unchanged.
+    ///
+    /// `max`, never overwrite: the local accumulator is also the enforcement
+    /// floor for increments lost to a failed INCRBY (LAB-1962), so a counter
+    /// that is behind must not lower it. A stale (previous-day) entry is
+    /// replaced by today's value, never summed with it; an entry that already
+    /// rolled PAST the fetched day is left alone. `today` MUST be the
+    /// epoch-day the counters were fetched under, not re-derived here: across
+    /// a UTC midnight a re-read would file yesterday's total under today, and
+    /// `max` would then pin that over-report for the whole day. A zero/absent
+    /// counter carries nothing the mirror lacks and is skipped, so the sync
+    /// alone never materialises entries for idle clients.
+    fn fold_budget_mirror<'a>(&self, today: u64, remote: impl IntoIterator<Item = (&'a str, u64)>) {
+        let Ok(mut map) = self.budget_usage.lock() else {
+            return;
+        };
+        for (client_id, used) in remote {
+            if used == 0 {
+                continue;
+            }
+            let entry = map.entry(client_id.to_owned()).or_insert((today, 0));
+            if entry.0 > today {
+                continue;
+            }
+            if entry.0 < today {
+                *entry = (today, 0);
+            }
+            entry.1 = entry.1.max(used);
         }
     }
 
@@ -6904,6 +7360,14 @@ enum ForwardOutcome {
     },
 }
 
+/// Non-transient rotation: skip this endpoint and try the next candidate.
+/// Pre-dates the `ForwardOutcome` return type as a bare `None`.
+const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
+    saw_529: false,
+    push_skip: true,
+    transient: false,
+};
+
 /// True when an upstream error body says this ACCOUNT cannot serve the
 /// requested model — distinct from a malformed request (LAB-941). Matched
 /// conservatively against observed wire formats:
@@ -7342,6 +7806,31 @@ fn body_wants_stream(body: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Caller-identity headers that must not leave this proxy. The IP set is what
+/// fronting hops (cloudflared, the Cloudflare Worker, nginx-ingress) carry the
+/// caller's address in — `resolve_client_ip` reads only `x-forwarded-for`; the
+/// rest are stripped so they cannot leak either. The `x-*-id` set is this
+/// proxy's own client/agent/session vocabulary. Relayed upstream, any of them
+/// ties a pooled-account request to the individual caller behind the proxy
+/// (GH #168). Deliberately absent: Claude Code's native
+/// `x-claude-code-session-id` (GH #171, operator decision) and edge-added
+/// `cf-*`, which the ingress strips (GH #166).
+const CLIENT_IDENTITY_HEADERS: &[&str] = &[
+    "x-forwarded-for",
+    "x-real-ip",
+    "forwarded",
+    "true-client-ip",
+    "x-client-id",
+    "x-agent-id",
+    "x-session-id",
+];
+
+fn strip_client_identity_headers(headers: &mut axum::http::HeaderMap) {
+    for name in CLIENT_IDENTITY_HEADERS {
+        headers.remove(*name);
+    }
+}
+
 /// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
 /// passes the picked endpoint and its pool index (used for `skip` and usage
 /// accounting).
@@ -7365,6 +7854,7 @@ async fn forward_anthropic(
     agent_id: &str,
     session_id: &str,
     model: &str,
+    fp: Option<&str>,
     session_key: Option<&str>,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
@@ -7397,6 +7887,9 @@ async fn forward_anthropic(
     headers.remove("host");
     headers.remove("content-length"); // body size may change after cache injection
     headers.remove("accept-encoding"); // need plaintext SSE to extract token usage
+    if !state.forward_caller_identity {
+        strip_client_identity_headers(&mut headers);
+    }
 
     // Default anthropic-version if client didn't set it
     if !headers.contains_key("anthropic-version") {
@@ -7548,30 +8041,32 @@ async fn forward_anthropic(
         state.signal_hard_limit_recovery(endpoint_name).await;
     }
 
-    // Log with capacity info + inject budget status header
-    let budget_status = {
+    // Capture the routing/utilization snapshot + inject budget status header.
+    // The `proxied` line itself is deferred to `finalize_stream`/
+    // `finalize_non_stream`, which merge it with token usage once known
+    // (LAB-3214: one INFO line per request, not two).
+    let (budget_status, ctx) = {
         let info = rate_info.read().await;
         let (eff_util, constraint, _adj_5h, _adj_7d) =
             effective_utilization(&info, AppState::now_epoch(), model);
-        info!(
-            req_id,
-            client = %client_ip,
-            client_id = %client_id,
-            ver = %client_ver,
-            agent = %agent_id,
-            session = %session_id,
-            model = %model,
-            account = endpoint_name,
-            status = status.as_u16(),
-            utilization = format_args!("{eff_util:.2}"),
-            util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-            util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+        let ctx = ProxiedCtx::Anthropic {
+            client_ver: client_ver.to_owned(),
+            utilization: format!("{eff_util:.2}"),
+            util_5h: info
+                .utilization_5h
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
+            util_7d: info
+                .utilization_7d
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
             constraint,
-            overage = info.overage_in_use,
-            total = ep.requests.load(Ordering::Relaxed),
-            "proxied"
-        );
-        compute_pressure_status(eff_util, client_id, state)
+            overage: info.overage_in_use,
+            pin: state.pin_status(client_id, endpoint_idx),
+            total: ep.requests.load(Ordering::Relaxed),
+            fp: fp.unwrap_or("-").to_string(),
+        };
+        (compute_pressure_status(eff_util, client_id, state), ctx)
     };
 
     let latency_ms = request_start.elapsed().as_millis() as u64;
@@ -7656,6 +8151,7 @@ async fn forward_anthropic(
                 &agent_clone,
                 &session_clone,
                 status_code,
+                ctx,
                 scanner,
                 request_start,
                 client_disconnected,
@@ -7681,8 +8177,7 @@ async fn forward_anthropic(
         // previous `unwrap_or_default()` turned a mid-body connection reset into
         // an empty body forwarded under the upstream's 2xx status — the caller
         // (Claude Code) then saw a truncated "success" and reported it as a
-        // socket error, while our logs showed a clean `proxied status=200`
-        // (that line is emitted above, before the body is read). Log loudly and
+        // socket error, while our logs showed no trace of it. Log loudly and
         // return a real 502 so the failure is visible and the SDK gets a
         // well-formed error frame instead of a silent corruption. Mirrors the
         // error-detection structure of the sibling body-read sites
@@ -7698,6 +8193,21 @@ async fn forward_anthropic(
                     status = status.as_u16(),
                     error = %e,
                     "upstream response body read failed mid-stream"
+                );
+                // This branch returns before `finalize_non_stream` — log the
+                // merged line here too (no usage: the body never arrived), so
+                // the routing/utilization snapshot still lands at INFO (AC4).
+                log_proxied(
+                    req_id,
+                    client_id,
+                    model,
+                    endpoint_name,
+                    &client_ip.to_string(),
+                    agent_id,
+                    session_id,
+                    status.as_u16(),
+                    &ctx,
+                    &TokenUsage::default(),
                 );
                 let body = serde_json::json!({
                     "type": "error",
@@ -7751,6 +8261,22 @@ async fn forward_anthropic(
             // into a permanent retry loop against this account (LAB-941).
             if is_model_unsupported_error(status, &parsed) {
                 state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                // This branch returns before `finalize_non_stream` — log the
+                // merged line here too, so a model-unsupported rejection
+                // still gets the routing/utilization snapshot at INFO, same
+                // as the old unconditional `proxied` line did (AC4).
+                log_proxied(
+                    req_id,
+                    client_id,
+                    model,
+                    endpoint_name,
+                    &client_ip.to_string(),
+                    agent_id,
+                    session_id,
+                    status.as_u16(),
+                    &ctx,
+                    &usage,
+                );
                 let response = builder
                     .body(Body::from(resp_body_bytes))
                     .unwrap_or_else(|_| {
@@ -7776,6 +8302,7 @@ async fn forward_anthropic(
             false,
             session_key,
             context_window,
+            Some(ctx),
         )
         .await;
         let response = builder
@@ -8009,24 +8536,31 @@ async fn proxy_handler(
             // cache order, for prize-sizing. Computed AFTER auto-injection so it
             // reflects the breakpoints actually forwarded upstream (covers the
             // headerless fleet that relies on the proxy's injected breakpoints).
-            // model is included because caches are per-model. Join to `usage`
-            // (cache_read/write) and `proxied` (account) by req_id offline.
-            let bps = prefix_breakpoint_hashes(&parsed)
-                .into_iter()
-                .map(|(pos, h)| format!("{pos}:{h}"))
-                .collect::<Vec<_>>()
-                .join("|");
-            info!(
-                req_id,
-                client_id = %client_id,
-                session = %session_id,
-                agent = %agent_id,
-                model = %model,
-                fp = %fp,
-                fps = %fps,
-                bps = %bps,
-                "fingerprint"
-            );
+            // model is included because caches are per-model. Join to `proxied`
+            // (account + token usage) by req_id offline.
+            //
+            // DEBUG only (LAB-3214): per-request detail, not the default INFO
+            // line. `bps` is unbounded length, so skip building it entirely
+            // when debug isn't enabled — it's otherwise unused (fp/fps still
+            // feed routing above regardless of log level).
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let bps = prefix_breakpoint_hashes(&parsed)
+                    .into_iter()
+                    .map(|(pos, h)| format!("{pos}:{h}"))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                debug!(
+                    req_id,
+                    client_id = %client_id,
+                    session = %session_id,
+                    agent = %agent_id,
+                    model = %model,
+                    fp = %fp,
+                    fps = %fps,
+                    bps = %bps,
+                    "fingerprint"
+                );
+            }
 
             // Re-serialize. The `preserve_order` feature on serde_json is critical:
             // without it, serde uses BTreeMap which reorders JSON keys alphabetically,
@@ -8110,6 +8644,11 @@ async fn proxy_handler(
     // Upstream error from the most recent model-unsupported rejection —
     // returned verbatim if the pool exhausts on nothing but rejections.
     let mut model_unsupported_resp: Option<Response> = None;
+    // OpenAI-shape body, built lazily on the first OpenAI-endpoint attempt
+    // and reused across rotations/retries (LAB-716). Lazy so requests served
+    // entirely by Anthropic endpoints — the common case — never pay for the
+    // translation.
+    let mut openai_fallback_body: Option<FallbackBody> = None;
     for retry_round in 0..=MAX_529_RETRIES {
         if retry_round > 0 {
             let delay = round_backoff_delay(retry_round, last_saw_529);
@@ -8129,58 +8668,90 @@ async fn proxy_handler(
             // `forward_anthropic` (Anthropic) or `try_fallback_upstream`
             // (OpenAI). Both return a `ForwardOutcome` so the shared
             // round-gated policy in `apply_round_outcome` covers both.
-            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) =
-                match state.pick_endpoint(affinity, &model, &skip).await {
-                    Some(i) => {
-                        let ep = &state.endpoints[i];
-                        match ep.protocol {
-                            Protocol::Anthropic => {
-                                let out = forward_anthropic(
-                                    &state,
-                                    &parts,
-                                    &body_bytes,
-                                    &oauth_body_bytes,
-                                    ep,
-                                    i,
-                                    &req_id,
-                                    &client_id,
-                                    &client_ver,
-                                    &client_ip,
-                                    &agent_id,
-                                    &session_id,
-                                    &model,
-                                    affinity,
-                                    request_start,
-                                )
-                                .await;
-                                (out, i)
-                            }
-                            Protocol::OpenAI => {
-                                let out = try_fallback_upstream(
-                                    &state,
-                                    &body_bytes,
-                                    &req_id,
-                                    &client_id,
-                                    &client_ip,
-                                    &agent_id,
-                                    &session_id,
-                                    &model,
-                                    i,
-                                    request_start,
-                                    true,
-                                )
-                                .await;
-                                (out, i)
-                            }
+            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
+                .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
+                .await
+            {
+                Some(i) => {
+                    let ep = &state.endpoints[i];
+                    match ep.protocol {
+                        Protocol::Anthropic => {
+                            let out = forward_anthropic(
+                                &state,
+                                &parts,
+                                &body_bytes,
+                                &oauth_body_bytes,
+                                ep,
+                                i,
+                                &req_id,
+                                &client_id,
+                                &client_ver,
+                                &client_ip,
+                                &agent_id,
+                                &session_id,
+                                &model,
+                                fp.as_deref(),
+                                affinity,
+                                request_start,
+                            )
+                            .await;
+                            (out, i)
+                        }
+                        Protocol::OpenAI => {
+                            let out = match openai_fallback_body
+                                .get_or_insert_with(|| build_openai_fallback_body(&body_bytes))
+                            {
+                                FallbackBody::Ready { body, is_streaming } => {
+                                    try_fallback_upstream(
+                                        &state,
+                                        body,
+                                        &req_id,
+                                        &client_id,
+                                        &client_ip,
+                                        &agent_id,
+                                        &session_id,
+                                        &model,
+                                        i,
+                                        request_start,
+                                        true,
+                                        *is_streaming,
+                                    )
+                                    .await
+                                }
+                                FallbackBody::Unparseable => {
+                                    warn!(
+                                            req_id,
+                                            upstream = ep.name,
+                                            "fallback: request JSON unparseable, skipping OpenAI endpoint"
+                                        );
+                                    ROTATE
+                                }
+                                FallbackBody::Untranslatable(msg) => {
+                                    warn!(
+                                        req_id,
+                                        upstream = ep.name,
+                                        error = %msg,
+                                        "fallback: request not representable in OpenAI format"
+                                    );
+                                    // Terminal, not a retry: the request itself
+                                    // is the problem, so rotating would fail the
+                                    // same way on every endpoint.
+                                    ForwardOutcome::Done(Box::new(untranslatable_request_response(
+                                        msg,
+                                    )))
+                                }
+                            };
+                            (out, i)
                         }
                     }
-                    // Candidates exhausted mid-round (all skipped / hard-limited /
-                    // model-filtered). Break to the round-end logic rather than
-                    // returning here, so a transient-only round still reaches the
-                    // transient-aware exhaustion status instead of short-circuiting
-                    // to a premature 429.
-                    None => break,
-                };
+                }
+                // Candidates exhausted mid-round (all skipped / hard-limited /
+                // model-filtered). Break to the round-end logic rather than
+                // returning here, so a transient-only round still reaches the
+                // transient-aware exhaustion status instead of short-circuiting
+                // to a premature 429.
+                None => break,
+            };
 
             match apply_round_outcome(
                 retry_round,
@@ -8238,10 +8809,58 @@ async fn proxy_handler(
 
 // ── Fallback upstream handler ────────────────────────────────────────
 
-/// Forward a request to a `Protocol::OpenAI` endpoint. For Anthropic-format
-/// callers (`proxy_handler`) it translates the request to OpenAI format and the
-/// response back (`translate = true`); for OpenAI-format callers
-/// (`openai_chat_handler`) it forwards directly (`translate = false`).
+/// Anthropic→OpenAI request body for `try_fallback_upstream`, built lazily by
+/// `proxy_handler` on the first OpenAI-endpoint attempt of a request and
+/// memoized across rotations/retries (LAB-716).
+enum FallbackBody {
+    /// Translated + serialized once; `is_streaming` read from the same parse.
+    Ready {
+        body: bytes::Bytes,
+        is_streaming: bool,
+    },
+    /// Request JSON didn't parse (or couldn't re-serialize) — rotate past
+    /// OpenAI endpoints; Anthropic endpoints still forward the raw bytes and
+    /// let the upstream reject them.
+    Unparseable,
+    /// Parsed but not representable in OpenAI format — terminal for the
+    /// request: rotating would fail identically on every endpoint.
+    Untranslatable(String),
+}
+
+fn build_openai_fallback_body(body_bytes: &[u8]) -> FallbackBody {
+    let parsed: serde_json::Value = match serde_json::from_slice(body_bytes) {
+        Ok(v) => v,
+        Err(_) => return FallbackBody::Unparseable,
+    };
+    let is_streaming = parsed
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    let openai_body = match translate_anthropic_request_to_openai(&parsed) {
+        Ok(v) => v,
+        Err(msg) => return FallbackBody::Untranslatable(msg),
+    };
+    match serde_json::to_vec(&openai_body) {
+        Ok(b) => FallbackBody::Ready {
+            body: b.into(),
+            is_streaming,
+        },
+        Err(e) => {
+            // Can't happen for a Value built from parsed JSON (string keys
+            // only) — but don't rotate invisibly if it somehow does.
+            warn!(error = %e, "fallback: translated body failed to serialize");
+            FallbackBody::Unparseable
+        }
+    }
+}
+
+/// Forward a request to a `Protocol::OpenAI` endpoint. Callers hand over the
+/// final wire body: `proxy_handler` pre-translates via
+/// `build_openai_fallback_body` and sets `translate = true` so the *response*
+/// is translated back to Anthropic format; `openai_chat_handler` passes the
+/// client's OpenAI-format bytes (temperature-stripped per LAB-798 when the
+/// model hard-rejects it, otherwise verbatim) with `translate = false`
+/// (passthrough).
 ///
 /// Returns `ForwardOutcome` so the caller's retry loop applies the SAME
 /// round-gated policy as the Anthropic path (`apply_round_outcome`): a
@@ -8258,7 +8877,9 @@ async fn proxy_handler(
 #[allow(clippy::too_many_arguments)]
 async fn try_fallback_upstream(
     state: &AppState,
-    body_bytes: &[u8],
+    // Final wire body (already OpenAI-shaped), serialized once by the
+    // caller; each attempt clones the refcounted `Bytes`.
+    request_body: &bytes::Bytes,
     req_id: &str,
     client_id: &str,
     client_ip: &std::net::IpAddr,
@@ -8267,15 +8888,9 @@ async fn try_fallback_upstream(
     model: &str,
     endpoint_idx: usize,
     request_start: std::time::Instant,
-    translate: bool, // true = Anthropic↔OpenAI translation needed
+    translate: bool, // true = upstream response needs OpenAI→Anthropic translation
+    is_streaming: bool,
 ) -> ForwardOutcome {
-    // Non-transient rotation: skip this endpoint and try the next candidate.
-    // Pre-dates the ForwardOutcome return type as a bare `None`.
-    const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
-        saw_529: false,
-        push_skip: true,
-        transient: false,
-    };
     let ep = &state.endpoints[endpoint_idx];
 
     info!(
@@ -8284,44 +8899,11 @@ async fn try_fallback_upstream(
         model,
         upstream = ep.name,
         translate,
+        pin = state.pin_status(client_id, endpoint_idx),
         "fallback: routing to unified OpenAI endpoint"
     );
 
     ep.requests.fetch_add(1, Ordering::Relaxed);
-
-    // Parse once to extract streaming flag before potential translation
-    let parsed: serde_json::Value = match serde_json::from_slice(body_bytes) {
-        Ok(v) => v,
-        Err(_) => return ROTATE,
-    };
-    let is_streaming = parsed
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
-
-    // Build request body
-    let request_body = if translate {
-        let openai_body = match translate_anthropic_request_to_openai(&parsed) {
-            Ok(v) => v,
-            Err(msg) => {
-                warn!(
-                    req_id,
-                    upstream = ep.name,
-                    error = %msg,
-                    "fallback: request not representable in OpenAI format"
-                );
-                // Terminal, not a retry: the request itself is the problem, so
-                // rotating to another endpoint would just fail the same way.
-                return ForwardOutcome::Done(Box::new(untranslatable_request_response(&msg)));
-            }
-        };
-        match serde_json::to_vec(&openai_body) {
-            Ok(b) => b,
-            Err(_) => return ROTATE,
-        }
-    } else {
-        body_bytes.to_vec()
-    };
 
     let url = format!("{}/v1/chat/completions", ep.base_url);
 
@@ -8335,7 +8917,7 @@ async fn try_fallback_upstream(
         .post(&url)
         .header("authorization", format!("Bearer {}", ep.token))
         .header("content-type", "application/json")
-        .body(request_body)
+        .body(request_body.clone())
         .send()
         .await
     {
@@ -8645,6 +9227,9 @@ async fn try_fallback_upstream(
         // the session registry (LAB-916) tracks Anthropic-bound traffic only.
         None,
         0,
+        // OpenAI endpoints carry stub RateLimitInfo — no routing snapshot to
+        // merge with; this path keeps its own usage-only log line (LAB-3214).
+        None,
     )
     .await;
 
@@ -10397,6 +10982,23 @@ async fn metrics_handler(
         state.body_read_timeout_total.load(Ordering::Relaxed),
     );
 
+    // Affinity overrides that migrated a session (GH#156), by the window that
+    // bound the sticky account — see the WARN in pick_sticky_weighted_v2.
+    prom_header(
+        &mut buf,
+        "anthropic_affinity_migrations_total",
+        "counter",
+        "Affinity overrides that migrated a session, by the window that bound the sticky account",
+    );
+    for bind in AffinityBind::ALL {
+        prom_counter(
+            &mut buf,
+            "anthropic_affinity_migrations_total",
+            &[("reason", bind.as_str())],
+            state.affinity_migrations[bind as usize].load(Ordering::Relaxed),
+        );
+    }
+
     // LAB-933/LAB-929 response cache counters (AC12 / LAB-929 AC4). Emitted
     // only when the cache is configured; `messages` and `count_tokens` are
     // separate series on the same metric names, distinguished by the
@@ -10769,9 +11371,16 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
         .unwrap_or(serde_json::json!(4096));
     out.insert("max_tokens".to_string(), max_tokens);
 
-    // Direct passthrough params
+    // Direct passthrough params — except `temperature` on models that
+    // hard-reject it as deprecated (Claude ≥ 4.7, LAB-798): forwarding it
+    // fails the whole request with a non-retryable 400. Drop policy and
+    // rationale live in `drops_deprecated_temperature`.
+    let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
     for key in &["temperature", "top_p", "top_k", "stream"] {
         if let Some(v) = body.get(*key) {
+            if *key == "temperature" && drops_deprecated_temperature(model_name, v) {
+                continue;
+            }
             out.insert(key.to_string(), v.clone());
         }
     }
@@ -11188,12 +11797,24 @@ fn anthropic_user_blocks_to_openai_content(
     })
 }
 
+// Test-only invocation counter for `translate_anthropic_request_to_openai`
+// (LAB-716 AC: translation must run at most once per request, not per retry
+// attempt). Thread-local: `#[tokio::test]` defaults to a current-thread
+// runtime on the test's own thread, so parallel tests can't cross-pollute.
+#[cfg(test)]
+thread_local! {
+    static TRANSLATE_A2O_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Err (with a client-facing message) when a message contains an image this
 /// translator can't represent faithfully — the caller must surface a real
 /// error instead of silently forwarding a request with the image dropped.
 fn translate_anthropic_request_to_openai(
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    #[cfg(test)]
+    TRANSLATE_A2O_CALLS.with(|c| c.set(c.get() + 1));
+
     let mut out = serde_json::Map::new();
 
     if let Some(model) = body.get("model") {
@@ -11368,9 +11989,16 @@ fn translate_anthropic_request_to_openai(
         out.insert("max_tokens".to_string(), mt.clone());
     }
 
-    // Passthrough params
+    // Passthrough params — same LAB-798 `temperature` guard as the forward
+    // translator: an OpenAI-protocol endpoint can front Claude ≥ 4.7 (empty
+    // `models` list serves everything), and the deprecated param 400s there
+    // too. Policy in `drops_deprecated_temperature`.
+    let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
     for key in &["temperature", "top_p", "stream"] {
         if let Some(v) = body.get(*key) {
+            if *key == "temperature" && drops_deprecated_temperature(model_name, v) {
+                continue;
+            }
             out.insert(key.to_string(), v.clone());
         }
     }
@@ -11763,9 +12391,9 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
 }
 
 /// Forward one OpenAI-compat request to a single Anthropic-protocol `Endpoint`.
-/// The caller has already translated the OpenAI request into `anthropic_body`
-/// (plus the OAuth variant `oauth_anthropic_body`); this helper picks the right
-/// variant by token prefix, forwards to the endpoint, and translates the
+/// The caller has already translated the OpenAI request and serialized it once
+/// into `anthropic_body_bytes` (plus the OAuth variant); this helper picks the
+/// right variant by token prefix, forwards to the endpoint, and translates the
 /// Anthropic response back to OpenAI format. Structurally similar to
 /// `forward_anthropic`, but intentionally kept separate: it speaks OpenAI on
 /// both edges (request body already translated, response translated back).
@@ -11780,8 +12408,10 @@ async fn forward_openai_compat_anthropic(
     parts: &axum::http::request::Parts,
     ep: &Endpoint,
     endpoint_idx: usize,
-    anthropic_body: &serde_json::Value,
-    oauth_anthropic_body: &serde_json::Value,
+    // Translated Anthropic-shape bodies, serialized once by the caller
+    // (LAB-716); each attempt clones the refcounted `Bytes`.
+    anthropic_body_bytes: &bytes::Bytes,
+    oauth_anthropic_body_bytes: &bytes::Bytes,
     req_id: &str,
     client_id: &str,
     client_ver: &str,
@@ -11808,6 +12438,9 @@ async fn forward_openai_compat_anthropic(
     }
     headers.remove("content-length"); // body size changes after translation
     headers.remove("accept-encoding"); // we need plaintext to translate the response
+    if !state.forward_caller_identity {
+        strip_client_identity_headers(&mut headers);
+    }
 
     // Inject required Anthropic headers
     headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -11831,15 +12464,14 @@ async fn forward_openai_compat_anthropic(
 
     // Use OAuth variant (with CC system prompt) for OAuth tokens
     let req_body = if token.starts_with("sk-ant-oat") {
-        oauth_anthropic_body
+        oauth_anthropic_body_bytes
     } else {
-        anthropic_body
+        anthropic_body_bytes
     };
-    let body_str = req_body.to_string();
     debug!(
         account = endpoint_name,
         model = %model,
-        body_len = body_str.len(),
+        body_len = req_body.len(),
         "openai-compat: upstream request"
     );
 
@@ -11852,7 +12484,7 @@ async fn forward_openai_compat_anthropic(
     let upstream_req = http_client
         .request(reqwest::Method::POST, &url)
         .headers(headers)
-        .body(body_str);
+        .body(req_body.clone());
 
     let resp = match upstream_req.send().await {
         Ok(r) => r,
@@ -11930,30 +12562,35 @@ async fn forward_openai_compat_anthropic(
         state.signal_hard_limit_recovery(endpoint_name).await;
     }
 
-    // Compute budget pressure status for response header + log
-    let budget_status = {
+    // Capture the routing/utilization snapshot + inject budget status header.
+    // The `proxied (openai-compat)` line is deferred to `finalize_stream`/
+    // `finalize_non_stream`, which merge it with token usage once known
+    // (LAB-3214: one INFO line per request, not two).
+    // Named `proxied_ctx` (not `ctx`) — this function's streaming branch
+    // already has a local `ctx: StreamContext` for SSE translation.
+    let (budget_status, proxied_ctx) = {
         let info = rate_info.read().await;
         let (eff_util, constraint, _adj_5h, _adj_7d) =
             effective_utilization(&info, AppState::now_epoch(), model);
-        info!(
-            req_id,
-            client = %client_ip,
-            client_id = %client_id,
-            ver = %client_ver,
-            agent = %agent_id,
-            session = %session_id,
-            model = %model,
-            account = endpoint_name,
-            status = status.as_u16(),
-            utilization = format_args!("{eff_util:.2}"),
-            util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-            util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+        let proxied_ctx = ProxiedCtx::OpenaiCompat {
+            client_ver: client_ver.to_owned(),
+            utilization: format!("{eff_util:.2}"),
+            util_5h: info
+                .utilization_5h
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
+            util_7d: info
+                .utilization_7d
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
             constraint,
-            openai_compat = true,
-            stream = is_streaming,
-            "proxied (openai-compat)"
-        );
-        compute_pressure_status(eff_util, client_id, state)
+            pin: state.pin_status(client_id, endpoint_idx),
+            stream: is_streaming,
+        };
+        (
+            compute_pressure_status(eff_util, client_id, state),
+            proxied_ctx,
+        )
     };
 
     // Non-2xx: log error detail, translate to OpenAI error format, return
@@ -11972,6 +12609,22 @@ async fn forward_openai_compat_anthropic(
             status = status.as_u16(),
             error_message = ?error_msg,
             "openai-compat: upstream error"
+        );
+        // This branch returns before `finalize_non_stream` — log the merged
+        // line here too (zero usage), so an upstream error still gets the
+        // routing/utilization snapshot at INFO, same as the old unconditional
+        // `proxied (openai-compat)` line did (AC4).
+        log_proxied(
+            req_id,
+            client_id,
+            model,
+            endpoint_name,
+            &client_ip.to_string(),
+            agent_id,
+            session_id,
+            status.as_u16(),
+            &proxied_ctx,
+            &TokenUsage::default(),
         );
 
         // Translate Anthropic error to OpenAI error format so clients
@@ -12154,6 +12807,7 @@ async fn forward_openai_compat_anthropic(
                 &agent_clone,
                 &session_clone,
                 status_code,
+                proxied_ctx,
                 scanner,
                 request_start,
                 client_gone,
@@ -12183,6 +12837,21 @@ async fn forward_openai_compat_anthropic(
         Ok(b) => b,
         Err(e) => {
             error!("failed to read upstream response: {e}");
+            // This branch returns before `finalize_non_stream` — log the
+            // merged line here too (no usage: the body never arrived), so
+            // the routing/utilization snapshot still lands at INFO (AC4).
+            log_proxied(
+                req_id,
+                client_id,
+                model,
+                endpoint_name,
+                &client_ip.to_string(),
+                agent_id,
+                session_id,
+                status.as_u16(),
+                &proxied_ctx,
+                &TokenUsage::default(),
+            );
             return ForwardOutcome::Done(Box::new(
                 (StatusCode::BAD_GATEWAY, "failed to read upstream response").into_response(),
             ));
@@ -12192,6 +12861,20 @@ async fn forward_openai_compat_anthropic(
     let anthropic_resp: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
         Ok(v) => v,
         Err(_) => {
+            // Same as above: malformed upstream body means we never reach
+            // `finalize_non_stream`, so log the routing snapshot here.
+            log_proxied(
+                req_id,
+                client_id,
+                model,
+                endpoint_name,
+                &client_ip.to_string(),
+                agent_id,
+                session_id,
+                status.as_u16(),
+                &proxied_ctx,
+                &TokenUsage::default(),
+            );
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
@@ -12225,6 +12908,7 @@ async fn forward_openai_compat_anthropic(
         true,
         session_key,
         context_window,
+        Some(proxied_ctx),
     )
     .await;
 
@@ -12288,12 +12972,12 @@ async fn openai_chat_handler(
         Err(resp) => return *resp,
     };
 
-    let body_bytes = match read_body_bounded(&state, body, &req_id).await {
+    let mut body_bytes = match read_body_bounded(&state, body, &req_id).await {
         Ok(b) => b,
         Err(resp) => return *resp,
     };
 
-    let openai_body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+    let mut openai_body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
             error!("failed to parse request JSON: {e}");
@@ -12311,6 +12995,35 @@ async fn openai_chat_handler(
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
+
+    // LAB-798: `Protocol::OpenAI` endpoints below forward `body_bytes`
+    // verbatim, so a hard-rejected `temperature` must be stripped here,
+    // before either wire body is built — the translated Anthropic arm then
+    // never sees it either, keeping the warn to once per request. Policy in
+    // `drops_deprecated_temperature`.
+    if openai_body
+        .get("temperature")
+        .is_some_and(|v| drops_deprecated_temperature(&model, v))
+    {
+        if let Some(obj) = openai_body.as_object_mut() {
+            obj.remove("temperature");
+        }
+        match serde_json::to_vec(&openai_body) {
+            Ok(b) => body_bytes = bytes::Bytes::from(b),
+            // Can't happen for a Value parsed from JSON (string keys only),
+            // but forwarding the original bytes would silently resend the
+            // rejected param — fail loudly instead, like the serialize arm
+            // below.
+            Err(e) => {
+                error!(req_id, error = %e, "failed to re-serialize request body after temperature strip");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "body serialization failed",
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // Pre-request gate: operator bypass, budget, utilization limit, emergency brake.
     // Note: budget + emergency don't need `model` and could run before body parsing,
@@ -12341,6 +13054,26 @@ async fn openai_chat_handler(
     let mut oauth_anthropic_body = anthropic_body.clone();
     inject_oauth_system_prompt(&mut oauth_anthropic_body);
 
+    // Serialize both variants once (LAB-716): the forward helper used to
+    // `to_string()` the JSON on every retry attempt; now each attempt clones
+    // a refcounted `Bytes`. Serializing a `Value` can only fail on a
+    // non-string map key, which JSON input can't produce — the 500 arm is a
+    // formality.
+    let (anthropic_body_bytes, oauth_body_bytes) = match (
+        serde_json::to_vec(&anthropic_body),
+        serde_json::to_vec(&oauth_anthropic_body),
+    ) {
+        (Ok(a), Ok(o)) => (bytes::Bytes::from(a), bytes::Bytes::from(o)),
+        _ => {
+            error!(req_id, "failed to serialize translated request body");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "body serialization failed",
+            )
+                .into_response();
+        }
+    };
+
     let n = state.endpoints.len();
     let mut last_saw_529 = false;
     let mut last_saw_transient = false;
@@ -12365,62 +13098,65 @@ async fn openai_chat_handler(
             // Pick the next endpoint and dispatch by protocol. Both forwards
             // return a `ForwardOutcome` so the shared round-gated policy in
             // `apply_round_outcome` covers both.
-            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) =
-                match state.pick_endpoint(affinity, &model, &skip).await {
-                    Some(i) => {
-                        let ep = &state.endpoints[i];
-                        match ep.protocol {
-                            Protocol::Anthropic => {
-                                let out = forward_openai_compat_anthropic(
-                                    &state,
-                                    &parts,
-                                    ep,
-                                    i,
-                                    &anthropic_body,
-                                    &oauth_anthropic_body,
-                                    &req_id,
-                                    &client_id,
-                                    &client_ver,
-                                    &client_ip,
-                                    &agent_id,
-                                    &session_id,
-                                    &model,
-                                    affinity,
-                                    is_streaming,
-                                    json_mode,
-                                    request_start,
-                                )
-                                .await;
-                                (out, i)
-                            }
-                            Protocol::OpenAI => {
-                                // The endpoint is OpenAI-native — forward the
-                                // original request body without translation.
-                                let out = try_fallback_upstream(
-                                    &state,
-                                    &body_bytes,
-                                    &req_id,
-                                    &client_id,
-                                    &client_ip,
-                                    &agent_id,
-                                    &session_id,
-                                    &model,
-                                    i,
-                                    request_start,
-                                    false,
-                                )
-                                .await;
-                                (out, i)
-                            }
+            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
+                .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
+                .await
+            {
+                Some(i) => {
+                    let ep = &state.endpoints[i];
+                    match ep.protocol {
+                        Protocol::Anthropic => {
+                            let out = forward_openai_compat_anthropic(
+                                &state,
+                                &parts,
+                                ep,
+                                i,
+                                &anthropic_body_bytes,
+                                &oauth_body_bytes,
+                                &req_id,
+                                &client_id,
+                                &client_ver,
+                                &client_ip,
+                                &agent_id,
+                                &session_id,
+                                &model,
+                                affinity,
+                                is_streaming,
+                                json_mode,
+                                request_start,
+                            )
+                            .await;
+                            (out, i)
+                        }
+                        Protocol::OpenAI => {
+                            // The endpoint is OpenAI-native — forward the
+                            // original request body without translation.
+                            let out = try_fallback_upstream(
+                                &state,
+                                &body_bytes,
+                                &req_id,
+                                &client_id,
+                                &client_ip,
+                                &agent_id,
+                                &session_id,
+                                &model,
+                                i,
+                                request_start,
+                                false,
+                                is_streaming,
+                            )
+                            .await;
+                            (out, i)
                         }
                     }
-                    // Candidates exhausted mid-round (all skipped / hard-limited /
-                    // model-filtered). Break to the round-end logic rather than
-                    // returning here, so a transient-only round still reaches the
-                    // transient-aware exhaustion status instead of short-circuiting
-                    // to a premature 429.
-                    None => break,
-                };
+                }
+                // Candidates exhausted mid-round (all skipped / hard-limited /
+                // model-filtered). Break to the round-end logic rather than
+                // returning here, so a transient-only round still reaches the
+                // transient-aware exhaustion status instead of short-circuiting
+                // to a premature 429.
+                None => break,
+            };
 
             match apply_round_outcome(
                 retry_round,
@@ -12593,6 +13329,17 @@ fn validate_clients(config: &Config) -> Result<(), String> {
         // with the other posture checks. Both reference the shared const.
         if seen_names.contains(&c.name.as_str()) {
             return Err(format!("client '{}': duplicate name", c.name));
+        }
+        // preferred_endpoints must name configured endpoints — same posture as
+        // the registry cross-checks below: a typo would silently leave the
+        // client un-pinned, defeating the whole point of a dedicated account.
+        for pe in &c.preferred_endpoints {
+            if !config.endpoints.iter().any(|ep| ep.name == *pe) {
+                return Err(format!(
+                    "client '{}': preferred_endpoints entry '{}' does not match any configured endpoint",
+                    c.name, pe
+                ));
+            }
         }
         // Names, not keys, in the error — never log a credential.
         if seen_keys.contains(&c.key.as_str()) {
@@ -13014,10 +13761,13 @@ async fn main() {
     // unreachable backend. A process that boots during a backend outage
     // serves local-only (coordination ops gated off via
     // `coordination_redis`) and attaches automatically when the backend
-    // becomes reachable; `None` here means a config error (unparseable URL),
-    // which stays local-only for the process lifetime. Mid-run outage
-    // behaviour is unchanged from LAB-932 AC5: once connected, drops
-    // reconnect with capped exponential backoff.
+    // becomes reachable. A config error (unparseable URL) is different —
+    // LAB-3026: an operator who set `redis_url` has said shared state is
+    // required, so a URL that fails to parse (e.g. a password with an
+    // unescaped `@`/`/`/`?`/`#`/`:`) fails startup outright instead of
+    // silently downgrading to local-only, matching the `response_cache`
+    // config gate below. Mid-run outage behaviour is unchanged from LAB-932
+    // AC5: once connected, drops reconnect with capped exponential backoff.
     let redis = if let Some(ref url) = config.redis_url {
         let perf = PerformanceConfig {
             default_command_timeout: REDIS_COMMAND_TIMEOUT,
@@ -13034,10 +13784,10 @@ async fn main() {
         let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
         match start_coordination_redis(url.as_str(), perf, conn_config, policy) {
             Ok(client) => Some(client),
-            Err(e) => {
-                warn!(error = %e, "invalid redis_url — running in local-only mode");
-                None
-            }
+            // Log only `kind()` (a fixed enum, e.g. `Url`/`Config`) — never
+            // the error's `Display`/`details()`, which for a malformed URL
+            // can echo the offending fragment back, credential included.
+            Err(e) => panic!("redis_url: failed to parse ({:?})", e.kind()),
         }
     } else {
         None
@@ -13148,6 +13898,7 @@ async fn main() {
                 .unwrap_or(DEFAULT_BODY_READ_TIMEOUT_SECS),
         ),
         body_read_timeout_total: AtomicU64::new(0),
+        affinity_migrations: Default::default(),
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: config
             .session_registry_max
@@ -13158,6 +13909,7 @@ async fn main() {
         expose_upstream_ratelimit_headers: config
             .expose_upstream_ratelimit_headers
             .unwrap_or(false),
+        forward_caller_identity: config.forward_caller_identity.unwrap_or(false),
         allowed_client_betas: config.allowed_client_betas.clone().unwrap_or_else(|| {
             DEFAULT_CLIENT_BETA_ALLOWLIST
                 .iter()
