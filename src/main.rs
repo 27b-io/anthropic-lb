@@ -2515,8 +2515,15 @@ impl AppState {
         match req.send().await {
             Ok(resp) => {
                 let status = resp.status();
-                self.update_rate_info_for(&ep.rate_info, &ep.name, resp.headers())
-                    .await;
+                self.update_rate_info_for(
+                    &ep.rate_info,
+                    &ep.name,
+                    resp.headers(),
+                    // Probes never request fast mode (PROBE_MODELS, fixed body).
+                    /* is_fast_mode */
+                    false,
+                )
+                .await;
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     self.mark_hard_limited_for(&ep.rate_info, &ep.name, resp.headers())
                         .await;
@@ -4614,8 +4621,13 @@ impl AppState {
     #[cfg(test)]
     async fn update_rate_info(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
         let ep = &self.endpoints[idx];
-        self.update_rate_info_for(&ep.rate_info, &ep.name, headers)
-            .await;
+        self.update_rate_info_for(
+            &ep.rate_info,
+            &ep.name,
+            headers,
+            /* is_fast_mode */ false,
+        )
+        .await;
     }
 
     /// Parse rate-limit headers from a response into the supplied
@@ -4625,7 +4637,39 @@ impl AppState {
         rate_info: &RwLock<RateLimitInfo>,
         endpoint_name: &str,
         headers: &reqwest::header::HeaderMap,
+        is_fast_mode: bool,
     ) {
+        // A fast-mode response's `anthropic-ratelimit-unified-*` headers
+        // describe the FAST/paid POOL, not the account's 5h/7d subscription
+        // windows. On the observed wire (LAB-2693 / anthropic-lb#163,
+        // 2026-09-02) a fast 200 reports `representative-claim: overage`,
+        // `overage-in-use: true`, the `overage-*` block, and NO `five_hour`
+        // claim — every field is fast-pool, none is account headroom. Ingesting
+        // it flipped `overage_in_use` true, and `routing_candidates` then added
+        // `overage_penalty`, demoting the serving account out of standard
+        // rotation on a single fast request. Fast mode bills a bucket separate
+        // from the standard windows (#161), so skip the whole ingest and leave
+        // the standard view as the last standard response left it (stale, not
+        // corrupted). `last_updated` therefore does not advance on fast-pool
+        // data, which keeps the background probe treating the view as due for
+        // refresh.
+        //
+        // This keys on the REQUEST, not the response: a fast-pool `overage` 200
+        // is indistinguishable on the wire from a genuine-overage standard 200
+        // (see the negative-control test), so the response alone cannot be
+        // classified — gating on `overage` markers would suppress real overage
+        // tracking on standard traffic. The invariant this relies on: a
+        // response to a fast request carries no genuine account 5h/7d claim. It
+        // holds today — fast-capable accounts answer from the fast pool, and a
+        // fast-disabled org returns 400 rather than a standard 200 (#160 also
+        // routes fast requests away from those accounts). If it ever breaks, a
+        // fast response could still freeze this account's standard view; the
+        // ≤`probe_interval_secs` background probe refreshes the real 5h/7d view
+        // regardless of traffic, bounding that staleness.
+        if is_fast_mode {
+            return;
+        }
+
         let mut info = rate_info.write().await;
 
         // Debug: log all ratelimit headers
@@ -8099,7 +8143,17 @@ async fn forward_anthropic(
 
     // Always update rate limit info and persist
     state
-        .update_rate_info_for(rate_info, endpoint_name, resp.headers())
+        .update_rate_info_for(
+            rate_info,
+            endpoint_name,
+            resp.headers(),
+            // Classify from the bytes actually sent upstream (the OAuth
+            // variant on OAuth tokens) — that body picks the rate bucket, and
+            // a fast-mode body's response carries fast-pool headers, not the
+            // account's (LAB-2693).
+            /* is_fast_mode */
+            request_wants_fast_mode(req_body),
+        )
         .await;
 
     // Update burn rate (after rate-limit headers are parsed)
@@ -12666,7 +12720,15 @@ async fn forward_openai_compat_anthropic(
     // clear the circuit-breaker counter.
     state.record_transport_success(endpoint_idx).await;
     state
-        .update_rate_info_for(rate_info, endpoint_name, resp.headers())
+        .update_rate_info_for(
+            rate_info,
+            endpoint_name,
+            resp.headers(),
+            // The OpenAI request shape cannot express `speed`, so a response
+            // here always answers a standard-speed request (LAB-2693).
+            /* is_fast_mode */
+            false,
+        )
         .await;
 
     // Update burn rate (after rate-limit headers are parsed)
