@@ -7984,6 +7984,7 @@ async fn forward_anthropic(
     parts: &axum::http::request::Parts,
     body_bytes: &bytes::Bytes,
     oauth_body_bytes: &bytes::Bytes,
+    is_fast_mode: bool,
     ep: &Endpoint,
     endpoint_idx: usize,
     req_id: &str,
@@ -8147,12 +8148,11 @@ async fn forward_anthropic(
             rate_info,
             endpoint_name,
             resp.headers(),
-            // Classify from the bytes actually sent upstream (the OAuth
-            // variant on OAuth tokens) — that body picks the rate bucket, and
-            // a fast-mode body's response carries fast-pool headers, not the
-            // account's (LAB-2693).
-            /* is_fast_mode */
-            request_wants_fast_mode(req_body),
+            // The request's speed picks the rate bucket: a fast-mode body's
+            // response carries fast-pool headers, not the account's
+            // (LAB-2693). Classified once in `proxy_handler`, not re-parsed
+            // from `req_body` on every response.
+            is_fast_mode,
         )
         .await;
 
@@ -8612,8 +8612,9 @@ async fn proxy_handler(
         Err(resp) => return *resp,
     };
 
-    // Parse body once for model extraction and optional cache injection
-    let (body_bytes, oauth_body_bytes, model, fp, cache_key) =
+    // Parse body once for model extraction, optional cache injection, and
+    // the fast-mode flag that picks the rate bucket downstream.
+    let (body_bytes, oauth_body_bytes, model, fp, cache_key, is_fast_mode) =
         if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             let model = parsed
                 .get("model")
@@ -8746,16 +8747,22 @@ async fn proxy_handler(
                 serde_json::to_vec(&oauth_parsed).unwrap_or_else(|_| bytes.clone())
             };
 
+            // Classified once here rather than re-parsed from the outbound
+            // bytes per upstream response: neither injector above touches
+            // `speed`, so one flag is true of both byte variants (LAB-2693).
+            let is_fast_mode = body_wants_fast_mode(&parsed);
+
             (
                 bytes::Bytes::from(bytes),
                 bytes::Bytes::from(oauth_bytes),
                 model,
                 Some(fp),
                 cache_key,
+                is_fast_mode,
             )
         } else {
             let clone = body_bytes.clone();
-            (body_bytes, clone, String::new(), None, None)
+            (body_bytes, clone, String::new(), None, None, false)
         };
 
     // Build the affinity key now that fp is known. fp is the finest routing
@@ -8841,6 +8848,7 @@ async fn proxy_handler(
                                 &parts,
                                 &body_bytes,
                                 &oauth_body_bytes,
+                                is_fast_mode,
                                 ep,
                                 i,
                                 &req_id,
