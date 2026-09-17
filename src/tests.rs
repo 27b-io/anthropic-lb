@@ -5441,6 +5441,147 @@ async fn fast_mode_burst_429_still_backs_off_and_rotates() {
     );
 }
 
+// ── Fast-mode 200 must not corrupt the account's headroom view (LAB-2693) ──
+
+/// A fast-mode 200's raw wire, exactly as captured in production on
+/// 2026-09-02 (LAB-2693 / anthropic-lb#163): the unified
+/// headers describe the FAST POOL — `representative-claim: overage`,
+/// `overage-in-use: true`, the `overage-*` block, a `unified-reset` ~29d out,
+/// a `fallback-percentage` — and carry NO `five_hour`/5h/7d account claim.
+/// Body is a normal Anthropic message so usage extraction still parses. The
+/// whole response (headers + body) rides in the `bad_head` slot with
+/// `connection: close`, so the body is delimited by EOF — same mechanism the
+/// burst-429 test uses for a header-only response.
+const HEAD_200_FAST_POOL: &str = "HTTP/1.1 200 OK\r\n\
+    content-type: application/json\r\n\
+    anthropic-ratelimit-unified-status: allowed\r\n\
+    anthropic-ratelimit-unified-representative-claim: overage\r\n\
+    anthropic-ratelimit-unified-overage-status: allowed\r\n\
+    anthropic-ratelimit-unified-overage-in-use: true\r\n\
+    anthropic-ratelimit-unified-overage-utilization: 0.0\r\n\
+    anthropic-ratelimit-unified-overage-reset: 1790812800\r\n\
+    anthropic-ratelimit-unified-reset: 1790812800\r\n\
+    anthropic-ratelimit-unified-fallback-percentage: 0.5\r\n\
+    connection: close\r\n\r\n\
+    {\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"model\":\"test\",\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}";
+
+/// AC-1 + AC-3: one `speed:"fast"` request whose upstream 200 carries the
+/// fast-pool unified headers must leave the serving account's standard
+/// headroom view exactly as the last standard response left it, and must NOT
+/// demote the account out of rotation. The fast-pool headers would otherwise
+/// flip `representative_claim` → `overage` and `overage_in_use` → true, which
+/// `routing_candidates` turns into a `+overage_penalty` demotion.
+#[tokio::test]
+async fn fast_mode_200_leaves_account_headroom_untouched() {
+    let (url, _hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_200_FAST_POOL, ANTHROPIC_OK_BODY).await;
+    let mut acct = make_endpoint("acct", Protocol::Anthropic);
+    acct.base_url = url;
+    let state = test_state_with(vec![acct]);
+
+    // Seed the account's standard view from a prior standard response, mirroring
+    // the live account state before the fast request landed.
+    let seeded_reset_5h = AppState::now_epoch() + 3000;
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.representative_claim = Some("five_hour".to_string());
+        info.utilization_5h = Some(0.31);
+        info.reset_5h = Some(seeded_reset_5h);
+        // overage_* stay at their defaults: not in overage.
+    }
+
+    let addr = serve(build_router(state.clone())).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"test","max_tokens":8,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // AC-1: every listed field equals its pre-request value.
+    let info = state.endpoints[0].rate_info.read().await;
+    assert_eq!(
+        info.representative_claim.as_deref(),
+        Some("five_hour"),
+        "fast-pool `overage` claim must not overwrite the account's standard claim"
+    );
+    assert!(
+        !info.overage_in_use,
+        "a fast 200 must not put the account into overage"
+    );
+    assert_eq!(info.overage_status, None);
+    assert_eq!(info.overage_utilization, None);
+    assert_eq!(info.overage_reset, None);
+    // The fast 200 carries no 5h header, so these fields have no on-wire datum
+    // to overwrite regardless of the guard; asserted per AC-1 to pin the full
+    // "standard view untouched" invariant.
+    assert_eq!(info.utilization_5h, Some(0.31), "5h utilization untouched");
+    assert_eq!(info.reset_5h, Some(seeded_reset_5h), "5h reset untouched");
+    drop(info);
+
+    // AC-3: the endpoint is offered at its configured priority (0), with no
+    // `overage_penalty` and not sourced from the overage window.
+    let candidates = state.routing_candidates("test", &[]).await;
+    assert_eq!(candidates.len(), 1, "the one endpoint must be a candidate");
+    assert_eq!(
+        candidates[0].priority, 0,
+        "no overage_penalty — the account stays in standard rotation"
+    );
+    assert_ne!(
+        candidates[0].source, "overage",
+        "routing must gate on the standard window, not a phantom overage window"
+    );
+}
+
+/// AC-2 negative control: the SAME fast-pool 200, on a body that does NOT ask
+/// for fast mode (absent, and explicit `"standard"`), ingests the unified
+/// headers exactly as today — `overage_in_use` flips true and
+/// `representative_claim` becomes `overage`. This is the behaviour the
+/// fast-mode guard suppresses; proving it still fires under standard speed is
+/// what shows the guard keys on speed and nothing else.
+#[tokio::test]
+async fn standard_speed_200_still_ingests_unified_headers() {
+    for body in [
+        r#"{"model":"test","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"test","max_tokens":8,"speed":"standard","messages":[{"role":"user","content":"hi"}]}"#,
+    ] {
+        let (url, _hits) =
+            spawn_status_then_ok_upstream(usize::MAX, HEAD_200_FAST_POOL, ANTHROPIC_OK_BODY).await;
+        let mut acct = make_endpoint("acct", Protocol::Anthropic);
+        acct.base_url = url;
+        let state = test_state_with(vec![acct]);
+        {
+            let mut info = state.endpoints[0].rate_info.write().await;
+            info.representative_claim = Some("five_hour".to_string());
+        }
+
+        let addr = serve(build_router(state.clone())).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "body: {body}");
+
+        let info = state.endpoints[0].rate_info.read().await;
+        assert!(
+            info.overage_in_use,
+            "standard speed must still ingest overage-in-use: {body}"
+        );
+        assert_eq!(
+            info.representative_claim.as_deref(),
+            Some("overage"),
+            "standard speed must still ingest the representative claim: {body}"
+        );
+    }
+}
+
 /// `is_burst_429` is the single definition shared by `mark_hard_limited_for`'s
 /// backoff ladder and the fast-mode exemption; all three signals must agree
 /// before a 429 counts as burst.
