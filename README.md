@@ -498,7 +498,7 @@ same 400, rather than forwarded unscanned, in two cases: the client sent a body
 the scanner cannot read — non-JSON (a parse differential must not smuggle
 content past the scan; this includes multipart uploads such as `/v1/files`), or
 an OpenAI-compat message role the translation does not map — or the
-newest-turn content exceeded the scan limit so its tail was never inspected
+newest-turn content exceeded the scan limit, so its tail was never inspected
 (otherwise padding past the limit would bypass enforcement). A block-mode
 client must therefore send JSON Messages traffic and keep scannable content
 within the limit. `annotate` (shadow mode) never rejects — it scans best-effort
