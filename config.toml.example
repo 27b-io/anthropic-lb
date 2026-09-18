@@ -32,7 +32,9 @@ probe_interval_secs = 300
 # binary is built with `--features guard`; ignored otherwise). One of:
 #   "off"       skip scanning
 #   "annotate"  scan + count + log, always forward (DEFAULT — shadow mode)
-#   "block"     reject a request carrying any finding with HTTP 400
+#   "block"     reject a request carrying any finding with HTTP 400; also fails
+#               closed (same 400) on a body it cannot scan in full — unparseable
+#               JSON, or newest-turn content past the scan limit
 # Operator clients are always "off". See the README "Guardrails" section.
 # guard = "annotate"
 #

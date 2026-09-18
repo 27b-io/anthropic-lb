@@ -8678,6 +8678,13 @@ async fn proxy_handler(
     // `pre_request_gate`. `None` for a non-JSON body — nothing to inspect.
     #[cfg(feature = "guard")]
     let mut guard_input: Option<guard::ScanInput> = None;
+    // Whether the body parsed as JSON at all — distinct from whether scannable
+    // user text was found. Under `block`, an UNPARSEABLE body fails closed (a
+    // parse differential vs upstream must not forward unscanned), but a body
+    // that parsed with no scannable text (e.g. an image-only turn) has nothing
+    // to scan and is allowed.
+    #[cfg(feature = "guard")]
+    let mut guard_body_parsed = false;
 
     // Parse body once for model extraction, optional cache injection, and
     // the fast-mode flag that picks the rate bucket downstream.
@@ -8704,6 +8711,7 @@ async fn proxy_handler(
             // the guard (never `system`). Read-only borrow of `parsed`.
             #[cfg(feature = "guard")]
             {
+                guard_body_parsed = true;
                 guard_input = guard::ScanInput::from_body(&parsed);
             }
 
@@ -8869,6 +8877,39 @@ async fn proxy_handler(
     #[cfg(feature = "guard")]
     let guard_annotate: Option<usize> = {
         let policy = state.client_guard_policy(&client_id);
+        // Fail closed under `block`: a body the guard could not scan in full
+        // cannot be certified clean, so reject it rather than forward it
+        // unscanned (LAB-3877 review). Two cases, both bypasses of an enforcing
+        // policy otherwise:
+        //   - the body did not parse as JSON here — a parse differential vs the
+        //     upstream could smuggle content past the scan;
+        //   - the newest-turn content was longer than the scan cap, so its tail
+        //     was never inspected (the "pad past the cap, then the secret" bypass).
+        // A body that parsed but carried no scannable text (e.g. an image-only
+        // turn) is NOT a scan failure and is allowed. Annotate/shadow mode never
+        // rejects — it measures best-effort.
+        if policy == guard::GuardPolicy::Block {
+            let unscannable = if !guard_body_parsed {
+                Some("request body could not be parsed for content scanning")
+            } else if guard_input
+                .as_ref()
+                .is_some_and(guard::ScanInput::truncated)
+            {
+                Some("request exceeds the guard scan limit and cannot be scanned in full")
+            } else {
+                None
+            };
+            if let Some(reason) = unscannable {
+                warn!(
+                    req_id,
+                    client_id = %client_id,
+                    verdict = "block",
+                    reason,
+                    "guard: fail-closed (unscannable under block policy)"
+                );
+                return guard_blocked_response(&[], reason);
+            }
+        }
         match state
             .guard
             .evaluate(policy, &client_id, guard_input.as_ref())

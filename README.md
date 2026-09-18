@@ -486,12 +486,26 @@ Operator clients are always `off` regardless of configuration.
   Findings carry **byte offsets only — never the matched secret** — in logs, the
   error body, and metrics alike.
 
+`block` **fails closed.** A request it cannot scan in full is rejected with the
+same 400, rather than forwarded unscanned, in two cases: the body did not parse
+as JSON (a parse differential must not smuggle content past the scan), or the
+newest-turn content exceeded the scan limit so its tail was never inspected
+(otherwise padding past the limit would bypass enforcement). A block-mode client
+must therefore keep scannable content within the limit. `annotate` (shadow mode)
+never rejects — it scans best-effort and always forwards.
+
 ### Metrics
 
 On `/metrics` (when built with the feature):
 
 - `anthropic_guard_verdicts_total{client, scanner, verdict}` — counter.
 - `anthropic_guard_scan_duration_seconds` — histogram of per-request scan time.
+
+The `client` dimension of the verdicts counter is cardinality-bounded (overflow
+folds into `_other`). Under a legacy shared-secret configuration the client id
+is caller-asserted, so per-client verdict counts are only reliable when
+per-client keys (`[[clients]]`) are configured — the same posture as the other
+per-client counters.
 
 ---
 
