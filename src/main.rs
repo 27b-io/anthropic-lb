@@ -2103,6 +2103,77 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// LAB-3877: run the Tier 0 content guard for one request — after
+    /// `pre_request_gate`, before endpoint selection, on every surface that
+    /// forwards client content (`proxy_handler` and `openai_chat_handler`).
+    /// `Ok(Some(n))` is an `Annotate` count for `X-Guard-Findings`; `Err` is
+    /// the 400 to return instead, in the OpenAI envelope when `openai_shape`.
+    ///
+    /// Fail closed under `block`: a body the guard could not scan in full
+    /// cannot be certified clean, so it is rejected rather than forwarded
+    /// unscanned (LAB-3877 review). Two cases, both bypasses of an enforcing
+    /// policy otherwise: `unscannable` — the caller sent content the scanner
+    /// cannot read (a non-empty body that did not parse, or an OpenAI shape
+    /// translation cannot map), so a parse differential vs the upstream could
+    /// smuggle content past the scan — and a newest turn longer than the scan
+    /// cap, whose tail was never inspected (the "pad past the cap, then the
+    /// secret" bypass). A body that parsed but carried no scannable text (e.g.
+    /// an image-only turn) is NOT a scan failure and is allowed. Annotate /
+    /// shadow mode never rejects — it measures best-effort.
+    #[cfg(feature = "guard")]
+    fn guard_hook(
+        &self,
+        req_id: &str,
+        client_id: &str,
+        unscannable: bool,
+        input: Option<&guard::ScanInput>,
+        openai_shape: bool,
+    ) -> Result<Option<usize>, Box<Response>> {
+        let policy = self.client_guard_policy(client_id);
+        let truncated = input.is_some_and(guard::ScanInput::truncated);
+        if policy == guard::GuardPolicy::Block {
+            let reason = if unscannable {
+                Some("request body could not be parsed for content scanning")
+            } else if truncated {
+                Some("request exceeds the guard scan limit and cannot be scanned in full")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                warn!(
+                    req_id,
+                    client_id = %client_id,
+                    verdict = "block",
+                    reason,
+                    "guard: fail-closed (unscannable under block policy)"
+                );
+                return Err(Box::new(guard_blocked_response(&[], reason, openai_shape)));
+            }
+        }
+        let (verdict, findings, reason) = match self.guard.evaluate(policy, client_id, input) {
+            guard::Verdict::Allow => return Ok(None),
+            guard::Verdict::Annotate { findings } => ("annotate", findings, None),
+            guard::Verdict::Block { findings, reason } => ("block", findings, Some(reason)),
+        };
+        warn!(
+            req_id,
+            client_id = %client_id,
+            verdict,
+            findings = findings.len(),
+            truncated,
+            detections = %guard::detections_summary(&findings),
+            "guard"
+        );
+        match reason {
+            None => Ok(Some(findings.len())),
+            Some(reason) => Err(Box::new(guard_blocked_response(
+                &findings,
+                &reason,
+                openai_shape,
+            ))),
+        }
+    }
+
     /// Count + log a model-allowlist denial.
     ///
     /// The model string is caller-controlled and bounded only by the request
@@ -8590,22 +8661,53 @@ async fn maybe_cache_store(
 /// LAB-3877: build the HTTP 400 for a `block` verdict. The body carries finding
 /// offsets and labels only — never the matched text — so an error surfaced to a
 /// client (or captured in its logs) cannot itself leak the secret it flagged.
+/// `openai_shape` selects the OpenAI error envelope for `/v1/chat/completions`
+/// clients (same convention as `model_unsupported_response`); the cause is
+/// machine-readable as `error.code` there and `error.type` on the Anthropic side.
 #[cfg(feature = "guard")]
-fn guard_blocked_response(findings: &[guard::Finding], reason: &str) -> Response {
-    let body = serde_json::json!({
-        "type": "error",
-        "error": {
-            "type": "guard_blocked",
-            "message": reason,
-            "findings": findings,
-        }
-    });
+fn guard_blocked_response(
+    findings: &[guard::Finding],
+    reason: &str,
+    openai_shape: bool,
+) -> Response {
+    let body = if openai_shape {
+        serde_json::json!({
+            "error": {
+                "message": reason,
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "guard_blocked",
+                "findings": findings,
+            }
+        })
+    } else {
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "guard_blocked",
+                "message": reason,
+                "findings": findings,
+            }
+        })
+    };
     (
         StatusCode::BAD_REQUEST,
         [(hyper::header::CONTENT_TYPE, "application/json")],
         body.to_string(),
     )
         .into_response()
+}
+
+/// LAB-3877: stamp an `Annotate` verdict's finding count onto the response as
+/// `X-Guard-Findings`. A decimal count is always a valid header value.
+#[cfg(feature = "guard")]
+fn stamp_guard_findings(mut response: Response, count: Option<usize>) -> Response {
+    if let Some(count) = count {
+        response
+            .headers_mut()
+            .insert("x-guard-findings", HeaderValue::from(count as u64));
+    }
+    response
 }
 
 async fn proxy_handler(
@@ -8869,76 +8971,22 @@ async fn proxy_handler(
     }
 
     // LAB-3877: Tier 0 content guard — runs after the gate, before endpoint
-    // selection. Read-only: it inspects the newest user/tool_result content and
-    // emits a verdict, never touching the bytes forwarded upstream. `Block`
-    // (opt-in per client) rejects here with a 400 before anything is served;
-    // `Annotate` (the shadow-mode default) records a count stamped onto the
-    // response below. Findings carry offsets only — never matched text.
+    // selection (see `AppState::guard_hook`). Unscannable = the client sent a
+    // body and it did not parse. Deliberately path-agnostic: the path is
+    // forwarded verbatim, so scoping by route would let `/v1/messages/` or a
+    // percent-encoded spelling skip the fail-closed rule. A bodiless request
+    // (`GET /v1/models`) has nothing to scan and is not a scan failure.
     #[cfg(feature = "guard")]
     let guard_annotate: Option<usize> = {
-        let policy = state.client_guard_policy(&client_id);
-        // Fail closed under `block`: a body the guard could not scan in full
-        // cannot be certified clean, so reject it rather than forward it
-        // unscanned (LAB-3877 review). Two cases, both bypasses of an enforcing
-        // policy otherwise:
-        //   - the body did not parse as JSON here — a parse differential vs the
-        //     upstream could smuggle content past the scan;
-        //   - the newest-turn content was longer than the scan cap, so its tail
-        //     was never inspected (the "pad past the cap, then the secret" bypass).
-        // A body that parsed but carried no scannable text (e.g. an image-only
-        // turn) is NOT a scan failure and is allowed. Annotate/shadow mode never
-        // rejects — it measures best-effort.
-        if policy == guard::GuardPolicy::Block {
-            let unscannable = if !guard_body_parsed {
-                Some("request body could not be parsed for content scanning")
-            } else if guard_input
-                .as_ref()
-                .is_some_and(guard::ScanInput::truncated)
-            {
-                Some("request exceeds the guard scan limit and cannot be scanned in full")
-            } else {
-                None
-            };
-            if let Some(reason) = unscannable {
-                warn!(
-                    req_id,
-                    client_id = %client_id,
-                    verdict = "block",
-                    reason,
-                    "guard: fail-closed (unscannable under block policy)"
-                );
-                return guard_blocked_response(&[], reason);
-            }
-        }
-        match state
-            .guard
-            .evaluate(policy, &client_id, guard_input.as_ref())
-        {
-            guard::Verdict::Allow => None,
-            guard::Verdict::Annotate { findings } => {
-                warn!(
-                    req_id,
-                    client_id = %client_id,
-                    verdict = "annotate",
-                    findings = findings.len(),
-                    truncated = guard_input.as_ref().is_some_and(guard::ScanInput::truncated),
-                    detections = %guard::detections_summary(&findings),
-                    "guard"
-                );
-                Some(findings.len())
-            }
-            guard::Verdict::Block { findings, reason } => {
-                warn!(
-                    req_id,
-                    client_id = %client_id,
-                    verdict = "block",
-                    findings = findings.len(),
-                    truncated = guard_input.as_ref().is_some_and(guard::ScanInput::truncated),
-                    detections = %guard::detections_summary(&findings),
-                    "guard"
-                );
-                return guard_blocked_response(&findings, &reason);
-            }
+        match state.guard_hook(
+            &req_id,
+            &client_id,
+            !guard_body_parsed && !body_bytes.is_empty(),
+            guard_input.as_ref(),
+            false,
+        ) {
+            Ok(annotate) => annotate,
+            Err(resp) => return *resp,
         }
     };
 
@@ -9141,18 +9189,8 @@ async fn proxy_handler(
     }
     .await;
 
-    // LAB-3877: stamp the annotate count onto the response. Header value is a
-    // decimal count, always a valid header value.
     #[cfg(feature = "guard")]
-    let response = {
-        let mut response = response;
-        if let Some(count) = guard_annotate {
-            response
-                .headers_mut()
-                .insert("x-guard-findings", HeaderValue::from(count as u64));
-        }
-        response
-    };
+    let response = stamp_guard_findings(response, guard_annotate);
 
     response
 }
@@ -13490,6 +13528,40 @@ async fn openai_chat_handler(
 
     let mut anthropic_body = translate_openai_to_anthropic(&openai_body);
 
+    // LAB-3877: Tier 0 content guard on the OpenAI-compat surface — the same
+    // hook as `proxy_handler`. The scanner reads the TRANSLATED body (the
+    // Messages shape it understands); the Anthropic arm below forwards that
+    // body, the OpenAI arm forwards the original bytes. Translation preserves
+    // the user text and `tool` content the scanner reads, but passes any other
+    // role (legacy `function`, `developer`, unknown) through verbatim, where
+    // the scanner cannot see it — so under `block` such a body is unscannable,
+    // not silently allowed. Unparseable JSON was already rejected above.
+    #[cfg(feature = "guard")]
+    let guard_annotate: Option<usize> = {
+        let unmapped_role = openai_body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .is_some_and(|msgs| {
+                msgs.iter().any(|m| {
+                    !matches!(
+                        m.get("role").and_then(|r| r.as_str()),
+                        Some("system" | "user" | "assistant" | "tool")
+                    )
+                })
+            });
+        let guard_input = guard::ScanInput::from_body(&anthropic_body);
+        match state.guard_hook(
+            &req_id,
+            &client_id,
+            unmapped_role,
+            guard_input.as_ref(),
+            true,
+        ) {
+            Ok(annotate) => annotate,
+            Err(resp) => return *resp,
+        }
+    };
+
     if state.auto_cache {
         let inj = inject_cache_breakpoints(&mut anthropic_body);
         if inj.skipped {
@@ -13529,123 +13601,133 @@ async fn openai_chat_handler(
         }
     };
 
-    let n = state.endpoints.len();
-    let mut last_saw_529 = false;
-    let mut last_saw_transient = false;
-    // Upstream error from the most recent model-unsupported rejection —
-    // returned verbatim if the pool exhausts on nothing but rejections.
-    let mut model_unsupported_resp: Option<Response> = None;
-    for retry_round in 0..=MAX_529_RETRIES {
-        if retry_round > 0 {
-            let delay = round_backoff_delay(retry_round, last_saw_529);
-            warn!(
-                retry_round = retry_round,
-                delay_ms = delay.as_millis() as u64,
-                saw_529 = last_saw_529,
-                "backoff: retrying all endpoints after transient/overload round"
-            );
-            tokio::time::sleep(delay).await;
-        }
-        let mut skip: Vec<EndpointIdx> = Vec::new();
-        let mut saw_529 = false;
-        let mut saw_transient = false;
-        for _attempt in 0..n {
-            // Pick the next endpoint and dispatch by protocol. Both forwards
-            // return a `ForwardOutcome` so the shared round-gated policy in
-            // `apply_round_outcome` covers both.
-            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
-                .await
-            {
-                Some(i) => {
-                    let ep = &state.endpoints[i];
-                    match ep.protocol {
-                        Protocol::Anthropic => {
-                            let out = forward_openai_compat_anthropic(
-                                &state,
-                                &parts,
-                                ep,
-                                i,
-                                &anthropic_body_bytes,
-                                &oauth_body_bytes,
-                                &req_id,
-                                &client_id,
-                                &client_ver,
-                                &client_ip,
-                                &agent_id,
-                                &session_id,
-                                &model,
-                                affinity,
-                                is_streaming,
-                                json_mode,
-                                request_start,
-                            )
-                            .await;
-                            (out, i)
-                        }
-                        Protocol::OpenAI => {
-                            // The endpoint is OpenAI-native — forward the
-                            // original request body without translation.
-                            let out = try_fallback_upstream(
-                                &state,
-                                &body_bytes,
-                                &req_id,
-                                &client_id,
-                                &client_ip,
-                                &agent_id,
-                                &session_id,
-                                &model,
-                                i,
-                                request_start,
-                                false,
-                                is_streaming,
-                            )
-                            .await;
-                            (out, i)
+    // Wrapped as in `proxy_handler`: every `return` inside yields the block's
+    // `Response`, so `X-Guard-Findings` is stamped once below.
+    let response: Response = async {
+        let n = state.endpoints.len();
+        let mut last_saw_529 = false;
+        let mut last_saw_transient = false;
+        // Upstream error from the most recent model-unsupported rejection —
+        // returned verbatim if the pool exhausts on nothing but rejections.
+        let mut model_unsupported_resp: Option<Response> = None;
+        for retry_round in 0..=MAX_529_RETRIES {
+            if retry_round > 0 {
+                let delay = round_backoff_delay(retry_round, last_saw_529);
+                warn!(
+                    retry_round = retry_round,
+                    delay_ms = delay.as_millis() as u64,
+                    saw_529 = last_saw_529,
+                    "backoff: retrying all endpoints after transient/overload round"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            let mut skip: Vec<EndpointIdx> = Vec::new();
+            let mut saw_529 = false;
+            let mut saw_transient = false;
+            for _attempt in 0..n {
+                // Pick the next endpoint and dispatch by protocol. Both forwards
+                // return a `ForwardOutcome` so the shared round-gated policy in
+                // `apply_round_outcome` covers both.
+                let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
+                    .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
+                    .await
+                {
+                    Some(i) => {
+                        let ep = &state.endpoints[i];
+                        match ep.protocol {
+                            Protocol::Anthropic => {
+                                let out = forward_openai_compat_anthropic(
+                                    &state,
+                                    &parts,
+                                    ep,
+                                    i,
+                                    &anthropic_body_bytes,
+                                    &oauth_body_bytes,
+                                    &req_id,
+                                    &client_id,
+                                    &client_ver,
+                                    &client_ip,
+                                    &agent_id,
+                                    &session_id,
+                                    &model,
+                                    affinity,
+                                    is_streaming,
+                                    json_mode,
+                                    request_start,
+                                )
+                                .await;
+                                (out, i)
+                            }
+                            Protocol::OpenAI => {
+                                // The endpoint is OpenAI-native — forward the
+                                // original request body without translation.
+                                let out = try_fallback_upstream(
+                                    &state,
+                                    &body_bytes,
+                                    &req_id,
+                                    &client_id,
+                                    &client_ip,
+                                    &agent_id,
+                                    &session_id,
+                                    &model,
+                                    i,
+                                    request_start,
+                                    false,
+                                    is_streaming,
+                                )
+                                .await;
+                                (out, i)
+                            }
                         }
                     }
-                }
-                // Candidates exhausted mid-round (all skipped / hard-limited /
-                // model-filtered). Break to the round-end logic rather than
-                // returning here, so a transient-only round still reaches the
-                // transient-aware exhaustion status instead of short-circuiting
-                // to a premature 429.
-                None => break,
-            };
+                    // Candidates exhausted mid-round (all skipped / hard-limited /
+                    // model-filtered). Break to the round-end logic rather than
+                    // returning here, so a transient-only round still reaches the
+                    // transient-aware exhaustion status instead of short-circuiting
+                    // to a premature 429.
+                    None => break,
+                };
 
-            match apply_round_outcome(
-                retry_round,
-                outcome,
-                picked_idx,
-                &mut skip,
-                &mut saw_529,
-                &mut saw_transient,
-                &mut model_unsupported_resp,
-            ) {
-                RetryStep::Return(resp) => return resp,
-                RetryStep::NextAttempt => continue,
-                RetryStep::EndRound => break,
+                match apply_round_outcome(
+                    retry_round,
+                    outcome,
+                    picked_idx,
+                    &mut skip,
+                    &mut saw_529,
+                    &mut saw_transient,
+                    &mut model_unsupported_resp,
+                ) {
+                    RetryStep::Return(resp) => return resp,
+                    RetryStep::NextAttempt => continue,
+                    RetryStep::EndRound => break,
+                }
+            }
+            last_saw_529 = saw_529;
+            last_saw_transient = saw_transient;
+            if !round_should_continue(retry_round, saw_529, saw_transient) {
+                break;
             }
         }
-        last_saw_529 = saw_529;
-        last_saw_transient = saw_transient;
-        if !round_should_continue(retry_round, saw_529, saw_transient) {
-            break;
-        }
-    }
 
-    // Same model-rejection exhaustion rule as `proxy_handler` (LAB-941),
-    // in the OpenAI error shape this handler's clients parse.
-    if !last_saw_529 && !last_saw_transient {
-        if let Some(resp) = model_unsupported_resp {
-            return resp;
+        // Same model-rejection exhaustion rule as `proxy_handler` (LAB-941),
+        // in the OpenAI error shape this handler's clients parse.
+        if !last_saw_529 && !last_saw_transient {
+            if let Some(resp) = model_unsupported_resp {
+                return resp;
+            }
+            if state.model_unsupported_everywhere(&model) {
+                warn!(model, "model unsupported on all eligible endpoints");
+                return model_unsupported_response(&model, true);
+            }
         }
-        if state.model_unsupported_everywhere(&model) {
-            warn!(model, "model unsupported on all eligible endpoints");
-            return model_unsupported_response(&model, true);
-        }
+        exhaustion_response(last_saw_transient, last_saw_529)
     }
-    exhaustion_response(last_saw_transient, last_saw_529)
+    .await;
+
+    #[cfg(feature = "guard")]
+    let response = stamp_guard_findings(response, guard_annotate);
+
+    response
 }
 
 // ── Main ────────────────────────────────────────────────────────────

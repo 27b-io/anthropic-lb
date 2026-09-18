@@ -366,6 +366,14 @@ impl ScanHistogram {
     }
 }
 
+/// AWS's published documentation example secret access key (the `EXAMPLEKEY`
+/// suffix marks it as such) — not a credential, and allow-listed by secret
+/// scanners for exactly that reason. Guard tests need a value that matches a
+/// real secret rule so the scanner fires; a synthetic placeholder would not
+/// match, and the tests would prove nothing.
+#[cfg(test)]
+pub(crate) const AWS_DOCS_EXAMPLE_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+
 /// Cardinality cap on the `client` dimension of the verdicts counter, so an
 /// unbounded stream of distinct client ids cannot grow the map without limit.
 /// Overflow folds into `_other`. Mirrors the `beta_flags_dropped` posture.
@@ -553,10 +561,12 @@ mod tests {
     #[test]
     fn secrets_scanner_positive_and_negative() {
         let s = SecretsScanner::new().expect("rules");
-        // Positive: a realistic high-entropy AWS secret access key.
-        let findings = s.scan(&input(
-            "aws_secret_access_key = \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\"",
-        ));
+        // Positive: AWS's documented example secret access key — shaped like
+        // the real thing so the rule fires.
+        let findings = s.scan(&input(&format!(
+            "aws_secret_access_key = \"{}\"",
+            AWS_DOCS_EXAMPLE_SECRET_KEY
+        )));
         assert!(!findings.is_empty(), "expected a secret finding");
         assert!(findings.iter().all(|f| f.scanner == "secrets_scanner"));
         assert!(findings.iter().all(|f| f.end > f.start));
@@ -633,7 +643,7 @@ mod tests {
         // Guard extraction borrows the body; the parsed Value must be untouched.
         let body = json!({"messages": [
             {"role": "user", "content": [
-                {"type": "text", "text": "token wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}
+                {"type": "text", "text": format!("token {}", AWS_DOCS_EXAMPLE_SECRET_KEY)}
             ]}
         ]});
         let before = serde_json::to_vec(&body).unwrap();

@@ -449,6 +449,12 @@ hot-path latency, at most 32 KiB of that content is scanned per request; a
 larger newest turn has its tail left unscanned (surfaced as `truncated` in the
 guard log).
 
+Scanning is content-driven: any proxied request whose JSON body carries
+`messages` is scanned — `/v1/messages`, `/v1/messages/count_tokens`, and
+`/v1/chat/completions` (scanned after translation to the Messages shape, so the
+same rules apply to both APIs). A request with no body, such as `GET
+/v1/models`, has nothing to scan and passes through.
+
 ### Per-client policy
 
 Each client sets its policy under `[[clients]]`:
@@ -484,15 +490,19 @@ Operator clients are always `off` regardless of configuration.
   ```
 
   Findings carry **byte offsets only — never the matched secret** — in logs, the
-  error body, and metrics alike.
+  error body, and metrics alike. On `/v1/chat/completions` the same 400 uses the
+  OpenAI error envelope (`error.code = "guard_blocked"`).
 
 `block` **fails closed.** A request it cannot scan in full is rejected with the
-same 400, rather than forwarded unscanned, in two cases: the body did not parse
-as JSON (a parse differential must not smuggle content past the scan), or the
+same 400, rather than forwarded unscanned, in two cases: the client sent a body
+the scanner cannot read — non-JSON (a parse differential must not smuggle
+content past the scan; this includes multipart uploads such as `/v1/files`), or
+an OpenAI-compat message role the translation does not map — or the
 newest-turn content exceeded the scan limit so its tail was never inspected
-(otherwise padding past the limit would bypass enforcement). A block-mode client
-must therefore keep scannable content within the limit. `annotate` (shadow mode)
-never rejects — it scans best-effort and always forwards.
+(otherwise padding past the limit would bypass enforcement). A block-mode
+client must therefore send JSON Messages traffic and keep scannable content
+within the limit. `annotate` (shadow mode) never rejects — it scans best-effort
+and always forwards.
 
 ### Metrics
 
