@@ -32,6 +32,12 @@ use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, trace, warn};
 
+// LAB-3877: Tier 0 request-content guard. Compiled only behind the `guard`
+// cargo feature; with it off, none of this module (or its scanner crates) is
+// built and request handling is unchanged.
+#[cfg(feature = "guard")]
+mod guard;
+
 // ── Config ──────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Clone)]
@@ -187,6 +193,12 @@ struct ClientConfig {
     /// client without the field.
     #[serde(default)]
     preferred_endpoints: Vec<String>,
+    /// LAB-3877: Tier 0 content-guard policy for this client —
+    /// `"off" | "annotate" | "block"`, default `annotate` (shadow mode). The
+    /// operator-bypass client is always `off` regardless of this value.
+    #[cfg(feature = "guard")]
+    #[serde(default)]
+    guard: guard::GuardPolicy,
 }
 
 /// Hand-written, NOT derived: a derived `Debug` would print `key` verbatim into
@@ -200,6 +212,8 @@ impl std::fmt::Debug for ClientConfig {
             .field("key", &"<redacted>")
             .field("models", &self.models)
             .field("preferred_endpoints", &self.preferred_endpoints)
+            // guard policy is not a secret, but keep the redacted-Debug field
+            // set complete so a future field isn't silently dropped here.
             .finish()
     }
 }
@@ -748,6 +762,11 @@ struct AppState {
     /// `client_id` is that principal's name rather than a client-asserted
     /// header. Empty ⇒ legacy `proxy_key` / open behaviour.
     clients: Vec<ClientConfig>,
+    /// LAB-3877: Tier 0 content guard — the compiled scanners plus their
+    /// metrics. Built once at startup; scanned read-only per request. Present
+    /// only under the `guard` feature.
+    #[cfg(feature = "guard")]
+    guard: guard::Guard,
     allowed_ips: Vec<IpAllowEntry>,
     /// Load balancers whose `x-forwarded-for` is trusted (LAB-1192).
     /// Consulted only by `resolve_client_ip`. Empty = header ignored.
@@ -2063,6 +2082,23 @@ impl AppState {
             Some(c) => !model.is_empty() && model_matches(&c.models, model),
             None => true,
         }
+    }
+
+    /// LAB-3877: resolve the Tier 0 guard policy for a client. The operator
+    /// bypass is always `Off` (it forwards operator-trusted content). Otherwise
+    /// the client's configured policy, defaulting to `Annotate` (shadow mode)
+    /// for any caller not in the table — including the legacy unknown-client
+    /// "-" and open-`proxy_key` modes, so shadow mode observes everything.
+    #[cfg(feature = "guard")]
+    fn client_guard_policy(&self, client_id: &str) -> guard::GuardPolicy {
+        if self.is_operator(client_id) {
+            return guard::GuardPolicy::Off;
+        }
+        self.clients
+            .iter()
+            .find(|c| c.name == client_id)
+            .map(|c| c.guard)
+            .unwrap_or_default()
     }
 
     /// Count + log a model-allowlist denial.
@@ -8549,6 +8585,27 @@ async fn maybe_cache_store(
     Response::from_parts(parts, Body::from(bytes))
 }
 
+/// LAB-3877: build the HTTP 400 for a `block` verdict. The body carries finding
+/// offsets and labels only — never the matched text — so an error surfaced to a
+/// client (or captured in its logs) cannot itself leak the secret it flagged.
+#[cfg(feature = "guard")]
+fn guard_blocked_response(findings: &[guard::Finding], reason: &str) -> Response {
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "guard_blocked",
+            "message": reason,
+            "findings": findings,
+        }
+    });
+    (
+        StatusCode::BAD_REQUEST,
+        [(hyper::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -8612,6 +8669,14 @@ async fn proxy_handler(
         Err(resp) => return *resp,
     };
 
+    // LAB-3877: the guard's scan input is extracted from the parsed body here,
+    // pre-injection, so it sees exactly what the client sent (auto-cache
+    // injection adds cache_control only, but extracting before it keeps the
+    // guard trivially body-neutral). The scan itself runs later, after
+    // `pre_request_gate`. `None` for a non-JSON body — nothing to inspect.
+    #[cfg(feature = "guard")]
+    let mut guard_input: Option<guard::ScanInput> = None;
+
     // Parse body once for model extraction, optional cache injection, and
     // the fast-mode flag that picks the rate bucket downstream.
     let (body_bytes, oauth_body_bytes, model, fp, cache_key, is_fast_mode) =
@@ -8632,6 +8697,13 @@ async fn proxy_handler(
             // double as the affinity discriminator; bps is computed POST-injection
             // (below) to reflect the breakpoints actually forwarded upstream.
             let (fp, fps) = content_fingerprints(&parsed);
+
+            // LAB-3877: extract the newest user text + tool_result blocks for
+            // the guard (never `system`). Read-only borrow of `parsed`.
+            #[cfg(feature = "guard")]
+            {
+                guard_input = guard::ScanInput::from_body(&parsed);
+            }
 
             // LAB-933/LAB-929: derive the response-cache key on the
             // PRE-injection body — the request exactly as the client sent
@@ -8786,6 +8858,53 @@ async fn proxy_handler(
         return *resp;
     }
 
+    // LAB-3877: Tier 0 content guard — runs after the gate, before endpoint
+    // selection. Read-only: it inspects the newest user/tool_result content and
+    // emits a verdict, never touching the bytes forwarded upstream. `Block`
+    // (opt-in per client) rejects here with a 400 before anything is served;
+    // `Annotate` (the shadow-mode default) records a count stamped onto the
+    // response below. Findings carry offsets only — never matched text.
+    #[cfg(feature = "guard")]
+    let guard_annotate: Option<usize> = {
+        let policy = state.client_guard_policy(&client_id);
+        match state
+            .guard
+            .evaluate(policy, &client_id, guard_input.as_ref())
+        {
+            guard::Verdict::Allow => None,
+            guard::Verdict::Annotate { findings } => {
+                warn!(
+                    req_id,
+                    client_id = %client_id,
+                    verdict = "annotate",
+                    findings = findings.len(),
+                    truncated = guard_input.as_ref().is_some_and(guard::ScanInput::truncated),
+                    detections = %guard::detections_summary(&findings),
+                    "guard"
+                );
+                Some(findings.len())
+            }
+            guard::Verdict::Block { findings, reason } => {
+                warn!(
+                    req_id,
+                    client_id = %client_id,
+                    verdict = "block",
+                    findings = findings.len(),
+                    truncated = guard_input.as_ref().is_some_and(guard::ScanInput::truncated),
+                    detections = %guard::detections_summary(&findings),
+                    "guard"
+                );
+                return guard_blocked_response(&findings, &reason);
+            }
+        }
+    };
+
+    // The remaining dispatch is wrapped so an `Annotate` verdict can stamp the
+    // `X-Guard-Findings` header onto whatever response it yields (cache hit,
+    // proxied success, or exhaustion) from one place. The wrapper is an
+    // immediately-awaited async block: behaviourally transparent, and a no-op
+    // when the guard feature is off.
+    let response: Response = async {
     // LAB-933: serve an opted-in replay from the encrypted response cache.
     // Placed AFTER the gate so budget/emergency policy still applies to
     // opted-in clients; a hit then never touches an upstream — no rate-limit
@@ -8973,6 +9092,23 @@ async fn proxy_handler(
         }
     }
     exhaustion_response(last_saw_transient, last_saw_529)
+    }
+    .await;
+
+    // LAB-3877: stamp the annotate count onto the response. Header value is a
+    // decimal count, always a valid header value.
+    #[cfg(feature = "guard")]
+    let response = {
+        let mut response = response;
+        if let Some(count) = guard_annotate {
+            response
+                .headers_mut()
+                .insert("x-guard-findings", HeaderValue::from(count as u64));
+        }
+        response
+    };
+
+    response
 }
 
 // ── Fallback upstream handler ────────────────────────────────────────
@@ -11244,6 +11380,58 @@ async fn metrics_handler(
                 );
             }
         }
+    }
+
+    // LAB-3877: Tier 0 guard metrics. Verdicts by (client, scanner, outcome)
+    // and the scan-duration histogram. Both per-replica, in-memory.
+    #[cfg(feature = "guard")]
+    {
+        prom_header(
+            &mut buf,
+            "anthropic_guard_verdicts_total",
+            "counter",
+            "Guard scan verdicts by client, scanner, and outcome (allow/annotate/block)",
+        );
+        for ((client, scanner, verdict), n) in state.guard.verdicts_snapshot() {
+            prom_counter(
+                &mut buf,
+                "anthropic_guard_verdicts_total",
+                &[
+                    ("client", client.as_str()),
+                    ("scanner", scanner),
+                    ("verdict", verdict),
+                ],
+                n,
+            );
+        }
+
+        let (hist, sum, count) = state.guard.scan_hist_snapshot();
+        prom_header(
+            &mut buf,
+            "anthropic_guard_scan_duration_seconds",
+            "histogram",
+            "Guard request-body scan duration in seconds",
+        );
+        for (le, cumulative) in &hist {
+            prom_counter(
+                &mut buf,
+                "anthropic_guard_scan_duration_seconds_bucket",
+                &[("le", le.as_str())],
+                *cumulative,
+            );
+        }
+        prom_gauge(
+            &mut buf,
+            "anthropic_guard_scan_duration_seconds_sum",
+            &[],
+            sum,
+        );
+        prom_counter(
+            &mut buf,
+            "anthropic_guard_scan_duration_seconds_count",
+            &[],
+            count,
+        );
     }
 
     (
@@ -14020,6 +14208,18 @@ async fn main() {
         None => None,
     };
 
+    // LAB-3877: build the Tier 0 guard once (rule/regex compilation is not
+    // cheap). A broken ruleset fails startup loudly rather than silently
+    // scanning nothing — the same fail-loud posture as the config gates above.
+    #[cfg(feature = "guard")]
+    let guard = match guard::Guard::new() {
+        Ok(g) => {
+            info!("content guard enabled (Tier 0 rules scanners; shadow-mode default)");
+            g
+        }
+        Err(msg) => panic!("guard init failed: {msg}"),
+    };
+
     let state = Arc::new(AppState {
         // Liveness knobs are load-bearing against Anthropic's Cloudflare edge:
         // h2 PING (while_idle) evicts half-closed pooled streams before they're
@@ -14048,6 +14248,8 @@ async fn main() {
         state_path,
         proxy_key: config.proxy_key.clone(),
         clients: config.clients.clone(),
+        #[cfg(feature = "guard")]
+        guard,
         allowed_ips,
         trusted_proxies,
         auth_throttle: AuthThrottle::new(

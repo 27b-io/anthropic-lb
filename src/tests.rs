@@ -376,6 +376,8 @@ fn test_state_base() -> AppState {
         state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
         proxy_key: None,
         clients: vec![],
+        #[cfg(feature = "guard")]
+        guard: crate::guard::Guard::empty(),
         allowed_ips: vec![],
         trusted_proxies: vec![],
         auth_throttle: AuthThrottle::new(
@@ -14840,6 +14842,180 @@ async fn oauth_system_prompt_no_reserialize_when_in_later_block() {
     );
 }
 
+/// A mock Anthropic upstream that records the raw forwarded body bytes and
+/// returns a minimal valid response with rate-limit headers. Returns the
+/// listener address and the shared capture buffer.
+#[cfg(feature = "guard")]
+async fn spawn_guard_body_upstream() -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<u8>>>) {
+    let captured: std::sync::Arc<tokio::sync::Mutex<Vec<u8>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let cap = captured.clone();
+    let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+        let cap = cap.clone();
+        async move {
+            let body_bytes = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap();
+            *cap.lock().await = body_bytes.to_vec();
+            let mut resp = axum::Json(serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 1}
+            }))
+            .into_response();
+            resp.headers_mut().insert(
+                "anthropic-ratelimit-unified-representative-claim",
+                HeaderValue::from_static("five_hour"),
+            );
+            resp.headers_mut().insert(
+                "anthropic-ratelimit-unified-5h-utilization",
+                HeaderValue::from_static("0.10"),
+            );
+            let reset = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600)
+                .to_string();
+            resp.headers_mut().insert(
+                "anthropic-ratelimit-unified-5h-reset",
+                HeaderValue::from_str(&reset).unwrap(),
+            );
+            resp
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+    (format!("http://{addr}"), captured)
+}
+
+/// LAB-3877: with the guard in its default `annotate` (shadow) mode, a request
+/// carrying a secret is (a) forwarded upstream byte-for-byte identical to what
+/// the client sent — detection must never disturb the prompt-cache prefix — and
+/// (b) tagged with the `X-Guard-Findings` header on the response.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_annotate_forwards_byte_identical_and_stamps_header() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-annotate.state.json"),
+        auto_cache: false, // clean byte-identity signal
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let app = build_router(state);
+    let addr = serve(app).await;
+
+    // Secret (AWS secret key) + PII (email) in the newest user turn.
+    let request_body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "system": [{"type": "text", "text": "you are helpful"}],
+        "messages": [{"role": "user", "content":
+            "deploy key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY email ops@example.com"}],
+        "max_tokens": 5
+    });
+    let request_bytes = serde_json::to_vec(&request_body).unwrap();
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(request_bytes.clone())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let hdr = resp
+        .headers()
+        .get("x-guard-findings")
+        .expect("annotate must stamp X-Guard-Findings");
+    let count: usize = hdr.to_str().unwrap().parse().unwrap();
+    assert!(count >= 1, "expected at least one finding, got {count}");
+
+    let forwarded = captured.lock().await;
+    assert_eq!(
+        forwarded.as_slice(),
+        request_bytes.as_slice(),
+        "guard must forward the body byte-identically (re-serialization breaks upstream cache)"
+    );
+}
+
+/// LAB-3877: a client whose policy is `block` gets an HTTP 400 with a
+/// `guard_blocked` body when its request carries a secret — and the upstream is
+/// never contacted. The error body carries finding offsets only, never the
+/// matched secret text.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_returns_400_with_offsets_and_skips_upstream() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let block_client = ClientConfig {
+        name: "blocked-client".to_string(),
+        key: "block-key".to_string(),
+        models: vec![],
+        preferred_endpoints: vec![],
+        guard: crate::guard::GuardPolicy::Block,
+    };
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        clients: vec![block_client],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-block.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let app = build_router(state);
+    let addr = serve(app).await;
+
+    let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    let request_body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user",
+            "content": format!("aws_secret_access_key = \"{secret}\"")}],
+        "max_tokens": 5
+    });
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "block-key")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "guard_blocked");
+    let findings = body["error"]["findings"]
+        .as_array()
+        .expect("findings array");
+    assert!(!findings.is_empty(), "block body must list findings");
+    for f in findings {
+        assert!(f.get("scanner").is_some());
+        assert!(f.get("detection_type").is_some());
+        assert!(f["start"].is_number() && f["end"].is_number());
+        assert!(f.get("matched").is_none(), "must not leak matched text");
+    }
+    // The whole error body must not contain the secret anywhere.
+    assert!(
+        !body.to_string().contains(secret),
+        "block response must never echo the matched secret"
+    );
+    // Upstream must not have been contacted.
+    assert!(
+        captured.lock().await.is_empty(),
+        "a blocked request must never reach the upstream"
+    );
+}
+
 /// Integration test: verify OAuth accounts get the CC system prompt injected
 /// in requests sent through the OpenAI-compat endpoint.
 #[tokio::test]
@@ -17469,6 +17645,8 @@ fn mk_client(name: &str, key: &str, models: &[&str]) -> ClientConfig {
         key: key.to_string(),
         models: models.iter().map(|s| s.to_string()).collect(),
         preferred_endpoints: vec![],
+        #[cfg(feature = "guard")]
+        guard: crate::guard::GuardPolicy::default(),
     }
 }
 

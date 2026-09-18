@@ -417,6 +417,84 @@ can steer are locked down by default:
 
 ---
 
+## Guardrails
+
+An optional content-inspection layer scans each request for leaked secrets and
+PII before it is forwarded upstream. It is **opt-in at build time** and **shadow
+mode by default** — it counts and annotates, but blocks nothing, until you have
+measured false-positive rates on your own traffic.
+
+### Building with the guard
+
+The layer lives behind the `guard` cargo feature and is **off by default**:
+
+```bash
+cargo build --release                    # no guard; unchanged behaviour, no extra deps
+cargo build --release --features guard   # guard compiled in
+```
+
+With the feature off, the scanner crates are not compiled and request handling
+is byte-for-byte unchanged. The two scanners are pure Rust (no C/C++ build
+dependency): a secrets scanner over a bundled gitleaks/kingfisher ruleset, and a
+PII scanner (emails, cards, IPs, JWTs, national ids, provider API-key shapes).
+
+### What it scans
+
+Only the **newest `user` text and `tool_result` blocks** of the request body —
+the freshest untrusted content. The `system` prompt is never scanned (it is
+operator-trusted and a known false-positive surface). Detection is strictly
+read-only: the body forwarded upstream is byte-identical to what the client
+sent, so prompt-cache prefixes and routing are never disturbed. To bound
+hot-path latency, at most 32 KiB of that content is scanned per request; a
+larger newest turn has its tail left unscanned (surfaced as `truncated` in the
+guard log).
+
+### Per-client policy
+
+Each client sets its policy under `[[clients]]`:
+
+```toml
+[[clients]]
+name = "alice"
+key  = "<openssl rand -hex 32>"
+guard = "annotate"   # "off" | "annotate" | "block"  (default: "annotate")
+```
+
+- `off` — skip scanning entirely.
+- `annotate` (**default**) — scan, count, and log findings, but always forward
+  the request. Shadow mode.
+- `block` — reject a request carrying any finding.
+
+Operator clients are always `off` regardless of configuration.
+
+- **Annotate** adds an `X-Guard-Findings: <count>` response header and a
+  structured `guard` log line keyed by request id (scanner, detection type,
+  count — never the matched text).
+- **Block** returns `HTTP 400` with:
+
+  ```json
+  {
+    "type": "error",
+    "error": {
+      "type": "guard_blocked",
+      "message": "...",
+      "findings": [ { "scanner": "...", "detection_type": "...", "start": 0, "end": 0 } ]
+    }
+  }
+  ```
+
+  Findings carry **byte offsets only — never the matched secret** — in logs, the
+  error body, and metrics alike.
+
+### Metrics
+
+On `/metrics` (when built with the feature):
+
+- `anthropic_guard_verdicts_total{client, scanner, verdict}` — counter.
+- `anthropic_guard_scan_duration_seconds` — histogram of per-request scan time.
+
+---
+
 ## Endpoints
 
 | Route | Method | Description |

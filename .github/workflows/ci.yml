@@ -89,3 +89,22 @@ jobs:
         run: cargo test
       - name: Check packaging
         run: cargo publish --dry-run --allow-dirty
+
+  guard:
+    name: Guard feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Clippy (guard)
+        run: cargo clippy --all-targets --features guard
+      - name: Tests (guard)
+        run: cargo test --features guard
+      # The scan-latency budget is a release-binary property, so the perf test
+      # asserts its tight bound only in release. Run it there so the SLO is
+      # actually gated in CI, not just measurable locally.
+      - name: Scan-latency budget (release)
+        run: cargo test --release --features guard scan_200kb_body_under_budget
