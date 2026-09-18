@@ -76,9 +76,19 @@ pub enum Verdict {
 /// A leaked credential in a config/env paste almost always appears within the
 /// first 32 KiB, so the coverage cost in shadow mode is small.
 ///
-// ponytail: fixed cap. If measured false-negatives past the cap justify it,
-// promote to a per-deployment config knob (the scanners scale ~linearly, so a
-// higher cap trades latency budget for coverage) rather than removing the bound.
+/// Latency note: the byte cap bounds scan cost for realistic content (prose or
+/// code with up to ~100 detections in 32 KiB scans in ~1.2 ms). The PII
+/// scanner's cost grows with the number of detections, so *degenerate*
+/// content — 32 KiB of almost nothing but PII tokens (~1000 detections) — can
+/// take ~14 ms. That is an adversarial p100, not a realistic p99, and it is
+/// bounded (input capped here, body capped at the 25 MiB inflight limit); it
+/// never leaks and never blocks another request's I/O.
+///
+// ponytail: fixed cap; scan runs inline on the async worker. If shadow-mode data
+// shows finding-dense bodies are common enough that the ~14 ms p100 matters,
+// the upgrade path is tokio::task::spawn_blocking for the scan (isolates the CPU
+// burst from the executor) and/or a per-deployment cap knob — not removing the
+// bound.
 pub const MAX_SCAN_BYTES: usize = 32 * 1024;
 
 /// The subset of a request body a scanner is allowed to see: the newest `user`
@@ -98,11 +108,6 @@ impl ScanInput {
     /// The concatenated text to scan.
     pub fn text(&self) -> &str {
         &self.text
-    }
-
-    /// Whether there is anything to scan.
-    pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
     }
 
     /// Whether the input was truncated to [`MAX_SCAN_BYTES`] (the tail is
@@ -204,12 +209,16 @@ pub fn detections_summary(findings: &[Finding]) -> String {
 
 /// A synchronous content scanner. Implementations are built once at startup
 /// (rule/regex compilation is not cheap) and shared read-only across requests.
+///
+/// A scanner reports findings; it does not decide policy. An empty result means
+/// nothing was flagged. Enforcement (annotate vs block) is [`Guard::evaluate`]'s
+/// job, so scanners never construct a [`Verdict`].
 pub trait Scanner: Send + Sync {
-    /// Stable label for logs and the `scanner` metric dimension.
+    /// Stable label for logs and the `scanner` metric dimension. Also the value
+    /// stamped into each [`Finding::scanner`] this scanner produces.
     fn name(&self) -> &'static str;
-    /// Scan the input. Returns `Allow` when nothing is flagged, otherwise
-    /// `Annotate { findings }`. Never returns `Block` — enforcement is policy.
-    fn scan(&self, input: &ScanInput) -> Verdict;
+    /// Scan the input, returning every detection (empty = nothing flagged).
+    fn scan(&self, input: &ScanInput) -> Vec<Finding>;
 }
 
 /// Secrets/credentials scanner backed by `secrets_scanner` with its bundled
@@ -222,12 +231,19 @@ pub struct SecretsScanner {
 
 impl SecretsScanner {
     pub fn new() -> Result<Self, String> {
+        // Hardened for untrusted request bodies: ignore inline `gitleaks:allow`
+        // markers a caller could embed to suppress detection, redact matched
+        // text, skip context capture, cap output.
+        let config = secrets_scanner::ScanConfig::proxy();
+        // Fail-closed by construction: if a future change to `proxy()` softened
+        // any of those guarantees, refuse to build rather than silently scan
+        // untrusted content un-hardened.
+        if !config.is_hardened() {
+            return Err("secrets_scanner proxy config is not hardened".to_string());
+        }
         let inner = secrets_scanner::Scanner::from_bundled()
             .map_err(|e| format!("secrets_scanner rule load failed: {e}"))?
-            // Hardened for untrusted request bodies: ignore inline
-            // `gitleaks:allow` markers a caller could embed to suppress
-            // detection, redact matched text, skip context capture, cap output.
-            .with_config(secrets_scanner::ScanConfig::proxy());
+            .with_config(config);
         Ok(Self { inner })
     }
 }
@@ -237,21 +253,17 @@ impl Scanner for SecretsScanner {
         "secrets_scanner"
     }
 
-    fn scan(&self, input: &ScanInput) -> Verdict {
-        let raw = self.inner.scan_content("request-body", input.text());
-        if raw.is_empty() {
-            return Verdict::Allow;
-        }
-        let findings = raw
+    fn scan(&self, input: &ScanInput) -> Vec<Finding> {
+        self.inner
+            .scan_content("request-body", input.text())
             .into_iter()
             .map(|f| Finding {
-                scanner: "secrets_scanner",
+                scanner: self.name(),
                 detection_type: f.rule_id,
                 start: f.start_offset,
                 end: f.end_offset,
             })
-            .collect();
-        Verdict::Annotate { findings }
+            .collect()
     }
 }
 
@@ -280,21 +292,17 @@ impl Scanner for LeakGuardScanner {
         "leakguard"
     }
 
-    fn scan(&self, input: &ScanInput) -> Verdict {
-        let matches = self.inner.find(input.text());
-        if matches.is_empty() {
-            return Verdict::Allow;
-        }
-        let findings = matches
+    fn scan(&self, input: &ScanInput) -> Vec<Finding> {
+        self.inner
+            .find(input.text())
             .into_iter()
             .map(|m| Finding {
-                scanner: "leakguard",
+                scanner: self.name(),
                 detection_type: format!("{:?}", m.kind),
                 start: m.start,
                 end: m.end,
             })
-            .collect();
-        Verdict::Annotate { findings }
+            .collect()
     }
 }
 
@@ -344,8 +352,10 @@ impl ScanHistogram {
         let mut series = Vec::with_capacity(self.buckets.len());
         for (i, b) in self.buckets.iter().enumerate() {
             cumulative += b.load(Ordering::Relaxed);
+            // f64 Display gives the plain decimal Prometheus wants for these
+            // edges (`0.0001`, not `1e-4`); no custom formatter needed.
             let le = if i < SCAN_DURATION_BUCKETS.len() {
-                format_le(SCAN_DURATION_BUCKETS[i])
+                SCAN_DURATION_BUCKETS[i].to_string()
             } else {
                 "+Inf".to_string()
             };
@@ -354,15 +364,6 @@ impl ScanHistogram {
         let sum = self.sum_nanos.load(Ordering::Relaxed) as f64 / 1e9;
         (series, sum, self.count.load(Ordering::Relaxed))
     }
-}
-
-/// Format a bucket edge for a Prometheus `le` label without a trailing
-/// exponent (`0.001`, not `1e-3`).
-fn format_le(v: f64) -> String {
-    let s = format!("{v:.6}");
-    // Trim trailing zeros but keep at least one decimal digit.
-    let trimmed = s.trim_end_matches('0');
-    trimmed.strip_suffix('.').unwrap_or(trimmed).to_string()
 }
 
 /// Cardinality cap on the `client` dimension of the verdicts counter, so an
@@ -425,7 +426,7 @@ impl Guard {
             return Verdict::Allow;
         }
         let input = match input {
-            Some(i) if !i.is_empty() => i,
+            Some(i) if !i.text.is_empty() => i,
             _ => return Verdict::Allow,
         };
 
@@ -435,15 +436,9 @@ impl Guard {
         // section so timing captures only scan work.
         let mut per_scanner: Vec<(&'static str, bool)> = Vec::with_capacity(self.scanners.len());
         for scanner in &self.scanners {
-            let hit = match scanner.scan(input) {
-                Verdict::Allow => false,
-                Verdict::Annotate { findings } | Verdict::Block { findings, .. } => {
-                    let any = !findings.is_empty();
-                    all.extend(findings);
-                    any
-                }
-            };
-            per_scanner.push((scanner.name(), hit));
+            let findings = scanner.scan(input);
+            per_scanner.push((scanner.name(), !findings.is_empty()));
+            all.extend(findings);
         }
         self.scan_hist.observe(start.elapsed());
 
@@ -559,36 +554,25 @@ mod tests {
     fn secrets_scanner_positive_and_negative() {
         let s = SecretsScanner::new().expect("rules");
         // Positive: a realistic high-entropy AWS secret access key.
-        let hit = s.scan(&input(
+        let findings = s.scan(&input(
             "aws_secret_access_key = \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\"",
         ));
-        match hit {
-            Verdict::Annotate { findings } => {
-                assert!(!findings.is_empty());
-                assert!(findings.iter().all(|f| f.scanner == "secrets_scanner"));
-                assert!(findings.iter().all(|f| f.end > f.start));
-            }
-            other => panic!("expected findings, got {other:?}"),
-        }
+        assert!(!findings.is_empty(), "expected a secret finding");
+        assert!(findings.iter().all(|f| f.scanner == "secrets_scanner"));
+        assert!(findings.iter().all(|f| f.end > f.start));
         // Negative: ordinary prose.
-        assert_eq!(
-            s.scan(&input("the quick brown fox jumps over the lazy dog")),
-            Verdict::Allow
-        );
+        assert!(s
+            .scan(&input("the quick brown fox jumps over the lazy dog"))
+            .is_empty());
     }
 
     #[test]
     fn leakguard_positive_and_negative() {
         let s = LeakGuardScanner::new();
-        let hit = s.scan(&input("email me at alice@example.com"));
-        match hit {
-            Verdict::Annotate { findings } => {
-                assert!(findings.iter().any(|f| f.detection_type == "Email"));
-                assert!(findings.iter().all(|f| f.scanner == "leakguard"));
-            }
-            other => panic!("expected findings, got {other:?}"),
-        }
-        assert_eq!(s.scan(&input("no personal data here")), Verdict::Allow);
+        let findings = s.scan(&input("email me at alice@example.com"));
+        assert!(findings.iter().any(|f| f.detection_type == "Email"));
+        assert!(findings.iter().all(|f| f.scanner == "leakguard"));
+        assert!(s.scan(&input("no personal data here")).is_empty());
     }
 
     #[test]
@@ -662,14 +646,22 @@ mod tests {
 
     /// Build a 200 KB Anthropic body whose newest user turn holds the whole
     /// payload — the worst case for the guard (the entire body is scannable
-    /// user content). Punctuation-dense so the scanners' match paths are
-    /// exercised, not just the fast keyword reject.
+    /// user content). A detection is embedded roughly every ~300 bytes so the
+    /// scanned window (capped at [`MAX_SCAN_BYTES`]) carries ~100 findings: this
+    /// exercises the finding-extraction path (allocation, detection_type
+    /// formatting, offset math), not just the fast keyword reject. ~100
+    /// detections in 32 KiB is a realistic-dense worst case; pathological
+    /// all-PII content is a documented ceiling on `MAX_SCAN_BYTES`, not the p99.
     fn body_200kb() -> Value {
         let mut big = String::with_capacity(210_000);
         while big.len() < 200_000 {
-            big.push_str("lorem ipsum dolor sit amet, consectetur adipiscing elit; ");
+            big.push_str(
+                "lorem ipsum dolor sit amet consectetur adipiscing elit sed do \
+                 eiusmod tempor incididunt ut labore et dolore magna aliqua ut \
+                 enim contact ops@example.com and more filler words here too ",
+            );
         }
-        big.push_str(" contact alice@example.com key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        big.truncate(200_000);
         json!({
             "system": "you are a helpful assistant",
             "messages": [{"role": "user", "content": big}]
@@ -701,8 +693,18 @@ mod tests {
         // the scan itself.
         let si = ScanInput::from_body(&body_200kb()).expect("scannable");
 
-        // Warm up (first regex run pays one-time costs).
-        let _ = g.evaluate(GuardPolicy::Annotate, "c", Some(&si));
+        // Guard against the test silently regressing to the fast-reject path:
+        // the scanned window must actually produce findings, so the timed loop
+        // exercises finding extraction, not just keyword rejection.
+        match g.evaluate(GuardPolicy::Annotate, "c", Some(&si)) {
+            Verdict::Annotate { findings } => assert!(
+                findings.len() >= 50,
+                "perf payload must be finding-dense (got {} findings) so the \
+                 extraction path is measured",
+                findings.len()
+            ),
+            other => panic!("perf payload produced no findings: {other:?}"),
+        }
 
         let iters = if cfg!(debug_assertions) { 30 } else { 300 };
         let mut samples: Vec<std::time::Duration> = Vec::with_capacity(iters);

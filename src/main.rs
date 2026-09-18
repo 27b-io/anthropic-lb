@@ -207,14 +207,16 @@ struct ClientConfig {
 /// as `debug_header_value`'s redaction of sensitive headers.
 impl std::fmt::Debug for ClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientConfig")
-            .field("name", &self.name)
+        let mut ds = f.debug_struct("ClientConfig");
+        ds.field("name", &self.name)
             .field("key", &"<redacted>")
             .field("models", &self.models)
-            .field("preferred_endpoints", &self.preferred_endpoints)
-            // guard policy is not a secret, but keep the redacted-Debug field
-            // set complete so a future field isn't silently dropped here.
-            .finish()
+            .field("preferred_endpoints", &self.preferred_endpoints);
+        // guard policy is not a secret; include it so the redacted Debug shows
+        // the full (non-key) field set.
+        #[cfg(feature = "guard")]
+        ds.field("guard", &self.guard);
+        ds.finish()
     }
 }
 
@@ -8902,8 +8904,11 @@ async fn proxy_handler(
     // The remaining dispatch is wrapped so an `Annotate` verdict can stamp the
     // `X-Guard-Findings` header onto whatever response it yields (cache hit,
     // proxied success, or exhaustion) from one place. The wrapper is an
-    // immediately-awaited async block: behaviourally transparent, and a no-op
-    // when the guard feature is off.
+    // immediately-awaited async block, so it is behaviourally transparent (and
+    // a no-op when the guard feature is off) — but note every `return` inside
+    // now yields the block's `Response`, not the handler's: a new early-return
+    // added below still exits the handler (via `response`) and simply carries
+    // the annotate header too, which is the intended behaviour.
     let response: Response = async {
     // LAB-933: serve an opted-in replay from the encrypted response cache.
     // Placed AFTER the gate so budget/emergency policy still applies to
