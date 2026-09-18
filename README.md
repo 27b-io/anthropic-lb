@@ -410,6 +410,17 @@ can steer are locked down by default:
   never strips `speed` on the client's behalf — if no eligible account is entitled, the
   client gets the upstream `400` verbatim rather than a silent downgrade or a
   synthetic `429`.
+- **A fast-mode `429` is forwarded to the caller, not treated as account
+  exhaustion.** Fast mode (`speed: "fast"`) bills against its own rate bucket,
+  separate from the account's 5h/7d windows, so a `429` on a fast request does
+  not cool the account or rotate to another one — the caller gets the `429`
+  with upstream's `retry-after`, exactly as a direct Anthropic client would.
+  Without this, one client looping fast requests would hard-limit every
+  account in turn and deny standard-speed traffic to everyone else. Occurrences
+  are counted as `anthropic_fast_mode_429_total{account}`. Transient *burst*
+  `429`s (`x-should-retry` with no `retry-after` and no rate-limit headers) are
+  excluded: those are per-minute limits on the account itself, so they keep
+  their usual backoff and rotation whatever speed was requested.
 
 ### Known Limitations
 
@@ -844,6 +855,23 @@ WantedBy=multi-user.target
 ---
 
 ## Testing
+
+The Rust toolchain is pinned in `rust-toolchain.toml`, so local builds, CI,
+and the Docker image all use the same compiler — rustup reads the file
+automatically and installs that version on first `cargo` invocation. (CI's
+toolchain action only bootstraps `stable`; every `cargo` command still
+resolves through the pin via rustup's toolchain-file override, and the
+Dockerfile copies the file into the builder stage.) Toolchain updates arrive as Renovate PRs
+and are never automerged (CI infra has a wide blast radius). This matters
+because CI runs with `-Dwarnings`: a new stable Rust ships new clippy lints that
+can fail code nobody touched, and with the pin that failure lands as a red
+*bump PR* — reviewable, with the lint fixes in the same branch — instead of a
+red `main` that blocks every merge and the next release
+([#142](https://github.com/27b-io/anthropic-lb/issues/142)). Fix new lints
+inside the bump PR; don't weaken `-Dwarnings`. Reproduce a bump locally with
+`rustup toolchain install <new-version> --profile minimal --component clippy && RUSTFLAGS="-Dwarnings" cargo +<new-version> clippy --all-targets`.
+If the lints can't be fixed right now, close the bump PR — `main` stays on the
+old pin and Renovate reopens it on the next run.
 
 ```bash
 # Run all tests
