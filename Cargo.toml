@@ -55,6 +55,19 @@ serde_bytes = "0.11"
 # cachekit-rs' AEAD stack — direct use costs no extra compile.
 subtle = "2.6"
 
+# LAB-3877: Tier 0 request-content guard. Both are pure Rust with no C/C++
+# build dependency (verified via `cargo tree`); `secrets_scanner` is pulled in
+# with default-features off to drop its CLI/filesystem-walker stack (clap,
+# rayon, walkdir, libc) — we use only the in-memory `scan_content` path against
+# the compiled-in ruleset. Optional: compiled only with the `guard` feature.
+secrets_scanner = { version = "0.2.3", default-features = false, optional = true }
+leakguard = { version = "0.9.1", optional = true }
+
+[features]
+# Off by default: with the feature disabled the guard module and both scanner
+# crates are not compiled, and request handling is unchanged.
+guard = ["dep:secrets_scanner", "dep:leakguard"]
+
 [dev-dependencies]
 tempfile = "3.25.0"
 async-trait = "0.1"

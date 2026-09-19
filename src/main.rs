@@ -32,6 +32,12 @@ use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, trace, warn};
 
+// LAB-3877: Tier 0 request-content guard. Compiled only behind the `guard`
+// cargo feature; with it off, none of this module (or its scanner crates) is
+// built and request handling is unchanged.
+#[cfg(feature = "guard")]
+mod guard;
+
 // ── Config ──────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Clone)]
@@ -187,6 +193,12 @@ struct ClientConfig {
     /// client without the field.
     #[serde(default)]
     preferred_endpoints: Vec<String>,
+    /// LAB-3877: Tier 0 content-guard policy for this client —
+    /// `"off" | "annotate" | "block"`, default `annotate` (shadow mode). The
+    /// operator-bypass client is always `off` regardless of this value.
+    #[cfg(feature = "guard")]
+    #[serde(default)]
+    guard: guard::GuardPolicy,
 }
 
 /// Hand-written, NOT derived: a derived `Debug` would print `key` verbatim into
@@ -195,12 +207,16 @@ struct ClientConfig {
 /// as `debug_header_value`'s redaction of sensitive headers.
 impl std::fmt::Debug for ClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientConfig")
-            .field("name", &self.name)
+        let mut ds = f.debug_struct("ClientConfig");
+        ds.field("name", &self.name)
             .field("key", &"<redacted>")
             .field("models", &self.models)
-            .field("preferred_endpoints", &self.preferred_endpoints)
-            .finish()
+            .field("preferred_endpoints", &self.preferred_endpoints);
+        // guard policy is not a secret; include it so the redacted Debug shows
+        // the full (non-key) field set.
+        #[cfg(feature = "guard")]
+        ds.field("guard", &self.guard);
+        ds.finish()
     }
 }
 
@@ -751,6 +767,11 @@ struct AppState {
     /// `client_id` is that principal's name rather than a client-asserted
     /// header. Empty ⇒ legacy `proxy_key` / open behaviour.
     clients: Vec<ClientConfig>,
+    /// LAB-3877: Tier 0 content guard — the compiled scanners plus their
+    /// metrics. Built once at startup; scanned read-only per request. Present
+    /// only under the `guard` feature.
+    #[cfg(feature = "guard")]
+    guard: guard::Guard,
     allowed_ips: Vec<IpAllowEntry>,
     /// Load balancers whose `x-forwarded-for` is trusted (LAB-1192).
     /// Consulted only by `resolve_client_ip`. Empty = header ignored.
@@ -2075,6 +2096,94 @@ impl AppState {
         }
     }
 
+    /// LAB-3877: resolve the Tier 0 guard policy for a client. The operator
+    /// bypass is always `Off` (it forwards operator-trusted content). Otherwise
+    /// the client's configured policy, defaulting to `Annotate` (shadow mode)
+    /// for any caller not in the table — including the legacy unknown-client
+    /// "-" and open-`proxy_key` modes, so shadow mode observes everything.
+    #[cfg(feature = "guard")]
+    fn client_guard_policy(&self, client_id: &str) -> guard::GuardPolicy {
+        if self.is_operator(client_id) {
+            return guard::GuardPolicy::Off;
+        }
+        self.clients
+            .iter()
+            .find(|c| c.name == client_id)
+            .map(|c| c.guard)
+            .unwrap_or_default()
+    }
+
+    /// LAB-3877: run the Tier 0 content guard for one request — after
+    /// `pre_request_gate`, before endpoint selection, on every surface that
+    /// forwards client content (`proxy_handler` and `openai_chat_handler`).
+    /// `Ok(Some(n))` is an `Annotate` count for `X-Guard-Findings`; `Err` is
+    /// the 400 to return instead, in the OpenAI envelope when `openai_shape`.
+    ///
+    /// Fail closed under `block`: a body the guard could not scan in full
+    /// cannot be certified clean, so it is rejected rather than forwarded
+    /// unscanned (LAB-3877 review). Two cases, both bypasses of an enforcing
+    /// policy otherwise: `unscannable` — the caller sent content the scanner
+    /// cannot read (a non-empty body that did not parse, or an OpenAI shape
+    /// translation cannot map), so a parse differential vs the upstream could
+    /// smuggle content past the scan — and a newest turn longer than the scan
+    /// cap, whose tail was never inspected (the "pad past the cap, then the
+    /// secret" bypass). A body that parsed but carried no scannable text (e.g.
+    /// an image-only turn) is NOT a scan failure and is allowed. Annotate /
+    /// shadow mode never rejects — it measures best-effort.
+    #[cfg(feature = "guard")]
+    fn guard_hook(
+        &self,
+        req_id: &str,
+        client_id: &str,
+        unscannable: bool,
+        input: Option<&guard::ScanInput>,
+        openai_shape: bool,
+    ) -> Result<Option<usize>, Box<Response>> {
+        let policy = self.client_guard_policy(client_id);
+        let truncated = input.is_some_and(guard::ScanInput::truncated);
+        if policy == guard::GuardPolicy::Block {
+            let reason = if unscannable {
+                Some("request body could not be parsed for content scanning")
+            } else if truncated {
+                Some("request exceeds the guard scan limit and cannot be scanned in full")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                warn!(
+                    req_id,
+                    client_id = %client_id,
+                    verdict = "block",
+                    reason,
+                    "guard: fail-closed (unscannable under block policy)"
+                );
+                return Err(Box::new(guard_blocked_response(&[], reason, openai_shape)));
+            }
+        }
+        let (verdict, findings, reason) = match self.guard.evaluate(policy, client_id, input) {
+            guard::Verdict::Allow => return Ok(None),
+            guard::Verdict::Annotate { findings } => ("annotate", findings, None),
+            guard::Verdict::Block { findings, reason } => ("block", findings, Some(reason)),
+        };
+        warn!(
+            req_id,
+            client_id = %client_id,
+            verdict,
+            findings = findings.len(),
+            truncated,
+            detections = %guard::detections_summary(&findings),
+            "guard"
+        );
+        match reason {
+            None => Ok(Some(findings.len())),
+            Some(reason) => Err(Box::new(guard_blocked_response(
+                &findings,
+                &reason,
+                openai_shape,
+            ))),
+        }
+    }
+
     /// Count + log a model-allowlist denial.
     ///
     /// The model string is caller-controlled and bounded only by the request
@@ -3010,6 +3119,13 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     // Fast mode (LAB-2669): body-paired with top-level `speed` — same
     // header-stripped/body-forwarded hard-400 shape as the families above.
     "fast-mode-*",
+    // Auto-mode classifier (LAB-3963): `dangerous-tool-use-*` is body-paired
+    // with top-level `safeguards` — same hard-400 shape as the families above,
+    // and Claude Code answers that 400 by denying every auto-mode tool use for
+    // the rest of the conversation. `auto-mode-classifier-*` rides the
+    // classifier's own follow-up requests.
+    "auto-mode-classifier-*",
+    "dangerous-tool-use-*",
 ];
 
 /// Cardinality bound for `beta_flags_dropped` — flag names are
@@ -8669,6 +8785,58 @@ async fn maybe_cache_store(
     Response::from_parts(parts, Body::from(bytes))
 }
 
+/// LAB-3877: build the HTTP 400 for a `block` verdict. The body carries finding
+/// offsets and labels only — never the matched text — so an error surfaced to a
+/// client (or captured in its logs) cannot itself leak the secret it flagged.
+/// `openai_shape` selects the OpenAI error envelope for `/v1/chat/completions`
+/// clients (same convention as `model_unsupported_response`); the cause is
+/// machine-readable as `error.code` there and `error.type` on the Anthropic side.
+#[cfg(feature = "guard")]
+fn guard_blocked_response(
+    findings: &[guard::Finding],
+    reason: &str,
+    openai_shape: bool,
+) -> Response {
+    let body = if openai_shape {
+        serde_json::json!({
+            "error": {
+                "message": reason,
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "guard_blocked",
+                "findings": findings,
+            }
+        })
+    } else {
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "guard_blocked",
+                "message": reason,
+                "findings": findings,
+            }
+        })
+    };
+    (
+        StatusCode::BAD_REQUEST,
+        [(hyper::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// LAB-3877: stamp an `Annotate` verdict's finding count onto the response as
+/// `X-Guard-Findings`. A decimal count is always a valid header value.
+#[cfg(feature = "guard")]
+fn stamp_guard_findings(mut response: Response, count: Option<usize>) -> Response {
+    if let Some(count) = count {
+        response
+            .headers_mut()
+            .insert("x-guard-findings", HeaderValue::from(count as u64));
+    }
+    response
+}
+
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -8732,6 +8900,21 @@ async fn proxy_handler(
         Err(resp) => return *resp,
     };
 
+    // LAB-3877: the guard's scan input is extracted from the parsed body here,
+    // pre-injection, so it sees exactly what the client sent (auto-cache
+    // injection adds cache_control only, but extracting before it keeps the
+    // guard trivially body-neutral). The scan itself runs later, after
+    // `pre_request_gate`. `None` for a non-JSON body — nothing to inspect.
+    #[cfg(feature = "guard")]
+    let mut guard_input: Option<guard::ScanInput> = None;
+    // Whether the body parsed as JSON at all — distinct from whether scannable
+    // user text was found. Under `block`, an UNPARSEABLE body fails closed (a
+    // parse differential vs upstream must not forward unscanned), but a body
+    // that parsed with no scannable text (e.g. an image-only turn) has nothing
+    // to scan and is allowed.
+    #[cfg(feature = "guard")]
+    let mut guard_body_parsed = false;
+
     // Parse body once for model extraction, optional cache injection, and
     // the fast-mode flag that picks the rate bucket and routing pool downstream.
     let (body_bytes, oauth_body_bytes, model, fp, cache_key, is_fast_mode) =
@@ -8752,6 +8935,14 @@ async fn proxy_handler(
             // double as the affinity discriminator; bps is computed POST-injection
             // (below) to reflect the breakpoints actually forwarded upstream.
             let (fp, fps) = content_fingerprints(&parsed);
+
+            // LAB-3877: extract the newest user text + tool_result blocks for
+            // the guard (never `system`). Read-only borrow of `parsed`.
+            #[cfg(feature = "guard")]
+            {
+                guard_body_parsed = true;
+                guard_input = guard::ScanInput::from_body(&parsed);
+            }
 
             // LAB-933/LAB-929: derive the response-cache key on the
             // PRE-injection body — the request exactly as the client sent
@@ -8908,6 +9099,35 @@ async fn proxy_handler(
         return *resp;
     }
 
+    // LAB-3877: Tier 0 content guard — runs after the gate, before endpoint
+    // selection (see `AppState::guard_hook`). Unscannable = the client sent a
+    // body and it did not parse. Deliberately path-agnostic: the path is
+    // forwarded verbatim, so scoping by route would let `/v1/messages/` or a
+    // percent-encoded spelling skip the fail-closed rule. A bodiless request
+    // (`GET /v1/models`) has nothing to scan and is not a scan failure.
+    #[cfg(feature = "guard")]
+    let guard_annotate: Option<usize> = {
+        match state.guard_hook(
+            &req_id,
+            &client_id,
+            !guard_body_parsed && !body_bytes.is_empty(),
+            guard_input.as_ref(),
+            false,
+        ) {
+            Ok(annotate) => annotate,
+            Err(resp) => return *resp,
+        }
+    };
+
+    // The remaining dispatch is wrapped so an `Annotate` verdict can stamp the
+    // `X-Guard-Findings` header onto whatever response it yields (cache hit,
+    // proxied success, or exhaustion) from one place. The wrapper is an
+    // immediately-awaited async block, so it is behaviourally transparent (and
+    // a no-op when the guard feature is off) — but note every `return` inside
+    // now yields the block's `Response`, not the handler's: a new early-return
+    // added below still exits the handler (via `response`) and simply carries
+    // the annotate header too, which is the intended behaviour.
+    let response: Response = async {
     // LAB-933: serve an opted-in replay from the encrypted response cache.
     // Placed AFTER the gate so budget/emergency policy still applies to
     // opted-in clients; a hit then never touches an upstream — no rate-limit
@@ -9098,6 +9318,13 @@ async fn proxy_handler(
         return model_unsupported_response(&model, false);
     }
     exhaustion_response(last_saw_transient, last_saw_529)
+    }
+    .await;
+
+    #[cfg(feature = "guard")]
+    let response = stamp_guard_findings(response, guard_annotate);
+
+    response
 }
 
 // ── Fallback upstream handler ────────────────────────────────────────
@@ -11392,6 +11619,58 @@ async fn metrics_handler(
         }
     }
 
+    // LAB-3877: Tier 0 guard metrics. Verdicts by (client, scanner, outcome)
+    // and the scan-duration histogram. Both per-replica, in-memory.
+    #[cfg(feature = "guard")]
+    {
+        prom_header(
+            &mut buf,
+            "anthropic_guard_verdicts_total",
+            "counter",
+            "Guard scan verdicts by client, scanner, and outcome (allow/annotate/block)",
+        );
+        for ((client, scanner, verdict), n) in state.guard.verdicts_snapshot() {
+            prom_counter(
+                &mut buf,
+                "anthropic_guard_verdicts_total",
+                &[
+                    ("client", client.as_str()),
+                    ("scanner", scanner),
+                    ("verdict", verdict),
+                ],
+                n,
+            );
+        }
+
+        let (hist, sum, count) = state.guard.scan_hist_snapshot();
+        prom_header(
+            &mut buf,
+            "anthropic_guard_scan_duration_seconds",
+            "histogram",
+            "Guard request-body scan duration in seconds",
+        );
+        for (le, cumulative) in &hist {
+            prom_counter(
+                &mut buf,
+                "anthropic_guard_scan_duration_seconds_bucket",
+                &[("le", le.as_str())],
+                *cumulative,
+            );
+        }
+        prom_gauge(
+            &mut buf,
+            "anthropic_guard_scan_duration_seconds_sum",
+            &[],
+            sum,
+        );
+        prom_counter(
+            &mut buf,
+            "anthropic_guard_scan_duration_seconds_count",
+            &[],
+            count,
+        );
+    }
+
     (
         StatusCode::OK,
         [(
@@ -13402,6 +13681,40 @@ async fn openai_chat_handler(
 
     let mut anthropic_body = translate_openai_to_anthropic(&openai_body);
 
+    // LAB-3877: Tier 0 content guard on the OpenAI-compat surface — the same
+    // hook as `proxy_handler`. The scanner reads the TRANSLATED body (the
+    // Messages shape it understands); the Anthropic arm below forwards that
+    // body, the OpenAI arm forwards the original bytes. Translation preserves
+    // the user text and `tool` content the scanner reads, but passes any other
+    // role (legacy `function`, `developer`, unknown) through verbatim, where
+    // the scanner cannot see it — so under `block` such a body is unscannable,
+    // not silently allowed. Unparseable JSON was already rejected above.
+    #[cfg(feature = "guard")]
+    let guard_annotate: Option<usize> = {
+        let unmapped_role = openai_body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .is_some_and(|msgs| {
+                msgs.iter().any(|m| {
+                    !matches!(
+                        m.get("role").and_then(|r| r.as_str()),
+                        Some("system" | "user" | "assistant" | "tool")
+                    )
+                })
+            });
+        let guard_input = guard::ScanInput::from_body(&anthropic_body);
+        match state.guard_hook(
+            &req_id,
+            &client_id,
+            unmapped_role,
+            guard_input.as_ref(),
+            true,
+        ) {
+            Ok(annotate) => annotate,
+            Err(resp) => return *resp,
+        }
+    };
+
     if state.auto_cache {
         let inj = inject_cache_breakpoints(&mut anthropic_body);
         if inj.skipped {
@@ -13441,123 +13754,133 @@ async fn openai_chat_handler(
         }
     };
 
-    let n = state.endpoints.len();
-    let mut last_saw_529 = false;
-    let mut last_saw_transient = false;
-    // Upstream error from the most recent account-level rejection —
-    // returned verbatim if the pool exhausts on nothing but rejections.
-    let mut rejected_resp: Option<Response> = None;
-    for retry_round in 0..=MAX_529_RETRIES {
-        if retry_round > 0 {
-            let delay = round_backoff_delay(retry_round, last_saw_529);
-            warn!(
-                retry_round = retry_round,
-                delay_ms = delay.as_millis() as u64,
-                saw_529 = last_saw_529,
-                "backoff: retrying all endpoints after transient/overload round"
-            );
-            tokio::time::sleep(delay).await;
-        }
-        let mut skip: Vec<EndpointIdx> = Vec::new();
-        let mut saw_529 = false;
-        let mut saw_transient = false;
-        for _attempt in 0..n {
-            // Pick the next endpoint and dispatch by protocol. Both forwards
-            // return a `ForwardOutcome` so the shared round-gated policy in
-            // `apply_round_outcome` covers both.
-            // OpenAI→Anthropic translation carries no `speed`: never fast.
-            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint_for_client(affinity, &model, &skip, &client_id, false)
-                .await
-            {
-                Some(i) => {
-                    let ep = &state.endpoints[i];
-                    match ep.protocol {
-                        Protocol::Anthropic => {
-                            let out = forward_openai_compat_anthropic(
-                                &state,
-                                &parts,
-                                ep,
-                                i,
-                                &anthropic_body_bytes,
-                                &oauth_body_bytes,
-                                &req_id,
-                                &client_id,
-                                &client_ver,
-                                &client_ip,
-                                &agent_id,
-                                &session_id,
-                                &model,
-                                affinity,
-                                is_streaming,
-                                json_mode,
-                                request_start,
-                            )
-                            .await;
-                            (out, i)
-                        }
-                        Protocol::OpenAI => {
-                            // The endpoint is OpenAI-native — forward the
-                            // original request body without translation.
-                            let out = try_fallback_upstream(
-                                &state,
-                                &body_bytes,
-                                &req_id,
-                                &client_id,
-                                &client_ip,
-                                &agent_id,
-                                &session_id,
-                                &model,
-                                i,
-                                request_start,
-                                false,
-                                is_streaming,
-                            )
-                            .await;
-                            (out, i)
+    // Wrapped as in `proxy_handler`: every `return` inside yields the block's
+    // `Response`, so `X-Guard-Findings` is stamped once below.
+    let response: Response = async {
+        let n = state.endpoints.len();
+        let mut last_saw_529 = false;
+        let mut last_saw_transient = false;
+        // Upstream error from the most recent account-level rejection —
+        // returned verbatim if the pool exhausts on nothing but rejections.
+        let mut rejected_resp: Option<Response> = None;
+        for retry_round in 0..=MAX_529_RETRIES {
+            if retry_round > 0 {
+                let delay = round_backoff_delay(retry_round, last_saw_529);
+                warn!(
+                    retry_round = retry_round,
+                    delay_ms = delay.as_millis() as u64,
+                    saw_529 = last_saw_529,
+                    "backoff: retrying all endpoints after transient/overload round"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            let mut skip: Vec<EndpointIdx> = Vec::new();
+            let mut saw_529 = false;
+            let mut saw_transient = false;
+            for _attempt in 0..n {
+                // Pick the next endpoint and dispatch by protocol. Both forwards
+                // return a `ForwardOutcome` so the shared round-gated policy in
+                // `apply_round_outcome` covers both.
+                // OpenAI→Anthropic translation carries no `speed`: never fast.
+                let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
+                    .pick_endpoint_for_client(affinity, &model, &skip, &client_id, false)
+                    .await
+                {
+                    Some(i) => {
+                        let ep = &state.endpoints[i];
+                        match ep.protocol {
+                            Protocol::Anthropic => {
+                                let out = forward_openai_compat_anthropic(
+                                    &state,
+                                    &parts,
+                                    ep,
+                                    i,
+                                    &anthropic_body_bytes,
+                                    &oauth_body_bytes,
+                                    &req_id,
+                                    &client_id,
+                                    &client_ver,
+                                    &client_ip,
+                                    &agent_id,
+                                    &session_id,
+                                    &model,
+                                    affinity,
+                                    is_streaming,
+                                    json_mode,
+                                    request_start,
+                                )
+                                .await;
+                                (out, i)
+                            }
+                            Protocol::OpenAI => {
+                                // The endpoint is OpenAI-native — forward the
+                                // original request body without translation.
+                                let out = try_fallback_upstream(
+                                    &state,
+                                    &body_bytes,
+                                    &req_id,
+                                    &client_id,
+                                    &client_ip,
+                                    &agent_id,
+                                    &session_id,
+                                    &model,
+                                    i,
+                                    request_start,
+                                    false,
+                                    is_streaming,
+                                )
+                                .await;
+                                (out, i)
+                            }
                         }
                     }
-                }
-                // Candidates exhausted mid-round (all skipped / hard-limited /
-                // model-filtered). Break to the round-end logic rather than
-                // returning here, so a transient-only round still reaches the
-                // transient-aware exhaustion status instead of short-circuiting
-                // to a premature 429.
-                None => break,
-            };
+                    // Candidates exhausted mid-round (all skipped / hard-limited /
+                    // model-filtered). Break to the round-end logic rather than
+                    // returning here, so a transient-only round still reaches the
+                    // transient-aware exhaustion status instead of short-circuiting
+                    // to a premature 429.
+                    None => break,
+                };
 
-            match apply_round_outcome(
-                retry_round,
-                outcome,
-                picked_idx,
-                &mut skip,
-                &mut saw_529,
-                &mut saw_transient,
-                &mut rejected_resp,
-            ) {
-                RetryStep::Return(resp) => return resp,
-                RetryStep::NextAttempt => continue,
-                RetryStep::EndRound => break,
+                match apply_round_outcome(
+                    retry_round,
+                    outcome,
+                    picked_idx,
+                    &mut skip,
+                    &mut saw_529,
+                    &mut saw_transient,
+                    &mut rejected_resp,
+                ) {
+                    RetryStep::Return(resp) => return resp,
+                    RetryStep::NextAttempt => continue,
+                    RetryStep::EndRound => break,
+                }
+            }
+            last_saw_529 = saw_529;
+            last_saw_transient = saw_transient;
+            if !round_should_continue(retry_round, saw_529, saw_transient) {
+                break;
             }
         }
-        last_saw_529 = saw_529;
-        last_saw_transient = saw_transient;
-        if !round_should_continue(retry_round, saw_529, saw_transient) {
-            break;
-        }
-    }
 
-    // Same rejection-exhaustion rule as `proxy_handler` (LAB-941), in the
-    // OpenAI error shape this handler's clients parse. Never `fast`: the
-    // OpenAI→Anthropic translation carries no `speed`.
-    if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, false) {
-        if let Some(resp) = rejected_resp {
-            return resp;
+        // Same rejection-exhaustion rule as `proxy_handler` (LAB-941), in the
+        // OpenAI error shape this handler's clients parse. Never `fast`: the
+        // OpenAI→Anthropic translation carries no `speed`.
+        if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, false) {
+            if let Some(resp) = rejected_resp {
+                return resp;
+            }
+            warn!(model, "model unsupported on all eligible endpoints");
+            return model_unsupported_response(&model, true);
         }
-        warn!(model, "model unsupported on all eligible endpoints");
-        return model_unsupported_response(&model, true);
+        exhaustion_response(last_saw_transient, last_saw_529)
     }
-    exhaustion_response(last_saw_transient, last_saw_529)
+    .await;
+
+    #[cfg(feature = "guard")]
+    let response = stamp_guard_findings(response, guard_annotate);
+
+    response
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -14167,6 +14490,18 @@ async fn main() {
         None => None,
     };
 
+    // LAB-3877: build the Tier 0 guard once (rule/regex compilation is not
+    // cheap). A broken ruleset fails startup loudly rather than silently
+    // scanning nothing — the same fail-loud posture as the config gates above.
+    #[cfg(feature = "guard")]
+    let guard = match guard::Guard::new() {
+        Ok(g) => {
+            info!("content guard enabled (Tier 0 rules scanners; shadow-mode default)");
+            g
+        }
+        Err(msg) => panic!("guard init failed: {msg}"),
+    };
+
     let state = Arc::new(AppState {
         // Liveness knobs are load-bearing against Anthropic's Cloudflare edge:
         // h2 PING (while_idle) evicts half-closed pooled streams before they're
@@ -14195,6 +14530,8 @@ async fn main() {
         state_path,
         proxy_key: config.proxy_key.clone(),
         clients: config.clients.clone(),
+        #[cfg(feature = "guard")]
+        guard,
         allowed_ips,
         trusted_proxies,
         auth_throttle: AuthThrottle::new(
