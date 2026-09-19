@@ -3104,6 +3104,13 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     // Fast mode (LAB-2669): body-paired with top-level `speed` — same
     // header-stripped/body-forwarded hard-400 shape as the families above.
     "fast-mode-*",
+    // Auto-mode classifier (LAB-3963): `dangerous-tool-use-*` is body-paired
+    // with top-level `safeguards` — same hard-400 shape as the families above,
+    // and Claude Code answers that 400 by denying every auto-mode tool use for
+    // the rest of the conversation. `auto-mode-classifier-*` rides the
+    // classifier's own follow-up requests.
+    "auto-mode-classifier-*",
+    "dangerous-tool-use-*",
 ];
 
 /// Cardinality bound for `beta_flags_dropped` — flag names are
