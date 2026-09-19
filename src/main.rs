@@ -501,10 +501,9 @@ const TAU_1H: f64 = 3600.0;
 const MAX_TRACKED_CLIENTS: usize = 10_000;
 
 /// Cap on distinct (client, model) labels in the allowlist-denial counter.
-/// The model half is caller-controlled, and under legacy auth the client
-/// half is too (`x-client-id`), so overflow lumps into a single global
-/// ("_other", "_other") bucket — a HARD bound of cap + 1 entries (LAB-2332,
-/// mirroring the LAB-2330 fix to `client_model_usage`).
+/// The model half is caller-controlled; the client half is config-bounded,
+/// so the hard bound is cap + configured clients + 1 — see
+/// `AppState::note_model_denied` for the scheme (LAB-2332, LAB-4028).
 const MAX_MODEL_DENIED_LABELS: usize = 64;
 
 /// Cap on distinct (client, model) pairs in the per-model usage counter
@@ -900,12 +899,8 @@ struct AppState {
     /// `_other` overflow (unlike the caller-controlled `prompt_too_long` key).
     fast_mode_429: Mutex<HashMap<String, u64>>,
     /// Per-client model-allowlist denials, keyed (client, model) (LAB-1083).
-    /// Exposed as `anthropic_client_model_denied_total`. Under `[[clients]]`
-    /// auth `client` is a credential-bound principal, but under legacy
-    /// `proxy_key` / `allow_unauthenticated` it comes from the
-    /// caller-controlled `x-client-id` header — so overflow lumps into a
-    /// single global ("_other", "_other") bucket, hard-bounding the map at
-    /// `MAX_MODEL_DENIED_LABELS` + 1 entries (LAB-2332).
+    /// Exposed as `anthropic_client_model_denied_total`. Cardinality is
+    /// hard-bounded — `note_model_denied` documents the scheme.
     model_denied: Mutex<HashMap<(String, String), u64>>,
     /// (endpoint idx, model) pairs an upstream rejected as unsupported — a
     /// gateway without the model, or a plan without access (LAB-941).
@@ -2184,16 +2179,27 @@ impl AppState {
     /// The model string is caller-controlled and bounded only by the request
     /// body cap, so it is truncated BEFORE becoming a map key: an untruncated
     /// label would be retained for the process lifetime and re-serialized into
-    /// the `/metrics` body on every scrape. Label COUNT is separately
-    /// hard-bounded at `MAX_MODEL_DENIED_LABELS` + 1: once the cap is
-    /// reached, every new pair lumps into a single global
-    /// `("_other", "_other")` bucket.
+    /// the `/metrics` body on every scrape.
     ///
-    /// Logs at `warn` the first time a (client, model) pair is denied and at
-    /// `debug` thereafter — a client hammering a denied model must not be able
-    /// to drive unbounded warn-level log volume. Pairs lumped into the
-    /// overflow bucket share its first-seen flag (deliberate: client-id
-    /// rotation must not mint warns). The counter still records every denial.
+    /// Label COUNT is hard-bounded at `MAX_MODEL_DENIED_LABELS` + N + 1 (N =
+    /// configured `[[clients]]`). Past the cap a new pair lumps into its
+    /// client's `("<client>", "_other")` bucket, so the denial stays
+    /// attributed and that client's first overflow denial still warns; a
+    /// client id NOT in `[[clients]]` lumps into the one global
+    /// `("_other", "_other")` bucket and can never mint a key.
+    ///
+    /// The client axis is config-bounded by reachability, not by the header
+    /// filter: this runs only when `client_allows_model` returned false, which
+    /// needs `client_id` to name a configured client. Under legacy
+    /// `proxy_key` / `allow_unauthenticated` there is no `[[clients]]` table,
+    /// so this is unreachable and the caller-controlled `x-client-id` never
+    /// touches this map. The global bucket is defence-in-depth for a future
+    /// caller that routes an unconfigured id here, not the close of a live
+    /// hole (LAB-2332, LAB-4028).
+    ///
+    /// Logs at `warn` the first time a key is minted and at `debug`
+    /// thereafter — a client hammering a denied model must not drive
+    /// unbounded warn-level log volume. The counter records every denial.
     /// Mirrors the once-per-model pattern used for unsupported-model
     /// warnings.
     fn note_model_denied(&self, client_id: &str, model: &str) {
@@ -2203,13 +2209,11 @@ impl AppState {
             let key = (client_id.to_owned(), model.clone());
             let label = if counts.len() < MAX_MODEL_DENIED_LABELS || counts.contains_key(&key) {
                 key
+            } else if self.clients.iter().any(|c| c.name == client_id) {
+                // Map full, pair new, client configured: its own bucket.
+                (client_id.to_owned(), "_other".to_owned())
             } else {
-                // Map full and this pair is new: lump into ONE global
-                // overflow bucket — hard bound of MAX_MODEL_DENIED_LABELS
-                // + 1 entries. A per-client ("<client>", "_other") key
-                // would let x-client-id rotation (legacy auth modes) grow
-                // the map without bound (expert-panel finding, LAB-2330;
-                // mirrored here by LAB-2332).
+                // Unconfigured id (unreachable today — see the fn doc).
                 ("_other".to_owned(), "_other".to_owned())
             };
             let entry = counts.entry(label).or_insert(0);
@@ -6806,7 +6810,7 @@ impl AppState {
                     // overflow bucket — hard bound of MAX_CLIENT_MODEL_LABELS
                     // + 1 entries. A per-client ("<client>", "_other") key
                     // would let x-client-id rotation (legacy auth modes) grow
-                    // the map without bound (expert-panel finding, LAB-2330).
+                    // the map without bound (LAB-2330).
                     ("_other".to_owned(), "_other".to_owned())
                 };
                 let entry = map.entry(key).or_insert([0; 4]);
@@ -13876,7 +13880,7 @@ fn validate_clients(config: &Config) -> Result<(), String> {
         }
         if c.name == "_other" {
             return Err(
-                "client: name must not be \"_other\" (the reserved metrics overflow-bucket label — a real client with this name would merge with, and take the warn-once flag of, the (\"_other\", \"_other\") overflow key)"
+                "client: name must not be \"_other\" (the reserved metrics overflow-bucket label — a real client with this name would merge into the (\"_other\", \"_other\") overflow key)"
                     .to_string(),
             );
         }
@@ -13917,6 +13921,13 @@ fn validate_clients(config: &Config) -> Result<(), String> {
     // (`resolve_client_id`'s fallback) — an IP mapped to a reserved sentinel
     // would resolve real traffic to it, bypassing the header filter above.
     for (ip, name) in &config.client_names {
+        // Same failure as an untrimmed `[[clients]]` name above: resolved
+        // verbatim by `resolve_client_id`, matches no budget key.
+        if name.is_empty() || name != name.trim() {
+            return Err(format!(
+                "client_names: \"{ip}\" maps to \"{name}\" — value must be non-empty with no leading or trailing whitespace"
+            ));
+        }
         if name == "-" || name == "_operator" || name == "_other" {
             return Err(format!(
                 "client_names: \"{ip}\" maps to reserved name \"{name}\" (\"-\" = unknown-client sentinel, \"_operator\" = operator-aggregation label, \"_other\" = metrics overflow bucket)"

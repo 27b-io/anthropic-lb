@@ -150,6 +150,8 @@ probe_interval_secs = 300
 # redis_url = "redis://redis.example.com:6379"
 
 # IP-to-client-name mapping (optional, fallback when no X-Client-ID header)
+# Values must be non-empty, trimmed, and not a reserved name ("-", "_operator",
+# "_other") — rejected at startup.
 # [client_names]
 # "192.0.2.10" = "alice-desktop"
 # "192.0.2.11" = "bob-laptop"
@@ -566,14 +568,17 @@ The 400 itself is forwarded to the client unchanged.
 
 Requests rejected by a client's model allow-list are counted as
 `anthropic_client_model_denied_total{client,model}` and logged at WARN. The
-`model` label is caller-controlled, so the label set is bounded — overflow
-past 64 distinct pairs lumps into a single global
-`client="_other",model="_other"` bucket (hard bound: 64 + 1 series).
-`_other` is a reserved client name: config validation rejects a
-`[[clients]]` entry or `client_names` value named `_other`, and a legacy
-`x-client-id: _other` header is ignored, so real traffic can never
-pre-claim the overflow key. `anthropic_client_model_token_usage_total`
-shares the same overflow scheme (bucket at 256 + 1 series).
+`model` label is caller-controlled, so the label set is bounded — past 64
+distinct pairs a client's further denials lump into its own
+`client="<name>",model="_other"` bucket, so attribution and the first-overflow
+WARN survive (hard bound: 64 + number of `[[clients]]` + 1 series). `_other`
+is a reserved client name: config validation rejects a `[[clients]]` entry or
+`client_names` value named `_other`, and a legacy `x-client-id: _other`
+header is ignored, so real traffic can never pre-claim the global bucket.
+`anthropic_client_model_token_usage_total` instead uses one global
+`client="_other",model="_other"` bucket, because its client id can be
+header-asserted under legacy auth (bounded at 256 + 1 distinct (client,
+model) pairs).
 
 ### OpenAI JSON-mode compatibility
 
