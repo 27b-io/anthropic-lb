@@ -396,8 +396,10 @@ can steer are locked down by default:
   flags the proxy itself needs, the flag families Claude Code sends, and
   `fast-mode-*`; the authoritative list is `DEFAULT_CLIENT_BETA_ALLOWLIST`
   in `src/main.rs`. Some families pair with a request-body field (`fast-mode-*`
-  with top-level `speed: "fast"`), and the body is forwarded verbatim — so
-  dropping the header alone is a hard upstream `400`, not a quiet downgrade.
+  with top-level `speed: "fast"`; the auto-mode classifier pair
+  `dangerous-tool-use-*` + `auto-mode-classifier-*` with top-level
+  `safeguards`), and the body is forwarded verbatim — so dropping the header
+  alone is a hard upstream `400`, not a quiet downgrade.
 - **A fast-mode `429` is forwarded to the caller, not treated as account
   exhaustion.** Fast mode (`speed: "fast"`) bills against its own rate bucket,
   separate from the account's 5h/7d windows, so a `429` on a fast request does

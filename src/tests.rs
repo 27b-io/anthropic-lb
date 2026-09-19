@@ -19091,6 +19091,10 @@ fn oauth_beta_filter_keeps_claude_code_flag_set() {
         "structured-outputs-2025-12-15",
         // LAB-2669: body-paired (`speed`); not in the 2.1.220 inventory.
         "fast-mode-2026-02-01",
+        // LAB-3963: auto-mode classifier pair; `dangerous-tool-use` is
+        // body-paired (`safeguards`). Not in the 2.1.220 inventory.
+        "auto-mode-classifier-2026-07-16",
+        "dangerous-tool-use-2026-09-03",
     ];
     // Negative control: the point of the allow-list is that it still rejects.
     // Without this, widening the default to "*" would keep the test green.
@@ -19270,6 +19274,62 @@ async fn dropped_beta_flag_appears_in_metrics() {
         metrics
             .contains("anthropic_beta_flag_dropped_total{flag=\"totally-unknown-2026-07-30\"} 1"),
         "metrics must report the dropped flag"
+    );
+}
+
+/// LAB-3963: the auto-mode classifier betas and their `safeguards` body must
+/// reach the upstream together through the real OAuth path (which
+/// re-serialises the body) — see `DEFAULT_CLIENT_BETA_ALLOWLIST` for why.
+#[tokio::test]
+async fn oauth_forwards_auto_mode_classifier_header_and_safeguards_body_together() {
+    let (upstream_url, mut seen) =
+        spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at(
+            "acct-a",
+            "sk-ant-oat01-test-aaa",
+            &upstream_url,
+        )],
+        auto_cache: false,
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+
+    // Compact JSON, as Claude Code sends it: the value must survive
+    // byte-for-byte whether the body is forwarded raw or re-serialised.
+    let safeguards = r#"[{"type":"dangerous_tool_use","classifier_context":"rm -rf ./build"}]"#;
+    let body = format!(
+        r#"{{"model":"test","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}],"safeguards":{safeguards}}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header(
+            "anthropic-beta",
+            "auto-mode-classifier-2026-07-16,dangerous-tool-use-2026-09-03",
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let (headers, bytes) = seen.recv().await.expect("upstream must have been hit once");
+    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    let tokens: Vec<&str> = sent.split(',').map(str::trim).collect();
+    for flag in [
+        "auto-mode-classifier-2026-07-16",
+        "dangerous-tool-use-2026-09-03",
+    ] {
+        assert!(
+            tokens.contains(&flag),
+            "beta not forwarded as an exact token: {flag} (sent: {sent})"
+        );
+    }
+    let raw = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        raw.contains(&format!(r#""safeguards":{safeguards}"#)),
+        "safeguards must reach the upstream byte-identical:\n{raw}"
     );
 }
 
