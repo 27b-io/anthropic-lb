@@ -89,3 +89,41 @@ jobs:
         run: cargo test
       - name: Check packaging
         run: cargo publish --dry-run --allow-dirty
+
+  guard:
+    name: Guard feature
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      # The full suite runs here too, so it needs the same real backend as the
+      # Test job: under CI the redis_integration tests panic (not skip) without
+      # ALB_TEST_REDIS_URL. Keep this block in step with `test.services`.
+      valkey:
+        image: valkey/valkey@sha256:495e4fecdc98ee48a20b207726caa5ab6451e0fac3642a9be10d9e70b3068df6 # 8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      ALB_TEST_REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Clippy (guard)
+        run: cargo clippy --all-targets --features guard
+      - name: Tests (guard)
+        run: cargo test --features guard
+      # The scan-latency budget is a release-binary property, so the perf test
+      # asserts its tight bound only in release. Run it there so the SLO is
+      # actually gated in CI, not just measurable locally.
+      - name: Scan-latency budget (release)
+        run: cargo test --release --features guard scan_200kb_body_under_budget
