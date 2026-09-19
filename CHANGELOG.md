@@ -3,6 +3,11 @@
 ## [0.2.5](https://github.com/27b-io/anthropic-lb/compare/v0.2.4...v0.2.5) (2026-09-19)
 
 
+### ⚠ BREAKING CHANGES
+
+* **LAB-2332:** `client_names` values `-`, `_operator` and `_other` are rejected at startup (previously accepted silently; an IP mapped to `-` skipped daily budget enforcement). Rename the mapping before upgrading. ([#148](https://github.com/27b-io/anthropic-lb/issues/148))
+
+
 ### Features
 
 * **guard:** Tier 0 request content-scan layer (LAB-3877) ([#179](https://github.com/27b-io/anthropic-lb/issues/179)) ([9a97ebb](https://github.com/27b-io/anthropic-lb/commit/9a97ebb9a5a4b36be52bc83fdcd2c02b8ae42504))

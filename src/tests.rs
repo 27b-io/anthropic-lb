@@ -18421,31 +18421,42 @@ async fn model_denial_increments_counter_per_client_and_model() {
 }
 
 /// The model label is caller-controlled — unbounded growth here would be a
-/// metrics-cardinality DoS.
+/// metrics-cardinality DoS. Bound is cap + N + 1; `note_model_denied`
+/// documents the scheme (LAB-2332, LAB-4028).
 #[test]
 fn model_denial_labels_are_bounded_by_other_overflow() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     for i in 0..(MAX_MODEL_DENIED_LABELS + 25) {
         state.note_model_denied("limited", &format!("junk-model-{i}"));
     }
-    // Expert-panel finding (LAB-2330, mirrored by LAB-2332): rotating the
-    // caller-controlled client id past the cap must NOT mint per-client
-    // overflow keys — the bound has to hold on the client axis too.
+    // Rotating an unconfigured client id past the cap must NOT mint keys.
     for i in 0..50 {
         state.note_model_denied(&format!("evil-{i}"), "claude-x");
     }
+    // An already-tracked pair keeps its own key past the cap. Without the
+    // `contains_key` clause it would drain into overflow with the bound still
+    // satisfied — attribution lost, tests green.
+    state.note_model_denied("limited", "junk-model-0");
     let counts = state.model_denied.lock().unwrap();
     assert!(
-        counts.len() <= MAX_MODEL_DENIED_LABELS + 1,
+        counts.len() <= MAX_MODEL_DENIED_LABELS + state.clients.len() + 1,
         "label map grew unbounded: {} entries",
         counts.len()
     );
-    // Overflow denials are not dropped — they land in the ONE global bucket:
-    // 25 "limited" overflow models + 50 rotated clients.
+    assert_eq!(
+        counts.get(&("limited".to_string(), "junk-model-0".to_string())),
+        Some(&2),
+        "an already-tracked pair must keep incrementing its own key past the cap"
+    );
+    assert_eq!(
+        counts.get(&("limited".to_string(), "_other".to_string())),
+        Some(&25),
+        "a configured client's overflow must land in its own bucket"
+    );
     assert_eq!(
         counts.get(&("_other".to_string(), "_other".to_string())),
-        Some(&75),
-        "overflow must land in the global _other bucket, not be dropped"
+        Some(&50),
+        "unconfigured ids must share the global _other bucket, not be dropped"
     );
 }
 
@@ -18554,10 +18565,12 @@ fn validate_clients_rejects_bad_names_and_empty_keys() {
         ("[[clients]]\nname = \"_other\"\nkey = \"k1\"\n", "_other"),
         // The legacy client_names IP map is the third identity entry point
         // (resolve_client_id's fallback) — its values must not claim a
-        // reserved sentinel either (expert-panel finding, #148 follow-up).
+        // reserved sentinel either (#148 follow-up).
         ("[client_names]\n\"10.0.0.5\" = \"-\"\n", "reserved"),
         ("[client_names]\n\"10.0.0.5\" = \"_operator\"\n", "reserved"),
         ("[client_names]\n\"10.0.0.5\" = \"_other\"\n", "reserved"),
+        ("[client_names]\n\"10.0.0.5\" = \"\"\n", "non-empty"),
+        ("[client_names]\n\"10.0.0.5\" = \"alice \"\n", "whitespace"),
         ("[[clients]]\nname = \"geo\"\nkey = \"\"\n", "key"),
         // Untrimmed: stored verbatim, so it would become a client_id matching
         // no client_budgets / operators / response_cache.clients key.
@@ -21919,7 +21932,7 @@ async fn openai_compat_surface_pins_authenticated_client_to_preferred_endpoint()
 /// overage window supersedes its exhausted subscription windows) but is
 /// priority-demoted — the pin must NOT treat it as viable, or the pinned
 /// client would bill paid overage forever while free general-pool capacity
-/// sits idle (expert-panel CRIT on the initial LAB-2636 cut).
+/// sits idle (LAB-2636).
 #[tokio::test]
 async fn pinned_client_spills_when_preferred_endpoint_at_paid_overage() {
     let state = pinned_test_state();
