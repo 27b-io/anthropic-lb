@@ -403,7 +403,9 @@ can steer are locked down by default:
   that field without its flag is a hard upstream `400`, not a quiet downgrade,
   so when the filter drops anything the proxy also removes every top-level
   body field that is neither base `/v1/messages` schema nor owned by a flag
-  that survived the SAME request. The feature turns off; the request still
+  that survived the SAME request. Scoped to `/v1/messages` and
+  `/v1/messages/count_tokens` — every other route forwards its body
+  byte-for-byte whatever the filter did to the header. The feature turns off; the request still
   works — including for a beta family this proxy has never heard of, with no
   allow-list change. Strips are counted in
   `anthropic_beta_body_field_stripped_total{field}` and warned on first

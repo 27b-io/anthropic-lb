@@ -22296,6 +22296,19 @@ async fn spawn_strict_anthropic_upstream() -> (String, Arc<Mutex<Vec<serde_json:
     // code it is checking: a non-base top-level field is accepted only while
     // the request still declares the beta that owns it.
     const UPSTREAM_PAIRINGS: &[(&str, &str)] = &[("speed", "fast-mode-")];
+    // Spelled out rather than imported from `BASE_BODY_FIELDS`: if the mock
+    // shares that table, a wrong entry in it makes the mock agree with the
+    // code under test and every assertion below stays green.
+    const UPSTREAM_BASE_FIELDS: &[&str] = &[
+        "model",
+        "messages",
+        "max_tokens",
+        "system",
+        "temperature",
+        "top_p",
+        "top_k",
+        "stream",
+    ];
     let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&seen);
     let app = Router::new().fallback(any(
@@ -22316,7 +22329,7 @@ async fn spawn_strict_anthropic_upstream() -> (String, Arc<Mutex<Vec<serde_json:
                     .as_object()
                     .map(|o| {
                         o.keys()
-                            .filter(|k| !BASE_BODY_FIELDS.contains(&k.as_str()))
+                            .filter(|k| !UPSTREAM_BASE_FIELDS.contains(&k.as_str()))
                             .filter(|k| {
                                 !UPSTREAM_PAIRINGS.iter().any(|(field, prefix)| {
                                     field == k
@@ -22360,6 +22373,14 @@ async fn forward_with_betas(
     client_betas: &str,
     body: &'static str,
 ) -> (StatusCode, serde_json::Value) {
+    forward_with_betas_on("/v1/messages", client_betas, body).await
+}
+
+async fn forward_with_betas_on(
+    path: &'static str,
+    client_betas: &str,
+    body: &'static str,
+) -> (StatusCode, serde_json::Value) {
     let (url, seen) = spawn_strict_anthropic_upstream().await;
     let mut state = test_state_with(vec![]);
     let mut ep = make_endpoint("acct", Protocol::Anthropic);
@@ -22371,7 +22392,7 @@ async fn forward_with_betas(
 
     let parts = axum::http::Request::builder()
         .method("POST")
-        .uri("/v1/messages")
+        .uri(path)
         .header("anthropic-beta", client_betas)
         .body(())
         .unwrap()
@@ -22514,6 +22535,15 @@ fn base_schema_fields_are_never_stripped() {
 fn known_pairings_travel_together() {
     for (pattern, field) in BETA_BODY_FIELDS {
         let flag = pattern.replace('*', "2026-01-01");
+        // Without this the loop is tautological: it synthesises the surviving
+        // flag from the pattern under test, so a row whose family is not on
+        // the allow-list — and therefore can never survive, making the row
+        // inert — still passes every assertion below.
+        assert!(
+            beta_flag_allowed(&default_betas(), &flag),
+            "{pattern} is not on the default allow-list, so it can never \
+             survive the header filter and this mapping is dead code"
+        );
         let body = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
                 "model": "claude-opus-4-7",
@@ -22534,4 +22564,81 @@ fn known_pairings_travel_together() {
         let parsed: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
         assert!(parsed.get(*field).is_none());
     }
+}
+
+/// Panel finding (CRIT), and the sharpest edge on this change: `proxy_handler`
+/// is the router's catch-all, so EVERY route reaches `forward_anthropic` —
+/// while `BASE_BODY_FIELDS` describes `/v1/messages` alone. Ungated, one
+/// unlisted beta flag on a `/v1/messages/batches` POST deleted the entire
+/// payload (`{"requests":[…]}` → `{}`) and forwarded it, turning a working
+/// request into a 400 AND destroying the caller's data on the way.
+///
+/// The strip is scoped to the schema it actually knows; everything else
+/// forwards byte-for-byte no matter what the beta filter did to the header.
+#[tokio::test]
+async fn strip_is_scoped_to_the_messages_schema() {
+    let (_, sent) = forward_with_betas_on(
+        "/v1/messages/batches",
+        "totally-unknown-2026-09-01",
+        r#"{"requests":[{"custom_id":"a","params":{"model":"claude-opus-4-7"}}]}"#,
+    )
+    .await;
+    assert!(
+        sent.get("requests").is_some(),
+        "a non-Messages route must forward its body untouched: {sent}"
+    );
+}
+
+/// The counter is the only alertable signal this mechanism adds, so a caller
+/// must not be able to blind it. One request carrying more junk top-level keys
+/// than the whole map holds used to fill every slot for the process lifetime,
+/// after which real strips landed in `_other` forever and the first-sighting
+/// warn never fired again.
+#[test]
+fn one_request_cannot_exhaust_the_strip_counter() {
+    let state = test_state_with(vec![]);
+    let junk: Vec<String> = (0..MAX_DROPPED_BETA_FLAGS * 2)
+        .map(|i| format!("junk_{i}"))
+        .collect();
+    state.record_stripped_body_fields("attacker", &junk, &["unknown-2026-01-01".to_string()]);
+    let used = state.beta_body_fields_stripped.lock().unwrap().len();
+    assert!(
+        used <= MAX_STRIPPED_FIELDS_PER_REQUEST,
+        "one request claimed {used} slots; the per-request cap is \
+         {MAX_STRIPPED_FIELDS_PER_REQUEST}"
+    );
+    // The genuine signal still gets a slot afterwards.
+    state.record_stripped_body_fields("real", &["speed".to_string()], &["fast-mode-x".to_string()]);
+    assert!(
+        state
+            .beta_body_fields_stripped
+            .lock()
+            .unwrap()
+            .contains_key("speed"),
+        "a real strip must still be countable after a junk-key request"
+    );
+}
+
+/// Stripped field names are JSON object keys — client-controlled bytes with
+/// none of the CR/LF guarantee hyper gives header tokens. Unsanitized they
+/// reach a plain-text log subscriber, where an embedded newline forges whole
+/// log lines, and they become `/metrics` label values.
+#[test]
+fn stripped_field_names_are_sanitized() {
+    assert_eq!(sanitize_metric_key("speed", 64), "speed");
+    assert_eq!(
+        sanitize_metric_key("context_management", 64),
+        "context_management"
+    );
+    assert_eq!(
+        sanitize_metric_key("x\n2026-01-01 WARN forged: client_id=admin", 64),
+        "_invalid",
+        "a newline-bearing key must not reach a log field verbatim"
+    );
+    assert_eq!(sanitize_metric_key("", 64), "_invalid");
+    // Non-ASCII survives truncation and is then rejected as a whole.
+    assert_eq!(sanitize_metric_key("café", 64), "_invalid");
+    // Truncation lands on a char boundary rather than splitting the codepoint
+    // (which would panic); what is left is a legitimate key.
+    assert_eq!(sanitize_metric_key("café", 4), "caf");
 }
