@@ -405,7 +405,21 @@ can steer are locked down by default:
   body field that is neither base `/v1/messages` schema nor owned by a flag
   that survived the SAME request. Scoped to `/v1/messages` and
   `/v1/messages/count_tokens` — every other route forwards its body
-  byte-for-byte whatever the filter did to the header. The feature turns off; the request still
+  byte-for-byte whatever the filter did to the header. Retained fields are
+  spliced through as their original bytes, so nothing below the top level is
+  reformatted.
+
+  The keep-side depends on `BETA_BODY_FIELDS` being **total** over the
+  allow-list: a surviving flag protects its body field only if a row claims
+  it, and a family with no row would have its field deleted out from under a
+  caller entitled to use it. A build-time test enforces that. If a flag
+  survives that has no row at all — an operator's custom
+  `allowed_client_betas` carrying a family this binary predates — the proxy
+  cannot tell that family's fields from an orphan's, so it forwards the body
+  untouched and forgoes the degrade for that request. Restoring a stripped
+  feature therefore needs BOTH an allow-list entry and a `BETA_BODY_FIELDS`
+  row: the allow-list stops the header being dropped, the row is what protects
+  the body half. The feature turns off; the request still
   works — including for a beta family this proxy has never heard of, with no
   allow-list change. Strips are counted in
   `anthropic_beta_body_field_stripped_total{field}` and warned on first

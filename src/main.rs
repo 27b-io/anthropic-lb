@@ -3253,33 +3253,66 @@ const BASE_BODY_FIELDS: &[&str] = &[
 /// upgrade is a targeted strip inside that one known structure — NOT a
 /// recursive unknown-key walk, which would eat `tools[].input_schema` and
 /// `tool_use.input`, both arbitrary client JSON by design.
-/// **Decay mode, and the one thing to check when `DEFAULT_CLIENT_BETA_ALLOWLIST`
-/// grows:** an entry only ever KEEPS a field whose flag survived, so a family
-/// that is not on the allow-list can never reach its row — such a row is
-/// inert, not protection. The live risk is the inverse: an allow-listed
-/// family that owns a top-level field and has NO row here loses that field on
-/// any request that also carries one unrecognised flag. Claude Code sends a
-/// dozen betas at once and "one flag the allow-list does not carry" is this
-/// proxy's normal state, so audit this table whenever the allow-list does.
-const BETA_BODY_FIELDS: &[(&str, &str)] = &[
-    ("context-management-*", "context_management"),
-    ("structured-outputs-*", "output_format"),
-    ("fast-mode-*", "speed"),
+/// Every beta family the allow-list can pass, mapped to the TOP-LEVEL body
+/// fields it owns. An empty slice means "owns none" and is a real answer, not
+/// a placeholder — it is what lets the strip tell "this family brought no body
+/// field" apart from "I have never heard of this family".
+///
+/// **This table must stay TOTAL over `DEFAULT_CLIENT_BETA_ALLOWLIST`**, and
+/// `beta_body_field_table_covers_the_allowlist` fails the build if it is not.
+/// Totality is the whole mechanism (LAB-1261, Helly R finding 1): a surviving
+/// flag protects its body field only if a row claims it, so a missing row
+/// means the proxy DELETES a field belonging to a feature the caller was
+/// entitled to use. `fallback-credit-*` is the worked example — it is on the
+/// allow-list, Claude Code sends it, and its `fallback_credit_token` is a
+/// billing instrument redeemable once within five minutes of a refusal.
+///
+/// A flag that survives while matching NO row means an allow-list this table
+/// has not caught up with — `strip_orphaned_beta_body_fields` then declines to
+/// strip anything, because it cannot tell that family's body fields from an
+/// orphan's. Losing the degrade is the safe failure; deleting a live field is
+/// not.
+///
+/// Only TOP-LEVEL fields belong here. `extended-cache-ttl-*` owns a nested
+/// `cache_control.ttl` and `effort-*` nests in `output_config`; both are
+/// listed as owning nothing, which is true of the top level and is the reason
+/// dropping either still 400s upstream.
+const BETA_BODY_FIELDS: &[(&str, &[&str])] = &[
+    // The proxy's own flags — unconditionally re-added, never body-paired.
+    ("oauth-2025-04-20", &[]),
+    ("claude-code-20250219", &[]),
+    // Body-paired families.
+    ("context-management-*", &["context_management"]),
+    ("structured-outputs-*", &["output_format"]),
+    ("fast-mode-*", &["speed"]),
+    ("fallback-credit-*", &["fallback_credit_token"]),
     // `safeguards` is claimed by BOTH halves of the auto-mode classifier pair:
     // an allow-list carrying only one of them must still keep the field.
-    ("dangerous-tool-use-*", "safeguards"),
-    ("auto-mode-classifier-*", "safeguards"),
+    ("dangerous-tool-use-*", &["safeguards"]),
+    ("auto-mode-classifier-*", &["safeguards"]),
+    // Allow-listed and header-only, or paired below the top level.
+    ("interleaved-thinking-*", &[]),
+    ("fine-grained-tool-streaming-*", &[]),
+    ("prompt-caching-*", &[]),
+    ("context-1m*", &[]),
+    ("extended-cache-ttl-*", &[]),
+    ("effort-*", &[]),
+    ("thinking-token-count-*", &[]),
+    ("mid-conversation-system-*", &[]),
+    ("advisor-tool-*", &[]),
+    ("redact-thinking-*", &[]),
+    ("afk-mode-*", &[]),
 ];
 
 /// Header/body coherence for the beta allow-list (LAB-1261).
 ///
 /// `inject_account_auth` filters the `anthropic-beta` HEADER. Several betas
-/// are paired — a header flag plus a body field that only exists when the
-/// flag is declared — so stripping the header alone leaves a request the
-/// upstream must reject outright (`speed: Extra inputs are not permitted`).
-/// A filter meant to degrade a feature gracefully instead hard-fails every
-/// request carrying it: the 2026-08-01 fleet outage, then LAB-2669
-/// (`fast-mode`) and LAB-3963 (`dangerous-tool-use`) from the field.
+/// are paired — a header flag plus a body field that only exists when the flag
+/// is declared — so stripping the header alone leaves a request the upstream
+/// must reject outright (`speed: Extra inputs are not permitted`). A filter
+/// meant to degrade a feature gracefully instead hard-fails every request
+/// carrying it: the 2026-08-01 fleet outage, then LAB-2669 (`fast-mode`) and
+/// LAB-3963 (`dangerous-tool-use`) from the field.
 ///
 /// So when the filter drops anything, drop the orphaned half of the body too:
 /// remove every top-level field that is neither base schema nor owned by a
@@ -3287,10 +3320,14 @@ const BETA_BODY_FIELDS: &[(&str, &str)] = &[
 /// 400ing, and — the point of the ticket — that holds for a beta family the
 /// LB has never seen, with no enumeration change.
 ///
-/// `surviving_betas` is the outbound header value, read back after filtering
-/// rather than derived from config: an operator running a custom
-/// `allowed_client_betas` gets the right answer without a second list to
-/// maintain.
+/// **Declines to strip when a surviving flag is not in `BETA_BODY_FIELDS`.**
+/// The keep-side of the rule is only as good as that table is total: an
+/// unrecognised SURVIVING family may own a top-level field, and stripping it
+/// deletes a capability the caller is entitled to (Helly R finding 1 — a
+/// custom `allowed_client_betas` carrying `mcp-client-*` kept the header and
+/// lost `mcp_servers`, leaving `tools[].mcp_server_name` dangling). Forgoing
+/// the degrade costs a 400 the caller already gets today; deleting a live
+/// field costs them a feature, or a billing instrument, silently.
 ///
 /// **Scoped to `/v1/messages` and `/v1/messages/count_tokens` by the caller.**
 /// `BASE_BODY_FIELDS` is that one schema, and `proxy_handler` is the router's
@@ -3298,17 +3335,23 @@ const BETA_BODY_FIELDS: &[(&str, &str)] = &[
 /// reach the same forward path with completely different bodies, which this
 /// would otherwise delete wholesale.
 ///
-/// Returns `None` — body forwarded untouched — when nothing was dropped (the
-/// hot path: no parse, no re-serialize), when the body is not a JSON object,
-/// or when every field is accounted for.
+/// `surviving_betas` is the outbound header value, read back after filtering
+/// rather than derived from config: an operator running a custom
+/// `allowed_client_betas` gets the right answer without a second list to
+/// maintain.
 ///
-/// When it DOES rewrite, the round-trip through serde renormalizes whitespace,
-/// string escapes and number formatting, so the cacheable prefix shifts and
-/// that request pays a `cache_write`. `preserve_order` keeps key ORDER, which
-/// is the invalidator this codebase cares most about, but it does not make the
-/// bytes identical. Accepted: the only requests that reach the rewrite are the
-/// ones answering a hard 400 today, so the trade is a cache write against a
-/// failed request.
+/// Returns `None` — body forwarded untouched — when nothing was dropped (the
+/// hot path: no parse, no rewrite), when a surviving flag is unrecognised,
+/// when the body is not a JSON object, or when every field is accounted for.
+///
+/// Retained fields are spliced through as `RawValue`, i.e. their original
+/// bytes, so nothing below the top level is reformatted. That is not cosmetic:
+/// a `serde_json::Value` round-trip rewrites an integer too large for `u64` as
+/// a float (`18446744073709551617` → `1.8446744073709552e+19`), silently
+/// changing a value inside retained tool history (Helly R finding 2). Only the
+/// top-level separators are re-emitted, so the cacheable prefix can still
+/// shift on a body that arrived pretty-printed — accepted, since the only
+/// requests reaching the rewrite are the ones answering a hard 400 today.
 fn strip_orphaned_beta_body_fields(
     body: &bytes::Bytes,
     surviving_betas: &str,
@@ -3317,37 +3360,96 @@ fn strip_orphaned_beta_body_fields(
     if dropped.is_empty() {
         return None;
     }
-    let mut parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
     let surviving: Vec<&str> = surviving_betas
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
-    let obj = parsed.as_object_mut()?;
+    // Every surviving flag must be one this proxy can account for, or it may
+    // own a top-level field indistinguishable from an orphan.
+    let mut protected: Vec<&str> = Vec::new();
+    for flag in &surviving {
+        let mut known = false;
+        for (pattern, fields) in BETA_BODY_FIELDS {
+            if suffix_wildcard_match(pattern, flag) {
+                known = true;
+                protected.extend_from_slice(fields);
+            }
+        }
+        if !known {
+            debug!(
+                flag = %flag,
+                "beta body coherence: surviving flag is not in BETA_BODY_FIELDS, \
+                 forwarding the body untouched rather than risk deleting a field \
+                 it owns"
+            );
+            return None;
+        }
+    }
+
+    let parsed: TopLevelObject = serde_json::from_slice(body).ok()?;
     let mut removed: Vec<String> = Vec::new();
-    obj.retain(|key, _| {
-        if BASE_BODY_FIELDS.contains(&key.as_str()) {
-            return true;
-        }
-        let owned_by_surviving_flag = BETA_BODY_FIELDS.iter().any(|(pattern, field)| {
-            *field == key.as_str()
-                && surviving
-                    .iter()
-                    .any(|flag| suffix_wildcard_match(pattern, flag))
-        });
-        if owned_by_surviving_flag {
-            return true;
-        }
-        removed.push(key.clone());
-        false
-    });
+    let kept: Vec<&(String, Box<serde_json::value::RawValue>)> = parsed
+        .0
+        .iter()
+        .filter(|(key, _)| {
+            if BASE_BODY_FIELDS.contains(&key.as_str()) || protected.contains(&key.as_str()) {
+                return true;
+            }
+            removed.push(key.clone());
+            false
+        })
+        .collect();
     if removed.is_empty() {
         return None;
     }
-    // A body that cannot be re-serialized is forwarded as-is: the upstream
-    // 400 that follows is strictly better than dropping the request here.
-    let rewritten = serde_json::to_vec(&parsed).ok()?;
-    Some((bytes::Bytes::from(rewritten), removed))
+    let mut out = String::from("{");
+    for (i, (key, value)) in kept.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        // The key is re-escaped rather than spliced: `RawValue` covers values
+        // only, and a key carrying a quote or a control character must not be
+        // able to break out of the string it is written into.
+        out.push_str(&serde_json::to_string(key).ok()?);
+        out.push(':');
+        out.push_str(value.get());
+    }
+    out.push('}');
+    Some((bytes::Bytes::from(out), removed))
+}
+
+/// A JSON object whose VALUES are kept as their original bytes.
+///
+/// `serde_json::Map<String, Value>` cannot express this, and pulling in an
+/// ordered map crate to hold `RawValue` would be a dependency for thirty
+/// lines. Order is preserved because the entries are simply collected in the
+/// order the parser yields them.
+struct TopLevelObject(Vec<(String, Box<serde_json::value::RawValue>)>);
+
+impl<'de> serde::Deserialize<'de> for TopLevelObject {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Entries;
+        impl<'de> serde::de::Visitor<'de> for Entries {
+            type Value = TopLevelObject;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<TopLevelObject, M::Error> {
+                let mut out = Vec::new();
+                while let Some(entry) =
+                    map.next_entry::<String, Box<serde_json::value::RawValue>>()?
+                {
+                    out.push(entry);
+                }
+                Ok(TopLevelObject(out))
+            }
+        }
+        d.deserialize_map(Entries)
+    }
 }
 
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
@@ -5768,9 +5870,17 @@ impl AppState {
             .take(MAX_STRIPPED_FIELDS_PER_REQUEST)
             .map(|f| sanitize_metric_key(f, MAX_DROPPED_BETA_FLAG_LEN))
             .collect();
+        // Removals past the cap still happened, so they are still counted —
+        // under `_other`, not discarded. Dropping them outright let an ordered
+        // payload hide the actionable field behind eight junk ones and leave
+        // no trace that anything else went (Helly R finding 3).
+        let over_cap = stripped.len().saturating_sub(keys.len()) as u64;
         let Ok(mut map) = self.beta_body_fields_stripped.lock() else {
             return;
         };
+        if over_cap > 0 {
+            *map.entry("_other".to_string()).or_insert(0) += over_cap;
+        }
         let mut first_seen: Vec<&str> = Vec::new();
         for field in &keys {
             if map.contains_key(field.as_str()) || map.len() < MAX_DROPPED_BETA_FLAGS {
@@ -5798,8 +5908,10 @@ impl AppState {
                 "stripped top-level body fields orphaned by the anthropic-beta \
                  allow-list — a PAIRED beta family is in live traffic that the \
                  allow-list does not carry; the feature is now off for this \
-                 client instead of 400ing. Add the flag family to \
-                 allowed_client_betas to restore it"
+                 client instead of 400ing. To restore it the family needs BOTH \
+                 an allow-list entry AND a row in BETA_BODY_FIELDS naming this \
+                 field — the allow-list alone only stops the drop; the row is \
+                 what protects the body half"
             );
         }
         // Repeats get their own line even when this call also carried a first

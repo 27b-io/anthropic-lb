@@ -22527,43 +22527,138 @@ fn base_schema_fields_are_never_stripped() {
     );
 }
 
-/// The paired families the LB already knows: each one's body field is
-/// stripped when its own flag is dropped, and kept when it is not. Catches a
-/// `BETA_BODY_FIELDS` entry whose pattern no longer matches its allow-list
-/// counterpart.
+/// Every known pairing travels with its flag in BOTH directions, and the
+/// assertion that makes this non-tautological: each pattern must actually be
+/// on the default allow-list. Without it the loop synthesises the surviving
+/// flag from the pattern under test, so a row for a family that can never
+/// survive — an inert row that reads as protection — still passes.
 #[test]
 fn known_pairings_travel_together() {
-    for (pattern, field) in BETA_BODY_FIELDS {
+    for (pattern, fields) in BETA_BODY_FIELDS {
         let flag = pattern.replace('*', "2026-01-01");
-        // Without this the loop is tautological: it synthesises the surviving
-        // flag from the pattern under test, so a row whose family is not on
-        // the allow-list — and therefore can never survive, making the row
-        // inert — still passes every assertion below.
         assert!(
             beta_flag_allowed(&default_betas(), &flag),
             "{pattern} is not on the default allow-list, so it can never \
              survive the header filter and this mapping is dead code"
         );
-        let body = bytes::Bytes::from(
-            serde_json::to_vec(&serde_json::json!({
-                "model": "claude-opus-4-7",
-                "messages": [],
-                "max_tokens": 1,
-                *field: "x",
-            }))
-            .unwrap(),
-        );
-        // Flag survived → field stays (no strip at all is a valid "stays").
-        let kept = strip_orphaned_beta_body_fields(&body, &flag, &["other-2026-01-01".to_string()]);
-        assert!(kept.is_none(), "{field} must survive while {flag} survives");
-        // Flag dropped → field goes with it.
-        let (rewritten, stripped) =
-            strip_orphaned_beta_body_fields(&body, "", std::slice::from_ref(&flag))
-                .unwrap_or_else(|| panic!("{field} must be stripped when {flag} is dropped"));
-        assert_eq!(stripped, vec![(*field).to_string()]);
-        let parsed: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
-        assert!(parsed.get(*field).is_none());
+        for field in *fields {
+            let body = bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "claude-opus-4-7",
+                    "messages": [],
+                    "max_tokens": 1,
+                    *field: "x",
+                }))
+                .unwrap(),
+            );
+            // Flag survived → field stays (no strip at all is a valid "stays").
+            assert!(
+                strip_orphaned_beta_body_fields(
+                    &body,
+                    &format!("{flag},oauth-2025-04-20"),
+                    &["other-2026-01-01".to_string()]
+                )
+                .is_none(),
+                "{field} must survive while {flag} survives"
+            );
+            // Flag dropped → field goes with it.
+            let (rewritten, stripped) = strip_orphaned_beta_body_fields(
+                &body,
+                "oauth-2025-04-20",
+                std::slice::from_ref(&flag),
+            )
+            .unwrap_or_else(|| panic!("{field} must be stripped when {flag} is dropped"));
+            assert_eq!(stripped, vec![(*field).to_string()]);
+            let parsed: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+            assert!(parsed.get(*field).is_none());
+        }
     }
+}
+
+/// Helly R finding 1, and the invariant the whole keep-side rests on: a
+/// surviving flag protects its body field ONLY if a row claims it, so the
+/// table has to be total over the allow-list. A family with no row is not
+/// neutral — its field gets deleted out from under a caller who was entitled
+/// to it. This fails the build rather than waiting for the billing surprise.
+#[test]
+fn beta_body_field_table_covers_the_allowlist() {
+    for family in DEFAULT_CLIENT_BETA_ALLOWLIST {
+        assert!(
+            BETA_BODY_FIELDS
+                .iter()
+                .any(|(pattern, _)| pattern == family),
+            "{family} is allow-listed but has no BETA_BODY_FIELDS row: a request \
+             carrying it plus any unrecognised flag would have that family's \
+             top-level body field deleted. Add a row — `&[]` if it owns none."
+        );
+    }
+}
+
+/// Helly R finding 1, the concrete case. `fallback-credit-*` is allow-listed
+/// and Claude Code sends it; `fallback_credit_token` is a billing instrument
+/// redeemable once within five minutes of a refusal. One unrelated unknown
+/// flag alongside it used to delete the token while the credit flag itself
+/// sailed through the filter.
+#[test]
+fn surviving_flag_protects_its_field_against_an_unrelated_drop() {
+    let body = bytes::Bytes::from_static(
+        br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1,"fallback_credit_token":"tok_abc"}"#,
+    );
+    assert!(
+        strip_orphaned_beta_body_fields(
+            &body,
+            "fallback-credit-2026-07-01,oauth-2025-04-20",
+            &["mid-conversation-tool-changes-2026-07-01".to_string()],
+        )
+        .is_none(),
+        "an unrelated dropped flag must not cost the caller their fallback credit"
+    );
+}
+
+/// Helly R finding 1, second half: a custom `allowed_client_betas` can pass a
+/// family this proxy has no row for. It may own a top-level field, and the
+/// proxy cannot tell that field from an orphan — so it declines to strip at
+/// all. Losing the degrade costs a 400 the caller already gets today; deleting
+/// `mcp_servers` while keeping the header leaves a dangling tool reference.
+#[test]
+fn unrecognised_surviving_flag_disables_the_strip() {
+    let body = bytes::Bytes::from_static(
+        br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1,"mcp_servers":[{"type":"url","url":"https://x","name":"calc"}]}"#,
+    );
+    assert!(
+        strip_orphaned_beta_body_fields(
+            &body,
+            "mcp-client-2025-11-20,oauth-2025-04-20",
+            &["totally-unknown-2026-09-01".to_string()],
+        )
+        .is_none(),
+        "a surviving flag with no BETA_BODY_FIELDS row must switch the strip off"
+    );
+}
+
+/// Helly R finding 2: a `serde_json::Value` round-trip rewrote an integer too
+/// large for `u64` as a float, silently changing a value inside RETAINED tool
+/// history — data corruption on the part of the payload the design promises
+/// to preserve. Retained fields are spliced through as their original bytes.
+#[test]
+fn rewrite_preserves_retained_values_exactly() {
+    let body = bytes::Bytes::from_static(
+        br#"{"model":"claude-opus-4-7","max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":"hi","input":{"record_id":18446744073709551617}}]}],"orphan_field":1}"#,
+    );
+    let (rewritten, stripped) = strip_orphaned_beta_body_fields(
+        &body,
+        "oauth-2025-04-20",
+        &["totally-unknown-2026-09-01".to_string()],
+    )
+    .expect("the orphan field must be stripped");
+    assert_eq!(stripped, vec!["orphan_field".to_string()]);
+    let text = std::str::from_utf8(&rewritten).unwrap();
+    assert!(
+        text.contains("18446744073709551617"),
+        "a retained nested integer must survive byte-for-byte, got: {text}"
+    );
+    assert!(!text.contains("1.8446744073709552e19"));
+    assert!(!text.contains("orphan_field"));
 }
 
 /// Panel finding (CRIT), and the sharpest edge on this change: `proxy_handler`
@@ -22601,12 +22696,22 @@ fn one_request_cannot_exhaust_the_strip_counter() {
         .map(|i| format!("junk_{i}"))
         .collect();
     state.record_stripped_body_fields("attacker", &junk, &["unknown-2026-01-01".to_string()]);
-    let used = state.beta_body_fields_stripped.lock().unwrap().len();
+    let map = state.beta_body_fields_stripped.lock().unwrap();
+    let used = map.len();
     assert!(
-        used <= MAX_STRIPPED_FIELDS_PER_REQUEST,
-        "one request claimed {used} slots; the per-request cap is \
-         {MAX_STRIPPED_FIELDS_PER_REQUEST}"
+        used <= MAX_STRIPPED_FIELDS_PER_REQUEST + 1,
+        "one request claimed {used} named slots; the per-request cap is \
+         {MAX_STRIPPED_FIELDS_PER_REQUEST} plus the shared _other bucket"
     );
+    // Helly R finding 3: the removals past the cap still happened, so they are
+    // still counted. Discarding them let an ordered payload hide the
+    // actionable field behind junk and leave no trace anything else went.
+    assert_eq!(
+        map.get("_other").copied(),
+        Some((MAX_DROPPED_BETA_FLAGS * 2 - MAX_STRIPPED_FIELDS_PER_REQUEST) as u64),
+        "every removal past the per-request cap must land in _other"
+    );
+    drop(map);
     // The genuine signal still gets a slot afterwards.
     state.record_stripped_body_fields("real", &["speed".to_string()], &["fast-mode-x".to_string()]);
     assert!(
