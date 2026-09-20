@@ -1005,12 +1005,13 @@ fn reserve_request_body(
                 "rejected: in-flight request-body memory budget exhausted (load-shedding)"
             );
             state.body_shed_total.fetch_add(1, Ordering::Relaxed);
-            let resp = (
+            let mut resp = proxy_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                [("retry-after", "1")],
+                "overloaded_error",
                 "overloaded: request-body memory budget exhausted",
-            )
-                .into_response();
+            );
+            resp.headers_mut()
+                .insert("retry-after", HeaderValue::from_static("1"));
             Err(Box::new(resp))
         }
     }
@@ -1044,9 +1045,11 @@ async fn read_body_bounded(
                     timeout_secs = state.body_read_timeout.as_secs(),
                     "request body read timed out (releasing body-memory reservation)"
                 );
-                let resp =
-                    (StatusCode::REQUEST_TIMEOUT, "request body read timed out").into_response();
-                return Err(Box::new(resp));
+                return Err(Box::new(proxy_error_response(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "timeout_error",
+                    "request body read timed out",
+                )));
             }
         }
     };
@@ -1871,7 +1874,11 @@ impl AppState {
         // Boxed Err, matching `reserve_request_body` — an inline `Response` is
         // 128+ bytes on the hot success path (clippy::result_large_err).
         let unauthorized = || -> Box<Response> {
-            Box::new((StatusCode::UNAUTHORIZED, "unauthorized").into_response())
+            Box::new(proxy_error_response(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "unauthorized",
+            ))
         };
         let from_header = headers.get("x-api-key").and_then(|v| v.to_str().ok());
         let from_bearer = if allow_bearer {
@@ -7189,7 +7196,7 @@ impl AppState {
             self.note_model_denied(client_id, model);
             // `model` is caller-controlled and echoed back — truncate it here
             // too, so a 25 MB model field cannot become a 25 MB error body.
-            let body = if model.is_empty() {
+            let msg = if model.is_empty() {
                 format!(
                     "client '{client_id}' has a model allow-list, but no model could be read from the request"
                 )
@@ -7199,15 +7206,27 @@ impl AppState {
                     truncate_label(model)
                 )
             };
-            return Err(Box::new((StatusCode::FORBIDDEN, body).into_response()));
+            return Err(Box::new(proxy_error_response(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                &msg,
+            )));
         }
 
         // 1. Daily token budget (existing)
         if client_id != "-" && self.check_budget(client_id).await.is_err() {
-            warn!(client_id = %client_id, "rejected: daily token budget exceeded");
-            return Err(Box::new(
-                (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response(),
-            ));
+            let retry_after = 86400 - (Self::now_epoch() % 86400);
+            warn!(client_id = %client_id, retry_after, "rejected: daily token budget exceeded");
+            let mut resp = proxy_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "daily token budget exceeded",
+            );
+            resp.headers_mut().insert(
+                "retry-after",
+                HeaderValue::from_str(&retry_after.to_string()).unwrap(),
+            );
+            return Err(Box::new(resp));
         }
 
         // 2. Utilization limit (new)
@@ -7217,11 +7236,11 @@ impl AppState {
                 retry_after = retry_after,
                 "rejected: utilization limit exceeded"
             );
-            let mut resp = (
+            let mut resp = proxy_error_response(
                 StatusCode::TOO_MANY_REQUESTS,
-                format!("utilization limit exceeded for client '{client_id}'"),
-            )
-                .into_response();
+                "rate_limit_error",
+                &format!("utilization limit exceeded for client '{client_id}'"),
+            );
             resp.headers_mut().insert(
                 "retry-after",
                 HeaderValue::from_str(&retry_after.to_string()).unwrap(),
@@ -7235,13 +7254,14 @@ impl AppState {
                 client_id = %client_id,
                 "rejected: emergency brake active"
             );
-            return Err(Box::new(
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "emergency: all accounts near exhaustion",
-                )
-                    .into_response(),
-            ));
+            let mut resp = proxy_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "emergency: all accounts near exhaustion",
+            );
+            resp.headers_mut()
+                .insert("retry-after", HeaderValue::from_static("30"));
+            return Err(Box::new(resp));
         }
 
         Ok(())
@@ -7962,18 +7982,17 @@ fn model_unsupported_response(model: &str, openai_shape: bool) -> Response {
         .into_response()
 }
 
-/// 400 in Anthropic's error envelope when an Anthropic request can't be
-/// faithfully translated for an OpenAI-compat fallback endpoint (e.g. an
-/// image source type the translator doesn't support). The caller's request
-/// was Anthropic Messages API shaped, so the error response matches that,
-/// regardless of which protocol the fallback endpoint speaks.
-fn untranslatable_request_response(message: &str) -> Response {
+/// Anthropic-shaped JSON error envelope for every proxy-generated denial.
+/// Reused across all surfaces (native + OpenAI-compat): the denial is a
+/// proxy-level decision, not an upstream protocol artefact, and OpenAI SDKs
+/// parse `error.message` from either shape.
+fn proxy_error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
     (
-        StatusCode::BAD_REQUEST,
+        status,
         [("content-type", "application/json")],
         serde_json::json!({
             "type": "error",
-            "error": { "type": "invalid_request_error", "message": message }
+            "error": { "type": error_type, "message": message }
         })
         .to_string(),
     )
@@ -9141,7 +9160,9 @@ async fn proxy_handler(
                                     // Terminal, not a retry: the request itself
                                     // is the problem, so rotating would fail the
                                     // same way on every endpoint.
-                                    ForwardOutcome::Done(Box::new(untranslatable_request_response(
+                                    ForwardOutcome::Done(Box::new(proxy_error_response(
+                                        StatusCode::BAD_REQUEST,
+                                        "invalid_request_error",
                                         msg,
                                     )))
                                 }

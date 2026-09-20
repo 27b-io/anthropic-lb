@@ -18642,6 +18642,157 @@ fn model_denial_labels_are_bounded_by_other_overflow() {
     );
 }
 
+// ── LAB-4129: proxy-generated denials return Anthropic JSON envelope ──
+
+/// Parse a `Box<Response>` body into a JSON value, asserting it's valid JSON.
+async fn parse_error_envelope(resp: Box<Response>) -> serde_json::Value {
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).expect("denial must be valid JSON")
+}
+
+#[tokio::test]
+async fn gate_403_model_denial_returns_json_envelope() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    let err = state
+        .pre_request_gate("limited", "claude-opus-5")
+        .await
+        .expect_err("opus must be denied");
+    assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "permission_error");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("limited"));
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("claude-opus-5"));
+}
+
+#[tokio::test]
+async fn gate_403_unreadable_model_returns_json_envelope() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    let err = state
+        .pre_request_gate("limited", "")
+        .await
+        .expect_err("empty model must be denied");
+    assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "permission_error");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no model could be read"));
+}
+
+#[tokio::test]
+async fn gate_429_budget_returns_json_envelope_with_retry_after() {
+    let today = AppState::now_epoch() / 86400;
+    let state = Arc::new(AppState {
+        client_budgets: [("budgeted".to_string(), 100)].into_iter().collect(),
+        ..test_state_base()
+    });
+    // Pre-populate usage to exceed the budget
+    state
+        .budget_usage
+        .lock()
+        .unwrap()
+        .insert("budgeted".to_string(), (today, 200));
+    let err = state
+        .pre_request_gate("budgeted", "")
+        .await
+        .expect_err("exceeded budget must be denied");
+    assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        err.headers().get("retry-after").is_some(),
+        "budget 429 must carry retry-after"
+    );
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "rate_limit_error");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("daily token budget exceeded"));
+}
+
+#[tokio::test]
+async fn gate_429_utilization_returns_json_envelope() {
+    let now = AppState::now_epoch();
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        state_path: PathBuf::from("/tmp/test.state.json"),
+        client_utilization_limits: [("capped".to_string(), 0.10)].into_iter().collect(),
+        ..test_state_base()
+    });
+    set_account_utilization(&state, 0, 0.95, 0.95, now + 10000, now + 100000).await;
+    let err = state
+        .pre_request_gate("capped", "")
+        .await
+        .expect_err("utilization above limit must be denied");
+    assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        err.headers().get("retry-after").is_some(),
+        "utilization 429 must carry retry-after"
+    );
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "rate_limit_error");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("utilization limit exceeded"));
+}
+
+#[tokio::test]
+async fn gate_429_emergency_brake_returns_json_envelope_with_retry_after() {
+    let now = AppState::now_epoch();
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        state_path: PathBuf::from("/tmp/test.state.json"),
+        emergency_brake: true,
+        emergency_threshold: 0.88,
+        ..test_state_base()
+    });
+    set_account_utilization(&state, 0, 0.95, 0.95, now + 10000, now + 100000).await;
+    let err = state
+        .pre_request_gate("anyone", "")
+        .await
+        .expect_err("emergency brake must deny");
+    assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry = err
+        .headers()
+        .get("retry-after")
+        .expect("emergency brake 429 must carry retry-after");
+    assert_eq!(retry.to_str().unwrap(), "30");
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "rate_limit_error");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("emergency"));
+}
+
+#[tokio::test]
+async fn authenticate_401_returns_json_envelope() {
+    let state = state_with_clients(vec![mk_client("valid", "k1", &[])]);
+    let headers = hdrs(&[("x-api-key", "wrong-key")]);
+    let err = state
+        .authenticate(&headers, false)
+        .expect_err("bad key must 401");
+    assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "authentication_error");
+    assert_eq!(json["error"]["message"], "unauthorized");
+}
+
 // ── AC-5 / AC-6: startup validation ──
 
 #[test]
