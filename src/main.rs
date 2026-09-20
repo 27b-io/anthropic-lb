@@ -3128,6 +3128,24 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     // classifier's own follow-up requests.
     "auto-mode-classifier-*",
     "dangerous-tool-use-*",
+    // Claude Code 2.1.278 per-turn family (LAB-3964). All three ride the
+    // in-`messages` `role:"system"` entry the (already allowed)
+    // mid-conversation-system beta introduced, so the body half is forwarded
+    // and only the header was being stripped:
+    //  - `mid-conversation-tool-changes-*` is body-paired with
+    //    `{type:"tool_addition"|"tool_removal"}` content blocks on that entry.
+    //    The header rides every request once the gate is on (~1.1k drops/h on
+    //    the lab fleet); the blocks appear only on the turn a deferred tool is
+    //    surfaced, and stripping the header on that turn is a hard 400 that
+    //    Claude Code answers by sticky-rejecting the beta for the conversation.
+    //  - `per-turn-control-*` is body-paired with `output_config.effort` on
+    //    that entry (models with the `per_turn_effort` capability).
+    //  - `timing-*` is body-paired with `output_config.timing` on that entry;
+    //    opt-in via CLAUDE_CODE_PER_TURN_TIMING in 2.1.278, so it has not been
+    //    seen dropped yet — listed so the first opt-in does not 400.
+    "mid-conversation-tool-changes-*",
+    "per-turn-control-*",
+    "timing-*",
 ];
 
 /// Cardinality bound for `beta_flags_dropped` — flag names are

@@ -132,9 +132,12 @@ probe_interval_secs = 300
 # NOTE: a configured list REPLACES the default — it does not extend it. Some
 # families also pair with a request-body field (fast-mode-* with top-level
 # speed: "fast"; the auto-mode classifier pair dangerous-tool-use-* +
-# auto-mode-classifier-* with top-level safeguards), and the body is forwarded
-# verbatim, so dropping the header alone is a hard upstream 400, not a quiet
-# downgrade. To allow one extra
+# auto-mode-classifier-* with top-level safeguards; the per-turn family
+# mid-conversation-tool-changes-* / per-turn-control-* / timing-* with
+# tool_addition blocks and output_config.effort / output_config.timing on the
+# role:"system" entry in messages), and the body is forwarded verbatim, so
+# dropping the header alone is a hard upstream 400, not a quiet downgrade. To
+# allow one extra
 # flag, copy every entry of DEFAULT_CLIENT_BETA_ALLOWLIST in src/main.rs (the
 # authoritative list) and add yours:
 # allowed_client_betas = [

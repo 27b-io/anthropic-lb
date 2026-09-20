@@ -398,8 +398,11 @@ can steer are locked down by default:
   in `src/main.rs`. Some families pair with a request-body field (`fast-mode-*`
   with top-level `speed: "fast"`; the auto-mode classifier pair
   `dangerous-tool-use-*` + `auto-mode-classifier-*` with top-level
-  `safeguards`), and the body is forwarded verbatim — so dropping the header
-  alone is a hard upstream `400`, not a quiet downgrade.
+  `safeguards`; the per-turn family `mid-conversation-tool-changes-*`,
+  `per-turn-control-*` and `timing-*` with `tool_addition`/`tool_removal`
+  blocks and `output_config.effort`/`output_config.timing` on the
+  `role: "system"` entry in `messages`), and the body is forwarded verbatim —
+  so dropping the header alone is a hard upstream `400`, not a quiet downgrade.
 - **A fast-mode `429` is forwarded to the caller, not treated as account
   exhaustion.** Fast mode (`speed: "fast"`) bills against its own rate bucket,
   separate from the account's 5h/7d windows, so a `429` on a fast request does
