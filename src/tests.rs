@@ -5511,9 +5511,9 @@ async fn standard_speed_429_still_cools_account_and_rotates() {
 /// BURST 429 — `x-should-retry` with no `retry-after` and no rate headers.
 /// Burst limits are per-minute RPM/concurrency on the ACCOUNT, not on a rate
 /// bucket, so they are real evidence about the account whatever speed was
-/// asked for. Exempting them would be worse: `x-should-retry` is reflected to
-/// callers as the transient hint, while rotation keeps standard traffic off
-/// the same still-bursting account.
+/// asked for. Exempting it would leave the account pinned: standard traffic
+/// routed to it would burst-429 and hard-limit it anyway. The caller still
+/// gets `x-should-retry` as its transient hint.
 #[tokio::test]
 async fn fast_mode_burst_429_still_backs_off_and_rotates() {
     use std::sync::atomic::Ordering;
@@ -19192,6 +19192,13 @@ async fn upstream_headers_stripped_by_default() {
         Some("req_mock_123"),
         "request-id is allow-listed for SDK error reports"
     );
+    assert_eq!(
+        resp.headers()
+            .get("x-should-retry")
+            .and_then(|v| v.to_str().ok()),
+        Some("true"),
+        "x-should-retry is allow-listed regardless of the ratelimit flag"
+    );
     assert!(resp.headers().contains_key("x-budget-status"));
 }
 
@@ -19226,13 +19233,6 @@ async fn upstream_ratelimit_headers_reflected_with_flag() {
         Some("0.25"),
         "flag must restore anthropic-ratelimit-* passthrough"
     );
-    assert_eq!(
-        resp.headers()
-            .get("x-should-retry")
-            .and_then(|v| v.to_str().ok()),
-        Some("true"),
-        "x-should-retry must be reflected unconditionally"
-    );
     assert!(
         !resp.headers().contains_key("set-cookie"),
         "set-cookie stays stripped even with the ratelimit flag on"
@@ -19245,13 +19245,21 @@ async fn upstream_ratelimit_headers_reflected_with_flag() {
 
 #[test]
 fn upstream_headers_do_not_synthesize_should_retry() {
-    let response = reflect_upstream_headers(
-        Response::builder(),
-        &reqwest::header::HeaderMap::new(),
-        false,
-    )
-    .body(())
-    .unwrap();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "content-type",
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    let response = reflect_upstream_headers(Response::builder(), &headers, false)
+        .body(())
+        .unwrap();
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
     assert!(!response.headers().contains_key("x-should-retry"));
 }
 
