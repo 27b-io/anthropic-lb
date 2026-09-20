@@ -3135,7 +3135,7 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     //  - `mid-conversation-tool-changes-*` is body-paired with
     //    `{type:"tool_addition"|"tool_removal"}` content blocks on that entry.
     //    The header rides every request once the gate is on (~1.1k drops/h on
-    //    the lab fleet); the blocks appear only on the turn a deferred tool is
+    //    a live deployment); the blocks appear only on the turn a deferred tool is
     //    surfaced, and stripping the header on that turn is a hard 400 that
     //    Claude Code answers by sticky-rejecting the beta for the conversation.
     //  - `per-turn-control-*` is body-paired with `output_config.effort` on
