@@ -7293,7 +7293,10 @@ fn has_oauth_system_prompt(body: &serde_json::Value) -> bool {
 ///   `system[0]` is a Claude Code attribution block, so the upstream's
 ///   positional strip of that block still fires
 fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
-    if has_oauth_system_prompt(body) {
+    // `Value`'s `IndexMut<&str>` panics on anything but Null/Object. A
+    // non-object body is rejected upstream of here by `proxy_handler`;
+    // this guard closes the class for every caller (LAB-4314).
+    if !body.is_object() || has_oauth_system_prompt(body) {
         return;
     }
 
@@ -7982,7 +7985,8 @@ fn model_unsupported_response(model: &str, openai_shape: bool) -> Response {
 /// faithfully translated for an OpenAI-compat fallback endpoint (e.g. an
 /// image source type the translator doesn't support). The caller's request
 /// was Anthropic Messages API shaped, so the error response matches that,
-/// regardless of which protocol the fallback endpoint speaks.
+/// regardless of which protocol the fallback endpoint speaks. Also the
+/// proxy's own rejection for a valid-JSON non-object body (LAB-4314).
 fn untranslatable_request_response(message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -8832,6 +8836,13 @@ async fn proxy_handler(
     // the fast-mode flag that picks the rate bucket downstream.
     let (body_bytes, oauth_body_bytes, model, fp, cache_key, is_fast_mode) =
         if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            // Valid JSON but not an object (`[1]`, `"x"`, `7`, `true`,
+            // `null`): nothing below can use it and the OAuth injector
+            // would panic on it. Reject in Anthropic's envelope, which is
+            // what the upstream would return anyway (LAB-4314).
+            if !parsed.is_object() {
+                return untranslatable_request_response("request body must be a JSON object");
+            }
             let model = parsed
                 .get("model")
                 .and_then(|m| m.as_str())
