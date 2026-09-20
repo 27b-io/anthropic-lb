@@ -14827,6 +14827,10 @@ const NON_OBJECT_JSON_BODIES: [&str; 5] = ["[1,2,3]", "\"x\"", "7", "true", "nul
 /// The shared injector must never index into a non-object: both of its
 /// call sites (`proxy_handler`, `openai_chat_handler`) route through here,
 /// so this is the locus that closes the class for all callers.
+///
+/// Four of the five shapes panicked before this guard existed. `null` did
+/// not: it auto-vivified into `{"system":[…]}`. That case therefore pins a
+/// deliberate behaviour change, not pre-existing behaviour.
 #[test]
 fn oauth_system_prompt_leaves_non_object_body_untouched() {
     for raw in NON_OBJECT_JSON_BODIES {
@@ -14839,9 +14843,10 @@ fn oauth_system_prompt_leaves_non_object_body_untouched() {
 
 /// A valid-JSON non-object body on `/v1/messages` must produce an HTTP
 /// response — a 400 in Anthropic's error envelope — rather than a panicked
-/// request task and a dropped connection. Drives the real router with an
-/// OAuth account so the injection path is live, and pins that the upstream
-/// is never contacted.
+/// request task and a dropped connection. Drives the real router and pins
+/// that the upstream is never contacted. The rejection fires before account
+/// selection, so the endpoint's token kind is irrelevant here; the OAuth
+/// token only documents which path used to panic.
 #[tokio::test]
 async fn proxy_rejects_non_object_json_body_with_envelope_400() {
     use std::sync::atomic::Ordering;
