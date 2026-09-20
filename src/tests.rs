@@ -22747,3 +22747,190 @@ fn stripped_field_names_are_sanitized() {
     // (which would panic); what is left is a legitimate key.
     assert_eq!(sanitize_metric_key("café", 4), "caf");
 }
+
+/// Adversarial-review probe (Helly R, delta pass on `7e2ebb5`), adopted as a
+/// permanent regression. `strip_orphaned_beta_body_fields` hand-writes its
+/// output object — keys re-escaped, values spliced as raw bytes — and manual
+/// JSON emission is exactly where a key containing a quote or a newline, or a
+/// value containing `}","model":"…`, gets a chance to break out of the string
+/// it was written into. The `\u006dodel` case is the subtle one: serde decodes
+/// the key, so an escaped spelling collapses onto a literal `model` already
+/// present and the output carries the duplicate — legal JSON, last-wins at the
+/// parser, and identical to how the upstream would have read the input.
+///
+/// The second loop pins the refusal cases: a body that is not a JSON object,
+/// has nothing to remove, or does not parse must forward untouched rather than
+/// be rewritten into something subtly different.
+#[test]
+fn raw_object_reemission_survives_hostile_keys_and_values() {
+    let dropped = vec!["unknown-beta".to_string()];
+    let cases = [
+        (r#"{"orphan":1}"#, r#"{}"#),
+        (
+            r#"{"\u006dodel":"a","orphan":1,"model":"b"}"#,
+            r#"{"model":"a","model":"b"}"#,
+        ),
+        (
+            r#"{"messages":[],"orphan":1,"orphan":2}"#,
+            r#"{"messages":[]}"#,
+        ),
+        (
+            r#"{"model":"a","evil\"key\n":0,"messages":[ {"x":1,"x":2,"text":"}\",\"model\":\"injected"} ]}"#,
+            r#"{"model":"a","messages":[ {"x":1,"x":2,"text":"}\",\"model\":\"injected"} ]}"#,
+        ),
+        (
+            r#"{"metadata":{"n":18446744073709551617,"decimal":0.123456789012345678901,"minus":-0,"exp":1e+009,"text":"\u0061\/b"},"orphan":null}"#,
+            r#"{"metadata":{"n":18446744073709551617,"decimal":0.123456789012345678901,"minus":-0,"exp":1e+009,"text":"\u0061\/b"}}"#,
+        ),
+        (
+            r#"{"messages":[],"metadata":null,"stream":false,"orphan":[{"model":"no"}]}"#,
+            r#"{"messages":[],"metadata":null,"stream":false}"#,
+        ),
+    ];
+    for (input, expected) in cases {
+        let (out, removed) = strip_orphaned_beta_body_fields(
+            &bytes::Bytes::copy_from_slice(input.as_bytes()),
+            "oauth-2025-04-20",
+            &dropped,
+        )
+        .unwrap();
+        assert_eq!(&out[..], expected.as_bytes(), "input: {input}");
+        assert!(!removed.is_empty());
+        assert!(serde_json::from_slice::<TopLevelObject>(&out).is_ok());
+    }
+    for input in [
+        "{}",
+        "[]",
+        "null",
+        r#"{"messages":[]}"#,
+        r#"{"orphan":1,}"#,
+        r#"{"orphan":1} {"model":"second"}"#,
+        r#"{"messages":"\ud800","orphan":1}"#,
+    ] {
+        let result = strip_orphaned_beta_body_fields(
+            &bytes::Bytes::copy_from_slice(input.as_bytes()),
+            "oauth-2025-04-20",
+            &dropped,
+        );
+        // RawValue may preserve a syntactically valid unpaired surrogate value;
+        // it must never decode it into a different string.
+        if input.contains("ud800") {
+            if let Some((out, _)) = result {
+                assert!(String::from_utf8_lossy(&out).contains("\\ud800"));
+            }
+        } else {
+            assert!(result.is_none(), "input: {input}");
+        }
+    }
+}
+
+/// Adversarial-review probe (Helly R, delta pass), adopted. Positive controls
+/// for the two policy rules, stated as behaviour rather than as the absence of
+/// the old defects: a known surviving family keeps its field while an orphan
+/// in the same body goes, an unrecognised surviving family disables the strip
+/// regardless of where it sits in the header, and the counter totals exactly
+/// across batches above and below the per-request cap (0 + 8 + 9 + 100 = 117
+/// removals, overflow included).
+#[test]
+fn surviving_families_and_strip_counter_positive_controls() {
+    let input = bytes::Bytes::from_static(br#"{"fallback_credit_token":{"token":"credit","mode":"strict"},"speed":"fast","orphan":1}"#);
+    let dropped = vec!["unknown-beta".to_string()];
+    let (out, removed) = strip_orphaned_beta_body_fields(
+        &input,
+        " fallback-credit-2026-07-01,fast-mode-2026-02-01,oauth-2025-04-20 ",
+        &dropped,
+    )
+    .unwrap();
+    assert_eq!(removed, vec!["orphan"]);
+    assert_eq!(
+        &out[..],
+        br#"{"fallback_credit_token":{"token":"credit","mode":"strict"},"speed":"fast"}"#
+    );
+    for flags in [
+        "mcp-client-2025-11-20,oauth-2025-04-20",
+        "oauth-2025-04-20,mcp-client-2025-11-20",
+        "fast-mode-2026-02-01,future-beta",
+    ] {
+        assert!(strip_orphaned_beta_body_fields(&input, flags, &dropped).is_none());
+    }
+    let state = test_state_with(vec![]);
+    for n in [0, 8, 9, 100] {
+        let removed = (0..n).map(|i| format!("key_{i}")).collect::<Vec<_>>();
+        state.record_stripped_body_fields("test", &removed, &dropped);
+    }
+    assert_eq!(
+        state
+            .beta_body_fields_stripped
+            .lock()
+            .unwrap()
+            .values()
+            .sum::<u64>(),
+        117
+    );
+}
+
+/// Adversarial-review probe (Helly R, delta pass), adopted. End-to-end through
+/// the router against a no-rewrite control, which is the part the unit tests
+/// cannot show: that the bytes reaching the upstream are the client's own.
+///
+/// It also closes a blind spot the fix itself created — now that a surviving
+/// `fallback-credit-*` protects its token, the original defect-asserting input
+/// no longer triggers a rewrite at all, so an orphan (`unknown_config`) has to
+/// be added deliberately and the strip counter checked, or this would pass by
+/// doing nothing.
+#[tokio::test]
+async fn full_router_rewrite_preserves_client_bytes() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = seen.clone();
+    let upstream = serve(Router::new().fallback(any(move |body: bytes::Bytes| {
+        let sink = sink.clone();
+        async move {
+            sink.lock()
+                .unwrap()
+                .push(String::from_utf8(body.to_vec()).unwrap());
+            (
+                [("content-type", "application/json")],
+                r#"{"type":"message","content":[],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+            )
+        }
+    })))
+    .await;
+    let mut ep = mk_endpoint("acct", "sk-ant-oat01-test");
+    ep.base_url = format!("http://{upstream}");
+    let state = Arc::new(AppState {
+        endpoints: vec![ep],
+        auto_cache: false,
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state.clone())).await;
+    let prefix = r#"{"model":"claude-opus-4-7","system":"You are Claude Code, Anthropic's official CLI for Claude.","messages":[ {"role":"assistant","content":[{"type":"tool_use","id":"t","name":"lookup","input":{"record_id":18446744073709551617,"text":"\u0061"}}]}, {"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"found"}]} ],"max_tokens":1,"fallback_credit_token":"credit""#;
+    let control = format!("{prefix}}}");
+    let orphan = format!("{prefix},\"unknown_config\":{{\"on\":true}}}}");
+    let client = Client::new();
+    for body in [&control, &orphan] {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .header(
+                "anthropic-beta",
+                "fallback-credit-2026-07-01,mid-conversation-tool-changes-2026-07-01",
+            )
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = resp.bytes().await.unwrap();
+    }
+    let captured = seen.lock().unwrap();
+    assert_eq!(captured[0], control);
+    assert_eq!(captured[1], control);
+    assert_eq!(
+        state
+            .beta_body_fields_stripped
+            .lock()
+            .unwrap()
+            .get("unknown_config"),
+        Some(&1)
+    );
+}
