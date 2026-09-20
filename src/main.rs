@@ -7222,10 +7222,8 @@ impl AppState {
                 "rate_limit_error",
                 "daily token budget exceeded",
             );
-            resp.headers_mut().insert(
-                "retry-after",
-                HeaderValue::from_str(&retry_after.to_string()).unwrap(),
-            );
+            resp.headers_mut()
+                .insert("retry-after", HeaderValue::from(retry_after));
             return Err(Box::new(resp));
         }
 
@@ -7241,10 +7239,8 @@ impl AppState {
                 "rate_limit_error",
                 &format!("utilization limit exceeded for client '{client_id}'"),
             );
-            resp.headers_mut().insert(
-                "retry-after",
-                HeaderValue::from_str(&retry_after.to_string()).unwrap(),
-            );
+            resp.headers_mut()
+                .insert("retry-after", HeaderValue::from(retry_after));
             return Err(Box::new(resp));
         }
 
@@ -7254,14 +7250,15 @@ impl AppState {
                 client_id = %client_id,
                 "rejected: emergency brake active"
             );
-            let mut resp = proxy_error_response(
+            // No `retry-after`: the brake is the same condition as
+            // `exhaustion_response`'s rate-limited branch — recovery is
+            // minutes to hours, and a short hint would tight-loop clients
+            // into a still-saturated pool. Fail fast instead.
+            return Err(Box::new(proxy_error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
                 "emergency: all accounts near exhaustion",
-            );
-            resp.headers_mut()
-                .insert("retry-after", HeaderValue::from_static("30"));
-            return Err(Box::new(resp));
+            )));
         }
 
         Ok(())
@@ -7982,10 +7979,18 @@ fn model_unsupported_response(model: &str, openai_shape: bool) -> Response {
         .into_response()
 }
 
-/// Anthropic-shaped JSON error envelope for every proxy-generated denial.
-/// Reused across all surfaces (native + OpenAI-compat): the denial is a
-/// proxy-level decision, not an upstream protocol artefact, and OpenAI SDKs
-/// parse `error.message` from either shape.
+/// Anthropic-shaped JSON error envelope for the proxy-generated admission
+/// denials (LAB-4129): `authenticate` 401, `pre_request_gate` 403/429,
+/// `reserve_request_body` 503, `read_body_bounded` 408, and the
+/// untranslatable-request 400. Other proxy-generated errors (retry
+/// exhaustion, the failed-auth throttle, bad-body 400) still return
+/// `text/plain`.
+///
+/// Deliberately NOT surface-shaped, unlike `guard_blocked_response` and
+/// `model_unsupported_response`: those carry a machine-readable cause in
+/// `error.code` that OpenAI-compat clients match on. For these denials the
+/// status code is the signal — OpenAI SDKs map it to the exception class and
+/// read `error.message`, which both envelope shapes carry.
 fn proxy_error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
     (
         status,

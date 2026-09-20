@@ -6151,6 +6151,12 @@ async fn body_memory_budget_sheds_oversized_with_503() {
         resp.headers().get("retry-after").is_some(),
         "memory-pressure 503 must carry Retry-After"
     );
+    assert_eq!(
+        resp.headers().get("content-type").map(|v| v.as_bytes()),
+        Some(&b"application/json"[..])
+    );
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["error"]["type"], "overloaded_error");
 }
 
 /// Control: with a generous budget the same request is served normally — the
@@ -6276,17 +6282,28 @@ async fn body_read_timeout_sheds_stalled_body_with_408() {
     .await
     .unwrap();
     // Send nothing further — the handler must time out rather than wait
-    // for the remaining 4080 bytes forever.
-    let mut buf = vec![0u8; 1024];
-    let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+    // for the remaining 4080 bytes forever. Read until the connection
+    // closes so the envelope body is complete, not just the status line.
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw))
         .await
         .expect("server must respond within the timeout, not hang")
         .unwrap();
-    let resp = String::from_utf8_lossy(&buf[..n]);
+    let resp = String::from_utf8_lossy(&raw);
     assert!(
         resp.starts_with("HTTP/1.1 408"),
         "stalled body must be shed with 408, got: {resp}"
     );
+    let (head, body) = resp
+        .split_once("\r\n\r\n")
+        .expect("response must have a header/body boundary");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: application/json"),
+        "408 must be content-type: application/json, got: {head}"
+    );
+    let json: serde_json::Value = serde_json::from_str(body).expect("408 body must be JSON");
+    assert_eq!(json["error"]["type"], "timeout_error");
     assert_eq!(
         state.inflight_body_bytes.load(Ordering::Relaxed),
         0,
@@ -18455,13 +18472,13 @@ async fn gate_denies_unreadable_model_for_restricted_client() {
         .await
         .expect_err("unknown model must be denied for a restricted client");
     assert_eq!(err.status(), StatusCode::FORBIDDEN);
-    let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let text = String::from_utf8_lossy(&body);
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "permission_error");
+    let text = json["error"]["message"].as_str().unwrap();
     assert!(
         text.contains("no model could be read"),
-        "body should explain the empty-model denial, got: {text}"
+        "message should explain the empty-model denial, got: {text}"
     );
 }
 
@@ -18514,12 +18531,11 @@ async fn denied_model_response_body_is_truncated() {
         .pre_request_gate("limited", &huge)
         .await
         .expect_err("oversized model must be denied");
-    let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
-        .await
-        .unwrap();
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["error"]["type"], "permission_error");
     assert!(
-        String::from_utf8_lossy(&body).chars().count() < 1_000,
-        "403 body must not echo the untruncated model"
+        json["error"]["message"].as_str().unwrap().chars().count() < 1_000,
+        "403 message must not echo the untruncated model"
     );
 }
 
@@ -18547,17 +18563,17 @@ async fn gate_denies_model_outside_client_allow_list_with_403_naming_both() {
         StatusCode::FORBIDDEN,
         "policy denial is 403, not 429 — 429 means 'retry later', which this never becomes"
     );
-    let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let text = String::from_utf8_lossy(&body);
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "permission_error");
+    let text = json["error"]["message"].as_str().unwrap();
     assert!(
         text.contains("limited"),
-        "body must name the client: {text}"
+        "message must name the client: {text}"
     );
     assert!(
         text.contains("claude-opus-5"),
-        "body must name the model: {text}"
+        "message must name the model: {text}"
     );
 }
 
@@ -18644,50 +18660,19 @@ fn model_denial_labels_are_bounded_by_other_overflow() {
 
 // ── LAB-4129: proxy-generated denials return Anthropic JSON envelope ──
 
-/// Parse a `Box<Response>` body into a JSON value, asserting it's valid JSON.
+/// Parse a proxy-generated denial into its JSON envelope, pinning AC-1 for
+/// every site that goes through it: `content-type: application/json` and a
+/// body that parses.
 async fn parse_error_envelope(resp: Box<Response>) -> serde_json::Value {
+    assert_eq!(
+        resp.headers().get("content-type").map(|v| v.as_bytes()),
+        Some(&b"application/json"[..]),
+        "denial must be content-type: application/json"
+    );
     let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .unwrap();
     serde_json::from_slice(&body).expect("denial must be valid JSON")
-}
-
-#[tokio::test]
-async fn gate_403_model_denial_returns_json_envelope() {
-    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
-    let err = state
-        .pre_request_gate("limited", "claude-opus-5")
-        .await
-        .expect_err("opus must be denied");
-    assert_eq!(err.status(), StatusCode::FORBIDDEN);
-    let json = parse_error_envelope(err).await;
-    assert_eq!(json["type"], "error");
-    assert_eq!(json["error"]["type"], "permission_error");
-    assert!(json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("limited"));
-    assert!(json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("claude-opus-5"));
-}
-
-#[tokio::test]
-async fn gate_403_unreadable_model_returns_json_envelope() {
-    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
-    let err = state
-        .pre_request_gate("limited", "")
-        .await
-        .expect_err("empty model must be denied");
-    assert_eq!(err.status(), StatusCode::FORBIDDEN);
-    let json = parse_error_envelope(err).await;
-    assert_eq!(json["type"], "error");
-    assert_eq!(json["error"]["type"], "permission_error");
-    assert!(json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("no model could be read"));
 }
 
 #[tokio::test]
@@ -18708,9 +18693,17 @@ async fn gate_429_budget_returns_json_envelope_with_retry_after() {
         .await
         .expect_err("exceeded budget must be denied");
     assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = err
+        .headers()
+        .get("retry-after")
+        .expect("budget 429 must carry retry-after")
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("retry-after must be integer seconds");
     assert!(
-        err.headers().get("retry-after").is_some(),
-        "budget 429 must carry retry-after"
+        (1..=86400).contains(&retry_after),
+        "budget retry-after must be seconds until the next UTC day, got {retry_after}"
     );
     let json = parse_error_envelope(err).await;
     assert_eq!(json["type"], "error");
@@ -18749,8 +18742,11 @@ async fn gate_429_utilization_returns_json_envelope() {
         .contains("utilization limit exceeded"));
 }
 
+/// The brake is the same condition as `exhaustion_response`'s rate-limited
+/// branch: recovery is minutes to hours, so a `retry-after` would tight-loop
+/// SDK clients into a still-saturated pool. It must fail fast — no hint.
 #[tokio::test]
-async fn gate_429_emergency_brake_returns_json_envelope_with_retry_after() {
+async fn gate_429_emergency_brake_returns_json_envelope_without_retry_after() {
     let now = AppState::now_epoch();
     let state = Arc::new(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
@@ -18765,11 +18761,10 @@ async fn gate_429_emergency_brake_returns_json_envelope_with_retry_after() {
         .await
         .expect_err("emergency brake must deny");
     assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
-    let retry = err
-        .headers()
-        .get("retry-after")
-        .expect("emergency brake 429 must carry retry-after");
-    assert_eq!(retry.to_str().unwrap(), "30");
+    assert!(
+        err.headers().get("retry-after").is_none(),
+        "emergency brake 429 must NOT carry retry-after (see exhaustion_response)"
+    );
     let json = parse_error_envelope(err).await;
     assert_eq!(json["type"], "error");
     assert_eq!(json["error"]["type"], "rate_limit_error");
