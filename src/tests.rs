@@ -19320,9 +19320,8 @@ fn oauth_beta_filter_keeps_claude_code_flag_set() {
         // body-paired (`safeguards`). Not in the 2.1.220 inventory.
         "auto-mode-classifier-2026-07-16",
         "dangerous-tool-use-2026-09-03",
-        // LAB-3964: per-turn family, all body-paired on the in-`messages`
-        // `role:"system"` entry (`tool_addition`/`tool_removal` blocks,
-        // `output_config.effort`, `output_config.timing`). 2.1.278 tokens.
+        // LAB-3964: per-turn family (2.1.278), body-paired — see
+        // DEFAULT_CLIENT_BETA_ALLOWLIST.
         "mid-conversation-tool-changes-2026-07-01",
         "per-turn-control-2026-07-01",
         "timing-2026-09-09",
@@ -19508,11 +19507,11 @@ async fn dropped_beta_flag_appears_in_metrics() {
     );
 }
 
-/// LAB-3963: the auto-mode classifier betas and their `safeguards` body must
-/// reach the upstream together through the real OAuth path (which
-/// re-serialises the body) — see `DEFAULT_CLIENT_BETA_ALLOWLIST` for why.
-#[tokio::test]
-async fn oauth_forwards_auto_mode_classifier_header_and_safeguards_body_together() {
+/// Body-paired beta families must reach the upstream header AND body together
+/// through the real OAuth path (which re-serialises the body) — see
+/// `DEFAULT_CLIENT_BETA_ALLOWLIST` for why. Asserts every flag is forwarded
+/// as an exact token and `must_contain` survives in the body byte-identical.
+async fn assert_oauth_forwards_betas_with_body(flags: &[&str], body: String, must_contain: &str) {
     let (upstream_url, mut seen) =
         spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
     let state = Arc::new(AppState {
@@ -19525,76 +19524,6 @@ async fn oauth_forwards_auto_mode_classifier_header_and_safeguards_body_together
         ..test_state_base()
     });
     let addr = serve(build_router(state)).await;
-
-    // Compact JSON, as Claude Code sends it: the value must survive
-    // byte-for-byte whether the body is forwarded raw or re-serialised.
-    let safeguards = r#"[{"type":"dangerous_tool_use","classifier_context":"rm -rf ./build"}]"#;
-    let body = format!(
-        r#"{{"model":"test","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}],"safeguards":{safeguards}}}"#
-    );
-    let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/messages"))
-        .header("content-type", "application/json")
-        .header(
-            "anthropic-beta",
-            "auto-mode-classifier-2026-07-16,dangerous-tool-use-2026-09-03",
-        )
-        .body(body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-
-    let (headers, bytes) = seen.recv().await.expect("upstream must have been hit once");
-    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
-    let tokens: Vec<&str> = sent.split(',').map(str::trim).collect();
-    for flag in [
-        "auto-mode-classifier-2026-07-16",
-        "dangerous-tool-use-2026-09-03",
-    ] {
-        assert!(
-            tokens.contains(&flag),
-            "beta not forwarded as an exact token: {flag} (sent: {sent})"
-        );
-    }
-    let raw = std::str::from_utf8(&bytes).unwrap();
-    assert!(
-        raw.contains(&format!(r#""safeguards":{safeguards}"#)),
-        "safeguards must reach the upstream byte-identical:\n{raw}"
-    );
-}
-
-/// LAB-3964: the per-turn beta family and its body half — a `role:"system"`
-/// entry in `messages` carrying `tool_addition` blocks and an `output_config`
-/// with `effort` + `timing` — must reach the upstream together through the
-/// real OAuth path (which re-serialises the body). Shapes are from the Claude
-/// Code 2.1.278 binary; see `DEFAULT_CLIENT_BETA_ALLOWLIST` for why.
-#[tokio::test]
-async fn oauth_forwards_per_turn_betas_header_and_system_entry_body_together() {
-    let (upstream_url, mut seen) =
-        spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at(
-            "acct-a",
-            "sk-ant-oat01-test-aaa",
-            &upstream_url,
-        )],
-        auto_cache: false,
-        ..test_state_base()
-    });
-    let addr = serve(build_router(state)).await;
-
-    // Compact JSON, as Claude Code sends it: the entry must survive
-    // byte-for-byte whether the body is forwarded raw or re-serialised.
-    let system_entry = r#"{"role":"system","content":[{"type":"tool_addition","tool":{"type":"tool_reference","name":"mcp__x__y"}}],"output_config":{"effort":"high","timing":{"type":"now","now":"2026-09-20T10:00:00+10:00"}}}"#;
-    let body = format!(
-        r#"{{"model":"test","max_tokens":1,"messages":[{{"role":"user","content":"hi"}},{system_entry}]}}"#
-    );
-    let flags = [
-        "mid-conversation-tool-changes-2026-07-01",
-        "per-turn-control-2026-07-01",
-        "timing-2026-09-09",
-    ];
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .header("content-type", "application/json")
@@ -19610,15 +19539,56 @@ async fn oauth_forwards_per_turn_betas_header_and_system_entry_body_together() {
     let tokens: Vec<&str> = sent.split(',').map(str::trim).collect();
     for flag in flags {
         assert!(
-            tokens.contains(&flag),
+            tokens.contains(flag),
             "beta not forwarded as an exact token: {flag} (sent: {sent})"
         );
     }
     let raw = std::str::from_utf8(&bytes).unwrap();
     assert!(
-        raw.contains(system_entry),
-        "the role:\"system\" entry must reach the upstream byte-identical:\n{raw}"
+        raw.contains(must_contain),
+        "body must reach the upstream byte-identical:\n{raw}"
     );
+}
+
+/// LAB-3963: auto-mode classifier pair ↔ top-level `safeguards`.
+#[tokio::test]
+async fn oauth_forwards_auto_mode_classifier_header_and_safeguards_body_together() {
+    // Compact JSON, as Claude Code sends it.
+    let safeguards = r#"[{"type":"dangerous_tool_use","classifier_context":"rm -rf ./build"}]"#;
+    let body = format!(
+        r#"{{"model":"test","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}],"safeguards":{safeguards}}}"#
+    );
+    assert_oauth_forwards_betas_with_body(
+        &[
+            "auto-mode-classifier-2026-07-16",
+            "dangerous-tool-use-2026-09-03",
+        ],
+        body,
+        &format!(r#""safeguards":{safeguards}"#),
+    )
+    .await;
+}
+
+/// LAB-3964: per-turn family ↔ a `role:"system"` entry in `messages` carrying
+/// `tool_addition` blocks and `output_config` with `effort` + `timing`. Unlike
+/// the top-level `safeguards` key above, this pairing sits INSIDE `messages`,
+/// which the auto-cache path mutates — so it gets its own byte-identical check.
+#[tokio::test]
+async fn oauth_forwards_per_turn_betas_header_and_system_entry_body_together() {
+    let system_entry = r#"{"role":"system","content":[{"type":"tool_addition","tool":{"type":"tool_reference","name":"mcp__x__y"}}],"output_config":{"effort":"high","timing":{"type":"now","now":"2026-09-20T10:00:00+10:00"}}}"#;
+    let body = format!(
+        r#"{{"model":"test","max_tokens":1,"messages":[{{"role":"user","content":"hi"}},{system_entry}]}}"#
+    );
+    assert_oauth_forwards_betas_with_body(
+        &[
+            "mid-conversation-tool-changes-2026-07-01",
+            "per-turn-control-2026-07-01",
+            "timing-2026-09-09",
+        ],
+        body,
+        system_entry,
+    )
+    .await;
 }
 
 /// Panel follow-up (LAB-1191): a client flag that IS one of the required
