@@ -575,6 +575,61 @@ past 64 distinct pairs lumps into a single global
 pre-claim the overflow key. `anthropic_client_model_token_usage_total`
 shares the same overflow scheme (bucket at 256 + 1 series).
 
+### Per-claim rate-limit visibility
+
+The API reports model-specific sub-budgets ("claims") alongside the general
+5h/7d windows. Each claim's utilization and waste risk have always been on
+`/metrics`; its **status** and **reset** are exported too:
+
+| Series | Meaning |
+|:-------|:--------|
+| `anthropic_claim_rate_limit_status{account,claim}` | Status ordinal — `0=allowed, 1=warning, 2=throttled, 3=rejected`. Same encoding as `anthropic_account_rate_limit_status`. |
+| `anthropic_claim_reset_seconds{account,claim}` | Seconds until that claim's window resets. Omitted (not zeroed) once the reset is in the past. |
+
+Status is **not** derivable from utilization in either direction, so read it
+rather than thresholding the percentage: an account can sit at 0.98 and still
+be `allowed_warning` — the router keeps routing to it — while another reads
+1.0 and is `rejected`, which makes the router hard-skip it for that claim.
+
+Across replicas these are gauges mirroring the same upstream claim, so
+aggregate with `max by (account, claim)`; `sum` multiplies the reading by the
+replica count.
+
+The `claim` label comes from the upstream `representative-claim` header,
+never from client input, but it is still an unvalidated remote string. It is
+truncated to 64 characters, and each account retains at most 32 distinct
+**unreserved** claim keys. Reserved keys — the four that gate all traffic plus
+the model-band carve-out — are always admitted, so the hard bound is 37 per
+account. That bound holds on the live header path and on the two paths that
+restore the map whole (the persisted state file and the cross-replica mirror),
+so a map written by an older build cannot restore unbounded.
+
+Keys already present keep updating past the cap; a genuinely new one past it is
+dropped, and the refusal is logged once per account rather than once per
+request. Unlike the caller-labelled counters above, overflow is *not* folded
+into an `_other` bucket: both routing lookups match exact keys and the
+emergency brake's input is allowlist-filtered, so an unknown key is already
+inert to routing and a bucket would only add a fake claim to the metrics.
+Reserving the keys that are *not* inert is what makes the cap safe — without
+that, a flood of unknown keys could lock out `seven_day` itself, and an account
+with no derivable weekly utilization routes as though it had no weekly limit.
+
+### Pool exhaustion
+
+`anthropic_pool_exhausted_total{kind}` counts the responses this proxy
+generated itself because no endpoint could serve the request:
+
+| `kind` | Response | Cause |
+|:-------|:---------|:------|
+| `rate_limited` | `429 exhausted all endpoints` (no `Retry-After`) | Every eligible endpoint was rate-limited or gated, or a retry round saw a 529. |
+| `transient` | `503 + Retry-After: 1` | Every eligible endpoint failed in transport, with no 529. |
+
+The per-account gauges describe the pool's *state*; this counter is the only
+signal that a caller was actually turned away because of it. Both label values
+are emitted from process start, so a flat zero is a measurement rather than an
+absence of data. These are independent per-replica event counts — aggregate
+with `sum by (kind)`, where `max` would undercount.
+
 ### OpenAI JSON-mode compatibility
 
 > [!IMPORTANT]
