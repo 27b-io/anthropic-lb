@@ -383,8 +383,9 @@ can steer are locked down by default:
   as a `502` with a distinct log line instead of re-sending credentials to
   the `Location` target.
 - **Response headers are allow-listed.** Only `content-type`,
-  `content-length`, `cache-control`, `request-id`, and `retry-after` are
-  reflected to callers (plus the proxy's own `x-budget-status`).
+  `content-length`, `cache-control`, `request-id`, `retry-after`, and
+  `x-should-retry` are reflected to callers (plus the proxy's own
+  `x-budget-status`).
   `anthropic-ratelimit-*` (the pooled capacity of every account),
   `set-cookie`, and org-identifying headers are stripped;
   `expose_upstream_ratelimit_headers = true` restores the ratelimit
