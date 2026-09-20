@@ -14855,6 +14855,141 @@ fn oauth_system_prompt_detected_in_later_block() {
     );
 }
 
+/// The three identity prompts shipped by Claude Code 2.1.x. Only the first
+/// matches `OAUTH_SYSTEM_PROMPT`; the other two must trigger injection, and
+/// the sentinel must land AFTER the attribution block, not before it.
+const CC_2_1_PERSONAS: [&str; 3] = [
+    "You are Claude Code, Anthropic's official CLI for Claude.",
+    "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+];
+
+const CC_ATTRIBUTION_BLOCK: &str =
+    "x-anthropic-billing-header: cc_version=2.1.274.15a; cc_entrypoint=sdk-cli;";
+
+/// Regression (LAB-4127): the upstream strips the attribution block only when
+/// it is system[0]. Prepending the sentinel displaced it on every OAuth
+/// request whose persona did not match the sentinel.
+#[test]
+fn oauth_system_prompt_inserted_after_leading_attribution_block() {
+    for persona in CC_2_1_PERSONAS {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": [
+                {"type": "text", "text": CC_ATTRIBUTION_BLOCK},
+                {"type": "text", "text": persona, "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+        inject_oauth_system_prompt(&mut body);
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(
+            system[0]["text"].as_str().unwrap(),
+            CC_ATTRIBUTION_BLOCK,
+            "attribution block must stay at system[0] for persona {persona:?}"
+        );
+        if persona.starts_with(OAUTH_SYSTEM_PROMPT) {
+            assert_eq!(system.len(), 2, "legacy persona is the sentinel: no-op");
+        } else {
+            assert_eq!(
+                system.len(),
+                3,
+                "persona {persona:?} must trigger injection"
+            );
+            assert_eq!(system[1]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
+            assert_eq!(system[2]["text"].as_str().unwrap(), persona);
+            assert!(
+                system[2].get("cache_control").is_some(),
+                "client's cache_control must move with its block"
+            );
+        }
+    }
+}
+
+#[test]
+fn oauth_system_prompt_only_leading_attribution_block_is_kept_first() {
+    // Attribution block not at index 0: the strip cannot fire anyway, so the
+    // sentinel goes to index 0 as before. No reordering of client blocks.
+    let mut body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "system": [
+            {"type": "text", "text": CC_2_1_PERSONAS[2]},
+            {"type": "text", "text": CC_ATTRIBUTION_BLOCK}
+        ],
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 5
+    });
+    inject_oauth_system_prompt(&mut body);
+    let system = body["system"].as_array().unwrap();
+    assert_eq!(system.len(), 3);
+    assert_eq!(system[0]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
+    assert_eq!(system[1]["text"].as_str().unwrap(), CC_2_1_PERSONAS[2]);
+    assert_eq!(system[2]["text"].as_str().unwrap(), CC_ATTRIBUTION_BLOCK);
+}
+
+/// Full proxy roundtrip on an OAuth account: the body the upstream receives
+/// keeps the attribution block at system[0] with the sentinel at system[1].
+#[tokio::test]
+async fn proxy_oauth_account_keeps_attribution_block_first() {
+    let seen_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+    let seen_body_clone = seen_body.clone();
+    let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+        let seen_body = seen_body_clone.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let body_bytes = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES)
+                .await
+                .unwrap();
+            *seen_body.lock().unwrap() = Some(body_bytes.to_vec());
+            mock_upstream_handler(Request::from_parts(parts, Body::empty())).await
+        }
+    }));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let oauth_ep = mk_endpoint_at(
+        "oauth-acct",
+        "sk-ant-oat01-test-token",
+        &format!("http://{}", mock_addr),
+    );
+    let state = Arc::new(AppState {
+        endpoints: vec![oauth_ep],
+        state_path: PathBuf::from("/tmp/anthropic-lb-oauth-attribution-test.state.json"),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+
+    let request = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "system": [
+            {"type": "text", "text": CC_ATTRIBUTION_BLOCK},
+            {"type": "text", "text": CC_2_1_PERSONAS[2], "cache_control": {"type": "ephemeral"}}
+        ],
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 5
+    });
+    let resp = Client::new()
+        .post(format!("http://{}/v1/messages", addr))
+        .header("content-type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let captured = seen_body.lock().unwrap().clone().expect("upstream body");
+    let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    let system = forwarded["system"].as_array().unwrap();
+    assert_eq!(system.len(), 3);
+    assert_eq!(system[0]["text"].as_str().unwrap(), CC_ATTRIBUTION_BLOCK);
+    assert_eq!(system[1]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
+    assert_eq!(system[2]["text"].as_str().unwrap(), CC_2_1_PERSONAS[2]);
+}
+
 /// Regression: full proxy roundtrip with OAuth account where the CC prompt
 /// is at system[1+]. Verifies the proxy does not re-serialize the body
 /// (which would break upstream prompt cache matching).
