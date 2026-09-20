@@ -457,8 +457,12 @@ carries a Messages-shaped `messages` **array** — `/v1/messages`,
 translation to the Messages shape, so the same rules apply to both APIs). A
 request with no body, such as `GET /v1/models`, has nothing to scan and passes
 through. Content the Messages shape does not carry is not scanned: fields
-translation drops outright (`messages[].name`, the top-level `user`), and
-content blocks of a type the scanner does not read.
+translation drops outright (`messages[].name`, the top-level `user`), content
+blocks of a type the scanner does not read, and a `messages` array whose
+elements the scanner cannot resolve to a newest `user` turn — elements that
+are not role objects, a `role` it does not recognise, or a `content` that is
+neither a string nor a block array. A body with no `messages` field at all
+(`/v1/complete`'s `prompt`, batch requests) is likewise unscanned.
 
 ### Per-client policy
 
@@ -503,12 +507,23 @@ same 400 rather than forwarded unscanned:
 
 - the body is not JSON — a parse differential must not smuggle content past the
   scan; this includes multipart uploads such as `/v1/files`;
-- on `/v1/chat/completions`, `messages` is not an array, or a message carries a
-  role outside `system`/`user`/`assistant`/`tool` — two shapes translation
-  cannot carry into the Messages shape the scanner reads, while an
-  `openai`-protocol endpoint forwards the client's original bytes. These two
-  are an enumeration, not a general rule: the unscanned content named under
-  **What it scans** above is not rejected;
+- `messages` is present but is not an array — a string, an object, a number,
+  `null`. The scanner reads that field as an array, so none of it reaches the
+  scan while all of it reaches the upstream. This applies on every path. A body
+  carrying **no** `messages` key is not rejected, on any path including
+  `/v1/messages`: the proxy serves every Anthropic endpoint through one
+  handler, and most of them (`/v1/complete`, `/v1/models`) never send the
+  field. Note the narrowness — `messages` can be an **array** and still be
+  unreadable (elements that are not role objects, a `content` the scanner
+  cannot parse); those are not rejected either, and are listed under **What it
+  scans** above;
+- on `/v1/chat/completions` only, `messages` is absent, or a message carries a
+  role outside `system`/`user`/`assistant`/`tool` — that endpoint is a single
+  API which requires the field, and both shapes are lost translating to the
+  Messages document the scanner reads while an `openai`-protocol endpoint
+  forwards the client's original bytes. These are an enumeration, not a general
+  rule: the unscanned content named under **What it scans** above is not
+  rejected;
 - the newest-turn content exceeded the scan limit, so its tail was never
   inspected — otherwise padding past the limit would bypass enforcement.
 

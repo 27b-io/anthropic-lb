@@ -15547,6 +15547,14 @@ async fn guard_block_fails_closed_on_unmapped_openai_role() {
         400,
         "unmapped role must fail closed under block"
     );
+    // LAB-4322 gave each fail-closed cause its own reason. Pinned here because
+    // the whole point of that split is that a client debugging this one is not
+    // sent hunting for a JSON syntax error that does not exist.
+    let err: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        err["error"]["message"], "request carries an OpenAI message role the scanner cannot read",
+        "the role reason must not masquerade as a parse failure, got {err}"
+    );
     assert!(
         captured.lock().await.is_empty(),
         "an unscannable chat-completions body must never reach the upstream under block"
@@ -15620,6 +15628,11 @@ async fn guard_block_fails_closed_on_non_array_openai_messages() {
             err["error"]["code"], "guard_blocked",
             "{shape}: OpenAI error envelope expected, got {err}"
         );
+        assert_eq!(
+            err["error"]["message"],
+            "request `messages` is missing or not an array and cannot be scanned",
+            "{shape}: the shape reason must not masquerade as a parse failure"
+        );
         assert!(
             !err.to_string().contains(secret),
             "{shape}: the block response must never echo client text"
@@ -15683,6 +15696,128 @@ async fn guard_non_block_forwards_non_array_openai_messages_byte_identically() {
             "{policy} forwards the original bytes byte-identically"
         );
     }
+}
+
+/// LAB-4341: on the native surface the forwarded document IS the unscanned
+/// one, so a `messages` the scanner cannot read as an array puts every
+/// character of it on the wire. That the upstream would reject the shape
+/// itself is no defence — the bytes have already left.
+///
+/// Scope: this pins the PRESENT-and-not-an-array shape only. An array that is
+/// itself unreadable still forwards; see `guard_messages_wrong_shape`.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_fails_closed_on_non_array_native_messages() {
+    let secret = AWS_DOCS_EXAMPLE_SECRET_KEY;
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-shape.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+
+    let bodies = [
+        (
+            "string",
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 5,
+                "messages": format!("aws_secret_access_key = \"{secret}\"")}),
+        ),
+        (
+            "object",
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 5,
+                "messages": {"role": "user", "content": format!("key {secret}")}}),
+        ),
+        (
+            "null",
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 5,
+                "messages": serde_json::Value::Null}),
+        ),
+    ];
+
+    for (shape, body) in bodies {
+        let resp = Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .header("x-api-key", "block-key")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            400,
+            "{shape} `messages` is unscannable and must fail closed under block"
+        );
+        let err: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            err["error"]["type"], "guard_blocked",
+            "{shape}: native Anthropic error envelope expected, got {err}"
+        );
+        assert_eq!(
+            err["error"]["message"],
+            "request `messages` is missing or not an array and cannot be scanned",
+            "{shape}: the shape reason must not masquerade as a parse failure"
+        );
+        assert!(
+            !err.to_string().contains(secret),
+            "{shape}: the block response must never echo client text"
+        );
+        assert!(
+            captured.lock().await.is_empty(),
+            "{shape}: not one byte may reach the upstream unscanned"
+        );
+    }
+}
+
+/// The non-regression half, and the reason the predicate keys on PRESENT-and-
+/// wrong-shape rather than on "not an array": `proxy_handler` is the router's
+/// `.fallback`, so a JSON body with no `messages` key reaches it routinely and
+/// must still forward. Failing those closed takes every non-Messages endpoint
+/// offline for `block` clients — this test goes red against exactly that.
+///
+/// The body carries no request text on purpose. `/v1/complete`'s `prompt` is
+/// unscanned user content, and a test asserting that a body WITH content must
+/// forward would be pinning a leak as correct.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_forwards_fallback_json_body_without_messages() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-no-messages.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+
+    // A non-Messages API shape: valid JSON, no `messages` key, no content.
+    let raw = r#"{"model":"claude-2.1","max_tokens_to_sample":5}"#;
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/complete"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "block-key")
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "a fallback body with no `messages` key must not fail closed under block"
+    );
+    assert_eq!(
+        captured.lock().await.as_slice(),
+        raw.as_bytes(),
+        "the body must be forwarded byte-identically"
+    );
 }
 
 /// Shadow-mode counterpart on the OpenAI-compat surface: `annotate` forwards
