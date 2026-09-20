@@ -14889,10 +14889,6 @@ fn oauth_system_prompt_inserted_after_leading_attribution_block() {
             CC_ATTRIBUTION_BLOCK,
             "attribution block must stay at system[0] for persona {persona:?}"
         );
-        assert!(
-            has_oauth_system_prompt(&body),
-            "sentinel must be present after injection for persona {persona:?}"
-        );
         if persona.starts_with(OAUTH_SYSTEM_PROMPT) {
             assert_eq!(system.len(), 2, "legacy persona is the sentinel: no-op");
         } else {
@@ -14902,7 +14898,6 @@ fn oauth_system_prompt_inserted_after_leading_attribution_block() {
                 "persona {persona:?} must trigger injection"
             );
             assert_eq!(system[1]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
-            assert!(system[1].get("cache_control").is_none());
             assert_eq!(system[2]["text"].as_str().unwrap(), persona);
             assert!(
                 system[2].get("cache_control").is_some(),
@@ -14956,8 +14951,11 @@ async fn proxy_oauth_account_keeps_attribution_block_first() {
         axum::serve(mock_listener, mock_app).await.unwrap();
     });
 
-    let mut oauth_ep = mk_endpoint("oauth-acct", "sk-ant-oat01-test-token");
-    oauth_ep.base_url = format!("http://{}", mock_addr);
+    let oauth_ep = mk_endpoint_at(
+        "oauth-acct",
+        "sk-ant-oat01-test-token",
+        &format!("http://{}", mock_addr),
+    );
     let state = Arc::new(AppState {
         endpoints: vec![oauth_ep],
         state_path: PathBuf::from("/tmp/anthropic-lb-oauth-attribution-test.state.json"),

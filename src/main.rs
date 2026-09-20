@@ -7312,11 +7312,11 @@ fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
                 ]);
             } else if let Some(arr) = system.as_array() {
                 // Keep a leading attribution block at index 0 (see ATTRIBUTION_BLOCK_PREFIX).
-                let at = usize::from(
-                    arr.first()
-                        .and_then(|b| b["text"].as_str())
-                        .is_some_and(|t| t.starts_with(ATTRIBUTION_BLOCK_PREFIX)),
-                );
+                let leads_with_attribution = arr
+                    .first()
+                    .and_then(|b| b["text"].as_str())
+                    .is_some_and(|t| t.starts_with(ATTRIBUTION_BLOCK_PREFIX));
+                let at = if leads_with_attribution { 1 } else { 0 };
                 let mut new_arr = arr.clone();
                 new_arr.insert(at, cc_block);
                 body["system"] = serde_json::Value::Array(new_arr);
