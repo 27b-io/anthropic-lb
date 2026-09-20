@@ -22703,3 +22703,133 @@ async fn hostile_claim_key_cannot_forge_metric_lines() {
         );
     }
 }
+
+/// The cap budgets UNRESERVED keys. Counting the whole map instead would let
+/// the five reserved keys eat the budget, admitting 27 unknown claims rather
+/// than the documented 32 — and would put the live path at odds with
+/// `bound_ingested_claims`, which has always counted this way.
+#[tokio::test]
+async fn claim_cap_budgets_unreserved_keys_only() {
+    let state = test_state_with(vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")]);
+    let now_epoch = AppState::now_epoch();
+
+    // All five reserved keys first, so they are present when the cap is tested.
+    state
+        .update_rate_info(0, &claim_headers(None, "0.10", now_epoch))
+        .await; // "seven_day"
+    for key in ["seven_day_sonnet", "seven_day_opus", "seven_day_haiku"] {
+        state
+            .update_rate_info(0, &claim_headers(Some(key), "0.10", now_epoch))
+            .await;
+    }
+    let mut band = reqwest::header::HeaderMap::new();
+    band.insert(
+        "anthropic-ratelimit-unified-7d_oi-utilization",
+        HeaderValue::from_static("0.20"),
+    );
+    band.insert(
+        "anthropic-ratelimit-unified-7d_oi-reset",
+        HeaderValue::from_str(&(now_epoch + 3600).to_string()).unwrap(),
+    );
+    state.update_rate_info(0, &band).await;
+
+    {
+        let info = state.endpoints[0].rate_info.read().await;
+        assert_eq!(
+            info.claims_7d
+                .keys()
+                .filter(|k| claim_key_is_reserved(k))
+                .count(),
+            5,
+            "fixture should seed all five reserved keys"
+        );
+    }
+
+    // Exactly the documented unreserved budget.
+    for i in 0..MAX_CLAIMS_PER_ACCOUNT {
+        let claim = format!("seven_day_junk{i}");
+        state
+            .update_rate_info(0, &claim_headers(Some(&claim), "0.50", now_epoch))
+            .await;
+    }
+
+    let info = state.endpoints[0].rate_info.read().await;
+    let unreserved = info
+        .claims_7d
+        .keys()
+        .filter(|k| !claim_key_is_reserved(k))
+        .count();
+    assert_eq!(
+        unreserved, MAX_CLAIMS_PER_ACCOUNT,
+        "all {MAX_CLAIMS_PER_ACCOUNT} unreserved claims must be admitted even with \
+         the reserved set present"
+    );
+    assert_eq!(
+        info.claims_7d.len(),
+        MAX_CLAIMS_PER_ACCOUNT + 5,
+        "hard bound is the unreserved cap plus the five reserved keys"
+    );
+}
+
+/// `representative_claim` must be truncated wherever the claim map is ingested
+/// whole, not just on the header path: `metrics_gate_weight` looks the key up in
+/// `claims_7d`, whose keys `bound_ingested_claims` truncates. An untruncated
+/// copy misses its own entry and the routing-weight gauges then report a
+/// different claim than the router used. Exercises the persisted-state path; the
+/// Redis path applies the identical expression.
+#[tokio::test]
+async fn ingested_representative_claim_is_truncated_to_match_its_key() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let oversized = format!("seven_day_{}", "z".repeat(4096));
+    let expected: String = oversized
+        .chars()
+        .take(MAX_LABEL_CHARS)
+        .chain(['…'])
+        .collect();
+    let now_epoch = AppState::now_epoch();
+
+    // A state file as a pre-truncation build would have written it: raw key,
+    // raw representative claim.
+    let mut state = test_state_with(vec![]);
+    {
+        let st = Arc::get_mut(&mut state).unwrap();
+        st.state_path = tmp.path().to_path_buf();
+        st.endpoints.push(make_endpoint("ep1", Protocol::Anthropic));
+    }
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.representative_claim = Some(oversized.clone());
+        info.claims_7d.insert(
+            oversized.clone(),
+            ClaimWindowData {
+                utilization: Some(0.30),
+                reset: Some(now_epoch + 302_400),
+                status: Some("allowed".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+    }
+    state.save_state().await;
+
+    let mut state2 = test_state_with(vec![]);
+    {
+        let st = Arc::get_mut(&mut state2).unwrap();
+        st.state_path = tmp.path().to_path_buf();
+        st.endpoints.push(make_endpoint("ep1", Protocol::Anthropic));
+    }
+    state2.load_state().await;
+
+    let info = state2.endpoints[0].rate_info.read().await;
+    assert_eq!(
+        info.representative_claim.as_deref(),
+        Some(expected.as_str()),
+        "the restored representative claim must be truncated"
+    );
+    let rep = info.representative_claim.as_deref().unwrap();
+    assert!(
+        info.claims_7d.contains_key(rep),
+        "the representative claim must resolve to a key that exists, got {:?} against {:?}",
+        rep,
+        info.claims_7d.keys().collect::<Vec<_>>()
+    );
+}

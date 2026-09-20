@@ -572,10 +572,21 @@ fn claim_key_is_reserved(key: &str) -> bool {
 /// so a per-refusal line would let an upstream drive unbounded log volume —
 /// the same exhaustion class the cap itself closes.
 fn claim_admitted(info: &mut RateLimitInfo, key: &str, account: &str) -> bool {
-    if claim_key_is_reserved(key)
-        || info.claims_7d.len() < MAX_CLAIMS_PER_ACCOUNT
-        || info.claims_7d.contains_key(key)
-    {
+    if claim_key_is_reserved(key) || info.claims_7d.contains_key(key) {
+        return true;
+    }
+    // Count UNRESERVED keys only, matching `bound_ingested_claims`. Counting the
+    // whole map would let the reserved keys eat the budget, so an account
+    // carrying all five would admit 27 unknown claims rather than the
+    // documented 32 — and the live path would then disagree with the ingest
+    // path about the same bound. The map is at most 37 entries, so the scan is
+    // cheaper than the allocation it avoids.
+    let unreserved = info
+        .claims_7d
+        .keys()
+        .filter(|k| !claim_key_is_reserved(k))
+        .count();
+    if unreserved < MAX_CLAIMS_PER_ACCOUNT {
         return true;
     }
     if !info.claim_cap_warned {
@@ -2873,7 +2884,11 @@ impl AppState {
                 info.utilization = pa.utilization;
                 info.utilization_7d = pa.utilization_7d;
                 info.utilization_5h = pa.utilization_5h;
-                info.representative_claim = pa.representative_claim.clone();
+                // Truncated alongside the claim map below: `metrics_gate_weight`
+                // looks this key up in `claims_7d`, whose keys
+                // `bound_ingested_claims` truncates, so an untruncated copy
+                // would miss its own entry (same reason as the header path).
+                info.representative_claim = pa.representative_claim.as_deref().map(truncate_label);
                 info.reset_5h = pa.reset_5h;
                 info.status_5h = pa.status_5h.clone();
                 info.overage_in_use = pa.overage_in_use;
@@ -5544,7 +5559,10 @@ impl AppState {
                             info.status_5h = remote.status_5h;
                             info.status_7d = remote.status_7d;
                             info.claims_7d = bound_ingested_claims(remote.claims_7d);
-                            info.representative_claim = remote.representative_claim;
+                            // Truncated to match the keys `bound_ingested_claims`
+                            // just wrote — see the same pairing in `load_state`.
+                            info.representative_claim =
+                                remote.representative_claim.as_deref().map(truncate_label);
                             info.remaining_requests = remote.remaining_requests;
                             info.remaining_tokens = remote.remaining_tokens;
                             info.limit_requests = remote.limit_requests;
