@@ -429,6 +429,7 @@ fn test_state_base() -> AppState {
             .map(|s| s.to_string())
             .collect(),
         beta_flags_dropped: Mutex::new(HashMap::new()),
+        beta_body_fields_stripped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
         fast_mode_429: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
@@ -22269,4 +22270,268 @@ async fn pinned_client_spills_when_preferred_endpoint_at_paid_overage() {
         Some(0),
         "an overage-covered preferred endpoint must spill to free general-pool capacity"
     );
+}
+
+// ---------------------------------------------------------------------------
+// LAB-1261 — header/body coherence for the `anthropic-beta` allow-list.
+//
+// The 2026-08-01 fleet outage, LAB-2669 (`fast-mode`/`speed`) and LAB-3963
+// (`dangerous-tool-use`/`safeguards`) are all one defect: the filter edits the
+// header and forwards the body verbatim, so a PAIRED beta the allow-list does
+// not carry becomes a hard upstream 400 on every request instead of a feature
+// quietly turning off. These tests pin the fix for a flag family the LB has
+// never seen — no allow-list entry required.
+// ---------------------------------------------------------------------------
+
+/// Mock upstream modelling the ONE upstream behaviour this ticket is about:
+/// Anthropic rejects top-level body fields it does not recognise
+/// (`speed: Extra inputs are not permitted`). Returns 400 on any non-base
+/// field, 200 otherwise, and records what it was actually sent.
+///
+/// A mock that always 200s would pass whether or not the body was rewritten,
+/// which is the whole assertion — so the strictness is the test.
+async fn spawn_strict_anthropic_upstream() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    // Anthropic's rule, restated independently of the production tables so a
+    // wrong entry in `BETA_BODY_FIELDS` cannot make this mock agree with the
+    // code it is checking: a non-base top-level field is accepted only while
+    // the request still declares the beta that owns it.
+    const UPSTREAM_PAIRINGS: &[(&str, &str)] = &[("speed", "fast-mode-")];
+    let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let app = Router::new().fallback(any(
+        move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let declared: Vec<String> = headers
+                    .get_all("anthropic-beta")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .flat_map(|s| s.split(','))
+                    .map(|s| s.trim().to_string())
+                    .collect();
+                let parsed: serde_json::Value =
+                    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                sink.lock().unwrap().push(parsed.clone());
+                let extra: Vec<String> = parsed
+                    .as_object()
+                    .map(|o| {
+                        o.keys()
+                            .filter(|k| !BASE_BODY_FIELDS.contains(&k.as_str()))
+                            .filter(|k| {
+                                !UPSTREAM_PAIRINGS.iter().any(|(field, prefix)| {
+                                    field == k
+                                        && declared.iter().any(|d| d.starts_with(prefix))
+                                })
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(field) = extra.first() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        axum::response::AppendHeaders([("content-type", "application/json")]),
+                        format!(
+                            r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"{field}: Extra inputs are not permitted"}}}}"#
+                        ),
+                    )
+                        .into_response();
+                }
+                (
+                    StatusCode::OK,
+                    axum::response::AppendHeaders([("content-type", "application/json")]),
+                    r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+                )
+                    .into_response()
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), seen)
+}
+
+/// Drive one request through `forward_anthropic` against the strict upstream.
+/// Returns the response status and the body the upstream actually received.
+async fn forward_with_betas(
+    client_betas: &str,
+    body: &'static str,
+) -> (StatusCode, serde_json::Value) {
+    let (url, seen) = spawn_strict_anthropic_upstream().await;
+    let mut state = test_state_with(vec![]);
+    let mut ep = make_endpoint("acct", Protocol::Anthropic);
+    ep.base_url = url;
+    // `sk-ant-oat` is what arms the beta filter — an API-key endpoint does not
+    // filter at all, so it could not exercise this path.
+    ep.token = "sk-ant-oat01-test".to_string();
+    Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+    let parts = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("anthropic-beta", client_betas)
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    let body_bytes = bytes::Bytes::from_static(body.as_bytes());
+    let outcome = forward_anthropic(
+        &state,
+        &parts,
+        &body_bytes,
+        &body_bytes,
+        /* is_fast_mode */ false,
+        &state.endpoints[0],
+        0,
+        "req-1261",
+        "client-1",
+        "-",
+        &"127.0.0.1".parse().unwrap(),
+        "-",
+        "-",
+        "claude-opus-4-7",
+        None,
+        None,
+        Instant::now(),
+    )
+    .await;
+    let status = match outcome {
+        ForwardOutcome::Done(resp) => resp.status(),
+        _ => panic!("expected a completed response, got a retry/rotate outcome"),
+    };
+    let received = seen.lock().unwrap().first().cloned().unwrap_or_default();
+    (status, received)
+}
+
+/// AC-1 + AC-2 + AC-4: a PAIRED beta family the LB has never seen. The header
+/// is dropped (allow-list intact) and its orphaned body field goes with it,
+/// so the upstream sees a coherent request and answers 200 — where today it
+/// answers 400 for every request of that family, fleet-wide.
+#[tokio::test]
+async fn unknown_paired_beta_degrades_instead_of_400() {
+    let (status, sent) = forward_with_betas(
+        "totally-unknown-2026-09-01",
+        r#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1,"totally_unknown_config":{"mode":"on"}}"#,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an unknown paired beta must degrade to a working request, not a 400"
+    );
+    assert!(
+        sent.get("totally_unknown_config").is_none(),
+        "the orphaned body half must be stripped with its header: {sent}"
+    );
+    assert!(
+        sent.get("max_tokens").is_some() && sent.get("messages").is_some(),
+        "base schema fields must survive untouched: {sent}"
+    );
+}
+
+/// AC-1: the unpaired case — an unknown flag with no body counterpart. The
+/// header is still dropped, and the body must not be touched at all.
+#[tokio::test]
+async fn unknown_unpaired_beta_leaves_body_untouched() {
+    let (status, sent) = forward_with_betas(
+        "totally-unknown-2026-09-01",
+        r#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1,"temperature":1.0,"top_p":0.9}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        sent.get("temperature").and_then(|v| v.as_f64()),
+        Some(1.0),
+        "no body field may be collateral: {sent}"
+    );
+    assert_eq!(sent.get("top_p").and_then(|v| v.as_f64()), Some(0.9));
+}
+
+/// The over-strip guard, and the reason the surviving set is read off the
+/// OUTBOUND header rather than off config: Claude Code sends a dozen betas at
+/// once. When one unknown flag arrives alongside allow-listed paired ones,
+/// only the orphan's field may go — `speed` belongs to `fast-mode-*`, which
+/// survived, so it must survive too. Without this, the fix would silently
+/// disable working features on every mixed request.
+#[tokio::test]
+async fn surviving_paired_beta_keeps_its_body_field() {
+    let (status, sent) = forward_with_betas(
+        "fast-mode-2026-02-01,totally-unknown-2026-09-01",
+        r#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1,"speed":"fast","totally_unknown_config":{}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        sent.get("speed").and_then(|v| v.as_str()),
+        Some("fast"),
+        "a body field whose own flag survived must not be stripped: {sent}"
+    );
+    assert!(
+        sent.get("totally_unknown_config").is_none(),
+        "the orphaned field must still go: {sent}"
+    );
+}
+
+/// The hot path pays nothing. No drop means no parse, no re-serialize, and
+/// byte-identical forwarding — which also keeps prompt-cache prefixes intact.
+#[test]
+fn no_dropped_flag_means_no_body_rewrite() {
+    let body = bytes::Bytes::from_static(
+        br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1,"speed":"fast"}"#,
+    );
+    assert!(
+        strip_orphaned_beta_body_fields(&body, "fast-mode-2026-02-01,oauth-2025-04-20", &[])
+            .is_none(),
+        "nothing dropped → body must be forwarded verbatim"
+    );
+}
+
+/// Every field of the base schema survives a drop. This is the list the fix
+/// trades the flag-family enumeration for, so a typo in it is a silent
+/// feature amputation on any request carrying an unknown beta — pin it.
+#[test]
+fn base_schema_fields_are_never_stripped() {
+    let body: serde_json::Value = BASE_BODY_FIELDS
+        .iter()
+        .map(|f| ((*f).to_string(), serde_json::json!("x")))
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    let bytes = bytes::Bytes::from(serde_json::to_vec(&body).unwrap());
+    assert!(
+        strip_orphaned_beta_body_fields(&bytes, "", &["unknown-2026-01-01".to_string()]).is_none(),
+        "a body made only of base fields must survive a drop untouched"
+    );
+}
+
+/// The paired families the LB already knows: each one's body field is
+/// stripped when its own flag is dropped, and kept when it is not. Catches a
+/// `BETA_BODY_FIELDS` entry whose pattern no longer matches its allow-list
+/// counterpart.
+#[test]
+fn known_pairings_travel_together() {
+    for (pattern, field) in BETA_BODY_FIELDS {
+        let flag = pattern.replace('*', "2026-01-01");
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "claude-opus-4-7",
+                "messages": [],
+                "max_tokens": 1,
+                *field: "x",
+            }))
+            .unwrap(),
+        );
+        // Flag survived → field stays (no strip at all is a valid "stays").
+        let kept = strip_orphaned_beta_body_fields(&body, &flag, &["other-2026-01-01".to_string()]);
+        assert!(kept.is_none(), "{field} must survive while {flag} survives");
+        // Flag dropped → field goes with it.
+        let (rewritten, stripped) =
+            strip_orphaned_beta_body_fields(&body, "", std::slice::from_ref(&flag))
+                .unwrap_or_else(|| panic!("{field} must be stripped when {flag} is dropped"));
+        assert_eq!(stripped, vec![(*field).to_string()]);
+        let parsed: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert!(parsed.get(*field).is_none());
+    }
 }

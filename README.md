@@ -195,7 +195,7 @@ token = "sk-ant-api03-..."
 | `emergency_threshold` | `f64` | `0.88` | Utilization threshold for emergency brake |
 | `redis_url` | `String?` | `None` | Redis/Valkey URL for distributed state |
 | `expose_upstream_ratelimit_headers` | `bool` | `false` | Reflect upstream `anthropic-ratelimit-*` headers to callers — they reveal the pooled capacity of every account, so enable on trusted networks only |
-| `allowed_client_betas` | `[String]?` | built-in list | Client `anthropic-beta` flags forwarded upstream on OAuth endpoints (`*` suffix wildcard); a configured list **replaces** the built-in default — copy the defaults alongside additions. Unlisted flags are dropped, logged, and counted (`anthropic_beta_flag_dropped_total`) so a caller can't activate arbitrary beta features against the operator's accounts |
+| `allowed_client_betas` | `[String]?` | built-in list | Client `anthropic-beta` flags forwarded upstream on OAuth endpoints (`*` suffix wildcard); a configured list **replaces** the built-in default — copy the defaults alongside additions. Unlisted flags are dropped, logged, and counted (`anthropic_beta_flag_dropped_total`) so a caller can't activate arbitrary beta features against the operator's accounts. A drop also strips any top-level body field belonging to a dropped flag (`anthropic_beta_body_field_stripped_total`), so a paired beta degrades off instead of failing the request |
 | `endpoints[].name` | `String` | — | Display name for the endpoint |
 | `endpoints[].protocol` | `String` | `"anthropic"` | `"anthropic"` (default) or `"openai"` |
 | `endpoints[].base_url` | `String?` | `https://api.anthropic.com` | Base URL; required and must be `https://` for `openai` |
@@ -395,11 +395,22 @@ can steer are locked down by default:
   `anthropic_beta_flag_dropped_total{flag}`. The built-in default covers the
   flags the proxy itself needs, the flag families Claude Code sends, and
   `fast-mode-*`; the authoritative list is `DEFAULT_CLIENT_BETA_ALLOWLIST`
-  in `src/main.rs`. Some families pair with a request-body field (`fast-mode-*`
-  with top-level `speed: "fast"`; the auto-mode classifier pair
-  `dangerous-tool-use-*` + `auto-mode-classifier-*` with top-level
-  `safeguards`), and the body is forwarded verbatim — so dropping the header
-  alone is a hard upstream `400`, not a quiet downgrade.
+  in `src/main.rs`.
+- **A dropped flag takes its body field with it.** Some beta families pair a
+  header flag with a top-level request-body field that only exists when the
+  flag is declared (`fast-mode-*` with `speed`, `context-management-*` with
+  `context_management`, `dangerous-tool-use-*` with `safeguards`). Forwarding
+  that field without its flag is a hard upstream `400`, not a quiet downgrade,
+  so when the filter drops anything the proxy also removes every top-level
+  body field that is neither base `/v1/messages` schema nor owned by a flag
+  that survived the SAME request. The feature turns off; the request still
+  works — including for a beta family this proxy has never heard of, with no
+  allow-list change. Strips are counted in
+  `anthropic_beta_body_field_stripped_total{field}` and warned on first
+  sighting; a non-zero rate means a paired family is in live traffic and
+  belongs on `allowed_client_betas`. Nested pairings (`extended-cache-ttl-*`
+  → `cache_control.ttl`) are out of scope — they are on the default
+  allow-list and so are never dropped.
 - **A fast-mode `429` is forwarded to the caller, not treated as account
   exhaustion.** Fast mode (`speed: "fast"`) bills against its own rate bucket,
   separate from the account's 5h/7d windows, so a `429` on a fast request does
