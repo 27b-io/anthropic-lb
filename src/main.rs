@@ -571,8 +571,15 @@ impl BurnRate {
 const DEFAULT_EMERGENCY_THRESHOLD: f64 = 0.88;
 
 /// Claude Code system prompt required by the Anthropic API for OAuth tokens (sk-ant-oat*)
-/// to access sonnet/opus models. Must be the FIRST system block in the request.
+/// to access sonnet/opus models. Any position in the `system` array satisfies the upstream;
+/// it is inserted at index 0 unless a Claude Code attribution block already holds that slot.
 const OAUTH_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Prefix of the attribution block Claude Code sends as `system[0]` (client version +
+/// conversation fingerprint). The upstream strips it only when it arrives unchanged at
+/// index 0, so anything the proxy inserts must go AFTER it — otherwise the block reaches
+/// the model and the prompt-cache key.
+const ATTRIBUTION_BLOCK_PREFIX: &str = "x-anthropic-billing-header:";
 
 /// Max bytes of 429 response body to include in debug logs.
 const MAX_429_BODY_LOG_BYTES: usize = 512;
@@ -7250,8 +7257,10 @@ impl AppState {
 
 // ── OAuth system prompt injection ──────────────────────────────────
 
-/// Check whether the request body already contains the OAuth system prompt
-/// as a prefix of the first system block (string or array form).
+/// Check whether the request body already contains the OAuth system prompt:
+/// as a prefix of the `system` string, or as a prefix of ANY block in the
+/// `system` array. The whole array is scanned because Claude Code puts its
+/// attribution block first and the identity prompt after it.
 fn has_oauth_system_prompt(body: &serde_json::Value) -> bool {
     match body.get("system") {
         Some(system) if system.is_string() => system
@@ -7271,16 +7280,18 @@ fn has_oauth_system_prompt(body: &serde_json::Value) -> bool {
     }
 }
 
-/// Inject the Claude Code system prompt as the first system block.
+/// Inject the Claude Code system prompt into the `system` array.
 ///
-/// OAuth tokens (sk-ant-oat*) require this exact prompt as the first system
-/// block to access sonnet/opus models. Haiku works without it, but we inject
-/// unconditionally for OAuth accounts to keep things simple.
+/// OAuth tokens (sk-ant-oat*) require this exact prompt somewhere in `system`
+/// to access sonnet/opus models; it does not have to be first. Haiku works
+/// without it, but we inject unconditionally for OAuth accounts to keep
+/// things simple.
 ///
-/// The prompt is prepended to any existing system content:
 /// - No system field → creates `"system": [{"type":"text","text":"..."}]`
 /// - String system → converts to array with CC prompt first, original second
-/// - Array system → prepends CC prompt block if not already present
+/// - Array system → inserts the CC prompt at index 0, or at index 1 when
+///   `system[0]` is a Claude Code attribution block, so the upstream's
+///   positional strip of that block still fires
 fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
     if has_oauth_system_prompt(body) {
         return;
@@ -7300,9 +7311,14 @@ fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
                     {"type": "text", "text": text}
                 ]);
             } else if let Some(arr) = system.as_array() {
-                // Prepend CC prompt block
-                let mut new_arr = vec![cc_block];
-                new_arr.extend(arr.iter().cloned());
+                // Keep a leading attribution block at index 0 (see ATTRIBUTION_BLOCK_PREFIX).
+                let at = usize::from(
+                    arr.first()
+                        .and_then(|b| b["text"].as_str())
+                        .is_some_and(|t| t.starts_with(ATTRIBUTION_BLOCK_PREFIX)),
+                );
+                let mut new_arr = arr.clone();
+                new_arr.insert(at, cc_block);
                 body["system"] = serde_json::Value::Array(new_arr);
             }
         }
@@ -8942,7 +8958,7 @@ async fn proxy_handler(
                 body_bytes.to_vec()
             };
 
-            // Pre-compute OAuth variant with Claude Code system prompt prepended.
+            // Pre-compute OAuth variant with Claude Code system prompt inserted.
             // OAuth tokens (sk-ant-oat*) require this to access sonnet/opus models.
             // Skip injection when the client already includes the prompt — the
             // normal `bytes` payload (which preserves auto-cache mutations) is
