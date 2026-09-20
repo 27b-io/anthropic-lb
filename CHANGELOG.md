@@ -5,7 +5,7 @@
 
 ### ⚠ BREAKING CHANGES
 
-* **LAB-3214:** the `usage` INFO log line is gone. Each proxied request now emits one `proxied` (or `proxied (openai-compat)`) INFO line at completion, carrying the token fields (`input`, `output`, `cached`, `cache_write`) alongside the routing fields; error paths emit the same line with zeroed usage. The `fingerprint` line is DEBUG-only (its `fp` field rides on the `proxied` line since [#174](https://github.com/27b-io/anthropic-lb/issues/174)). Log consumers filtering on `usage` or `fingerprint` at the default level must filter on `proxied` instead. ([#172](https://github.com/27b-io/anthropic-lb/issues/172)) ([a0d0269](https://github.com/27b-io/anthropic-lb/commit/a0d0269d391c9d22144fa38ebebd338bd31db534))
+* **LAB-3214:** log consumers filtering on `usage` or `fingerprint` at INFO must filter on `proxied` (or `proxied (openai-compat)`) instead. The `usage` line is merged into one `proxied` line per request, emitted at completion with the token fields (names unchanged); error paths log it with zeroed usage. `usage` survives only on the `/upstream/<name>` fallback path. The `fingerprint` line is DEBUG-only; its `fp` rides on the native `/v1/messages` `proxied` line via [#174](https://github.com/27b-io/anthropic-lb/issues/174) (the openai-compat line carries no `fp`). Entry restored by hand: the malformed commit subject (`fix!(scope):`) hid this change from release-please, hence a patch release. ([#172](https://github.com/27b-io/anthropic-lb/issues/172)) ([a0d0269](https://github.com/27b-io/anthropic-lb/commit/a0d0269d391c9d22144fa38ebebd338bd31db534))
 
 
 ### Features

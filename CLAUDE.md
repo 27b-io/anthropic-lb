@@ -35,17 +35,23 @@ which triggers `release.yml` (build + crates.io) and `docker.yml`.
   `fix(LAB-932): ...`). Non-conventional subjects are invisible to
   release-please and produce no release. The repo squash-merges with the
   PR title as the subject and a blank body, so the PR title is the whole
-  commit message release-please sees.
+  commit message release-please sees unless the PR body carries an
+  override block (below).
 - **Scoped breaking changes use the spec form `type(scope)!: summary`**
   (e.g. `fix(LAB-3214)!: ...`). `type!(scope): ...` is NOT parsed —
-  release-please drops the commit from the notes entirely and skips the
-  version bump it should have caused (#172 vanished from 0.2.5 this way).
-- **`BREAKING CHANGE:` footers must go in the PR body**, inside a
-  `BEGIN_COMMIT_OVERRIDE ... END_COMMIT_OVERRIDE` block: the squash body
-  is blank, so a footer on a branch commit never reaches the squash
-  commit. release-please uses the block in place of the whole commit
-  message, so repeat the conventional header inside it, then the footer:
-  `fix(LAB-3214)!: summary` / blank line / `BREAKING CHANGE: what breaks`.
+  release-please silently drops the commit (no notes entry, no version
+  bump); #172 was missed this way and its 0.2.5 entry restored by hand.
+- **`BREAKING CHANGE:` footers go in the PR body** (the blank squash body
+  discards branch-commit footers), inside an override block. The block
+  replaces the whole commit message, so repeat the header:
+
+  ```
+  BEGIN_COMMIT_OVERRIDE
+  fix(LAB-3214)!: summary
+
+  BREAKING CHANGE: what breaks
+  END_COMMIT_OVERRIDE
+  ```
 - **Pre-1.0 is pinned**: breaking changes bump the minor (never to 1.0.0),
   features bump the patch, and 0.x GitHub releases are flagged pre-release.
 - **Releasing 1.0.0** is an explicit human act: land a commit with a
