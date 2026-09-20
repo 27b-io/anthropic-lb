@@ -2132,20 +2132,26 @@ impl AppState {
     /// secret" bypass). A body that parsed but carried no scannable text (e.g.
     /// an image-only turn) is NOT a scan failure and is allowed. Annotate /
     /// shadow mode never rejects — it measures best-effort.
+    ///
+    /// `unscannable` carries its own reason because the causes are not alike:
+    /// the body that did not parse and the body whose `messages` is the wrong
+    /// shape both reach here, and telling a client the second was a parse
+    /// failure sends whoever debugs it after a JSON syntax error that is not
+    /// there. Reasons are `&'static str` — no request content may enter them.
     #[cfg(feature = "guard")]
     fn guard_hook(
         &self,
         req_id: &str,
         client_id: &str,
-        unscannable: bool,
+        unscannable: Option<&'static str>,
         input: Option<&guard::ScanInput>,
         openai_shape: bool,
     ) -> Result<Option<usize>, Box<Response>> {
         let policy = self.client_guard_policy(client_id);
         let truncated = input.is_some_and(guard::ScanInput::truncated);
         if policy == guard::GuardPolicy::Block {
-            let reason = if unscannable {
-                Some("request body could not be parsed for content scanning")
+            let reason = if let Some(reason) = unscannable {
+                Some(reason)
             } else if truncated {
                 Some("request exceeds the guard scan limit and cannot be scanned in full")
             } else {
@@ -9018,10 +9024,12 @@ async fn proxy_handler(
     // (`GET /v1/models`) has nothing to scan and is not a scan failure.
     #[cfg(feature = "guard")]
     let guard_annotate: Option<usize> = {
+        let unscannable = (!guard_body_parsed && !body_bytes.is_empty())
+            .then_some("request body could not be parsed for content scanning");
         match state.guard_hook(
             &req_id,
             &client_id,
-            !guard_body_parsed && !body_bytes.is_empty(),
+            unscannable,
             guard_input.as_ref(),
             false,
         ) {
@@ -13703,32 +13711,41 @@ async fn openai_chat_handler(
     // LAB-3877: Tier 0 content guard on the OpenAI-compat surface — the same
     // hook as `proxy_handler`. The scanner reads the TRANSLATED body (the
     // Messages shape it understands); the Anthropic arm below forwards that
-    // body, the OpenAI arm forwards the original bytes. Translation preserves
-    // the user text and `tool` content the scanner reads, but passes any other
-    // role (legacy `function`, `developer`, unknown) through verbatim, where
-    // the scanner cannot see it — so under `block` such a body is unscannable,
-    // not silently allowed. Unparseable JSON was already rejected above.
+    // body, the OpenAI arm forwards the original bytes. Unparseable JSON was
+    // already rejected above.
+    //
+    // The two conditions below are an ENUMERATION, not a rule: each is a
+    // shape translation cannot carry into the Messages document, so the
+    // scanner never sees it while the OpenAI arm still ships it. Anything
+    // else translation drops — `messages[].name`, the top-level `user` field
+    // — is NOT covered here and is unscanned on both surfaces (deferred to
+    // the guard epic). Adding a field to the translator's drop list does not
+    // extend this predicate; extend it by hand.
     #[cfg(feature = "guard")]
     let guard_annotate: Option<usize> = {
-        let unmapped_role = openai_body
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .is_some_and(|msgs| {
-                msgs.iter().any(|m| {
+        let unscannable = match openai_body.get("messages").and_then(|m| m.as_array()) {
+            // Translation preserves the user text and `tool` content the
+            // scanner reads, but passes any other role (legacy `function`,
+            // `developer`, unknown) through verbatim.
+            Some(msgs) => msgs
+                .iter()
+                .any(|m| {
                     !matches!(
                         m.get("role").and_then(|r| r.as_str()),
                         Some("system" | "user" | "assistant" | "tool")
                     )
                 })
-            });
+                .then_some("request carries an OpenAI message role the scanner cannot read"),
+            // LAB-4322: `messages` is absent or not an array. The translator
+            // reads it through the same `.as_array()` and then writes an array
+            // back unconditionally, so the scanned document gets an EMPTY
+            // `messages` while the original bytes keep every character the
+            // client sent. `/v1/chat/completions` requires an array here, so
+            // nothing legitimate is rejected.
+            None => Some("request `messages` is not an array and cannot be scanned"),
+        };
         let guard_input = guard::ScanInput::from_body(&anthropic_body);
-        match state.guard_hook(
-            &req_id,
-            &client_id,
-            unmapped_role,
-            guard_input.as_ref(),
-            true,
-        ) {
+        match state.guard_hook(&req_id, &client_id, unscannable, guard_input.as_ref(), true) {
             Ok(annotate) => annotate,
             Err(resp) => return *resp,
         }

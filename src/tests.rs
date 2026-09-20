@@ -15553,6 +15553,138 @@ async fn guard_block_fails_closed_on_unmapped_openai_role() {
     );
 }
 
+/// LAB-4322: `translate_openai_to_anthropic` reads `messages` through
+/// `.as_array()` and then unconditionally writes an array back, so a non-array
+/// `messages` becomes an EMPTY array in the document the scanner reads — while
+/// a `Protocol::OpenAI` endpoint forwards the client's original bytes, text and
+/// all. Under `block` every such shape is unscannable, so none of it reaches an
+/// upstream. `null` and absent are both listed: they differ at
+/// `body.get("messages")` (`Some(Null)` vs `None`) and a refactor could split
+/// them.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_fails_closed_on_non_array_openai_messages() {
+    let secret = AWS_DOCS_EXAMPLE_SECRET_KEY;
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = upstream;
+    let state = Arc::new(AppState {
+        endpoints: vec![gw],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-shape.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+
+    let bodies = [
+        (
+            "string",
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 5,
+                "messages": format!("aws_secret_access_key = \"{secret}\"")}),
+        ),
+        (
+            "object",
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 5,
+                "messages": {"role": "user", "content": format!("key {secret}")}}),
+        ),
+        (
+            "null",
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 5,
+                "messages": serde_json::Value::Null}),
+        ),
+        (
+            "absent",
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 5}),
+        ),
+    ];
+
+    for (shape, body) in bodies {
+        let resp = Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer block-key")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            400,
+            "{shape} `messages` is unscannable and must fail closed under block"
+        );
+        let err: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            err["error"]["code"], "guard_blocked",
+            "{shape}: OpenAI error envelope expected, got {err}"
+        );
+        assert!(
+            !err.to_string().contains(secret),
+            "{shape}: the block response must never echo client text"
+        );
+        assert!(
+            captured.lock().await.is_empty(),
+            "{shape}: not one byte may reach a Protocol::OpenAI upstream unscanned"
+        );
+    }
+}
+
+/// LAB-4322 counterpart: the fail-closed widening is gated on `block` only.
+/// Under `annotate` and `off` the same unscannable body still reaches the
+/// upstream, and the bytes on the wire stay byte-identical to the client's —
+/// the prompt-cache raw-prefix invariant. Each policy sends a distinct body so
+/// the byte-identity assertion cannot pass against the other's capture.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_non_block_forwards_non_array_openai_messages_byte_identically() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = upstream;
+    let state = Arc::new(AppState {
+        endpoints: vec![gw],
+        clients: vec![
+            mk_client("annotate", "annotate-key", &[]),
+            ClientConfig {
+                guard: crate::guard::GuardPolicy::Off,
+                ..mk_client("off", "off-key", &[])
+            },
+        ],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-shape-shadow.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+
+    for policy in ["annotate", "off"] {
+        let raw = format!(
+            r#"{{"model":"claude-sonnet-4-6","max_tokens":5,"messages":"{policy} aws_secret_access_key = \"{AWS_DOCS_EXAMPLE_SECRET_KEY}\""}}"#
+        );
+        let resp = Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {policy}-key"))
+            .body(raw.clone())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200, "{policy} must never reject");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["id"], "msg_test",
+            "{policy} must return the upstream's own response"
+        );
+        assert_eq!(
+            captured.lock().await.as_slice(),
+            raw.as_bytes(),
+            "{policy} forwards the original bytes byte-identically"
+        );
+    }
+}
+
 /// Shadow-mode counterpart on the OpenAI-compat surface: `annotate` forwards
 /// the request and stamps `X-Guard-Findings` on the translated response.
 #[cfg(feature = "guard")]
