@@ -3707,7 +3707,7 @@ fn translate_sse_inband_error_emits_openai_error_frame() {
 
     // Flag set → stream loop finalizes as failure and skips the clean [DONE]
     // guard (the error frame carries its own terminator).
-    assert!(ctx.upstream_error);
+    assert!(ctx.terminal.errored);
 
     // Exactly one [DONE], and it belongs to the error frame itself.
     assert_eq!(result.matches("[DONE]").count(), 1);
@@ -4211,7 +4211,7 @@ fn reverse_sse_no_duplicate_message_stop() {
 
 #[test]
 fn reverse_sse_message_stopped_set_by_both_terminator_paths() {
-    // LAB-710: `ctx.message_stopped` gates the transport-error frame — once
+    // LAB-710: `ctx.terminal.completed` gates the transport-error frame — once
     // the client has its `message_stop`, a later read failure must not ship
     // an error frame. Both emit sites must set it: finish_reason (the normal
     // case) and a bare [DONE] with no finish_reason seen.
@@ -4220,12 +4220,12 @@ fn reverse_sse_message_stopped_set_by_both_terminator_paths() {
         "{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}",
         &mut ctx,
     );
-    assert!(!ctx.message_stopped);
+    assert!(!ctx.terminal.completed);
     translate_openai_sse_to_anthropic(
         "{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
         &mut ctx,
     );
-    assert!(ctx.message_stopped, "finish_reason emitted message_stop");
+    assert!(ctx.terminal.completed, "finish_reason emitted message_stop");
 
     // message_stop is terminal inside the translator too: an in-band error
     // line (or stray delta) arriving post-completion must emit nothing.
@@ -4237,7 +4237,7 @@ fn reverse_sse_message_stopped_set_by_both_terminator_paths() {
         after.is_empty(),
         "no frame may follow message_stop, got: {after:?}"
     );
-    assert!(!ctx.upstream_error);
+    assert!(!ctx.terminal.errored);
 
     let mut ctx = ReverseStreamContext::default();
     translate_openai_sse_to_anthropic(
@@ -4246,7 +4246,7 @@ fn reverse_sse_message_stopped_set_by_both_terminator_paths() {
     );
     let done_events = translate_openai_sse_to_anthropic("[DONE]", &mut ctx);
     assert!(done_events[0].contains("message_stop"));
-    assert!(ctx.message_stopped, "bare [DONE] emitted message_stop");
+    assert!(ctx.terminal.completed, "bare [DONE] emitted message_stop");
 }
 
 #[test]
@@ -4259,7 +4259,7 @@ fn reverse_sse_inband_error_before_message_start() {
         "{\"error\":{\"message\":\"The server had an error\",\"type\":\"server_error\"}}",
         &mut ctx,
     );
-    assert!(ctx.upstream_error);
+    assert!(ctx.terminal.errored);
     assert_eq!(events.len(), 1);
     assert!(events[0].starts_with("event: error\n"));
     let data_line = events[0].lines().nth(1).unwrap();
@@ -16071,6 +16071,164 @@ async fn fallback_translated_stream_no_error_frame_after_message_stop() {
     assert!(
         !body.contains("event: error"),
         "no error frame may follow message_stop, got: {body:?}"
+    );
+}
+
+// ── LAB-4031: single-terminator invariant on the remaining stream loops ──
+//
+// An SSE stream has exactly one terminator, and an error frame is one.
+// LAB-710 enforced that on the two translating loops' transport-error
+// arms; these cover the native passthrough and the fallback translate
+// branch's end-of-stream.
+
+/// Raw-TCP SSE upstream: answers one request with `body` as a single HTTP
+/// chunk, then either closes the chunked body cleanly (`0\r\n\r\n` → the
+/// proxy sees `Ok(None)`) or drops the socket without it (→ the proxy's
+/// next `resp.chunk()` errors, hyper `IncompleteMessage`).
+async fn spawn_sse_upstream(body: &'static str, clean_close: bool) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let _ = stream.read(&mut buf).await;
+        let head = "HTTP/1.1 200 OK\r\n\
+             content-type: text/event-stream\r\n\
+             transfer-encoding: chunked\r\n\
+             \r\n";
+        let _ = stream.write_all(head.as_bytes()).await;
+        let chunk = format!("{:x}\r\n{}\r\n", body.len(), body);
+        let _ = stream.write_all(chunk.as_bytes()).await;
+        if clean_close {
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        }
+        let _ = stream.shutdown().await;
+    });
+    addr
+}
+
+/// State whose only routable endpoint is an OpenAI-protocol fallback at
+/// `mock_addr`, so a `/v1/messages` request takes `try_fallback_upstream`'s
+/// translate branch.
+async fn fallback_only_state(mock_addr: SocketAddr, state_file: &str) -> Arc<AppState> {
+    let mut openai = make_endpoint("fallback", Protocol::OpenAI);
+    openai.base_url = format!("http://{}", mock_addr);
+    openai.priority = 100;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("acct-a", "sk-ant-api-a"), openai],
+        state_path: PathBuf::from(format!("/tmp/anthropic-lb-{state_file}.state.json")),
+        auto_cache: false,
+        ..test_state_base()
+    });
+    let mut info = state.endpoints[0].rate_info.write().await;
+    info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+    drop(info);
+    state
+}
+
+async fn stream_messages(addr: SocketAddr) -> String {
+    let resp = Client::new()
+        .post(format!("http://{}/v1/messages", addr))
+        .header("content-type", "application/json")
+        .header("x-api-key", "any")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 16,
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn native_stream_no_error_frame_after_message_stop() {
+    // Gap 1: the native /v1/messages passthrough forwarded a complete
+    // message (message_stop went downstream verbatim) and then the peer
+    // dropped without the chunked terminator. The client already has a
+    // complete stream; a trailing `event: error` would make the SDK raise on
+    // a request that succeeded.
+    let mock_addr = spawn_sse_upstream(
+        concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ),
+        false,
+    )
+    .await;
+    let (app, _state) = test_app(&format!("http://{}", mock_addr), None);
+    let body = stream_messages(serve(app).await).await;
+
+    assert!(
+        body.contains("event: message_stop\n"),
+        "upstream's message_stop must be forwarded, got: {body:?}"
+    );
+    assert!(
+        !body.contains("event: error"),
+        "no error frame may follow message_stop, got: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn fallback_translated_stream_clean_eof_mid_message_emits_error_frame() {
+    // Gap 2a: upstream body ends cleanly (an intermediary's read timeout,
+    // say) after content but before finish_reason / [DONE]. The client is
+    // holding message_start + deltas; closing the socket there is a silent
+    // truncation. It must get an explicit `event: error` instead.
+    let mock_addr = spawn_sse_upstream(
+        "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+        true,
+    )
+    .await;
+    let state = fallback_only_state(mock_addr, "clean-eof-mid-message").await;
+    let body = stream_messages(serve(build_router(state)).await).await;
+
+    assert!(
+        body.contains("text_delta"),
+        "content before the cut must still reach the client, got: {body:?}"
+    );
+    assert!(
+        !body.contains("message_stop"),
+        "an unfinished message must not be faked complete, got: {body:?}"
+    );
+    let err_at = body.find("event: error\n").unwrap_or_else(|| {
+        panic!("clean EOF mid-message must terminate with an error frame, got: {body:?}")
+    });
+    assert!(
+        err_at > body.find("text_delta").unwrap(),
+        "error frame must be the stream's last event, got: {body:?}"
+    );
+    assert!(
+        body.contains("\"type\":\"api_error\""),
+        "error frame must use Anthropic's documented api_error type, got: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn fallback_translated_stream_done_only_emits_error_frame() {
+    // Gap 2b: upstream 200s with `data: [DONE]` and nothing else. The
+    // translator has no message to stop, so pre-fix the client got a 200
+    // with a completely empty SSE body — same shape LAB-710 closed for the
+    // in-band-error case, on the no-error path.
+    let mock_addr = spawn_sse_upstream("data: [DONE]\n\n", true).await;
+    let state = fallback_only_state(mock_addr, "done-only").await;
+    let body = stream_messages(serve(build_router(state)).await).await;
+
+    assert!(
+        !body.contains("message_start") && !body.contains("message_stop"),
+        "no message may be fabricated from an empty stream, got: {body:?}"
+    );
+    assert!(
+        body.contains("event: error\n") && body.contains("\"type\":\"api_error\""),
+        "empty upstream stream must terminate with an error frame, got: {body:?}"
     );
 }
 
