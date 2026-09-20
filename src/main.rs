@@ -3099,6 +3099,13 @@ const DEFAULT_BODY_READ_TIMEOUT_SECS: u64 = 60;
 /// `max_inflight_body_mb` config key; set it to 0 to disable the limit.
 const DEFAULT_MAX_INFLIGHT_BODY_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Prefix identifying an Anthropic OAuth token, as opposed to an
+/// `sk-ant-api*` API key. This is a protocol discriminator, not a
+/// credential: every auth branch that treats a token as OAuth — Bearer
+/// auth, the Claude Code system-prompt injection, the client beta-flag
+/// filter — keys off it, so the six of them must not be able to drift.
+const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
+
 /// Required OAuth beta flags. Both needed: oauth-2025-04-20 for OAuth auth,
 /// claude-code-20250219 for Claude Code API access quota routing.
 const OAUTH_BETA_FLAGS: &[&str] = &["oauth-2025-04-20", "claude-code-20250219"];
@@ -3390,15 +3397,33 @@ fn strip_orphaned_beta_body_fields(
     let parsed: TopLevelObject = match serde_json::from_slice(body) {
         Ok(parsed) => parsed,
         Err(e) => {
-            // Swallowing this is the worst possible silence: the caller is on
-            // the one path that only runs because a flag was already dropped,
-            // so the untouched body goes upstream and earns the hard 400 this
-            // function exists to prevent — with nothing in the log tying the
-            // rejection to a body the proxy could not parse.
-            warn!(
-                error = %e,
-                "beta body coherence: request body is not a JSON object, forwarding it \
-                 untouched — the orphaned-field strip cannot run and upstream will reject it"
+            // Reached only because a flag was already dropped, so the body
+            // goes upstream untouched and will likely earn the hard rejection
+            // this function exists to prevent. Worth a line so the two are
+            // connectable; not worth more than a line.
+            //
+            // `debug!`, not `warn!`: the trigger is a malformed client body,
+            // which one caller can repeat at request rate. The sibling
+            // `record_dropped_beta_flags` warns on first sighting only and
+            // debug-logs the rest for exactly this reason, and it has the
+            // per-client state to do so — this is a free function and does
+            // not, so the quiet level is the honest choice.
+            //
+            // The error is rendered by `classify()` and a length, NOT by its
+            // `Display`. serde embeds the offending value for a type error
+            // (`invalid type: string "<the whole body>", expected …`), so
+            // `%e` over a 25 MiB client body would copy prompt content into
+            // the operator log at roughly 3x after escaping. That variant is
+            // currently unreachable — a non-object body panics earlier in
+            // `inject_oauth_system_prompt` — which makes `%e` safe only by
+            // accident, and a landmine for whoever fixes that panic.
+            debug!(
+                error_kind = ?e.classify(),
+                line = e.line(),
+                column = e.column(),
+                body_len = body.len(),
+                "beta body coherence: unparseable request body, forwarding it untouched — \
+                 the orphaned-field strip cannot run"
             );
             return None;
         }
@@ -6367,7 +6392,7 @@ fn inject_account_auth(
     let mut dropped: Vec<String> = Vec::new();
     if token.starts_with("sk-ant-api") {
         headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
-    } else if token.starts_with("sk-ant-oat") {
+    } else if token.starts_with(OAUTH_TOKEN_PREFIX) {
         headers.insert(
             "authorization",
             HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
@@ -8646,7 +8671,7 @@ async fn forward_anthropic(
     if tracing::enabled!(tracing::Level::DEBUG) {
         let auth_method = if passthrough {
             "passthrough"
-        } else if token.starts_with("sk-ant-oat") {
+        } else if token.starts_with(OAUTH_TOKEN_PREFIX) {
             "oauth"
         } else {
             "api-key"
@@ -8655,7 +8680,7 @@ async fn forward_anthropic(
             req_id,
             account = endpoint_name,
             auth_method,
-            body_bytes = if token.starts_with("sk-ant-oat") {
+            body_bytes = if token.starts_with(OAUTH_TOKEN_PREFIX) {
                 oauth_body_bytes.len()
             } else {
                 body_bytes.len()
@@ -8673,10 +8698,10 @@ async fn forward_anthropic(
     upstream_req = upstream_req.headers(headers);
     // Use OAuth variant (with CC system prompt) for OAuth tokens, and its
     // beta-coherent rewrite when the filter orphaned a body field (LAB-1261).
-    let req_body = if token.starts_with("sk-ant-oat") {
+    let req_body = if token.starts_with(OAUTH_TOKEN_PREFIX) {
         // `dropped` is only ever non-empty on this branch, so a rewrite
         // without it would mean the filter's contract changed underneath us.
-        debug_assert!(coherent_body.is_none() || token.starts_with("sk-ant-oat"));
+        debug_assert!(coherent_body.is_none() || token.starts_with(OAUTH_TOKEN_PREFIX));
         match &coherent_body {
             Some((rewritten, _)) => rewritten,
             None => oauth_body_bytes,
@@ -10784,24 +10809,22 @@ async fn build_metrics_snap(
     }
 }
 
-/// Snapshot one of the beta-filter counter maps for the `/metrics` render,
+/// Snapshot a `String`-keyed counter map for the `/metrics` render,
 /// recovering — and clearing — a poisoned lock rather than publishing an
 /// empty map.
 ///
-/// `.lock().ok().unwrap_or_default()` emits a zero that no alert can tell
-/// apart from a genuine zero, so a single panicking holder silently disarms
-/// `AnthropicLbBetaBodyFieldStripped` — the rule that fires on
-/// `anthropic_beta_body_field_stripped_total` going non-zero — for the rest
-/// of the process. Logging and *still* returning empty would only make the
-/// endpoint lie more loudly.
+/// `.lock().ok().unwrap_or_default()` emits a zero indistinguishable from a
+/// real one, and logging while *still* returning empty would only make the
+/// endpoint lie more loudly. Clearing is the half that matters: every writer
+/// to these maps takes the lock with `let Ok(..) else { return }` / `if let
+/// Ok(..)`, so an uncleared poison kills the counter permanently rather than
+/// leaving it stale. Same recovery rationale as `lock_transport_errors`,
+/// which does it silently — a panicking holder is worth a line.
 ///
-/// Clearing the poison is the half that matters: both increment paths
-/// (`record_dropped_beta_flags`, `record_stripped_body_fields`) take the lock
-/// with `let Ok(..) else { return }`, so without a clear they skip forever
-/// after one panic and the counter is dead, not merely stale. Recovering is
-/// safe for the same reason it is in `AppState::lock_transport_errors`: these
-/// are plain counter stores with no cross-key invariant, so the worst a
-/// panicking holder can leave behind is one missing increment.
+/// Nothing in these critical sections can currently panic, so this is
+/// defence against a future edit, not a live incident. The remaining
+/// `/metrics` maps keep the zeroing pattern only because their value types
+/// do not fit this signature.
 fn snapshot_counters(
     counters: &Mutex<HashMap<String, u64>>,
     map: &'static str,
@@ -10901,18 +10924,8 @@ async fn metrics_handler(
         .map(|g| g.clone())
         .unwrap_or_default();
     let cluster_info = state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
-    let prompt_too_long: Vec<(String, u64)> = state
-        .prompt_too_long
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
-    let fast_mode_429: Vec<(String, u64)> = state
-        .fast_mode_429
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
+    let prompt_too_long = snapshot_counters(&state.prompt_too_long, "prompt_too_long");
+    let fast_mode_429 = snapshot_counters(&state.fast_mode_429, "fast_mode_429");
     let model_denied: Vec<((String, String), u64)> = state
         .model_denied
         .lock()
@@ -13603,7 +13616,7 @@ async fn forward_openai_compat_anthropic(
     let context_window = context_window_for(model, request_has_1m_beta(&headers));
 
     // Use OAuth variant (with CC system prompt) for OAuth tokens
-    let req_body = if token.starts_with("sk-ant-oat") {
+    let req_body = if token.starts_with(OAUTH_TOKEN_PREFIX) {
         oauth_anthropic_body_bytes
     } else {
         anthropic_body_bytes

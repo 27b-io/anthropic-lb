@@ -22283,15 +22283,20 @@ async fn pinned_client_spills_when_preferred_endpoint_at_paid_overage() {
 // never seen — no allow-list entry required.
 // ---------------------------------------------------------------------------
 
-/// An OAuth-shaped fixture token, assembled at compile time so the tree holds
-/// no contiguous Anthropic OAuth-token prefix for a credential scanner — or a
-/// human skimming a diff — to mistake for a leaked key.
+/// An OAuth-shaped fixture token, derived from the production discriminator
+/// so it cannot drift from the predicate it exists to exercise.
 ///
 /// The shape is load-bearing, not decoration: `inject_account_auth` and
-/// `forward_anthropic` both branch on `token.starts_with("sk-ant-oat")` to
-/// decide whether the beta filter runs at all, so an obviously-fake token of
-/// any other shape would exercise none of the code below.
-const OAUTH_SHAPED_FIXTURE_TOKEN: &str = concat!("sk-", "ant-oat01-not-a-real-token");
+/// `forward_anthropic` both branch on `OAUTH_TOKEN_PREFIX` to decide whether
+/// the beta filter runs at all, so a fixture of any other shape would
+/// exercise none of the code below.
+///
+/// No claim is made here about credential scanning. This repo's own rule
+/// (`.gitleaks.toml`) requires a 20-character tail, which neither this value
+/// nor the `-test` literals elsewhere in this file ever matched.
+fn oauth_shaped_fixture_token() -> String {
+    format!("{OAUTH_TOKEN_PREFIX}-FIXTURE-DO-NOT-USE")
+}
 
 /// 5h utilization the strict upstream reports on every 200. Distinctive
 /// enough that reading it back off an endpoint proves it came from here.
@@ -22435,9 +22440,9 @@ async fn forward_with_betas_full(
     let mut state = test_state_with(vec![]);
     let mut ep = make_endpoint("acct", Protocol::Anthropic);
     ep.base_url = url;
-    // `sk-ant-oat` is what arms the beta filter — an API-key endpoint does not
-    // filter at all, so it could not exercise this path.
-    ep.token = OAUTH_SHAPED_FIXTURE_TOKEN.to_string();
+    // `OAUTH_TOKEN_PREFIX` is what arms the beta filter — an API-key endpoint
+    // does not filter at all, so it could not exercise this path.
+    ep.token = oauth_shaped_fixture_token();
     {
         let state = Arc::get_mut(&mut state).unwrap();
         state.endpoints.push(ep);
@@ -22574,9 +22579,9 @@ async fn stripped_speed_draws_the_standard_rate_bucket() {
     // unconditionally re-added `OAUTH_BETA_FLAGS` are exactly that.
     let (status, sent, state) = forward_with_betas_full(
         "/v1/messages",
-        Some(vec!["oauth-2025-04-20".to_string()]),
+        /* allowed_client_betas */ Some(vec!["oauth-2025-04-20".to_string()]),
         /* is_fast_mode */ true,
-        "fast-mode-2026-02-01",
+        /* client_betas */ "fast-mode-2026-02-01",
         FAST_BODY,
     )
     .await;
@@ -22595,9 +22600,9 @@ async fn stripped_speed_draws_the_standard_rate_bucket() {
     // Control: same body, same `is_fast_mode`, allow-list carrying the flag.
     let (status, sent, state) = forward_with_betas_full(
         "/v1/messages",
-        None,
+        /* allowed_client_betas */ None,
         /* is_fast_mode */ true,
-        "fast-mode-2026-02-01",
+        /* client_betas */ "fast-mode-2026-02-01",
         FAST_BODY,
     )
     .await;
@@ -22846,45 +22851,64 @@ fn one_request_cannot_exhaust_the_strip_counter() {
 ///
 /// `/metrics` used to read this map with `.lock().ok().unwrap_or_default()`,
 /// so one panicking holder emitted an empty series — a zero no alert can tell
-/// apart from a genuine zero, which silently disarms the rule that fires on
-/// `anthropic_beta_body_field_stripped_total` going non-zero. Logging and
-/// still returning empty would not have fixed it either: both increment paths
-/// take the lock with `let Ok(..) else { return }`, so after one panic the
-/// counter is dead, not merely stale. Clearing the poison is the half that
-/// keeps it alive, and the second half of this test is what pins that.
-#[test]
-fn poisoned_counter_lock_is_recovered_not_zeroed() {
-    let state = test_state_with(vec![]);
+/// apart from a real one. Logging and still returning empty would not have
+/// fixed it: every writer takes the lock with `let Ok(..) else { return }`,
+/// so after one panic the counter is dead, not merely stale. Clearing the
+/// poison is the half that keeps it alive.
+///
+/// Driven through the real router rather than by calling `snapshot_counters`
+/// directly, for the same reason `metrics_local_fallback_recovers_poisoned_lock`
+/// is: this must prove the `/metrics` RENDER recovers, not just the helper in
+/// isolation.
+#[tokio::test]
+async fn poisoned_counter_lock_is_recovered_not_zeroed() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-aaa")]);
     state.record_stripped_body_fields("c1", &["speed".to_string()], &["fast-mode-x".to_string()]);
 
-    // The only way a `Mutex` becomes poisoned: a holder panics.
-    let poisoner = Arc::clone(&state);
-    let panicked = std::thread::spawn(move || {
-        let _guard = poisoner.beta_body_fields_stripped.lock().unwrap();
-        panic!("deliberate: poisoning the counter lock for this test");
-    })
-    .join();
+    // The only way a `Mutex` becomes poisoned: a holder panics. Poison it
+    // directly so the recovery under test is the one in the render path.
+    {
+        let state = state.clone();
+        std::thread::spawn(move || {
+            let _g = state.beta_body_fields_stripped.lock().unwrap();
+            panic!("deliberate: poison the stripped-field counter mutex");
+        })
+        .join()
+        .unwrap_err();
+    }
+    assert!(state.beta_body_fields_stripped.is_poisoned());
+
+    let addr = serve(build_router(state.clone())).await;
+    let body = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(
-        panicked.is_err() && state.beta_body_fields_stripped.is_poisoned(),
-        "the fixture must actually poison the lock or this test proves nothing"
+        body.contains(r#"anthropic_beta_body_field_stripped_total{field="speed"} 1"#),
+        "/metrics must publish the real count through a poisoned lock, not a zero \
+         indistinguishable from a genuine one:\n{body}"
     );
 
-    assert_eq!(
-        snapshot_counters(
-            &state.beta_body_fields_stripped,
-            "beta_body_fields_stripped"
-        ),
-        vec![("speed".to_string(), 1)],
-        "/metrics must publish the real counts, not a zero indistinguishable from a genuine one"
-    );
+    // Clearing the poison is what keeps the counter alive: the increment path
+    // bails on a poisoned lock, so without it the series freezes here.
     state.record_stripped_body_fields("c1", &["speed".to_string()], &["fast-mode-x".to_string()]);
+    assert!(
+        !state.beta_body_fields_stripped.is_poisoned(),
+        "the render must have cleared the poison, or counting stops for good"
+    );
     assert_eq!(
-        snapshot_counters(
-            &state.beta_body_fields_stripped,
-            "beta_body_fields_stripped"
-        ),
-        vec![("speed".to_string(), 2)],
-        "counting must resume once the poison is cleared, or the series stays dead"
+        state
+            .beta_body_fields_stripped
+            .lock()
+            .unwrap()
+            .get("speed")
+            .copied(),
+        Some(2),
+        "counting must resume once the poison is cleared"
     );
 }
 
@@ -23059,7 +23083,7 @@ async fn full_router_rewrite_preserves_client_bytes() {
         }
     })))
     .await;
-    let mut ep = mk_endpoint("acct", OAUTH_SHAPED_FIXTURE_TOKEN);
+    let mut ep = mk_endpoint("acct", &oauth_shaped_fixture_token());
     ep.base_url = format!("http://{upstream}");
     let state = Arc::new(AppState {
         endpoints: vec![ep],
