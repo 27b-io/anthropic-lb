@@ -533,6 +533,42 @@ fn truncate_label(s: &str) -> String {
     out.push('…');
     out
 }
+
+/// Cap on distinct 7d claim keys retained per account. Keys are minted from the
+/// upstream `anthropic-ratelimit-unified-representative-claim` header — never
+/// from client input — but that is still an unvalidated remote string, and every
+/// key it mints becomes a permanent `claim` label on four `anthropic_claim_*`
+/// series. Without a cap a misbehaving or hostile upstream grows both the map
+/// and the scrape without limit (CWE-770; same class as the LAB-2330 fix to
+/// `client_model_usage`). The real wire protocol uses a handful per account
+/// (`seven_day`, the model carve-outs, the normalised Fable band), so the cap
+/// only bites on abuse.
+///
+/// Hard bound is `MAX_CLAIMS_PER_ACCOUNT + 1`: `FABLE_BAND_CLAIM` is a compile-time
+/// constant that bypasses the cap deliberately, because losing the Fable band to a
+/// junk-filled map would blind exactly the routing signal this cap exists to keep
+/// legible.
+const MAX_CLAIMS_PER_ACCOUNT: usize = 32;
+
+/// Whether a 7d claim key may be stored for this account. Mirrors the
+/// `MAX_TRACKED_CLIENTS` admission rule: keys already present always pass, so
+/// live claims keep updating past the cap, and only genuinely new keys are
+/// refused. Overflow is DROPPED rather than folded into an `_other` bucket the
+/// way caller-labelled counters do it — `claims_7d` is routing input, not just a
+/// metric, and a synthetic merged claim would feed the weighting math and the
+/// emergency brake. Refusal is logged, never silent.
+fn claim_admitted(claims: &HashMap<String, ClaimWindowData>, key: &str, account: &str) -> bool {
+    if claims.len() < MAX_CLAIMS_PER_ACCOUNT || claims.contains_key(key) {
+        return true;
+    }
+    warn!(
+        account,
+        claim = key,
+        cap = MAX_CLAIMS_PER_ACCOUNT,
+        "refusing new 7d claim key: account is at the claim cap"
+    );
+    false
+}
 const TAU_6H: f64 = 21600.0;
 
 /// Per-account burn rate tracker: requests per minute at three time scales.
@@ -872,6 +908,12 @@ struct AppState {
     /// (the window that bound the sticky account). Exposed as
     /// `anthropic_affinity_migrations_total{reason="loaded"|"spent"}`.
     affinity_migrations: [AtomicU64; 2],
+    /// Client-facing pool-exhaustion responses, indexed by `PoolExhaustion`.
+    /// Exposed as `anthropic_pool_exhausted_total{kind="rate_limited"|"transient"}`.
+    /// The only metric trace of the 429/503 a caller actually received when the
+    /// whole pool was unavailable (LAB-4189) — before this, exhaustion existed
+    /// solely as a `warn!` line, so there was nothing to graph or alert on.
+    pool_exhausted: [AtomicU64; 2],
     /// Reflect upstream `anthropic-ratelimit-*` headers to callers (see
     /// `Config::expose_upstream_ratelimit_headers`). Default: false.
     expose_upstream_ratelimit_headers: bool,
@@ -3193,6 +3235,31 @@ impl AffinityBind {
     }
 }
 
+/// Why the proxy gave up on the whole pool and answered the caller itself.
+/// Label value of `anthropic_pool_exhausted_total{kind}`; also indexes
+/// `AppState::pool_exhausted`. Closed by the type system, so this counter's
+/// label set cannot grow.
+#[derive(Clone, Copy)]
+enum PoolExhaustion {
+    /// Every endpoint was rate-limited or gated (or a round saw a 529) — the
+    /// `429 exhausted all endpoints` arm. Recovery is minutes-to-hours.
+    RateLimited = 0,
+    /// Every endpoint failed in transport with no 529 — the retryable
+    /// `503 + Retry-After` arm.
+    Transient = 1,
+}
+
+impl PoolExhaustion {
+    const ALL: [Self; 2] = [Self::RateLimited, Self::Transient];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate_limited",
+            Self::Transient => "transient",
+        }
+    }
+}
+
 /// Capacity a candidate has left to keep a sticky session, and which window
 /// binds it. Both terms are time-free. Deliberately NOT `weight`: weight =
 /// waste_risk × headroom, and waste_risk's denominator is time-to-weekly-reset,
@@ -4842,10 +4909,17 @@ impl AppState {
         // Determine the claim key for 7d data storage.
         // If claim starts with "seven_day", use it verbatim (e.g., "seven_day_sonnet").
         // Otherwise default to "seven_day" (general bucket).
-        let claim_key_7d = rep_claim
-            .as_deref()
-            .filter(|c| c.starts_with("seven_day"))
-            .unwrap_or("seven_day");
+        // Truncated here, at the single point where an upstream string becomes a
+        // map key: the key outlives the response as a `claim` metric label and is
+        // re-serialised on every scrape, so an unbounded one is retained for the
+        // process lifetime (see `truncate_label`).
+        let claim_key_7d = truncate_label(
+            rep_claim
+                .as_deref()
+                .filter(|c| c.starts_with("seven_day"))
+                .unwrap_or("seven_day"),
+        );
+        let claim_key_7d = claim_key_7d.as_str();
 
         // Capture 5h utilization (flat — no per-model sub-budgets observed for 5h).
         // Track whether we got utilization for sticky status fix (Bug #1).
@@ -4867,10 +4941,18 @@ impl AppState {
         {
             if let Ok(s) = v.to_str() {
                 if let Ok(util) = s.parse::<f64>() {
-                    let entry = info.claims_7d.entry(claim_key_7d.to_string()).or_default();
-                    entry.utilization = Some(util.clamp(0.0, 1.0));
-                    entry.last_seen = now_epoch;
-                    true
+                    // Creating the entry is the map's only growth point, so the
+                    // cap belongs here. A refused key reports `false` — it stored
+                    // no utilization, and claiming otherwise would clear the
+                    // surviving claim's status below (Bug #1's path).
+                    if claim_admitted(&info.claims_7d, claim_key_7d, endpoint_name) {
+                        let entry = info.claims_7d.entry(claim_key_7d.to_string()).or_default();
+                        entry.utilization = Some(util.clamp(0.0, 1.0));
+                        entry.last_seen = now_epoch;
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
@@ -7929,8 +8011,9 @@ fn round_backoff_delay(retry_round: u32, last_saw_529: bool) -> Duration {
 /// round that also saw a 529) stays `429` with NO `Retry-After`: recovery there
 /// is on the order of minutes/hours, so a short retry hint would tight-loop the
 /// client into a still-exhausted pool.
-fn exhaustion_response(last_saw_transient: bool, last_saw_529: bool) -> Response {
+fn exhaustion_response(state: &AppState, last_saw_transient: bool, last_saw_529: bool) -> Response {
     if last_saw_transient && !last_saw_529 {
+        state.pool_exhausted[PoolExhaustion::Transient as usize].fetch_add(1, Ordering::Relaxed);
         warn!("all endpoints transient-failed after backoff; returning retryable 503");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -7939,6 +8022,7 @@ fn exhaustion_response(last_saw_transient: bool, last_saw_529: bool) -> Response
         )
             .into_response();
     }
+    state.pool_exhausted[PoolExhaustion::RateLimited as usize].fetch_add(1, Ordering::Relaxed);
     warn!("all endpoints exhausted (rate-limited)");
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
 }
@@ -9225,7 +9309,7 @@ async fn proxy_handler(
             return model_unsupported_response(&model, false);
         }
     }
-    exhaustion_response(last_saw_transient, last_saw_529)
+    exhaustion_response(&state, last_saw_transient, last_saw_529)
     }
     .await;
 
@@ -10854,6 +10938,55 @@ async fn metrics_handler(
         }
     }
 
+    // Per-claim status and reset (LAB-4189). `anthropic_account_rate_limit_status`
+    // and `anthropic_account_reset_seconds` are labelled `window="5h"|"7d"` only,
+    // so a model carve-out — the Fable band above all — had no status of its own
+    // and no reset an operator could read.
+    //
+    // Status is NOT recoverable from utilization in either direction, which is the
+    // whole reason these exist: an account can read 0.98 and still be
+    // `allowed_warning` (the router keeps sending it traffic) while another reads
+    // 1.0 and is `rejected` (hard-skipped entirely). Both observed in the same
+    // scrape. Any panel thresholding utilization mislabels both cases; read this
+    // series instead.
+    prom_header(
+        &mut buf,
+        "anthropic_claim_rate_limit_status",
+        "gauge",
+        "Per-claim rate-limit status ordinal (0=allowed, 1=warning, 2=throttled, 3=rejected)",
+    );
+    for s in &snaps {
+        for claim in &s.claims {
+            prom_gauge(
+                &mut buf,
+                "anthropic_claim_rate_limit_status",
+                &[("account", &s.name), ("claim", &claim.key)],
+                status_to_ordinal(claim.status.as_deref()),
+            );
+        }
+    }
+    prom_header(
+        &mut buf,
+        "anthropic_claim_reset_seconds",
+        "gauge",
+        "Seconds until this claim's window resets",
+    );
+    for s in &snaps {
+        for claim in &s.claims {
+            // Past-dated resets are omitted rather than clamped to 0, matching
+            // `anthropic_account_reset_seconds`: a stale reset is unknown, not
+            // "resets now".
+            if let Some(r) = claim.reset.filter(|&r| r > now_epoch) {
+                prom_gauge(
+                    &mut buf,
+                    "anthropic_claim_reset_seconds",
+                    &[("account", &s.name), ("claim", &claim.key)],
+                    (r - now_epoch) as f64,
+                );
+            }
+        }
+    }
+
     // ── Routing weights (refreshed by refresh_metrics_weights per probe cycle) ─────
 
     prom_header(
@@ -11483,6 +11616,27 @@ async fn metrics_handler(
             "anthropic_affinity_migrations_total",
             &[("reason", bind.as_str())],
             state.affinity_migrations[bind as usize].load(Ordering::Relaxed),
+        );
+    }
+
+    // Client-facing pool exhaustion (LAB-4189): the 429/503 the caller actually
+    // received because every endpoint was gated or failed. Distinct from the
+    // per-account `anthropic_account_*` gauges, which describe the pool's state
+    // but never say whether a request was turned away because of it. Per-replica
+    // and in-memory, so aggregate with `sum by (kind)` across replicas — unlike
+    // the gauges, these are independent events, not two views of one upstream.
+    prom_header(
+        &mut buf,
+        "anthropic_pool_exhausted_total",
+        "counter",
+        "Client-facing pool-exhaustion responses by kind (rate_limited=429, transient=503)",
+    );
+    for kind in PoolExhaustion::ALL {
+        prom_counter(
+            &mut buf,
+            "anthropic_pool_exhausted_total",
+            &[("kind", kind.as_str())],
+            state.pool_exhausted[kind as usize].load(Ordering::Relaxed),
         );
     }
 
@@ -13892,7 +14046,7 @@ async fn openai_chat_handler(
                 return model_unsupported_response(&model, true);
             }
         }
-        exhaustion_response(last_saw_transient, last_saw_529)
+        exhaustion_response(&state, last_saw_transient, last_saw_529)
     }
     .await;
 
@@ -14622,6 +14776,7 @@ async fn main() {
         ),
         body_read_timeout_total: AtomicU64::new(0),
         affinity_migrations: Default::default(),
+        pool_exhausted: Default::default(),
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: config
             .session_registry_max
