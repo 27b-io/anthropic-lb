@@ -5819,14 +5819,16 @@ const SSE_SCAN_MAX_LINE: usize = 64 * 1024;
 ///
 /// An SSE stream has exactly one terminator, and an error frame is one:
 /// never an error frame after the success terminator, never a success
-/// terminator after an error frame, never a 200 whose body ends without
-/// either. Every stream loop and translator gates terminator emission on
-/// this — one vocabulary, so a reviewer can grep `terminal.` and find each
-/// site. It lives where the downstream truth is observable: on
+/// terminator after an error frame. Every stream loop and translator gates
+/// terminator emission on this — one vocabulary, so a reviewer can grep
+/// `terminal.` and find each site. The translating loops also synthesise a
+/// terminator when the upstream ends without one; the byte-passthrough
+/// loops forward the upstream's stream as-is and only suppress a second
+/// terminator. It lives where the downstream truth is observable: on
 /// `SseUsageScanner` for the byte-passthrough (downstream == upstream), on
 /// `StreamContext` / `ReverseStreamContext` for the translating loops
 /// (the proxy emits the terminator itself).
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Default)]
 struct SseTerminal {
     /// Success terminator went downstream: Anthropic `message_stop` or
     /// OpenAI `data: [DONE]`.
@@ -5838,7 +5840,7 @@ struct SseTerminal {
 
 impl SseTerminal {
     /// Either terminator has gone downstream — nothing may follow it.
-    fn reached(self) -> bool {
+    fn reached(&self) -> bool {
         self.completed || self.errored
     }
 }
@@ -5866,9 +5868,7 @@ struct SseUsageScanner {
     event_preview: Vec<String>,
     event_count: usize,
     bytes_seen: usize,
-    /// Terminator state of the bytes forwarded so far. On the passthrough
-    /// the scanner is the only line-aware observer of the stream, so it is
-    /// where `message_stop` / `event: error` going downstream is recorded.
+    /// Terminator state of the bytes forwarded so far.
     terminal: SseTerminal,
 }
 
@@ -9508,12 +9508,12 @@ async fn try_fallback_upstream(
 
         tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
-            // `ctx.terminal` is the single-terminator state for both
-            // branches. Translate branch: set inside the translator
-            // (`message_stop` emitted / error frame emitted). Passthrough
-            // branch: `completed` is set below when upstream's `[DONE]` has
-            // been forwarded verbatim, so an error frame on the next read
-            // doesn't ship a second `[DONE]` and break strict OpenAI parsers.
+            // `ctx.terminal` serves both branches. Translate: `completed` by
+            // the translator, `errored` by the translator (in-band error) or
+            // this loop (transport Err / end-of-stream guard). Passthrough:
+            // `completed` is set below when upstream's `[DONE]` has been
+            // forwarded verbatim, so an error frame on the next read doesn't
+            // ship a second `[DONE]` and break strict OpenAI parsers.
             let mut ctx = ReverseStreamContext::default();
             let mut client_gone = false;
             // Carries any partial trailing SSE line between chunks so the
@@ -11712,8 +11712,9 @@ struct StreamContext {
     /// own `[DONE]`), or the stream loop synthesised one on a transport
     /// failure; the loop must stop translating and must NOT emit a clean
     /// `[DONE]` afterwards — that would fake a successful completion after
-    /// a truncation. `completed`: a `[DONE]`-carrying frame went downstream
-    /// (set by the loop, which sees every emitted frame).
+    /// a truncation. `completed`: the clean `[DONE]` went downstream (set by
+    /// the loop, which sees every emitted frame; the error frame's own
+    /// `[DONE]` does not count).
     terminal: SseTerminal,
 }
 
@@ -12156,6 +12157,13 @@ fn translate_anthropic_to_openai(body: &serde_json::Value, json_mode: bool) -> s
 /// Parse a raw SSE event block and translate to OpenAI format.
 /// Returns None for events that should be skipped (ping, text content_block_start, etc.).
 fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
+    // Both terminators are final (mirror of the reverse translator): once
+    // `[DONE]` or an error frame is out, a stray upstream event must not
+    // translate into a second `[DONE]`-carrying frame.
+    if ctx.terminal.reached() {
+        return None;
+    }
+
     let mut event_type = String::new();
     let mut data = String::new();
 
@@ -13407,9 +13415,7 @@ async fn forward_openai_compat_anthropic(
         tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
             let mut scanner = SseUsageScanner::default();
-            // `ctx.terminal` is the single-terminator state: `completed`
-            // set here on every `[DONE]`-carrying frame, `errored` by the
-            // translator (in-band error) or below (transport failure).
+            // Terminator state: see `StreamContext::terminal`.
             let mut ctx = StreamContext {
                 json_mode,
                 ..StreamContext::default()
@@ -13435,19 +13441,20 @@ async fn forward_openai_compat_anthropic(
                                 // ends_with, not equality: the json_mode flush
                                 // and the in-band error frame both append the
                                 // terminator to another frame in one string.
-                                if translated.ends_with("data: [DONE]\n\n") {
+                                // The in-band error frame carries its own
+                                // [DONE]; `errored` (set by the translator)
+                                // already makes it terminal — it is not a
+                                // success completion.
+                                if translated.ends_with("data: [DONE]\n\n") && !ctx.terminal.errored
+                                {
                                     ctx.terminal.completed = true;
                                 }
-                                // In-band `event: error` sets ctx.terminal.errored
-                                // — the frame just translated carries its own
-                                // [DONE]. Treat like a transport error: stop
-                                // translating, skip the buffer flush and the
-                                // clean-[DONE] guard, and finalize as a failure.
                                 if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
                                     client_gone = true;
                                     break;
                                 }
                                 if ctx.terminal.errored {
+                                    // Nothing may follow the error frame.
                                     break;
                                 }
                             }
@@ -13494,12 +13501,9 @@ async fn forward_openai_compat_anthropic(
                 let remaining = String::from_utf8_lossy(&buffer).into_owned();
                 if !remaining.trim().is_empty() {
                     if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
-                        if translated.ends_with("data: [DONE]\n\n") {
+                        if translated.ends_with("data: [DONE]\n\n") && !ctx.terminal.errored {
                             ctx.terminal.completed = true;
                         }
-                        // An error event in the trailing buffer (stream closed
-                        // without a final \n\n) set ctx.terminal.errored — same
-                        // rules as in-loop.
                         if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
                             client_gone = true;
                         }
