@@ -7982,9 +7982,17 @@ fn model_unsupported_response(model: &str, openai_shape: bool) -> Response {
 /// Anthropic-shaped JSON error envelope for the proxy-generated admission
 /// denials (LAB-4129): `authenticate` 401, `pre_request_gate` 403/429,
 /// `reserve_request_body` 503, `read_body_bounded` 408, and the
-/// untranslatable-request 400. Other proxy-generated errors (retry
-/// exhaustion, the failed-auth throttle, bad-body 400) still return
-/// `text/plain`.
+/// untranslatable-request 400. This is not the whole error surface — the
+/// IP-allowlist 403, retry exhaustion, the failed-auth throttle and the
+/// bad-body 400s still return `text/plain`.
+///
+/// All three 429s share `rate_limit_error`: that is the type Anthropic binds
+/// to 429, and a narrower invented one would break SDK matching. What
+/// separates them on the wire is `retry-after` — budget and utilization
+/// carry one, the emergency brake deliberately does not. Two types are ours
+/// rather than Anthropic's, which binds `overloaded_error` to 529 and has no
+/// 408 type at all: `503 overloaded_error` and `408 timeout_error` name load
+/// shed *here*, not an upstream condition relayed.
 ///
 /// Deliberately NOT surface-shaped, unlike `guard_blocked_response` and
 /// `model_unsupported_response`: those carry a machine-readable cause in

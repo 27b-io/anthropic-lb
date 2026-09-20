@@ -18703,17 +18703,15 @@ async fn gate_429_budget_returns_json_envelope_with_retry_after() {
         .unwrap()
         .parse()
         .expect("retry-after must be integer seconds");
-    // Pin the VALUE, not just a range: the hint must expire exactly at the
-    // next UTC midnight, the same boundary `check_budget`'s day key rolls on
-    // — a plausible-looking regression (a fixed 3600, or `86400 - now%3600`)
-    // stays inside 1..=86400 and would slip past a range check. The gate read
-    // its own clock somewhere in [t0, t1], so measuring the deadline from t1
-    // overshoots the true one by at most the elapsed test time; that bound is
-    // what makes this exact without a frozen clock.
+    // The gate read its own clock somewhere in [t0, t1]; pin the value
+    // against every instant it could have seen. A range check is not enough:
+    // a fixed `3600` and a wrong `86400 - now%3600` both land inside
+    // 1..=86400, and both passed it.
     assert!(
-        (t1 + retry_after) % 86400 <= t1 - t0,
-        "budget retry-after must expire at the next UTC midnight (86400 - now%86400), \
-         got {retry_after} at t1={t1}"
+        (t0..=t1).any(|now| retry_after == 86400 - now % 86400),
+        "budget retry-after must be the seconds left until the next UTC midnight, \
+         the boundary check_budget's day key rolls on; got {retry_after} for a gate \
+         clock read in [{t0}, {t1}]"
     );
     let json = parse_error_envelope(err).await;
     assert_eq!(json["type"], "error");
