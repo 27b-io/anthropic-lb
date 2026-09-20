@@ -3,6 +3,11 @@
 ## [0.2.5](https://github.com/27b-io/anthropic-lb/compare/v0.2.4...v0.2.5) (2026-09-19)
 
 
+### ⚠ BREAKING CHANGES
+
+* **LAB-3214:** the `usage` INFO log line is gone. Each proxied request now emits one `proxied` (or `proxied (openai-compat)`) INFO line at completion, carrying the token fields (`input`, `output`, `cached`, `cache_write`) alongside the routing fields; error paths emit the same line with zeroed usage. The `fingerprint` line is DEBUG-only (its `fp` field rides on the `proxied` line since [#174](https://github.com/27b-io/anthropic-lb/issues/174)). Log consumers filtering on `usage` or `fingerprint` at the default level must filter on `proxied` instead. ([#172](https://github.com/27b-io/anthropic-lb/issues/172)) ([a0d0269](https://github.com/27b-io/anthropic-lb/commit/a0d0269d391c9d22144fa38ebebd338bd31db534))
+
+
 ### Features
 
 * **guard:** Tier 0 request content-scan layer (LAB-3877) ([#179](https://github.com/27b-io/anthropic-lb/issues/179)) ([9a97ebb](https://github.com/27b-io/anthropic-lb/commit/9a97ebb9a5a4b36be52bc83fdcd2c02b8ae42504))

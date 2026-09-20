@@ -33,9 +33,19 @@ which triggers `release.yml` (build + crates.io) and `docker.yml`.
 - **Squash-merge titles must be conventional commits** — `feat: ...`,
   `fix: ...`, `feat!: ...`; ticket refs go in the scope (e.g.
   `fix(LAB-932): ...`). Non-conventional subjects are invisible to
-  release-please and produce no release. Caveat: with the repo's current
-  merge settings the squash subject can come from the *commit* title
-  (single-commit PRs) rather than the PR title — make both conventional.
+  release-please and produce no release. The repo squash-merges with the
+  PR title as the subject and a blank body, so the PR title is the whole
+  commit message release-please sees.
+- **Scoped breaking changes use the spec form `type(scope)!: summary`**
+  (e.g. `fix(LAB-3214)!: ...`). `type!(scope): ...` is NOT parsed —
+  release-please drops the commit from the notes entirely and skips the
+  version bump it should have caused (#172 vanished from 0.2.5 this way).
+- **`BREAKING CHANGE:` footers must go in the PR body**, inside a
+  `BEGIN_COMMIT_OVERRIDE ... END_COMMIT_OVERRIDE` block: the squash body
+  is blank, so a footer on a branch commit never reaches the squash
+  commit. release-please uses the block in place of the whole commit
+  message, so repeat the conventional header inside it, then the footer:
+  `fix(LAB-3214)!: summary` / blank line / `BREAKING CHANGE: what breaks`.
 - **Pre-1.0 is pinned**: breaking changes bump the minor (never to 1.0.0),
   features bump the patch, and 0.x GitHub releases are flagged pre-release.
 - **Releasing 1.0.0** is an explicit human act: land a commit with a
