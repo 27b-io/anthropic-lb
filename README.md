@@ -598,11 +598,21 @@ replica count.
 The `claim` label comes from the upstream `representative-claim` header,
 never from client input, but it is still an unvalidated remote string. It is
 truncated to 64 characters, and each account retains at most 32 distinct
-claim keys plus the model-band carve-out (hard bound: 33 per account).
-Keys already present keep updating past the cap; a genuinely new key past it
-is dropped and logged at WARN. Unlike the caller-labelled counters above, the
-overflow is *not* folded into an `_other` bucket — this map is routing input,
-and a synthetic merged claim would feed the weighting math.
+**unreserved** claim keys. Reserved keys — the four that gate all traffic plus
+the model-band carve-out — are always admitted, so the hard bound is 37 per
+account. That bound holds on the live header path and on the two paths that
+restore the map whole (the persisted state file and the cross-replica mirror),
+so a map written by an older build cannot restore unbounded.
+
+Keys already present keep updating past the cap; a genuinely new one past it is
+dropped, and the refusal is logged once per account rather than once per
+request. Unlike the caller-labelled counters above, overflow is *not* folded
+into an `_other` bucket: both routing lookups match exact keys and the
+emergency brake's input is allowlist-filtered, so an unknown key is already
+inert to routing and a bucket would only add a fake claim to the metrics.
+Reserving the keys that are *not* inert is what makes the cap safe — without
+that, a flood of unknown keys could lock out `seven_day` itself, and an account
+with no derivable weekly utilization routes as though it had no weekly limit.
 
 ### Pool exhaustion
 

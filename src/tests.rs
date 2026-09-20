@@ -22406,7 +22406,6 @@ async fn metrics_counts_client_facing_pool_exhaustion() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let (app, state) = test_app(&mock_url, None);
     let addr = serve(app).await;
-    let client = Client::new();
     let scrape = |addr| async move {
         Client::new()
             .get(format!("http://{}/metrics", addr))
@@ -22443,7 +22442,29 @@ async fn metrics_counts_client_facing_pool_exhaustion() {
         after.contains("anthropic_pool_exhausted_total{kind=\"transient\"} 1"),
         "transient exhaustion should count 1:\n{after}"
     );
-    drop(client);
+}
+
+/// A response carrying a distinct `representative-claim`, with a reset inside
+/// the parser's 7d sanity window so the entry actually persists. A literal far
+/// future epoch is silently discarded by that cap, which would leave the claim
+/// reset-less and the test asserting less than it looks like it asserts.
+fn claim_headers(claim: Option<&str>, util: &str, now_epoch: u64) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(c) = claim {
+        headers.insert(
+            "anthropic-ratelimit-unified-representative-claim",
+            HeaderValue::from_str(c).unwrap(),
+        );
+    }
+    headers.insert(
+        "anthropic-ratelimit-unified-7d-utilization",
+        HeaderValue::from_str(util).unwrap(),
+    );
+    headers.insert(
+        "anthropic-ratelimit-unified-7d-reset",
+        HeaderValue::from_str(&(now_epoch + 3600).to_string()).unwrap(),
+    );
+    headers
 }
 
 /// AC-4: claim keys are minted from the upstream response header, never from
@@ -22453,43 +22474,56 @@ async fn metrics_counts_client_facing_pool_exhaustion() {
 #[tokio::test]
 async fn claim_keys_cannot_mint_unbounded_series() {
     let state = test_state_with(vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")]);
+    let now_epoch = AppState::now_epoch();
 
-    // 200 distinct well-formed claim keys, far past the cap.
-    for i in 0..200 {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            "anthropic-ratelimit-unified-representative-claim",
-            HeaderValue::from_str(&format!("seven_day_junk{i}")).unwrap(),
+    // Oversized key FIRST, while the map has room: this exercises truncation,
+    // not the cap. (Sent after the flood it would be refused outright, and the
+    // truncation assertion would pass even with `truncate_label` deleted.)
+    let oversized = format!("seven_day_{}", "x".repeat(4096));
+    let expected: String = oversized
+        .chars()
+        .take(MAX_LABEL_CHARS)
+        .chain(['…'])
+        .collect();
+    state
+        .update_rate_info(0, &claim_headers(Some(&oversized), "0.50", now_epoch))
+        .await;
+    {
+        let info = state.endpoints[0].rate_info.read().await;
+        assert!(
+            info.claims_7d.contains_key(&expected),
+            "the oversized key must be stored truncated, got {:?}",
+            info.claims_7d.keys().collect::<Vec<_>>()
         );
-        headers.insert(
-            "anthropic-ratelimit-unified-7d-utilization",
-            HeaderValue::from_static("0.50"),
+        assert!(
+            !info.claims_7d.contains_key(&oversized),
+            "the untruncated key must never be retained"
         );
-        headers.insert(
-            "anthropic-ratelimit-unified-7d-reset",
-            HeaderValue::from_static("9999999999"),
+        assert_eq!(
+            info.representative_claim.as_deref(),
+            Some(expected.as_str()),
+            "representative_claim must be truncated too, or refresh_metrics_weights \
+             looks up a key that cannot exist"
         );
-        state.update_rate_info(0, &headers).await;
     }
 
-    // One oversized key: a single header value can be many KiB.
-    let oversized = format!("seven_day_{}", "x".repeat(4096));
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        "anthropic-ratelimit-unified-representative-claim",
-        HeaderValue::from_str(&oversized).unwrap(),
-    );
-    headers.insert(
-        "anthropic-ratelimit-unified-7d-utilization",
-        HeaderValue::from_static("0.50"),
-    );
-    state.update_rate_info(0, &headers).await;
+    // Now flood far past the cap.
+    for i in 0..200 {
+        let claim = format!("seven_day_junk{i}");
+        state
+            .update_rate_info(0, &claim_headers(Some(&claim), "0.50", now_epoch))
+            .await;
+    }
 
     let info = state.endpoints[0].rate_info.read().await;
+    let unreserved = info
+        .claims_7d
+        .keys()
+        .filter(|k| !claim_key_is_reserved(k))
+        .count();
     assert!(
-        info.claims_7d.len() <= MAX_CLAIMS_PER_ACCOUNT + 1,
-        "claims map must stay bounded, got {} keys",
-        info.claims_7d.len()
+        unreserved <= MAX_CLAIMS_PER_ACCOUNT,
+        "unreserved claim keys must stay bounded, got {unreserved}"
     );
     assert!(
         info.claims_7d
@@ -22497,48 +22531,35 @@ async fn claim_keys_cannot_mint_unbounded_series() {
             .all(|k| k.chars().count() <= MAX_LABEL_CHARS + 1),
         "every claim key must be truncated to a bounded label length"
     );
-    assert!(
-        !info.claims_7d.contains_key(&oversized),
-        "the untruncated key must never be retained"
-    );
 }
 
-/// AC-4 companion: the cap must not cost a real account its claims. Keys
-/// already present keep updating past the cap, and the Fable band — a
-/// compile-time constant, not an upstream string — is admitted regardless.
+/// AC-4, the failure mode the cap itself creates. `effective_utilization` skips
+/// its flat-field fallback whenever `claims_7d` is non-empty, so an account
+/// whose map is full of unknown keys with `seven_day` refused would derive NO
+/// weekly utilization — routing as though it had no weekly limit, and dropping
+/// out of the emergency brake's all-saturated test at 100%.
+///
+/// Order matters: the flood runs FIRST, so the reserved keys arrive against an
+/// already-full map. Seeded the other way round this passes even unfixed.
 #[tokio::test]
-async fn claim_cap_never_evicts_a_live_claim() {
+async fn claim_cap_never_refuses_a_routing_relevant_claim() {
     let state = test_state_with(vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")]);
-
-    let mut fill = reqwest::header::HeaderMap::new();
-    fill.insert(
-        "anthropic-ratelimit-unified-7d-utilization",
-        HeaderValue::from_static("0.10"),
-    );
-    fill.insert(
-        "anthropic-ratelimit-unified-7d-reset",
-        HeaderValue::from_static("9999999999"),
-    );
-    state.update_rate_info(0, &fill).await; // mints "seven_day"
+    let now_epoch = AppState::now_epoch();
 
     for i in 0..MAX_CLAIMS_PER_ACCOUNT * 2 {
-        let mut headers = fill.clone();
-        headers.insert(
-            "anthropic-ratelimit-unified-representative-claim",
-            HeaderValue::from_str(&format!("seven_day_junk{i}")).unwrap(),
-        );
-        state.update_rate_info(0, &headers).await;
+        let claim = format!("seven_day_junk{i}");
+        state
+            .update_rate_info(0, &claim_headers(Some(&claim), "0.10", now_epoch))
+            .await;
     }
 
-    // The general claim predates the flood and must still be updatable.
-    let mut refresh = fill.clone();
-    refresh.insert(
-        "anthropic-ratelimit-unified-7d-utilization",
-        HeaderValue::from_static("0.77"),
-    );
-    state.update_rate_info(0, &refresh).await;
+    // No representative-claim header → the parser's `seven_day` default, the
+    // key `claim_gates_all_traffic` feeds to the brake.
+    state
+        .update_rate_info(0, &claim_headers(None, "0.77", now_epoch))
+        .await;
 
-    // The Fable band arrives after the cap is full — it must still land.
+    // The Fable band arrives against the same full map.
     let mut band = reqwest::header::HeaderMap::new();
     band.insert(
         "anthropic-ratelimit-unified-7d_oi-utilization",
@@ -22546,7 +22567,7 @@ async fn claim_cap_never_evicts_a_live_claim() {
     );
     band.insert(
         "anthropic-ratelimit-unified-7d_oi-reset",
-        HeaderValue::from_static("9999999999"),
+        HeaderValue::from_str(&(now_epoch + 3600).to_string()).unwrap(),
     );
     band.insert(
         "anthropic-ratelimit-unified-7d_oi-status",
@@ -22558,7 +22579,8 @@ async fn claim_cap_never_evicts_a_live_claim() {
     assert_eq!(
         info.claims_7d.get("seven_day").and_then(|c| c.utilization),
         Some(0.77),
-        "a claim already in the map must keep updating past the cap"
+        "the all-traffic claim must be admitted against a full map — without it \
+         the account derives no weekly utilization and routes as unconstrained"
     );
     assert_eq!(
         info.claims_7d
@@ -22566,5 +22588,53 @@ async fn claim_cap_never_evicts_a_live_claim() {
             .and_then(|c| c.status.as_deref()),
         Some("rejected"),
         "the Fable band must be admitted even with the cap full"
+    );
+    // The point of the two assertions above: routing still sees a weekly figure.
+    let (_, window, _, adj_7d) = effective_utilization(&info, now_epoch, "");
+    assert!(
+        adj_7d.is_some(),
+        "a flooded account must still derive a 7d utilization (window={window})"
+    );
+}
+
+/// AC-4 at the two ingest points that bypass the header parser entirely: the
+/// persisted state file and the Redis mirror both assign `claims_7d` whole. A
+/// map written by a pre-cap build must not restore unbounded.
+#[test]
+fn ingested_claims_are_bounded_and_truncated() {
+    let mut raw: HashMap<String, ClaimWindowData> = HashMap::new();
+    for i in 0..500 {
+        raw.insert(format!("seven_day_junk{i}"), ClaimWindowData::default());
+    }
+    let oversized = format!("seven_day_{}", "y".repeat(4096));
+    raw.insert(oversized.clone(), ClaimWindowData::default());
+    // Reserved keys, deliberately sorting AFTER the junk so a naive
+    // "keep the first N sorted" would drop them.
+    for key in ["seven_day", "seven_day_sonnet", FABLE_BAND_CLAIM] {
+        raw.insert(key.to_string(), ClaimWindowData::default());
+    }
+
+    let bounded = bound_ingested_claims(raw);
+
+    let unreserved = bounded.keys().filter(|k| !claim_key_is_reserved(k)).count();
+    assert_eq!(
+        unreserved, MAX_CLAIMS_PER_ACCOUNT,
+        "unreserved keys must be trimmed to exactly the cap"
+    );
+    for key in ["seven_day", "seven_day_sonnet", FABLE_BAND_CLAIM] {
+        assert!(
+            bounded.contains_key(key),
+            "reserved key {key} must survive trimming"
+        );
+    }
+    assert!(
+        !bounded.contains_key(&oversized),
+        "an untruncated key must not survive ingest"
+    );
+    assert!(
+        bounded
+            .keys()
+            .all(|k| k.chars().count() <= MAX_LABEL_CHARS + 1),
+        "every ingested key must be truncated"
     );
 }

@@ -373,6 +373,10 @@ struct RedisRateInfo {
 
 #[derive(Default)]
 struct RateLimitInfo {
+    /// Set once this account has refused a claim key for being over
+    /// `MAX_CLAIMS_PER_ACCOUNT`, so the WARN is emitted once per process rather
+    /// than once per request. Runtime-only: never persisted or synced.
+    claim_cap_warned: bool,
     remaining_requests: Option<u64>,
     remaining_tokens: Option<u64>,
     limit_requests: Option<u64>,
@@ -534,40 +538,89 @@ fn truncate_label(s: &str) -> String {
     out
 }
 
-/// Cap on distinct 7d claim keys retained per account. Keys are minted from the
-/// upstream `anthropic-ratelimit-unified-representative-claim` header — never
-/// from client input — but that is still an unvalidated remote string, and every
-/// key it mints becomes a permanent `claim` label on four `anthropic_claim_*`
-/// series. Without a cap a misbehaving or hostile upstream grows both the map
-/// and the scrape without limit (CWE-770; same class as the LAB-2330 fix to
-/// `client_model_usage`). The real wire protocol uses a handful per account
-/// (`seven_day`, the model carve-outs, the normalised Fable band), so the cap
-/// only bites on abuse.
-///
-/// Hard bound is `MAX_CLAIMS_PER_ACCOUNT + 1`: `FABLE_BAND_CLAIM` is a compile-time
-/// constant that bypasses the cap deliberately, because losing the Fable band to a
-/// junk-filled map would blind exactly the routing signal this cap exists to keep
-/// legible.
+/// Cap on distinct UNRESERVED 7d claim keys per account. Keys are minted from
+/// the upstream `representative-claim` header — never from client input, but
+/// still an unvalidated remote string, and each one becomes a permanent `claim`
+/// label on the `anthropic_claim_*` series (CWE-770). Reserved keys are exempt,
+/// so the hard bound per account is `MAX_CLAIMS_PER_ACCOUNT` + the reserved set.
 const MAX_CLAIMS_PER_ACCOUNT: usize = 32;
 
+/// Claim keys the cap must NEVER refuse: the four that gate all traffic plus the
+/// normalised Fable band. A compile-time-closed set, so exempting them costs a
+/// bounded five entries — and not exempting them is a routing hazard, not merely
+/// a lost metric. `effective_utilization` skips its flat-field fallback whenever
+/// `claims_7d` is non-empty, so an account whose map is full of unknown keys
+/// with `seven_day` refused derives NO weekly utilization at all: it would route
+/// as though it had no weekly limit, and drop out of the emergency brake's
+/// all-accounts-saturated test while sitting at 100%.
+fn claim_key_is_reserved(key: &str) -> bool {
+    claim_gates_all_traffic(key) || key == FABLE_BAND_CLAIM
+}
+
 /// Whether a 7d claim key may be stored for this account. Mirrors the
-/// `MAX_TRACKED_CLIENTS` admission rule: keys already present always pass, so
-/// live claims keep updating past the cap, and only genuinely new keys are
-/// refused. Overflow is DROPPED rather than folded into an `_other` bucket the
-/// way caller-labelled counters do it — `claims_7d` is routing input, not just a
-/// metric, and a synthetic merged claim would feed the weighting math and the
-/// emergency brake. Refusal is logged, never silent.
-fn claim_admitted(claims: &HashMap<String, ClaimWindowData>, key: &str, account: &str) -> bool {
-    if claims.len() < MAX_CLAIMS_PER_ACCOUNT || claims.contains_key(key) {
+/// `MAX_TRACKED_CLIENTS` admission rule — keys already present always pass, so
+/// live claims keep updating past the cap — with reserved keys exempt entirely.
+///
+/// Overflow is dropped rather than folded into an `_other` bucket the way the
+/// caller-labelled counters do it, because bucketing would buy nothing here:
+/// both routing lookups (`resolve_7d_claim`, `constraining_7d_claims`) match
+/// exact keys and the brake's input is allowlist-filtered, so an unknown key is
+/// already inert to routing. Reserving the keys that are NOT inert is what makes
+/// the cap safe; the bucket would only add a fake claim to the metrics.
+///
+/// Logged once per account: the refusal fires per request under a claim flood,
+/// so a per-refusal line would let an upstream drive unbounded log volume —
+/// the same exhaustion class the cap itself closes.
+fn claim_admitted(info: &mut RateLimitInfo, key: &str, account: &str) -> bool {
+    if claim_key_is_reserved(key)
+        || info.claims_7d.len() < MAX_CLAIMS_PER_ACCOUNT
+        || info.claims_7d.contains_key(key)
+    {
         return true;
     }
-    warn!(
-        account,
-        claim = key,
-        cap = MAX_CLAIMS_PER_ACCOUNT,
-        "refusing new 7d claim key: account is at the claim cap"
-    );
+    if !info.claim_cap_warned {
+        info.claim_cap_warned = true;
+        warn!(
+            account,
+            claim = key,
+            cap = MAX_CLAIMS_PER_ACCOUNT,
+            "claim cap reached; refusing unknown 7d claim keys for this account \
+             (routing-relevant keys are still admitted)"
+        );
+    }
     false
+}
+
+/// Apply the key bound to a claims map that arrived whole rather than through
+/// the header parser — the persisted state file and the Redis mirror both
+/// assign `claims_7d` outright. Without this the bound holds only on the live
+/// path, and a state file written by a pre-cap build (or a peer replica still
+/// running one) restores an unbounded, untruncated map that `contains_key` then
+/// lets every junk key keep updating forever.
+///
+/// Reserved keys always survive. The rest are kept in sorted order so every
+/// replica and every restart retains the same subset rather than a
+/// HashMap-iteration-order lottery.
+fn bound_ingested_claims(
+    claims: HashMap<String, ClaimWindowData>,
+) -> HashMap<String, ClaimWindowData> {
+    let mut out: HashMap<String, ClaimWindowData> = claims
+        .into_iter()
+        .map(|(k, v)| (truncate_label(&k), v))
+        .collect();
+    let mut unreserved: Vec<String> = out
+        .keys()
+        .filter(|k| !claim_key_is_reserved(k))
+        .cloned()
+        .collect();
+    if unreserved.len() <= MAX_CLAIMS_PER_ACCOUNT {
+        return out;
+    }
+    unreserved.sort_unstable();
+    for key in unreserved.into_iter().skip(MAX_CLAIMS_PER_ACCOUNT) {
+        out.remove(&key);
+    }
+    out
 }
 const TAU_6H: f64 = 21600.0;
 
@@ -2831,15 +2884,15 @@ impl AppState {
 
                 // Load claims_7d: either from persisted map or migrate from flat fields
                 if !pa.claims_7d.is_empty() {
-                    info.claims_7d = pa.claims_7d.clone();
+                    info.claims_7d = bound_ingested_claims(pa.claims_7d.clone());
                 } else if let Some(util_7d) = pa.utilization_7d {
                     // Migration: old state file with flat 7d fields only
-                    let key = pa
-                        .representative_claim
-                        .as_deref()
-                        .filter(|c| c.starts_with("seven_day"))
-                        .unwrap_or("seven_day")
-                        .to_string();
+                    let key = truncate_label(
+                        pa.representative_claim
+                            .as_deref()
+                            .filter(|c| c.starts_with("seven_day"))
+                            .unwrap_or("seven_day"),
+                    );
                     info.claims_7d.insert(
                         key,
                         ClaimWindowData {
@@ -3513,13 +3566,11 @@ fn status_to_ordinal(status: Option<&str>) -> f64 {
         Some("throttled") => 2.0,
         Some("allowed_warning") => 1.0,
         Some("allowed") | None => 0.0,
-        Some(unknown) => {
-            warn!(
-                status = unknown,
-                "unknown rate-limit status in ordinal mapping"
-            );
-            1.0
-        }
+        // Unknown maps to the warning tier, silently: this is a read-only
+        // exposition helper called once per account per claim per scrape, and
+        // `status_to_floor` already WARNs on the same unknown string where it
+        // actually changes a routing decision.
+        Some(_) => 1.0,
     }
 }
 
@@ -4903,16 +4954,18 @@ impl AppState {
             .map(|s| s.to_string());
 
         if let Some(ref claim) = rep_claim {
-            info.representative_claim = Some(claim.clone());
+            // Truncated for the same reason as the claim key below, plus one of
+            // its own: `refresh_metrics_weights` looks this string up in the
+            // (now truncated) claims map, so an untruncated copy would miss its
+            // own entry and silently report a different claim than the router used.
+            info.representative_claim = Some(truncate_label(claim));
         }
 
         // Determine the claim key for 7d data storage.
         // If claim starts with "seven_day", use it verbatim (e.g., "seven_day_sonnet").
         // Otherwise default to "seven_day" (general bucket).
-        // Truncated here, at the single point where an upstream string becomes a
-        // map key: the key outlives the response as a `claim` metric label and is
-        // re-serialised on every scrape, so an unbounded one is retained for the
-        // process lifetime (see `truncate_label`).
+        // Truncated because the key outlives the response as a `claim` metric
+        // label — see `truncate_label`.
         let claim_key_7d = truncate_label(
             rep_claim
                 .as_deref()
@@ -4941,11 +4994,12 @@ impl AppState {
         {
             if let Ok(s) = v.to_str() {
                 if let Ok(util) = s.parse::<f64>() {
-                    // Creating the entry is the map's only growth point, so the
-                    // cap belongs here. A refused key reports `false` — it stored
-                    // no utilization, and claiming otherwise would clear the
-                    // surviving claim's status below (Bug #1's path).
-                    if claim_admitted(&info.claims_7d, claim_key_7d, endpoint_name) {
+                    // The header parser's only growth point for `claims_7d`
+                    // (`bound_ingested_claims` covers the two wholesale assigns).
+                    // A refused key reports `false` because it stored nothing —
+                    // reporting parsed 7d utilization for data that was dropped
+                    // would be a lie to every consumer of that flag.
+                    if claim_admitted(&mut info, claim_key_7d, endpoint_name) {
                         let entry = info.claims_7d.entry(claim_key_7d.to_string()).or_default();
                         entry.utilization = Some(util.clamp(0.0, 1.0));
                         entry.last_seen = now_epoch;
@@ -5489,7 +5543,7 @@ impl AppState {
                             info.reset_7d = remote.reset_7d;
                             info.status_5h = remote.status_5h;
                             info.status_7d = remote.status_7d;
-                            info.claims_7d = remote.claims_7d;
+                            info.claims_7d = bound_ingested_claims(remote.claims_7d);
                             info.representative_claim = remote.representative_claim;
                             info.remaining_requests = remote.remaining_requests;
                             info.remaining_tokens = remote.remaining_tokens;
@@ -10203,7 +10257,6 @@ fn prom_header(buf: &mut String, name: &str, metric_type: &str, help: &str) {
     let _ = writeln!(buf, "# TYPE {name} {metric_type}");
 }
 
-#[allow(dead_code)]
 #[derive(Default, Clone)]
 struct ClaimMetricsSnap {
     key: String,
@@ -10938,17 +10991,11 @@ async fn metrics_handler(
         }
     }
 
-    // Per-claim status and reset (LAB-4189). `anthropic_account_rate_limit_status`
-    // and `anthropic_account_reset_seconds` are labelled `window="5h"|"7d"` only,
-    // so a model carve-out — the Fable band above all — had no status of its own
-    // and no reset an operator could read.
-    //
-    // Status is NOT recoverable from utilization in either direction, which is the
-    // whole reason these exist: an account can read 0.98 and still be
-    // `allowed_warning` (the router keeps sending it traffic) while another reads
-    // 1.0 and is `rejected` (hard-skipped entirely). Both observed in the same
-    // scrape. Any panel thresholding utilization mislabels both cases; read this
-    // series instead.
+    // Per-claim status and reset (LAB-4189). The account-level siblings are
+    // labelled `window="5h"|"7d"` only, so a model carve-out had neither. Status
+    // is not recoverable from utilization in either direction — see the
+    // per-claim section of the README for the why, and read this rather than
+    // thresholding the percentage.
     prom_header(
         &mut buf,
         "anthropic_claim_rate_limit_status",
@@ -11620,11 +11667,10 @@ async fn metrics_handler(
     }
 
     // Client-facing pool exhaustion (LAB-4189): the 429/503 the caller actually
-    // received because every endpoint was gated or failed. Distinct from the
-    // per-account `anthropic_account_*` gauges, which describe the pool's state
-    // but never say whether a request was turned away because of it. Per-replica
-    // and in-memory, so aggregate with `sum by (kind)` across replicas — unlike
-    // the gauges, these are independent events, not two views of one upstream.
+    // received because every endpoint was gated or failed. The per-account
+    // gauges describe the pool's state but never say whether a request was
+    // turned away because of it. Independent per-replica events, not mirrors of
+    // one upstream value — aggregate with `sum by (kind)`.
     prom_header(
         &mut buf,
         "anthropic_pool_exhausted_total",
