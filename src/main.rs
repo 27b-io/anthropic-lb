@@ -3387,7 +3387,22 @@ fn strip_orphaned_beta_body_fields(
         }
     }
 
-    let parsed: TopLevelObject = serde_json::from_slice(body).ok()?;
+    let parsed: TopLevelObject = match serde_json::from_slice(body) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            // Swallowing this is the worst possible silence: the caller is on
+            // the one path that only runs because a flag was already dropped,
+            // so the untouched body goes upstream and earns the hard 400 this
+            // function exists to prevent — with nothing in the log tying the
+            // rejection to a body the proxy could not parse.
+            warn!(
+                error = %e,
+                "beta body coherence: request body is not a JSON object, forwarding it \
+                 untouched — the orphaned-field strip cannot run and upstream will reject it"
+            );
+            return None;
+        }
+    };
     let mut removed: Vec<String> = Vec::new();
     let kept: Vec<&(String, Box<serde_json::value::RawValue>)> = parsed
         .0
@@ -10769,6 +10784,42 @@ async fn build_metrics_snap(
     }
 }
 
+/// Snapshot one of the beta-filter counter maps for the `/metrics` render,
+/// recovering — and clearing — a poisoned lock rather than publishing an
+/// empty map.
+///
+/// `.lock().ok().unwrap_or_default()` emits a zero that no alert can tell
+/// apart from a genuine zero, so a single panicking holder silently disarms
+/// `AnthropicLbBetaBodyFieldStripped` — the rule that fires on
+/// `anthropic_beta_body_field_stripped_total` going non-zero — for the rest
+/// of the process. Logging and *still* returning empty would only make the
+/// endpoint lie more loudly.
+///
+/// Clearing the poison is the half that matters: both increment paths
+/// (`record_dropped_beta_flags`, `record_stripped_body_fields`) take the lock
+/// with `let Ok(..) else { return }`, so without a clear they skip forever
+/// after one panic and the counter is dead, not merely stale. Recovering is
+/// safe for the same reason it is in `AppState::lock_transport_errors`: these
+/// are plain counter stores with no cross-key invariant, so the worst a
+/// panicking holder can leave behind is one missing increment.
+fn snapshot_counters(
+    counters: &Mutex<HashMap<String, u64>>,
+    map: &'static str,
+) -> Vec<(String, u64)> {
+    let guard = match counters.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            warn!(
+                map,
+                "/metrics: counter lock was poisoned; recovered the counts and cleared it"
+            );
+            counters.clear_poison();
+            poisoned.into_inner()
+        }
+    };
+    guard.iter().map(|(k, v)| (k.clone(), *v)).collect()
+}
+
 async fn metrics_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -10868,18 +10919,11 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
-    let beta_body_fields_stripped: Vec<(String, u64)> = state
-        .beta_body_fields_stripped
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
-    let beta_flags_dropped: Vec<(String, u64)> = state
-        .beta_flags_dropped
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
+    let beta_body_fields_stripped = snapshot_counters(
+        &state.beta_body_fields_stripped,
+        "beta_body_fields_stripped",
+    );
+    let beta_flags_dropped = snapshot_counters(&state.beta_flags_dropped, "beta_flags_dropped");
     let auth_failures: Vec<(&'static str, u64)> = state
         .auth_failures
         .lock()

@@ -22283,6 +22283,20 @@ async fn pinned_client_spills_when_preferred_endpoint_at_paid_overage() {
 // never seen — no allow-list entry required.
 // ---------------------------------------------------------------------------
 
+/// An OAuth-shaped fixture token, assembled at compile time so the tree holds
+/// no contiguous Anthropic OAuth-token prefix for a credential scanner — or a
+/// human skimming a diff — to mistake for a leaked key.
+///
+/// The shape is load-bearing, not decoration: `inject_account_auth` and
+/// `forward_anthropic` both branch on `token.starts_with("sk-ant-oat")` to
+/// decide whether the beta filter runs at all, so an obviously-fake token of
+/// any other shape would exercise none of the code below.
+const OAUTH_SHAPED_FIXTURE_TOKEN: &str = concat!("sk-", "ant-oat01-not-a-real-token");
+
+/// 5h utilization the strict upstream reports on every 200. Distinctive
+/// enough that reading it back off an endpoint proves it came from here.
+const STRICT_UPSTREAM_5H_UTILIZATION: &str = "0.42";
+
 /// Mock upstream modelling the ONE upstream behaviour this ticket is about:
 /// Anthropic rejects top-level body fields it does not recognise
 /// (`speed: Extra inputs are not permitted`). Returns 400 on any non-base
@@ -22352,14 +22366,28 @@ async fn spawn_strict_anthropic_upstream() -> (String, Arc<Mutex<Vec<serde_json:
                 }
                 (
                     StatusCode::OK,
-                    axum::response::AppendHeaders([("content-type", "application/json")]),
+                    axum::response::AppendHeaders([
+                        ("content-type", "application/json"),
+                        // Standard-window headroom. Only `update_rate_info_for`
+                        // reads it, and only when the request was NOT fast —
+                        // which makes its arrival the observable proof that the
+                        // request drew the standard bucket. See
+                        // `stripped_speed_draws_the_standard_rate_bucket`.
+                        (
+                            "anthropic-ratelimit-unified-5h-utilization",
+                            STRICT_UPSTREAM_5H_UTILIZATION,
+                        ),
+                    ]),
                     r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
                 )
                     .into_response()
             }
         },
     ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => panic!("bind the strict Anthropic mock upstream on 127.0.0.1:0: {e}"),
+    };
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -22381,14 +22409,42 @@ async fn forward_with_betas_on(
     client_betas: &str,
     body: &'static str,
 ) -> (StatusCode, serde_json::Value) {
+    let (status, received, _) = forward_with_betas_full(
+        path,
+        None,
+        /* is_fast_mode */ false,
+        client_betas,
+        body,
+    )
+    .await;
+    (status, received)
+}
+
+/// As above, but with the two knobs the fast-mode regression needs: a custom
+/// `allowed_client_betas` and the `is_fast_mode` verdict `proxy_handler` would
+/// have reached on the pre-filter body. Also hands back the state, so the
+/// caller can read what the rate-limit ingest did to the endpoint.
+async fn forward_with_betas_full(
+    path: &'static str,
+    allowed_client_betas: Option<Vec<String>>,
+    is_fast_mode: bool,
+    client_betas: &str,
+    body: &'static str,
+) -> (StatusCode, serde_json::Value, Arc<AppState>) {
     let (url, seen) = spawn_strict_anthropic_upstream().await;
     let mut state = test_state_with(vec![]);
     let mut ep = make_endpoint("acct", Protocol::Anthropic);
     ep.base_url = url;
     // `sk-ant-oat` is what arms the beta filter — an API-key endpoint does not
     // filter at all, so it could not exercise this path.
-    ep.token = "sk-ant-oat01-test".to_string();
-    Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+    ep.token = OAUTH_SHAPED_FIXTURE_TOKEN.to_string();
+    {
+        let state = Arc::get_mut(&mut state).unwrap();
+        state.endpoints.push(ep);
+        if let Some(allowed) = allowed_client_betas {
+            state.allowed_client_betas = allowed;
+        }
+    }
 
     let parts = axum::http::Request::builder()
         .method("POST")
@@ -22404,7 +22460,7 @@ async fn forward_with_betas_on(
         &parts,
         &body_bytes,
         &body_bytes,
-        /* is_fast_mode */ false,
+        is_fast_mode,
         &state.endpoints[0],
         0,
         "req-1261",
@@ -22424,7 +22480,7 @@ async fn forward_with_betas_on(
         _ => panic!("expected a completed response, got a retry/rotate outcome"),
     };
     let received = seen.lock().unwrap().first().cloned().unwrap_or_default();
-    (status, received)
+    (status, received, state)
 }
 
 /// AC-1 + AC-2 + AC-4: a PAIRED beta family the LB has never seen. The header
@@ -22493,6 +22549,68 @@ async fn surviving_paired_beta_keeps_its_body_field() {
     assert!(
         sent.get("totally_unknown_config").is_none(),
         "the orphaned field must still go: {sent}"
+    );
+}
+
+/// Stripping `speed` must also unwind the fast-mode verdict `proxy_handler`
+/// reached on the pre-filter body, or the accounting bills a request that ran
+/// as standard against the fast pool.
+///
+/// `update_rate_info_for` returns early for a fast request — a fast 200's
+/// `anthropic-ratelimit-unified-*` headers describe the fast pool, not the
+/// account's 5h/7d windows (LAB-2693). So whether the mock's 5h utilization
+/// lands in `rate_info` IS the bucket the request drew, and the control below
+/// is what makes the assertion mean anything: the same request with
+/// `fast-mode-*` allowed keeps `speed`, stays fast, and ingests nothing.
+#[tokio::test]
+async fn stripped_speed_draws_the_standard_rate_bucket() {
+    const FAST_BODY: &str =
+        r#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1,"speed":"fast"}"#;
+    let expected: f64 = STRICT_UPSTREAM_5H_UTILIZATION.parse().unwrap();
+
+    // `fast-mode-*` off the allow-list: the header flag is dropped, `speed` is
+    // orphaned and goes with it. Only families that HAVE a `BETA_BODY_FIELDS`
+    // row may survive, or the strip disables itself — the proxy's own
+    // unconditionally re-added `OAUTH_BETA_FLAGS` are exactly that.
+    let (status, sent, state) = forward_with_betas_full(
+        "/v1/messages",
+        Some(vec!["oauth-2025-04-20".to_string()]),
+        /* is_fast_mode */ true,
+        "fast-mode-2026-02-01",
+        FAST_BODY,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        sent.get("speed").is_none(),
+        "the orphaned `speed` must be stripped once its flag is dropped: {sent}"
+    );
+    assert_eq!(
+        state.endpoints[0].rate_info.read().await.utilization_5h,
+        Some(expected),
+        "a request that went upstream WITHOUT `speed` ran as standard, so its \
+         rate-limit headers are account headroom and must be ingested"
+    );
+
+    // Control: same body, same `is_fast_mode`, allow-list carrying the flag.
+    let (status, sent, state) = forward_with_betas_full(
+        "/v1/messages",
+        None,
+        /* is_fast_mode */ true,
+        "fast-mode-2026-02-01",
+        FAST_BODY,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        sent.get("speed").and_then(|v| v.as_str()),
+        Some("fast"),
+        "the default allow-list carries `fast-mode-*`, so `speed` must survive: {sent}"
+    );
+    assert_eq!(
+        state.endpoints[0].rate_info.read().await.utilization_5h,
+        None,
+        "a genuinely fast request must not ingest fast-pool headers as account headroom"
     );
 }
 
@@ -22724,6 +22842,52 @@ fn one_request_cannot_exhaust_the_strip_counter() {
     );
 }
 
+/// A poisoned counter lock must not turn into a published zero.
+///
+/// `/metrics` used to read this map with `.lock().ok().unwrap_or_default()`,
+/// so one panicking holder emitted an empty series — a zero no alert can tell
+/// apart from a genuine zero, which silently disarms the rule that fires on
+/// `anthropic_beta_body_field_stripped_total` going non-zero. Logging and
+/// still returning empty would not have fixed it either: both increment paths
+/// take the lock with `let Ok(..) else { return }`, so after one panic the
+/// counter is dead, not merely stale. Clearing the poison is the half that
+/// keeps it alive, and the second half of this test is what pins that.
+#[test]
+fn poisoned_counter_lock_is_recovered_not_zeroed() {
+    let state = test_state_with(vec![]);
+    state.record_stripped_body_fields("c1", &["speed".to_string()], &["fast-mode-x".to_string()]);
+
+    // The only way a `Mutex` becomes poisoned: a holder panics.
+    let poisoner = Arc::clone(&state);
+    let panicked = std::thread::spawn(move || {
+        let _guard = poisoner.beta_body_fields_stripped.lock().unwrap();
+        panic!("deliberate: poisoning the counter lock for this test");
+    })
+    .join();
+    assert!(
+        panicked.is_err() && state.beta_body_fields_stripped.is_poisoned(),
+        "the fixture must actually poison the lock or this test proves nothing"
+    );
+
+    assert_eq!(
+        snapshot_counters(
+            &state.beta_body_fields_stripped,
+            "beta_body_fields_stripped"
+        ),
+        vec![("speed".to_string(), 1)],
+        "/metrics must publish the real counts, not a zero indistinguishable from a genuine one"
+    );
+    state.record_stripped_body_fields("c1", &["speed".to_string()], &["fast-mode-x".to_string()]);
+    assert_eq!(
+        snapshot_counters(
+            &state.beta_body_fields_stripped,
+            "beta_body_fields_stripped"
+        ),
+        vec![("speed".to_string(), 2)],
+        "counting must resume once the poison is cleared, or the series stays dead"
+    );
+}
+
 /// Stripped field names are JSON object keys — client-controlled bytes with
 /// none of the CR/LF guarantee hyper gives header tokens. Unsanitized they
 /// reach a plain-text log subscriber, where an embedded newline forges whole
@@ -22895,7 +23059,7 @@ async fn full_router_rewrite_preserves_client_bytes() {
         }
     })))
     .await;
-    let mut ep = mk_endpoint("acct", "sk-ant-oat01-test");
+    let mut ep = mk_endpoint("acct", OAUTH_SHAPED_FIXTURE_TOKEN);
     ep.base_url = format!("http://{upstream}");
     let state = Arc::new(AppState {
         endpoints: vec![ep],
