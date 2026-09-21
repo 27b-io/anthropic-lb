@@ -133,6 +133,64 @@ fallback_upstream = "anything"
     assert!(err.contains("priority"));
 }
 
+/// LAB-4395: both ways to lose the read-only principal silently. Either drop
+/// fails OPEN — an empty `admin_readers` promotes the principal to an ordinary
+/// client with full proxy authority rather than disabling it.
+#[test]
+fn config_rejects_a_dropped_read_only_principal() {
+    // 1. the pre-rename spelling at the root.
+    let value: toml::Value = toml::from_str(
+        r#"
+listen = "0.0.0.0:8080"
+readers = ["grafana"]
+"#,
+    )
+    .unwrap();
+    let err = reject_legacy_config_keys(&value).unwrap_err();
+    // Backticked, so `admin_readers` in the same message cannot satisfy it.
+    assert!(err.contains("`readers`"), "{err}");
+    assert!(err.contains("`admin_readers`"), "{err}");
+
+    // 2. the right spelling under the wrong header. TOML binds a bare key to
+    //    the table above it, so this nests into the entry and serde drops it.
+    for section in ["clients", "endpoints"] {
+        let toml_str = format!(
+            r#"
+listen = "0.0.0.0:8080"
+
+[[{section}]]
+name = "grafana"
+key = "dummy-key"
+admin_readers = ["grafana"]
+"#
+        );
+        let value: toml::Value = toml::from_str(&toml_str).unwrap();
+        // Guard against the test rotting into a tautology: assert the key
+        // really did nest before asserting that we catch it nesting.
+        assert!(
+            value.as_table().unwrap().get("admin_readers").is_none(),
+            "{section}: expected the key to bind to the entry, not the root"
+        );
+        let err = reject_legacy_config_keys(&value).unwrap_err();
+        assert!(err.contains("`admin_readers`"), "{section}: {err}");
+        assert!(err.contains("TOP-LEVEL"), "{section}: {err}");
+    }
+
+    // …and the correct placement still boots.
+    let ok: toml::Value = toml::from_str(
+        r#"
+listen = "0.0.0.0:8080"
+admin_readers = ["grafana"]
+
+[[clients]]
+name = "grafana"
+key = "dummy-key"
+"#,
+    )
+    .unwrap();
+    assert!(reject_legacy_config_keys(&ok).is_ok());
+}
+
 #[test]
 fn config_accepts_endpoints_only_schema() {
     let toml_str = r#"
@@ -10651,7 +10709,7 @@ async fn limit_operator_bypass() {
     set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
     // Operator bypasses everything
     assert!(state.is_operator("ray"));
-    assert!(state.pre_request_gate("ray", "").await.is_ok());
+    assert!(state.pre_request_gate("-", "ray", "").await.is_ok());
     // Non-operator does not bypass
     assert!(!state.is_operator("gastown"));
 }
@@ -10774,9 +10832,9 @@ async fn emergency_operator_bypass() {
     set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
     assert!(state.is_emergency_brake_active().await);
     // Operator bypasses pre_request_gate even during emergency
-    assert!(state.pre_request_gate("ray", "").await.is_ok());
+    assert!(state.pre_request_gate("-", "ray", "").await.is_ok());
     // Non-operator gets blocked
-    assert!(state.pre_request_gate("gastown", "").await.is_err());
+    assert!(state.pre_request_gate("-", "gastown", "").await.is_err());
 }
 
 #[tokio::test]
@@ -18588,7 +18646,7 @@ fn client_allow_list_denies_an_unreadable_model() {
 async fn gate_denies_unreadable_model_for_restricted_client() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     let err = state
-        .pre_request_gate("limited", "")
+        .pre_request_gate("-", "limited", "")
         .await
         .expect_err("unknown model must be denied for a restricted client");
     assert_eq!(err.status(), StatusCode::FORBIDDEN);
@@ -18648,7 +18706,7 @@ async fn denied_model_response_body_is_truncated() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     let huge = "z".repeat(100_000);
     let err = state
-        .pre_request_gate("limited", &huge)
+        .pre_request_gate("-", "limited", &huge)
         .await
         .expect_err("oversized model must be denied");
     let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
@@ -18676,7 +18734,7 @@ fn truncate_label_handles_multibyte_without_panicking() {
 async fn gate_denies_model_outside_client_allow_list_with_403_naming_both() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     let err = state
-        .pre_request_gate("limited", "claude-opus-5")
+        .pre_request_gate("-", "limited", "claude-opus-5")
         .await
         .expect_err("opus must be denied");
     assert_eq!(
@@ -18702,7 +18760,7 @@ async fn gate_denies_model_outside_client_allow_list_with_403_naming_both() {
 async fn gate_allows_model_inside_client_allow_list() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     assert!(state
-        .pre_request_gate("limited", "claude-haiku-4-5")
+        .pre_request_gate("-", "limited", "claude-haiku-4-5")
         .await
         .is_ok());
 }
@@ -18716,7 +18774,7 @@ async fn gate_allow_list_bypassed_by_operators() {
     });
     assert!(
         state
-            .pre_request_gate("limited", "claude-opus-5")
+            .pre_request_gate("-", "limited", "claude-opus-5")
             .await
             .is_ok(),
         "operators bypass the allow-list like every other gate check"
@@ -18742,7 +18800,7 @@ async fn gate_denial_beats_the_operator_bypass_when_a_name_holds_both_roles() {
     });
     assert!(
         state
-            .pre_request_gate("both", "claude-opus-5")
+            .pre_request_gate("-", "both", "claude-opus-5")
             .await
             .is_err(),
         "overlap must resolve to the denial, never to the bypass"
@@ -18760,14 +18818,14 @@ async fn gate_leaves_a_plain_client_on_its_existing_policy() {
     });
     assert!(
         state
-            .pre_request_gate("limited", "claude-haiku-4-5")
+            .pre_request_gate("-", "limited", "claude-haiku-4-5")
             .await
             .is_ok(),
         "an allowed model still passes"
     );
     assert!(
         state
-            .pre_request_gate("limited", "claude-opus-5")
+            .pre_request_gate("-", "limited", "claude-opus-5")
             .await
             .is_err(),
         "the allow-list still denies"
@@ -18781,12 +18839,12 @@ async fn model_denial_increments_counter_per_client_and_model() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     for _ in 0..3 {
         assert!(state
-            .pre_request_gate("limited", "claude-opus-5")
+            .pre_request_gate("-", "limited", "claude-opus-5")
             .await
             .is_err());
     }
     assert!(state
-        .pre_request_gate("limited", "claude-fable-5")
+        .pre_request_gate("-", "limited", "claude-fable-5")
         .await
         .is_err());
 
@@ -19310,7 +19368,7 @@ async fn metrics_exposes_the_model_denial_counter() {
     });
     let app = build_router(state.clone());
     assert!(state
-        .pre_request_gate("limited", "claude-opus-5")
+        .pre_request_gate("-", "limited", "claude-opus-5")
         .await
         .is_err());
 

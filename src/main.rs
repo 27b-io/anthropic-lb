@@ -7285,11 +7285,12 @@ impl AppState {
     /// reproduced by adversarial review 2026-09-21). A role whose premise is
     /// "this credential cannot harm the pool" must not hold pool admission
     /// capacity while being told it has no authority.
-    fn deny_admin_reader(&self, client_id: &str) -> Option<Box<Response>> {
+    fn deny_admin_reader(&self, req_id: &str, client_id: &str) -> Option<Box<Response>> {
         if !self.is_admin_reader(client_id) {
             return None;
         }
         warn!(
+            req_id,
             client_id = %client_id,
             "rejected: read-only principal has no proxy authority"
         );
@@ -7399,7 +7400,12 @@ impl AppState {
     /// Returns Ok(()) or an error Response (403/429).
     ///
     /// Boxed Err — see `ForwardOutcome` (clippy::result_large_err).
-    async fn pre_request_gate(&self, client_id: &str, model: &str) -> Result<(), Box<Response>> {
+    async fn pre_request_gate(
+        &self,
+        req_id: &str,
+        client_id: &str,
+        model: &str,
+    ) -> Result<(), Box<Response>> {
         // Read-only principal (LAB-4395). Both proxied handlers already ran
         // this before admitting a body; repeating it here is the backstop for
         // any future caller of the gate that does not. Checked BEFORE the
@@ -7407,7 +7413,7 @@ impl AppState {
         // validation, so the order cannot matter today, but if that check is
         // ever weakened this arm makes the wider grant lose to the denial
         // rather than win.
-        if let Some(resp) = self.deny_admin_reader(client_id) {
+        if let Some(resp) = self.deny_admin_reader(req_id, client_id) {
             return Err(resp);
         }
         if self.is_operator(client_id) {
@@ -9023,7 +9029,7 @@ async fn proxy_handler(
     // LAB-4395 / GH #199: a read-only principal is refused here, on identity
     // alone, before it can reserve any of the shared body budget or have a
     // byte of its body read. `pre_request_gate` repeats the check.
-    if let Some(resp) = state.deny_admin_reader(&client_id) {
+    if let Some(resp) = state.deny_admin_reader(&req_id, &client_id) {
         return *resp;
     }
 
@@ -9242,7 +9248,7 @@ async fn proxy_handler(
     // Note: budget + emergency don't need `model` and could run before body parsing,
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
-    if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
+    if let Err(resp) = state.pre_request_gate(&req_id, &client_id, &model).await {
         return *resp;
     }
 
@@ -13931,7 +13937,7 @@ async fn openai_chat_handler(
 
     // LAB-4395 / GH #199: same identity-only refusal as `proxy_handler`, and
     // for the same reason — ahead of the reservation below.
-    if let Some(resp) = state.deny_admin_reader(&client_id) {
+    if let Some(resp) = state.deny_admin_reader(&req_id, &client_id) {
         return *resp;
     }
 
@@ -13998,7 +14004,7 @@ async fn openai_chat_handler(
     // Note: budget + emergency don't need `model` and could run before body parsing,
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
-    if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
+    if let Err(resp) = state.pre_request_gate(&req_id, &client_id, &model).await {
         return *resp;
     }
 
@@ -14530,6 +14536,12 @@ fn validate_exposure(config: &Config) -> Result<(), String> {
 ///
 /// `serde` silently drops unknown keys by default; this gives the operator
 /// a clear migration message instead of a silent misconfiguration.
+///
+/// The `admin_readers` arm also rejects a MISPLACED spelling, not just a
+/// removed one, because that drop fails OPEN: an empty `admin_readers` does
+/// not disable the read-only principal, it promotes it to an ordinary client
+/// with full proxy authority, and `validate_clients`' overlap and membership
+/// cross-checks never run for want of a name to check.
 fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
     let table = match value.as_table() {
         Some(t) => t,
@@ -14552,6 +14564,38 @@ fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
             "config: fallback_upstream is no longer supported — set a high priority on the OpenAI endpoint instead (see CLAUDE.md)"
                 .to_string(),
         );
+    }
+    // LAB-4395. Two ways to lose the read-only principal silently, both of
+    // which promote it rather than disable it (see this function's doc):
+    //   1. `readers` at the root — the pre-rename spelling, still the natural
+    //      guess for anyone working from the original ticket.
+    //   2. `admin_readers` (or `readers`) written UNDER a `[[clients]]` or
+    //      `[[endpoints]]` header — TOML binds a bare key to the table above
+    //      it, so appending the line to the end of a config nests it. This is
+    //      the likelier mistake of the two: the spelling is right and the file
+    //      looks correct. Neither struct has such a field, so no false hits.
+    if table.contains_key("readers") {
+        return Err(
+            "config: `readers` is not a config key — the read-only principal list is `admin_readers` (see README §Config Reference)"
+                .to_string(),
+        );
+    }
+    for section in ["clients", "endpoints"] {
+        let Some(entries) = table.get(section).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for entry in entries {
+            let Some(entry) = entry.as_table() else {
+                continue;
+            };
+            for key in ["admin_readers", "readers"] {
+                if entry.contains_key(key) {
+                    return Err(format!(
+                        "config: `{key}` found inside a [[{section}]] entry — it is a TOP-LEVEL key; a bare key after a [[{section}]] header binds to that entry and is silently dropped. Move `admin_readers` above the first [[{section}]] block (see README §Config Reference)"
+                    ));
+                }
+            }
+        }
     }
     // LAB-1083: `proxy_key` is the legacy single shared secret, `[[clients]]`
     // its per-client replacement. Rejecting the combination rather than
