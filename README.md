@@ -191,7 +191,7 @@ token = "sk-ant-api03-..."
 | `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
 | `client_utilization_limits` | `{name: f64}` | `{}` | Per-client utilization ceiling (0.0–1.0) |
 | `operators` | `Vec<String>` | `[]` | Client IDs that bypass all enforcement |
-| `admin_readers` | `Vec<String>` | `[]` | Client IDs granted `/_stats` + `/metrics` and nothing else — every `/v1` surface answers 403. The role for a scrape or a dashboard. Requires `[[clients]]`; a name in both `readers` and `operators` is a startup error |
+| `admin_readers` | `Vec<String>` | `[]` | Client IDs granted `/_stats` + `/metrics` and nothing else — every `/v1` surface answers 403. The role for a scrape or a dashboard. Requires `[[clients]]`; a name in both `admin_readers` and `operators` is a startup error |
 | `strategy` | `String` | `dynamic-capacity-v1` | Routing strategy (see note below) |
 | `emergency_threshold` | `f64` | `0.88` | Utilization threshold for emergency brake |
 | `redis_url` | `String?` | `None` | Redis/Valkey URL for distributed state |
