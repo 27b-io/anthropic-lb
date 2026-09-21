@@ -13667,15 +13667,7 @@ async fn metrics_build_info_and_start_time() {
         info.contains(&format!("version=\"{}\"", env!("CARGO_PKG_VERSION"))),
         "{info}"
     );
-    assert!(
-        info.contains(&format!("revision=\"{}\"", build_revision())),
-        "{info}"
-    );
-    let rev = build_revision();
-    assert!(
-        !rev.is_empty() && rev.len() <= 7,
-        "revision is the 7-char short form or `unknown`: {rev:?}"
-    );
+    assert!(info.contains("revision=\""), "{info}");
 
     assert!(
         body.contains("# TYPE process_start_time_seconds gauge"),
@@ -13691,6 +13683,20 @@ async fn metrics_build_info_and_start_time() {
         "start_epoch {} vs now {now}",
         state.start_epoch
     );
+}
+
+/// LAB-4379 AC4: the revision label is the 7-character short commit that
+/// `sha-*` image tags use, or `unknown` when the build did not set one.
+#[test]
+fn build_revision_is_short_sha_or_unknown() {
+    assert_eq!(
+        build_revision(Some("9c0d22b9aa2d8027cde27f1be250da48118a3e33")),
+        "9c0d22b"
+    );
+    assert_eq!(build_revision(Some("9c0d22b")), "9c0d22b");
+    assert_eq!(build_revision(Some("abc")), "abc");
+    assert_eq!(build_revision(Some("")), "unknown");
+    assert_eq!(build_revision(None), "unknown");
 }
 
 /// LAB-4379 AC2: the transport-error counter's HELP text states its

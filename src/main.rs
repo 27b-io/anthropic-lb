@@ -24,7 +24,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -979,12 +979,8 @@ struct AppState {
     /// whole pool was unavailable (LAB-4189) — before this, exhaustion existed
     /// solely as a `warn!` line, so there was nothing to graph or alert on.
     pool_exhausted: [AtomicU64; 2],
-    /// Request-latency histogram keyed by `(route, status)` for
-    /// `anthropic_http_request_duration_seconds`. Both label sets are closed
-    /// (`route_label` collapses paths onto a fixed vocabulary; status is an
-    /// HTTP code), so the map is bounded by construction. Fed by the
-    /// `record_request_duration` middleware, so it covers every response the
-    /// proxy sends, including rejections that never reach an upstream.
+    /// `anthropic_http_request_duration_seconds` cells keyed by
+    /// `(route, status)`; bounded by construction — see `route_label`.
     /// Per-process — aggregate with `sum`.
     request_durations: Mutex<HashMap<(&'static str, u16), RequestDurationHist>>,
     /// Unix-epoch second this process built its state. Exported as
@@ -5630,15 +5626,6 @@ impl AppState {
         let info = self.cluster_info().await;
         if let Ok(mut cache) = self.cluster_info_cache.lock() {
             *cache = info;
-        }
-    }
-
-    /// Record one finished request in the latency histogram. The critical
-    /// section is two additions, so a poisoned lock is not recoverable
-    /// information — skip rather than block the response path.
-    fn observe_request_duration(&self, route: &'static str, status: u16, elapsed: Duration) {
-        if let Ok(mut m) = self.request_durations.lock() {
-            m.entry((route, status)).or_default().observe(elapsed);
         }
     }
 
@@ -10297,6 +10284,29 @@ fn prom_header(buf: &mut String, name: &str, metric_type: &str, help: &str) {
     let _ = writeln!(buf, "# TYPE {name} {metric_type}");
 }
 
+/// Emit one histogram's `_bucket` / `_sum` / `_count` series for a single
+/// label set. `series` is `(le, cumulative_count)` with `+Inf` last — the
+/// shape both `RequestDurationHist::snapshot` and the guard's
+/// `ScanHistogram::snapshot` produce. The family's `# HELP` / `# TYPE` header
+/// is the caller's job: it must appear once even when the family has many
+/// label sets.
+fn prom_histogram(
+    buf: &mut String,
+    family: &str,
+    labels: &[(&str, &str)],
+    series: &[(String, u64)],
+    sum: f64,
+    count: u64,
+) {
+    for (le, cumulative) in series {
+        let mut with_le = labels.to_vec();
+        with_le.push(("le", le.as_str()));
+        prom_counter(buf, &format!("{family}_bucket"), &with_le, *cumulative);
+    }
+    prom_gauge(buf, &format!("{family}_sum"), labels, sum);
+    prom_counter(buf, &format!("{family}_count"), labels, count);
+}
+
 /// Upper edges (seconds) of `anthropic_http_request_duration_seconds`, plus an
 /// implicit `+Inf`. Spans the proxy's own sub-second rejections through the
 /// multi-minute non-streaming generations the upstream client budget allows.
@@ -10305,10 +10315,10 @@ const REQUEST_DURATION_BUCKETS: [f64; 12] = [
 ];
 
 /// One `(route, status)` cell of the request-duration histogram. Bucket counts
-/// are non-cumulative here; `metrics_handler` cumulates them into the
-/// `le`-labelled series Prometheus expects. The total count is the `+Inf`
-/// bucket, so it is not stored twice.
-#[derive(Clone, Default)]
+/// are stored non-cumulative; `snapshot` cumulates them into the `le`-labelled
+/// series Prometheus expects. The total count is the sum of all buckets (the
+/// cumulated `+Inf` at emit time), so it is not stored separately.
+#[derive(Clone, Copy, Default)]
 struct RequestDurationHist {
     buckets: [u64; REQUEST_DURATION_BUCKETS.len() + 1],
     sum_secs: f64,
@@ -10323,6 +10333,25 @@ impl RequestDurationHist {
             .unwrap_or(REQUEST_DURATION_BUCKETS.len());
         self.buckets[idx] += 1;
         self.sum_secs += secs;
+    }
+
+    /// `(le, cumulative_count)` per bucket (last entry `+Inf`), sum in
+    /// seconds, and total count — the shape `prom_histogram` emits.
+    fn snapshot(&self) -> (Vec<(String, u64)>, f64, u64) {
+        let mut cumulative = 0u64;
+        let series = self
+            .buckets
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                cumulative += n;
+                let le = REQUEST_DURATION_BUCKETS
+                    .get(i)
+                    .map_or_else(|| "+Inf".to_string(), |edge| edge.to_string());
+                (le, cumulative)
+            })
+            .collect();
+        (series, self.sum_secs, cumulative)
     }
 }
 
@@ -10341,9 +10370,12 @@ fn route_label(path: &str) -> &'static str {
 }
 
 /// Router-wide middleware: time every request from receipt to the moment the
-/// handler yields its response — for a streamed body that is the headers and
-/// first bytes, not the end of the stream — and record it under
+/// handler yields its response — that is when response headers are ready; for
+/// a streamed body none of the stream time is included — and record it under
 /// `(route, status)`. One site covers every handler, the fallback included.
+/// The critical section is two additions, so a poisoned mutex holds nothing
+/// inconsistent: recover it (as `lock_transport_errors` does) rather than let
+/// the whole family silently vanish from `/metrics`.
 async fn record_request_duration(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
@@ -10352,7 +10384,13 @@ async fn record_request_duration(
     let route = route_label(req.uri().path());
     let start = Instant::now();
     let resp = next.run(req).await;
-    state.observe_request_duration(route, resp.status().as_u16(), start.elapsed());
+    state
+        .request_durations
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry((route, resp.status().as_u16()))
+        .or_default()
+        .observe(start.elapsed());
     resp
 }
 
@@ -10360,8 +10398,8 @@ async fn record_request_duration(
 /// Dockerfile sets from its `GIT_SHA` build argument). Truncated to the
 /// 7-character form `sha-*` image tags use, so `anthropic_lb_info{revision}`
 /// compares byte-for-byte against the deployed tag. `unknown` when unset.
-fn build_revision() -> &'static str {
-    let sha = option_env!("ANTHROPIC_LB_GIT_SHA").unwrap_or("");
+fn build_revision(raw: Option<&'static str>) -> &'static str {
+    let sha = raw.unwrap_or("");
     if sha.is_empty() {
         return "unknown";
     }
@@ -10579,24 +10617,6 @@ async fn build_metrics_snap(
     }
 }
 
-/// The proxy's router. Shared with the integration tests so they exercise the
-/// production route table and middleware stack rather than a copy of it.
-fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/_stats", axum::routing::get(stats_handler))
-        .route("/metrics", axum::routing::get(metrics_handler))
-        .route(
-            "/v1/chat/completions",
-            axum::routing::post(openai_chat_handler),
-        )
-        .fallback(any(proxy_handler))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            record_request_duration,
-        ))
-        .with_state(state)
-}
-
 async fn metrics_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -10712,10 +10732,11 @@ async fn metrics_handler(
     let mut request_durations: Vec<((&'static str, u16), RequestDurationHist)> = state
         .request_durations
         .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (*k, v.clone())).collect())
-        .unwrap_or_default();
-    // Deterministic series order across scrapes.
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .collect();
+    // Stable order for the humans who diff two scrapes.
     request_durations.sort_by_key(|(k, _)| *k);
 
     // ── Phase 2: Serialize (sync — no locks held) ──────────────────
@@ -10735,13 +10756,14 @@ async fn metrics_handler(
         &[
             ("strategy", state.routing_strategy.as_str()),
             ("version", env!("CARGO_PKG_VERSION")),
-            ("revision", build_revision()),
+            (
+                "revision",
+                build_revision(option_env!("ANTHROPIC_LB_GIT_SHA")),
+            ),
         ],
         1.0,
     );
 
-    // Standard process start-time gauge: `time() - process_start_time_seconds`
-    // is uptime, `changes(process_start_time_seconds[1h])` counts restarts.
     prom_header(
         &mut buf,
         "process_start_time_seconds",
@@ -10761,34 +10783,18 @@ async fn metrics_handler(
         &mut buf,
         "anthropic_http_request_duration_seconds",
         "histogram",
-        "Seconds from request receipt to response headers (streamed bodies excluded) by route and status; per-process, aggregate with sum",
+        "Seconds from request receipt until response headers are sent (streamed body time excluded) by route and status; per-process, aggregate with sum",
     );
     for ((route, status), hist) in &request_durations {
         let status = status.to_string();
-        let mut cumulative = 0u64;
-        for (i, n) in hist.buckets.iter().enumerate() {
-            cumulative += n;
-            let le = REQUEST_DURATION_BUCKETS
-                .get(i)
-                .map_or_else(|| "+Inf".to_string(), |edge| edge.to_string());
-            prom_counter(
-                &mut buf,
-                "anthropic_http_request_duration_seconds_bucket",
-                &[("route", route), ("status", &status), ("le", &le)],
-                cumulative,
-            );
-        }
-        prom_gauge(
+        let (series, sum, count) = hist.snapshot();
+        prom_histogram(
             &mut buf,
-            "anthropic_http_request_duration_seconds_sum",
+            "anthropic_http_request_duration_seconds",
             &[("route", route), ("status", &status)],
-            hist.sum_secs,
-        );
-        prom_counter(
-            &mut buf,
-            "anthropic_http_request_duration_seconds_count",
-            &[("route", route), ("status", &status)],
-            cumulative,
+            &series,
+            sum,
+            count,
         );
     }
 
@@ -11953,24 +11959,12 @@ async fn metrics_handler(
             "histogram",
             "Guard request-body scan duration in seconds",
         );
-        for (le, cumulative) in &hist {
-            prom_counter(
-                &mut buf,
-                "anthropic_guard_scan_duration_seconds_bucket",
-                &[("le", le.as_str())],
-                *cumulative,
-            );
-        }
-        prom_gauge(
+        prom_histogram(
             &mut buf,
-            "anthropic_guard_scan_duration_seconds_sum",
+            "anthropic_guard_scan_duration_seconds",
             &[],
+            &hist,
             sum,
-        );
-        prom_counter(
-            &mut buf,
-            "anthropic_guard_scan_duration_seconds_count",
-            &[],
             count,
         );
     }
@@ -14622,6 +14616,24 @@ fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// The proxy's router. Shared with the integration tests so they exercise the
+/// production route table and middleware stack rather than a copy of it.
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/_stats", axum::routing::get(stats_handler))
+        .route("/metrics", axum::routing::get(metrics_handler))
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(openai_chat_handler),
+        )
+        .fallback(any(proxy_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_request_duration,
+        ))
+        .with_state(state)
 }
 
 #[tokio::main]
