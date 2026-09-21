@@ -55,9 +55,14 @@ jobs:
             exit 1
           fi
 
+      # The "stable" ref only bootstraps rustup. Every cargo command below
+      # actually runs the version pinned in rust-toolchain.toml, which
+      # rustup resolves ahead of the default toolchain. CI is NOT unpinned.
+      # No `components:` input: rust-toolchain.toml already declares
+      # rustfmt+clippy, and rustup installs them onto the PINNED toolchain.
+      # An input here would install onto the discarded "stable" toolchain
+      # instead — two sources of truth for the same fact.
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
@@ -97,9 +102,16 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      # No `targets:` input: it installs the target's std onto the action's
+      # discarded "stable" toolchain (`rustup toolchain install stable
+      # --target ...`), while every cargo/cross call below resolves through
+      # the pinned toolchain instead — a silent no-op, not provisioning.
+      # Every leg in this matrix is either the runner's host triple (native
+      # build, no extra target needed) or routed through `cross`, which
+      # provisions its target against the pinned toolchain itself on miss.
+      # Adding a genuinely cross-compiled non-`cross` target later needs an
+      # explicit `rustup target add <target>` step here, not this input.
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:

@@ -376,6 +376,8 @@ fn test_state_base() -> AppState {
         state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
         proxy_key: None,
         clients: vec![],
+        #[cfg(feature = "guard")]
+        guard: crate::guard::Guard::empty(),
         allowed_ips: vec![],
         trusted_proxies: vec![],
         auth_throttle: AuthThrottle::new(
@@ -417,6 +419,7 @@ fn test_state_base() -> AppState {
         body_read_timeout: Duration::from_secs(DEFAULT_BODY_READ_TIMEOUT_SECS),
         body_read_timeout_total: AtomicU64::new(0),
         affinity_migrations: Default::default(),
+        pool_exhausted: Default::default(),
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: DEFAULT_SESSION_REGISTRY_MAX,
         session_registry_ttl_secs: DEFAULT_SESSION_REGISTRY_TTL_SECS,
@@ -428,6 +431,7 @@ fn test_state_base() -> AppState {
             .collect(),
         beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
+        fast_mode_429: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache: None,
@@ -3875,6 +3879,31 @@ fn translate_sse_tool_use_stop_reason() {
 }
 
 #[test]
+fn translate_sse_inband_error_emits_openai_error_frame() {
+    // LAB-710: an Anthropic `event: error` mid-stream must reach the OpenAI
+    // client as an error frame, not vanish into the `_ => None` arm.
+    let mut ctx = StreamContext::default();
+    let raw = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}";
+    let result = translate_sse_event(raw, &mut ctx).unwrap();
+
+    // Flag set → stream loop finalizes as failure and skips the clean [DONE]
+    // guard (the error frame carries its own terminator).
+    assert!(ctx.upstream_error);
+
+    // Exactly one [DONE], and it belongs to the error frame itself.
+    assert_eq!(result.matches("[DONE]").count(), 1);
+    assert!(result.ends_with("data: [DONE]\n\n"));
+
+    let first_event = result.split("\n\n").next().unwrap();
+    let chunk: serde_json::Value =
+        serde_json::from_str(first_event.strip_prefix("data: ").unwrap()).unwrap();
+    assert_eq!(chunk["error"]["type"], "upstream_error");
+    let msg = chunk["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("overloaded_error"));
+    assert!(msg.contains("Overloaded"));
+}
+
+#[test]
 fn translate_sse_text_block_start_skipped() {
     let mut ctx = StreamContext::default();
     let raw = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}";
@@ -4087,6 +4116,10 @@ fn json_mode_stream_message_stop_safety_net_flushes_buffer() {
     let content: serde_json::Value = serde_json::from_str(frames.next().unwrap()).unwrap();
     assert_eq!(content["choices"][0]["delta"]["content"], r#"{"ok":true}"#);
     assert_eq!(frames.next(), Some("[DONE]"));
+    // The stream loop detects the terminator with ends_with("data: [DONE]\n\n")
+    // — a combined frame that failed this would earn a second [DONE] from the
+    // post-loop guard (LAB-710 panel finding).
+    assert!(output.ends_with("data: [DONE]\n\n"));
 }
 
 // ── Reverse translation: Anthropic → OpenAI ──────────────────────
@@ -4354,6 +4387,98 @@ fn reverse_sse_no_duplicate_message_stop() {
     assert!(
         done_events.is_empty(),
         "DONE after finish_reason should emit nothing (message_stop already sent)"
+    );
+}
+
+#[test]
+fn reverse_sse_message_stopped_set_by_both_terminator_paths() {
+    // LAB-710: `ctx.message_stopped` gates the transport-error frame — once
+    // the client has its `message_stop`, a later read failure must not ship
+    // an error frame. Both emit sites must set it: finish_reason (the normal
+    // case) and a bare [DONE] with no finish_reason seen.
+    let mut ctx = ReverseStreamContext::default();
+    translate_openai_sse_to_anthropic(
+        "{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
+    assert!(!ctx.message_stopped);
+    translate_openai_sse_to_anthropic(
+        "{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        &mut ctx,
+    );
+    assert!(ctx.message_stopped, "finish_reason emitted message_stop");
+
+    // message_stop is terminal inside the translator too: an in-band error
+    // line (or stray delta) arriving post-completion must emit nothing.
+    let after = translate_openai_sse_to_anthropic(
+        "{\"error\":{\"message\":\"late\",\"type\":\"server_error\"}}",
+        &mut ctx,
+    );
+    assert!(
+        after.is_empty(),
+        "no frame may follow message_stop, got: {after:?}"
+    );
+    assert!(!ctx.upstream_error);
+
+    let mut ctx = ReverseStreamContext::default();
+    translate_openai_sse_to_anthropic(
+        "{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
+    let done_events = translate_openai_sse_to_anthropic("[DONE]", &mut ctx);
+    assert!(done_events[0].contains("message_stop"));
+    assert!(ctx.message_stopped, "bare [DONE] emitted message_stop");
+}
+
+#[test]
+fn reverse_sse_inband_error_before_message_start() {
+    // LAB-710: an in-band OpenAI {"error": {...}} line before any content
+    // must emit an Anthropic `event: error` frame — previously it hit the
+    // missing-choices early-return and the client got 200 + empty SSE body.
+    let mut ctx = ReverseStreamContext::default();
+    let events = translate_openai_sse_to_anthropic(
+        "{\"error\":{\"message\":\"The server had an error\",\"type\":\"server_error\"}}",
+        &mut ctx,
+    );
+    assert!(ctx.upstream_error);
+    assert_eq!(events.len(), 1);
+    assert!(events[0].starts_with("event: error\n"));
+    let data_line = events[0].lines().nth(1).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(data_line.strip_prefix("data: ").unwrap()).unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "api_error");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("server_error"));
+    assert!(msg.contains("The server had an error"));
+
+    // No fake success terminator: trailing [DONE] after the error emits nothing.
+    let after = translate_openai_sse_to_anthropic("[DONE]", &mut ctx);
+    assert!(after.is_empty());
+}
+
+#[test]
+fn reverse_sse_inband_error_mid_message_suppresses_message_stop() {
+    // Error arriving after content started: error frame is final — no
+    // message_stop may follow it, even if the upstream still sends [DONE].
+    let mut ctx = ReverseStreamContext::default();
+    translate_openai_sse_to_anthropic(
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
+    assert!(ctx.message_started);
+
+    let err_events = translate_openai_sse_to_anthropic(
+        "{\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\"}}",
+        &mut ctx,
+    );
+    assert_eq!(err_events.len(), 1);
+    assert!(err_events[0].starts_with("event: error\n"));
+
+    let done_events = translate_openai_sse_to_anthropic("[DONE]", &mut ctx);
+    assert!(
+        done_events.is_empty(),
+        "no message_stop may follow an in-band error frame"
     );
 }
 
@@ -5411,6 +5536,409 @@ async fn openai_529_triggers_bebo_backoff_retry() {
         hits.load(Ordering::SeqCst),
         2,
         "exactly one 529 then one successful retry"
+    );
+}
+
+// ── LAB-2675: a fast-mode 429 must not hard-limit the whole account ──
+
+/// Anthropic-shaped 429 carrying `retry-after: 7`. `connection: close` makes
+/// the (empty) body EOF-delimited, matching the other raw-TCP heads here.
+const HEAD_429_RETRY_AFTER_7: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n";
+
+/// Two Anthropic endpoints: priority-0 always 429s, priority-1 always 200s.
+/// Speed-agnostic — both the fast-mode test and its standard-speed control
+/// drive it; only the request body differs.
+/// Priority (not affinity hashing) forces the first attempt onto the 429
+/// endpoint, so the healthy endpoint's hit count is a clean "did we rotate?"
+/// probe. Same trick as `openai_429_sets_cooldown_and_next_request_skips_endpoint`.
+async fn two_endpoint_429_then_healthy() -> (
+    Arc<AppState>,
+    SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (limited_url, _limited_hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_429_RETRY_AFTER_7, ANTHROPIC_OK_BODY).await;
+    let (healthy_url, healthy_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+
+    let mut limited = make_endpoint("limited", Protocol::Anthropic);
+    limited.base_url = limited_url;
+    let mut healthy = make_endpoint("healthy", Protocol::Anthropic);
+    healthy.base_url = healthy_url;
+    healthy.priority = 1;
+
+    let state = test_state_with(vec![limited, healthy]);
+    let addr = serve(build_router(state.clone())).await;
+    (state, addr, healthy_hits)
+}
+
+/// AC-1: fast mode bills against a rate bucket that is NOT the account's
+/// standard 5h/7d window, so a fast-mode 429 must reach the caller with
+/// upstream's `retry-after` and leave the account in rotation. Cooling the
+/// account here is the LAB-2669 security finding: one client looping
+/// `speed: "fast"` would deny standard traffic for every other client.
+#[tokio::test]
+async fn fast_mode_429_forwards_to_client_and_leaves_account_alone() {
+    use std::sync::atomic::Ordering;
+    let (state, addr, healthy_hits) = two_endpoint_429_then_healthy().await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"test","max_tokens":1,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "a fast-mode 429 must be forwarded, not swallowed into a rotation"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("7"),
+        "upstream's retry-after must reach the client — it is how the caller backs off"
+    );
+
+    let info = state.endpoints[0].rate_info.read().await;
+    assert!(
+        info.hard_limited_until.is_none(),
+        "a fast-bucket 429 must not cool the account for STANDARD traffic"
+    );
+    assert_eq!(
+        (info.remaining_requests, info.remaining_tokens),
+        (None, None),
+        "a fast-bucket 429 must not poison the account's standard headroom view"
+    );
+    drop(info);
+
+    assert_eq!(
+        healthy_hits.load(Ordering::SeqCst),
+        0,
+        "a fast-mode 429 must not rotate — rotating just sweeps every account's fast bucket"
+    );
+
+    // AC-3: the forwarded 429 is silent unless it is counted, and a looping
+    // client is exactly what an operator needs to see.
+    let m = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        m.contains("anthropic_fast_mode_429_total{account=\"limited\"} 1"),
+        "fast-mode 429s must be visible on /metrics per account:\n{m}"
+    );
+}
+
+/// AC-2 negative control: the same upstream 429, on a body that does NOT ask
+/// for fast mode, keeps today's behaviour — hard-limit the account and rotate.
+/// Both the absent field and an explicit `"standard"` are standard speed.
+///
+/// (The ticket suggested extending `try_fallback_upstream_rotates_on_429`;
+/// that test drives the OpenAI fallback upstream, which cannot express
+/// `speed` at all, so it cannot control for this change. The control has to
+/// run through the same Anthropic handler path as AC-1.)
+#[tokio::test]
+async fn standard_speed_429_still_cools_account_and_rotates() {
+    use std::sync::atomic::Ordering;
+    for body in [
+        r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"test","max_tokens":1,"speed":"standard","messages":[{"role":"user","content":"hi"}]}"#,
+    ] {
+        let (state, addr, healthy_hits) = two_endpoint_429_then_healthy().await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "a standard-speed 429 must still rotate to the healthy account: {body}"
+        );
+        assert!(
+            healthy_hits.load(Ordering::SeqCst) >= 1,
+            "the request must reach the priority-1 endpoint: {body}"
+        );
+
+        let info = state.endpoints[0].rate_info.read().await;
+        assert!(
+            info.hard_limited_until.is_some(),
+            "a standard-speed 429 must still hard-limit the account: {body}"
+        );
+        assert_eq!(
+            (info.remaining_requests, info.remaining_tokens),
+            (Some(0), Some(0)),
+            "a standard-speed 429 must still poison remaining_* : {body}"
+        );
+    }
+}
+
+/// Panel finding (CRIT): the fast-mode exemption must NOT swallow a transient
+/// BURST 429 — `x-should-retry` with no `retry-after` and no rate headers.
+/// Burst limits are per-minute RPM/concurrency on the ACCOUNT, not on a rate
+/// bucket, so they are real evidence about the account whatever speed was
+/// asked for. Exempting them would be worse than the bug this commit fixes:
+/// `x-should-retry` is not reflected to callers, so the client would get a
+/// bare 429 with no transient hint AND no rotation, while standard traffic
+/// routed to the same still-bursting account would hard-limit it anyway.
+#[tokio::test]
+async fn fast_mode_burst_429_still_backs_off_and_rotates() {
+    use std::sync::atomic::Ordering;
+    const HEAD_429_BURST: &str = "HTTP/1.1 429 Too Many Requests\r\nx-should-retry: true\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n";
+    let (limited_url, _) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_429_BURST, ANTHROPIC_OK_BODY).await;
+    let (healthy_url, healthy_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let mut limited = make_endpoint("limited", Protocol::Anthropic);
+    limited.base_url = limited_url;
+    let mut healthy = make_endpoint("healthy", Protocol::Anthropic);
+    healthy.base_url = healthy_url;
+    healthy.priority = 1;
+    let state = test_state_with(vec![limited, healthy]);
+    let addr = serve(build_router(state.clone())).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"test","max_tokens":1,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a burst 429 must still rotate, even on a fast-mode request"
+    );
+    assert!(
+        healthy_hits.load(Ordering::SeqCst) >= 1,
+        "the request must reach the priority-1 endpoint"
+    );
+
+    let info = state.endpoints[0].rate_info.read().await;
+    assert_eq!(
+        info.consecutive_burst_429s, 1,
+        "the burst backoff ladder must still engage on a fast-mode request"
+    );
+    assert!(
+        info.hard_limited_until.is_some(),
+        "a burst 429 must still apply its (short) cooldown"
+    );
+    assert_eq!(
+        (info.remaining_requests, info.remaining_tokens),
+        (None, None),
+        "a burst 429 must not poison remaining_* — it is not capacity exhaustion"
+    );
+}
+
+// ── Fast-mode 200 must not corrupt the account's headroom view (LAB-2693) ──
+
+/// A fast-mode 200's raw wire, exactly as captured in production on
+/// 2026-09-02 (LAB-2693 / anthropic-lb#163): the unified
+/// headers describe the FAST POOL — `representative-claim: overage`,
+/// `overage-in-use: true`, the `overage-*` block, a `unified-reset` ~29d out,
+/// a `fallback-percentage` — and carry NO `five_hour`/5h/7d account claim.
+/// Body is a normal Anthropic message so usage extraction still parses. The
+/// whole response (headers + body) rides in the `bad_head` slot with
+/// `connection: close`, so the body is delimited by EOF — same mechanism the
+/// burst-429 test uses for a header-only response.
+const HEAD_200_FAST_POOL: &str = "HTTP/1.1 200 OK\r\n\
+    content-type: application/json\r\n\
+    anthropic-ratelimit-unified-status: allowed\r\n\
+    anthropic-ratelimit-unified-representative-claim: overage\r\n\
+    anthropic-ratelimit-unified-overage-status: allowed\r\n\
+    anthropic-ratelimit-unified-overage-in-use: true\r\n\
+    anthropic-ratelimit-unified-overage-utilization: 0.0\r\n\
+    anthropic-ratelimit-unified-overage-reset: 1790812800\r\n\
+    anthropic-ratelimit-unified-reset: 1790812800\r\n\
+    anthropic-ratelimit-unified-fallback-percentage: 0.5\r\n\
+    connection: close\r\n\r\n\
+    {\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"model\":\"test\",\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}";
+
+/// AC-1 + AC-3: one `speed:"fast"` request whose upstream 200 carries the
+/// fast-pool unified headers must leave the serving account's standard
+/// headroom view exactly as the last standard response left it, and must NOT
+/// demote the account out of rotation. The fast-pool headers would otherwise
+/// flip `representative_claim` → `overage` and `overage_in_use` → true, which
+/// `routing_candidates` turns into a `+overage_penalty` demotion.
+#[tokio::test]
+async fn fast_mode_200_leaves_account_headroom_untouched() {
+    let (url, _hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_200_FAST_POOL, ANTHROPIC_OK_BODY).await;
+    let mut acct = make_endpoint("acct", Protocol::Anthropic);
+    acct.base_url = url;
+    let state = test_state_with(vec![acct]);
+
+    // Seed the account's standard view from a prior standard response, mirroring
+    // the live account state before the fast request landed.
+    let seeded_reset_5h = AppState::now_epoch() + 3000;
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.representative_claim = Some("five_hour".to_string());
+        info.utilization_5h = Some(0.31);
+        info.reset_5h = Some(seeded_reset_5h);
+        // overage_* stay at their defaults: not in overage.
+    }
+
+    let addr = serve(build_router(state.clone())).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"test","max_tokens":8,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // AC-1: every listed field equals its pre-request value.
+    let info = state.endpoints[0].rate_info.read().await;
+    assert_eq!(
+        info.representative_claim.as_deref(),
+        Some("five_hour"),
+        "fast-pool `overage` claim must not overwrite the account's standard claim"
+    );
+    assert!(
+        !info.overage_in_use,
+        "a fast 200 must not put the account into overage"
+    );
+    assert_eq!(info.overage_status, None);
+    assert_eq!(info.overage_utilization, None);
+    assert_eq!(info.overage_reset, None);
+    // The fast 200 carries no 5h header, so these fields have no on-wire datum
+    // to overwrite regardless of the guard; asserted per AC-1 to pin the full
+    // "standard view untouched" invariant.
+    assert_eq!(info.utilization_5h, Some(0.31), "5h utilization untouched");
+    assert_eq!(info.reset_5h, Some(seeded_reset_5h), "5h reset untouched");
+    drop(info);
+
+    // AC-3: the endpoint is offered at its configured priority (0), with no
+    // `overage_penalty` and not sourced from the overage window.
+    let candidates = state.routing_candidates("test", &[]).await;
+    assert_eq!(candidates.len(), 1, "the one endpoint must be a candidate");
+    assert_eq!(
+        candidates[0].priority, 0,
+        "no overage_penalty — the account stays in standard rotation"
+    );
+    assert_ne!(
+        candidates[0].source, "overage",
+        "routing must gate on the standard window, not a phantom overage window"
+    );
+}
+
+/// AC-2 negative control: the SAME fast-pool 200, on a body that does NOT ask
+/// for fast mode (absent, and explicit `"standard"`), ingests the unified
+/// headers exactly as today — `overage_in_use` flips true and
+/// `representative_claim` becomes `overage`. This is the behaviour the
+/// fast-mode guard suppresses; proving it still fires under standard speed is
+/// what shows the guard keys on speed and nothing else.
+#[tokio::test]
+async fn standard_speed_200_still_ingests_unified_headers() {
+    for body in [
+        r#"{"model":"test","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"test","max_tokens":8,"speed":"standard","messages":[{"role":"user","content":"hi"}]}"#,
+    ] {
+        let (url, _hits) =
+            spawn_status_then_ok_upstream(usize::MAX, HEAD_200_FAST_POOL, ANTHROPIC_OK_BODY).await;
+        let mut acct = make_endpoint("acct", Protocol::Anthropic);
+        acct.base_url = url;
+        let state = test_state_with(vec![acct]);
+        {
+            let mut info = state.endpoints[0].rate_info.write().await;
+            info.representative_claim = Some("five_hour".to_string());
+        }
+
+        let addr = serve(build_router(state.clone())).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "body: {body}");
+
+        let info = state.endpoints[0].rate_info.read().await;
+        assert!(
+            info.overage_in_use,
+            "standard speed must still ingest overage-in-use: {body}"
+        );
+        assert_eq!(
+            info.representative_claim.as_deref(),
+            Some("overage"),
+            "standard speed must still ingest the representative claim: {body}"
+        );
+    }
+}
+
+/// `is_burst_429` is the single definition shared by `mark_hard_limited_for`'s
+/// backoff ladder and the fast-mode exemption; all three signals must agree
+/// before a 429 counts as burst.
+#[test]
+fn burst_429_needs_should_retry_and_no_capacity_evidence() {
+    let hdrs = |pairs: &[(&str, &str)]| {
+        let mut h = reqwest::header::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    };
+    assert!(is_burst_429(&hdrs(&[("x-should-retry", "true")])));
+    assert!(
+        !is_burst_429(&hdrs(&[("retry-after", "7")])),
+        "no x-should-retry: not a burst limit"
+    );
+    assert!(
+        !is_burst_429(&hdrs(&[("x-should-retry", "true"), ("retry-after", "7")])),
+        "retry-after means upstream told us the capacity window, not a burst"
+    );
+    assert!(
+        !is_burst_429(&hdrs(&[
+            ("x-should-retry", "true"),
+            ("anthropic-ratelimit-unified-status", "rejected")
+        ])),
+        "rate-limit headers are capacity evidence, not a burst"
+    );
+}
+
+/// The body predicate itself: only a top-level string `"fast"` counts. A
+/// nested `speed`, a non-string, or an unparseable body is standard speed —
+/// the fail-safe direction, since guessing "fast" wrongly would suppress a
+/// real account cooldown.
+#[test]
+fn fast_mode_body_predicate() {
+    let fast = br#"{"model":"m","speed":"fast"}"#;
+    assert!(request_wants_fast_mode(fast));
+    assert!(!request_wants_fast_mode(br#"{"model":"m"}"#));
+    assert!(!request_wants_fast_mode(
+        br#"{"model":"m","speed":"standard"}"#
+    ));
+    assert!(!request_wants_fast_mode(br#"{"model":"m","speed":true}"#));
+    assert!(
+        !request_wants_fast_mode(br#"{"model":"m","metadata":{"speed":"fast"}}"#),
+        "only the TOP-LEVEL speed field selects the fast rate bucket"
+    );
+    assert!(
+        !request_wants_fast_mode(b"not json"),
+        "an unparseable body must fall back to standard — never suppress a cooldown on a guess"
     );
 }
 
@@ -11223,6 +11751,20 @@ fn resolve_client_id_ignores_reserved_operator_header() {
 }
 
 #[test]
+fn resolve_client_id_ignores_reserved_other_header() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let ip: IpAddr = "192.168.1.100".parse().unwrap();
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("x-client-id", HeaderValue::from_static("_other"));
+
+    let resolved = state.resolve_client_id(&ip, &headers);
+    assert_eq!(
+        resolved, "-",
+        "a self-asserted _other identity must not merge into the metrics overflow bucket"
+    );
+}
+
+#[test]
 fn compute_pressure_status_operator_always_healthy() {
     let state = Arc::new(AppState {
         client: Client::new(),
@@ -14494,6 +15036,141 @@ fn oauth_system_prompt_detected_in_later_block() {
     );
 }
 
+/// The three identity prompts shipped by Claude Code 2.1.x. Only the first
+/// matches `OAUTH_SYSTEM_PROMPT`; the other two must trigger injection, and
+/// the sentinel must land AFTER the attribution block, not before it.
+const CC_2_1_PERSONAS: [&str; 3] = [
+    "You are Claude Code, Anthropic's official CLI for Claude.",
+    "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+];
+
+const CC_ATTRIBUTION_BLOCK: &str =
+    "x-anthropic-billing-header: cc_version=2.1.274.15a; cc_entrypoint=sdk-cli;";
+
+/// Regression (LAB-4127): the upstream strips the attribution block only when
+/// it is system[0]. Prepending the sentinel displaced it on every OAuth
+/// request whose persona did not match the sentinel.
+#[test]
+fn oauth_system_prompt_inserted_after_leading_attribution_block() {
+    for persona in CC_2_1_PERSONAS {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": [
+                {"type": "text", "text": CC_ATTRIBUTION_BLOCK},
+                {"type": "text", "text": persona, "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        });
+        inject_oauth_system_prompt(&mut body);
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(
+            system[0]["text"].as_str().unwrap(),
+            CC_ATTRIBUTION_BLOCK,
+            "attribution block must stay at system[0] for persona {persona:?}"
+        );
+        if persona.starts_with(OAUTH_SYSTEM_PROMPT) {
+            assert_eq!(system.len(), 2, "legacy persona is the sentinel: no-op");
+        } else {
+            assert_eq!(
+                system.len(),
+                3,
+                "persona {persona:?} must trigger injection"
+            );
+            assert_eq!(system[1]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
+            assert_eq!(system[2]["text"].as_str().unwrap(), persona);
+            assert!(
+                system[2].get("cache_control").is_some(),
+                "client's cache_control must move with its block"
+            );
+        }
+    }
+}
+
+#[test]
+fn oauth_system_prompt_only_leading_attribution_block_is_kept_first() {
+    // Attribution block not at index 0: the strip cannot fire anyway, so the
+    // sentinel goes to index 0 as before. No reordering of client blocks.
+    let mut body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "system": [
+            {"type": "text", "text": CC_2_1_PERSONAS[2]},
+            {"type": "text", "text": CC_ATTRIBUTION_BLOCK}
+        ],
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 5
+    });
+    inject_oauth_system_prompt(&mut body);
+    let system = body["system"].as_array().unwrap();
+    assert_eq!(system.len(), 3);
+    assert_eq!(system[0]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
+    assert_eq!(system[1]["text"].as_str().unwrap(), CC_2_1_PERSONAS[2]);
+    assert_eq!(system[2]["text"].as_str().unwrap(), CC_ATTRIBUTION_BLOCK);
+}
+
+/// Full proxy roundtrip on an OAuth account: the body the upstream receives
+/// keeps the attribution block at system[0] with the sentinel at system[1].
+#[tokio::test]
+async fn proxy_oauth_account_keeps_attribution_block_first() {
+    let seen_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+    let seen_body_clone = seen_body.clone();
+    let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+        let seen_body = seen_body_clone.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let body_bytes = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES)
+                .await
+                .unwrap();
+            *seen_body.lock().unwrap() = Some(body_bytes.to_vec());
+            mock_upstream_handler(Request::from_parts(parts, Body::empty())).await
+        }
+    }));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let oauth_ep = mk_endpoint_at(
+        "oauth-acct",
+        "sk-ant-oat01-test-token",
+        &format!("http://{}", mock_addr),
+    );
+    let state = Arc::new(AppState {
+        endpoints: vec![oauth_ep],
+        state_path: PathBuf::from("/tmp/anthropic-lb-oauth-attribution-test.state.json"),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+
+    let request = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "system": [
+            {"type": "text", "text": CC_ATTRIBUTION_BLOCK},
+            {"type": "text", "text": CC_2_1_PERSONAS[2], "cache_control": {"type": "ephemeral"}}
+        ],
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 5
+    });
+    let resp = Client::new()
+        .post(format!("http://{}/v1/messages", addr))
+        .header("content-type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let captured = seen_body.lock().unwrap().clone().expect("upstream body");
+    let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    let system = forwarded["system"].as_array().unwrap();
+    assert_eq!(system.len(), 3);
+    assert_eq!(system[0]["text"].as_str().unwrap(), CC_ATTRIBUTION_BLOCK);
+    assert_eq!(system[1]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
+    assert_eq!(system[2]["text"].as_str().unwrap(), CC_2_1_PERSONAS[2]);
+}
+
 /// Regression: full proxy roundtrip with OAuth account where the CC prompt
 /// is at system[1+]. Verifies the proxy does not re-serialize the body
 /// (which would break upstream prompt cache matching).
@@ -14613,6 +15290,491 @@ async fn oauth_system_prompt_no_reserialize_when_in_later_block() {
         system[1]["text"].as_str().unwrap(),
         OAUTH_SYSTEM_PROMPT,
         "system[1] should be the CC prompt, untouched"
+    );
+}
+
+#[cfg(feature = "guard")]
+use crate::guard::AWS_DOCS_EXAMPLE_SECRET_KEY;
+
+/// A `[[clients]]` entry with the opt-in `block` guard policy, keyed
+/// `block-key`.
+#[cfg(feature = "guard")]
+fn guard_block_client() -> ClientConfig {
+    ClientConfig {
+        name: "blocked-client".to_string(),
+        key: "block-key".to_string(),
+        models: vec![],
+        preferred_endpoints: vec![],
+        guard: crate::guard::GuardPolicy::Block,
+    }
+}
+
+/// A mock Anthropic upstream that records the raw forwarded body bytes and
+/// returns a minimal valid response with rate-limit headers. Returns the
+/// listener address and the shared capture buffer.
+#[cfg(feature = "guard")]
+async fn spawn_guard_body_upstream() -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<u8>>>) {
+    let captured: std::sync::Arc<tokio::sync::Mutex<Vec<u8>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let cap = captured.clone();
+    let mock_app = Router::new().fallback(any(move |req: Request<Body>| {
+        let cap = cap.clone();
+        async move {
+            let body_bytes = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap();
+            *cap.lock().await = body_bytes.to_vec();
+            let mut resp = axum::Json(serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 1}
+            }))
+            .into_response();
+            resp.headers_mut().insert(
+                "anthropic-ratelimit-unified-representative-claim",
+                HeaderValue::from_static("five_hour"),
+            );
+            resp.headers_mut().insert(
+                "anthropic-ratelimit-unified-5h-utilization",
+                HeaderValue::from_static("0.10"),
+            );
+            let reset = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600)
+                .to_string();
+            resp.headers_mut().insert(
+                "anthropic-ratelimit-unified-5h-reset",
+                HeaderValue::from_str(&reset).unwrap(),
+            );
+            resp
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+    (format!("http://{addr}"), captured)
+}
+
+/// LAB-3877: with the guard in its default `annotate` (shadow) mode, a request
+/// carrying a secret is (a) forwarded upstream byte-for-byte identical to what
+/// the client sent — detection must never disturb the prompt-cache prefix — and
+/// (b) tagged with the `X-Guard-Findings` header on the response.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_annotate_forwards_byte_identical_and_stamps_header() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-annotate.state.json"),
+        auto_cache: false, // clean byte-identity signal
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let app = build_router(state);
+    let addr = serve(app).await;
+
+    // Secret (AWS secret key) + PII (email) in the newest user turn.
+    let request_body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "system": [{"type": "text", "text": "you are helpful"}],
+        "messages": [{"role": "user", "content":
+            format!("deploy key {AWS_DOCS_EXAMPLE_SECRET_KEY} email ops@example.com")}],
+        "max_tokens": 5
+    });
+    let request_bytes = serde_json::to_vec(&request_body).unwrap();
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(request_bytes.clone())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let hdr = resp
+        .headers()
+        .get("x-guard-findings")
+        .expect("annotate must stamp X-Guard-Findings");
+    let count: usize = hdr.to_str().unwrap().parse().unwrap();
+    assert!(count >= 1, "expected at least one finding, got {count}");
+
+    let forwarded = captured.lock().await;
+    assert_eq!(
+        forwarded.as_slice(),
+        request_bytes.as_slice(),
+        "guard must forward the body byte-identically (re-serialization breaks upstream cache)"
+    );
+}
+
+/// LAB-3877: a client whose policy is `block` gets an HTTP 400 with a
+/// `guard_blocked` body when its request carries a secret — and the upstream is
+/// never contacted. The error body carries finding offsets only, never the
+/// matched secret text.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_returns_400_with_offsets_and_skips_upstream() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-block.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let app = build_router(state);
+    let addr = serve(app).await;
+
+    let secret = AWS_DOCS_EXAMPLE_SECRET_KEY;
+    let request_body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user",
+            "content": format!("aws_secret_access_key = \"{secret}\"")}],
+        "max_tokens": 5
+    });
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "block-key")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "guard_blocked");
+    let findings = body["error"]["findings"]
+        .as_array()
+        .expect("findings array");
+    assert!(!findings.is_empty(), "block body must list findings");
+    for f in findings {
+        assert!(f.get("scanner").is_some());
+        assert!(f.get("detection_type").is_some());
+        assert!(f["start"].is_number() && f["end"].is_number());
+        assert!(f.get("matched").is_none(), "must not leak matched text");
+    }
+    // The whole error body must not contain the secret anywhere.
+    assert!(
+        !body.to_string().contains(secret),
+        "block response must never echo the matched secret"
+    );
+    // Upstream must not have been contacted.
+    assert!(
+        captured.lock().await.is_empty(),
+        "a blocked request must never reach the upstream"
+    );
+}
+
+/// LAB-3877 (review finding #2): `block` fails closed on a body the guard cannot
+/// scan in full. A newest-turn payload padded past the 32 KiB scan limit — even
+/// with no secret in the scanned window — is rejected, not forwarded unscanned,
+/// so the "pad past the cap, then the secret" bypass is closed.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_fails_closed_on_oversized_body() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-oversized.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let app = build_router(state);
+    let addr = serve(app).await;
+
+    // Newest user turn: >32 KiB of clean padding (the scanned window finds
+    // nothing) followed by a secret in the unscanned tail.
+    let mut content = "x ".repeat(20_000); // ~40 KiB, well past the 32 KiB cap
+    content.push_str(&format!(
+        " aws_secret_access_key = \"{AWS_DOCS_EXAMPLE_SECRET_KEY}\""
+    ));
+    let request_body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 5
+    });
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "block-key")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        400,
+        "oversized body must fail closed under block"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "guard_blocked");
+    assert!(
+        captured.lock().await.is_empty(),
+        "a body that cannot be scanned in full must never reach the upstream under block"
+    );
+}
+
+/// LAB-3877 (review finding #3): `block` fails closed on an unparseable body — a
+/// parse differential vs the upstream must not smuggle content past the scan.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_fails_closed_on_unparseable_body() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-unparseable.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let app = build_router(state);
+    let addr = serve(app).await;
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "block-key")
+        .body("{ this is not valid json ]]")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        400,
+        "unparseable body must fail closed under block"
+    );
+    assert!(
+        captured.lock().await.is_empty(),
+        "an unparseable body must never reach the upstream under block"
+    );
+}
+
+/// Shadow-mode counterpart: `annotate` (the default) must NOT reject an
+/// oversized body — it scans best-effort and forwards byte-identically. Guards
+/// against the fail-closed logic leaking into the shadow-mode default.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_annotate_forwards_oversized_body() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-annotate-oversized.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let app = build_router(state);
+    let addr = serve(app).await;
+
+    let content = "x ".repeat(20_000); // ~40 KiB, past the cap, no secret
+    let request_body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 5
+    });
+    let request_bytes = serde_json::to_vec(&request_body).unwrap();
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(request_bytes.clone())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "annotate must never reject");
+    assert_eq!(
+        captured.lock().await.as_slice(),
+        request_bytes.as_slice(),
+        "annotate forwards the oversized body byte-identically"
+    );
+}
+
+/// LAB-3877 (review): the block-mode fail-closed rule needs a body to fail on.
+/// A bodiless `GET /v1/models` from a block-mode client has nothing to scan and
+/// must pass through — not 400 as "unparseable".
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_passes_bodiless_get_through() {
+    let (upstream, _captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-get.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let app = build_router(state);
+    let addr = serve(app).await;
+
+    let resp = Client::new()
+        .get(format!("http://{addr}/v1/models"))
+        .header("x-api-key", "block-key")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "a bodiless GET is not a scan failure under block"
+    );
+}
+
+/// LAB-3877 (review): the guard covers `/v1/chat/completions` too — a `block`
+/// client cannot route around enforcement via the OpenAI-compat surface. The
+/// 400 uses the OpenAI error envelope, still offsets-only, upstream untouched.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_applies_to_openai_chat_completions() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-block.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let app = build_router(state);
+    let addr = serve(app).await;
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer block-key")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user",
+                "content": format!("aws_secret_access_key = \"{AWS_DOCS_EXAMPLE_SECRET_KEY}\"")}],
+            "max_tokens": 5
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "guard_blocked");
+    assert!(
+        !body["error"]["findings"]
+            .as_array()
+            .expect("findings array")
+            .is_empty(),
+        "block body must list findings"
+    );
+    assert!(
+        !body.to_string().contains(AWS_DOCS_EXAMPLE_SECRET_KEY),
+        "OpenAI-shape block response must never echo the matched secret"
+    );
+    assert!(
+        captured.lock().await.is_empty(),
+        "a blocked chat-completions request must never reach the upstream"
+    );
+}
+
+/// LAB-3877 (review): an OpenAI message role the translator does not map
+/// (legacy `function`) carries content the scanner cannot see but the
+/// OpenAI-protocol arm would still forward — under `block` it fails closed.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_fails_closed_on_unmapped_openai_role() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-role.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let app = build_router(state);
+    let addr = serve(app).await;
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer block-key")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "function", "name": "env",
+                "content": format!("AWS_SECRET_ACCESS_KEY={AWS_DOCS_EXAMPLE_SECRET_KEY}")}],
+            "max_tokens": 5
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        400,
+        "unmapped role must fail closed under block"
+    );
+    assert!(
+        captured.lock().await.is_empty(),
+        "an unscannable chat-completions body must never reach the upstream under block"
+    );
+}
+
+/// Shadow-mode counterpart on the OpenAI-compat surface: `annotate` forwards
+/// the request and stamps `X-Guard-Findings` on the translated response.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_annotate_stamps_header_on_openai_chat_completions() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-annotate.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let app = build_router(state);
+    let addr = serve(app).await;
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "email me at ops@example.com"}],
+            "max_tokens": 5
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "annotate must never reject");
+    let count: usize = resp
+        .headers()
+        .get("x-guard-findings")
+        .expect("annotate must stamp X-Guard-Findings")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(count >= 1, "expected at least one finding, got {count}");
+    assert!(
+        !captured.lock().await.is_empty(),
+        "annotate forwards the request upstream"
     );
 }
 
@@ -15153,6 +16315,78 @@ async fn proxy_handler_fallback_streaming() {
     assert!(
         body.contains("message_stop"),
         "should have message_stop event"
+    );
+}
+
+#[tokio::test]
+async fn fallback_translated_stream_no_error_frame_after_message_stop() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // LAB-710: a transport read failure AFTER the upstream's `[DONE]` must
+    // not ship an Anthropic error frame — the translated `message_stop`
+    // already terminated the stream from the client's view. Mirror of the
+    // passthrough `sent_done` guard, one protocol over.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let _ = stream.read(&mut buf).await;
+        let head = "HTTP/1.1 200 OK\r\n\
+             content-type: text/event-stream\r\n\
+             transfer-encoding: chunked\r\n\
+             \r\n";
+        let _ = stream.write_all(head.as_bytes()).await;
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let chunk = format!("{:x}\r\n{}\r\n", body.len(), body);
+        let _ = stream.write_all(chunk.as_bytes()).await;
+        // Drop WITHOUT the 0-length chunked terminator: the proxy's next
+        // resp.chunk() errors after message_stop already went downstream.
+        let _ = stream.shutdown().await;
+    });
+
+    let mut openai = make_endpoint("fallback", Protocol::OpenAI);
+    openai.base_url = format!("http://{}", mock_addr);
+    openai.priority = 100;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("acct-a", "sk-ant-api-a"), openai],
+        state_path: PathBuf::from("/tmp/anthropic-lb-done-then-err-test.state.json"),
+        auto_cache: false,
+        ..test_state_base()
+    });
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+    }
+
+    let addr = serve(build_router(state.clone())).await;
+
+    let resp = Client::new()
+        .post(format!("http://{}/v1/messages", addr))
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 1024,
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+
+    assert!(
+        body.contains("message_stop"),
+        "stream completed — must carry the success terminator, got: {body:?}"
+    );
+    assert!(
+        !body.contains("event: error"),
+        "no error frame may follow message_stop, got: {body:?}"
     );
 }
 
@@ -17245,6 +18479,8 @@ fn mk_client(name: &str, key: &str, models: &[&str]) -> ClientConfig {
         key: key.to_string(),
         models: models.iter().map(|s| s.to_string()).collect(),
         preferred_endpoints: vec![],
+        #[cfg(feature = "guard")]
+        guard: crate::guard::GuardPolicy::default(),
     }
 }
 
@@ -17701,16 +18937,24 @@ fn model_denial_labels_are_bounded_by_other_overflow() {
     for i in 0..(MAX_MODEL_DENIED_LABELS + 25) {
         state.note_model_denied("limited", &format!("junk-model-{i}"));
     }
+    // Expert-panel finding (LAB-2330, mirrored by LAB-2332): rotating the
+    // caller-controlled client id past the cap must NOT mint per-client
+    // overflow keys — the bound has to hold on the client axis too.
+    for i in 0..50 {
+        state.note_model_denied(&format!("evil-{i}"), "claude-x");
+    }
     let counts = state.model_denied.lock().unwrap();
     assert!(
         counts.len() <= MAX_MODEL_DENIED_LABELS + 1,
         "label map grew unbounded: {} entries",
         counts.len()
     );
+    // Overflow denials are not dropped — they land in the ONE global bucket:
+    // 25 "limited" overflow models + 50 rotated clients.
     assert_eq!(
-        counts.get(&("limited".to_string(), "_other".to_string())),
-        Some(&25),
-        "overflow must land in the _other bucket, not be dropped"
+        counts.get(&("_other".to_string(), "_other".to_string())),
+        Some(&75),
+        "overflow must land in the global _other bucket, not be dropped"
     );
 }
 
@@ -17813,6 +19057,16 @@ fn validate_clients_rejects_bad_names_and_empty_keys() {
             "[[clients]]\nname = \"_operator\"\nkey = \"k1\"\n",
             "_operator",
         ),
+        // Reserved: the metrics overflow bucket is keyed ("_other", "_other");
+        // a real client with that name could pre-create the exact pair and
+        // later overflow denials/usage would merge into it (CodeRabbit, #148).
+        ("[[clients]]\nname = \"_other\"\nkey = \"k1\"\n", "_other"),
+        // The legacy client_names IP map is the third identity entry point
+        // (resolve_client_id's fallback) — its values must not claim a
+        // reserved sentinel either (expert-panel finding, #148 follow-up).
+        ("[client_names]\n\"10.0.0.5\" = \"-\"\n", "reserved"),
+        ("[client_names]\n\"10.0.0.5\" = \"_operator\"\n", "reserved"),
+        ("[client_names]\n\"10.0.0.5\" = \"_other\"\n", "reserved"),
         ("[[clients]]\nname = \"geo\"\nkey = \"\"\n", "key"),
         // Untrimmed: stored verbatim, so it would become a client_id matching
         // no client_budgets / operators / response_cache.clients key.
@@ -18378,6 +19632,10 @@ fn oauth_beta_filter_keeps_claude_code_flag_set() {
         "structured-outputs-2025-12-15",
         // LAB-2669: body-paired (`speed`); not in the 2.1.220 inventory.
         "fast-mode-2026-02-01",
+        // LAB-3963: auto-mode classifier pair; `dangerous-tool-use` is
+        // body-paired (`safeguards`). Not in the 2.1.220 inventory.
+        "auto-mode-classifier-2026-07-16",
+        "dangerous-tool-use-2026-09-03",
     ];
     // Negative control: the point of the allow-list is that it still rejects.
     // Without this, widening the default to "*" would keep the test green.
@@ -18557,6 +19815,62 @@ async fn dropped_beta_flag_appears_in_metrics() {
         metrics
             .contains("anthropic_beta_flag_dropped_total{flag=\"totally-unknown-2026-07-30\"} 1"),
         "metrics must report the dropped flag"
+    );
+}
+
+/// LAB-3963: the auto-mode classifier betas and their `safeguards` body must
+/// reach the upstream together through the real OAuth path (which
+/// re-serialises the body) — see `DEFAULT_CLIENT_BETA_ALLOWLIST` for why.
+#[tokio::test]
+async fn oauth_forwards_auto_mode_classifier_header_and_safeguards_body_together() {
+    let (upstream_url, mut seen) =
+        spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at(
+            "acct-a",
+            "sk-ant-oat01-test-aaa",
+            &upstream_url,
+        )],
+        auto_cache: false,
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+
+    // Compact JSON, as Claude Code sends it: the value must survive
+    // byte-for-byte whether the body is forwarded raw or re-serialised.
+    let safeguards = r#"[{"type":"dangerous_tool_use","classifier_context":"rm -rf ./build"}]"#;
+    let body = format!(
+        r#"{{"model":"test","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}],"safeguards":{safeguards}}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header(
+            "anthropic-beta",
+            "auto-mode-classifier-2026-07-16,dangerous-tool-use-2026-09-03",
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let (headers, bytes) = seen.recv().await.expect("upstream must have been hit once");
+    let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    let tokens: Vec<&str> = sent.split(',').map(str::trim).collect();
+    for flag in [
+        "auto-mode-classifier-2026-07-16",
+        "dangerous-tool-use-2026-09-03",
+    ] {
+        assert!(
+            tokens.contains(&flag),
+            "beta not forwarded as an exact token: {flag} (sent: {sent})"
+        );
+    }
+    let raw = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        raw.contains(&format!(r#""safeguards":{safeguards}"#)),
+        "safeguards must reach the upstream byte-identical:\n{raw}"
     );
 }
 
@@ -21135,5 +22449,567 @@ async fn pinned_client_spills_when_preferred_endpoint_at_paid_overage() {
             .await,
         Some(0),
         "an overage-covered preferred endpoint must spill to free general-pool capacity"
+    );
+}
+
+// ── LAB-4189: direct Fable band visibility ───────────────────────────
+//
+// Three series make a pool-exhaustion event readable from a scrape alone, rather
+// than only from `/_stats` and logs: per-claim status, per-claim reset, and a
+// counter for the 429 the caller actually got.
+
+/// AC-1/AC-2: a model carve-out claim gets its own status ordinal and its own
+/// reset countdown, labelled by `claim` — neither of which the `window`-labelled
+/// account series can express.
+#[tokio::test]
+async fn metrics_exports_per_claim_status_and_reset() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = test_app(&mock_url, None);
+
+    let now_epoch = AppState::now_epoch();
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        // The band is exhausted: utilization 1.0, hard-rejected, resets in 2 days.
+        info.claims_7d.insert(
+            FABLE_BAND_CLAIM.to_string(),
+            ClaimWindowData {
+                utilization: Some(1.0),
+                reset: Some(now_epoch + 172_800),
+                status: Some("rejected".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+        // The general claim is healthy at the same instant — this is the
+        // divergence a utilization threshold cannot see.
+        info.claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: Some(0.40),
+                reset: Some(now_epoch + 302_400),
+                status: Some("allowed".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+    }
+
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{}/metrics", addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.contains("# TYPE anthropic_claim_rate_limit_status gauge"),
+        "missing claim status TYPE line:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "anthropic_claim_rate_limit_status{account=\"acct-a\",claim=\"seven_day_fable\"} 3"
+        ),
+        "band claim should report ordinal 3 (rejected):\n{body}"
+    );
+    assert!(
+        body.contains(
+            "anthropic_claim_rate_limit_status{account=\"acct-a\",claim=\"seven_day\"} 0"
+        ),
+        "general claim should report ordinal 0 (allowed) at the same scrape:\n{body}"
+    );
+
+    let reset_line = body
+        .lines()
+        .find(|l| {
+            l.starts_with("anthropic_claim_reset_seconds{")
+                && l.contains("claim=\"seven_day_fable\"")
+        })
+        .unwrap_or_else(|| panic!("missing claim reset for the band:\n{body}"));
+    let secs: f64 = reset_line.rsplit(' ').next().unwrap().parse().unwrap();
+    assert!(
+        (secs - 172_800.0).abs() < 5.0,
+        "band reset should count down ~172800s, got {secs}"
+    );
+}
+
+/// AC-2 boundary: an expired reset is omitted, not clamped to zero — mirroring
+/// `anthropic_account_reset_seconds`. A stale timestamp means "unknown", and
+/// emitting 0 would read as "resets now" on the reset-ordered panel.
+#[tokio::test]
+async fn metrics_omits_claim_reset_already_in_the_past() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = test_app(&mock_url, None);
+
+    let now_epoch = AppState::now_epoch();
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.claims_7d.insert(
+            FABLE_BAND_CLAIM.to_string(),
+            ClaimWindowData {
+                utilization: Some(1.0),
+                reset: Some(now_epoch - 60),
+                status: Some("rejected".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+    }
+
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{}/metrics", addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        !body.contains("anthropic_claim_reset_seconds{account=\"acct-a\""),
+        "a past-dated reset must not emit a sample:\n{body}"
+    );
+    // Status still reports — the claim is known-rejected even with a stale reset.
+    assert!(
+        body.contains(
+            "anthropic_claim_rate_limit_status{account=\"acct-a\",claim=\"seven_day_fable\"} 3"
+        ),
+        "status must survive a stale reset:\n{body}"
+    );
+}
+
+/// AC-3: both `exhaustion_response` arms increment, under their own `kind`, and
+/// both series exist at zero before any exhaustion so a rate() panel has a
+/// baseline instead of "No data".
+#[tokio::test]
+async fn metrics_counts_client_facing_pool_exhaustion() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = test_app(&mock_url, None);
+    let addr = serve(app).await;
+    let scrape = |addr| async move {
+        Client::new()
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    };
+
+    let before = scrape(addr).await;
+    assert!(
+        before.contains("anthropic_pool_exhausted_total{kind=\"rate_limited\"} 0")
+            && before.contains("anthropic_pool_exhausted_total{kind=\"transient\"} 0"),
+        "both kinds must be emitted at zero before any exhaustion:\n{before}"
+    );
+
+    // The incident shape: every endpoint gated, nothing transient → 429.
+    let resp = exhaustion_response(&state, false, false);
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    // A 529 round counts as rate-limited too — same 429 to the caller.
+    let _ = exhaustion_response(&state, true, true);
+    // Transport-only exhaustion is the other arm → retryable 503.
+    let resp = exhaustion_response(&state, true, false);
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let after = scrape(addr).await;
+    assert!(
+        after.contains("anthropic_pool_exhausted_total{kind=\"rate_limited\"} 2"),
+        "rate-limit exhaustion (incl. the 529 round) should count 2:\n{after}"
+    );
+    assert!(
+        after.contains("anthropic_pool_exhausted_total{kind=\"transient\"} 1"),
+        "transient exhaustion should count 1:\n{after}"
+    );
+}
+
+/// A response carrying a distinct `representative-claim`, with a reset inside
+/// the parser's 7d sanity window so the entry actually persists. A literal far
+/// future epoch is silently discarded by that cap, which would leave the claim
+/// reset-less and the test asserting less than it looks like it asserts.
+fn claim_headers(claim: Option<&str>, util: &str, now_epoch: u64) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(c) = claim {
+        headers.insert(
+            "anthropic-ratelimit-unified-representative-claim",
+            HeaderValue::from_str(c).unwrap(),
+        );
+    }
+    headers.insert(
+        "anthropic-ratelimit-unified-7d-utilization",
+        HeaderValue::from_str(util).unwrap(),
+    );
+    headers.insert(
+        "anthropic-ratelimit-unified-7d-reset",
+        HeaderValue::from_str(&(now_epoch + 3600).to_string()).unwrap(),
+    );
+    headers
+}
+
+/// AC-4: claim keys are minted from the upstream response header, never from
+/// client input — and even that upstream string cannot mint unbounded series.
+/// A hostile upstream (reachable via the redirect-with-credentials path) is the
+/// threat model; CWE-770.
+#[tokio::test]
+async fn claim_keys_cannot_mint_unbounded_series() {
+    let state = test_state_with(vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")]);
+    let now_epoch = AppState::now_epoch();
+
+    // Oversized key FIRST, while the map has room: this exercises truncation,
+    // not the cap. (Sent after the flood it would be refused outright, and the
+    // truncation assertion would pass even with `truncate_label` deleted.)
+    let oversized = format!("seven_day_{}", "x".repeat(4096));
+    let expected: String = oversized
+        .chars()
+        .take(MAX_LABEL_CHARS)
+        .chain(['…'])
+        .collect();
+    state
+        .update_rate_info(0, &claim_headers(Some(&oversized), "0.50", now_epoch))
+        .await;
+    {
+        let info = state.endpoints[0].rate_info.read().await;
+        assert!(
+            info.claims_7d.contains_key(&expected),
+            "the oversized key must be stored truncated, got {:?}",
+            info.claims_7d.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !info.claims_7d.contains_key(&oversized),
+            "the untruncated key must never be retained"
+        );
+        assert_eq!(
+            info.representative_claim.as_deref(),
+            Some(expected.as_str()),
+            "representative_claim must be truncated too, or refresh_metrics_weights \
+             looks up a key that cannot exist"
+        );
+    }
+
+    // Now flood far past the cap.
+    for i in 0..200 {
+        let claim = format!("seven_day_junk{i}");
+        state
+            .update_rate_info(0, &claim_headers(Some(&claim), "0.50", now_epoch))
+            .await;
+    }
+
+    let info = state.endpoints[0].rate_info.read().await;
+    let unreserved = info
+        .claims_7d
+        .keys()
+        .filter(|k| !claim_key_is_reserved(k))
+        .count();
+    assert!(
+        unreserved <= MAX_CLAIMS_PER_ACCOUNT,
+        "unreserved claim keys must stay bounded, got {unreserved}"
+    );
+    assert!(
+        info.claims_7d
+            .keys()
+            .all(|k| k.chars().count() <= MAX_LABEL_CHARS + 1),
+        "every claim key must be truncated to a bounded label length"
+    );
+}
+
+/// AC-4, the failure mode the cap itself creates. `effective_utilization` skips
+/// its flat-field fallback whenever `claims_7d` is non-empty, so an account
+/// whose map is full of unknown keys with `seven_day` refused would derive NO
+/// weekly utilization — routing as though it had no weekly limit, and dropping
+/// out of the emergency brake's all-saturated test at 100%.
+///
+/// Order matters: the flood runs FIRST, so the reserved keys arrive against an
+/// already-full map. Seeded the other way round this passes even unfixed.
+#[tokio::test]
+async fn claim_cap_never_refuses_a_routing_relevant_claim() {
+    let state = test_state_with(vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")]);
+    let now_epoch = AppState::now_epoch();
+
+    for i in 0..MAX_CLAIMS_PER_ACCOUNT * 2 {
+        let claim = format!("seven_day_junk{i}");
+        state
+            .update_rate_info(0, &claim_headers(Some(&claim), "0.10", now_epoch))
+            .await;
+    }
+
+    // No representative-claim header → the parser's `seven_day` default, the
+    // key `claim_gates_all_traffic` feeds to the brake.
+    state
+        .update_rate_info(0, &claim_headers(None, "0.77", now_epoch))
+        .await;
+
+    // The Fable band arrives against the same full map.
+    let mut band = reqwest::header::HeaderMap::new();
+    band.insert(
+        "anthropic-ratelimit-unified-7d_oi-utilization",
+        HeaderValue::from_static("0.95"),
+    );
+    band.insert(
+        "anthropic-ratelimit-unified-7d_oi-reset",
+        HeaderValue::from_str(&(now_epoch + 3600).to_string()).unwrap(),
+    );
+    band.insert(
+        "anthropic-ratelimit-unified-7d_oi-status",
+        HeaderValue::from_static("rejected"),
+    );
+    state.update_rate_info(0, &band).await;
+
+    let info = state.endpoints[0].rate_info.read().await;
+    assert_eq!(
+        info.claims_7d.get("seven_day").and_then(|c| c.utilization),
+        Some(0.77),
+        "the all-traffic claim must be admitted against a full map — without it \
+         the account derives no weekly utilization and routes as unconstrained"
+    );
+    assert_eq!(
+        info.claims_7d
+            .get(FABLE_BAND_CLAIM)
+            .and_then(|c| c.status.as_deref()),
+        Some("rejected"),
+        "the Fable band must be admitted even with the cap full"
+    );
+    // The point of the two assertions above: routing still sees a weekly figure.
+    let (_, window, _, adj_7d) = effective_utilization(&info, now_epoch, "");
+    assert!(
+        adj_7d.is_some(),
+        "a flooded account must still derive a 7d utilization (window={window})"
+    );
+}
+
+/// AC-4 at the two ingest points that bypass the header parser entirely: the
+/// persisted state file and the Redis mirror both assign `claims_7d` whole. A
+/// map written by a pre-cap build must not restore unbounded.
+#[test]
+fn ingested_claims_are_bounded_and_truncated() {
+    let mut raw: HashMap<String, ClaimWindowData> = HashMap::new();
+    for i in 0..500 {
+        raw.insert(format!("seven_day_junk{i}"), ClaimWindowData::default());
+    }
+    let oversized = format!("seven_day_{}", "y".repeat(4096));
+    raw.insert(oversized.clone(), ClaimWindowData::default());
+    // Reserved keys, deliberately sorting AFTER the junk so a naive
+    // "keep the first N sorted" would drop them.
+    for key in ["seven_day", "seven_day_sonnet", FABLE_BAND_CLAIM] {
+        raw.insert(key.to_string(), ClaimWindowData::default());
+    }
+
+    let bounded = bound_ingested_claims(raw);
+
+    let unreserved = bounded.keys().filter(|k| !claim_key_is_reserved(k)).count();
+    assert_eq!(
+        unreserved, MAX_CLAIMS_PER_ACCOUNT,
+        "unreserved keys must be trimmed to exactly the cap"
+    );
+    for key in ["seven_day", "seven_day_sonnet", FABLE_BAND_CLAIM] {
+        assert!(
+            bounded.contains_key(key),
+            "reserved key {key} must survive trimming"
+        );
+    }
+    assert!(
+        !bounded.contains_key(&oversized),
+        "an untruncated key must not survive ingest"
+    );
+    assert!(
+        bounded
+            .keys()
+            .all(|k| k.chars().count() <= MAX_LABEL_CHARS + 1),
+        "every ingested key must be truncated"
+    );
+}
+
+/// The `claim` label was flagged as a Prometheus exposition-injection vector.
+/// It is not: `prom_gauge` puts every label value through `prom_escape`. This
+/// asserts that end to end on the rendered body rather than on the helper
+/// (`prometheus_label_escaping` already covers the helper), using a worse input
+/// than the header path can actually deliver — written straight into
+/// `claims_7d` to model a poisoned state file or Redis mirror, since an HTTP
+/// `HeaderValue` rejects the newline the attack needs in the first place.
+#[tokio::test]
+async fn hostile_claim_key_cannot_forge_metric_lines() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = test_app(&mock_url, None);
+    let now_epoch = AppState::now_epoch();
+
+    // Closes the label, emits a value, opens a forged metric, and trails a
+    // backslash to probe escape-swallowing of the closing quote.
+    let hostile = "seven_day\"} 1\ninjected_metric{x=\"\\";
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.claims_7d.insert(
+            hostile.to_string(),
+            ClaimWindowData {
+                utilization: Some(0.5),
+                reset: Some(now_epoch + 3600),
+                status: Some("rejected".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+    }
+
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{}/metrics", addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        !body.lines().any(|l| l.starts_with("injected_metric")),
+        "a claim key must not be able to forge a metric line:\n{body}"
+    );
+    assert!(
+        !body.contains("seven_day\"} 1\ninjected_metric"),
+        "the hostile key must never appear unescaped:\n{body}"
+    );
+    // One sample per series is the real proof: a successful breakout would mint
+    // a second line on at least one of them.
+    for metric in [
+        "anthropic_claim_utilization",
+        "anthropic_claim_rate_limit_status",
+        "anthropic_claim_reset_seconds",
+    ] {
+        let n = body
+            .lines()
+            .filter(|l| l.starts_with(&format!("{metric}{{")))
+            .count();
+        assert_eq!(
+            n, 1,
+            "{metric} should emit exactly one sample, got {n}:\n{body}"
+        );
+    }
+}
+
+/// The cap budgets UNRESERVED keys. Counting the whole map instead would let
+/// the five reserved keys eat the budget, admitting 27 unknown claims rather
+/// than the documented 32 — and would put the live path at odds with
+/// `bound_ingested_claims`, which has always counted this way.
+#[tokio::test]
+async fn claim_cap_budgets_unreserved_keys_only() {
+    let state = test_state_with(vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")]);
+    let now_epoch = AppState::now_epoch();
+
+    // All five reserved keys first, so they are present when the cap is tested.
+    state
+        .update_rate_info(0, &claim_headers(None, "0.10", now_epoch))
+        .await; // "seven_day"
+    for key in ["seven_day_sonnet", "seven_day_opus", "seven_day_haiku"] {
+        state
+            .update_rate_info(0, &claim_headers(Some(key), "0.10", now_epoch))
+            .await;
+    }
+    let mut band = reqwest::header::HeaderMap::new();
+    band.insert(
+        "anthropic-ratelimit-unified-7d_oi-utilization",
+        HeaderValue::from_static("0.20"),
+    );
+    band.insert(
+        "anthropic-ratelimit-unified-7d_oi-reset",
+        HeaderValue::from_str(&(now_epoch + 3600).to_string()).unwrap(),
+    );
+    state.update_rate_info(0, &band).await;
+
+    {
+        let info = state.endpoints[0].rate_info.read().await;
+        assert_eq!(
+            info.claims_7d
+                .keys()
+                .filter(|k| claim_key_is_reserved(k))
+                .count(),
+            5,
+            "fixture should seed all five reserved keys"
+        );
+    }
+
+    // Exactly the documented unreserved budget.
+    for i in 0..MAX_CLAIMS_PER_ACCOUNT {
+        let claim = format!("seven_day_junk{i}");
+        state
+            .update_rate_info(0, &claim_headers(Some(&claim), "0.50", now_epoch))
+            .await;
+    }
+
+    let info = state.endpoints[0].rate_info.read().await;
+    let unreserved = info
+        .claims_7d
+        .keys()
+        .filter(|k| !claim_key_is_reserved(k))
+        .count();
+    assert_eq!(
+        unreserved, MAX_CLAIMS_PER_ACCOUNT,
+        "all {MAX_CLAIMS_PER_ACCOUNT} unreserved claims must be admitted even with \
+         the reserved set present"
+    );
+    assert_eq!(
+        info.claims_7d.len(),
+        MAX_CLAIMS_PER_ACCOUNT + 5,
+        "hard bound is the unreserved cap plus the five reserved keys"
+    );
+}
+
+/// `representative_claim` must be truncated wherever the claim map is ingested
+/// whole, not just on the header path: `metrics_gate_weight` looks the key up in
+/// `claims_7d`, whose keys `bound_ingested_claims` truncates. An untruncated
+/// copy misses its own entry and the routing-weight gauges then report a
+/// different claim than the router used. Exercises the persisted-state path; the
+/// Redis path applies the identical expression.
+#[tokio::test]
+async fn ingested_representative_claim_is_truncated_to_match_its_key() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let oversized = format!("seven_day_{}", "z".repeat(4096));
+    let expected: String = oversized
+        .chars()
+        .take(MAX_LABEL_CHARS)
+        .chain(['…'])
+        .collect();
+    let now_epoch = AppState::now_epoch();
+
+    // A state file as a pre-truncation build would have written it: raw key,
+    // raw representative claim.
+    let mut state = test_state_with(vec![]);
+    {
+        let st = Arc::get_mut(&mut state).unwrap();
+        st.state_path = tmp.path().to_path_buf();
+        st.endpoints.push(make_endpoint("ep1", Protocol::Anthropic));
+    }
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.representative_claim = Some(oversized.clone());
+        info.claims_7d.insert(
+            oversized.clone(),
+            ClaimWindowData {
+                utilization: Some(0.30),
+                reset: Some(now_epoch + 302_400),
+                status: Some("allowed".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+    }
+    state.save_state().await;
+
+    let mut state2 = test_state_with(vec![]);
+    {
+        let st = Arc::get_mut(&mut state2).unwrap();
+        st.state_path = tmp.path().to_path_buf();
+        st.endpoints.push(make_endpoint("ep1", Protocol::Anthropic));
+    }
+    state2.load_state().await;
+
+    let info = state2.endpoints[0].rate_info.read().await;
+    assert_eq!(
+        info.representative_claim.as_deref(),
+        Some(expected.as_str()),
+        "the restored representative claim must be truncated"
+    );
+    let rep = info.representative_claim.as_deref().unwrap();
+    assert!(
+        info.claims_7d.contains_key(rep),
+        "the representative claim must resolve to a key that exists, got {:?} against {:?}",
+        rep,
+        info.claims_7d.keys().collect::<Vec<_>>()
     );
 }
