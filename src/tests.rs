@@ -15115,6 +15115,16 @@ async fn oauth_system_prompt_no_reserialize_when_in_later_block() {
 #[cfg(feature = "guard")]
 use crate::guard::AWS_DOCS_EXAMPLE_SECRET_KEY;
 
+/// LAB-4341: the upstream token every guard test's `Endpoint` carries. Not a
+/// credential and never was, but it used to be spelled with the real key
+/// prefix and a digit-pair version, which is the shape a reader or a scanner
+/// learns to skim past. Kept under `sk-ant-api` on purpose, not as decoration:
+/// `inject_account_auth` branches on that prefix to choose `x-api-key` over
+/// `Bearer`, so a token without it silently changes which header these tests
+/// exercise.
+#[cfg(feature = "guard")]
+const TEST_ENDPOINT_TOKEN: &str = "sk-ant-api-guard-test-token";
+
 /// A `[[clients]]` entry with the opt-in `block` guard policy, keyed
 /// `block-key`.
 #[cfg(feature = "guard")]
@@ -15190,7 +15200,7 @@ async fn spawn_guard_body_upstream() -> (String, std::sync::Arc<tokio::sync::Mut
 async fn guard_annotate_forwards_byte_identical_and_stamps_header() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-annotate.state.json"),
         auto_cache: false, // clean byte-identity signal
         guard: crate::guard::Guard::new().expect("guard rules"),
@@ -15242,7 +15252,7 @@ async fn guard_annotate_forwards_byte_identical_and_stamps_header() {
 async fn guard_block_returns_400_with_offsets_and_skips_upstream() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-block.state.json"),
         auto_cache: false,
@@ -15304,7 +15314,7 @@ async fn guard_block_returns_400_with_offsets_and_skips_upstream() {
 async fn guard_block_fails_closed_on_oversized_body() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-oversized.state.json"),
         auto_cache: false,
@@ -15355,7 +15365,7 @@ async fn guard_block_fails_closed_on_oversized_body() {
 async fn guard_block_fails_closed_on_unparseable_body() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-unparseable.state.json"),
         auto_cache: false,
@@ -15393,7 +15403,7 @@ async fn guard_block_fails_closed_on_unparseable_body() {
 async fn guard_annotate_forwards_oversized_body() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-annotate-oversized.state.json"),
         auto_cache: false,
         guard: crate::guard::Guard::new().expect("guard rules"),
@@ -15434,7 +15444,7 @@ async fn guard_annotate_forwards_oversized_body() {
 async fn guard_block_passes_bodiless_get_through() {
     let (upstream, _captured) = spawn_guard_body_upstream().await;
     let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-get.state.json"),
         auto_cache: false,
@@ -15466,7 +15476,7 @@ async fn guard_block_passes_bodiless_get_through() {
 async fn guard_block_applies_to_openai_chat_completions() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-block.state.json"),
         auto_cache: false,
@@ -15518,7 +15528,7 @@ async fn guard_block_applies_to_openai_chat_completions() {
 async fn guard_block_fails_closed_on_unmapped_openai_role() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-role.state.json"),
         auto_cache: false,
@@ -15711,7 +15721,7 @@ async fn guard_block_fails_closed_on_non_array_native_messages() {
     let secret = AWS_DOCS_EXAMPLE_SECRET_KEY;
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-shape.state.json"),
         auto_cache: false,
@@ -15788,7 +15798,7 @@ async fn guard_block_fails_closed_on_non_array_native_messages() {
 async fn guard_block_forwards_fallback_json_body_without_messages() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-no-messages.state.json"),
         auto_cache: false,
@@ -15827,7 +15837,7 @@ async fn guard_block_forwards_fallback_json_body_without_messages() {
 async fn guard_annotate_stamps_header_on_openai_chat_completions() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api03-test", &upstream)],
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-annotate.state.json"),
         auto_cache: false,
         guard: crate::guard::Guard::new().expect("guard rules"),

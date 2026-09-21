@@ -8704,15 +8704,23 @@ async fn maybe_cache_store(
     Response::from_parts(parts, Body::from(bytes))
 }
 
-/// LAB-4322/LAB-4341: the one reason string for a `messages` field that is
-/// present but not an array. Both surfaces reach it — `openai_chat_handler`
+/// LAB-4322/LAB-4341: the one reason string for a `messages` the scanner
+/// cannot read as an array. Both surfaces reach it — `openai_chat_handler`
 /// because translation rewrites the field into an EMPTY array before the
 /// scanner sees it, `proxy_handler` because `ScanInput::from_body` reads it
 /// through the same `.as_array()` and yields nothing to scan. Shared so the
 /// two can never drift into describing the same shape two different ways.
+///
+/// The text covers BOTH causes because the surfaces disagree on which ones
+/// they reject: `/v1/chat/completions` is a single API that requires the
+/// field, so absent is malformed there and takes this reason too, while the
+/// `proxy_handler` fallback must keep forwarding the `messages`-less bodies of
+/// `/v1/complete` and `/v1/models` and so only ever reaches it for a present
+/// field of the wrong shape. Naming one cause would misdescribe the other to
+/// the client reading `error.message`.
 #[cfg(feature = "guard")]
 const GUARD_REASON_MESSAGES_NOT_ARRAY: &str =
-    "request `messages` is not an array and cannot be scanned";
+    "request `messages` is missing or not an array and cannot be scanned";
 
 /// LAB-3877: build the HTTP 400 for a `block` verdict. The body carries finding
 /// offsets and labels only — never the matched text — so an error surfaced to a
