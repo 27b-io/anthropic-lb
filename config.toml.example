@@ -94,6 +94,17 @@ probe_interval_secs = 300
 # status is then trust-based and forgeable.
 # operators = ["ray", "openclaw", "claude"]
 
+# Read-only principals: these client_ids may read /_stats and /metrics and
+# NOTHING else — every /v1 surface answers 403, so they can never spend the
+# pool. This is the role for a Prometheus/vmagent scrape or a Grafana
+# datasource: an operator credential would work too, but it also bypasses
+# every budget and limit, making the scrape key unmetered spend authority
+# (and any client_budgets entry for that name dead config).
+# Requires [[clients]] — under the legacy proxy_key the single key holder is
+# the operator by construction, so this cannot be enforced and is a startup
+# error. A name may be in operators OR readers, never both (startup error).
+# readers = ["vmagent", "grafana"]
+
 # Per-client utilization limits: clients are 429'd when ALL model-compatible endpoints
 # exceed their configured limit. Values must be 0.0-1.0.
 # [client_utilization_limits]
