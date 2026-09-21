@@ -630,6 +630,36 @@ are emitted from process start, so a flat zero is a measurement rather than an
 absence of data. These are independent per-replica event counts — aggregate
 with `sum by (kind)`, where `max` would undercount.
 
+### Request latency, restarts and build identity
+
+`anthropic_http_request_duration_seconds{route, status}` is a histogram of the
+time from request receipt to the moment the proxy sends response headers — for
+a streamed response that is the headers and first bytes, not the end of the
+stream. It is recorded by router-wide middleware, so every response counts,
+including the 401/403/429/503 the proxy generates itself before any upstream is
+contacted. `route` is a closed vocabulary (`/v1/messages`,
+`/v1/messages/count_tokens`, `/v1/chat/completions`, `/_stats`, `/metrics`,
+`other`) and `status` is the HTTP code, so a caller cannot mint series by
+varying the URL. Per-replica: aggregate with `sum by (le, route, status)`
+before `histogram_quantile`.
+
+`process_start_time_seconds` is the standard start-time gauge:
+`time() - process_start_time_seconds` is uptime and
+`changes(process_start_time_seconds[1h])` counts restarts, so a recycle no
+longer has to be inferred from counter resets.
+
+`anthropic_lb_info{strategy, version, revision}` identifies the running build.
+`version` is the crate version; `revision` is the 7-character git commit taken
+from the `GIT_SHA` Docker build argument (`unknown` when built without it), so
+it compares directly against a `sha-*` image tag.
+
+Most series on `/metrics` are per-replica and aggregate with `sum`. The
+exception is `anthropic_upstream_transport_errors_total`: with Redis
+coordination it is the fleet-wide total and every replica reports the same
+value — aggregate with `max`, not `sum`, or the count multiplies by the number
+of replicas. Without Redis it is this process's own count. Its HELP text states
+this on the scrape.
+
 ### OpenAI JSON-mode compatibility
 
 > [!IMPORTANT]
@@ -960,6 +990,8 @@ sudo systemctl enable --now anthropic-lb
 
 ```bash
 docker build -t anthropic-lb .
+# Bake the commit into anthropic_lb_info{revision} (defaults to "unknown")
+docker build --build-arg GIT_SHA=$(git rev-parse HEAD) -t anthropic-lb .
 docker run -v /path/to/config.toml:/etc/anthropic-lb/config.toml anthropic-lb
 ```
 
