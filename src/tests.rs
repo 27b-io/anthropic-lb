@@ -21752,6 +21752,119 @@ async fn read_only_principal_reaches_the_admin_surfaces() {
     }
 }
 
+/// GH #199 / LAB-4395, found by adversarial review 2026-09-21: the refusal
+/// must happen BEFORE the request-body admission reservation, not after.
+///
+/// Refused after admission, this role was a service-wide denial primitive. Six
+/// reader connections declaring 25 MiB bodies and sending ONE BYTE each
+/// reserved the entire 128 MiB budget on declared `content-length` alone;
+/// unrelated clients then got `503` without reaching an upstream, the readers
+/// got `408` rather than `403` when the read timed out, and the whole thing
+/// was repeatable the instant the timeout released. Removing spend authority
+/// does not make a widely-distributed credential safe if it still controls
+/// admission capacity for everyone else.
+///
+/// Both halves of the ordering are asserted: a reader declaring MORE than the
+/// entire budget still gets `403` and not `503` (proving identity is checked
+/// first, not that the reservation happened to fit), and the shared budget is
+/// untouched while six such connections are open.
+#[tokio::test]
+async fn read_only_principal_is_refused_before_it_can_reserve_body_budget() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for path in ["/v1/messages", "/v1/chat/completions"] {
+        let (url, hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+        let state = Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
+            clients: vec![
+                mk_client("viewer", "key-view", &[]),
+                mk_client("ops", "key-ops", &[]),
+            ],
+            admin_readers: vec!["viewer".to_string()],
+            operators: vec!["ops".to_string()],
+            max_inflight_body_bytes: 128 * 1024 * 1024,
+            body_read_timeout: Duration::from_secs(2),
+            ..test_state_base()
+        });
+        let addr = serve(build_router(state.clone())).await;
+        let legit = r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+
+        // Six connections that would have pinned the whole budget. Each sends
+        // one byte, so anything read from them is a response to the headers.
+        let mut sockets = Vec::new();
+        for mb in [25, 25, 25, 25, 25, 3] {
+            let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nx-api-key: key-view\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{{",
+                mb * 1024 * 1024
+            );
+            socket.write_all(req.as_bytes()).await.unwrap();
+            sockets.push(socket);
+        }
+
+        for mut socket in sockets {
+            let mut buf = [0; 1024];
+            let n = tokio::time::timeout(Duration::from_secs(4), socket.read(&mut buf))
+                .await
+                .expect("a refused reader must be answered, not left to time out")
+                .unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                head.starts_with("HTTP/1.1 403"),
+                "{path}: reader must get 403 on identity, not 408/503 after admission: {}",
+                head.lines().next().unwrap_or_default()
+            );
+        }
+        assert_eq!(
+            state.inflight_body_bytes.load(Ordering::Acquire),
+            0,
+            "{path}: a refused reader must never hold body budget"
+        );
+
+        // A reader declaring more than the ENTIRE budget still gets 403 — if
+        // the reservation ran first this would be a 503.
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        socket
+            .write_all(
+                format!(
+                    "POST {path} HTTP/1.1\r\nHost: localhost\r\nx-api-key: key-view\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{{",
+                    256 * 1024 * 1024u64
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(4), socket.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 403"),
+            "{path}: identity is checked before the reservation, so budget size is irrelevant"
+        );
+
+        // …and an ordinary client is unaffected throughout.
+        let resp = Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-api-key", "key-ops")
+            .body(legit)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "{path}: readers must not shed unrelated traffic"
+        );
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "{path}: exactly the operator request reached the upstream"
+        );
+    }
+}
+
 /// AC-1, deny half: every proxied surface answers 403 — and the refusal is
 /// complete, not cosmetic. The upstream is a COUNTING one, so "no upstream
 /// call" is asserted rather than assumed, and the usage/budget maps must stay
