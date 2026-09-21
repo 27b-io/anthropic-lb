@@ -419,6 +419,7 @@ fn test_state_base() -> AppState {
         body_read_timeout: Duration::from_secs(DEFAULT_BODY_READ_TIMEOUT_SECS),
         body_read_timeout_total: AtomicU64::new(0),
         affinity_migrations: Default::default(),
+        pool_exhausted: Default::default(),
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: DEFAULT_SESSION_REGISTRY_MAX,
         session_registry_ttl_secs: DEFAULT_SESSION_REGISTRY_TTL_SECS,
@@ -23120,5 +23121,567 @@ async fn full_router_rewrite_preserves_client_bytes() {
             .unwrap()
             .get("unknown_config"),
         Some(&1)
+    );
+}
+
+// ── LAB-4189: direct Fable band visibility ───────────────────────────
+//
+// Three series make a pool-exhaustion event readable from a scrape alone, rather
+// than only from `/_stats` and logs: per-claim status, per-claim reset, and a
+// counter for the 429 the caller actually got.
+
+/// AC-1/AC-2: a model carve-out claim gets its own status ordinal and its own
+/// reset countdown, labelled by `claim` — neither of which the `window`-labelled
+/// account series can express.
+#[tokio::test]
+async fn metrics_exports_per_claim_status_and_reset() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = test_app(&mock_url, None);
+
+    let now_epoch = AppState::now_epoch();
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        // The band is exhausted: utilization 1.0, hard-rejected, resets in 2 days.
+        info.claims_7d.insert(
+            FABLE_BAND_CLAIM.to_string(),
+            ClaimWindowData {
+                utilization: Some(1.0),
+                reset: Some(now_epoch + 172_800),
+                status: Some("rejected".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+        // The general claim is healthy at the same instant — this is the
+        // divergence a utilization threshold cannot see.
+        info.claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: Some(0.40),
+                reset: Some(now_epoch + 302_400),
+                status: Some("allowed".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+    }
+
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{}/metrics", addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.contains("# TYPE anthropic_claim_rate_limit_status gauge"),
+        "missing claim status TYPE line:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "anthropic_claim_rate_limit_status{account=\"acct-a\",claim=\"seven_day_fable\"} 3"
+        ),
+        "band claim should report ordinal 3 (rejected):\n{body}"
+    );
+    assert!(
+        body.contains(
+            "anthropic_claim_rate_limit_status{account=\"acct-a\",claim=\"seven_day\"} 0"
+        ),
+        "general claim should report ordinal 0 (allowed) at the same scrape:\n{body}"
+    );
+
+    let reset_line = body
+        .lines()
+        .find(|l| {
+            l.starts_with("anthropic_claim_reset_seconds{")
+                && l.contains("claim=\"seven_day_fable\"")
+        })
+        .unwrap_or_else(|| panic!("missing claim reset for the band:\n{body}"));
+    let secs: f64 = reset_line.rsplit(' ').next().unwrap().parse().unwrap();
+    assert!(
+        (secs - 172_800.0).abs() < 5.0,
+        "band reset should count down ~172800s, got {secs}"
+    );
+}
+
+/// AC-2 boundary: an expired reset is omitted, not clamped to zero — mirroring
+/// `anthropic_account_reset_seconds`. A stale timestamp means "unknown", and
+/// emitting 0 would read as "resets now" on the reset-ordered panel.
+#[tokio::test]
+async fn metrics_omits_claim_reset_already_in_the_past() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = test_app(&mock_url, None);
+
+    let now_epoch = AppState::now_epoch();
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.claims_7d.insert(
+            FABLE_BAND_CLAIM.to_string(),
+            ClaimWindowData {
+                utilization: Some(1.0),
+                reset: Some(now_epoch - 60),
+                status: Some("rejected".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+    }
+
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{}/metrics", addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        !body.contains("anthropic_claim_reset_seconds{account=\"acct-a\""),
+        "a past-dated reset must not emit a sample:\n{body}"
+    );
+    // Status still reports — the claim is known-rejected even with a stale reset.
+    assert!(
+        body.contains(
+            "anthropic_claim_rate_limit_status{account=\"acct-a\",claim=\"seven_day_fable\"} 3"
+        ),
+        "status must survive a stale reset:\n{body}"
+    );
+}
+
+/// AC-3: both `exhaustion_response` arms increment, under their own `kind`, and
+/// both series exist at zero before any exhaustion so a rate() panel has a
+/// baseline instead of "No data".
+#[tokio::test]
+async fn metrics_counts_client_facing_pool_exhaustion() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = test_app(&mock_url, None);
+    let addr = serve(app).await;
+    let scrape = |addr| async move {
+        Client::new()
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    };
+
+    let before = scrape(addr).await;
+    assert!(
+        before.contains("anthropic_pool_exhausted_total{kind=\"rate_limited\"} 0")
+            && before.contains("anthropic_pool_exhausted_total{kind=\"transient\"} 0"),
+        "both kinds must be emitted at zero before any exhaustion:\n{before}"
+    );
+
+    // The incident shape: every endpoint gated, nothing transient → 429.
+    let resp = exhaustion_response(&state, false, false);
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    // A 529 round counts as rate-limited too — same 429 to the caller.
+    let _ = exhaustion_response(&state, true, true);
+    // Transport-only exhaustion is the other arm → retryable 503.
+    let resp = exhaustion_response(&state, true, false);
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let after = scrape(addr).await;
+    assert!(
+        after.contains("anthropic_pool_exhausted_total{kind=\"rate_limited\"} 2"),
+        "rate-limit exhaustion (incl. the 529 round) should count 2:\n{after}"
+    );
+    assert!(
+        after.contains("anthropic_pool_exhausted_total{kind=\"transient\"} 1"),
+        "transient exhaustion should count 1:\n{after}"
+    );
+}
+
+/// A response carrying a distinct `representative-claim`, with a reset inside
+/// the parser's 7d sanity window so the entry actually persists. A literal far
+/// future epoch is silently discarded by that cap, which would leave the claim
+/// reset-less and the test asserting less than it looks like it asserts.
+fn claim_headers(claim: Option<&str>, util: &str, now_epoch: u64) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(c) = claim {
+        headers.insert(
+            "anthropic-ratelimit-unified-representative-claim",
+            HeaderValue::from_str(c).unwrap(),
+        );
+    }
+    headers.insert(
+        "anthropic-ratelimit-unified-7d-utilization",
+        HeaderValue::from_str(util).unwrap(),
+    );
+    headers.insert(
+        "anthropic-ratelimit-unified-7d-reset",
+        HeaderValue::from_str(&(now_epoch + 3600).to_string()).unwrap(),
+    );
+    headers
+}
+
+/// AC-4: claim keys are minted from the upstream response header, never from
+/// client input — and even that upstream string cannot mint unbounded series.
+/// A hostile upstream (reachable via the redirect-with-credentials path) is the
+/// threat model; CWE-770.
+#[tokio::test]
+async fn claim_keys_cannot_mint_unbounded_series() {
+    let state = test_state_with(vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")]);
+    let now_epoch = AppState::now_epoch();
+
+    // Oversized key FIRST, while the map has room: this exercises truncation,
+    // not the cap. (Sent after the flood it would be refused outright, and the
+    // truncation assertion would pass even with `truncate_label` deleted.)
+    let oversized = format!("seven_day_{}", "x".repeat(4096));
+    let expected: String = oversized
+        .chars()
+        .take(MAX_LABEL_CHARS)
+        .chain(['…'])
+        .collect();
+    state
+        .update_rate_info(0, &claim_headers(Some(&oversized), "0.50", now_epoch))
+        .await;
+    {
+        let info = state.endpoints[0].rate_info.read().await;
+        assert!(
+            info.claims_7d.contains_key(&expected),
+            "the oversized key must be stored truncated, got {:?}",
+            info.claims_7d.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !info.claims_7d.contains_key(&oversized),
+            "the untruncated key must never be retained"
+        );
+        assert_eq!(
+            info.representative_claim.as_deref(),
+            Some(expected.as_str()),
+            "representative_claim must be truncated too, or refresh_metrics_weights \
+             looks up a key that cannot exist"
+        );
+    }
+
+    // Now flood far past the cap.
+    for i in 0..200 {
+        let claim = format!("seven_day_junk{i}");
+        state
+            .update_rate_info(0, &claim_headers(Some(&claim), "0.50", now_epoch))
+            .await;
+    }
+
+    let info = state.endpoints[0].rate_info.read().await;
+    let unreserved = info
+        .claims_7d
+        .keys()
+        .filter(|k| !claim_key_is_reserved(k))
+        .count();
+    assert!(
+        unreserved <= MAX_CLAIMS_PER_ACCOUNT,
+        "unreserved claim keys must stay bounded, got {unreserved}"
+    );
+    assert!(
+        info.claims_7d
+            .keys()
+            .all(|k| k.chars().count() <= MAX_LABEL_CHARS + 1),
+        "every claim key must be truncated to a bounded label length"
+    );
+}
+
+/// AC-4, the failure mode the cap itself creates. `effective_utilization` skips
+/// its flat-field fallback whenever `claims_7d` is non-empty, so an account
+/// whose map is full of unknown keys with `seven_day` refused would derive NO
+/// weekly utilization — routing as though it had no weekly limit, and dropping
+/// out of the emergency brake's all-saturated test at 100%.
+///
+/// Order matters: the flood runs FIRST, so the reserved keys arrive against an
+/// already-full map. Seeded the other way round this passes even unfixed.
+#[tokio::test]
+async fn claim_cap_never_refuses_a_routing_relevant_claim() {
+    let state = test_state_with(vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")]);
+    let now_epoch = AppState::now_epoch();
+
+    for i in 0..MAX_CLAIMS_PER_ACCOUNT * 2 {
+        let claim = format!("seven_day_junk{i}");
+        state
+            .update_rate_info(0, &claim_headers(Some(&claim), "0.10", now_epoch))
+            .await;
+    }
+
+    // No representative-claim header → the parser's `seven_day` default, the
+    // key `claim_gates_all_traffic` feeds to the brake.
+    state
+        .update_rate_info(0, &claim_headers(None, "0.77", now_epoch))
+        .await;
+
+    // The Fable band arrives against the same full map.
+    let mut band = reqwest::header::HeaderMap::new();
+    band.insert(
+        "anthropic-ratelimit-unified-7d_oi-utilization",
+        HeaderValue::from_static("0.95"),
+    );
+    band.insert(
+        "anthropic-ratelimit-unified-7d_oi-reset",
+        HeaderValue::from_str(&(now_epoch + 3600).to_string()).unwrap(),
+    );
+    band.insert(
+        "anthropic-ratelimit-unified-7d_oi-status",
+        HeaderValue::from_static("rejected"),
+    );
+    state.update_rate_info(0, &band).await;
+
+    let info = state.endpoints[0].rate_info.read().await;
+    assert_eq!(
+        info.claims_7d.get("seven_day").and_then(|c| c.utilization),
+        Some(0.77),
+        "the all-traffic claim must be admitted against a full map — without it \
+         the account derives no weekly utilization and routes as unconstrained"
+    );
+    assert_eq!(
+        info.claims_7d
+            .get(FABLE_BAND_CLAIM)
+            .and_then(|c| c.status.as_deref()),
+        Some("rejected"),
+        "the Fable band must be admitted even with the cap full"
+    );
+    // The point of the two assertions above: routing still sees a weekly figure.
+    let (_, window, _, adj_7d) = effective_utilization(&info, now_epoch, "");
+    assert!(
+        adj_7d.is_some(),
+        "a flooded account must still derive a 7d utilization (window={window})"
+    );
+}
+
+/// AC-4 at the two ingest points that bypass the header parser entirely: the
+/// persisted state file and the Redis mirror both assign `claims_7d` whole. A
+/// map written by a pre-cap build must not restore unbounded.
+#[test]
+fn ingested_claims_are_bounded_and_truncated() {
+    let mut raw: HashMap<String, ClaimWindowData> = HashMap::new();
+    for i in 0..500 {
+        raw.insert(format!("seven_day_junk{i}"), ClaimWindowData::default());
+    }
+    let oversized = format!("seven_day_{}", "y".repeat(4096));
+    raw.insert(oversized.clone(), ClaimWindowData::default());
+    // Reserved keys, deliberately sorting AFTER the junk so a naive
+    // "keep the first N sorted" would drop them.
+    for key in ["seven_day", "seven_day_sonnet", FABLE_BAND_CLAIM] {
+        raw.insert(key.to_string(), ClaimWindowData::default());
+    }
+
+    let bounded = bound_ingested_claims(raw);
+
+    let unreserved = bounded.keys().filter(|k| !claim_key_is_reserved(k)).count();
+    assert_eq!(
+        unreserved, MAX_CLAIMS_PER_ACCOUNT,
+        "unreserved keys must be trimmed to exactly the cap"
+    );
+    for key in ["seven_day", "seven_day_sonnet", FABLE_BAND_CLAIM] {
+        assert!(
+            bounded.contains_key(key),
+            "reserved key {key} must survive trimming"
+        );
+    }
+    assert!(
+        !bounded.contains_key(&oversized),
+        "an untruncated key must not survive ingest"
+    );
+    assert!(
+        bounded
+            .keys()
+            .all(|k| k.chars().count() <= MAX_LABEL_CHARS + 1),
+        "every ingested key must be truncated"
+    );
+}
+
+/// The `claim` label was flagged as a Prometheus exposition-injection vector.
+/// It is not: `prom_gauge` puts every label value through `prom_escape`. This
+/// asserts that end to end on the rendered body rather than on the helper
+/// (`prometheus_label_escaping` already covers the helper), using a worse input
+/// than the header path can actually deliver — written straight into
+/// `claims_7d` to model a poisoned state file or Redis mirror, since an HTTP
+/// `HeaderValue` rejects the newline the attack needs in the first place.
+#[tokio::test]
+async fn hostile_claim_key_cannot_forge_metric_lines() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = test_app(&mock_url, None);
+    let now_epoch = AppState::now_epoch();
+
+    // Closes the label, emits a value, opens a forged metric, and trails a
+    // backslash to probe escape-swallowing of the closing quote.
+    let hostile = "seven_day\"} 1\ninjected_metric{x=\"\\";
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.claims_7d.insert(
+            hostile.to_string(),
+            ClaimWindowData {
+                utilization: Some(0.5),
+                reset: Some(now_epoch + 3600),
+                status: Some("rejected".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+    }
+
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{}/metrics", addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        !body.lines().any(|l| l.starts_with("injected_metric")),
+        "a claim key must not be able to forge a metric line:\n{body}"
+    );
+    assert!(
+        !body.contains("seven_day\"} 1\ninjected_metric"),
+        "the hostile key must never appear unescaped:\n{body}"
+    );
+    // One sample per series is the real proof: a successful breakout would mint
+    // a second line on at least one of them.
+    for metric in [
+        "anthropic_claim_utilization",
+        "anthropic_claim_rate_limit_status",
+        "anthropic_claim_reset_seconds",
+    ] {
+        let n = body
+            .lines()
+            .filter(|l| l.starts_with(&format!("{metric}{{")))
+            .count();
+        assert_eq!(
+            n, 1,
+            "{metric} should emit exactly one sample, got {n}:\n{body}"
+        );
+    }
+}
+
+/// The cap budgets UNRESERVED keys. Counting the whole map instead would let
+/// the five reserved keys eat the budget, admitting 27 unknown claims rather
+/// than the documented 32 — and would put the live path at odds with
+/// `bound_ingested_claims`, which has always counted this way.
+#[tokio::test]
+async fn claim_cap_budgets_unreserved_keys_only() {
+    let state = test_state_with(vec![mk_endpoint("acct-a", "sk-ant-api-test-aaa")]);
+    let now_epoch = AppState::now_epoch();
+
+    // All five reserved keys first, so they are present when the cap is tested.
+    state
+        .update_rate_info(0, &claim_headers(None, "0.10", now_epoch))
+        .await; // "seven_day"
+    for key in ["seven_day_sonnet", "seven_day_opus", "seven_day_haiku"] {
+        state
+            .update_rate_info(0, &claim_headers(Some(key), "0.10", now_epoch))
+            .await;
+    }
+    let mut band = reqwest::header::HeaderMap::new();
+    band.insert(
+        "anthropic-ratelimit-unified-7d_oi-utilization",
+        HeaderValue::from_static("0.20"),
+    );
+    band.insert(
+        "anthropic-ratelimit-unified-7d_oi-reset",
+        HeaderValue::from_str(&(now_epoch + 3600).to_string()).unwrap(),
+    );
+    state.update_rate_info(0, &band).await;
+
+    {
+        let info = state.endpoints[0].rate_info.read().await;
+        assert_eq!(
+            info.claims_7d
+                .keys()
+                .filter(|k| claim_key_is_reserved(k))
+                .count(),
+            5,
+            "fixture should seed all five reserved keys"
+        );
+    }
+
+    // Exactly the documented unreserved budget.
+    for i in 0..MAX_CLAIMS_PER_ACCOUNT {
+        let claim = format!("seven_day_junk{i}");
+        state
+            .update_rate_info(0, &claim_headers(Some(&claim), "0.50", now_epoch))
+            .await;
+    }
+
+    let info = state.endpoints[0].rate_info.read().await;
+    let unreserved = info
+        .claims_7d
+        .keys()
+        .filter(|k| !claim_key_is_reserved(k))
+        .count();
+    assert_eq!(
+        unreserved, MAX_CLAIMS_PER_ACCOUNT,
+        "all {MAX_CLAIMS_PER_ACCOUNT} unreserved claims must be admitted even with \
+         the reserved set present"
+    );
+    assert_eq!(
+        info.claims_7d.len(),
+        MAX_CLAIMS_PER_ACCOUNT + 5,
+        "hard bound is the unreserved cap plus the five reserved keys"
+    );
+}
+
+/// `representative_claim` must be truncated wherever the claim map is ingested
+/// whole, not just on the header path: `metrics_gate_weight` looks the key up in
+/// `claims_7d`, whose keys `bound_ingested_claims` truncates. An untruncated
+/// copy misses its own entry and the routing-weight gauges then report a
+/// different claim than the router used. Exercises the persisted-state path; the
+/// Redis path applies the identical expression.
+#[tokio::test]
+async fn ingested_representative_claim_is_truncated_to_match_its_key() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let oversized = format!("seven_day_{}", "z".repeat(4096));
+    let expected: String = oversized
+        .chars()
+        .take(MAX_LABEL_CHARS)
+        .chain(['…'])
+        .collect();
+    let now_epoch = AppState::now_epoch();
+
+    // A state file as a pre-truncation build would have written it: raw key,
+    // raw representative claim.
+    let mut state = test_state_with(vec![]);
+    {
+        let st = Arc::get_mut(&mut state).unwrap();
+        st.state_path = tmp.path().to_path_buf();
+        st.endpoints.push(make_endpoint("ep1", Protocol::Anthropic));
+    }
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.representative_claim = Some(oversized.clone());
+        info.claims_7d.insert(
+            oversized.clone(),
+            ClaimWindowData {
+                utilization: Some(0.30),
+                reset: Some(now_epoch + 302_400),
+                status: Some("allowed".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+    }
+    state.save_state().await;
+
+    let mut state2 = test_state_with(vec![]);
+    {
+        let st = Arc::get_mut(&mut state2).unwrap();
+        st.state_path = tmp.path().to_path_buf();
+        st.endpoints.push(make_endpoint("ep1", Protocol::Anthropic));
+    }
+    state2.load_state().await;
+
+    let info = state2.endpoints[0].rate_info.read().await;
+    assert_eq!(
+        info.representative_claim.as_deref(),
+        Some(expected.as_str()),
+        "the restored representative claim must be truncated"
+    );
+    let rep = info.representative_claim.as_deref().unwrap();
+    assert!(
+        info.claims_7d.contains_key(rep),
+        "the representative claim must resolve to a key that exists, got {:?} against {:?}",
+        rep,
+        info.claims_7d.keys().collect::<Vec<_>>()
     );
 }
