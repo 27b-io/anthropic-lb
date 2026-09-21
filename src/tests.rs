@@ -1,5 +1,43 @@
 use super::*;
 
+// ── Frozen clock (test-only) ─────────────────────────────────────────
+
+/// Pins `AppState::now_epoch` on this thread for the guard's lifetime and
+/// restores the PREVIOUS value on drop — including on panic, and including a
+/// nested freeze, so an inner guard cannot silently hand the outer test the
+/// wall clock back. Restoring on panic matters under `--test-threads=1`, where
+/// libtest runs tests in place on one shared thread.
+///
+/// The freeze applies to every `now_epoch` read on the thread, not just the
+/// one under test: fixtures that mint timestamps from `SystemTime::now()`
+/// directly (several `reset_epoch` ones here do) will be years out of step
+/// with it.
+#[must_use]
+struct FrozenClock(Option<u64>);
+
+impl FrozenClock {
+    fn at(epoch: u64) -> Self {
+        // The override is thread-local, so on a multi-thread runtime any
+        // `tokio::spawn`ed work reads the wall clock instead — and does it
+        // silently. Fail here rather than let a gate test pass for the wrong
+        // reason.
+        debug_assert!(
+            !matches!(
+                tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+            ),
+            "FrozenClock is thread-local: current-thread runtime only"
+        );
+        Self(FROZEN_NOW.with(|c| c.replace(Some(epoch))))
+    }
+}
+
+impl Drop for FrozenClock {
+    fn drop(&mut self) {
+        FROZEN_NOW.with(|c| c.set(self.0));
+    }
+}
+
 /// The error describer must surface the real cause + classification, not
 /// just reqwest's opaque "error sending request" Display. Uses a genuine
 /// connect failure so it exercises the is_connect classifier and the
@@ -18675,51 +18713,63 @@ async fn parse_error_envelope(resp: Box<Response>) -> serde_json::Value {
     serde_json::from_slice(&body).expect("denial must be valid JSON")
 }
 
+/// Two instants on 2024-01-01 (12:34:56Z and 14:34:56Z). Neither is a day
+/// boundary, because at `now % 86400 == 0` the true answer and every
+/// `86400 - now % k` mutant (k dividing 86400) are all 86400 — a midnight
+/// instant hides a wrong modulus rather than exposing it.
+///
+/// Two of them, not one, because freezing makes the expected value a constant:
+/// against a single instant the assertion cannot tell a correct computation
+/// from a hardcoded answer. A second instant is what restores that.
+const FROZEN_GATE_CLOCKS: [u64; 2] = [1_704_112_496, 1_704_119_696];
+
 #[tokio::test]
 async fn gate_429_budget_returns_json_envelope_with_retry_after() {
-    let today = AppState::now_epoch() / 86400;
-    let state = Arc::new(AppState {
-        client_budgets: [("budgeted".to_string(), 100)].into_iter().collect(),
-        ..test_state_base()
-    });
-    // Pre-populate usage to exceed the budget
-    state
-        .budget_usage
-        .lock()
-        .unwrap()
-        .insert("budgeted".to_string(), (today, 200));
-    let t0 = AppState::now_epoch();
-    let err = state
-        .pre_request_gate("budgeted", "")
-        .await
-        .expect_err("exceeded budget must be denied");
-    let t1 = AppState::now_epoch();
-    assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
-    let retry_after: u64 = err
-        .headers()
-        .get("retry-after")
-        .expect("budget 429 must carry retry-after")
-        .to_str()
-        .unwrap()
-        .parse()
-        .expect("retry-after must be integer seconds");
-    // The gate read its own clock somewhere in [t0, t1]; pin the value
-    // against every instant it could have seen. A range check is not enough:
-    // a fixed `3600` and a wrong `86400 - now%3600` both land inside
-    // 1..=86400, and both passed it.
-    assert!(
-        (t0..=t1).any(|now| retry_after == 86400 - now % 86400),
-        "budget retry-after must be the seconds left until the next UTC midnight, \
-         the boundary check_budget's day key rolls on; got {retry_after} for a gate \
-         clock read in [{t0}, {t1}]"
-    );
-    let json = parse_error_envelope(err).await;
-    assert_eq!(json["type"], "error");
-    assert_eq!(json["error"]["type"], "rate_limit_error");
-    assert!(json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("daily token budget exceeded"));
+    for frozen in FROZEN_GATE_CLOCKS {
+        // Frozen only to remove a rollover flake, not to sharpen the assertion:
+        // the day key this test writes and the one `check_budget` reads must
+        // land in the same bucket, and on the live clock a UTC midnight
+        // between those two reads files the usage under yesterday — the gate
+        // then allows the request and `expect_err` fails with no defect.
+        let _clock = FrozenClock::at(frozen);
+        let today = frozen / 86400;
+        let state = Arc::new(AppState {
+            client_budgets: [("budgeted".to_string(), 100)].into_iter().collect(),
+            ..test_state_base()
+        });
+        // Pre-populate usage to exceed the budget
+        state
+            .budget_usage
+            .lock()
+            .unwrap()
+            .insert("budgeted".to_string(), (today, 200));
+        let err = state
+            .pre_request_gate("budgeted", "")
+            .await
+            .expect_err("exceeded budget must be denied");
+        assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = err
+            .headers()
+            .get("retry-after")
+            .expect("budget 429 must carry retry-after")
+            .to_str()
+            .unwrap()
+            .parse()
+            .expect("retry-after must be integer seconds");
+        assert_eq!(
+            retry_after,
+            86400 - frozen % 86400,
+            "budget retry-after must be the seconds left until the next UTC midnight, \
+             the boundary check_budget's day key rolls on"
+        );
+        let json = parse_error_envelope(err).await;
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "rate_limit_error");
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("daily token budget exceeded"));
+    }
 }
 
 #[tokio::test]

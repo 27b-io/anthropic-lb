@@ -2334,8 +2334,29 @@ struct PersistedEndpoint {
 /// into a torn file before the atomic rename promotes it).
 static STATE_SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
 
+// Test-only clock override for `now_epoch`, set by `FrozenClock`. Thread-local:
+// `#[tokio::test]` defaults to a current-thread runtime on the test's own
+// thread, so parallel tests can't cross-pollute (same rationale as
+// TRANSLATE_A2O_CALLS below). The flip side is that a `multi_thread` test's
+// spawned work would read the wall clock instead — `FrozenClock` asserts
+// against that rather than leaving it to be discovered.
+#[cfg(test)]
+thread_local! {
+    static FROZEN_NOW: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 impl AppState {
     fn now_epoch() -> u64 {
+        // A gate call reads this clock more than once (`check_budget` keys the
+        // day, `pre_request_gate` computes the retry hint). Budget keys roll at
+        // UTC midnight, so a rollover between two live reads buckets usage
+        // under one day and answers for another; tests pin all reads to one
+        // instant. `#[cfg(test)]` — no clock field on AppState, no production
+        // seam, and the release build's `.text` is unchanged.
+        #[cfg(test)]
+        if let Some(frozen) = FROZEN_NOW.with(|c| c.get()) {
+            return frozen;
+        }
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
