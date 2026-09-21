@@ -18723,6 +18723,11 @@ async fn gate_allow_list_bypassed_by_operators() {
     );
 }
 
+/// Also the ONLY test pinning the `pre_request_gate` backstop call: both
+/// proxied handlers refuse a reader earlier, so every other reader test passes
+/// with the gate's own check removed. If this test is ever retired as
+/// "unreachable state", that call site goes unpinned with it.
+///
 /// The denial is checked ABOVE the operator bypass, so a name that somehow
 /// reached both lists loses its bypass rather than keeping it.
 /// `validate_clients` rejects that config at boot — this pins the runtime
@@ -21764,10 +21769,17 @@ async fn read_only_principal_reaches_the_admin_surfaces() {
 /// does not make a widely-distributed credential safe if it still controls
 /// admission capacity for everyone else.
 ///
-/// Both halves of the ordering are asserted: a reader declaring MORE than the
-/// entire budget still gets `403` and not `503` (proving identity is checked
-/// first, not that the reservation happened to fit), and the shared budget is
-/// untouched while six such connections are open.
+/// The load-bearing assertion is the LAST block, not the first. Six readers
+/// getting `403` shows only that they get `403` — under a 128 MiB budget every
+/// declaration clamps to at most `MAX_REQUEST_BODY_BYTES` (25 MiB) and is
+/// admitted either way, so that block cannot distinguish the orderings, and
+/// nor can sampling `inflight_body_bytes` after the connections are answered
+/// (it proves released, not never-taken). The third block is the proof: a
+/// 1 MiB budget with a declared 4 MiB survives the clamp and cannot be
+/// admitted, so reservation-first answers `503` and identity-first answers
+/// `403`. Re-verification caught the earlier version asserting the property it
+/// did not test: moving the refusal to just below the reservation passed the
+/// whole suite. If you weaken this block, re-run that mutation.
 #[tokio::test]
 async fn read_only_principal_is_refused_before_it_can_reserve_body_budget() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21821,14 +21833,28 @@ async fn read_only_principal_is_refused_before_it_can_reserve_body_budget() {
             "{path}: a refused reader must never hold body budget"
         );
 
-        // A reader declaring more than the ENTIRE budget still gets 403 — if
-        // the reservation ran first this would be a 503.
-        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // The ordering proof, on its own server with a budget SMALLER than
+        // the clamp. `reserve_request_body` clamps to
+        // `min(content_length, MAX_REQUEST_BODY_BYTES)` = at most 25 MiB, so
+        // against the 128 MiB budget above NO declaration can ever be shed —
+        // asserting 403 there proves only that a reader gets 403, under
+        // either ordering. A 1 MiB budget with a declared 4 MiB clamps to
+        // 4 MiB, which cannot be admitted: reservation-first answers 503,
+        // identity-first answers 403. That difference is the whole property.
+        let tight = Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
+            clients: vec![mk_client("viewer", "key-view", &[])],
+            admin_readers: vec!["viewer".to_string()],
+            max_inflight_body_bytes: 1024 * 1024,
+            ..test_state_base()
+        });
+        let tight_addr = serve(build_router(tight)).await;
+        let mut socket = tokio::net::TcpStream::connect(tight_addr).await.unwrap();
         socket
             .write_all(
                 format!(
                     "POST {path} HTTP/1.1\r\nHost: localhost\r\nx-api-key: key-view\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{{",
-                    256 * 1024 * 1024u64
+                    4 * 1024 * 1024u64
                 )
                 .as_bytes(),
             )
@@ -21839,12 +21865,17 @@ async fn read_only_principal_is_refused_before_it_can_reserve_body_budget() {
             .await
             .unwrap()
             .unwrap();
+        let head = String::from_utf8_lossy(&buf[..n]).to_string();
         assert!(
-            String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 403"),
-            "{path}: identity is checked before the reservation, so budget size is irrelevant"
+            head.starts_with("HTTP/1.1 403"),
+            "{path}: a 503 here means the reader reached admission control before identity: {}",
+            head.lines().next().unwrap_or_default()
         );
 
-        // …and an ordinary client is unaffected throughout.
+        // …and an ordinary client is unaffected throughout. This probe stays
+        // on /v1/messages for both iterations deliberately: the body budget is
+        // global, so the second iteration — readers hammering the OpenAI
+        // surface — proves non-interference ACROSS handlers.
         let resp = Client::new()
             .post(format!("http://{addr}/v1/messages"))
             .header("x-api-key", "key-ops")
@@ -21855,12 +21886,12 @@ async fn read_only_principal_is_refused_before_it_can_reserve_body_budget() {
         assert_eq!(
             resp.status(),
             reqwest::StatusCode::OK,
-            "{path}: readers must not shed unrelated traffic"
+            "readers on {path} must not shed /v1/messages traffic"
         );
         assert_eq!(
             hits.load(Ordering::Relaxed),
             1,
-            "{path}: exactly the operator request reached the upstream"
+            "readers on {path}: only the operator request reached the upstream"
         );
     }
 }
