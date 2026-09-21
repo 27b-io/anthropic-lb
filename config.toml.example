@@ -87,8 +87,9 @@ probe_interval_secs = 300
 
 # Operators: these client_ids are never throttled by utilization limits, budget
 # limits, the emergency brake, or the per-client model allow-list. Under
-# [[clients]] they are also the ONLY principals that may read /_stats and
-# /metrics (LAB-1192) — give your monitoring scraper an operator credential.
+# [[clients]] they may also read /_stats and /metrics (LAB-1192) — but do NOT
+# give a monitoring scraper an operator credential: use admin_readers below,
+# which grants the same two surfaces without the bypass.
 # Under [[clients]] these name authenticated principals. Without it, identity is
 # resolved via the x-client-id header or the client_names IP map — i.e. operator
 # status is then trust-based and forgeable.
@@ -102,8 +103,8 @@ probe_interval_secs = 300
 # (and any client_budgets entry for that name dead config).
 # Requires [[clients]] — under the legacy proxy_key the single key holder is
 # the operator by construction, so this cannot be enforced and is a startup
-# error. A name may be in operators OR readers, never both (startup error).
-# readers = ["vmagent", "grafana"]
+# error. A name may be in operators OR admin_readers, never both (startup error).
+# admin_readers = ["vmagent", "grafana"]
 
 # Per-client utilization limits: clients are 429'd when ALL model-compatible endpoints
 # exceed their configured limit. Values must be 0.0-1.0.

@@ -396,7 +396,7 @@ fn test_state_base() -> AppState {
         budget_usage: Mutex::new(HashMap::new()),
         client_utilization_limits: HashMap::new(),
         operators: vec![],
-        readers: vec![],
+        admin_readers: vec![],
         emergency_brake: true,
         emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
         client_request_rates: Mutex::new(HashMap::new()),
@@ -18723,24 +18723,6 @@ async fn gate_allow_list_bypassed_by_operators() {
     );
 }
 
-/// LAB-4395: the gate is the single placement that covers both proxied
-/// handlers, so the denial is asserted there rather than per-route.
-#[tokio::test]
-async fn gate_denies_a_read_only_principal() {
-    let state = Arc::new(AppState {
-        clients: vec![mk_client("viewer", "k1", &[])],
-        readers: vec!["viewer".to_string()],
-        ..test_state_base()
-    });
-    assert!(
-        state
-            .pre_request_gate("viewer", "claude-opus-5")
-            .await
-            .is_err(),
-        "a read-only principal has no proxy authority"
-    );
-}
-
 /// The denial is checked ABOVE the operator bypass, so a name that somehow
 /// reached both lists loses its bypass rather than keeping it.
 /// `validate_clients` rejects that config at boot — this pins the runtime
@@ -18750,7 +18732,7 @@ async fn gate_denial_beats_the_operator_bypass_when_a_name_holds_both_roles() {
     let state = Arc::new(AppState {
         clients: vec![mk_client("both", "k1", &[])],
         operators: vec!["both".to_string()],
-        readers: vec!["both".to_string()],
+        admin_readers: vec!["both".to_string()],
         ..test_state_base()
     });
     assert!(
@@ -18768,7 +18750,7 @@ async fn gate_denial_beats_the_operator_bypass_when_a_name_holds_both_roles() {
 async fn gate_leaves_a_plain_client_on_its_existing_policy() {
     let state = Arc::new(AppState {
         clients: vec![mk_client("limited", "k1", &["claude-haiku-*"])],
-        readers: vec!["viewer".to_string()],
+        admin_readers: vec!["viewer".to_string()],
         ..test_state_base()
     });
     assert!(
@@ -19034,42 +19016,45 @@ fn validate_clients_skips_all_crosschecks_without_a_client_table() {
     assert!(validate_clients(&cfg(&fragment)).is_ok());
 }
 
-/// AC-3 (LAB-4395): `readers` is bound by the same registry rule as every
+/// AC-3 (LAB-4395): `admin_readers` is bound by the same registry rule as every
 /// other name-keyed surface — a typo would silently create a role nobody
 /// holds, leaving the credential it was meant to scope on its old one.
 #[test]
 fn validate_clients_rejects_a_reader_naming_no_configured_client() {
     let err = validate_clients(&cfg(
-        "readers = [\"grafanna\"]\n\n[[clients]]\nname = \"grafana\"\nkey = \"k1\"\n",
+        "admin_readers = [\"grafanna\"]\n\n[[clients]]\nname = \"grafana\"\nkey = \"k1\"\n",
     ))
     .unwrap_err();
-    assert!(err.contains("readers"), "must name the surface: {err}");
+    assert!(
+        err.contains("admin_readers"),
+        "must name the surface: {err}"
+    );
     assert!(err.contains("grafanna"), "must name the typo: {err}");
 }
 
-/// AC-3: one name, one role. `operators` bypasses every policy and `readers`
+/// AC-3: one name, one role. `operators` bypasses every policy and `admin_readers`
 /// is refused every request — a name in both is a config whose author meant
 /// one of two opposite things, so it fails at boot instead of silently
 /// resolving to either.
 #[test]
 fn validate_clients_rejects_a_name_in_both_operators_and_readers() {
     let err = validate_clients(&cfg(
-        "operators = [\"ops\"]\nreaders = [\"ops\"]\n\n[[clients]]\nname = \"ops\"\nkey = \"k1\"\n",
+        "operators = [\"ops\"]\nadmin_readers = [\"ops\"]\n\n[[clients]]\nname = \"ops\"\nkey = \"k1\"\n",
     ))
     .unwrap_err();
-    assert!(err.contains("readers"), "{err}");
+    assert!(err.contains("admin_readers"), "{err}");
     assert!(err.contains("operators"), "{err}");
     assert!(err.contains("ops"), "must name the offending name: {err}");
 }
 
 /// Unlike the other cross-checks, this one fires on the LEGACY path too:
 /// with one shared `proxy_key` the key holder is the operator by construction
-/// and proxy-path client ids are caller-asserted, so a `readers` entry would
+/// and proxy-path client ids are caller-asserted, so a `admin_readers` entry would
 /// restrict nobody while reading as though it scoped something.
 #[test]
 fn validate_clients_rejects_readers_without_a_client_table() {
-    let err = validate_clients(&cfg("readers = [\"grafana\"]\n")).unwrap_err();
-    assert!(err.contains("readers"), "{err}");
+    let err = validate_clients(&cfg("admin_readers = [\"grafana\"]\n")).unwrap_err();
+    assert!(err.contains("admin_readers"), "{err}");
     assert!(
         err.contains("[[clients]]"),
         "must say what it requires: {err}"
@@ -19080,12 +19065,12 @@ fn validate_clients_rejects_readers_without_a_client_table() {
 #[test]
 fn validate_clients_accepts_disjoint_operator_and_reader_roles() {
     let parsed = cfg(
-        "operators = [\"ops\"]\nreaders = [\"grafana\", \"vmagent\"]\n\n[[clients]]\nname = \"ops\"\nkey = \"k1\"\n\n[[clients]]\nname = \"grafana\"\nkey = \"k2\"\n\n[[clients]]\nname = \"vmagent\"\nkey = \"k3\"\n",
+        "operators = [\"ops\"]\nadmin_readers = [\"grafana\", \"vmagent\"]\n\n[[clients]]\nname = \"ops\"\nkey = \"k1\"\n\n[[clients]]\nname = \"grafana\"\nkey = \"k2\"\n\n[[clients]]\nname = \"vmagent\"\nkey = \"k3\"\n",
     );
     // Guard against the vacuous-pass trap: top-level arrays written after a
     // table header bind to that table and vanish silently.
     assert_eq!(
-        parsed.readers,
+        parsed.admin_readers,
         vec!["grafana".to_string(), "vmagent".to_string()]
     );
     assert!(validate_clients(&parsed).is_ok());
@@ -21689,7 +21674,7 @@ fn admin_matrix_app(upstream_url: &str) -> (Router, Arc<AppState>) {
             mk_client("geo", "key-geo", &[]),
         ],
         operators: vec!["ops".to_string()],
-        readers: vec!["viewer".to_string()],
+        admin_readers: vec!["viewer".to_string()],
         ..test_state_base()
     });
     (build_router(state.clone()), state)
@@ -21740,14 +21725,9 @@ async fn admin_surfaces_gate_by_operator_principal() {
     }
 }
 
-// ── LAB-4395: the read-only principal ──
-//
-// `operators` was one bit meaning two things — "may read the dashboards" and
-// "bypasses every request policy" — so the only credential that could be
-// handed to a scrape or a dashboard was also unmetered spend authority over
-// the whole pool. These pin the third class: read surfaces yes, proxy no.
+// ── LAB-4395: the read-only principal — read surfaces yes, proxy no ──
 
-/// AC-1, read half: a `readers` principal is admitted to both admin surfaces,
+/// AC-1, read half: a `admin_readers` principal is admitted to both admin surfaces,
 /// exactly like an operator. The test above stays the proof that the other two
 /// classes did not move.
 #[tokio::test]
@@ -21778,17 +21758,20 @@ async fn read_only_principal_reaches_the_admin_surfaces() {
 /// empty: a refused request that still books tokens would reintroduce the
 /// spend authority this role exists to remove.
 ///
-/// The three paths are the whole proxied surface by construction: the router
-/// is `/_stats`, `/metrics`, `/v1/chat/completions` and a `.fallback(...)`
+/// These three paths stand in for the whole proxied surface: the router is
+/// `/_stats`, `/metrics`, `/v1/chat/completions` and a `.fallback(...)`
 /// catch-all, so `/v1/messages` and `/v1/models` both land in `proxy_handler`
-/// and both handlers reach the same `pre_request_gate`.
+/// and both handlers reach the same `pre_request_gate`. Caveat: this asserts
+/// against `build_router` here, which hand-copies the table in `main()` — a
+/// route added to `main()` alone would not be covered until the two are one
+/// function (GH #198).
 #[tokio::test]
 async fn read_only_principal_is_refused_on_every_proxy_surface() {
     let (url, hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
     let state = Arc::new(AppState {
         endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
         clients: vec![mk_client("viewer", "key-view", &[])],
-        readers: vec!["viewer".to_string()],
+        admin_readers: vec!["viewer".to_string()],
         ..test_state_base()
     });
     let addr = serve(build_router(state.clone())).await;

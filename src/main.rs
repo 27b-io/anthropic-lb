@@ -124,7 +124,7 @@ struct Config {
     /// `validate_clients` rejects the key on the legacy path rather than let it
     /// pretend to scope a shared secret it cannot scope.
     #[serde(default)]
-    readers: Vec<String>,
+    admin_readers: Vec<String>,
     /// Enable the emergency brake. Default: true.
     emergency_brake: Option<bool>,
     /// Emergency brake threshold (0.0-1.0). When ALL accounts exceed this,
@@ -934,7 +934,7 @@ struct AppState {
     operators: Vec<String>,
     /// Read-only client IDs — `/_stats` + `/metrics` only, 403 on every `/v1`
     /// surface. Disjoint from `operators`; the overlap is a boot error.
-    readers: Vec<String>,
+    admin_readers: Vec<String>,
     /// Whether the emergency brake is enabled. Default: true.
     emergency_brake: bool,
     /// Emergency brake threshold. Default: 0.88.
@@ -2107,10 +2107,10 @@ impl AppState {
     /// principal (LAB-1192 AC-4). Returns the rejection response, or `None`
     /// when the caller may proceed.
     ///
-    /// Under `[[clients]]`: unauthenticated → 401, authenticated
-    /// non-operator → 403 — `/_stats` discloses other clients' ids and the
-    /// endpoint account names, which a per-client key holder has no business
-    /// reading. A `readers` principal (LAB-4395) is admitted here and ONLY
+    /// Under `[[clients]]`: unauthenticated → 401, an authenticated principal
+    /// in neither `operators` nor `admin_readers` → 403 — `/_stats` discloses
+    /// other clients' ids and the endpoint account names, which a per-client
+    /// key holder has no business reading. An `admin_readers` principal (LAB-4395) is admitted here and ONLY
     /// here: it is exactly the credential to hand a scrape or a dashboard,
     /// because `pre_request_gate` refuses it on every proxied surface.
     /// Under legacy `proxy_key`, a valid key serves: one shared
@@ -2126,7 +2126,7 @@ impl AppState {
     ) -> Option<Box<Response>> {
         match self.authenticate_throttled(client_ip, headers, false, route) {
             Err(resp) => Some(resp),
-            Ok(Some(c)) if !self.is_operator(&c.name) && !self.is_reader(&c.name) => {
+            Ok(Some(c)) if !self.is_operator(&c.name) && !self.is_admin_reader(&c.name) => {
                 warn!(
                     client = %client_ip,
                     client_id = %c.name,
@@ -7262,8 +7262,8 @@ impl AppState {
 
     /// Check if client_id is a read-only principal (LAB-4395): admitted to
     /// `/_stats` and `/metrics`, refused on every proxied surface.
-    fn is_reader(&self, client_id: &str) -> bool {
-        self.readers.iter().any(|r| r == client_id)
+    fn is_admin_reader(&self, client_id: &str) -> bool {
+        self.admin_readers.iter().any(|r| r == client_id)
     }
 
     /// Check if all model-compatible endpoints exceed this client's utilization limit.
@@ -7371,7 +7371,7 @@ impl AppState {
         // ever weakened this arm makes the wider grant lose to the denial
         // rather than win. Refusing here also means no upstream call, no
         // budget record and no endpoint selection for the refused request.
-        if self.is_reader(client_id) {
+        if self.is_admin_reader(client_id) {
             warn!(
                 client_id = %client_id,
                 "rejected: read-only principal has no proxy authority"
@@ -14348,29 +14348,33 @@ fn validate_clients(config: &Config) -> Result<(), String> {
     // legacy path client ids are header-derived and there is no registry to
     // check against.
 
-    // `readers` (LAB-4395) is the one cross-check surface that must fire on
+    // `admin_readers` (LAB-4395) is the one cross-check surface that must fire on
     // the legacy path too, because there it cannot work at all: with a single
     // shared `proxy_key` the key holder IS the operator (`authenticate`
     // returns no principal, so `authorize_admin` serves), and `client_id` on
-    // the proxy path is caller-asserted via `x-client-id`. A `readers` entry
+    // the proxy path is caller-asserted via `x-client-id`. An `admin_readers` entry
     // would therefore restrict nobody and grant nobody — a control that reads
     // as scoping while scoping nothing. Reject rather than half-handle,
     // exactly as with `passthrough` below. Unlike `operators`, there are no
     // pre-existing configs carrying this key, so nothing regresses.
-    if !config.readers.is_empty() && clients.is_empty() {
+    if !config.admin_readers.is_empty() && clients.is_empty() {
         return Err(
-            "readers: requires [[clients]] — under legacy proxy_key the key holder is the operator by construction and client ids are caller-asserted, so a read-only role cannot be enforced"
+            "admin_readers: requires [[clients]] — under legacy proxy_key the key holder is the operator by construction and client ids are caller-asserted, so a read-only role cannot be enforced"
                 .to_string(),
         );
     }
     // One name, one role. `operators` bypasses every request policy and
-    // `readers` is refused every proxied request; a name in both is a config
+    // `admin_readers` is refused every proxied request; a name in both is a config
     // whose author meant one of two opposite things. `pre_request_gate`
     // resolves the overlap to the denial, but silently resolving it is how a
     // typo becomes an outage or an unmetered key — so name it at boot.
-    if let Some(dup) = config.readers.iter().find(|r| config.operators.contains(r)) {
+    if let Some(dup) = config
+        .admin_readers
+        .iter()
+        .find(|r| config.operators.contains(r))
+    {
         return Err(format!(
-            "readers: \"{dup}\" is also in operators — a client is either a read-only principal or an operator, never both"
+            "admin_readers: \"{dup}\" is also in operators — a client is either a read-only principal or an operator, never both"
         ));
     }
 
@@ -14404,7 +14408,7 @@ fn validate_clients(config: &Config) -> Result<(), String> {
                 .map(|k| ("client_utilization_limits", k)),
         )
         .chain(config.operators.iter().map(|k| ("operators", k)))
-        .chain(config.readers.iter().map(|k| ("readers", k)))
+        .chain(config.admin_readers.iter().map(|k| ("admin_readers", k)))
         .chain(
             config
                 .response_cache
@@ -14639,10 +14643,11 @@ async fn main() {
     // Operators gate /_stats + /metrics under [[clients]] (LAB-1192 AC-4). An
     // empty operators list there means NO principal can read them — a silent
     // way to blind a monitoring scrape. Warn so the omission is visible.
-    if !config.clients.is_empty() && config.operators.is_empty() && config.readers.is_empty() {
+    if !config.clients.is_empty() && config.operators.is_empty() && config.admin_readers.is_empty()
+    {
         warn!(
-            "[[clients]] configured with empty operators AND readers lists — /_stats and \
-             /metrics will reject EVERY caller (403); name at least one client in readers \
+            "[[clients]] configured with empty operators AND admin_readers lists — /_stats and \
+             /metrics will reject EVERY caller (403); name at least one client in admin_readers \
              (read-only, the right role for a scrape) or operators, or your monitoring \
              goes blind"
         );
@@ -14885,7 +14890,7 @@ async fn main() {
         budget_usage: Mutex::new(HashMap::new()),
         client_utilization_limits: config.client_utilization_limits.clone(),
         operators: config.operators.clone(),
-        readers: config.readers.clone(),
+        admin_readers: config.admin_readers.clone(),
         emergency_brake: config.emergency_brake.unwrap_or(true),
         emergency_threshold: config
             .emergency_threshold
