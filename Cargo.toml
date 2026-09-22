@@ -1,12 +1,15 @@
 [package]
 name = "anthropic-lb"
-version = "0.2.3"
+version = "0.2.5"
 edition = "2021"
 description = "Load-balancing reverse proxy for multiple Anthropic API accounts with dynamic capacity routing"
 license = "MIT"
 repository = "https://github.com/27b-io/anthropic-lb"
 keywords = ["anthropic", "proxy", "load-balancer", "api", "claude"]
 categories = ["network-programming", "web-programming"]
+# The toolchain pin is a repo-dev concern; shipping it in the crate would make
+# `cargo install anthropic-lb` force-download that exact toolchain on consumers.
+exclude = ["rust-toolchain.toml"]
 
 [dependencies]
 axum = "0.8"
@@ -51,6 +54,19 @@ serde_bytes = "0.11"
 # Constant-time credential comparison (LAB-1083). Already in the tree via
 # cachekit-rs' AEAD stack — direct use costs no extra compile.
 subtle = "2.6"
+
+# LAB-3877: Tier 0 request-content guard. Both are pure Rust with no C/C++
+# build dependency (verified via `cargo tree`); `secrets_scanner` is pulled in
+# with default-features off to drop its CLI/filesystem-walker stack (clap,
+# rayon, walkdir, libc) — we use only the in-memory `scan_content` path against
+# the compiled-in ruleset. Optional: compiled only with the `guard` feature.
+secrets_scanner = { version = "0.2.3", default-features = false, optional = true }
+leakguard = { version = "0.9.1", optional = true }
+
+[features]
+# Off by default: with the feature disabled the guard module and both scanner
+# crates are not compiled, and request handling is unchanged.
+guard = ["dep:secrets_scanner", "dep:leakguard"]
 
 [dev-dependencies]
 tempfile = "3.25.0"
