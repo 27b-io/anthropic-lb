@@ -118,42 +118,113 @@ impl ScanInput {
     }
 
     /// Build a scan input from a parsed Anthropic Messages body, extracting only
-    /// the newest `user` message's text and tool_result blocks. Returns `None`
-    /// when the body has no scannable user content.
+    /// the newest `user` message's text and tool_result blocks. `system` is
+    /// never read.
     ///
     /// "Newest" = the last element of `messages` whose role is `user`. That is
     /// the turn being sent for completion (and, after tool use, the turn that
-    /// carries the tool results). `system` is never read.
-    pub fn from_body(body: &Value) -> Option<Self> {
-        let messages = body.get("messages")?.as_array()?;
-        // Last user-role message.
-        let last_user = messages
-            .iter()
-            .rev()
-            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))?;
+    /// carries the tool results).
+    ///
+    /// LAB-4358: the return is a [`ScanOutcome`], not an `Option`. The old
+    /// `None` conflated "readable, no text" with "could not read the document",
+    /// and `guard_hook` forwarded both under `block` — so `{"messages":["<secret>"]}`,
+    /// a `"User"` role, and an object-valued `content` each reached the upstream
+    /// unscanned. The line drawn here is **structural readability vs content
+    /// absence**: a document the scanner can parse but which carries no text it
+    /// reads is [`ScanOutcome::NothingToScan`] (allowed); a body it cannot parse
+    /// is [`ScanOutcome::Unscannable`] (fails closed under `block`).
+    ///
+    /// Readability is judged per role, not per message: locating the newest user
+    /// turn requires reading EVERY element's role, because an element the
+    /// scanner cannot parse could itself be that turn. Content readability is
+    /// judged on the newest user turn only — an `assistant` message with
+    /// `content: null` is routine and carries nothing this scanner would read.
+    ///
+    /// `null` is treated as absent everywhere below, not as present-and-wrong.
+    /// A JSON null cannot be hiding content, so rejecting it would cost
+    /// availability (clients whose codegen emits `null` for an omitted optional,
+    /// which `tool_result.content` is) and buy no coverage.
+    pub fn from_body(body: &Value) -> ScanOutcome {
+        // A body that is not a JSON object is not a request any endpoint this
+        // proxy serves accepts, and `Value::get` answers `None` on one — so
+        // without this it would read as "no `messages` key" and forward. A bare
+        // `POST /v1/messages -d '"<secret>"'` parses fine and is all content.
+        if !body.is_object() {
+            return ScanOutcome::Unscannable(REASON_BODY_NOT_OBJECT);
+        }
+        let Some(messages) = body.get("messages") else {
+            // Not a Messages request at all. `proxy_handler` is the router's
+            // `.fallback`, so `/v1/complete` and `/v1/models` reach the guard
+            // with no `messages` key; failing those closed would take every
+            // non-Messages endpoint offline for `block` clients. What those
+            // bodies DO carry (`prompt`, `requests[].params`) is unscanned —
+            // a documented coverage boundary, unchanged by this function.
+            return ScanOutcome::NothingToScan;
+        };
+        let Some(messages) = messages.as_array() else {
+            return ScanOutcome::Unscannable(REASON_MESSAGES_NOT_ARRAY);
+        };
+
+        let mut last_user: Option<&Value> = None;
+        for message in messages {
+            let Some(role) = message.get("role").and_then(Value::as_str) else {
+                // A non-object element, or one whose `role` is absent or not a
+                // string. `{"messages":["<secret>"]}` lands here.
+                return ScanOutcome::Unscannable(REASON_MESSAGE_UNREADABLE);
+            };
+            match role {
+                "user" => last_user = Some(message),
+                "assistant" => {}
+                // The Messages API accepts `user` and `assistant` and nothing
+                // else, so no legitimate body reaches this arm — but `"User"`,
+                // `"USER"` and the OpenAI roles translation passes through
+                // verbatim (`developer`, `function`) all do, and each is a
+                // message the scanner cannot classify. Matching case-insensitively
+                // instead would be worse than useless: a trailing `{"role":"User"}`
+                // would then shadow the real newest user turn and hide it.
+                _ => return ScanOutcome::Unscannable(REASON_MESSAGE_UNREADABLE),
+            }
+        }
+        // A readable conversation with no user turn yet (an `assistant`-only
+        // prefill, or an OpenAI body whose only message was hoisted into
+        // `system`). Nothing to scan, not a scan failure.
+        let Some(last_user) = last_user else {
+            return ScanOutcome::NothingToScan;
+        };
 
         let mut segments: Vec<&str> = Vec::new();
         match last_user.get("content") {
+            None | Some(Value::Null) => {}
             // Shorthand string content is user text.
             Some(Value::String(s)) => segments.push(s),
             Some(Value::Array(blocks)) => {
                 for block in blocks {
                     match block.get("type").and_then(Value::as_str) {
-                        Some("text") => {
-                            if let Some(t) = block.get("text").and_then(Value::as_str) {
-                                segments.push(t);
+                        Some("text") => match text_block_segment(block) {
+                            Ok(Some(t)) => segments.push(t),
+                            Ok(None) => {}
+                            Err(reason) => return ScanOutcome::Unscannable(reason),
+                        },
+                        Some("tool_result") => {
+                            if !collect_tool_result(block, &mut segments) {
+                                return ScanOutcome::Unscannable(REASON_CONTENT_UNREADABLE);
                             }
                         }
-                        Some("tool_result") => collect_tool_result(block, &mut segments),
-                        _ => {}
+                        // A block type this scanner does not read — `image`,
+                        // `document`, `thinking`. A question of content coverage,
+                        // NOT a readability failure: the image-only turn is a
+                        // deliberate allow and must stay one.
+                        Some(_) => {}
+                        // No string `type`: not a content block at all.
+                        None => return ScanOutcome::Unscannable(REASON_CONTENT_UNREADABLE),
                     }
                 }
             }
-            _ => {}
+            Some(_) => return ScanOutcome::Unscannable(REASON_CONTENT_UNREADABLE),
         }
 
         if segments.is_empty() {
-            return None;
+            return ScanOutcome::NothingToScan;
         }
 
         let mut text = segments.join("\n");
@@ -166,25 +237,189 @@ impl ScanInput {
             }
             text.truncate(end);
         }
-        Some(ScanInput { text, truncated })
+        ScanOutcome::Scannable(ScanInput { text, truncated })
+    }
+
+    /// The `/v1/chat/completions` variant. Readability is judged on `original` —
+    /// the body the client sent, and the bytes a `Protocol::OpenAI` upstream
+    /// receives — while the text is extracted from `translated`, the Messages
+    /// document this scanner understands.
+    ///
+    /// The split is not a formality, and judging readability on `translated`
+    /// alone is not sufficient: `translate_openai_to_anthropic` is LOSSY in
+    /// three places, and each loss turns an unreadable document into a readable
+    /// empty one while the original bytes keep every character.
+    ///
+    /// 1. `messages` absent, or not an array — rewritten to an EMPTY array.
+    /// 2. A `tool` message's `content` — funnelled through
+    ///    `.as_str() → .as_array()+text-join → .unwrap_or_default()`, so an
+    ///    object, a scalar, or an array whose `text` is not a string collapses
+    ///    to `""`. The scanner then reads an empty `tool_result` and reports it
+    ///    CLEAN, which is worse than reporting nothing.
+    /// 3. An `image_url` part — rewritten through
+    ///    `pointer("/image_url/url").unwrap_or("")`, so a part whose `image_url`
+    ///    is not an object with a string `url` becomes an empty image block.
+    ///
+    /// Everything else (a non-object element, an unmapped role, an object-valued
+    /// user `content`) does survive translation verbatim and is caught by
+    /// [`ScanInput::from_body`] on the translated document.
+    pub fn from_openai_body(original: &Value, translated: &Value) -> ScanOutcome {
+        // `/v1/chat/completions` is a single API that requires this field, so
+        // absent is a malformed Messages request here — unlike the native
+        // fallback, where it means "not a Messages request at all".
+        let Some(messages) = original.get("messages").and_then(Value::as_array) else {
+            return ScanOutcome::Unscannable(REASON_MESSAGES_NOT_ARRAY);
+        };
+        for message in messages {
+            if let Err(reason) = openai_message_readable(message) {
+                return ScanOutcome::Unscannable(reason);
+            }
+        }
+        Self::from_body(translated)
     }
 }
 
-/// A `tool_result` block's `content` is either a string or an array of content
-/// blocks (typically `text`). Pull out every text span; ignore image/other.
-fn collect_tool_result<'a>(block: &'a Value, out: &mut Vec<&'a str>) {
-    match block.get("content") {
-        Some(Value::String(s)) => out.push(s),
-        Some(Value::Array(inner)) => {
-            for b in inner {
-                if b.get("type").and_then(Value::as_str) == Some("text") {
-                    if let Some(t) = b.get("text").and_then(Value::as_str) {
-                        out.push(t);
-                    }
+/// Whether one ORIGINAL OpenAI `messages` element is readable, for the losses
+/// [`ScanInput::from_openai_body`] documents.
+///
+/// The content walk is scoped to `user` and `tool` — the only roles whose
+/// content reaches the scanned document. `system` is hoisted out of `messages`
+/// and never scanned, and `assistant` content is not the newest user turn;
+/// both are deliberate coverage boundaries, so an unreadable shape there is not
+/// a failure to read the SCAN, and rejecting it would deny requests for no gain.
+fn openai_message_readable(message: &Value) -> Result<(), &'static str> {
+    let Some(role) = message.get("role").and_then(Value::as_str) else {
+        return Err(REASON_MESSAGE_UNREADABLE);
+    };
+    if role != "user" && role != "tool" {
+        return Ok(());
+    }
+    match message.get("content") {
+        None | Some(Value::Null) | Some(Value::String(_)) => Ok(()),
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                // Every part must be an object carrying a string `type`.
+                let Some(part_type) = part.get("type").and_then(Value::as_str) else {
+                    return Err(REASON_CONTENT_UNREADABLE);
+                };
+                // A present `text` must be a string whatever the part type says:
+                // the `tool` arm joins parts through `p.get("text").as_str()`
+                // without consulting `type`, dropping anything else silently.
+                text_block_segment(part)?;
+                // `image_url` is read through `pointer("/image_url/url")`, so
+                // any other shape loses its content to an empty url.
+                if part_type == "image_url"
+                    && part
+                        .pointer("/image_url/url")
+                        .and_then(Value::as_str)
+                        .is_none()
+                {
+                    return Err(REASON_CONTENT_UNREADABLE);
                 }
             }
+            Ok(())
         }
-        _ => {}
+        Some(_) => Err(REASON_CONTENT_UNREADABLE),
+    }
+}
+
+/// The `text` of one content block: `Ok(Some)` when it carries a string,
+/// `Ok(None)` when absent (nothing can be hiding there), `Err` when present in
+/// a shape this scanner cannot read.
+///
+/// One predicate, three call sites (user text blocks, `tool_result` inner
+/// blocks, and the OpenAI original-body walk). Keeping three copies of a
+/// fail-closed rule in sync is the debt this change just paid off elsewhere.
+fn text_block_segment(block: &Value) -> Result<Option<&str>, &'static str> {
+    match block.get("text") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(t)) => Ok(Some(t)),
+        Some(_) => Err(REASON_CONTENT_UNREADABLE),
+    }
+}
+
+/// What [`ScanInput::from_body`] could make of a request body (LAB-4358).
+///
+/// Three outcomes, not two. `NothingToScan` and `Unscannable` are both "no
+/// [`ScanInput`]", but they are opposite facts about the request: the first
+/// says the guard read the document and there was nothing in it to scan, the
+/// second says the guard could not read the document at all. Only the first is
+/// safe to forward under `block`. Returning them as one `None` is what left the
+/// array-shaped bypasses open, and making them separate variants is what stops
+/// a future caller from re-acquiring them silently — the compiler now forces
+/// every call site to say which of the two it means.
+#[must_use]
+pub enum ScanOutcome {
+    /// Text was extracted; scan it.
+    Scannable(ScanInput),
+    /// The document was readable and genuinely carried no text this scanner
+    /// reads: an image-only turn, a conversation with no user turn, or a body
+    /// that is not a Messages request. A deliberate allow.
+    NothingToScan,
+    /// The request body could not be read. Fails closed under `block`. Set by
+    /// `from_body` for a `messages` it cannot parse, and by the handler for a
+    /// non-empty body that is not JSON at all.
+    Unscannable(&'static str),
+}
+
+/// The request body parsed as JSON but is not an object.
+pub const REASON_BODY_NOT_OBJECT: &str = "request body is not a JSON object and cannot be scanned";
+/// `messages` is absent or is not an array.
+///
+/// The text names BOTH causes because the two surfaces reject different ones:
+/// `/v1/chat/completions` requires the field, so absent is malformed there and
+/// takes this reason too, while the `proxy_handler` fallback must keep
+/// forwarding the `messages`-less bodies of `/v1/complete` and `/v1/models` and
+/// so only ever reaches it for a present field of the wrong shape. Naming one
+/// cause would misdescribe the other to the client reading `error.message`.
+pub const REASON_MESSAGES_NOT_ARRAY: &str =
+    "request `messages` is missing or not an array and cannot be scanned";
+/// A `messages` element the scanner cannot resolve to a message: not an object,
+/// a `role` that is absent or not a string, or a role it cannot classify.
+///
+/// One reason, not one per cause, on purpose. Translation rewrites an element
+/// it cannot read into `{"role": ""}`, so splitting "not a message" from "bad
+/// role" would report a DIFFERENT cause for the same client body depending on
+/// which endpoint it hit — a diagnostic that flips on routing is worse than one
+/// that is merely coarse.
+pub const REASON_MESSAGE_UNREADABLE: &str =
+    "request `messages` contains a message the scanner cannot read";
+/// Content that is present but not in a readable shape.
+pub const REASON_CONTENT_UNREADABLE: &str =
+    "request `messages` content is not in a shape the scanner can read";
+/// A non-empty request body that is not JSON at all. Set by the handler, not by
+/// [`ScanInput::from_body`], but it is a guard reason and lives with the rest.
+pub const REASON_BODY_UNPARSEABLE: &str = "request body could not be parsed for content scanning";
+
+/// A `tool_result` block's `content` is either a string or an array of content
+/// blocks (typically `text`). Pull out every text span; ignore image/other.
+///
+/// Returns whether the block was READABLE. `false` means the block carried a
+/// `content` (or an inner block) in a shape this function cannot walk, which
+/// under `block` policy must fail closed rather than be silently skipped —
+/// `out` may hold partial segments in that case and the caller discards them.
+fn collect_tool_result<'a>(block: &'a Value, out: &mut Vec<&'a str>) -> bool {
+    match block.get("content") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => {
+            out.push(s);
+            true
+        }
+        Some(Value::Array(inner)) => {
+            for b in inner {
+                match b.get("type").and_then(Value::as_str) {
+                    Some("text") => match text_block_segment(b) {
+                        Ok(Some(t)) => out.push(t),
+                        Ok(None) => {}
+                        Err(_) => return false,
+                    },
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+            true
+        }
+        Some(_) => false,
     }
 }
 
@@ -516,6 +751,21 @@ mod tests {
         }
     }
 
+    /// Unwrap a [`ScanOutcome`] the test expects to be scannable. Deliberately
+    /// not an inherent `ScanOutcome::ok()` on the production type: collapsing
+    /// the three outcomes back into an `Option` is the exact mistake LAB-4358
+    /// removed, and a convenience method would put it one `.ok()` away.
+    #[track_caller]
+    fn scannable(outcome: ScanOutcome) -> ScanInput {
+        match outcome {
+            ScanOutcome::Scannable(input) => input,
+            ScanOutcome::NothingToScan => panic!("expected Scannable, got NothingToScan"),
+            ScanOutcome::Unscannable(reason) => {
+                panic!("expected Scannable, got Unscannable({reason})")
+            }
+        }
+    }
+
     #[test]
     fn scan_input_extracts_newest_user_and_tool_result_never_system() {
         let body = json!({
@@ -531,7 +781,7 @@ mod tests {
                 ]}
             ]
         });
-        let si = ScanInput::from_body(&body).expect("scannable");
+        let si = scannable(ScanInput::from_body(&body));
         assert!(si.text().contains("please read this"));
         assert!(si.text().contains("file contents here"));
         // Never the system prompt, never older turns.
@@ -544,7 +794,102 @@ mod tests {
         let body = json!({"system": "x", "messages": [
             {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}
         ]});
-        assert!(ScanInput::from_body(&body).is_none());
+        assert!(matches!(
+            ScanInput::from_body(&body),
+            ScanOutcome::NothingToScan
+        ));
+    }
+
+    /// LAB-4358: `null` is absent, not present-and-unreadable. A JSON null
+    /// cannot be hiding content, so rejecting it would deny requests from any
+    /// client whose codegen emits `null` for an omitted optional — which
+    /// `tool_result.content` genuinely is — and buy no coverage. Pinned because
+    /// the first cut of the tri-state DID reject it.
+    #[test]
+    fn null_content_is_absent_not_unreadable() {
+        for body in [
+            json!({"messages": [{"role": "user", "content": null}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": null}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": null}
+            ]}]}),
+        ] {
+            assert!(
+                matches!(ScanInput::from_body(&body), ScanOutcome::NothingToScan),
+                "null must read as absent, not as unscannable: {body}"
+            );
+        }
+    }
+
+    /// LAB-4358: a body that parses as JSON but is not an object reads as "no
+    /// `messages` key" through `Value::get`, so without an explicit check a
+    /// bare `POST /v1/messages -d '"<secret>"'` forwards unscanned while being
+    /// nothing but content.
+    #[test]
+    fn non_object_body_is_unscannable() {
+        for body in [
+            json!("a secret string"),
+            json!([{"role": "user"}]),
+            json!(7),
+        ] {
+            assert!(
+                matches!(ScanInput::from_body(&body), ScanOutcome::Unscannable(_)),
+                "a non-object body cannot be read as a Messages request: {body}"
+            );
+        }
+    }
+
+    /// LAB-4358: `translate_openai_to_anthropic` coerces an unreadable `tool`
+    /// content and a malformed `image_url` into EMPTY strings, so the translated
+    /// document reads as clean (or empty) while the original bytes — the ones a
+    /// `Protocol::OpenAI` upstream receives — still carry the content. Judging
+    /// readability on the translated document alone reports these CLEAN, which
+    /// is worse than reporting them unscanned.
+    #[test]
+    fn openai_readability_is_judged_on_the_original_body() {
+        // What the translator produces for each: readable, and empty.
+        let benign_translation = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": ""}
+        ]}]});
+        for original in [
+            json!({"messages": [{"role": "tool", "tool_call_id": "t1", "content": {"v": "x"}}]}),
+            json!({"messages": [{"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "text", "text": {"v": "x"}}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": "not-an-object"}
+            ]}]}),
+        ] {
+            assert!(
+                matches!(
+                    ScanInput::from_openai_body(&original, &benign_translation),
+                    ScanOutcome::Unscannable(_)
+                ),
+                "translation loses this content; the original must fail closed: {original}"
+            );
+        }
+        // The same shape done correctly still scans. Note what the translator
+        // hands back for the BENIGN empty case above: `Scannable("")` — "I read
+        // it and it was empty", which `Guard::evaluate` then allows on the empty
+        // text. That is the state the three originals above were borrowing to
+        // look clean, which is why readability cannot be judged there.
+        let ok = json!({"messages": [{"role": "tool", "tool_call_id": "t1", "content": "hello"}]});
+        let ok_translated = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "hello"}
+        ]}]});
+        match ScanInput::from_openai_body(&ok, &ok_translated) {
+            ScanOutcome::Scannable(input) => assert_eq!(input.text(), "hello"),
+            other => panic!(
+                "a readable tool result must scan, got {}",
+                match other {
+                    ScanOutcome::NothingToScan => "NothingToScan",
+                    ScanOutcome::Unscannable(r) => r,
+                    ScanOutcome::Scannable(_) => unreachable!(),
+                }
+            ),
+        }
     }
 
     #[test]
@@ -554,7 +899,7 @@ mod tests {
                 {"type": "tool_result", "content": "plain string result"}
             ]}
         ]});
-        let si = ScanInput::from_body(&body).expect("scannable");
+        let si = scannable(ScanInput::from_body(&body));
         assert_eq!(si.text(), "plain string result");
     }
 
@@ -648,8 +993,8 @@ mod tests {
         ]});
         let before = serde_json::to_vec(&body).unwrap();
         let g = Guard::new().expect("guard");
-        let si = ScanInput::from_body(&body);
-        let _ = g.evaluate(GuardPolicy::Block, "c", si.as_ref());
+        let si = scannable(ScanInput::from_body(&body));
+        let _ = g.evaluate(GuardPolicy::Block, "c", Some(&si));
         let after = serde_json::to_vec(&body).unwrap();
         assert_eq!(before, after, "guard must not mutate the request body");
     }
@@ -680,7 +1025,7 @@ mod tests {
 
     #[test]
     fn scan_input_capped_at_max_scan_bytes() {
-        let si = ScanInput::from_body(&body_200kb()).expect("scannable");
+        let si = scannable(ScanInput::from_body(&body_200kb()));
         assert!(si.truncated(), "a 200KB user turn must trip the cap");
         assert!(
             si.text().len() <= MAX_SCAN_BYTES,
@@ -701,7 +1046,7 @@ mod tests {
         // Go through the real extraction path so the cap is part of the
         // measurement, then reuse the (capped) input across iterations to time
         // the scan itself.
-        let si = ScanInput::from_body(&body_200kb()).expect("scannable");
+        let si = scannable(ScanInput::from_body(&body_200kb()));
 
         // Guard against the test silently regressing to the fast-reject path:
         // the scanned window must actually produce findings, so the timed loop
