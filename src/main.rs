@@ -5789,7 +5789,17 @@ impl AppState {
         // walking the keyspace against a backend that is already slow. A
         // manual cursor loop keeps each page under the ordinary 2s command
         // budget and genuinely ends the scan when this function returns.
-        let mut replicas = 0u64;
+        //
+        // The count is the *cardinality* of the matched keys, not the sum of
+        // page lengths: SCAN guarantees only that a key present for the whole
+        // iteration comes back at least once, and is explicitly allowed to
+        // return it on more than one page. (Not a live symptom — LAB-4554
+        // chased a `replicas_seen: 3` here and measurement cleared the loop:
+        // three distinct ids, each refreshing its own key every 5s, the third
+        // being the Cloudflare container stack that shares this store by
+        // design. But 110 keys against `COUNT 100` is one page today and two
+        // once the keyspace grows, so summing was wrong by construction.)
+        let mut heartbeats: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut cursor = String::from("0");
         loop {
             let result: Result<(String, Vec<String>), fred::error::RedisError> = redis
@@ -5810,7 +5820,7 @@ impl AppState {
                 .await;
             match result {
                 Ok((next_cursor, keys)) => {
-                    replicas += keys.len() as u64;
+                    heartbeats.extend(keys);
                     cursor = next_cursor;
                     if cursor == "0" {
                         break;
@@ -5823,6 +5833,7 @@ impl AppState {
                 }
             }
         }
+        let replicas = heartbeats.len() as u64;
 
         // Aggregate budget usage from Redis (batch MGET). The same fetch
         // re-seeds this replica's local `budget_usage` mirror (LAB-3217) —
