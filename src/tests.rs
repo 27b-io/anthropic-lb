@@ -20350,10 +20350,12 @@ fn start_coordination_redis_rejects_numeric_password_prefix_mis_route() {
 // so the redis→fred migration has a baseline to rewrite against.
 //
 // Opt-in by design: set `ALB_TEST_REDIS_URL` (plain `redis://host:port`,
-// no db suffix, no auth) to run them. When unset, every test prints a SKIP
-// notice and returns — never a silent pass against nothing. When the env
-// var IS set and the backend is unreachable, the tests PANIC, so CI (which
-// always sets it — see .github/workflows/ci.yml) can never skip silently.
+// no db suffix, no auth) to run them. When unset, every test that needs the
+// backend prints a SKIP notice and returns — never a silent pass against
+// nothing (the killable-proxy harness self-test needs none, so always runs).
+// When the env var IS set and the backend is unreachable, the tests PANIC,
+// so CI (which always sets it — see .github/workflows/ci.yml) can never skip
+// silently.
 //
 // Isolation: each test owns a dedicated logical DB (the `/N` suffix in the
 // connection URL) and flushes it on connect, because ALL `alb:*`
@@ -20473,11 +20475,16 @@ mod redis_integration {
         client
     }
 
+    /// Kill handle for a killable proxy: `kill_proxy` sends the proxy the
+    /// sender half of an ack channel and waits for its "listener closed" reply.
+    type KillSwitch = tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>;
+
     /// TCP forwarder in front of the real backend that can be killed
     /// mid-test to simulate Redis dying while connections are established.
     /// Killing aborts every live relay and drops the listener, so both
-    /// in-flight commands and subsequent reconnect attempts fail.
-    async fn spawn_killable_proxy(target: String) -> (String, tokio::sync::oneshot::Sender<()>) {
+    /// in-flight commands and subsequent reconnect attempts fail. The port
+    /// itself stays reserved for a revive (see `spawn_killable_proxy_at`).
+    async fn spawn_killable_proxy(target: String) -> (String, KillSwitch) {
         spawn_killable_proxy_at("127.0.0.1:0", target).await
     }
 
@@ -20490,15 +20497,14 @@ mod redis_integration {
     /// is dead, but the kernel will not hand the port to any concurrent
     /// `bind(127.0.0.1:0)` (another test's mock server). Without it the dead
     /// window leaves the port unowned and the revive races on `EADDRINUSE`.
-    /// `SO_REUSEADDR` on both sockets is what lets the listener — and later
-    /// the revive — bind over `hold`; a plain `TcpListener::bind` already sets
-    /// it, so that alone never was the missing piece. Two sockets on the same
-    /// exact addr:port with only `SO_REUSEADDR` is Linux behaviour (BSD/macOS
-    /// would need `SO_REUSEPORT` too) — CI and this opt-in suite are Linux.
-    async fn spawn_killable_proxy_at(
-        bind: &str,
-        target: String,
-    ) -> (String, tokio::sync::oneshot::Sender<()>) {
+    /// Never listening is also what lets the listener, and every later revive,
+    /// bind over `hold`: `SO_REUSEADDR` cannot bind over a LISTEN socket, so a
+    /// `listen()` on `hold` would break every revive. A plain
+    /// `TcpListener::bind` already sets `SO_REUSEADDR`, so that alone never was
+    /// the missing piece. Two sockets on one exact addr:port with only
+    /// `SO_REUSEADDR` is Linux behaviour; BSD/macOS reject it, so there `hold`
+    /// is skipped and the port goes unreserved, as it did before LAB-2299.
+    async fn spawn_killable_proxy_at(bind: &str, target: String) -> (String, KillSwitch) {
         fn reusable_socket(addr: std::net::SocketAddr) -> tokio::net::TcpSocket {
             let socket = tokio::net::TcpSocket::new_v4().unwrap();
             socket.set_reuseaddr(true).unwrap();
@@ -20507,21 +20513,30 @@ mod redis_integration {
                 .unwrap_or_else(|e| panic!("killable proxy: bind {addr}: {e}"));
             socket
         }
-        let hold = reusable_socket(bind.parse().unwrap());
-        let addr = hold.local_addr().unwrap();
+        let requested: std::net::SocketAddr = bind
+            .parse()
+            .unwrap_or_else(|e| panic!("killable proxy: bad bind address {bind}: {e}"));
+        let hold = cfg!(target_os = "linux").then(|| reusable_socket(requested));
+        let addr = hold.as_ref().map_or(requested, |h| h.local_addr().unwrap());
         let listener = reusable_socket(addr)
             .listen(1024)
             .unwrap_or_else(|e| panic!("killable proxy: listen {addr}: {e}"));
-        let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
+        let addr = listener.local_addr().unwrap();
+        let (kill_tx, mut kill_rx): (KillSwitch, _) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let mut relays: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-            loop {
+            let mut relays = tokio::task::JoinSet::new();
+            let dead = loop {
                 tokio::select! {
-                    _ = &mut kill_rx => break,
+                    dead = &mut kill_rx => break dead,
                     accepted = listener.accept() => {
-                        let Ok((mut inbound, _)) = accepted else { break };
+                        // Panic, not `break`: a proxy that stops accepting is a
+                        // broken harness, and a silent exit would park with
+                        // `kill_rx` alive — `kill_proxy` would wait forever.
+                        // Unwinding drops `relays`, which aborts every relay.
+                        let (mut inbound, _) = accepted
+                            .unwrap_or_else(|e| panic!("killable proxy: accept on {addr}: {e}"));
                         let target = target.clone();
-                        relays.push(tokio::spawn(async move {
+                        relays.spawn(async move {
                             if let Ok(mut outbound) =
                                 tokio::net::TcpStream::connect(&target).await
                             {
@@ -20529,17 +20544,21 @@ mod redis_integration {
                                     tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
                                         .await;
                             }
-                        }));
+                        });
                     }
                 }
-            }
-            for relay in relays {
-                relay.abort();
-            }
-            // Further connects are refused from here on…
+            };
+            relays.abort_all();
+            // Further connects are refused from here on — and only now does
+            // `kill_proxy` return, so a revive never meets this listener live.
             drop(listener);
-            // …but the port stays ours until the test's runtime tears this
-            // task down, so a revive at `addr` can never lose the bind race.
+            if let Ok(dead) = dead {
+                let _ = dead.send(());
+            }
+            // Moving `hold` into this task IS the reservation: the port stays
+            // ours until the test's runtime drops the parked task. Delete this
+            // line and `hold` drops when the function returns — the dead window
+            // is unowned again and the LAB-2299 race silently comes back.
             let _hold = hold;
             std::future::pending::<()>().await;
         });
@@ -20549,7 +20568,7 @@ mod redis_integration {
     /// fred client (the client under test) routed through a killable proxy.
     /// Same skip/panic contract as `redis_test_conn`. The DB is flushed via
     /// the independent redis-crate client before the fred client connects.
-    async fn proxied_conn(db: u8) -> Option<(RedisClient, tokio::sync::oneshot::Sender<()>)> {
+    async fn proxied_conn(db: u8) -> Option<(RedisClient, KillSwitch)> {
         let base = test_redis_url()?;
         let target = base
             .trim_start_matches("redis://")
@@ -20565,8 +20584,14 @@ mod redis_integration {
         Some((fred, kill))
     }
 
-    async fn kill_proxy(kill: tokio::sync::oneshot::Sender<()>) {
-        let _ = kill.send(());
+    /// Returns only once the proxy's listener is closed, so a same-address
+    /// revive can never meet it still in LISTEN (LAB-2299), however starved
+    /// the runtime. The fixed sleep alone left that ordering to the scheduler.
+    async fn kill_proxy(kill: KillSwitch) {
+        let (dead_tx, dead_rx) = tokio::sync::oneshot::channel();
+        let _ = kill.send(dead_tx);
+        // Err only if the proxy task is already gone — its listener with it.
+        let _ = dead_rx.await;
         // Give the aborts a beat to drop sockets before asserting failures.
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -20647,6 +20672,27 @@ mod redis_integration {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{addr}"), counter)
+    }
+
+    /// LAB-2299: `kill_proxy` must return only after the proxy's listener is
+    /// closed — a revive at the same address would otherwise meet it still in
+    /// LISTEN, which `SO_REUSEADDR` cannot bind over. 100 blocking tasks queued
+    /// ahead of the killed proxy keep the runtime busy well past any fixed
+    /// grace period before the proxy task gets to run. No backend needed:
+    /// nothing ever connects.
+    #[tokio::test]
+    async fn killable_proxy_revives_even_when_the_kill_is_starved() {
+        let target = "127.0.0.1:1".to_string();
+        let (addr, kill) = spawn_killable_proxy(target.clone()).await;
+        // Let the proxy task park on its first poll, so the kill below
+        // re-queues it BEHIND the busy tasks.
+        tokio::task::yield_now().await;
+        for _ in 0..100 {
+            tokio::spawn(async { std::thread::sleep(Duration::from_millis(5)) });
+        }
+        kill_proxy(kill).await;
+        let (revived, _revived_kill) = spawn_killable_proxy_at(&addr, target).await;
+        assert_eq!(revived, addr, "proxy must revive at its old address");
     }
 
     /// AC2 phase 1: the hard-limit MGET merge against real keys — a remote
