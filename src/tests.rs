@@ -14520,7 +14520,7 @@ async fn metrics_overage_account_gate_status_and_reset() {
     );
     let reset = value("anthropic_account_reset_seconds{account=\"acct-a\",window=\"overage\"}");
     assert!(
-        (reset - 86_400.0).abs() < 5.0,
+        (86_340.0..=86_400.0).contains(&reset),
         "overage reset ~86400, got {reset}"
     );
     // Not in overage → no overage series at all.

@@ -10487,7 +10487,7 @@ fn append_routing_weight_metrics(
         buf,
         "anthropic_account_routing_weight",
         "gauge",
-        "Per-account routing weight (headroom * waste_risk, or plain headroom when no 7d claim)",
+        "Per-account routing weight (headroom * waste_risk, or plain headroom when overage is in use or no 7d claim)",
     );
     prom_header(
         buf,
@@ -10499,7 +10499,7 @@ fn append_routing_weight_metrics(
         buf,
         "anthropic_account_effective_gate",
         "gauge",
-        "Effective routing gate: max(time_adjusted_5h, time_adjusted_7d) with status floors",
+        "Effective routing gate: time_adjusted_overage while overage is in use, else max(time_adjusted_5h, time_adjusted_7d), with status floors",
     );
 
     for (ep, snap) in endpoints.iter().zip(snaps.iter()) {
@@ -11239,7 +11239,7 @@ async fn metrics_handler(
         &mut buf,
         "anthropic_account_routing_weight",
         "gauge",
-        "Per-account routing weight (headroom * waste_risk, or plain headroom when no 7d claim)",
+        "Per-account routing weight (headroom * waste_risk, or plain headroom when overage is in use or no 7d claim)",
     );
     prom_header(
         &mut buf,
@@ -11251,7 +11251,7 @@ async fn metrics_handler(
         &mut buf,
         "anthropic_account_effective_gate",
         "gauge",
-        "Effective routing gate: max(time_adjusted_5h, time_adjusted_7d) with status floors",
+        "Effective routing gate: time_adjusted_overage while overage is in use, else max(time_adjusted_5h, time_adjusted_7d), with status floors",
     );
 
     // Snap-carried gauges (captured at snap time).
