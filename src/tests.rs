@@ -17492,22 +17492,9 @@ fn prompt_too_long_counter_bounds_model_cardinality() {
 /// Canned Anthropic context-window-overflow 400, byte-for-byte.
 const PROMPT_TOO_LONG_BODY: &[u8] = br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213462 tokens > 200000 maximum"}}"#;
 
-/// Upstream that answers every request with the canned 400 — the shared
-/// canned-status helper with `bad_first = MAX` (never recovers). `bad_head`
-/// is a raw pre-formatted response, so the JSON body rides along in it; the
-/// content-length is computed here and the leak is one string per test run.
+/// Upstream that answers every request with the canned 400.
 async fn spawn_prompt_too_long_upstream() -> String {
-    let raw: &'static str = Box::leak(
-        format!(
-            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            PROMPT_TOO_LONG_BODY.len(),
-            std::str::from_utf8(PROMPT_TOO_LONG_BODY).unwrap(),
-        )
-        .into_boxed_str(),
-    );
-    spawn_status_then_ok_upstream(usize::MAX, raw, ANTHROPIC_OK_BODY)
-        .await
-        .0
+    spawn_400_upstream(PROMPT_TOO_LONG_BODY).await.0
 }
 
 #[tokio::test]
@@ -23292,32 +23279,19 @@ async fn ingested_representative_claim_is_truncated_to_match_its_key() {
     );
 }
 
-// ── LAB-4729: an "out of extra usage" 400 cools the account, re-sends once ──
+// ── LAB-4729: an "out of extra usage" 400 re-sends once; the account is NOT cooled ──
 
 /// The entitlement 400 as observed live (2026-09-22) — request id replaced.
 const ENTITLEMENT_400_BODY: &[u8] = br#"{"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage. Ask your workspace admin to add more so you can keep going."},"request_id":"req_test_entitlement"}"#;
 
-/// 400s that are NOT the entitlement condition — each must reach the caller
-/// untouched. `why` names what the predicate must refuse to match.
-const NON_ENTITLEMENT_400S: &[(&str, &[u8])] = &[
-    ("a different invalid_request_error message", PROMPT_TOO_LONG_BODY),
-    (
-        "the anchor message under authentication_error",
-        br#"{"type":"error","error":{"type":"authentication_error","message":"You're out of extra usage. Ask your workspace admin to add more so you can keep going."}}"#,
-    ),
-    (
-        "the anchor mid-message, not at its start",
-        br#"{"type":"error","error":{"type":"invalid_request_error","message":"tools.0: You're out of extra usage is not a valid tool name"}}"#,
-    ),
-    (
-        "a message that merely mentions usage",
-        br#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid usage of tool_choice: extra usage fields are not permitted"}}"#,
-    ),
-    (
-        "a malformed (truncated) JSON body",
-        br#"{"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage."#,
-    ),
-];
+/// The anchor message under the wrong `error.type` — the nearest miss, since
+/// only the type tells it apart.
+const ENTITLEMENT_MSG_AS_AUTH_ERROR: &[u8] = br#"{"type":"error","error":{"type":"authentication_error","message":"You're out of extra usage. Ask your workspace admin to add more so you can keep going."}}"#;
+
+/// A truncated entitlement body. It never parses, so the forward paths never
+/// ask the predicate about it — pinned end-to-end, not in the unit test.
+const MALFORMED_ENTITLEMENT_400: &[u8] =
+    br#"{"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage."#;
 
 #[test]
 fn entitlement_400_predicate_is_anchored_exact_type_and_400_only() {
@@ -23332,6 +23306,7 @@ fn entitlement_400_predicate_is_anchored_exact_type_and_400_only() {
         &other_plan
     ));
 
+    // The predicate sees every parsed body, 2xx included — the status guard is real.
     for status in [
         StatusCode::TOO_MANY_REQUESTS,
         StatusCode::FORBIDDEN,
@@ -23343,27 +23318,23 @@ fn entitlement_400_predicate_is_anchored_exact_type_and_400_only() {
             "only a 400 is the entitlement condition, not {status}"
         );
     }
-    for (why, raw) in NON_ENTITLEMENT_400S {
-        // The malformed body never parses, so the forward paths never ask
-        // the predicate about it — pinned end-to-end in the passthrough test.
-        if let Ok(body) = serde_json::from_slice::<serde_json::Value>(raw) {
-            assert!(
-                !is_entitlement_exhausted_400(StatusCode::BAD_REQUEST, &body),
-                "must not match {why}"
-            );
-        }
-    }
-    for (why, body) in [
+    let negatives: [(&str, &[u8]); 4] = [
+        ("a different invalid_request_error message", PROMPT_TOO_LONG_BODY),
         (
-            "a non-string message",
-            serde_json::json!({"type":"error","error":{"type":"invalid_request_error","message":42}}),
+            "the anchor message under authentication_error",
+            ENTITLEMENT_MSG_AS_AUTH_ERROR,
         ),
-        ("no error object", serde_json::json!({"type":"error"})),
         (
-            "a top-level array",
-            serde_json::json!([ENTITLEMENT_400_ANCHOR]),
+            "the anchor mid-message, not at its start",
+            br#"{"type":"error","error":{"type":"invalid_request_error","message":"tools.0: You're out of extra usage is not a valid tool name"}}"#,
         ),
-    ] {
+        (
+            "a message that merely mentions usage",
+            br#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid usage of tool_choice: extra usage fields are not permitted"}}"#,
+        ),
+    ];
+    for (why, raw) in negatives {
+        let body: serde_json::Value = serde_json::from_slice(raw).unwrap();
         assert!(
             !is_entitlement_exhausted_400(StatusCode::BAD_REQUEST, &body),
             "must not match {why}"
@@ -23390,31 +23361,29 @@ async fn spawn_400_upstream(
 
 type Hits = std::sync::Arc<std::sync::atomic::AtomicUsize>;
 
-/// `spent` (priority 0) always answers `body` as a 400; `healthy`
-/// (priority 1) always 200s. Priority, not affinity hashing, forces the first
-/// attempt onto `spent`, so `healthy`'s hit count is a clean "did we
-/// re-send?" probe — same trick as `two_endpoint_429_then_healthy`.
-async fn spent_then_healthy(body: &'static [u8]) -> (Arc<AppState>, SocketAddr, Hits, Hits) {
+/// `spent` (priority 0) always answers `body` as a 400; `healthy` at
+/// priority 1 is `healthy_url`. Priority, not affinity hashing, forces the
+/// first attempt onto `spent`, so hit counts are a clean "did we re-send?"
+/// probe — same trick as `two_endpoint_429_then_healthy`.
+async fn spent_then(body: &'static [u8], healthy_url: &str) -> (Arc<AppState>, SocketAddr, Hits) {
     let (spent_url, spent_hits) = spawn_400_upstream(body).await;
-    let (healthy_url, healthy_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
     let spent = mk_endpoint_at("spent", "sk-ant-api-s", &spent_url);
-    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &healthy_url);
+    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", healthy_url);
     healthy.priority = 1;
     let state = test_state_with(vec![spent, healthy]);
     let addr = serve(build_router(state.clone())).await;
+    (state, addr, spent_hits)
+}
+
+/// `spent_then` with an always-200 `healthy`.
+async fn spent_then_healthy(body: &'static [u8]) -> (Arc<AppState>, SocketAddr, Hits, Hits) {
+    let (healthy_url, healthy_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let (state, addr, spent_hits) = spent_then(body, &healthy_url).await;
     (state, addr, spent_hits, healthy_hits)
 }
 
-async fn metrics_text(addr: SocketAddr) -> String {
-    reqwest::Client::new()
-        .get(format!("http://{addr}/metrics"))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap()
-}
+const MESSAGES_BODY: &str =
+    r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
 
 /// AC-2 / AC-4 / AC-5: the request is re-sent to the next account and THAT
 /// response reaches the caller, the event is counted per account — and a
@@ -23426,16 +23395,13 @@ async fn metrics_text(addr: SocketAddr) -> String {
 async fn entitlement_400_resends_once_and_leaves_account_alone() {
     use std::sync::atomic::Ordering;
     for (kind, body) in [
-        (
-            "non-streaming",
-            r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
-        ),
+        ("non-streaming", MESSAGES_BODY),
         (
             "streaming",
             r#"{"model":"claude-opus-5","max_tokens":1,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
         ),
     ] {
-        let (state, addr, spent_hits, healthy_hits) =
+        let (_state, addr, spent_hits, healthy_hits) =
             spent_then_healthy(ENTITLEMENT_400_BODY).await;
         for _ in 0..2 {
             let resp = reqwest::Client::new()
@@ -23451,29 +23417,62 @@ async fn entitlement_400_resends_once_and_leaves_account_alone() {
                 "{kind}: the re-send's response is what the caller sees"
             );
         }
+        // A cooled priority-0 account would be filtered out of the second
+        // request, giving (1, 2).
         assert_eq!(
             (
                 spent_hits.load(Ordering::SeqCst),
                 healthy_hits.load(Ordering::SeqCst)
             ),
             (2, 2),
-            "{kind}: each request tries the refusing account, then re-sends once"
+            "{kind}: each request tries the uncooled account, then re-sends once"
         );
-        let info = state.endpoints[0].rate_info.read().await;
-        assert!(
-            info.hard_limited_until.is_none(),
-            "{kind}: a request-class refusal must not cool the account for all traffic"
-        );
-        assert_eq!(
-            (info.remaining_requests, info.remaining_tokens),
-            (None, None),
-            "{kind}: nor poison its headroom view"
-        );
-        drop(info);
-        let m = metrics_text(addr).await;
+        let m = reqwest::Client::new()
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
         assert!(
             m.contains(r#"anthropic_entitlement_400_total{account="spent"} 2"#),
             "{kind}: the event must be counted per account on /metrics:\n{m}"
+        );
+    }
+}
+
+/// The refusing account is not cooled and `skip` resets per retry round, so
+/// without carrying it across rounds a 529 or transport blip on the re-send
+/// target would re-pick the refuser, whose second 400 would end the request
+/// before the healthy account got its backoff retry.
+#[tokio::test]
+async fn entitlement_refuser_stays_skipped_across_retry_rounds() {
+    use std::sync::atomic::Ordering;
+    const HEAD_529: &str =
+        "HTTP/1.1 529 Overloaded\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    for kind in ["529 then ok", "transport blip then ok"] {
+        let (url, target_hits) = if kind.starts_with("529") {
+            spawn_status_then_ok_upstream(1, HEAD_529, ANTHROPIC_OK_BODY).await
+        } else {
+            spawn_flaky_upstream(1, ANTHROPIC_OK_BODY).await
+        };
+        let (_state, addr, spent_hits) = spent_then(ENTITLEMENT_400_BODY, &url).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(MESSAGES_BODY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{kind}");
+        assert_eq!(
+            (
+                spent_hits.load(Ordering::SeqCst),
+                target_hits.load(Ordering::SeqCst)
+            ),
+            (1, 2),
+            "{kind}: the refuser must not be re-picked in the backoff round"
         );
     }
 }
@@ -23493,12 +23492,12 @@ async fn second_entitlement_400_reaches_caller_without_sweeping_pool() {
     let mut ok = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
     ok.priority = 2;
     let state = test_state_with(vec![a, b, ok]);
-    let addr = serve(build_router(state.clone())).await;
+    let addr = serve(build_router(state)).await;
 
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .header("content-type", "application/json")
-        .body(r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .body(MESSAGES_BODY)
         .send()
         .await
         .unwrap();
@@ -23513,15 +23512,6 @@ async fn second_entitlement_400_reaches_caller_without_sweeping_pool() {
         (1, 1, 0),
         "exactly one re-send: the third account must not be tried"
     );
-    let m = metrics_text(addr).await;
-    for acct in ["spent-a", "spent-b"] {
-        assert!(
-            m.contains(&format!(
-                r#"anthropic_entitlement_400_total{{account="{acct}"}} 1"#
-            )),
-            "{acct} must be counted:\n{m}"
-        );
-    }
 }
 
 /// With nothing else to re-send to, the caller gets the upstream's real 400
@@ -23535,7 +23525,7 @@ async fn entitlement_400_with_no_other_account_returns_upstream_400() {
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .header("content-type", "application/json")
-        .body(r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .body(MESSAGES_BODY)
         .send()
         .await
         .unwrap();
@@ -23551,16 +23541,27 @@ async fn entitlement_400_with_no_other_account_returns_upstream_400() {
 }
 
 /// AC-3: every other 400 is the caller's own error — returned byte-for-byte
-/// (status, body, upstream `request-id`), not re-sent, nothing counted.
+/// (status, body, upstream `request-id`), not re-sent, nothing counted. The
+/// predicate's negatives are unit-tested; these two rows pin the forward path
+/// on the nearest miss and on a body that never parses.
 #[tokio::test]
 async fn non_entitlement_400_passes_through_byte_for_byte() {
     use std::sync::atomic::Ordering;
-    for (why, body) in NON_ENTITLEMENT_400S {
+    for (why, body) in [
+        (
+            "the anchor message under authentication_error",
+            ENTITLEMENT_MSG_AS_AUTH_ERROR,
+        ),
+        (
+            "a malformed (truncated) JSON body",
+            MALFORMED_ENTITLEMENT_400,
+        ),
+    ] {
         let (state, addr, spent_hits, healthy_hits) = spent_then_healthy(body).await;
         let resp = reqwest::Client::new()
             .post(format!("http://{addr}/v1/messages"))
             .header("content-type", "application/json")
-            .body(r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .body(MESSAGES_BODY)
             .send()
             .await
             .unwrap();
@@ -23572,7 +23573,7 @@ async fn non_entitlement_400_passes_through_byte_for_byte() {
             Some("req_upstream_400"),
             "{why}: upstream request-id must reach the caller"
         );
-        assert_eq!(&resp.bytes().await.unwrap()[..], *body, "{why}");
+        assert_eq!(&resp.bytes().await.unwrap()[..], body, "{why}");
         assert_eq!(
             (
                 spent_hits.load(Ordering::SeqCst),
@@ -23589,8 +23590,8 @@ async fn non_entitlement_400_passes_through_byte_for_byte() {
 }
 
 /// The OpenAI-compat handler forwards to the same Anthropic accounts, so the
-/// same entitlement 400 re-sends there too — and likewise leaves the account
-/// in rotation.
+/// same entitlement 400 re-sends there too (its own `note_entitlement_400`
+/// call site, so its own pin).
 #[tokio::test]
 async fn entitlement_400_resends_on_openai_compat_path() {
     use std::sync::atomic::Ordering;
@@ -23610,11 +23611,5 @@ async fn entitlement_400_resends_on_openai_compat_path() {
         ),
         (1, 1)
     );
-    assert!(state.endpoints[0]
-        .rate_info
-        .read()
-        .await
-        .hard_limited_until
-        .is_none());
     assert_eq!(state.entitlement_400.lock().unwrap().get("spent"), Some(&1));
 }

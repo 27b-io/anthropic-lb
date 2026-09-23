@@ -6630,7 +6630,7 @@ impl AppState {
         }
         warn!(
             account = endpoint_name,
-            "upstream 400: account out of extra usage — re-sending once to another account (account not cooled)"
+            "upstream 400: account out of extra usage (account not cooled; request re-sent at most once)"
         );
     }
 
@@ -8173,7 +8173,7 @@ fn apply_round_outcome(
     saw_529: &mut bool,
     saw_transient: &mut bool,
     model_unsupported_resp: &mut Option<Response>,
-    entitlement_resp: &mut Option<Response>,
+    entitlement_resp: &mut Option<(EndpointIdx, Response)>,
 ) -> RetryStep {
     match outcome {
         ForwardOutcome::Done(resp) => RetryStep::Return(*resp),
@@ -8188,12 +8188,14 @@ fn apply_round_outcome(
         // Account out of extra usage (LAB-4729): re-send ONCE per request.
         // The refusal is scoped to a class of request, so every account may
         // give it — rotating on each would sweep the whole pool for a request
-        // nothing can serve. A second one goes to the caller as-is.
+        // nothing can serve. A second one goes to the caller as-is. The
+        // refusing endpoint rides along so every later round skips it too:
+        // it is not cooled, and `skip` resets per round.
         ForwardOutcome::RetryEntitlement(resp) => {
             if entitlement_resp.is_some() {
                 return RetryStep::Return(*resp);
             }
-            *entitlement_resp = Some(*resp);
+            *entitlement_resp = Some((picked_idx, *resp));
             skip.push(picked_idx);
             RetryStep::NextAttempt
         }
@@ -9454,7 +9456,7 @@ async fn proxy_handler(
     let mut model_unsupported_resp: Option<Response> = None;
     // First entitlement 400 (LAB-4729): its presence spends the one re-send;
     // returned if nothing else can serve the request.
-    let mut entitlement_resp: Option<Response> = None;
+    let mut entitlement_resp: Option<(EndpointIdx, Response)> = None;
     // OpenAI-shape body, built lazily on the first OpenAI-endpoint attempt
     // and reused across rotations/retries (LAB-716). Lazy so requests served
     // entirely by Anthropic endpoints — the common case — never pay for the
@@ -9471,7 +9473,9 @@ async fn proxy_handler(
             );
             tokio::time::sleep(delay).await;
         }
-        let mut skip: Vec<EndpointIdx> = Vec::new();
+        // Seeded with an entitlement-refusing endpoint (LAB-4729): after a
+        // 529/transient round it must not be re-picked and spend the re-send.
+        let mut skip: Vec<EndpointIdx> = entitlement_resp.iter().map(|(i, _)| *i).collect();
         let mut saw_529 = false;
         let mut saw_transient = false;
         for _attempt in 0..n {
@@ -9607,7 +9611,7 @@ async fn proxy_handler(
     // found nothing else to try is returned the same way (LAB-4729): the
     // caller sees why, not a synthetic 429.
     if !last_saw_529 && !last_saw_transient {
-        if let Some(resp) = entitlement_resp.or(model_unsupported_resp) {
+        if let Some(resp) = entitlement_resp.map(|(_, r)| r).or(model_unsupported_resp) {
             return resp;
         }
         // Warm-cache path: every eligible endpoint was filtered by the
@@ -11757,10 +11761,7 @@ async fn metrics_handler(
         );
     }
 
-    // Entitlement 400s by account (LAB-4729): "out of extra usage" refusals,
-    // the first per request re-sent to another account. Sustained growth on
-    // one account means its credits are gone; across the pool, a request
-    // class (past-band Fable) outrunning the credit limits.
+    // Entitlement 400s by account (LAB-4729): an account's extra usage is gone.
     prom_header(
         &mut buf,
         "anthropic_entitlement_400_total",
@@ -14280,7 +14281,7 @@ async fn openai_chat_handler(
         // returned verbatim if the pool exhausts on nothing but rejections.
         let mut model_unsupported_resp: Option<Response> = None;
         // One-shot entitlement re-send, as in `proxy_handler` (LAB-4729).
-        let mut entitlement_resp: Option<Response> = None;
+        let mut entitlement_resp: Option<(EndpointIdx, Response)> = None;
         for retry_round in 0..=MAX_529_RETRIES {
             if retry_round > 0 {
                 let delay = round_backoff_delay(retry_round, last_saw_529);
@@ -14292,7 +14293,9 @@ async fn openai_chat_handler(
                 );
                 tokio::time::sleep(delay).await;
             }
-            let mut skip: Vec<EndpointIdx> = Vec::new();
+            // Entitlement-refusing endpoint stays skipped across rounds, as in
+            // `proxy_handler` (LAB-4729).
+            let mut skip: Vec<EndpointIdx> = entitlement_resp.iter().map(|(i, _)| *i).collect();
             let mut saw_529 = false;
             let mut saw_transient = false;
             for _attempt in 0..n {
@@ -14384,7 +14387,7 @@ async fn openai_chat_handler(
         // Same model-rejection exhaustion rule as `proxy_handler` (LAB-941),
         // in the OpenAI error shape this handler's clients parse.
         if !last_saw_529 && !last_saw_transient {
-            if let Some(resp) = entitlement_resp.or(model_unsupported_resp) {
+            if let Some(resp) = entitlement_resp.map(|(_, r)| r).or(model_unsupported_resp) {
                 return resp;
             }
             if state.model_unsupported_everywhere(&model) {
