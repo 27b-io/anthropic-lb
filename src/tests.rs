@@ -9237,6 +9237,76 @@ fn routing_weight_no_data_uses_defaults() {
     assert!(rw.weight > 0.0);
 }
 
+/// LAB-4441: the gate published on `/metrics` must equal the gate the router
+/// uses for the same `RateLimitInfo`. The metrics path once lacked the overage
+/// branch and published gate 1.0 / weight 0 for accounts the router was
+/// actively serving through paid overage. (c) guards the non-overage path.
+#[test]
+fn metrics_gate_matches_routing_gate() {
+    let now = 1_000_000u64;
+    let seven_day = |status: &str| {
+        HashMap::from([(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: Some(0.60),
+                reset: Some(now + 302400),
+                status: Some(status.to_string()),
+                last_seen: now,
+            },
+        )])
+    };
+    // Subscription windows exhausted (both rejected); overage carrying load.
+    let overage = |util: f64, reset: u64| RateLimitInfo {
+        utilization_5h: Some(1.0),
+        reset_5h: Some(now + 7200),
+        status_5h: Some("rejected".to_string()),
+        claims_7d: seven_day("rejected"),
+        overage_in_use: true,
+        overage_status: Some("allowed".to_string()),
+        overage_utilization: Some(util),
+        overage_reset: Some(reset),
+        ..Default::default()
+    };
+    let half_ramp = now + (NEAR_RESET_OVERAGE_SECS / 2.0) as u64;
+    let cases = [
+        (
+            "(a) overage, rejected 7d",
+            overage(0.30, now + 86_400),
+            0.30,
+        ),
+        (
+            "(b) overage, near-reset ramp",
+            overage(0.80, half_ramp),
+            0.40,
+        ),
+        (
+            "(c) overage inactive",
+            RateLimitInfo {
+                utilization_5h: Some(0.40),
+                reset_5h: Some(now + 7200),
+                status_5h: Some("allowed".to_string()),
+                claims_7d: seven_day("allowed_warning"),
+                ..Default::default()
+            },
+            WARNING_UTIL_FLOOR,
+        ),
+    ];
+    for (name, info, want) in cases {
+        let rw = compute_routing_weight(&info, "claude-sonnet-4-6", now, false).expect(name);
+        let (gate, weight) = metrics_gate_weight(&info, now, Instant::now()).expect(name);
+        assert_eq!(gate, rw.gate, "{name}: metrics gate != routing gate");
+        assert!(
+            (gate - want).abs() < 1e-9,
+            "{name}: gate {gate}, want {want}"
+        );
+        assert_eq!(
+            weight, rw.weight,
+            "{name}: metrics weight != routing weight"
+        );
+        assert!(weight > 0.0, "{name}: servable account published weight 0");
+    }
+}
+
 // ── classify_hard_limit_sync tests ────────────────────────────
 
 #[test]
@@ -14384,6 +14454,79 @@ async fn metrics_status_gate_and_data_age() {
     assert!(
         !body.contains("anthropic_account_data_age_seconds{account=\"acct-b\""),
         "acct-b should have no data_age_seconds:\n{body}"
+    );
+}
+
+/// LAB-4441 AC-1/AC-3: an account serving via overage with its 7d claim
+/// rejected publishes the overage gate (not 1.0), a non-zero routing weight,
+/// and the overage window's status and reset.
+#[tokio::test]
+async fn metrics_overage_account_gate_status_and_reset() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = test_app(&mock_url, None);
+    let now_epoch = AppState::now_epoch();
+
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.utilization_5h = Some(1.0);
+        info.reset_5h = Some(now_epoch + 7200);
+        info.status_5h = Some("rejected".to_string());
+        info.claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: Some(1.0),
+                reset: Some(now_epoch + 302400),
+                status: Some("rejected".to_string()),
+                ..Default::default()
+            },
+        );
+        info.overage_in_use = true;
+        info.overage_status = Some("allowed_warning".to_string());
+        info.overage_utilization = Some(0.30);
+        info.overage_reset = Some(now_epoch + 86_400);
+    }
+    state.refresh_metrics_weights().await;
+
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{}/metrics", addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let value = |prefix: &str| -> f64 {
+        body.lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix}:\n{body}"))
+            .split_whitespace()
+            .last()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+
+    // allowed_warning floor (0.80) over raw overage util 0.30.
+    let gate = value("anthropic_account_effective_gate{account=\"acct-a\"}");
+    assert_eq!(
+        gate, WARNING_UTIL_FLOOR,
+        "overage gate, not the rejected 1.0"
+    );
+    assert!(value("anthropic_account_routing_weight{account=\"acct-a\"}") > 0.0);
+    assert_eq!(
+        value("anthropic_account_rate_limit_status{account=\"acct-a\",window=\"overage\"}"),
+        1.0
+    );
+    let reset = value("anthropic_account_reset_seconds{account=\"acct-a\",window=\"overage\"}");
+    assert!(
+        (86_340.0..=86_400.0).contains(&reset),
+        "overage reset ~86400, got {reset}"
+    );
+    // Not in overage → no overage series at all.
+    assert!(
+        !body.contains("account=\"acct-b\",window=\"overage\""),
+        "acct-b must emit no overage series:\n{body}"
     );
 }
 
