@@ -16385,6 +16385,83 @@ async fn guard_block_forwards_conversation_without_user_turn() {
     }
 }
 
+/// LAB-4358: `guard_hook` against every `ScanOutcome` under every policy,
+/// called directly. The tables above pin rejection vs forwarding through the
+/// handlers; what only this pins is the fail-closed LOG, emitted under every
+/// policy (`would-block` when the policy does not enforce) so shadow mode can
+/// size a `block` rollout. `Guard::empty()` suffices: no fail-closed cause
+/// reaches the scanners.
+#[cfg(feature = "guard")]
+#[test]
+fn guard_hook_logs_fail_closed_cause_under_every_policy() {
+    use crate::guard::{ScanInput, ScanOutcome, MAX_SCAN_BYTES, REASON_MESSAGE_UNREADABLE};
+    let buf = log_capture_buf();
+    let mut clients = guard_non_block_clients();
+    clients.push(guard_block_client());
+    let state = AppState {
+        clients,
+        ..test_state_base()
+    };
+    let user_turn = |len: usize| {
+        ScanInput::from_body(&serde_json::json!({
+            "messages": [{"role": "user", "content": "a".repeat(len)}]
+        }))
+    };
+    // (label, outcome, the fail-closed cause it must log, if any)
+    let cases = [
+        (
+            "unscannable",
+            ScanOutcome::Unscannable(REASON_MESSAGE_UNREADABLE),
+            Some(REASON_MESSAGE_UNREADABLE),
+        ),
+        (
+            "truncated",
+            user_turn(MAX_SCAN_BYTES + 1),
+            Some("exceeds the guard scan limit"),
+        ),
+        ("scannable", user_turn(16), None),
+        ("nothing-to-scan", ScanOutcome::NothingToScan, None),
+    ];
+    for (label, outcome, cause) in &cases {
+        for (client, blocks) in [
+            ("blocked-client", true),
+            ("annotate", false),
+            ("off", false),
+        ] {
+            let req_id = format!("lab4358-hook-{label}-{client}");
+            let rejected = state.guard_hook(&req_id, client, outcome, false).is_err();
+            assert_eq!(
+                rejected,
+                blocks && cause.is_some(),
+                "{req_id}: reject iff block AND a fail-closed cause"
+            );
+
+            let marker = format!("req_id=\"{req_id}\"");
+            let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            let lines: Vec<&str> = output
+                .lines()
+                .filter(|l| l.contains(&marker) && l.contains("guard: unscannable request"))
+                .collect();
+            let Some(cause) = cause else {
+                assert!(
+                    lines.is_empty(),
+                    "{req_id}: no fail-closed cause, so no line, got {lines:?}"
+                );
+                continue;
+            };
+            let verdict = if blocks {
+                r#"verdict="block""#
+            } else {
+                r#"verdict="would-block""#
+            };
+            assert!(
+                lines.len() == 1 && lines[0].contains(verdict) && lines[0].contains(cause),
+                "{req_id}: expected one {verdict} line naming the cause, got {lines:?}"
+            );
+        }
+    }
+}
+
 /// Shadow-mode counterpart on the OpenAI-compat surface: `annotate` forwards
 /// the request and stamps `X-Guard-Findings` on the translated response.
 #[cfg(feature = "guard")]

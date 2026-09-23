@@ -206,8 +206,8 @@ impl ScanInput {
                             Err(reason) => return ScanOutcome::Unscannable(reason),
                         },
                         Some("tool_result") => {
-                            if !collect_tool_result(block, &mut segments) {
-                                return ScanOutcome::Unscannable(REASON_CONTENT_UNREADABLE);
+                            if let Err(reason) = collect_tool_result(block, &mut segments) {
+                                return ScanOutcome::Unscannable(reason);
                             }
                         }
                         // A block type this scanner does not read — `image`,
@@ -394,33 +394,26 @@ pub const REASON_BODY_UNPARSEABLE: &str = "request body could not be parsed for 
 /// A `tool_result` block's `content` is either a string or an array of content
 /// blocks (typically `text`). Pull out every text span; ignore image/other.
 ///
-/// Returns whether the block was READABLE. `false` means the block carried a
-/// `content` (or an inner block) in a shape this function cannot walk, which
-/// under `block` policy must fail closed rather than be silently skipped —
-/// `out` may hold partial segments in that case and the caller discards them.
-fn collect_tool_result<'a>(block: &'a Value, out: &mut Vec<&'a str>) -> bool {
+/// `Err` carries the reason the block was unreadable: a `content` (or an inner
+/// block) in a shape this function cannot walk, which under `block` policy must
+/// fail closed rather than be silently skipped. `out` may hold partial segments
+/// in that case and the caller discards them.
+fn collect_tool_result<'a>(block: &'a Value, out: &mut Vec<&'a str>) -> Result<(), &'static str> {
     match block.get("content") {
-        None | Some(Value::Null) => true,
-        Some(Value::String(s)) => {
-            out.push(s);
-            true
-        }
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) => out.push(s),
         Some(Value::Array(inner)) => {
             for b in inner {
                 match b.get("type").and_then(Value::as_str) {
-                    Some("text") => match text_block_segment(b) {
-                        Ok(Some(t)) => out.push(t),
-                        Ok(None) => {}
-                        Err(_) => return false,
-                    },
+                    Some("text") => out.extend(text_block_segment(b)?),
                     Some(_) => {}
-                    None => return false,
+                    None => return Err(REASON_CONTENT_UNREADABLE),
                 }
             }
-            true
         }
-        Some(_) => false,
+        Some(_) => return Err(REASON_CONTENT_UNREADABLE),
     }
+    Ok(())
 }
 
 /// A compact, deduplicated `scanner:detection_type` summary for the structured
