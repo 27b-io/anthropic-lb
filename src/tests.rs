@@ -22442,6 +22442,14 @@ fn rejected_credential_shape_fingerprint_and_user_agent() {
         presented_credential(&hdrs(&[("authorization", "Basic dXNlcjpwdw==")])).0,
         "auth-other"
     );
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "bearer k")])).0,
+        "bearer"
+    );
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "Bearer")])).0,
+        "auth-other"
+    );
     // Both headers: x-api-key is the one compared first, so it names the shape.
     assert_eq!(
         presented_credential(&hdrs(&[("x-api-key", "k"), ("authorization", "bearer k")])).0,
@@ -22453,8 +22461,16 @@ fn rejected_credential_shape_fingerprint_and_user_agent() {
     assert_eq!(fp, "67baf0920d1c", "must match the README recipe");
     assert!(!key.contains(&fp), "fingerprint leaked a run of the key");
     assert_eq!(credential_fingerprint(None), "-");
+    // The README recipe hashes the bare key, so the Bearer scheme must be
+    // stripped: `presented_credential` hands back the key alone.
+    let bearer = hdrs(&[("authorization", format!("Bearer {key}").as_str())]);
+    assert_eq!(presented_credential(&bearer).1, Some(key.as_bytes()));
 
     assert_eq!(bounded_user_agent(&hdrs(&[])), "-");
+    assert_eq!(bounded_user_agent(&hdrs(&[("user-agent", "")])), "-");
+    let mut obs_text = hyper::HeaderMap::new();
+    obs_text.insert("user-agent", HeaderValue::from_bytes(b"agent\xff").unwrap());
+    assert_eq!(bounded_user_agent(&obs_text), "-", "not visible ASCII");
     assert_eq!(
         bounded_user_agent(&hdrs(&[("user-agent", "curl/8.5.0")])),
         "curl/8.5.0"

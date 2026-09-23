@@ -3343,8 +3343,9 @@ fn credential_fingerprint(presented: Option<&[u8]>) -> String {
 
 /// User-agent of a rejected request, clipped by `truncate_label` for the log
 /// line (LAB-4720). "-" when absent, empty, or not visible ASCII. No further
-/// sanitising: hyper's header parser admits only visible ASCII plus TAB, and
-/// the caller records it with `?` so it renders quoted and escaped.
+/// sanitising: `to_str` admits only visible ASCII plus TAB (hyper's parser
+/// also passes obs-text bytes 0x80-0xFF), and the caller records it with `?`
+/// so it renders quoted and escaped.
 fn bounded_user_agent(headers: &hyper::HeaderMap) -> String {
     headers
         .get("user-agent")
