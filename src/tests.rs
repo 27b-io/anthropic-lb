@@ -6286,6 +6286,60 @@ fn fast_mode_not_enabled_error_detection() {
     ));
 }
 
+/// MF-1: the matcher requires an exact match, not a substring — a message
+/// that merely CONTAINS the entitlement clause (trailing wording drift, or a
+/// client-echoed field name in an unrelated 400) must not match. Substring
+/// matching plus an unguarded caller let one crafted request walk and mark
+/// every reachable account.
+#[test]
+fn fast_mode_not_enabled_error_requires_exact_match() {
+    let superstring = serde_json::json!({
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": "Fast mode is not enabled for your organization. An organization admin must enable this feature. (extra upstream wording)"}
+    });
+    assert!(
+        !is_fast_mode_not_enabled_error(StatusCode::BAD_REQUEST, &superstring),
+        "a superstring of the entitlement message must not match — exact match only"
+    );
+}
+
+/// MF-1 integration regression: an entitlement-shaped 400 on a request that
+/// never asked for `speed: "fast"` must not be treated as a fast-mode
+/// rejection — no account mark, no rotation, the 400 forwards verbatim.
+/// Otherwise a client could craft such a 400 (e.g. an unrecognized top-level
+/// field literally named the entitlement message, which upstream may echo
+/// back) and walk every reachable account, starving all other tenants' fast
+/// traffic.
+#[tokio::test]
+async fn fast_mode_shaped_400_on_standard_request_is_not_marked_or_rotated() {
+    use std::sync::atomic::Ordering;
+    let (url, hits) = spawn_status_then_ok_upstream(usize::MAX, HEAD_400_FAST_MODE, b"{}").await;
+    let state = test_state_with(vec![mk_endpoint_at("only", "sk-ant-api-o", &url)]);
+    let addr = serve(build_router(state.clone())).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(STANDARD_BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a standard request must see the upstream 400 verbatim"
+    );
+    assert!(
+        state.fast_mode_disabled_endpoints().is_empty(),
+        "an entitlement-shaped 400 on a non-fast request must not mark the account"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "must not rotate/retry a non-fast request off an entitlement-shaped 400"
+    );
+}
+
 /// AC-3/AC-4: a marked endpoint leaves the pool for fast requests only —
 /// affinity or not — standard requests still see it, and an expired mark
 /// restores it without a restart.
@@ -6375,6 +6429,56 @@ fn pool_cannot_serve_unions_negative_caches() {
     assert!(!state.pool_cannot_serve("claude-sonnet-5", true));
 }
 
+/// MF-2/Cobel HIGH: an OpenAI-protocol endpoint never accrues a fast-mode
+/// mark (it has no org entitlement to reject) and its request translation
+/// drops `speed` entirely, so routing a fast request there would silently
+/// serve it at standard speed. It must never be a fast-request candidate;
+/// standard requests still see it.
+#[tokio::test]
+async fn fast_mode_excludes_openai_protocol_endpoints() {
+    let state = test_state_with(vec![
+        make_endpoint("anthropic-only", Protocol::Anthropic),
+        make_endpoint("openai-fallback", Protocol::OpenAI),
+    ]);
+    for _ in 0..8 {
+        assert_eq!(
+            state
+                .pick_endpoint_for_client(None, "claude-opus-5", &[], "", true)
+                .await,
+            Some(0),
+            "a fast request must never route to an OpenAI-protocol endpoint"
+        );
+    }
+    assert_eq!(
+        state.routing_candidates("claude-opus-5", &[]).await.len(),
+        2,
+        "standard requests must still see the OpenAI-protocol endpoint"
+    );
+}
+
+/// MF-2: an Anthropic account fast-disabled plus an OpenAI fallback must be
+/// treated as pool-exhausted for a fast request (truthful error) — the
+/// OpenAI endpoint can't honor `speed:"fast"` and must not count as
+/// "eligible" capacity that masks the exhaustion (that mask is exactly what
+/// let a fast request silently downgrade through the fallback instead of
+/// getting the truthful rejection).
+#[test]
+fn pool_cannot_serve_excludes_openai_protocol_for_fast_requests() {
+    let state = test_state_with(vec![
+        mk_endpoint("anthropic-only", "sk-ant-api-a"),
+        make_endpoint("openai-fallback", Protocol::OpenAI),
+    ]);
+    state.note_fast_mode_disabled("anthropic-only", 0);
+    assert!(
+        state.pool_cannot_serve("claude-opus-5", true),
+        "an OpenAI fallback must not mask a fully fast-disabled Anthropic pool"
+    );
+    assert!(
+        !state.pool_cannot_serve("claude-opus-5", false),
+        "the same pool can serve a standard request"
+    );
+}
+
 /// AC-2 native path: the first entitlement 400 rotates within the request
 /// (client sees the 200 from the entitled account), the NEXT fast request
 /// skips the non-entitled account outright, and a standard request on the
@@ -6455,8 +6559,10 @@ async fn fast_mode_disabled_rotates_and_next_fast_request_skips_account() {
     );
 
     // A standard request is unaffected by the mark: priority sends it to
-    // `reject` — the hit count, not the status, is the assertion (the mock
-    // 400s every body, so the matcher rotates this one too).
+    // `reject`, same as before. Post-MF-1 the entitlement-shaped 400 is
+    // gated on `is_fast_mode`, so a standard request that draws it does NOT
+    // rotate — it forwards the 400 verbatim (matches
+    // `fast_mode_shaped_400_on_standard_request_is_not_marked_or_rotated`).
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
         .header("content-type", "application/json")
@@ -6469,7 +6575,11 @@ async fn fast_mode_disabled_rotates_and_next_fast_request_skips_account() {
         2,
         "a standard request must still route to the fast-mode-disabled account"
     );
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a standard request must see the entitlement-shaped 400 verbatim, not be rotated off it"
+    );
 }
 
 /// Panel finding: a rejection on ONE account while the rest of the pool is
@@ -6502,6 +6612,43 @@ async fn fast_mode_rejection_plus_rate_limited_pool_stays_retryable() {
         resp.status(),
         reqwest::StatusCode::TOO_MANY_REQUESTS,
         "one non-entitled account plus a rate-limited rest must stay retryable, not 400"
+    );
+}
+
+/// Model-shaped twin of `fast_mode_rejection_plus_rate_limited_pool_stays_retryable`
+/// (MF-3): the same `pool_cannot_serve` gate governs the pre-existing LAB-941
+/// model-unsupported rejection, not just the new fast-mode one. A rejection on
+/// ONE account while the rest of the pool is merely rate-limited (never
+/// attempted, so never negative-cached) must stay retryable, not surface the
+/// stashed 404 — a deliberate generalisation of LAB-941, not a regression.
+#[tokio::test]
+async fn model_unsupported_rejection_plus_rate_limited_pool_stays_retryable() {
+    let (reject_url, _hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
+    let state = test_state_with(vec![
+        mk_endpoint_at("reject", "sk-ant-api-r", &reject_url),
+        mk_endpoint("limited", "sk-ant-api-l"),
+    ]);
+    state.endpoints[1]
+        .rate_info
+        .write()
+        .await
+        .hard_limited_until = Some(Instant::now() + Duration::from_secs(60));
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"claude-nope-1","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "one model-unsupported account plus a rate-limited rest must stay retryable, not 404"
     );
 }
 

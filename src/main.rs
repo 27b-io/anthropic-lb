@@ -4099,6 +4099,15 @@ impl AppState {
             if !ep.serves_model(model) {
                 continue;
             }
+            // An OpenAI-protocol endpoint can never honor speed:"fast" (its
+            // translation drops the field) and never accrues a fast-mode
+            // mark, so it must not count as "eligible" for a fast request —
+            // otherwise a pool with only OpenAI capacity left would look
+            // servable and the exhaustion reply would never fire (LAB-2687
+            // MF-2/Cobel HIGH).
+            if fast && ep.protocol == Protocol::OpenAI {
+                continue;
+            }
             eligible += 1;
             if !excluded.contains(&i) {
                 return false;
@@ -4992,6 +5001,18 @@ impl AppState {
                     endpoint = self.endpoints[c.endpoint].name,
                     model,
                     "pick: skipping, fast mode disabled on endpoint"
+                );
+                return false;
+            }
+            // An OpenAI-protocol endpoint never carries a fast-mode mark (it
+            // has no org entitlement to reject) and its request translation
+            // drops `speed` entirely — routing a fast request there would
+            // silently serve it at standard speed (LAB-2687 MF-2/Cobel HIGH).
+            if fast && self.endpoints[c.endpoint].protocol == Protocol::OpenAI {
+                trace!(
+                    endpoint = self.endpoints[c.endpoint].name,
+                    model,
+                    "pick: skipping, openai-protocol endpoint can't honor speed:\"fast\""
                 );
                 return false;
             }
@@ -7971,17 +7992,21 @@ const FAST_MODE_NOT_ENABLED_MSG: &str =
 /// True when an upstream 400 says this ACCOUNT's org has fast mode disabled
 /// (LAB-2687): 400 `{"type":"error","error":{"type":"invalid_request_error",
 /// "message":"Fast mode is not enabled for your organization. ..."}}`.
-/// Anchored on the org clause so a hypothetical per-model "Fast mode is not
-/// enabled for <model>" 400 can't mark an entitled account. The proxy-induced
-/// `speed: Extra inputs are not permitted` 400 must NOT match either —
-/// rotating cannot fix a request the proxy itself broke.
+/// Exact-matched against `FAST_MODE_NOT_ENABLED_MSG`, not a substring: the
+/// message is upstream text the client does not control, but a client can
+/// still provoke an unrelated 400 whose echoed content happens to contain
+/// this clause (an unrecognized top-level field literally named the phrase),
+/// so a `.contains` match plus an unguarded caller could walk and mark every
+/// reachable account on a single crafted request. The caller additionally
+/// gates this on `is_fast_mode` — a fast-mode-shaped 400 on a request that
+/// never asked for fast mode is never grounds to mark the account.
 fn is_fast_mode_not_enabled_error(status: StatusCode, body: &serde_json::Value) -> bool {
     status == StatusCode::BAD_REQUEST
         && body.pointer("/error/type").and_then(|v| v.as_str()) == Some("invalid_request_error")
         && body
             .pointer("/error/message")
             .and_then(|v| v.as_str())
-            .is_some_and(|m| m.contains("Fast mode is not enabled for your organization"))
+            .is_some_and(|m| m == FAST_MODE_NOT_ENABLED_MSG)
 }
 
 /// Surface the real cause of a `reqwest::Error`. The Display form only shows
@@ -8946,7 +8971,7 @@ async fn forward_anthropic(
             let rejected = if is_model_unsupported_error(status, &parsed) {
                 state.note_model_unsupported(endpoint_name, endpoint_idx, model);
                 true
-            } else if is_fast_mode_not_enabled_error(status, &parsed) {
+            } else if is_fast_mode && is_fast_mode_not_enabled_error(status, &parsed) {
                 state.note_fast_mode_disabled(endpoint_name, endpoint_idx);
                 true
             } else {
@@ -9640,6 +9665,19 @@ async fn proxy_handler(
     // permanently-failing request (LAB-941, LAB-2687). Anything short of that
     // — one rejection plus rate limits on the rest — is a rate-limited pool
     // and keeps the retryable status.
+    //
+    // Deliberate LAB-941 behaviour change (MF-3, 2026-09-23): pre-LAB-2687,
+    // a stashed model-unsupported rejection returned unconditionally here
+    // whenever the final round saw no 529/transient, regardless of whether
+    // the rest of the pool was ever attempted. That is no longer true — a
+    // single rejection alongside accounts that are merely rate-limited
+    // (never negative-cached because never tried) now stays retryable
+    // (429) instead of surfacing the stashed 4xx, exactly as it already did
+    // for fast-mode-disabled (`fast_mode_rejection_plus_rate_limited_pool_stays_retryable`).
+    // On a large headroom-routed pool "some account is cooling" is the
+    // common state, so this generalisation is intentional, not a
+    // regression: it's covered for the model-unsupported case by
+    // `model_unsupported_rejection_plus_rate_limited_pool_stays_retryable`.
     if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, is_fast_mode) {
         if let Some(resp) = rejected_resp {
             return resp;
@@ -14405,9 +14443,9 @@ async fn openai_chat_handler(
             }
         }
 
-        // Same rejection-exhaustion rule as `proxy_handler` (LAB-941), in the
-        // OpenAI error shape this handler's clients parse. Never `fast`: the
-        // OpenAI→Anthropic translation carries no `speed`.
+        // Same rejection-exhaustion rule as `proxy_handler` (LAB-941, deliberate
+        // MF-3 generalisation). Never `fast`: the OpenAI→Anthropic translation
+        // carries no `speed`.
         if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, false) {
             if let Some(resp) = rejected_resp {
                 return resp;
