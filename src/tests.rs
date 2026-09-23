@@ -23613,3 +23613,56 @@ async fn entitlement_400_resends_on_openai_compat_path() {
     );
     assert_eq!(state.entitlement_400.lock().unwrap().get("spent"), Some(&1));
 }
+
+/// AC-2 "the second response is what the caller sees": once the re-send gets
+/// an answer, the first account's entitlement 400 is no longer the terminal
+/// cause. A model rejection surfaces as itself, and a rate-limited re-send
+/// target yields the retryable pool-exhaustion 429 — not a non-retryable
+/// "add credits" for a pool that is merely cooling.
+#[tokio::test]
+async fn resend_outcome_supersedes_stashed_entitlement_400() {
+    use std::sync::atomic::Ordering;
+    for (kind, head, want) in [
+        (
+            "model-unsupported 404",
+            HEAD_404_MODEL,
+            reqwest::StatusCode::NOT_FOUND,
+        ),
+        (
+            "rate-limited 429",
+            HEAD_429_RETRY_AFTER_7,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+        ),
+    ] {
+        let (url, target_hits) = spawn_status_then_ok_upstream(usize::MAX, head, b"{}").await;
+        let (_state, addr, spent_hits) = spent_then(ENTITLEMENT_400_BODY, &url).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(MESSAGES_BODY)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, want, "{kind}: body {body}");
+        assert!(
+            !body.contains("out of extra usage"),
+            "{kind}: the stashed entitlement 400 must not win: {body}"
+        );
+        if want == reqwest::StatusCode::NOT_FOUND {
+            assert!(
+                body.contains("not_found_error") && body.contains("claude-nope-1"),
+                "{kind}: the re-send target's own error must reach the caller: {body}"
+            );
+        }
+        assert_eq!(
+            (
+                spent_hits.load(Ordering::SeqCst),
+                target_hits.load(Ordering::SeqCst)
+            ),
+            (1, 1),
+            "{kind}"
+        );
+    }
+}

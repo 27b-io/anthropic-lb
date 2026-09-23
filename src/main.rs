@@ -8173,8 +8173,17 @@ fn apply_round_outcome(
     saw_529: &mut bool,
     saw_transient: &mut bool,
     model_unsupported_resp: &mut Option<Response>,
-    entitlement_resp: &mut Option<(EndpointIdx, Response)>,
+    entitlement_resp: &mut Option<(EndpointIdx, Option<Response>)>,
 ) -> RetryStep {
+    // Any later outcome supersedes a stashed entitlement 400 as the caller's
+    // answer (LAB-4729): the re-send's 404, or the 429 of a merely rate-limited
+    // pool, is the truer terminal cause. The endpoint stays, so the one-shot is
+    // still spent and the refuser still skipped.
+    if !matches!(outcome, ForwardOutcome::RetryEntitlement(_)) {
+        if let Some((_, stashed)) = entitlement_resp.as_mut() {
+            *stashed = None;
+        }
+    }
     match outcome {
         ForwardOutcome::Done(resp) => RetryStep::Return(*resp),
         // Model rejected by this endpoint: rotate immediately (another
@@ -8195,7 +8204,7 @@ fn apply_round_outcome(
             if entitlement_resp.is_some() {
                 return RetryStep::Return(*resp);
             }
-            *entitlement_resp = Some((picked_idx, *resp));
+            *entitlement_resp = Some((picked_idx, Some(*resp)));
             skip.push(picked_idx);
             RetryStep::NextAttempt
         }
@@ -9456,7 +9465,7 @@ async fn proxy_handler(
     let mut model_unsupported_resp: Option<Response> = None;
     // First entitlement 400 (LAB-4729): its presence spends the one re-send;
     // returned if nothing else can serve the request.
-    let mut entitlement_resp: Option<(EndpointIdx, Response)> = None;
+    let mut entitlement_resp: Option<(EndpointIdx, Option<Response>)> = None;
     // OpenAI-shape body, built lazily on the first OpenAI-endpoint attempt
     // and reused across rotations/retries (LAB-716). Lazy so requests served
     // entirely by Anthropic endpoints — the common case — never pay for the
@@ -9609,9 +9618,10 @@ async fn proxy_handler(
     // status; the negative cache already routes follow-up requests away from
     // the rejecting endpoints (LAB-941). An entitlement 400 whose one re-send
     // found nothing else to try is returned the same way (LAB-4729): the
-    // caller sees why, not a synthetic 429.
+    // caller sees why, not a synthetic 429. Present only if no later attempt
+    // answered — see `apply_round_outcome`.
     if !last_saw_529 && !last_saw_transient {
-        if let Some(resp) = entitlement_resp.map(|(_, r)| r).or(model_unsupported_resp) {
+        if let Some(resp) = entitlement_resp.and_then(|(_, r)| r).or(model_unsupported_resp) {
             return resp;
         }
         // Warm-cache path: every eligible endpoint was filtered by the
@@ -14281,7 +14291,7 @@ async fn openai_chat_handler(
         // returned verbatim if the pool exhausts on nothing but rejections.
         let mut model_unsupported_resp: Option<Response> = None;
         // One-shot entitlement re-send, as in `proxy_handler` (LAB-4729).
-        let mut entitlement_resp: Option<(EndpointIdx, Response)> = None;
+        let mut entitlement_resp: Option<(EndpointIdx, Option<Response>)> = None;
         for retry_round in 0..=MAX_529_RETRIES {
             if retry_round > 0 {
                 let delay = round_backoff_delay(retry_round, last_saw_529);
@@ -14387,7 +14397,10 @@ async fn openai_chat_handler(
         // Same model-rejection exhaustion rule as `proxy_handler` (LAB-941),
         // in the OpenAI error shape this handler's clients parse.
         if !last_saw_529 && !last_saw_transient {
-            if let Some(resp) = entitlement_resp.map(|(_, r)| r).or(model_unsupported_resp) {
+            if let Some(resp) = entitlement_resp
+                .and_then(|(_, r)| r)
+                .or(model_unsupported_resp)
+            {
                 return resp;
             }
             if state.model_unsupported_everywhere(&model) {
