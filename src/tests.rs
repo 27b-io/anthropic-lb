@@ -433,6 +433,7 @@ fn test_state_base() -> AppState {
         prompt_too_long: Mutex::new(HashMap::new()),
         fast_mode_429: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
+        client_rejections: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache: None,
     }
@@ -1318,6 +1319,183 @@ async fn affinity_override_one_exhausted() {
     .await;
 }
 
+// ── LAB-3295: status-floor-bound migrations log at INFO with reason="floored" ──
+
+/// Pin ONE sticky key that hashes to `sticky_idx` (via `keys_hashing_to`, the
+/// same idiom the GH#156 counter tests use), route it once, and return the
+/// per-reason affinity-migration counter (`[loaded, spent, floored]`) plus the
+/// capture buffer's log lines mentioning `marker`. Deterministic: the key lands
+/// on the sticky account, so the override fires exactly once. The counter is
+/// per-`state`; the log buffer is process-global, so we filter by the unique
+/// `marker` the key carries verbatim into the override line's `affinity=` field.
+async fn migrate_one_sticky(
+    state: &AppState,
+    sticky_idx: usize,
+    marker: &str,
+) -> ([u64; 3], Vec<String>) {
+    let buf = log_capture_buf();
+    let key = keys_hashing_to(state, sticky_idx, 1, 50_000, marker)
+        .await
+        .pop()
+        .expect("a key hashing to the sticky account");
+    let picked = state
+        .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
+        .await
+        .unwrap();
+    assert_ne!(
+        picked, sticky_idx,
+        "the override must migrate the session off the sticky account"
+    );
+    let counts = [
+        state.affinity_migrations[AffinityBind::Loaded as usize].load(Ordering::Relaxed),
+        state.affinity_migrations[AffinityBind::Spent as usize].load(Ordering::Relaxed),
+        state.affinity_migrations[AffinityBind::Floored as usize].load(Ordering::Relaxed),
+    ];
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let lines = output
+        .lines()
+        .filter(|l| l.contains(marker))
+        .map(str::to_string)
+        .collect();
+    (counts, lines)
+}
+
+/// Set a status floor on account `idx`'s general `seven_day` claim (the claim
+/// that gates opus), so its gate is bound by an Anthropic status flag rather
+/// than raw utilisation — the LAB-3295 floor-bound case.
+async fn set_7d_status(state: &AppState, idx: usize, status: &str) {
+    let mut info = state.endpoints[idx].rate_info.write().await;
+    info.claims_7d
+        .get_mut("seven_day")
+        .expect("set_account_utilization populates seven_day")
+        .status = Some(status.to_string());
+}
+
+/// AC-5(a), StickyWeightedV2: the sticky account is fresh on raw utilisation
+/// (5h/7d both 0.10) but Anthropic has flagged its weekly window
+/// (`allowed_warning` → 0.80 gate floor). The override still fires — routing is
+/// unchanged — but the migration is a routine status-floor move, so it logs at
+/// INFO with `reason="floored"` and increments only the floored counter. No
+/// `affinity broken` WARN is emitted.
+#[tokio::test]
+async fn affinity_floor_bound_migration_logs_info_v2() {
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("sticky", "sk-ant-api-a"),
+            mk_endpoint("fresh", "sk-ant-api-b"),
+        ],
+        RoutingStrategy::StickyWeightedV2,
+    );
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_7d_status(&state, 0, "allowed_warning").await;
+
+    let marker = "lab3295-floored-v2";
+    let (counts, lines) = migrate_one_sticky(&state, 0, marker).await;
+
+    assert_eq!(
+        counts,
+        [0, 0, 1],
+        "a status-floor migration counts only as floored, got [loaded,spent,floored]={counts:?}"
+    );
+    assert!(
+        !lines.is_empty(),
+        "expected at least one override log line for marker {marker}"
+    );
+    for l in &lines {
+        assert!(
+            l.contains(" INFO ") && !l.contains(" WARN "),
+            "floor-bound migration must log at INFO, not WARN: {l}"
+        );
+        assert!(
+            l.contains("reason=\"floored\"") && l.contains("affinity migrated"),
+            "line must carry reason=\"floored\" and the routine message: {l}"
+        );
+        assert!(
+            !l.contains("affinity broken"),
+            "the `affinity broken` WARN text must not appear for a floor-bound migration: {l}"
+        );
+    }
+}
+
+/// AC-5(a), legacy DynamicCapacityV1: same floor-bound scenario at the other
+/// override site — it too logs at INFO with `reason="floored"`.
+#[tokio::test]
+async fn affinity_floor_bound_migration_logs_info_legacy() {
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("sticky", "sk-ant-api-a"),
+            mk_endpoint("fresh", "sk-ant-api-b"),
+        ],
+        RoutingStrategy::DynamicCapacityV1,
+    );
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.10, 0.10, now + 10000, now + 300000).await;
+    set_7d_status(&state, 0, "allowed_warning").await;
+
+    let marker = "lab3295-floored-legacy";
+    let (counts, lines) = migrate_one_sticky(&state, 0, marker).await;
+
+    assert_eq!(
+        counts,
+        [0, 0, 1],
+        "legacy site: only floored migrations expected, got {counts:?}"
+    );
+    assert!(
+        !lines.is_empty(),
+        "expected override log lines for {marker}"
+    );
+    for l in &lines {
+        assert!(
+            l.contains(" INFO ")
+                && l.contains("reason=\"floored\"")
+                && !l.contains("affinity broken"),
+            "legacy floor-bound migration must log INFO/floored, not the WARN: {l}"
+        );
+    }
+}
+
+/// AC-5(b): the sticky account is genuinely load-bound — raw 5h utilisation
+/// 0.80, status `allowed` (no floor). The migration stays a WARN with
+/// `reason="loaded"` and the unchanged `affinity broken` message.
+#[tokio::test]
+async fn affinity_raw_load_migration_stays_warn() {
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("sticky", "sk-ant-api-a"),
+            mk_endpoint("fresh", "sk-ant-api-b"),
+        ],
+        RoutingStrategy::StickyWeightedV2,
+    );
+    let now = AppState::now_epoch();
+    // Raw 5h load of 0.80 → gate 0.80 with no status floor involved.
+    set_account_utilization(&state, 0, 0.80, 0.10, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.10, 0.10, now + 10000, now + 300000).await;
+
+    let marker = "lab3295-loaded";
+    let (counts, lines) = migrate_one_sticky(&state, 0, marker).await;
+
+    assert_eq!(
+        counts,
+        [1, 0, 0],
+        "raw-load migration counts only as loaded, never floored, got {counts:?}"
+    );
+    assert!(
+        !lines.is_empty(),
+        "expected override log lines for {marker}"
+    );
+    for l in &lines {
+        assert!(
+            l.contains(" WARN ")
+                && l.contains("reason=\"loaded\"")
+                && l.contains("affinity broken"),
+            "raw-load migration must stay a WARN with the unchanged message: {l}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn affinity_override_both_rough() {
     // Scenario: both accounts in bad shape — affinity preserved
@@ -1682,9 +1860,10 @@ async fn affinity_override_spent_discounts_near_weekly_reset() {
         idx, 1,
         "session must stay on the expiring account it hashed to"
     );
-    let [loaded, spent] = &state.affinity_migrations;
+    let [loaded, spent, floored] = &state.affinity_migrations;
     assert_eq!(spent.load(Ordering::Relaxed), 0, "spent counter");
     assert_eq!(loaded.load(Ordering::Relaxed), 0, "loaded counter");
+    assert_eq!(floored.load(Ordering::Relaxed), 0, "floored counter");
 }
 
 #[tokio::test]
@@ -1712,9 +1891,10 @@ async fn affinity_migration_counter_names_the_binding_window() {
         .await
         .unwrap();
     assert_eq!(idx, 0, "session must leave the spent account");
-    let [loaded, spent] = &state.affinity_migrations;
+    let [loaded, spent, floored] = &state.affinity_migrations;
     assert_eq!(spent.load(Ordering::Relaxed), 1, "spent counter");
     assert_eq!(loaded.load(Ordering::Relaxed), 0, "loaded counter");
+    assert_eq!(floored.load(Ordering::Relaxed), 0, "floored counter");
 
     // reason="loaded": identical 7d, the sticky account's 5h gate is the limit.
     let state = test_state_with_strategy(
@@ -1735,9 +1915,76 @@ async fn affinity_migration_counter_names_the_binding_window() {
         .await
         .unwrap();
     assert_eq!(idx, 0, "session must leave the busy account");
-    let [loaded, spent] = &state.affinity_migrations;
+    let [loaded, spent, floored] = &state.affinity_migrations;
     assert_eq!(loaded.load(Ordering::Relaxed), 1, "loaded counter");
     assert_eq!(spent.load(Ordering::Relaxed), 0, "spent counter");
+    assert_eq!(floored.load(Ordering::Relaxed), 0, "floored counter");
+}
+
+/// Regression (LAB-4719): a `reason="spent"` migration fled an account at
+/// headroom 0.040 and landed on its equally spent twin (headroom 0.040,
+/// util_7d 0.96), which answered with Anthropic's entitlement 400, while the
+/// same log line named a healthy `best_account` (util_7d 0.21 → headroom 0.79;
+/// 0.040 / 0.79 = the logged `ratio=0.051`). The twin got picked because a
+/// 7d-spent account is still gate-healthy and its expiring quota earns it a
+/// large waste-risk bucket. A replacement the override would itself flee must
+/// never be chosen.
+#[tokio::test]
+async fn affinity_spent_migration_skips_equally_spent_replacement() {
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("spent", "sk-ant-api-a"),
+            mk_endpoint("spent-twin", "sk-ant-api-b"),
+            mk_endpoint("healthy", "sk-ant-api-c"),
+        ],
+        RoutingStrategy::StickyWeightedV2,
+    );
+    let now = AppState::now_epoch();
+    // Both spent accounts reset in 20h: outside the near-reset ramp (so the 4%
+    // left reads as spent) yet close enough for a sizeable bucket.
+    set_account_utilization(&state, 0, 0.00, 0.96, now + 10000, now + 20 * 3600).await;
+    set_account_utilization(&state, 1, 0.00, 0.96, now + 10000, now + 20 * 3600).await;
+    set_account_utilization(&state, 2, 0.12, 0.21, now + 10000, now + 5 * 86400).await;
+
+    let candidates = state.routing_candidates("claude-opus-4-6", &[]).await;
+    let headroom: Vec<(f64, &str)> = candidates
+        .iter()
+        .map(|c| {
+            let (h, bind) = affinity_headroom(c);
+            (h, bind.as_str())
+        })
+        .collect();
+    for (i, want) in [0.04, 0.04, 0.79].into_iter().enumerate() {
+        assert!(
+            (headroom[i].0 - want).abs() < 1e-9,
+            "fixture must reproduce the logged headroom triple: {headroom:?}"
+        );
+    }
+    assert_eq!(
+        headroom[0].1, "spent",
+        "the sticky account must bind on its week"
+    );
+
+    let sessions = keys_hashing_to(&state, 0, 40, 20000, "lab4719-session").await;
+    assert_eq!(
+        sessions.len(),
+        40,
+        "need sessions sticky on the spent account"
+    );
+    for s in &sessions {
+        let idx = state
+            .pick_endpoint(Some(s), "claude-opus-4-6", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            idx, 2,
+            "session {s} sticky on the spent account must migrate to the healthy one, not its equally spent twin"
+        );
+    }
+    let [loaded, spent, floored] = &state.affinity_migrations;
+    assert_eq!(spent.load(Ordering::Relaxed), 40, "spent counter");
+    assert_eq!(loaded.load(Ordering::Relaxed), 0, "loaded counter");
+    assert_eq!(floored.load(Ordering::Relaxed), 0, "floored counter");
 }
 
 #[test]
@@ -7833,6 +8080,156 @@ async fn budget_check_within_limit() {
     assert!(state.check_budget("unknown").await.is_ok());
 }
 
+// ── Unit: pre-request-gate rejection counter (LAB-2551) ────────
+
+/// A budget-exhausted request must both 429 and increment the rejection
+/// counter under its (client, reason) key — the counter is the only
+/// machine-readable record of a gate rejection (the warn! log is not
+/// chartable).
+#[tokio::test]
+async fn gate_rejection_counted_by_client_and_reason() {
+    let mut budgets = HashMap::new();
+    budgets.insert("client-a".to_string(), 100u64);
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        client_budgets: budgets,
+        ..test_state_base()
+    });
+    state.record_budget_usage("client-a", 200).await;
+
+    for expected in [1u64, 2] {
+        let resp = state
+            .pre_request_gate("client-a", "claude-sonnet-4-6")
+            .await
+            .expect_err("exhausted budget must reject");
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let counts = state.client_rejections.lock().unwrap();
+        assert_eq!(
+            counts.get(&("client-a".to_string(), "budget")),
+            Some(&expected),
+            "each rejection must increment the (client, budget) key"
+        );
+    }
+}
+
+/// Past the cap, rejections for NEW clients must lump into the single global
+/// `_other` key (keeping the reason label) — a per-client overflow key would
+/// be unbounded on the client axis under legacy header auth (CWE-770, the
+/// LAB-2332 lesson). Existing keys keep counting past the cap.
+#[test]
+fn rejection_counter_overflow_lumps_into_global_other() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    // The cap bounds distinct CLIENTS, not (client, reason) entries: 32
+    // clients on 2 reasons each is 64 entries but only 32 slots — a new
+    // client must still be admitted with its own key.
+    for i in 0..32 {
+        state.note_client_rejection(&format!("client-{i}"), "budget");
+        state.note_client_rejection(&format!("client-{i}"), "utilization");
+    }
+    state.note_client_rejection("client-32", "budget");
+    {
+        let counts = state.client_rejections.lock().unwrap();
+        assert_eq!(
+            counts.get(&("client-32".to_string(), "budget")),
+            Some(&1),
+            "entry count must not gate admission — only distinct clients do"
+        );
+    }
+    // Fill up to the distinct-client cap.
+    for i in 33..MAX_CLIENT_REJECTION_LABELS {
+        state.note_client_rejection(&format!("client-{i}"), "budget");
+    }
+    // Over the cap: new clients bucket into ("_other", reason)…
+    state.note_client_rejection("fresh-1", "budget");
+    state.note_client_rejection("fresh-2", "brake");
+    // …while an existing key still counts…
+    state.note_client_rejection("client-0", "budget");
+    // …and a TRACKED client's first hit on a NEW reason keeps its own key —
+    // a brake event stamps every active client at once, so crossing the cap
+    // mid-incident must not split a tracked client's attribution.
+    state.note_client_rejection("client-0", "brake");
+
+    let counts = state.client_rejections.lock().unwrap();
+    assert_eq!(counts.get(&("_other".to_string(), "budget")), Some(&1));
+    assert_eq!(counts.get(&("_other".to_string(), "brake")), Some(&1));
+    assert_eq!(counts.get(&("client-0".to_string(), "budget")), Some(&2));
+    assert_eq!(counts.get(&("client-0".to_string(), "brake")), Some(&1));
+    assert!(
+        counts.len() <= 3 * (MAX_CLIENT_REJECTION_LABELS + 1),
+        "map must stay hard-bounded at reasons × (tracked clients + _other)"
+    );
+}
+
+/// The client id is caller-controlled under legacy header auth: an oversized
+/// value must be truncated BEFORE becoming a map key, or it is retained for
+/// the process lifetime and re-serialized on every /metrics scrape.
+#[test]
+fn rejection_counter_truncates_client_label() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let huge = "x".repeat(4096);
+    state.note_client_rejection(&huge, "brake");
+    let counts = state.client_rejections.lock().unwrap();
+    let (client, _) = counts.keys().next().expect("one entry recorded");
+    assert!(
+        client.chars().count() <= MAX_LABEL_CHARS + 1,
+        "client label must be truncated (got {} chars)",
+        client.chars().count()
+    );
+}
+
+/// End to end: a budget-429 through the router must surface as
+/// `anthropic_client_rejections_total{client,reason}` on /metrics, and the
+/// family header must be present even before that (discoverability at zero).
+#[tokio::test]
+async fn metrics_expose_client_rejections() {
+    let mut budgets = HashMap::new();
+    budgets.insert("client-a".to_string(), 100u64);
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        client_budgets: budgets,
+        ..test_state_base()
+    });
+    state.record_budget_usage("client-a", 200).await;
+    let addr = serve(build_router(state)).await;
+    let c = reqwest::Client::new();
+
+    let m = c
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        m.contains("# TYPE anthropic_client_rejections_total counter"),
+        "family header must be exported before any rejection:\n{m}"
+    );
+
+    let resp = c
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-client-id", "client-a")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+    let m = c
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        m.contains(r#"anthropic_client_rejections_total{client="client-a",reason="budget"} 1"#),
+        "budget 429 must increment the labelled counter:\n{m}"
+    );
+}
+
 // ── Integration: 5xx retry ─────────────────────────────────────
 
 #[tokio::test]
@@ -9056,6 +9453,76 @@ fn routing_weight_no_data_uses_defaults() {
     assert_eq!(rw.gate_5h, 0.5);
     assert_eq!(rw.source, "headroom_only");
     assert!(rw.weight > 0.0);
+}
+
+/// LAB-4441: the gate published on `/metrics` must equal the gate the router
+/// uses for the same `RateLimitInfo`. The metrics path once lacked the overage
+/// branch and published gate 1.0 / weight 0 for accounts the router was
+/// actively serving through paid overage. (c) guards the non-overage path.
+#[test]
+fn metrics_gate_matches_routing_gate() {
+    let now = 1_000_000u64;
+    let seven_day = |status: &str| {
+        HashMap::from([(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: Some(0.60),
+                reset: Some(now + 302400),
+                status: Some(status.to_string()),
+                last_seen: now,
+            },
+        )])
+    };
+    // Subscription windows exhausted (both rejected); overage carrying load.
+    let overage = |util: f64, reset: u64| RateLimitInfo {
+        utilization_5h: Some(1.0),
+        reset_5h: Some(now + 7200),
+        status_5h: Some("rejected".to_string()),
+        claims_7d: seven_day("rejected"),
+        overage_in_use: true,
+        overage_status: Some("allowed".to_string()),
+        overage_utilization: Some(util),
+        overage_reset: Some(reset),
+        ..Default::default()
+    };
+    let half_ramp = now + (NEAR_RESET_OVERAGE_SECS / 2.0) as u64;
+    let cases = [
+        (
+            "(a) overage, rejected 7d",
+            overage(0.30, now + 86_400),
+            0.30,
+        ),
+        (
+            "(b) overage, near-reset ramp",
+            overage(0.80, half_ramp),
+            0.40,
+        ),
+        (
+            "(c) overage inactive",
+            RateLimitInfo {
+                utilization_5h: Some(0.40),
+                reset_5h: Some(now + 7200),
+                status_5h: Some("allowed".to_string()),
+                claims_7d: seven_day("allowed_warning"),
+                ..Default::default()
+            },
+            WARNING_UTIL_FLOOR,
+        ),
+    ];
+    for (name, info, want) in cases {
+        let rw = compute_routing_weight(&info, "claude-sonnet-4-6", now, false).expect(name);
+        let (gate, weight) = metrics_gate_weight(&info, now, Instant::now()).expect(name);
+        assert_eq!(gate, rw.gate, "{name}: metrics gate != routing gate");
+        assert!(
+            (gate - want).abs() < 1e-9,
+            "{name}: gate {gate}, want {want}"
+        );
+        assert_eq!(
+            weight, rw.weight,
+            "{name}: metrics weight != routing weight"
+        );
+        assert!(weight > 0.0, "{name}: servable account published weight 0");
+    }
 }
 
 // ── classify_hard_limit_sync tests ────────────────────────────
@@ -14205,6 +14672,79 @@ async fn metrics_status_gate_and_data_age() {
     assert!(
         !body.contains("anthropic_account_data_age_seconds{account=\"acct-b\""),
         "acct-b should have no data_age_seconds:\n{body}"
+    );
+}
+
+/// LAB-4441 AC-1/AC-3: an account serving via overage with its 7d claim
+/// rejected publishes the overage gate (not 1.0), a non-zero routing weight,
+/// and the overage window's status and reset.
+#[tokio::test]
+async fn metrics_overage_account_gate_status_and_reset() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = test_app(&mock_url, None);
+    let now_epoch = AppState::now_epoch();
+
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.utilization_5h = Some(1.0);
+        info.reset_5h = Some(now_epoch + 7200);
+        info.status_5h = Some("rejected".to_string());
+        info.claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: Some(1.0),
+                reset: Some(now_epoch + 302400),
+                status: Some("rejected".to_string()),
+                ..Default::default()
+            },
+        );
+        info.overage_in_use = true;
+        info.overage_status = Some("allowed_warning".to_string());
+        info.overage_utilization = Some(0.30);
+        info.overage_reset = Some(now_epoch + 86_400);
+    }
+    state.refresh_metrics_weights().await;
+
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{}/metrics", addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let value = |prefix: &str| -> f64 {
+        body.lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix}:\n{body}"))
+            .split_whitespace()
+            .last()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+
+    // allowed_warning floor (0.80) over raw overage util 0.30.
+    let gate = value("anthropic_account_effective_gate{account=\"acct-a\"}");
+    assert_eq!(
+        gate, WARNING_UTIL_FLOOR,
+        "overage gate, not the rejected 1.0"
+    );
+    assert!(value("anthropic_account_routing_weight{account=\"acct-a\"}") > 0.0);
+    assert_eq!(
+        value("anthropic_account_rate_limit_status{account=\"acct-a\",window=\"overage\"}"),
+        1.0
+    );
+    let reset = value("anthropic_account_reset_seconds{account=\"acct-a\",window=\"overage\"}");
+    assert!(
+        (86_340.0..=86_400.0).contains(&reset),
+        "overage reset ~86400, got {reset}"
+    );
+    // Not in overage → no overage series at all.
+    assert!(
+        !body.contains("account=\"acct-b\",window=\"overage\""),
+        "acct-b must emit no overage series:\n{body}"
     );
 }
 
@@ -20805,10 +21345,12 @@ fn start_coordination_redis_rejects_numeric_password_prefix_mis_route() {
 // so the redis→fred migration has a baseline to rewrite against.
 //
 // Opt-in by design: set `ALB_TEST_REDIS_URL` (plain `redis://host:port`,
-// no db suffix, no auth) to run them. When unset, every test prints a SKIP
-// notice and returns — never a silent pass against nothing. When the env
-// var IS set and the backend is unreachable, the tests PANIC, so CI (which
-// always sets it — see .github/workflows/ci.yml) can never skip silently.
+// no db suffix, no auth) to run them. When unset, every test that needs the
+// backend prints a SKIP notice and returns — never a silent pass against
+// nothing (the killable-proxy harness self-test needs none, so always runs).
+// When the env var IS set and the backend is unreachable, the tests PANIC,
+// so CI (which always sets it — see .github/workflows/ci.yml) can never skip
+// silently.
 //
 // Isolation: each test owns a dedicated logical DB (the `/N` suffix in the
 // connection URL) and flushes it on connect, because ALL `alb:*`
@@ -20928,33 +21470,68 @@ mod redis_integration {
         client
     }
 
+    /// Kill handle for a killable proxy: `kill_proxy` sends the proxy the
+    /// sender half of an ack channel and waits for its "listener closed" reply.
+    type KillSwitch = tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>;
+
     /// TCP forwarder in front of the real backend that can be killed
     /// mid-test to simulate Redis dying while connections are established.
     /// Killing aborts every live relay and drops the listener, so both
-    /// in-flight commands and subsequent reconnect attempts fail.
-    async fn spawn_killable_proxy(target: String) -> (String, tokio::sync::oneshot::Sender<()>) {
+    /// in-flight commands and subsequent reconnect attempts fail. The port
+    /// itself stays reserved for a revive (see `spawn_killable_proxy_at`).
+    async fn spawn_killable_proxy(target: String) -> (String, KillSwitch) {
         spawn_killable_proxy_at("127.0.0.1:0", target).await
     }
 
     /// Same as `spawn_killable_proxy`, but at a caller-chosen address — used
     /// to REVIVE a killed proxy at its old address so a reconnect policy can
     /// find the backend again.
-    async fn spawn_killable_proxy_at(
-        bind: &str,
-        target: String,
-    ) -> (String, tokio::sync::oneshot::Sender<()>) {
-        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+    ///
+    /// The port stays reserved for the rest of the test (LAB-2299): `hold` is
+    /// bound but never listens, so connects are still refused while the proxy
+    /// is dead, but the kernel will not hand the port to any concurrent
+    /// `bind(127.0.0.1:0)` (another test's mock server). Without it the dead
+    /// window leaves the port unowned and the revive races on `EADDRINUSE`.
+    /// Never listening is also what lets the listener, and every later revive,
+    /// bind over `hold`: `SO_REUSEADDR` cannot bind over a LISTEN socket, so a
+    /// `listen()` on `hold` would break every revive. A plain
+    /// `TcpListener::bind` already sets `SO_REUSEADDR`, so that alone never was
+    /// the missing piece. Two sockets on one exact addr:port with only
+    /// `SO_REUSEADDR` is Linux behaviour; BSD/macOS reject it, so there `hold`
+    /// is skipped and the port goes unreserved, as it did before LAB-2299.
+    async fn spawn_killable_proxy_at(bind: &str, target: String) -> (String, KillSwitch) {
+        fn reusable_socket(addr: std::net::SocketAddr) -> tokio::net::TcpSocket {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.set_reuseaddr(true).unwrap();
+            socket
+                .bind(addr)
+                .unwrap_or_else(|e| panic!("killable proxy: bind {addr}: {e}"));
+            socket
+        }
+        let requested: std::net::SocketAddr = bind
+            .parse()
+            .unwrap_or_else(|e| panic!("killable proxy: bad bind address {bind}: {e}"));
+        let hold = cfg!(target_os = "linux").then(|| reusable_socket(requested));
+        let addr = hold.as_ref().map_or(requested, |h| h.local_addr().unwrap());
+        let listener = reusable_socket(addr)
+            .listen(1024)
+            .unwrap_or_else(|e| panic!("killable proxy: listen {addr}: {e}"));
         let addr = listener.local_addr().unwrap();
-        let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
+        let (kill_tx, mut kill_rx): (KillSwitch, _) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let mut relays: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-            loop {
+            let mut relays = tokio::task::JoinSet::new();
+            let dead = loop {
                 tokio::select! {
-                    _ = &mut kill_rx => break,
+                    dead = &mut kill_rx => break dead,
                     accepted = listener.accept() => {
-                        let Ok((mut inbound, _)) = accepted else { break };
+                        // Panic, not `break`: a proxy that stops accepting is a
+                        // broken harness, and a silent exit would park with
+                        // `kill_rx` alive — `kill_proxy` would wait forever.
+                        // Unwinding drops `relays`, which aborts every relay.
+                        let (mut inbound, _) = accepted
+                            .unwrap_or_else(|e| panic!("killable proxy: accept on {addr}: {e}"));
                         let target = target.clone();
-                        relays.push(tokio::spawn(async move {
+                        relays.spawn(async move {
                             if let Ok(mut outbound) =
                                 tokio::net::TcpStream::connect(&target).await
                             {
@@ -20962,14 +21539,23 @@ mod redis_integration {
                                     tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
                                         .await;
                             }
-                        }));
+                        });
                     }
                 }
+            };
+            relays.abort_all();
+            // Further connects are refused from here on — and only now does
+            // `kill_proxy` return, so a revive never meets this listener live.
+            drop(listener);
+            if let Ok(dead) = dead {
+                let _ = dead.send(());
             }
-            for relay in relays {
-                relay.abort();
-            }
-            // Listener drops here → further connects are refused.
+            // Moving `hold` into this task IS the reservation: the port stays
+            // ours until the test's runtime drops the parked task. Delete this
+            // line and `hold` drops when the function returns — the dead window
+            // is unowned again and the LAB-2299 race silently comes back.
+            let _hold = hold;
+            std::future::pending::<()>().await;
         });
         (format!("127.0.0.1:{}", addr.port()), kill_tx)
     }
@@ -20977,7 +21563,7 @@ mod redis_integration {
     /// fred client (the client under test) routed through a killable proxy.
     /// Same skip/panic contract as `redis_test_conn`. The DB is flushed via
     /// the independent redis-crate client before the fred client connects.
-    async fn proxied_conn(db: u8) -> Option<(RedisClient, tokio::sync::oneshot::Sender<()>)> {
+    async fn proxied_conn(db: u8) -> Option<(RedisClient, KillSwitch)> {
         let base = test_redis_url()?;
         let target = base
             .trim_start_matches("redis://")
@@ -20993,8 +21579,14 @@ mod redis_integration {
         Some((fred, kill))
     }
 
-    async fn kill_proxy(kill: tokio::sync::oneshot::Sender<()>) {
-        let _ = kill.send(());
+    /// Returns only once the proxy's listener is closed, so a same-address
+    /// revive can never meet it still in LISTEN (LAB-2299), however starved
+    /// the runtime. The fixed sleep alone left that ordering to the scheduler.
+    async fn kill_proxy(kill: KillSwitch) {
+        let (dead_tx, dead_rx) = tokio::sync::oneshot::channel();
+        let _ = kill.send(dead_tx);
+        // Err only if the proxy task is already gone — its listener with it.
+        let _ = dead_rx.await;
         // Give the aborts a beat to drop sockets before asserting failures.
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -21075,6 +21667,27 @@ mod redis_integration {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{addr}"), counter)
+    }
+
+    /// LAB-2299: `kill_proxy` must return only after the proxy's listener is
+    /// closed — a revive at the same address would otherwise meet it still in
+    /// LISTEN, which `SO_REUSEADDR` cannot bind over. 100 blocking tasks queued
+    /// ahead of the killed proxy keep the runtime busy well past any fixed
+    /// grace period before the proxy task gets to run. No backend needed:
+    /// nothing ever connects.
+    #[tokio::test]
+    async fn killable_proxy_revives_even_when_the_kill_is_starved() {
+        let target = "127.0.0.1:1".to_string();
+        let (addr, kill) = spawn_killable_proxy(target.clone()).await;
+        // Let the proxy task park on its first poll, so the kill below
+        // re-queues it BEHIND the busy tasks.
+        tokio::task::yield_now().await;
+        for _ in 0..100 {
+            tokio::spawn(async { std::thread::sleep(Duration::from_millis(5)) });
+        }
+        kill_proxy(kill).await;
+        let (revived, _revived_kill) = spawn_killable_proxy_at(&addr, target).await;
+        assert_eq!(revived, addr, "proxy must revive at its old address");
     }
 
     /// AC2 phase 1: the hard-limit MGET merge against real keys — a remote
