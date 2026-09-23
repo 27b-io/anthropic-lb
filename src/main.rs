@@ -2238,8 +2238,8 @@ impl AppState {
     /// policy otherwise: `unscannable` — the caller sent content the scanner
     /// cannot read (a non-empty body that did not parse, or an OpenAI shape
     /// translation cannot map), so a parse differential vs the upstream could
-    /// smuggle content past the scan — and a newest turn longer than the scan
-    /// cap, whose tail was never inspected (the "pad past the cap, then the
+    /// smuggle content past the scan — and scannable content longer than the
+    /// scan cap, whose tail was never inspected (the "pad past the cap, then the
     /// secret" bypass). A body that parsed but carried no scannable text (e.g.
     /// an image-only turn) is NOT a scan failure and is allowed. Annotate /
     /// shadow mode never rejects — it measures best-effort.
@@ -9144,8 +9144,9 @@ async fn proxy_handler(
             // (below) to reflect the breakpoints actually forwarded upstream.
             let (fp, fps) = content_fingerprints(&parsed);
 
-            // LAB-3877: extract the newest user text + tool_result blocks for
-            // the guard (never `system`). Read-only borrow of `parsed`.
+            // LAB-3877: extract the newest user text + tool_result blocks and
+            // any `safeguards[].classifier_context` for the guard (never
+            // `system`). Read-only borrow of `parsed`.
             #[cfg(feature = "guard")]
             {
                 guard_body_parsed = true;

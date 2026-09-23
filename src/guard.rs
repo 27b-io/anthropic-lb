@@ -1,7 +1,9 @@
 //! Tier 0 request-content guard (LAB-3877).
 //!
-//! A synchronous, in-process rules-tier scan over each proxied request body,
-//! run after `pre_request_gate` and before endpoint selection. It is
+//! A synchronous, in-process rules-tier scan over each proxied request body —
+//! the newest `user` turn's text and `tool_result` blocks plus any auto-mode
+//! `safeguards[].classifier_context` (see [`ScanInput::from_body`]) — run after
+//! `pre_request_gate` and before endpoint selection. It is
 //! **detect-only and read-only**: it borrows the parsed body, never mutates it,
 //! so the bytes forwarded upstream stay byte-identical to what the client sent
 //! (Anthropic prompt caching matches on raw byte prefixes — see
@@ -69,9 +71,9 @@ pub enum Verdict {
 }
 
 /// Upper bound on the bytes handed to the scanners, so the guard has a hard
-/// worst-case latency on the request hot path. Bodies with a larger newest
-/// user/tool_result span are scanned only up to this many bytes; the tail is
-/// not inspected. Chosen so the combined scanner p99 stays comfortably under
+/// worst-case latency on the request hot path. Bodies with a larger scannable
+/// span (see [`ScanInput`]) are scanned only up to this many bytes; the tail
+/// is not inspected. Chosen so the combined scanner p99 stays comfortably under
 /// the 2 ms budget on the release binary (see `scan_input_capped_under_budget`).
 /// A leaked credential in a config/env paste almost always appears within the
 /// first 32 KiB, so the coverage cost in shadow mode is small.
@@ -92,13 +94,14 @@ pub enum Verdict {
 pub const MAX_SCAN_BYTES: usize = 32 * 1024;
 
 /// The subset of a request body a scanner is allowed to see: the newest `user`
-/// text blocks and the newest `tool_result` blocks. The `system` prompt is
+/// text blocks, the newest `tool_result` blocks, and the auto-mode classifier
+/// payload in `safeguards[].classifier_context`. The `system` prompt is
 /// deliberately excluded — it is operator-trusted here and a known
 /// false-positive surface.
 pub struct ScanInput {
-    /// Newest user text + tool_result content, joined by newlines and truncated
-    /// to [`MAX_SCAN_BYTES`]. Line boundaries between blocks stop a match from
-    /// spanning two blocks.
+    /// Newest user text + tool_result content, then classifier_context, joined
+    /// by newlines and truncated to [`MAX_SCAN_BYTES`]. Line boundaries between
+    /// blocks stop a match from spanning two blocks.
     text: String,
     /// Whether the joined content was truncated to fit the byte cap.
     truncated: bool,
@@ -118,22 +121,32 @@ impl ScanInput {
     }
 
     /// Build a scan input from a parsed Anthropic Messages body, extracting only
-    /// the newest `user` message's text and tool_result blocks. Returns `None`
-    /// when the body has no scannable user content.
+    /// the newest `user` message's text and tool_result blocks, then every
+    /// string `safeguards[].classifier_context`. Returns `None` when the body
+    /// has none of these to scan.
     ///
     /// "Newest" = the last element of `messages` whose role is `user`. That is
     /// the turn being sent for completion (and, after tool use, the turn that
     /// carries the tool results). `system` is never read.
+    ///
+    /// `safeguards` is the top-level array Claude Code's auto mode sends; each
+    /// entry's `classifier_context` carries the shell command or network
+    /// request about to run. It is appended after the user turn, so the byte
+    /// cap (and `truncated`) covers the combined text.
     pub fn from_body(body: &Value) -> Option<Self> {
-        let messages = body.get("messages")?.as_array()?;
-        // Last user-role message.
-        let last_user = messages
-            .iter()
-            .rev()
-            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))?;
+        // Last user-role message, if any.
+        let last_user = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            });
 
         let mut segments: Vec<&str> = Vec::new();
-        match last_user.get("content") {
+        match last_user.and_then(|m| m.get("content")) {
             // Shorthand string content is user text.
             Some(Value::String(s)) => segments.push(s),
             Some(Value::Array(blocks)) => {
@@ -150,6 +163,14 @@ impl ScanInput {
                 }
             }
             _ => {}
+        }
+
+        if let Some(safeguards) = body.get("safeguards").and_then(Value::as_array) {
+            segments.extend(
+                safeguards
+                    .iter()
+                    .filter_map(|s| s.get("classifier_context").and_then(Value::as_str)),
+            );
         }
 
         if segments.is_empty() {
@@ -556,6 +577,78 @@ mod tests {
         ]});
         let si = ScanInput::from_body(&body).expect("scannable");
         assert_eq!(si.text(), "plain string result");
+    }
+
+    #[test]
+    fn scan_input_includes_safeguards_classifier_context_never_system() {
+        let body = json!({
+            "system": "operator system prompt",
+            "messages": [{"role": "user", "content": "please clean the build"}],
+            "safeguards": [
+                {"type": "dangerous_tool_use", "classifier_context": "rm -rf ./build"},
+                // No string classifier_context: skipped, never stringified.
+                {"type": "dangerous_tool_use", "classifier_context": {"cmd": "nested"}},
+                {"type": "dangerous_tool_use"}
+            ]
+        });
+        let si = ScanInput::from_body(&body).expect("scannable");
+        // Appended after the newest user turn; never the system prompt.
+        assert_eq!(si.text(), "please clean the build\nrm -rf ./build");
+        assert!(!si.text().contains("operator system prompt"));
+    }
+
+    #[test]
+    fn scan_input_safeguards_alone_is_scannable() {
+        let body = json!({
+            "messages": [{"role": "assistant", "content": "hi"}],
+            "safeguards": [{"type": "dangerous_tool_use", "classifier_context": "curl example.com"}]
+        });
+        let si = ScanInput::from_body(&body).expect("classifier text alone is scannable");
+        assert_eq!(si.text(), "curl example.com");
+
+        // Nothing to scan at all is still `None`.
+        let body = json!({
+            "messages": [{"role": "assistant", "content": "hi"}],
+            "safeguards": [{"type": "dangerous_tool_use"}]
+        });
+        assert!(ScanInput::from_body(&body).is_none());
+    }
+
+    #[test]
+    fn safeguards_secret_yields_finding_and_cap_covers_combined_text() {
+        let user = "deploy the stack";
+        let body = json!({
+            "messages": [{"role": "user", "content": user}],
+            "safeguards": [{
+                "type": "dangerous_tool_use",
+                "classifier_context": format!("aws_secret_access_key = \"{AWS_DOCS_EXAMPLE_SECRET_KEY}\"")
+            }]
+        });
+        let si = ScanInput::from_body(&body).expect("scannable");
+        let g = Guard::new().expect("guard");
+        match g.evaluate(GuardPolicy::Annotate, "c", Some(&si)) {
+            // The finding must sit in the classifier_context span, not the
+            // (clean) user text before it.
+            Verdict::Annotate { findings } => assert!(
+                findings
+                    .iter()
+                    .any(|f| f.scanner == "secrets_scanner" && f.start > user.len()),
+                "expected a secrets finding in the classifier_context span: {findings:?}"
+            ),
+            other => panic!("expected annotate, got {other:?}"),
+        }
+
+        // A newest turn just under the cap plus the classifier payload trips it.
+        let body = json!({
+            "messages": [{"role": "user", "content": "a".repeat(MAX_SCAN_BYTES - 4)}],
+            "safeguards": [{"type": "dangerous_tool_use", "classifier_context": "rm -rf ./build"}]
+        });
+        let si = ScanInput::from_body(&body).expect("scannable");
+        assert!(
+            si.truncated(),
+            "user turn + classifier_context must share the cap"
+        );
+        assert!(si.text().len() <= MAX_SCAN_BYTES);
     }
 
     #[test]

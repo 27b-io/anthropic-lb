@@ -443,13 +443,15 @@ PII scanner (emails, cards, IPs, JWTs, national ids, provider API-key shapes).
 ### What it scans
 
 Only the **newest `user` text and `tool_result` blocks** of the request body —
-the freshest untrusted content. The `system` prompt is never scanned (it is
-operator-trusted and a known false-positive surface). Detection is strictly
-read-only: the body forwarded upstream is byte-identical to what the client
-sent, so prompt-cache prefixes and routing are never disturbed. To bound
-hot-path latency, at most 32 KiB of that content is scanned per request; a
-larger newest turn has its tail left unscanned (surfaced as `truncated` in the
-guard log).
+the freshest untrusted content — plus the string `classifier_context` of each
+top-level `safeguards` entry, where Claude Code's auto mode sends the shell
+command or network request it is about to run. The `system` prompt is never
+scanned (it is operator-trusted and a known false-positive surface). Detection
+is strictly read-only: the body forwarded upstream is byte-identical to what
+the client sent, so prompt-cache prefixes and routing are never disturbed. To
+bound hot-path latency, at most 32 KiB of that content is scanned per request,
+the classifier text counted after the newest turn; anything past the limit is
+left unscanned (surfaced as `truncated` in the guard log).
 
 Scanning is content-driven: a proxied request is scanned when its JSON body
 carries a Messages-shaped `messages` **array** — `/v1/messages`,
@@ -524,8 +526,9 @@ same 400 rather than forwarded unscanned:
   forwards the client's original bytes. These are an enumeration, not a general
   rule: the unscanned content named under **What it scans** above is not
   rejected;
-- the newest-turn content exceeded the scan limit, so its tail was never
-  inspected — otherwise padding past the limit would bypass enforcement.
+- the scanned content (newest turn plus classifier text) exceeded the scan
+  limit, so its tail was never inspected — otherwise padding past the limit
+  would bypass enforcement.
 
 A block-mode client must therefore send JSON Messages traffic and keep
 scannable content within the limit. `annotate` (shadow mode) never rejects — it
