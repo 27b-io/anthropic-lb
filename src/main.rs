@@ -3784,39 +3784,69 @@ struct RoutingWeight {
     overage_active: bool,
 }
 
+/// 5h gate: time-adjusted 5h utilization with status floors, falling back to
+/// raw unified, legacy token ratio, or 0.5 (unknown). A fixed 0.5 while the
+/// account's data predates its last hard limit.
+///
+/// Shared by `compute_routing_weight` and `metrics_gate_weight` so the gate
+/// published on `/metrics` cannot drift from the one the router uses (LAB-4441).
+fn gate_5h(info: &RateLimitInfo, now_epoch: u64, stale_after_hard_limit: bool) -> f64 {
+    if stale_after_hard_limit {
+        return 0.5;
+    }
+    time_adjusted_utilization(
+        info.utilization_5h,
+        info.reset_5h,
+        info.status_5h.as_deref(),
+        NEAR_RESET_5H_SECS,
+        now_epoch,
+    )
+    .unwrap_or_else(|| {
+        if let Some(util) = info.utilization {
+            util
+        } else if let Some(remaining) = info.remaining_tokens {
+            let limit = info.limit_tokens.unwrap_or(1_000_000);
+            (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
+        } else {
+            0.5
+        }
+    })
+}
+
+/// Overage gate: `Some` iff the account is serving via paid overage, in which
+/// case this gate REPLACES the exhausted 5h/7d gates — the overage window
+/// governs, and a rejected subscription claim does not skip the account.
+/// `None` while overage is off or the data predates the last hard limit.
+///
+/// Shared by `compute_routing_weight` and `metrics_gate_weight` (LAB-4441:
+/// the metrics path lacked this branch and published gate 1.0 for accounts
+/// the router was actively serving through).
+fn overage_gate(info: &RateLimitInfo, now_epoch: u64, stale_after_hard_limit: bool) -> Option<f64> {
+    if !info.overage_in_use || stale_after_hard_limit {
+        return None;
+    }
+    Some(
+        time_adjusted_utilization(
+            info.overage_utilization,
+            info.overage_reset,
+            info.overage_status.as_deref(),
+            NEAR_RESET_OVERAGE_SECS,
+            now_epoch,
+        )
+        .unwrap_or(0.0),
+    )
+}
+
 fn compute_routing_weight(
     info: &RateLimitInfo,
     model: &str,
     now_epoch: u64,
     stale_after_hard_limit: bool,
 ) -> Option<RoutingWeight> {
-    // Overage active: the account's exhausted subscription window is being covered
-    // by paid overage. The subscription gates are moot — the overage window governs.
-    let overage_active = info.overage_in_use && !stale_after_hard_limit;
+    let gate_overage = overage_gate(info, now_epoch, stale_after_hard_limit);
+    let overage_active = gate_overage.is_some();
 
-    // 5h gate: time-adjusted 5h utilization with status floors
-    let gate_5h = if stale_after_hard_limit {
-        0.5
-    } else {
-        time_adjusted_utilization(
-            info.utilization_5h,
-            info.reset_5h,
-            info.status_5h.as_deref(),
-            NEAR_RESET_5H_SECS,
-            now_epoch,
-        )
-        .unwrap_or_else(|| {
-            // Fallback: raw unified, legacy, or unknown
-            if let Some(util) = info.utilization {
-                util
-            } else if let Some(remaining) = info.remaining_tokens {
-                let limit = info.limit_tokens.unwrap_or(1_000_000);
-                (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
-            } else {
-                0.5
-            }
-        })
-    };
+    let gate_5h = gate_5h(info, now_epoch, stale_after_hard_limit);
 
     // Whether a status floor (`status_to_floor` inside `time_adjusted_utilization`)
     // raised `gate_5h` above its raw time-adjusted utilisation. Compared against
@@ -3894,18 +3924,9 @@ fn compute_routing_weight(
 
     // Effective gate: when overage is in use, the overage window governs — the
     // exhausted 5h/7d gates are superseded. waste_risk is moot for an overage account.
-    let (gate, wr, source) = if overage_active {
-        let gate_overage = time_adjusted_utilization(
-            info.overage_utilization,
-            info.overage_reset,
-            info.overage_status.as_deref(),
-            NEAR_RESET_OVERAGE_SECS,
-            now_epoch,
-        )
-        .unwrap_or(0.0);
-        (gate_overage, 0.0, "overage")
-    } else {
-        (gate_5h.max(gate_7d), wr_7d, source_7d)
+    let (gate, wr, source) = match gate_overage {
+        Some(g) => (g, 0.0, "overage"),
+        None => (gate_5h.max(gate_7d), wr_7d, source_7d),
     };
 
     // Weekly headroom for the affinity override (`affinity_headroom`): 1.0 when
@@ -4350,28 +4371,7 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
         .hard_limited_until
         .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
 
-    // 5h gate — same logic as routing_candidates
-    let gate_5h = if stale_after_hard_limit {
-        0.5
-    } else {
-        time_adjusted_utilization(
-            info.utilization_5h,
-            info.reset_5h,
-            info.status_5h.as_deref(),
-            NEAR_RESET_5H_SECS,
-            now_epoch,
-        )
-        .unwrap_or_else(|| {
-            if let Some(util) = info.utilization {
-                util
-            } else if let Some(remaining) = info.remaining_tokens {
-                let limit = info.limit_tokens.unwrap_or(1_000_000);
-                (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
-            } else {
-                0.5
-            }
-        })
-    };
+    let gate_5h = gate_5h(info, now_epoch, stale_after_hard_limit);
 
     // 7d gate + waste_risk from a SINGLE representative ClaimWindowData
     // — utilization, reset and status are read as a coherent triple
@@ -4415,7 +4415,7 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
             })
     };
 
-    let (gate_7d, wr) = if let Some(claim) = representative {
+    let (gate_7d, wr_7d) = if let Some(claim) = representative {
         let g = if stale_after_hard_limit {
             0.5
         } else {
@@ -4436,7 +4436,12 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
         (g, 0.0)
     };
 
-    let gate = gate_5h.max(gate_7d);
+    // Overage supersedes the subscription gates exactly as in
+    // `compute_routing_weight`: the overage window governs, waste_risk is moot.
+    let (gate, wr) = match overage_gate(info, now_epoch, stale_after_hard_limit) {
+        Some(g) => (g, 0.0),
+        None => (gate_5h.max(gate_7d), wr_7d),
+    };
     let headroom = (1.0 - gate).max(0.01);
     let weight = if wr > 0.0 { wr * headroom } else { headroom };
     let weight = if gate >= 1.0 { 0.0 } else { weight };
@@ -10463,6 +10468,8 @@ struct EndpointMetricsSnap {
     last_updated_epoch: Option<u64>,
     overage_in_use: bool,
     overage_utilization: Option<f64>,
+    overage_status: Option<String>,
+    overage_reset: Option<u64>,
     /// Routing-weight gauges, captured from the source struct's atomics at
     /// snap time. Snap-carried so the routing-weight emission is pool-agnostic.
     routing_weight: f64,
@@ -10630,6 +10637,8 @@ async fn build_metrics_snap(
         last_updated_epoch: info.last_updated_epoch,
         overage_in_use: info.overage_in_use,
         overage_utilization: info.overage_utilization,
+        overage_status: info.overage_status.clone(),
+        overage_reset: info.overage_reset,
         routing_weight: f64::from_bits(routing_weight_atomic.load(Ordering::Relaxed)),
         routing_share: f64::from_bits(routing_share_atomic.load(Ordering::Relaxed)),
         effective_gate: f64::from_bits(effective_gate_atomic.load(Ordering::Relaxed)),
@@ -10828,6 +10837,17 @@ async fn metrics_handler(
             &[("account", &s.name), ("window", "7d")],
             status_to_ordinal(s.status_7d.as_deref()),
         );
+        // Overage window: same presence rule as its utilization series —
+        // emitted only while overage is serving (its fields are cleared
+        // otherwise), so the status floor that feeds the overage gate is visible.
+        if s.overage_in_use {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_rate_limit_status",
+                &[("account", &s.name), ("window", "overage")],
+                status_to_ordinal(s.overage_status.as_deref()),
+            );
+        }
     }
 
     // Account reset countdowns
@@ -10851,6 +10871,17 @@ async fn metrics_handler(
                 &mut buf,
                 "anthropic_account_reset_seconds",
                 &[("account", &s.name), ("window", "7d")],
+                (r - now_epoch) as f64,
+            );
+        }
+        if let Some(r) = s
+            .overage_reset
+            .filter(|&r| s.overage_in_use && r > now_epoch)
+        {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_reset_seconds",
+                &[("account", &s.name), ("window", "overage")],
                 (r - now_epoch) as f64,
             );
         }
