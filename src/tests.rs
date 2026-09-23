@@ -23666,3 +23666,40 @@ async fn resend_outcome_supersedes_stashed_entitlement_400() {
         );
     }
 }
+
+/// A poisoned `entitlement_400` lock: `/metrics` publishes the real count and
+/// clears the poison. Driven through the router, not the helper in isolation.
+#[tokio::test]
+async fn entitlement_400_poisoned_lock_is_recovered_not_zeroed() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-aaa")]);
+    state.note_entitlement_400("spent");
+    {
+        let state = state.clone();
+        std::thread::spawn(move || {
+            let _g = state.entitlement_400.lock().unwrap();
+            panic!("deliberate: poison the entitlement-400 counter mutex");
+        })
+        .join()
+        .unwrap_err();
+    }
+    assert!(state.entitlement_400.is_poisoned());
+
+    let addr = serve(build_router(state.clone())).await;
+    let m = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        m.contains(r#"anthropic_entitlement_400_total{account="spent"} 1"#),
+        "/metrics must publish the real count through a poisoned lock:\n{m}"
+    );
+
+    // The render must clear the poison, or the `if let Ok` increment keeps
+    // skipping and the series freezes here for the life of the process.
+    state.note_entitlement_400("spent");
+    assert_eq!(state.entitlement_400.lock().unwrap().get("spent"), Some(&2));
+}

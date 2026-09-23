@@ -10738,6 +10738,38 @@ async fn build_metrics_snap(
     }
 }
 
+/// Snapshot a `String`-keyed counter map for the `/metrics` render,
+/// recovering — and clearing — a poisoned lock rather than publishing an
+/// empty map.
+///
+/// `.lock().ok().unwrap_or_default()` emits a zero indistinguishable from a
+/// real one, and logging while *still* returning empty would only make the
+/// endpoint lie more loudly. Clearing is the half that matters: every writer
+/// to these maps takes the lock with `let Ok(..) else { return }` / `if let
+/// Ok(..)`, so an uncleared poison kills the counter permanently rather than
+/// leaving it stale. Same recovery rationale as `lock_transport_errors`,
+/// which does it silently — a panicking holder is worth a line.
+///
+/// Nothing in these critical sections can currently panic, so this is
+/// defence against a future edit, not a live incident.
+fn snapshot_counters(
+    counters: &Mutex<HashMap<String, u64>>,
+    map: &'static str,
+) -> Vec<(String, u64)> {
+    let guard = match counters.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            warn!(
+                map,
+                "/metrics: counter lock was poisoned; recovered the counts and cleared it"
+            );
+            counters.clear_poison();
+            poisoned.into_inner()
+        }
+    };
+    guard.iter().map(|(k, v)| (k.clone(), *v)).collect()
+}
+
 async fn metrics_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -10831,12 +10863,7 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
-    let entitlement_400: Vec<(String, u64)> = state
-        .entitlement_400
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
+    let entitlement_400 = snapshot_counters(&state.entitlement_400, "entitlement_400");
     let model_denied: Vec<((String, String), u64)> = state
         .model_denied
         .lock()
