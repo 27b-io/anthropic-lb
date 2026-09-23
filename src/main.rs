@@ -4750,10 +4750,21 @@ impl AppState {
                 // (so the cache warms on the replacement and stays there) yet spread
                 // across sessions (distinct keys → distinct replacements), and
                 // independent of which account is momentarily `best`.
+                //
+                // "Healthy" = the override would not flee it: the negation of the
+                // trigger above. Excluding only `picked` let a 7d-spent account
+                // (gate-healthy, big expiring-quota bucket) replace an equally
+                // spent one, which answered the caller with Anthropic's
+                // entitlement 400 (LAB-4719). The floor also excludes `picked`.
+                // Never empty: `best` always clears it, and clearing it means
+                // headroom > 0, so gate < 1 and weight > 0. The `best` fallback
+                // below is therefore unreachable from routing_candidates; it
+                // stays as a guard, and it would still satisfy the floor.
+                let floor = best_headroom * STICKY_WEIGHTED_OVERRIDE_RATIO;
                 let remaining: Vec<&RoutingCandidate> = effective
                     .iter()
                     .copied()
-                    .filter(|c| c.endpoint != picked.endpoint)
+                    .filter(|c| affinity_headroom(c).0 >= floor)
                     .collect();
                 let remaining_weight: f64 = remaining.iter().map(|c| c.weight).sum();
                 let replacement = if remaining_weight > 0.0 {

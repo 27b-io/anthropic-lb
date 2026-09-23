@@ -1920,6 +1920,72 @@ async fn affinity_migration_counter_names_the_binding_window() {
     assert_eq!(floored.load(Ordering::Relaxed), 0, "floored counter");
 }
 
+/// Regression (LAB-4719): a `reason="spent"` migration fled an account at
+/// headroom 0.040 and landed on its equally spent twin (headroom 0.040,
+/// util_7d 0.96), which answered with Anthropic's entitlement 400, while the
+/// same log line named a healthy `best_account` (util_7d 0.21 → headroom 0.79;
+/// 0.040 / 0.79 = the logged `ratio=0.051`). The twin got picked because a
+/// 7d-spent account is still gate-healthy and its expiring quota earns it a
+/// large waste-risk bucket. A replacement the override would itself flee must
+/// never be chosen.
+#[tokio::test]
+async fn affinity_spent_migration_skips_equally_spent_replacement() {
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("spent", "sk-ant-api-a"),
+            mk_endpoint("spent-twin", "sk-ant-api-b"),
+            mk_endpoint("healthy", "sk-ant-api-c"),
+        ],
+        RoutingStrategy::StickyWeightedV2,
+    );
+    let now = AppState::now_epoch();
+    // Both spent accounts reset in 20h: outside the near-reset ramp (so the 4%
+    // left reads as spent) yet close enough for a sizeable bucket.
+    set_account_utilization(&state, 0, 0.00, 0.96, now + 10000, now + 20 * 3600).await;
+    set_account_utilization(&state, 1, 0.00, 0.96, now + 10000, now + 20 * 3600).await;
+    set_account_utilization(&state, 2, 0.12, 0.21, now + 10000, now + 5 * 86400).await;
+
+    let candidates = state.routing_candidates("claude-opus-4-6", &[]).await;
+    let headroom: Vec<(f64, &str)> = candidates
+        .iter()
+        .map(|c| {
+            let (h, bind) = affinity_headroom(c);
+            (h, bind.as_str())
+        })
+        .collect();
+    for (i, want) in [0.04, 0.04, 0.79].into_iter().enumerate() {
+        assert!(
+            (headroom[i].0 - want).abs() < 1e-9,
+            "fixture must reproduce the logged headroom triple: {headroom:?}"
+        );
+    }
+    assert_eq!(
+        headroom[0].1, "spent",
+        "the sticky account must bind on its week"
+    );
+
+    let sessions = keys_hashing_to(&state, 0, 40, 20000, "lab4719-session").await;
+    assert_eq!(
+        sessions.len(),
+        40,
+        "need sessions sticky on the spent account"
+    );
+    for s in &sessions {
+        let idx = state
+            .pick_endpoint(Some(s), "claude-opus-4-6", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            idx, 2,
+            "session {s} sticky on the spent account must migrate to the healthy one, not its equally spent twin"
+        );
+    }
+    let [loaded, spent, floored] = &state.affinity_migrations;
+    assert_eq!(spent.load(Ordering::Relaxed), 40, "spent counter");
+    assert_eq!(loaded.load(Ordering::Relaxed), 0, "loaded counter");
+    assert_eq!(floored.load(Ordering::Relaxed), 0, "floored counter");
+}
+
 #[test]
 fn content_fingerprint_stable_across_growing_turns() {
     // Same system + same first user, with later turns appended, must yield the
