@@ -1012,6 +1012,12 @@ struct AppState {
     /// config, so the label set is bounded by the operator and needs no
     /// `_other` overflow (unlike the caller-controlled `prompt_too_long` key).
     fast_mode_429: Mutex<HashMap<String, u64>>,
+    /// Upstream "out of extra usage" 400s, by account (LAB-4729). The first
+    /// per request is re-sent to another account; the account is NOT cooled
+    /// (see `note_entitlement_400`). Exposed as
+    /// `anthropic_entitlement_400_total{account}`; config-bounded labels, as
+    /// `fast_mode_429`.
+    entitlement_400: Mutex<HashMap<String, u64>>,
     /// Per-client model-allowlist denials, keyed (client, model) (LAB-1083).
     /// Exposed as `anthropic_client_model_denied_total`. Under `[[clients]]`
     /// auth `client` is a credential-bound principal, but under legacy
@@ -6608,6 +6614,26 @@ impl AppState {
         );
     }
 
+    /// Count + WARN an upstream entitlement 400 (`is_entitlement_exhausted_400`,
+    /// LAB-4729). The retry loop re-sends the request once; the account is
+    /// deliberately NOT cooled. The refusal is scoped to a class of request
+    /// (e.g. past-band Fable on a credits-exhausted account) — the same account
+    /// keeps serving other traffic — so cooling it hands any client a lever:
+    /// each refused request would cool two accounts (original + re-send), and
+    /// a modest rate of them keeps the whole pool cooled, denying every
+    /// client. Same reasoning as the fast-mode 429 exemption in
+    /// `classify_retry_status`. The cost is one zero-token round trip per
+    /// refused request, visible on this counter.
+    fn note_entitlement_400(&self, endpoint_name: &str) {
+        if let Ok(mut counts) = self.entitlement_400.lock() {
+            *counts.entry(endpoint_name.to_owned()).or_insert(0) += 1;
+        }
+        warn!(
+            account = endpoint_name,
+            "upstream 400: account out of extra usage — re-sending once to another account (account not cooled)"
+        );
+    }
+
     /// Snapshot the session registry for `/_stats`: TTL-filtered, sorted by
     /// context-window % desc, capped to `SESSIONS_STATS_TOP_N`. Raw IPs and
     /// session ids never leave the registry — the label is a hash of the
@@ -7823,6 +7849,10 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 ///     429 while stashing the upstream's error response, so a model no OTHER
 ///     endpoint can serve still surfaces the real error — a nonexistent-model
 ///     404 must not morph into a synthetic 429 that invites retries.
+///   - `RetryEntitlement(resp)`: the account is out of paid extra usage for
+///     this request (`is_entitlement_exhausted_400`, LAB-4729). The loop
+///     re-sends ONCE, and a second entitlement 400 — or nothing left to try —
+///     returns `resp` to the caller.
 // Response payloads are boxed so the enum stays small (one word per payload):
 // it rides in the Err of `classify_retry_status`'s Result, where an inline
 // `Response` is 128+ bytes on the hot success path (clippy::result_large_err —
@@ -7830,6 +7860,7 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 enum ForwardOutcome {
     Done(Box<Response>),
     RetryModelUnsupported(Box<Response>),
+    RetryEntitlement(Box<Response>),
     Retry {
         saw_529: bool,
         push_skip: bool,
@@ -7872,6 +7903,30 @@ fn is_model_unsupported_error(status: StatusCode, body: &serde_json::Value) -> b
         return true;
     }
     msg.to_ascii_lowercase().contains("invalid model name")
+}
+
+/// Anchor for the entitlement 400 (LAB-4729). Only the first sentence: the
+/// second names who can add more ("Ask your workspace admin …") and varies by
+/// plan, the first is the condition itself.
+const ENTITLEMENT_400_ANCHOR: &str = "You're out of extra usage";
+
+/// True when an upstream 400 is Anthropic refusing the request because the
+/// ACCOUNT's paid extra usage is exhausted — account state wearing a client-
+/// error status (LAB-4729). Observed live 2026-09-22:
+///   400 `{"type":"error","error":{"type":"invalid_request_error",
+///   "message":"You're out of extra usage. Ask your workspace admin to add
+///   more so you can keep going."}}`
+/// Every other 400 is the caller's own error and must reach it unchanged, so
+/// this is deliberately narrow: exact `error.type` and a message ANCHORED at
+/// its start — a substring match (`usage`, `extra usage`) would reroute real
+/// client errors that merely mention the word.
+fn is_entitlement_exhausted_400(status: StatusCode, body: &serde_json::Value) -> bool {
+    status == StatusCode::BAD_REQUEST
+        && body.pointer("/error/type").and_then(|v| v.as_str()) == Some("invalid_request_error")
+        && body
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m.starts_with(ENTITLEMENT_400_ANCHOR))
 }
 
 /// Surface the real cause of a `reqwest::Error`. The Display form only shows
@@ -8109,6 +8164,7 @@ enum RetryStep {
 /// `retry_round` gates rotation: a transient (transport-level) failure on round
 /// 0 keeps the affinity/cache-warm endpoint (`EndRound` → backoff → retry IT);
 /// on rounds ≥1 it rotates (push skip). 429/5xx/529 always rotate immediately.
+#[allow(clippy::too_many_arguments)]
 fn apply_round_outcome(
     retry_round: u32,
     outcome: ForwardOutcome,
@@ -8117,6 +8173,7 @@ fn apply_round_outcome(
     saw_529: &mut bool,
     saw_transient: &mut bool,
     model_unsupported_resp: &mut Option<Response>,
+    entitlement_resp: &mut Option<Response>,
 ) -> RetryStep {
     match outcome {
         ForwardOutcome::Done(resp) => RetryStep::Return(*resp),
@@ -8125,6 +8182,18 @@ fn apply_round_outcome(
         // the case where none does (LAB-941).
         ForwardOutcome::RetryModelUnsupported(resp) => {
             *model_unsupported_resp = Some(*resp);
+            skip.push(picked_idx);
+            RetryStep::NextAttempt
+        }
+        // Account out of extra usage (LAB-4729): re-send ONCE per request.
+        // The refusal is scoped to a class of request, so every account may
+        // give it — rotating on each would sweep the whole pool for a request
+        // nothing can serve. A second one goes to the caller as-is.
+        ForwardOutcome::RetryEntitlement(resp) => {
+            if entitlement_resp.is_some() {
+                return RetryStep::Return(*resp);
+            }
+            *entitlement_resp = Some(*resp);
             skip.push(picked_idx);
             RetryStep::NextAttempt
         }
@@ -8831,12 +8900,25 @@ async fn forward_anthropic(
             // negative-cache the pair and rotate — another account may serve
             // it. Forwarding the 404 as-is wedges affinity-pinned clients
             // into a permanent retry loop against this account (LAB-941).
-            if is_model_unsupported_error(status, &parsed) {
-                state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+            // Out of extra usage: re-send once to another account (LAB-4729).
+            // Both are account state wearing a 4xx. A streaming request lands
+            // here too: upstream sends the 400 as a JSON body, not an event
+            // stream, so it re-sends before any byte reaches the client.
+            let rotate: Option<fn(Box<Response>) -> ForwardOutcome> =
+                if is_model_unsupported_error(status, &parsed) {
+                    state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                    Some(ForwardOutcome::RetryModelUnsupported)
+                } else if is_entitlement_exhausted_400(status, &parsed) {
+                    state.note_entitlement_400(endpoint_name);
+                    Some(ForwardOutcome::RetryEntitlement)
+                } else {
+                    None
+                };
+            if let Some(retry) = rotate {
                 // This branch returns before `finalize_non_stream` — log the
-                // merged line here too, so a model-unsupported rejection
-                // still gets the routing/utilization snapshot at INFO, same
-                // as the old unconditional `proxied` line did (AC4).
+                // merged line here too, so a rotated rejection still gets the
+                // routing/utilization snapshot at INFO, same as the old
+                // unconditional `proxied` line did (AC4).
                 log_proxied(
                     req_id,
                     client_id,
@@ -8854,7 +8936,7 @@ async fn forward_anthropic(
                     .unwrap_or_else(|_| {
                         (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                     });
-                return ForwardOutcome::RetryModelUnsupported(Box::new(response));
+                return retry(Box::new(response));
             }
         }
         finalize_non_stream(
@@ -9370,6 +9452,9 @@ async fn proxy_handler(
     // Upstream error from the most recent model-unsupported rejection —
     // returned verbatim if the pool exhausts on nothing but rejections.
     let mut model_unsupported_resp: Option<Response> = None;
+    // First entitlement 400 (LAB-4729): its presence spends the one re-send;
+    // returned if nothing else can serve the request.
+    let mut entitlement_resp: Option<Response> = None;
     // OpenAI-shape body, built lazily on the first OpenAI-endpoint attempt
     // and reused across rotations/retries (LAB-716). Lazy so requests served
     // entirely by Anthropic endpoints — the common case — never pay for the
@@ -9488,6 +9573,7 @@ async fn proxy_handler(
                 &mut saw_529,
                 &mut saw_transient,
                 &mut model_unsupported_resp,
+                &mut entitlement_resp,
             ) {
                 // LAB-933: the single success seam — every proxied response
                 // (Anthropic or translated OpenAI) exits proxy_handler here,
@@ -9517,9 +9603,11 @@ async fn proxy_handler(
     // final round) returns the upstream's own error — truthful when the model
     // exists nowhere. Overload/transient exhaustion keeps its retryable
     // status; the negative cache already routes follow-up requests away from
-    // the rejecting endpoints (LAB-941).
+    // the rejecting endpoints (LAB-941). An entitlement 400 whose one re-send
+    // found nothing else to try is returned the same way (LAB-4729): the
+    // caller sees why, not a synthetic 429.
     if !last_saw_529 && !last_saw_transient {
-        if let Some(resp) = model_unsupported_resp {
+        if let Some(resp) = entitlement_resp.or(model_unsupported_resp) {
             return resp;
         }
         // Warm-cache path: every eligible endpoint was filtered by the
@@ -10729,6 +10817,12 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
+    let entitlement_400: Vec<(String, u64)> = state
+        .entitlement_400
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
     let model_denied: Vec<((String, String), u64)> = state
         .model_denied
         .lock()
@@ -11658,6 +11752,25 @@ async fn metrics_handler(
         prom_counter(
             &mut buf,
             "anthropic_fast_mode_429_total",
+            &[("account", account.as_str())],
+            *n,
+        );
+    }
+
+    // Entitlement 400s by account (LAB-4729): "out of extra usage" refusals,
+    // the first per request re-sent to another account. Sustained growth on
+    // one account means its credits are gone; across the pool, a request
+    // class (past-band Fable) outrunning the credit limits.
+    prom_header(
+        &mut buf,
+        "anthropic_entitlement_400_total",
+        "counter",
+        "Upstream 'out of extra usage' 400s by account; the first per request is re-sent to another account",
+    );
+    for (account, n) in &entitlement_400 {
+        prom_counter(
+            &mut buf,
+            "anthropic_entitlement_400_total",
             &[("account", account.as_str())],
             *n,
         );
@@ -13643,6 +13756,7 @@ async fn forward_openai_compat_anthropic(
         // Translate Anthropic error to OpenAI error format so clients
         // (LiteLLM, etc.) can parse the actual error message.
         let mut model_unsupported = false;
+        let mut entitlement = false;
         let openai_error =
             if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&error_body) {
                 // Count + trace context-window overflows here too (LAB-916) —
@@ -13652,8 +13766,10 @@ async fn forward_openai_compat_anthropic(
                         state.note_prompt_too_long(req_id, model, session_key, msg);
                     }
                 }
-                // Same model-rejection detection as the native path (LAB-941).
+                // Same model-rejection detection as the native path (LAB-941),
+                // and the same entitlement 400 (LAB-4729).
                 model_unsupported = is_model_unsupported_error(status, &parsed);
+                entitlement = is_entitlement_exhausted_400(status, &parsed);
                 // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
                 let msg = parsed
                     .pointer("/error/message")
@@ -13696,6 +13812,10 @@ async fn forward_openai_compat_anthropic(
         if model_unsupported {
             state.note_model_unsupported(endpoint_name, endpoint_idx, model);
             return ForwardOutcome::RetryModelUnsupported(Box::new(response));
+        }
+        if entitlement {
+            state.note_entitlement_400(endpoint_name);
+            return ForwardOutcome::RetryEntitlement(Box::new(response));
         }
         return ForwardOutcome::Done(Box::new(response));
     }
@@ -14159,6 +14279,8 @@ async fn openai_chat_handler(
         // Upstream error from the most recent model-unsupported rejection —
         // returned verbatim if the pool exhausts on nothing but rejections.
         let mut model_unsupported_resp: Option<Response> = None;
+        // One-shot entitlement re-send, as in `proxy_handler` (LAB-4729).
+        let mut entitlement_resp: Option<Response> = None;
         for retry_round in 0..=MAX_529_RETRIES {
             if retry_round > 0 {
                 let delay = round_backoff_delay(retry_round, last_saw_529);
@@ -14245,6 +14367,7 @@ async fn openai_chat_handler(
                     &mut saw_529,
                     &mut saw_transient,
                     &mut model_unsupported_resp,
+                    &mut entitlement_resp,
                 ) {
                     RetryStep::Return(resp) => return resp,
                     RetryStep::NextAttempt => continue,
@@ -14261,7 +14384,7 @@ async fn openai_chat_handler(
         // Same model-rejection exhaustion rule as `proxy_handler` (LAB-941),
         // in the OpenAI error shape this handler's clients parse.
         if !last_saw_529 && !last_saw_transient {
-            if let Some(resp) = model_unsupported_resp {
+            if let Some(resp) = entitlement_resp.or(model_unsupported_resp) {
                 return resp;
             }
             if state.model_unsupported_everywhere(&model) {
@@ -15020,6 +15143,7 @@ async fn main() {
         beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
         fast_mode_429: Mutex::new(HashMap::new()),
+        entitlement_400: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache,
