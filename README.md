@@ -52,7 +52,7 @@ Routes requests across multiple Anthropic accounts using dynamic capacity-based 
 | **Shadow logging** | Optional JSONL file with request metadata, tokens, latency |
 | **Model routing** | Per-account model allowlists with wildcard prefix matching |
 | **Client identification** | Via `X-Client-ID` header or IP-based mapping |
-| **Streaming** | SSE/streaming responses flow through with usage extraction |
+| **Streaming** | SSE/streaming responses flow through with usage extraction (streams from `openai` endpoints are forwarded but not debited — see [What doesn't translate](#what-doesnt-translate)) |
 | **State persistence** | Utilization + reset times + status survive restarts |
 | **OpenAI-compatible endpoints** | Route to OpenAI-format APIs as first-class endpoints (`protocol = "openai"`) |
 | **~6 MB binary** | Zero runtime dependencies |
@@ -804,8 +804,8 @@ The Anthropic↔OpenAI translation layer is not lossless. When an Anthropic-form
 12. If 429 → mark rate-limited (propagate to Redis), add to skip list, retry with next account
 13. If 5xx/529 → add to skip list, retry with different account
 14. Parse rate-limit headers (utilization per claim, reset times, status)
-15. Extract token usage from response (streaming SSE or JSON body)
-16. Record usage per-account + per-client, update budget (local + Redis)
+15. Extract token usage from response (streaming SSE or JSON body; streams from `openai` endpoints have no usage extraction)
+16. Record extracted usage per-account + per-client, update budget (local + Redis)
 17. Write shadow log entry (async, non-blocking)
 18. State persisted to disk (+ Redis if configured), restored on restart
 ```
