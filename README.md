@@ -175,14 +175,17 @@ token = "sk-ant-api03-..."
 | `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id` |
 | `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`) |
 | `clients[].models` | `[String]` | `[]` | Models this client may request (empty = all; `*` suffix wildcards) |
+| `clients[].preferred_endpoints` | `[String]` | `[]` | Pin this client to named endpoint(s); spills to the full pool when none is healthy (incl. at paid overage). Names are startup-validated |
 | `proxy_key` | `String?` | `None` | **Legacy** shared secret. Mutually exclusive with `[[clients]]` |
 | `allow_unauthenticated` | `bool` | `false` | The one escape hatch from default-deny: boot with no credentials at all. Trusted-network-only; incompatible with configured credentials |
 | `allowed_ips` | `[String]?` | `None` | IP/CIDR allowlist (unset = **allow all**) |
 | `trusted_proxies` | `[String]?` | `None` | IPs/CIDRs of load balancers whose `x-forwarded-for` is honoured (unset = header ignored) |
+| `forward_caller_identity` | `bool` | `false` | Relay caller-identity headers (`x-forwarded-for`, `x-real-ip`, `forwarded`, `true-client-ip`, `x-client-id`, `x-agent-id`, `x-session-id`) to the upstream; off = stripped once the proxy has used them (see *Real client IP behind a load balancer*) |
 | `auth_failure_limit` | `u32` | `10` | Failed-auth attempts per client IP inside the window before further invalid credentials get 429; valid credentials always pass (0 = throttle off) |
 | `auth_failure_window_secs` | `u64` | `300` | Failed-auth throttle window |
 | `auto_cache` | `bool` | `true` | Inject prompt caching beta header |
 | `shadow_log` | `String?` | `None` | Path to JSONL shadow log file |
+| `debug_log` | `String?` | `None` | Path to an additional `debug`-level `tracing` log file (see [Logging](#logging)); the stderr stream stays at `info` regardless |
 | `soft_limit` | `f64` | `0.90` | Utilization ceiling — accounts above are excluded from routing |
 | `client_names` | `{IP: name}` | `{}` | IP → client ID mapping |
 | `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
@@ -342,6 +345,7 @@ It **fails closed** on a model it cannot read. The proxy takes the model from th
 | **Admin surfaces** | `operators = ["ops"]` | `/_stats` + `/metrics` need an operator credential (401/403) | no one can read them under `[[clients]]` |
 | **Failed-auth throttle** | `auth_failure_limit` / `auth_failure_window_secs` | Further invalid credentials get 429 + `retry-after` per client IP after repeated failures; valid credentials always pass | on (10 / 300s) |
 | **Trusted proxies** | `trusted_proxies = ["192.0.2.0/24"]` | Real client IP recovered from `x-forwarded-for` behind a listed LB | header ignored |
+| **Caller-identity privacy** | `forward_caller_identity = false` | Caller IP and `x-client-id`/`x-agent-id`/`x-session-id` headers dropped before the upstream request | **stripped** |
 | **Model allow-list** | `clients[].models` | Rejects models outside a client's list (403) | all models |
 
 IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are compared in constant time, and startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`).
@@ -355,6 +359,8 @@ IP check runs first, then the credential check; failed credentials are subject t
 ### Real client IP behind a load balancer
 
 Behind a GCLB/Cloudflare/ingress, the TCP peer is the LB — without XFF handling, IP allowlists degenerate to "allow the LB", per-IP throttles rate-limit the LB, and every log line records the LB. Configure `trusted_proxies` with the LB's address range; the client IP then becomes the **rightmost `x-forwarded-for` entry not itself in `trusted_proxies`** — the last hop an attacker cannot append to. From any peer *not* in the list the header is ignored entirely (never trusted, never logged as authoritative), and malformed entries fall back to the peer address.
+
+Those headers stop here. Once the client IP is resolved, the proxy drops `x-forwarded-for`, `x-real-ip`, `forwarded`, `true-client-ip` and its own `x-client-id`, `x-agent-id`, `x-session-id` from the upstream request on both forward paths, so a pooled-account request upstream is not labelled with the caller behind the proxy. `forward_caller_identity = true` restores relaying. Two things this does not cover. Edge-added `cf-*` headers (`cf-connecting-ip` carries the same caller IP) are the ingress's to strip, not the proxy's ([#166](https://github.com/27b-io/anthropic-lb/issues/166)): the Cloudflare Worker does, a plain cloudflared tunnel does not, so on that path the caller IP still reaches the upstream. And Claude Code's native `x-claude-code-session-id` passes through untouched pending [#171](https://github.com/27b-io/anthropic-lb/issues/171).
 
 > [!IMPORTANT]
 > Behind a load balancer, **`[[clients]]` credentials are the identity**. The `client_names` IP map is a lab-only convenience: it maps *source addresses*, and once traffic arrives through an LB the recovered XFF address is only as trustworthy as the LB's own header hygiene. Do not hang budgets or operator status on `client_names` on a public ingress.
@@ -386,12 +392,157 @@ can steer are locked down by default:
 - **Client beta flags are allow-listed.** On OAuth endpoints, client
   `anthropic-beta` values outside `allowed_client_betas` are dropped before
   forwarding, logged at `warn`, and counted in
-  `anthropic_beta_flag_dropped_total{flag}`.
+  `anthropic_beta_flag_dropped_total{flag}`. The built-in default covers the
+  flags the proxy itself needs, the flag families Claude Code sends, and
+  `fast-mode-*`; the authoritative list is `DEFAULT_CLIENT_BETA_ALLOWLIST`
+  in `src/main.rs`. Some families pair with a request-body field (`fast-mode-*`
+  with top-level `speed: "fast"`; the auto-mode classifier pair
+  `dangerous-tool-use-*` + `auto-mode-classifier-*` with top-level
+  `safeguards`), and the body is forwarded verbatim — so dropping the header
+  alone is a hard upstream `400`, not a quiet downgrade.
+- **A fast-mode `429` is forwarded to the caller, not treated as account
+  exhaustion.** Fast mode (`speed: "fast"`) bills against its own rate bucket,
+  separate from the account's 5h/7d windows, so a `429` on a fast request does
+  not cool the account or rotate to another one — the caller gets the `429`
+  with upstream's `retry-after`, exactly as a direct Anthropic client would.
+  Without this, one client looping fast requests would hard-limit every
+  account in turn and deny standard-speed traffic to everyone else. Occurrences
+  are counted as `anthropic_fast_mode_429_total{account}`. Transient *burst*
+  `429`s (`x-should-retry` with no `retry-after` and no rate-limit headers) are
+  excluded: those are per-minute limits on the account itself, so they keep
+  their usual backoff and rotation whatever speed was requested.
 
 ### Known Limitations
 
 - **Client ID spoofing (legacy configs only)**: without `[[clients]]`, the `x-client-id` header takes priority over the `client_names` IP mapping, so any authenticated client can claim any identity — including an operator name, another client's budget, or another client's response-cache tenant. Configure `[[clients]]` to close this; it is the reason that mode exists.
 - **Emergency brake is model-blind**: The brake evaluates worst-case utilization across all model claims. If sonnet is exhausted but haiku has headroom, the brake blocks all traffic including haiku. This is intentional fail-safe behavior.
+
+---
+
+## Guardrails
+
+An optional content-inspection layer scans each request for leaked secrets and
+PII before it is forwarded upstream. It is **opt-in at build time** and **shadow
+mode by default** — it counts and annotates, but blocks nothing, until you have
+measured false-positive rates on your own traffic.
+
+### Building with the guard
+
+The layer lives behind the `guard` cargo feature and is **off by default**:
+
+```bash
+cargo build --release                    # no guard; unchanged behaviour, no extra deps
+cargo build --release --features guard   # guard compiled in
+```
+
+With the feature off, the scanner crates are not compiled and request handling
+is byte-for-byte unchanged. The two scanners are pure Rust (no C/C++ build
+dependency): a secrets scanner over a bundled gitleaks/kingfisher ruleset, and a
+PII scanner (emails, cards, IPs, JWTs, national ids, provider API-key shapes).
+
+### What it scans
+
+Only the **newest `user` text and `tool_result` blocks** of the request body —
+the freshest untrusted content. The `system` prompt is never scanned (it is
+operator-trusted and a known false-positive surface). Detection is strictly
+read-only: the body forwarded upstream is byte-identical to what the client
+sent, so prompt-cache prefixes and routing are never disturbed. To bound
+hot-path latency, at most 32 KiB of that content is scanned per request; a
+larger newest turn has its tail left unscanned (surfaced as `truncated` in the
+guard log).
+
+Scanning is content-driven: a proxied request is scanned when its JSON body
+carries a Messages-shaped `messages` **array** — `/v1/messages`,
+`/v1/messages/count_tokens`, and `/v1/chat/completions` (scanned after
+translation to the Messages shape, so the same rules apply to both APIs). A
+request with no body, such as `GET /v1/models`, has nothing to scan and passes
+through. Content the Messages shape does not carry is not scanned: fields
+translation drops outright (`messages[].name`, the top-level `user`), content
+blocks of a type the scanner does not read, and a `messages` array whose
+elements the scanner cannot resolve to a newest `user` turn — elements that
+are not role objects, a `role` it does not recognise, or a `content` that is
+neither a string nor a block array. A body with no `messages` field at all
+(`/v1/complete`'s `prompt`, batch requests) is likewise unscanned.
+
+### Per-client policy
+
+Each client sets its policy under `[[clients]]`:
+
+```toml
+[[clients]]
+name = "alice"
+key  = "<openssl rand -hex 32>"
+guard = "annotate"   # "off" | "annotate" | "block"  (default: "annotate")
+```
+
+- `off` — skip scanning entirely.
+- `annotate` (**default**) — scan, count, and log findings, but always forward
+  the request. Shadow mode.
+- `block` — reject a request carrying any finding.
+
+Operator clients are always `off` regardless of configuration.
+
+- **Annotate** adds an `X-Guard-Findings: <count>` response header and a
+  structured `guard` log line keyed by request id (scanner, detection type,
+  count — never the matched text).
+- **Block** returns `HTTP 400` with:
+
+  ```json
+  {
+    "type": "error",
+    "error": {
+      "type": "guard_blocked",
+      "message": "...",
+      "findings": [ { "scanner": "...", "detection_type": "...", "start": 0, "end": 0 } ]
+    }
+  }
+  ```
+
+  Findings carry **byte offsets only — never the matched secret** — in logs, the
+  error body, and metrics alike. On `/v1/chat/completions` the same 400 uses the
+  OpenAI error envelope (`error.code = "guard_blocked"`).
+
+`block` **fails closed.** A request it cannot scan in full is rejected with the
+same 400 rather than forwarded unscanned:
+
+- the body is not JSON — a parse differential must not smuggle content past the
+  scan; this includes multipart uploads such as `/v1/files`;
+- `messages` is present but is not an array — a string, an object, a number,
+  `null`. The scanner reads that field as an array, so none of it reaches the
+  scan while all of it reaches the upstream. This applies on every path. A body
+  carrying **no** `messages` key is not rejected, on any path including
+  `/v1/messages`: the proxy serves every Anthropic endpoint through one
+  handler, and most of them (`/v1/complete`, `/v1/models`) never send the
+  field. Note the narrowness — `messages` can be an **array** and still be
+  unreadable (elements that are not role objects, a `content` the scanner
+  cannot parse); those are not rejected either, and are listed under **What it
+  scans** above;
+- on `/v1/chat/completions` only, `messages` is absent, or a message carries a
+  role outside `system`/`user`/`assistant`/`tool` — that endpoint is a single
+  API which requires the field, and both shapes are lost translating to the
+  Messages document the scanner reads while an `openai`-protocol endpoint
+  forwards the client's original bytes. These are an enumeration, not a general
+  rule: the unscanned content named under **What it scans** above is not
+  rejected;
+- the newest-turn content exceeded the scan limit, so its tail was never
+  inspected — otherwise padding past the limit would bypass enforcement.
+
+A block-mode client must therefore send JSON Messages traffic and keep
+scannable content within the limit. `annotate` (shadow mode) never rejects — it
+scans best-effort and always forwards.
+
+### Metrics
+
+On `/metrics` (when built with the feature):
+
+- `anthropic_guard_verdicts_total{client, scanner, verdict}` — counter.
+- `anthropic_guard_scan_duration_seconds` — histogram of per-request scan time.
+
+The `client` dimension of the verdicts counter is cardinality-bounded (overflow
+folds into `_other`). Under a legacy shared-secret configuration the client id
+is caller-asserted, so per-client verdict counts are only reliable when
+per-client keys (`[[clients]]`) are configured — the same posture as the other
+per-client counters.
 
 ---
 
@@ -440,8 +591,69 @@ The 400 itself is forwarded to the client unchanged.
 
 Requests rejected by a client's model allow-list are counted as
 `anthropic_client_model_denied_total{client,model}` and logged at WARN. The
-`model` label is caller-controlled, so it is bounded — overflow past 64
-distinct pairs buckets into `model="_other"`.
+`model` label is caller-controlled, so the label set is bounded — overflow
+past 64 distinct pairs lumps into a single global
+`client="_other",model="_other"` bucket (hard bound: 64 + 1 series).
+`_other` is a reserved client name: config validation rejects a
+`[[clients]]` entry or `client_names` value named `_other`, and a legacy
+`x-client-id: _other` header is ignored, so real traffic can never
+pre-claim the overflow key. `anthropic_client_model_token_usage_total`
+shares the same overflow scheme (bucket at 256 + 1 series).
+
+### Per-claim rate-limit visibility
+
+The API reports model-specific sub-budgets ("claims") alongside the general
+5h/7d windows. Each claim's utilization and waste risk have always been on
+`/metrics`; its **status** and **reset** are exported too:
+
+| Series | Meaning |
+|:-------|:--------|
+| `anthropic_claim_rate_limit_status{account,claim}` | Status ordinal — `0=allowed, 1=warning, 2=throttled, 3=rejected`. Same encoding as `anthropic_account_rate_limit_status`. |
+| `anthropic_claim_reset_seconds{account,claim}` | Seconds until that claim's window resets. Omitted (not zeroed) once the reset is in the past. |
+
+Status is **not** derivable from utilization in either direction, so read it
+rather than thresholding the percentage: an account can sit at 0.98 and still
+be `allowed_warning` — the router keeps routing to it — while another reads
+1.0 and is `rejected`, which makes the router hard-skip it for that claim.
+
+Across replicas these are gauges mirroring the same upstream claim, so
+aggregate with `max by (account, claim)`; `sum` multiplies the reading by the
+replica count.
+
+The `claim` label comes from the upstream `representative-claim` header,
+never from client input, but it is still an unvalidated remote string. It is
+truncated to 64 characters, and each account retains at most 32 distinct
+**unreserved** claim keys. Reserved keys — the four that gate all traffic plus
+the model-band carve-out — are always admitted, so the hard bound is 37 per
+account. That bound holds on the live header path and on the two paths that
+restore the map whole (the persisted state file and the cross-replica mirror),
+so a map written by an older build cannot restore unbounded.
+
+Keys already present keep updating past the cap; a genuinely new one past it is
+dropped, and the refusal is logged once per account rather than once per
+request. Unlike the caller-labelled counters above, overflow is *not* folded
+into an `_other` bucket: both routing lookups match exact keys and the
+emergency brake's input is allowlist-filtered, so an unknown key is already
+inert to routing and a bucket would only add a fake claim to the metrics.
+Reserving the keys that are *not* inert is what makes the cap safe — without
+that, a flood of unknown keys could lock out `seven_day` itself, and an account
+with no derivable weekly utilization routes as though it had no weekly limit.
+
+### Pool exhaustion
+
+`anthropic_pool_exhausted_total{kind}` counts the responses this proxy
+generated itself because no endpoint could serve the request:
+
+| `kind` | Response | Cause |
+|:-------|:---------|:------|
+| `rate_limited` | `429 exhausted all endpoints` (no `Retry-After`) | Every eligible endpoint was rate-limited or gated, or a retry round saw a 529. |
+| `transient` | `503 + Retry-After: 1` | Every eligible endpoint failed in transport, with no 529. |
+
+The per-account gauges describe the pool's *state*; this counter is the only
+signal that a caller was actually turned away because of it. Both label values
+are emitted from process start, so a flat zero is a measurement rather than an
+absence of data. These are independent per-replica event counts — aggregate
+with `sum by (kind)`, where `max` would undercount.
 
 ### OpenAI JSON-mode compatibility
 
@@ -592,6 +804,22 @@ The configured `token` is injected as `Authorization: Bearer`, and the request i
 
 ---
 
+## Logging
+
+Structured `tracing` logs go to stderr at `info` level by default (one line
+per request that reaches upstream, carrying routing context — client, model,
+account, status, utilization — and token usage together; on the native
+`/v1/messages` path the line also carries `fp`, the content fingerprint, `-`
+when the body was unparseable). Override the filter with `RUST_LOG` (e.g.
+`RUST_LOG=anthropic_lb=debug`), or set `debug_log = "/path/to/file.log"` in
+the config to additionally write a `debug`-level file log alongside the
+`info`-level stderr stream. At `debug`, the full per-request content
+fingerprinting detail (`fingerprint`: `fp`/`fps`/`bps`) becomes visible —
+useful for diagnosing routing-affinity stickiness, but too high-volume for
+the default filter.
+
+---
+
 ## Shadow Logging
 
 When `shadow_log` is set, every request writes a JSONL entry with:
@@ -632,7 +860,7 @@ redis_url = "redis://redis.example.com:6379"
 | **Rate info** | JSON blob per account | ~5s (background sync) |
 | **Replica heartbeats** | `SET EX 30` per instance | ~5s |
 
-**Fail-open**: All Redis operations degrade gracefully. If Redis is unavailable, each replica falls back to local-only state. No request is ever blocked by a Redis error.
+**Fail-open**: All Redis *operations* degrade gracefully. If a syntactically valid `redis_url` is unreachable, each replica falls back to local-only state and reconnects in the background. No request is ever blocked by a Redis error. A `redis_url` that fails to *parse* (e.g. a rotated password containing an unescaped `/`, `?`, or `#`) is a config error, not a connectivity one — it fails startup outright rather than silently running without the shared state an operator asked for.
 
 **Key schema** (all keys auto-expire via TTL):
 
@@ -643,7 +871,7 @@ alb:rate:{account_name}             →  JSON   (reset-based TTL)
 alb:heartbeat:{instance_id}         →  u64    (30s TTL)
 ```
 
-When Redis is connected, `/_stats` includes a `cluster` section with replica count and cross-replica budget usage.
+When Redis is connected, `/_stats` includes a `cluster` section with replica count and cross-replica budget usage. The per-client `client_budgets` block and the `anthropic_client_budget_*` gauges are also re-seeded from the shared counter every ~5s, so a freshly restarted replica reports the fleet's spend for the day rather than only what it has seen itself.
 
 > [!NOTE]
 > `redis_url` is entirely optional. Omit it for single-instance deployments — behavior is identical to running without Redis.
@@ -805,6 +1033,23 @@ WantedBy=multi-user.target
 ---
 
 ## Testing
+
+The Rust toolchain is pinned in `rust-toolchain.toml`, so local builds, CI,
+and the Docker image all use the same compiler — rustup reads the file
+automatically and installs that version on first `cargo` invocation. (CI's
+toolchain action only bootstraps `stable`; every `cargo` command still
+resolves through the pin via rustup's toolchain-file override, and the
+Dockerfile copies the file into the builder stage.) Toolchain updates arrive as Renovate PRs
+and are never automerged (CI infra has a wide blast radius). This matters
+because CI runs with `-Dwarnings`: a new stable Rust ships new clippy lints that
+can fail code nobody touched, and with the pin that failure lands as a red
+*bump PR* — reviewable, with the lint fixes in the same branch — instead of a
+red `main` that blocks every merge and the next release
+([#142](https://github.com/27b-io/anthropic-lb/issues/142)). Fix new lints
+inside the bump PR; don't weaken `-Dwarnings`. Reproduce a bump locally with
+`rustup toolchain install <new-version> --profile minimal --component clippy && RUSTFLAGS="-Dwarnings" cargo +<new-version> clippy --all-targets`.
+If the lints can't be fixed right now, close the bump PR — `main` stays on the
+old pin and Renovate reopens it on the next run.
 
 ```bash
 # Run all tests
