@@ -20564,17 +20564,72 @@ fn start_coordination_redis_rejects_numeric_password_prefix_mis_route() {
 // var IS set and the backend is unreachable, the tests PANIC, so CI (which
 // always sets it — see .github/workflows/ci.yml) can never skip silently.
 //
-// Isolation: each test owns a dedicated logical DB (the `/N` suffix in the
-// connection URL) and flushes it on connect, because ALL `alb:*`
-// coordination keys (hard/rate/weight/budget/probe/heartbeat/
-// transport_errors) are hardcoded in production code and cannot be
-// prefixed per-test. Never point ALB_TEST_REDIS_URL at a Redis holding
-// data you care about.
+// Isolation: each test owns a dedicated logical DB (allocated in the `Db`
+// enum, appended as the `/N` suffix of the connection URL) and flushes it on
+// connect, because ALL `alb:*` coordination keys (hard/rate/weight/budget/
+// probe/heartbeat/transport_errors) are hardcoded in production code and
+// cannot be prefixed per-test. Never point ALB_TEST_REDIS_URL at a Redis
+// holding data you care about. The allocation runs past the default 16 DBs,
+// so run a throwaway server with the same DB count as CI:
+//
+//   redis-server --port 16379 --bind 127.0.0.1 --save "" --appendonly no --databases 32 --daemonize yes
+//   ALB_TEST_REDIS_URL=redis://127.0.0.1:16379 cargo test redis_integration
 mod redis_integration {
     use super::*;
     use redis::AsyncCommands;
 
     const TEST_REDIS_ENV: &str = "ALB_TEST_REDIS_URL";
+
+    /// The logical-DB allocation (see the module doc). An enum, not constants,
+    /// so the compiler rejects a reused number (E0081);
+    /// `db_numbers_come_only_from_the_db_allocation` rejects a raw number
+    /// that bypasses it. DB 0 is deliberately unused.
+    #[repr(u8)]
+    enum Db {
+        MergeHardLimits = 1,
+        RateInfoMostRecent = 2,
+        RoutingWeights = 3,
+        RecoverySentinelCas = 4,
+        BudgetIncrbyAccumulates = 5,
+        PoisonedBudgetSelfHeals = 6,
+        ClusterInfoScanPages = 7,
+        TransportErrorsAccumulate = 8,
+        TransportErrorsRequeue = 9,
+        ProbeLockOneReplica = 10,
+        ProbeLockFailsOpen = 11,
+        BackendDeathMidRun = 12,
+        BackendRecoveryMidRun = 13,
+        BackendDownAtStartup = 14,
+        LostIncrbyRevival = 15,
+        SeedBudgetMirror = 16,
+    }
+
+    /// Runs without a backend, so a bypass of `Db` fails every `cargo test`,
+    /// not just the ones that happen to collide. Covers all three ways a test
+    /// picks its DB: the two helpers' argument and an inline `…}/N` URL.
+    #[test]
+    fn db_numbers_come_only_from_the_db_allocation() {
+        let src = include_str!("tests.rs");
+        let start = src.find("mod redis_integration {").expect("module present");
+        let module = &src[start..];
+        let module = &module[..module.find("\n}\n").expect("module end")];
+        for carrier in ["redis_test_conn(", "proxied_conn(", "}/"] {
+            let mut seen = 0;
+            for (at, _) in module.match_indices(carrier) {
+                seen += 1;
+                let rest = module[at + carrier.len()..].trim_start();
+                let line = src[..start + at].lines().count();
+                assert!(
+                    !rest.starts_with(|c: char| c.is_ascii_digit()),
+                    "src/tests.rs:{line}: raw DB number after `{carrier}` — add a `Db` variant"
+                );
+            }
+            assert!(
+                seen > 0,
+                "`{carrier}` never matched — the scan has gone vacuous"
+            );
+        }
+    }
 
     /// Resolve the opt-in backend URL. None (with a SKIP notice) when the
     /// env var is unset locally; PANICS when unset in CI (`CI` env present),
@@ -20617,7 +20672,7 @@ mod redis_integration {
     /// Connect to the opt-in test backend, selecting logical DB `db` and
     /// flushing it. Returns None (with a SKIP notice) when the env var is
     /// unset; panics when it is set but the backend is unreachable.
-    /// `db` must be unique per test — logical DBs are the isolation unit.
+    /// Take `db` from `Db` — logical DBs are the isolation unit.
     ///
     /// Returns a PAIR of clients on the same DB: the `redis`-crate connection
     /// is the test's independent fixture/assertion client (deliberately NOT
@@ -20837,7 +20892,7 @@ mod redis_integration {
     /// nothing. Pairs with the pure `classify_hard_limit_*` unit tests.
     #[tokio::test]
     async fn sync_from_redis_merges_hard_limits_with_real_backend() {
-        let Some((mut conn, fred)) = redis_test_conn(1).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::MergeHardLimits as u8).await else {
             return;
         };
         let state = state_with_redis(
@@ -20950,7 +21005,7 @@ mod redis_integration {
     /// both directions, plus the absent-key case, against real MGET replies.
     #[tokio::test]
     async fn sync_from_redis_rate_info_most_recent_wins_both_directions() {
-        let Some((mut conn, fred)) = redis_test_conn(2).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::RateInfoMostRecent as u8).await else {
             return;
         };
         let state = state_with_redis(
@@ -21013,7 +21068,7 @@ mod redis_integration {
     /// malformed and absent values touch nothing.
     #[tokio::test]
     async fn sync_from_redis_applies_published_routing_weights() {
-        let Some((mut conn, fred)) = redis_test_conn(3).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::RoutingWeights as u8).await else {
             return;
         };
         let state = state_with_redis(
@@ -21070,7 +21125,7 @@ mod redis_integration {
     /// covered by the pure `classify_hard_limit_*` tests.
     #[tokio::test]
     async fn recovery_sentinel_cas_clears_stale_but_not_live_hard_limits() {
-        let Some((mut conn, fred)) = redis_test_conn(4).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::RecoverySentinelCas as u8).await else {
             return;
         };
         let state = state_with_redis(vec![], fred);
@@ -21127,7 +21182,8 @@ mod redis_integration {
     /// yesterday's spend invisible today.
     #[tokio::test]
     async fn budget_incrby_accumulates_across_replicas_with_expiry() {
-        let Some((mut conn, fred)) = redis_test_conn(5).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::BudgetIncrbyAccumulates as u8).await
+        else {
             return;
         };
         avoid_utc_midnight().await;
@@ -21206,7 +21262,7 @@ mod redis_integration {
     /// `fold_budget_mirror_seeds_floors_and_replaces_stale_day`.
     #[tokio::test]
     async fn sync_from_redis_seeds_budget_mirror_from_shared_counter() {
-        let Some((mut conn, fred)) = redis_test_conn(11).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::SeedBudgetMirror as u8).await else {
             return;
         };
         avoid_utc_midnight().await;
@@ -21332,7 +21388,8 @@ mod redis_integration {
     /// authoritative over larger local state — that pin stands.
     #[tokio::test]
     async fn budget_incrby_poisoned_key_self_heals_and_absent_key_uses_local_floor() {
-        let Some((mut conn, fred)) = redis_test_conn(6).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::PoisonedBudgetSelfHeals as u8).await
+        else {
             return;
         };
         avoid_utc_midnight().await;
@@ -21488,12 +21545,17 @@ mod redis_integration {
             .unwrap()
             .to_string();
         let (proxy_addr, kill) = spawn_killable_proxy(target.clone()).await;
-        let url = format!("redis://{proxy_addr}/15");
+        let url = format!("redis://{proxy_addr}/{}", Db::LostIncrbyRevival as u8);
         drop(connect_and_flush(&url).await);
         let fred = fred_test_client(&url).await;
         // Independent assertion client, connected DIRECTLY to the backend so
         // it can verify the increment really was lost (not buffered/replayed).
-        let mut direct = connect(&format!("{}/15", base.trim_end_matches('/'))).await;
+        let mut direct = connect(&format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            Db::LostIncrbyRevival as u8
+        ))
+        .await;
 
         let state = Arc::new(AppState {
             client_budgets: [("lost-cli".to_string(), 100u64)].into(),
@@ -21549,7 +21611,7 @@ mod redis_integration {
     /// undercounts. Budget MGET aggregation is asserted in the same pass.
     #[tokio::test]
     async fn cluster_info_counts_heartbeats_across_multiple_scan_pages() {
-        let Some((mut conn, fred)) = redis_test_conn(7).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::ClusterInfoScanPages as u8).await else {
             return;
         };
         avoid_utc_midnight().await;
@@ -21588,7 +21650,8 @@ mod redis_integration {
     /// the idle tick refresh the TTL.
     #[tokio::test]
     async fn flush_transport_errors_hincrby_accumulates_across_replicas() {
-        let Some((mut conn, fred)) = redis_test_conn(8).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::TransportErrorsAccumulate as u8).await
+        else {
             return;
         };
         let replica_a = state_with_redis(vec![], fred.clone());
@@ -21648,7 +21711,7 @@ mod redis_integration {
     /// signal.
     #[tokio::test]
     async fn flush_transport_errors_requeues_deltas_when_redis_dies() {
-        let Some((fred, kill)) = proxied_conn(9).await else {
+        let Some((fred, kill)) = proxied_conn(Db::TransportErrorsRequeue as u8).await else {
             return;
         };
         let state = state_with_redis(vec![], fred);
@@ -21670,7 +21733,7 @@ mod redis_integration {
     /// is held, and a different model probes under its own lock.
     #[tokio::test]
     async fn probe_lock_grants_one_replica_per_endpoint_model() {
-        let Some((mut conn, fred)) = redis_test_conn(10).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::ProbeLockOneReplica as u8).await else {
             return;
         };
         let (mock_url, hits) = spawn_counting_upstream().await;
@@ -21719,7 +21782,7 @@ mod redis_integration {
     /// probe proceeds anyway (a dead coordinator must not stop probing).
     #[tokio::test]
     async fn probe_lock_fails_open_when_redis_is_down() {
-        let Some((fred, kill)) = proxied_conn(11).await else {
+        let Some((fred, kill)) = proxied_conn(Db::ProbeLockFailsOpen as u8).await else {
             return;
         };
         let (mock_url, hits) = spawn_counting_upstream().await;
@@ -21751,7 +21814,7 @@ mod redis_integration {
     /// cold-start absence case; this covers loss of an established backend.
     #[tokio::test]
     async fn backend_death_mid_run_degrades_to_local_only() {
-        let Some((fred, kill)) = proxied_conn(12).await else {
+        let Some((fred, kill)) = proxied_conn(Db::BackendDeathMidRun as u8).await else {
             return;
         };
         avoid_utc_midnight().await;
@@ -21816,13 +21879,18 @@ mod redis_integration {
             .unwrap()
             .to_string();
         let (proxy_addr, kill) = spawn_killable_proxy(target.clone()).await;
-        let url = format!("redis://{proxy_addr}/13");
+        let url = format!("redis://{proxy_addr}/{}", Db::BackendRecoveryMidRun as u8);
         drop(connect_and_flush(&url).await);
         let fred = fred_test_client(&url).await;
         // Independent assertion client, connected DIRECTLY to the backend
         // (not through the killable proxy, and without flushing) so it can
         // verify post-recovery writes actually landed.
-        let direct = connect(&format!("{}/13", base.trim_end_matches('/'))).await;
+        let direct = connect(&format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            Db::BackendRecoveryMidRun as u8
+        ))
+        .await;
 
         let state = Arc::new(AppState {
             client_budgets: [("recover-cli".to_string(), 100u64)].into(),
@@ -21905,17 +21973,22 @@ mod redis_integration {
             .next()
             .unwrap()
             .to_string();
-        // Flush DB 14 through a DIRECT connection — the proxy is dead at
+        // Flush this test's DB through a DIRECT connection — the proxy is dead at
         // client creation, so the usual flush-through-proxy path cannot run.
         // The same client later verifies that post-attach writes landed.
-        let direct = connect_and_flush(&format!("{}/14", base.trim_end_matches('/'))).await;
+        let direct = connect_and_flush(&format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            Db::BackendDownAtStartup as u8
+        ))
+        .await;
 
         // Reserve an address, then kill it BEFORE the client under test
         // exists: nothing is listening when the connection task makes its
         // first attempt — the exact boot-during-outage scenario.
         let (proxy_addr, kill) = spawn_killable_proxy(target.clone()).await;
         kill_proxy(kill).await;
-        let url = format!("redis://{proxy_addr}/14");
+        let url = format!("redis://{proxy_addr}/{}", Db::BackendDownAtStartup as u8);
 
         // The PRODUCTION constructor (fail_fast=false, background connect),
         // with the harness's short budgets and fast constant reconnect.

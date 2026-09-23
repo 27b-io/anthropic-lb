@@ -76,6 +76,10 @@ jobs:
         image: valkey/valkey@sha256:495e4fecdc98ee48a20b207726caa5ab6451e0fac3642a9be10d9e70b3068df6 # 8
         ports:
           - 6379:6379
+        env:
+          # Services take no command args; the image appends this to
+          # valkey-server. `Db` in src/tests.rs needs more than 16 DBs.
+          VALKEY_EXTRA_FLAGS: --databases 32
         options: >-
           --health-cmd "valkey-cli ping"
           --health-interval 5s
@@ -105,6 +109,10 @@ jobs:
         image: valkey/valkey@sha256:495e4fecdc98ee48a20b207726caa5ab6451e0fac3642a9be10d9e70b3068df6 # 8
         ports:
           - 6379:6379
+        env:
+          # Services take no command args; the image appends this to
+          # valkey-server. `Db` in src/tests.rs needs more than 16 DBs.
+          VALKEY_EXTRA_FLAGS: --databases 32
         options: >-
           --health-cmd "valkey-cli ping"
           --health-interval 5s
