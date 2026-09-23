@@ -32,6 +32,12 @@ use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, trace, warn};
 
+// LAB-3877: Tier 0 request-content guard. Compiled only behind the `guard`
+// cargo feature; with it off, none of this module (or its scanner crates) is
+// built and request handling is unchanged.
+#[cfg(feature = "guard")]
+mod guard;
+
 // ── Config ──────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Clone)]
@@ -148,6 +154,9 @@ struct Config {
     /// They reveal the pooled capacity of every account behind the proxy, so
     /// this is trusted-network-only. Default: false (LAB-1191).
     expose_upstream_ratelimit_headers: Option<bool>,
+    /// Relay the caller-identity headers (`CLIENT_IDENTITY_HEADERS`) to the
+    /// upstream. Default: false = stripped once the proxy has used them (GH #168).
+    forward_caller_identity: Option<bool>,
     /// Client-supplied `anthropic-beta` flags forwarded upstream on OAuth
     /// endpoints ("*" suffix wildcards, like `endpoints[].models`). Absent =
     /// built-in default (`DEFAULT_CLIENT_BETA_ALLOWLIST`); a configured
@@ -184,6 +193,12 @@ struct ClientConfig {
     /// client without the field.
     #[serde(default)]
     preferred_endpoints: Vec<String>,
+    /// LAB-3877: Tier 0 content-guard policy for this client —
+    /// `"off" | "annotate" | "block"`, default `annotate` (shadow mode). The
+    /// operator-bypass client is always `off` regardless of this value.
+    #[cfg(feature = "guard")]
+    #[serde(default)]
+    guard: guard::GuardPolicy,
 }
 
 /// Hand-written, NOT derived: a derived `Debug` would print `key` verbatim into
@@ -192,12 +207,16 @@ struct ClientConfig {
 /// as `debug_header_value`'s redaction of sensitive headers.
 impl std::fmt::Debug for ClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientConfig")
-            .field("name", &self.name)
+        let mut ds = f.debug_struct("ClientConfig");
+        ds.field("name", &self.name)
             .field("key", &"<redacted>")
             .field("models", &self.models)
-            .field("preferred_endpoints", &self.preferred_endpoints)
-            .finish()
+            .field("preferred_endpoints", &self.preferred_endpoints);
+        // guard policy is not a secret; include it so the redacted Debug shows
+        // the full (non-key) field set.
+        #[cfg(feature = "guard")]
+        ds.field("guard", &self.guard);
+        ds.finish()
     }
 }
 
@@ -354,6 +373,10 @@ struct RedisRateInfo {
 
 #[derive(Default)]
 struct RateLimitInfo {
+    /// Set once this account has refused a claim key for being over
+    /// `MAX_CLAIMS_PER_ACCOUNT`, so the WARN is emitted once per process rather
+    /// than once per request. Runtime-only: never persisted or synced.
+    claim_cap_warned: bool,
     remaining_requests: Option<u64>,
     remaining_tokens: Option<u64>,
     limit_requests: Option<u64>,
@@ -482,7 +505,10 @@ const TAU_1H: f64 = 3600.0;
 const MAX_TRACKED_CLIENTS: usize = 10_000;
 
 /// Cap on distinct (client, model) labels in the allowlist-denial counter.
-/// The model half is caller-controlled; overflow buckets into `_other`.
+/// The model half is caller-controlled, and under legacy auth the client
+/// half is too (`x-client-id`), so overflow lumps into a single global
+/// ("_other", "_other") bucket — a HARD bound of cap + 1 entries (LAB-2332,
+/// mirroring the LAB-2330 fix to `client_model_usage`).
 const MAX_MODEL_DENIED_LABELS: usize = 64;
 
 /// Cap on distinct (client, model) pairs in the per-model usage counter
@@ -509,6 +535,102 @@ fn truncate_label(s: &str) -> String {
     }
     let mut out: String = s.chars().take(MAX_LABEL_CHARS).collect();
     out.push('…');
+    out
+}
+
+/// Cap on distinct UNRESERVED 7d claim keys per account. Keys are minted from
+/// the upstream `representative-claim` header — never from client input, but
+/// still an unvalidated remote string, and each one becomes a permanent `claim`
+/// label on the `anthropic_claim_*` series (CWE-770). Reserved keys are exempt,
+/// so the hard bound per account is `MAX_CLAIMS_PER_ACCOUNT` + the reserved set.
+const MAX_CLAIMS_PER_ACCOUNT: usize = 32;
+
+/// Claim keys the cap must NEVER refuse: the four that gate all traffic plus the
+/// normalised Fable band. A compile-time-closed set, so exempting them costs a
+/// bounded five entries — and not exempting them is a routing hazard, not merely
+/// a lost metric. `effective_utilization` skips its flat-field fallback whenever
+/// `claims_7d` is non-empty, so an account whose map is full of unknown keys
+/// with `seven_day` refused derives NO weekly utilization at all: it would route
+/// as though it had no weekly limit, and drop out of the emergency brake's
+/// all-accounts-saturated test while sitting at 100%.
+fn claim_key_is_reserved(key: &str) -> bool {
+    claim_gates_all_traffic(key) || key == FABLE_BAND_CLAIM
+}
+
+/// Whether a 7d claim key may be stored for this account. Mirrors the
+/// `MAX_TRACKED_CLIENTS` admission rule — keys already present always pass, so
+/// live claims keep updating past the cap — with reserved keys exempt entirely.
+///
+/// Overflow is dropped rather than folded into an `_other` bucket the way the
+/// caller-labelled counters do it, because bucketing would buy nothing here:
+/// both routing lookups (`resolve_7d_claim`, `constraining_7d_claims`) match
+/// exact keys and the brake's input is allowlist-filtered, so an unknown key is
+/// already inert to routing. Reserving the keys that are NOT inert is what makes
+/// the cap safe; the bucket would only add a fake claim to the metrics.
+///
+/// Logged once per account: the refusal fires per request under a claim flood,
+/// so a per-refusal line would let an upstream drive unbounded log volume —
+/// the same exhaustion class the cap itself closes.
+fn claim_admitted(info: &mut RateLimitInfo, key: &str, account: &str) -> bool {
+    if claim_key_is_reserved(key) || info.claims_7d.contains_key(key) {
+        return true;
+    }
+    // Count UNRESERVED keys only, matching `bound_ingested_claims`. Counting the
+    // whole map would let the reserved keys eat the budget, so an account
+    // carrying all five would admit 27 unknown claims rather than the
+    // documented 32 — and the live path would then disagree with the ingest
+    // path about the same bound. The map is at most 37 entries, so the scan is
+    // cheaper than the allocation it avoids.
+    let unreserved = info
+        .claims_7d
+        .keys()
+        .filter(|k| !claim_key_is_reserved(k))
+        .count();
+    if unreserved < MAX_CLAIMS_PER_ACCOUNT {
+        return true;
+    }
+    if !info.claim_cap_warned {
+        info.claim_cap_warned = true;
+        warn!(
+            account,
+            claim = key,
+            cap = MAX_CLAIMS_PER_ACCOUNT,
+            "claim cap reached; refusing unknown 7d claim keys for this account \
+             (routing-relevant keys are still admitted)"
+        );
+    }
+    false
+}
+
+/// Apply the key bound to a claims map that arrived whole rather than through
+/// the header parser — the persisted state file and the Redis mirror both
+/// assign `claims_7d` outright. Without this the bound holds only on the live
+/// path, and a state file written by a pre-cap build (or a peer replica still
+/// running one) restores an unbounded, untruncated map that `contains_key` then
+/// lets every junk key keep updating forever.
+///
+/// Reserved keys always survive. The rest are kept in sorted order so every
+/// replica and every restart retains the same subset rather than a
+/// HashMap-iteration-order lottery.
+fn bound_ingested_claims(
+    claims: HashMap<String, ClaimWindowData>,
+) -> HashMap<String, ClaimWindowData> {
+    let mut out: HashMap<String, ClaimWindowData> = claims
+        .into_iter()
+        .map(|(k, v)| (truncate_label(&k), v))
+        .collect();
+    let mut unreserved: Vec<String> = out
+        .keys()
+        .filter(|k| !claim_key_is_reserved(k))
+        .cloned()
+        .collect();
+    if unreserved.len() <= MAX_CLAIMS_PER_ACCOUNT {
+        return out;
+    }
+    unreserved.sort_unstable();
+    for key in unreserved.into_iter().skip(MAX_CLAIMS_PER_ACCOUNT) {
+        out.remove(&key);
+    }
     out
 }
 const TAU_6H: f64 = 21600.0;
@@ -549,8 +671,15 @@ impl BurnRate {
 const DEFAULT_EMERGENCY_THRESHOLD: f64 = 0.88;
 
 /// Claude Code system prompt required by the Anthropic API for OAuth tokens (sk-ant-oat*)
-/// to access sonnet/opus models. Must be the FIRST system block in the request.
+/// to access sonnet/opus models. Any position in the `system` array satisfies the upstream;
+/// it is inserted at index 0 unless a Claude Code attribution block already holds that slot.
 const OAUTH_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Prefix of the attribution block Claude Code sends as `system[0]` (client version +
+/// conversation fingerprint). The upstream strips it only when it arrives unchanged at
+/// index 0, so anything the proxy inserts must go AFTER it — otherwise the block reaches
+/// the model and the prompt-cache key.
+const ATTRIBUTION_BLOCK_PREFIX: &str = "x-anthropic-billing-header:";
 
 /// Max bytes of 429 response body to include in debug logs.
 const MAX_429_BODY_LOG_BYTES: usize = 512;
@@ -560,6 +689,28 @@ const MAX_429_BODY_LOG_BYTES: usize = 512;
 /// sensitive headers (e.g. `x-auth-foo`, `session-token`) are caught by default.
 const SENSITIVE_HEADER_SUBSTRINGS: &[&str] =
     &["auth", "cookie", "token", "key", "secret", "session"];
+
+/// True when a 429 is a transient BURST limit rather than capacity exhaustion:
+/// `x-should-retry` set, but no `retry-after` and no rate-limit headers.
+///
+/// This distinction is account-level and speed-blind. Anthropic applies burst
+/// (per-minute RPM / concurrency) limits to the ACCOUNT, not to a request's
+/// rate bucket, so a burst 429 is real evidence about the account even when
+/// the request asked for fast mode — which is why the fast-mode exemption in
+/// `classify_retry_status` defers to it (LAB-2675 panel finding). Shared with
+/// `mark_hard_limited_for`, which uses it to pick the backoff ladder over the
+/// capacity cooldown, so the two can never disagree on what "burst" means.
+fn is_burst_429(headers: &reqwest::header::HeaderMap) -> bool {
+    let has_rate_headers = headers.keys().any(|k| {
+        let name = k.as_str();
+        name.starts_with("anthropic-ratelimit-requests")
+            || name.starts_with("anthropic-ratelimit-tokens")
+            || name.starts_with("anthropic-ratelimit-unified-")
+            || name.starts_with("x-ratelimit-")
+    });
+    let should_retry = headers.get("x-should-retry").and_then(|v| v.to_str().ok()) == Some("true");
+    should_retry && !headers.contains_key("retry-after") && !has_rate_headers
+}
 
 /// Format 429 response headers and body for a single debug log line.
 /// Redacts sensitive headers, truncates body to MAX_429_BODY_LOG_BYTES.
@@ -723,6 +874,11 @@ struct AppState {
     /// `client_id` is that principal's name rather than a client-asserted
     /// header. Empty ⇒ legacy `proxy_key` / open behaviour.
     clients: Vec<ClientConfig>,
+    /// LAB-3877: Tier 0 content guard — the compiled scanners plus their
+    /// metrics. Built once at startup; scanned read-only per request. Present
+    /// only under the `guard` feature.
+    #[cfg(feature = "guard")]
+    guard: guard::Guard,
     allowed_ips: Vec<IpAllowEntry>,
     /// Load balancers whose `x-forwarded-for` is trusted (LAB-1192).
     /// Consulted only by `resolve_client_ip`. Empty = header ignored.
@@ -754,6 +910,8 @@ struct AppState {
     /// Per-client daily token budgets: client_id → max tokens per day.
     client_budgets: HashMap<String, u64>,
     /// Budget tracking: client_id → (epoch_day, tokens_used). Resets on new day.
+    /// Process-local; with Redis it is re-seeded from the shared counter every
+    /// sync tick (`fold_budget_mirror`, LAB-3217) so it survives restarts.
     budget_usage: Mutex<HashMap<String, (u64, u64)>>,
     /// Per-client utilization limits: client_id → max effective utilization.
     client_utilization_limits: HashMap<String, f64>,
@@ -810,9 +968,22 @@ struct AppState {
     /// Count of requests shed because the body was not fully received within
     /// `body_read_timeout`. Exposed as `anthropic_body_read_timeout_total`.
     body_read_timeout_total: AtomicU64,
+    /// Affinity overrides that migrated a session, indexed by `AffinityBind`
+    /// (what bound the sticky account). Exposed as
+    /// `anthropic_affinity_migrations_total{reason="loaded"|"spent"|"floored"}`.
+    affinity_migrations: [AtomicU64; 3],
+    /// Client-facing pool-exhaustion responses, indexed by `PoolExhaustion`.
+    /// Exposed as `anthropic_pool_exhausted_total{kind="rate_limited"|"transient"}`.
+    /// The only metric trace of the 429/503 a caller actually received when the
+    /// whole pool was unavailable (LAB-4189) — before this, exhaustion existed
+    /// solely as a `warn!` line, so there was nothing to graph or alert on.
+    pool_exhausted: [AtomicU64; 2],
     /// Reflect upstream `anthropic-ratelimit-*` headers to callers (see
     /// `Config::expose_upstream_ratelimit_headers`). Default: false.
     expose_upstream_ratelimit_headers: bool,
+    /// Relay caller-identity headers upstream (see
+    /// `Config::forward_caller_identity`). Default: false = stripped.
+    forward_caller_identity: bool,
     /// `anthropic-beta` flags a client may forward upstream on OAuth
     /// endpoints ("*" suffix wildcards). Flags outside the list are dropped.
     allowed_client_betas: Vec<String>,
@@ -833,11 +1004,21 @@ struct AppState {
     /// Upstream "prompt is too long" 400s by model (LAB-916). Exposed as
     /// `anthropic_prompt_too_long_total`; bounded via `_other` overflow.
     prompt_too_long: Mutex<HashMap<String, u64>>,
+    /// Upstream 429s on fast-mode requests, by account (LAB-2675). These are
+    /// forwarded to the caller instead of cooling the account — fast mode has
+    /// its own rate bucket — so this counter is the only operator-visible
+    /// trace of a client draining fast capacity. Exposed as
+    /// `anthropic_fast_mode_429_total{account}`. Account names come from
+    /// config, so the label set is bounded by the operator and needs no
+    /// `_other` overflow (unlike the caller-controlled `prompt_too_long` key).
+    fast_mode_429: Mutex<HashMap<String, u64>>,
     /// Per-client model-allowlist denials, keyed (client, model) (LAB-1083).
-    /// Exposed as `anthropic_client_model_denied_total`. `client` is an
-    /// authenticated principal so it is bounded by config, but `model` is
-    /// caller-controlled — bounded via the same `_other` overflow as
-    /// `prompt_too_long`.
+    /// Exposed as `anthropic_client_model_denied_total`. Under `[[clients]]`
+    /// auth `client` is a credential-bound principal, but under legacy
+    /// `proxy_key` / `allow_unauthenticated` it comes from the
+    /// caller-controlled `x-client-id` header — so overflow lumps into a
+    /// single global ("_other", "_other") bucket, hard-bounding the map at
+    /// `MAX_MODEL_DENIED_LABELS` + 1 entries (LAB-2332).
     model_denied: Mutex<HashMap<(String, String), u64>>,
     /// (endpoint idx, model) pairs an upstream rejected as unsupported — a
     /// gateway without the model, or a plan without access (LAB-941).
@@ -1005,7 +1186,16 @@ struct RoutingCandidate {
     gate_7d: f64,
     gate: f64,
     wr: f64,
+    /// Unused share of the model's weekly (7d) quota; 1.0 when unknown or
+    /// superseded by overage. Time-free — the affinity override reads this,
+    /// never `wr`/`weight` (see `affinity_headroom`).
+    unused_7d: f64,
     weight: f64,
+    /// The effective `gate` is set by an Anthropic status floor
+    /// (`status_to_floor`) that exceeds raw utilisation, not by raw load or
+    /// overage. Drives `affinity_headroom`'s `Floored` classification so a
+    /// routine status-floor migration logs at INFO, not WARN (LAB-3295).
+    gate_floor_bound: bool,
     source: &'static str,
 }
 
@@ -2019,19 +2209,117 @@ impl AppState {
         }
     }
 
+    /// LAB-3877: resolve the Tier 0 guard policy for a client. The operator
+    /// bypass is always `Off` (it forwards operator-trusted content). Otherwise
+    /// the client's configured policy, defaulting to `Annotate` (shadow mode)
+    /// for any caller not in the table — including the legacy unknown-client
+    /// "-" and open-`proxy_key` modes, so shadow mode observes everything.
+    #[cfg(feature = "guard")]
+    fn client_guard_policy(&self, client_id: &str) -> guard::GuardPolicy {
+        if self.is_operator(client_id) {
+            return guard::GuardPolicy::Off;
+        }
+        self.clients
+            .iter()
+            .find(|c| c.name == client_id)
+            .map(|c| c.guard)
+            .unwrap_or_default()
+    }
+
+    /// LAB-3877: run the Tier 0 content guard for one request — after
+    /// `pre_request_gate`, before endpoint selection, on every surface that
+    /// forwards client content (`proxy_handler` and `openai_chat_handler`).
+    /// `Ok(Some(n))` is an `Annotate` count for `X-Guard-Findings`; `Err` is
+    /// the 400 to return instead, in the OpenAI envelope when `openai_shape`.
+    ///
+    /// Fail closed under `block`: a body the guard could not scan in full
+    /// cannot be certified clean, so it is rejected rather than forwarded
+    /// unscanned (LAB-3877 review). Two cases, both bypasses of an enforcing
+    /// policy otherwise: `unscannable` — the caller sent content the scanner
+    /// cannot read (a non-empty body that did not parse, or an OpenAI shape
+    /// translation cannot map), so a parse differential vs the upstream could
+    /// smuggle content past the scan — and a newest turn longer than the scan
+    /// cap, whose tail was never inspected (the "pad past the cap, then the
+    /// secret" bypass). A body that parsed but carried no scannable text (e.g.
+    /// an image-only turn) is NOT a scan failure and is allowed. Annotate /
+    /// shadow mode never rejects — it measures best-effort.
+    ///
+    /// `unscannable` carries its own reason because the causes are not alike:
+    /// the body that did not parse and the body whose `messages` is the wrong
+    /// shape both reach here, and telling a client the second was a parse
+    /// failure sends whoever debugs it after a JSON syntax error that is not
+    /// there. Reasons are `&'static str` — no request content may enter them.
+    #[cfg(feature = "guard")]
+    fn guard_hook(
+        &self,
+        req_id: &str,
+        client_id: &str,
+        unscannable: Option<&'static str>,
+        input: Option<&guard::ScanInput>,
+        openai_shape: bool,
+    ) -> Result<Option<usize>, Box<Response>> {
+        let policy = self.client_guard_policy(client_id);
+        let truncated = input.is_some_and(guard::ScanInput::truncated);
+        if policy == guard::GuardPolicy::Block {
+            let reason = if let Some(reason) = unscannable {
+                Some(reason)
+            } else if truncated {
+                Some("request exceeds the guard scan limit and cannot be scanned in full")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                warn!(
+                    req_id,
+                    client_id = %client_id,
+                    verdict = "block",
+                    reason,
+                    "guard: fail-closed (unscannable under block policy)"
+                );
+                return Err(Box::new(guard_blocked_response(&[], reason, openai_shape)));
+            }
+        }
+        let (verdict, findings, reason) = match self.guard.evaluate(policy, client_id, input) {
+            guard::Verdict::Allow => return Ok(None),
+            guard::Verdict::Annotate { findings } => ("annotate", findings, None),
+            guard::Verdict::Block { findings, reason } => ("block", findings, Some(reason)),
+        };
+        warn!(
+            req_id,
+            client_id = %client_id,
+            verdict,
+            findings = findings.len(),
+            truncated,
+            detections = %guard::detections_summary(&findings),
+            "guard"
+        );
+        match reason {
+            None => Ok(Some(findings.len())),
+            Some(reason) => Err(Box::new(guard_blocked_response(
+                &findings,
+                &reason,
+                openai_shape,
+            ))),
+        }
+    }
+
     /// Count + log a model-allowlist denial.
     ///
     /// The model string is caller-controlled and bounded only by the request
     /// body cap, so it is truncated BEFORE becoming a map key: an untruncated
     /// label would be retained for the process lifetime and re-serialized into
-    /// the `/metrics` body on every scrape. Label COUNT is separately bounded
-    /// by `_other` overflow.
+    /// the `/metrics` body on every scrape. Label COUNT is separately
+    /// hard-bounded at `MAX_MODEL_DENIED_LABELS` + 1: once the cap is
+    /// reached, every new pair lumps into a single global
+    /// `("_other", "_other")` bucket.
     ///
     /// Logs at `warn` the first time a (client, model) pair is denied and at
     /// `debug` thereafter — a client hammering a denied model must not be able
-    /// to drive unbounded warn-level log volume. The counter still records
-    /// every denial. Mirrors the once-per-model pattern used for
-    /// unsupported-model warnings.
+    /// to drive unbounded warn-level log volume. Pairs lumped into the
+    /// overflow bucket share its first-seen flag (deliberate: client-id
+    /// rotation must not mint warns). The counter still records every denial.
+    /// Mirrors the once-per-model pattern used for unsupported-model
+    /// warnings.
     fn note_model_denied(&self, client_id: &str, model: &str) {
         let model = truncate_label(model);
         let mut first_time = true;
@@ -2040,7 +2328,13 @@ impl AppState {
             let label = if counts.len() < MAX_MODEL_DENIED_LABELS || counts.contains_key(&key) {
                 key
             } else {
-                (client_id.to_owned(), "_other".to_owned())
+                // Map full and this pair is new: lump into ONE global
+                // overflow bucket — hard bound of MAX_MODEL_DENIED_LABELS
+                // + 1 entries. A per-client ("<client>", "_other") key
+                // would let x-client-id rotation (legacy auth modes) grow
+                // the map without bound (expert-panel finding, LAB-2330;
+                // mirrored here by LAB-2332).
+                ("_other".to_owned(), "_other".to_owned())
             };
             let entry = counts.entry(label).or_insert(0);
             first_time = *entry == 0;
@@ -2084,8 +2378,10 @@ impl AppState {
             let id = id.trim();
             // "_operator" is the reserved operator-aggregation label on
             // /_stats and /metrics — a self-asserted claim to it would merge
-            // this caller's usage into the hidden operator bucket.
-            if !id.is_empty() && id != "-" && id != "_operator" {
+            // this caller's usage into the hidden operator bucket. "_other"
+            // is the reserved metrics overflow-bucket label (LAB-2330/2332) —
+            // claiming it would merge this caller into the overflow key.
+            if !id.is_empty() && id != "-" && id != "_operator" && id != "_other" {
                 return id.to_string();
             }
         }
@@ -2469,8 +2765,15 @@ impl AppState {
         match req.send().await {
             Ok(resp) => {
                 let status = resp.status();
-                self.update_rate_info_for(&ep.rate_info, &ep.name, resp.headers())
-                    .await;
+                self.update_rate_info_for(
+                    &ep.rate_info,
+                    &ep.name,
+                    resp.headers(),
+                    // Probes never request fast mode (PROBE_MODELS, fixed body).
+                    /* is_fast_mode */
+                    false,
+                )
+                .await;
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     self.mark_hard_limited_for(&ep.rate_info, &ep.name, resp.headers())
                         .await;
@@ -2592,7 +2895,11 @@ impl AppState {
                 info.utilization = pa.utilization;
                 info.utilization_7d = pa.utilization_7d;
                 info.utilization_5h = pa.utilization_5h;
-                info.representative_claim = pa.representative_claim.clone();
+                // Truncated alongside the claim map below: `metrics_gate_weight`
+                // looks this key up in `claims_7d`, whose keys
+                // `bound_ingested_claims` truncates, so an untruncated copy
+                // would miss its own entry (same reason as the header path).
+                info.representative_claim = pa.representative_claim.as_deref().map(truncate_label);
                 info.reset_5h = pa.reset_5h;
                 info.status_5h = pa.status_5h.clone();
                 info.overage_in_use = pa.overage_in_use;
@@ -2603,15 +2910,15 @@ impl AppState {
 
                 // Load claims_7d: either from persisted map or migrate from flat fields
                 if !pa.claims_7d.is_empty() {
-                    info.claims_7d = pa.claims_7d.clone();
+                    info.claims_7d = bound_ingested_claims(pa.claims_7d.clone());
                 } else if let Some(util_7d) = pa.utilization_7d {
                     // Migration: old state file with flat 7d fields only
-                    let key = pa
-                        .representative_claim
-                        .as_deref()
-                        .filter(|c| c.starts_with("seven_day"))
-                        .unwrap_or("seven_day")
-                        .to_string();
+                    let key = truncate_label(
+                        pa.representative_claim
+                            .as_deref()
+                            .filter(|c| c.starts_with("seven_day"))
+                            .unwrap_or("seven_day"),
+                    );
                     info.claims_7d.insert(
                         key,
                         ClaimWindowData {
@@ -2942,6 +3249,13 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     // Fast mode (LAB-2669): body-paired with top-level `speed` — same
     // header-stripped/body-forwarded hard-400 shape as the families above.
     "fast-mode-*",
+    // Auto-mode classifier (LAB-3963): `dangerous-tool-use-*` is body-paired
+    // with top-level `safeguards` — same hard-400 shape as the families above,
+    // and Claude Code answers that 400 by denying every auto-mode tool use for
+    // the rest of the conversation. `auto-mode-classifier-*` rides the
+    // classifier's own follow-up requests.
+    "auto-mode-classifier-*",
+    "dangerous-tool-use-*",
 ];
 
 /// Cardinality bound for `beta_flags_dropped` — flag names are
@@ -2970,12 +3284,89 @@ fn beta_flag_allowed(allowed: &[String], flag: &str) -> bool {
 }
 
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
-/// weight is below 50% of the alternative, stickiness is broken immediately.
+/// `affinity_headroom` is below 50% of the alternative's, stickiness is broken.
 const LEGACY_AFFINITY_OVERRIDE_RATIO: f64 = 0.5;
 
-/// Sticky-weighted override threshold. Lower than the legacy algorithm to
-/// preserve cache locality and only break stickiness for egregious disparities.
+/// Sticky-weighted override threshold on `affinity_headroom`. Lower than the
+/// legacy algorithm to preserve cache locality and only break stickiness for
+/// egregious disparities.
 const STICKY_WEIGHTED_OVERRIDE_RATIO: f64 = 0.25;
+
+/// Which window bound the sticky account when an affinity override fired.
+/// Label value of `anthropic_affinity_migrations_total{reason}`; also indexes
+/// `AppState::affinity_migrations`.
+#[derive(Clone, Copy)]
+enum AffinityBind {
+    /// The effective gate is tighter, bound by raw (time-adjusted) 5h
+    /// utilisation or overage — the pool is the bottleneck (operator-actionable).
+    Loaded = 0,
+    /// Unused weekly quota is tighter — one account's week is nearly spent.
+    Spent = 1,
+    /// The gate is tighter, but set by an Anthropic status floor
+    /// (`status_to_floor`) that exceeds raw utilisation — the LB is moving the
+    /// session off an account Anthropic flagged, onto fresh capacity. Routine,
+    /// not a pool-health signal: logged at INFO, not WARN (LAB-3295).
+    Floored = 2,
+}
+
+impl AffinityBind {
+    const ALL: [Self; 3] = [Self::Loaded, Self::Spent, Self::Floored];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::Spent => "spent",
+            Self::Floored => "floored",
+        }
+    }
+}
+
+/// Why the proxy gave up on the whole pool and answered the caller itself.
+/// Label value of `anthropic_pool_exhausted_total{kind}`; also indexes
+/// `AppState::pool_exhausted`. Closed by the type system, so this counter's
+/// label set cannot grow.
+#[derive(Clone, Copy)]
+enum PoolExhaustion {
+    /// Every endpoint was rate-limited or gated (or a round saw a 529) — the
+    /// `429 exhausted all endpoints` arm. Recovery is minutes-to-hours.
+    RateLimited = 0,
+    /// Every endpoint failed in transport with no 529 — the retryable
+    /// `503 + Retry-After` arm.
+    Transient = 1,
+}
+
+impl PoolExhaustion {
+    const ALL: [Self; 2] = [Self::RateLimited, Self::Transient];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate_limited",
+            Self::Transient => "transient",
+        }
+    }
+}
+
+/// Capacity a candidate has left to keep a sticky session, and which window
+/// binds it. Both terms are time-free. Deliberately NOT `weight`: weight =
+/// waste_risk × headroom, and waste_risk's denominator is time-to-weekly-reset,
+/// so an account that reset yesterday read ~8x "worse" than one resetting in
+/// hours at identical load — which migrated 25% of prod sessions off the
+/// FRESHEST accounts in the pool (GH#156). waste_risk stays in the bucket
+/// weights, where burning expiring quota first is the point.
+fn affinity_headroom(c: &RoutingCandidate) -> (f64, AffinityBind) {
+    let loaded = (1.0 - c.gate).max(0.0);
+    if c.unused_7d < loaded {
+        (c.unused_7d, AffinityBind::Spent)
+    } else if c.gate_floor_bound {
+        // Same headroom value as `Loaded` — routing decision unchanged — but a
+        // distinct reason so a status-floor-forced migration is not mistaken
+        // for pool exhaustion (LAB-3295). Only when the gate (not weekly quota)
+        // binds; a genuinely spent week is `Spent` above and stays WARN.
+        (loaded, AffinityBind::Floored)
+    } else {
+        (loaded, AffinityBind::Loaded)
+    }
+}
 
 /// Extract version string from User-Agent header.
 /// "claude-cli/2.1.68 (external, cli)" → "2.1.68"
@@ -3006,6 +3397,62 @@ fn model_family(model: &str) -> &str {
     } else {
         ""
     }
+}
+
+/// Claude ≥ 4.7 hard-rejects sampling `temperature` — the API returns a
+/// non-retryable `invalid_request_error` ("`temperature` is deprecated for
+/// this model") for any value other than the default 1 (LAB-798, verified
+/// against the live API 2026-07-25). The version is the numeric segments
+/// after the family name: "claude-sonnet-4-5-20250929" → 4.5,
+/// "claude-fable-5[1m]" → 5.0. Old-style ids ("claude-3-5-sonnet-…") put the
+/// version before the family and parse as 0.0 → accepts, which is correct
+/// (all 3.x models take temperature). Unknown families also parse as
+/// accepting: forward unchanged and let the upstream decide.
+fn model_rejects_temperature(model: &str) -> bool {
+    let family = model_family(model);
+    if family.is_empty() {
+        return false;
+    }
+    let Some((_, rest)) = model.split_once(family) else {
+        return false;
+    };
+    let mut nums = rest.split('-').filter(|s| !s.is_empty()).map_while(|seg| {
+        let end = seg.find(|c: char| !c.is_ascii_digit()).unwrap_or(seg.len());
+        // 4+ digit runs are date stamps ("-20250929"), not version parts
+        if end == 0 || end >= 4 {
+            None
+        } else {
+            seg[..end].parse::<u32>().ok()
+        }
+    });
+    let major = nums.next().unwrap_or(0);
+    let minor = nums.next().unwrap_or(0);
+    (major, minor) >= (4, 7)
+}
+
+/// Decide whether a request's `temperature` must be dropped before
+/// forwarding, and log the operator-visible warn when it is. Shared by every
+/// path that builds an upstream body (LAB-798): the OpenAI→Anthropic shim,
+/// the Anthropic→OpenAI fallback translator, and the raw OpenAI passthrough —
+/// a `protocol = "openai"` endpoint can front Claude too, so all three must
+/// agree.
+///
+/// Only confirmed non-default numerics are dropped: the default (1) is still
+/// accepted upstream, and most OpenAI SDKs send it unprompted — warning on
+/// every default-sending request would be spam. Non-numeric junk ("0.7",
+/// null) forwards so it earns the same upstream type error it gets on ≤ 4.6
+/// models. The per-drop warn is deliberate: the client asked for sampling
+/// behavior it will not get, and that must stay visible to operators.
+fn drops_deprecated_temperature(model: &str, value: &serde_json::Value) -> bool {
+    if !model_rejects_temperature(model) || !matches!(value.as_f64(), Some(t) if t != 1.0) {
+        return false;
+    }
+    warn!(
+        model = %truncate_label(model),
+        temperature = %value,
+        "dropping `temperature`: deprecated and hard-rejected by this model"
+    );
+    true
 }
 
 /// Internal claim key for the Fable included-usage band. On Max plans Fable is
@@ -3158,13 +3605,11 @@ fn status_to_ordinal(status: Option<&str>) -> f64 {
         Some("throttled") => 2.0,
         Some("allowed_warning") => 1.0,
         Some("allowed") | None => 0.0,
-        Some(unknown) => {
-            warn!(
-                status = unknown,
-                "unknown rate-limit status in ordinal mapping"
-            );
-            1.0
-        }
+        // Unknown maps to the warning tier, silently: this is a read-only
+        // exposition helper called once per account per claim per scrape, and
+        // `status_to_floor` already WARNs on the same unknown string where it
+        // actually changes a routing decision.
+        Some(_) => 1.0,
     }
 }
 
@@ -3329,7 +3774,11 @@ struct RoutingWeight {
     gate_7d: f64,
     gate: f64,
     wr: f64,
+    /// See `RoutingCandidate::unused_7d`.
+    unused_7d: f64,
     weight: f64,
+    /// See `RoutingCandidate::gate_floor_bound`.
+    gate_floor_bound: bool,
     source: &'static str,
     /// Account is serving via paid overage — caller demotes its priority tier.
     overage_active: bool,
@@ -3368,6 +3817,25 @@ fn compute_routing_weight(
             }
         })
     };
+
+    // Whether a status floor (`status_to_floor` inside `time_adjusted_utilization`)
+    // raised `gate_5h` above its raw time-adjusted utilisation. Compared against
+    // the ALREADY-computed `gate_5h` — not a second status-bearing call — so the
+    // two can't drift AND `status_to_floor` is evaluated only once: a duplicate
+    // status-bearing call would re-emit its unknown-status WARN, the very noise
+    // this ticket removes (CodeRabbit on #175). The floor-free call shares
+    // `gate_5h`'s inputs, so it is `None` exactly on `gate_5h`'s fallback path,
+    // where no floor applies → not floor-bound. False under staleness (gate is a
+    // fixed 0.5). Feeds `AffinityBind::Floored` (LAB-3295).
+    let gate_5h_floor_bound = !stale_after_hard_limit
+        && time_adjusted_utilization(
+            info.utilization_5h,
+            info.reset_5h,
+            None,
+            NEAR_RESET_5H_SECS,
+            now_epoch,
+        )
+        .is_some_and(|unfloored| gate_5h > unfloored);
 
     // 7d model-specific gate and waste risk. For Fable both the band claim and
     // the general weekly claim constrain (headroom = min of the two remainders);
@@ -3440,6 +3908,51 @@ fn compute_routing_weight(
         (gate_5h.max(gate_7d), wr_7d, source_7d)
     };
 
+    // Weekly headroom for the affinity override (`affinity_headroom`): 1.0 when
+    // unknown or superseded by overage, else the tighter of the primary claim
+    // and (Fable) the pool it draws from. Reuses the gate's near-reset ramp so
+    // quota expiring within NEAR_RESET_7D_SECS reads as headroom, not "spent":
+    // the bucket weights pull sessions ONTO expiring accounts and the override
+    // must not push them straight back off. Status floors are the gate's job
+    // (`None`). Deliberately not hedged under stale_after_hard_limit — a 429
+    // says nothing about how much of the week is spent.
+    // ponytail: 6h ramp; an account with ≤25% of its week left and 6h–~30h to
+    // reset still reads "spent" while the buckets favour it. Widen the ramp if
+    // that WARN band shows up in prod.
+    let unused_of = |c: &ClaimWindowData| {
+        let util =
+            time_adjusted_utilization(c.utilization, c.reset, None, NEAR_RESET_7D_SECS, now_epoch)
+                .unwrap_or(0.0);
+        (1.0 - util).max(0.0)
+    };
+    let unused_7d = if overage_active {
+        1.0
+    } else {
+        primary_7d.map_or(1.0, |c| {
+            pool_cap_7d
+                .iter()
+                .fold(unused_of(c), |u, p| u.min(unused_of(p)))
+        })
+    };
+
+    // Floor-bound: the effective `gate` is set by an Anthropic status floor that
+    // exceeds raw utilisation, not by raw load or overage. Routine — Anthropic
+    // flagged the account and the LB is migrating the session off it — so the
+    // affinity override logs it at INFO, not a pool-health WARN (LAB-3295).
+    // The 7d gate is a pure status floor (`gate_of` forces util=0), so its
+    // winning over gate_5h (which is >= 0) means a non-zero floor bound the gate;
+    // the 5h case is `gate_5h_floor_bound`. Overage never floors (its gate comes
+    // from the overage window); staleness is already excluded by both terms.
+    //
+    // ponytail: `Floored` covers EVERY status floor, not just `allowed_warning`
+    // (0.80) — `throttled` (0.98) and `rejected` (1.0) too. That is intended
+    // (AC-1: "status_to_floor is non-zero and set the gate"): a `rejected`
+    // account has weight 0 so it is never the sticky pick and never reaches
+    // here, and a lone `throttled` account with a healthy alternative is the
+    // same single-account-flagged case, not pool exhaustion. If throttled/
+    // rejected migrations ever need to stay loud, split on the floor tier here.
+    let gate_floor_bound = !overage_active && (gate_7d > gate_5h || gate_5h_floor_bound);
+
     let headroom = (1.0 - gate).max(0.01);
     let weight = if wr > 0.0 { wr * headroom } else { headroom };
     let weight = if gate >= 1.0 { 0.0 } else { weight };
@@ -3449,6 +3962,8 @@ fn compute_routing_weight(
         gate_7d,
         gate,
         wr,
+        unused_7d,
+        gate_floor_bound,
         weight,
         source,
         overage_active,
@@ -3638,7 +4153,9 @@ impl AppState {
                         gate_7d: 0.0,
                         gate: 0.0,
                         wr: 0.0,
+                        unused_7d: 1.0,
                         weight: 1.0,
+                        gate_floor_bound: false,
                         source: "openai",
                     });
                 }
@@ -3709,7 +4226,9 @@ impl AppState {
                         gate_7d: rw.gate_7d,
                         gate: rw.gate,
                         wr: rw.wr,
+                        unused_7d: rw.unused_7d,
                         weight: rw.weight,
+                        gate_floor_bound: rw.gate_floor_bound,
                         source: rw.source,
                     });
                 }
@@ -4152,20 +4671,39 @@ impl AppState {
             } else {
                 effective[0]
             };
-            if picked.weight < other.weight * LEGACY_AFFINITY_OVERRIDE_RATIO {
+            let (picked_headroom, bind) = affinity_headroom(picked);
+            let (other_headroom, _) = affinity_headroom(other);
+            if picked_headroom < other_headroom * LEGACY_AFFINITY_OVERRIDE_RATIO {
+                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
                 // Loud on purpose — see the StickyWeightedV2 override below for
                 // the cascade rationale. Breaking affinity is a pool-health
-                // warning sign, not routine.
-                warn!(
-                    strategy = RoutingStrategy::DynamicCapacityV1.as_str(),
-                    affinity = affinity_key.unwrap_or("-"),
-                    picked_account = self.endpoint_name(picked.endpoint),
-                    picked_weight = format!("{:.3}", picked.weight),
-                    other_account = self.endpoint_name(other.endpoint),
-                    other_weight = format!("{:.3}", other.weight),
-                    ratio = format!("{:.3}", picked.weight / other.weight),
-                    "affinity broken: sticky endpoint too loaded, migrating session (cascade risk)"
-                );
+                // warning sign, NOT routine — EXCEPT when a status floor bound
+                // the sticky account (`Floored`): Anthropic flagged it and we're
+                // moving the session onto fresh capacity, which is what the
+                // floor exists for. That case logs at INFO (LAB-3295); the
+                // counter still records every migration by reason. The field set
+                // is identical across levels — only tracing's compile-time level
+                // forces the two arms — so it lives once in this local macro.
+                macro_rules! log_migration {
+                    ($lvl:ident, $msg:literal) => {
+                        $lvl!(
+                            strategy = RoutingStrategy::DynamicCapacityV1.as_str(),
+                            affinity = affinity_key.unwrap_or("-"),
+                            reason = bind.as_str(),
+                            picked_account = self.endpoint_name(picked.endpoint),
+                            picked_headroom = format!("{:.3}", picked_headroom),
+                            other_account = self.endpoint_name(other.endpoint),
+                            other_headroom = format!("{:.3}", other_headroom),
+                            ratio = format!("{:.3}", picked_headroom / other_headroom),
+                            $msg
+                        )
+                    };
+                }
+                if matches!(bind, AffinityBind::Floored) {
+                    log_migration!(info, "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)");
+                } else {
+                    log_migration!(warn, "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)");
+                }
                 picked = other;
             }
             // NOTE: Request-balance override intentionally disabled. The previous
@@ -4187,15 +4725,16 @@ impl AppState {
         let mut picked = self.pick_weighted_bucket(effective, total_weight, affinity_key);
 
         if let Some(key) = affinity_key {
-            let best = effective
+            let (picked_headroom, bind) = affinity_headroom(picked);
+            let (best, best_headroom) = effective
                 .iter()
-                .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap())
-                .copied()
+                .map(|c| (*c, affinity_headroom(c).0))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap();
             if best.endpoint != picked.endpoint
-                && picked.weight < best.weight * STICKY_WEIGHTED_OVERRIDE_RATIO
+                && picked_headroom < best_headroom * STICKY_WEIGHTED_OVERRIDE_RATIO
             {
-                // The sticky account is too loaded to keep this session. Do NOT
+                // The sticky account is out of headroom for this session. Do NOT
                 // migrate to `best` (the global argmax): that target rotates every
                 // request as utilizations drift, so a session chases it across the
                 // whole pool and pays a cold-cache `cache_creation` charge on every
@@ -4221,19 +4760,40 @@ impl AppState {
                 } else {
                     best
                 };
-                // Loud on purpose: sustained breaking means the pool is the
-                // bottleneck — add capacity, don't tune the ratio.
-                warn!(
-                    strategy = RoutingStrategy::StickyWeightedV2.as_str(),
-                    affinity = key,
-                    picked_account = self.endpoint_name(picked.endpoint),
-                    picked_weight = format!("{:.3}", picked.weight),
-                    replacement_account = self.endpoint_name(replacement.endpoint),
-                    replacement_weight = format!("{:.3}", replacement.weight),
-                    best_account = self.endpoint_name(best.endpoint),
-                    ratio = format!("{:.3}", picked.weight / best.weight),
-                    "affinity broken: sticky endpoint too loaded, migrating session to stable replacement"
-                );
+                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
+                // Loud on purpose. Sustained breaking with reason="loaded" means
+                // the pool is the bottleneck — add capacity, don't tune the
+                // ratio. reason="spent" means one account's week is nearly gone
+                // while others are fresh; expect it to cluster before weekly
+                // resets and vanish after. reason="floored" is neither: Anthropic
+                // put a status floor on the sticky account and we're moving the
+                // session onto fresh capacity — the floor doing its job, not a
+                // pool problem. It logs at INFO so the WARN stays a real signal
+                // (LAB-3295); the counter records all three. Field set is
+                // identical across levels — tracing's compile-time level forces
+                // the two arms — so it lives once in this local macro.
+                macro_rules! log_migration {
+                    ($lvl:ident, $msg:literal) => {
+                        $lvl!(
+                            strategy = RoutingStrategy::StickyWeightedV2.as_str(),
+                            affinity = key,
+                            reason = bind.as_str(),
+                            picked_account = self.endpoint_name(picked.endpoint),
+                            picked_headroom = format!("{:.3}", picked_headroom),
+                            replacement_account = self.endpoint_name(replacement.endpoint),
+                            replacement_headroom =
+                                format!("{:.3}", affinity_headroom(replacement).0),
+                            best_account = self.endpoint_name(best.endpoint),
+                            ratio = format!("{:.3}", picked_headroom / best_headroom),
+                            $msg
+                        )
+                    };
+                }
+                if matches!(bind, AffinityBind::Floored) {
+                    log_migration!(info, "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)");
+                } else {
+                    log_migration!(warn, "affinity broken: sticky endpoint out of headroom, migrating session to stable replacement");
+                }
                 picked = replacement;
             }
         }
@@ -4431,8 +4991,13 @@ impl AppState {
     #[cfg(test)]
     async fn update_rate_info(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
         let ep = &self.endpoints[idx];
-        self.update_rate_info_for(&ep.rate_info, &ep.name, headers)
-            .await;
+        self.update_rate_info_for(
+            &ep.rate_info,
+            &ep.name,
+            headers,
+            /* is_fast_mode */ false,
+        )
+        .await;
     }
 
     /// Parse rate-limit headers from a response into the supplied
@@ -4442,7 +5007,39 @@ impl AppState {
         rate_info: &RwLock<RateLimitInfo>,
         endpoint_name: &str,
         headers: &reqwest::header::HeaderMap,
+        is_fast_mode: bool,
     ) {
+        // A fast-mode response's `anthropic-ratelimit-unified-*` headers
+        // describe the FAST/paid POOL, not the account's 5h/7d subscription
+        // windows. On the observed wire (LAB-2693 / anthropic-lb#163,
+        // 2026-09-02) a fast 200 reports `representative-claim: overage`,
+        // `overage-in-use: true`, the `overage-*` block, and NO `five_hour`
+        // claim — every field is fast-pool, none is account headroom. Ingesting
+        // it flipped `overage_in_use` true, and `routing_candidates` then added
+        // `overage_penalty`, demoting the serving account out of standard
+        // rotation on a single fast request. Fast mode bills a bucket separate
+        // from the standard windows (#161), so skip the whole ingest and leave
+        // the standard view as the last standard response left it (stale, not
+        // corrupted). `last_updated` therefore does not advance on fast-pool
+        // data, which keeps the background probe treating the view as due for
+        // refresh.
+        //
+        // This keys on the REQUEST, not the response: a fast-pool `overage` 200
+        // is indistinguishable on the wire from a genuine-overage standard 200
+        // (see the negative-control test), so the response alone cannot be
+        // classified — gating on `overage` markers would suppress real overage
+        // tracking on standard traffic. The invariant this relies on: a
+        // response to a fast request carries no genuine account 5h/7d claim. It
+        // holds today — fast-capable accounts answer from the fast pool, and a
+        // fast-disabled org returns 400 rather than a standard 200 (#160 also
+        // routes fast requests away from those accounts). If it ever breaks, a
+        // fast response could still freeze this account's standard view; the
+        // ≤`probe_interval_secs` background probe refreshes the real 5h/7d view
+        // regardless of traffic, bounding that staleness.
+        if is_fast_mode {
+            return;
+        }
+
         let mut info = rate_info.write().await;
 
         // Debug: log all ratelimit headers
@@ -4469,16 +5066,25 @@ impl AppState {
             .map(|s| s.to_string());
 
         if let Some(ref claim) = rep_claim {
-            info.representative_claim = Some(claim.clone());
+            // Truncated for the same reason as the claim key below, plus one of
+            // its own: `refresh_metrics_weights` looks this string up in the
+            // (now truncated) claims map, so an untruncated copy would miss its
+            // own entry and silently report a different claim than the router used.
+            info.representative_claim = Some(truncate_label(claim));
         }
 
         // Determine the claim key for 7d data storage.
         // If claim starts with "seven_day", use it verbatim (e.g., "seven_day_sonnet").
         // Otherwise default to "seven_day" (general bucket).
-        let claim_key_7d = rep_claim
-            .as_deref()
-            .filter(|c| c.starts_with("seven_day"))
-            .unwrap_or("seven_day");
+        // Truncated because the key outlives the response as a `claim` metric
+        // label — see `truncate_label`.
+        let claim_key_7d = truncate_label(
+            rep_claim
+                .as_deref()
+                .filter(|c| c.starts_with("seven_day"))
+                .unwrap_or("seven_day"),
+        );
+        let claim_key_7d = claim_key_7d.as_str();
 
         // Capture 5h utilization (flat — no per-model sub-budgets observed for 5h).
         // Track whether we got utilization for sticky status fix (Bug #1).
@@ -4500,10 +5106,19 @@ impl AppState {
         {
             if let Ok(s) = v.to_str() {
                 if let Ok(util) = s.parse::<f64>() {
-                    let entry = info.claims_7d.entry(claim_key_7d.to_string()).or_default();
-                    entry.utilization = Some(util.clamp(0.0, 1.0));
-                    entry.last_seen = now_epoch;
-                    true
+                    // The header parser's only growth point for `claims_7d`
+                    // (`bound_ingested_claims` covers the two wholesale assigns).
+                    // A refused key reports `false` because it stored nothing —
+                    // reporting parsed 7d utilization for data that was dropped
+                    // would be a lie to every consumer of that flag.
+                    if claim_admitted(&mut info, claim_key_7d, endpoint_name) {
+                        let entry = info.claims_7d.entry(claim_key_7d.to_string()).or_default();
+                        entry.utilization = Some(util.clamp(0.0, 1.0));
+                        entry.last_seen = now_epoch;
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
@@ -4799,19 +5414,9 @@ impl AppState {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        // Detect transient burst 429: x-should-retry present but no retry-after
-        // and no rate-limit headers. These are per-minute burst limits, not
-        // capacity exhaustion — use exponential backoff and don't poison state.
-        let has_rate_headers = headers.keys().any(|k| {
-            let name = k.as_str();
-            name.starts_with("anthropic-ratelimit-requests")
-                || name.starts_with("anthropic-ratelimit-tokens")
-                || name.starts_with("anthropic-ratelimit-unified-")
-                || name.starts_with("x-ratelimit-")
-        });
-        let should_retry =
-            headers.get("x-should-retry").and_then(|v| v.to_str().ok()) == Some("true");
-        let is_burst_limit = should_retry && raw_retry_after.is_none() && !has_rate_headers;
+        // Transient burst 429 (per-minute RPM / concurrency) rather than capacity
+        // exhaustion: exponential backoff and don't poison state.
+        let is_burst_limit = is_burst_429(headers);
 
         let cooldown = if is_burst_limit {
             info.consecutive_burst_429s = info.consecutive_burst_429s.saturating_add(1);
@@ -5050,8 +5655,11 @@ impl AppState {
                             info.reset_7d = remote.reset_7d;
                             info.status_5h = remote.status_5h;
                             info.status_7d = remote.status_7d;
-                            info.claims_7d = remote.claims_7d;
-                            info.representative_claim = remote.representative_claim;
+                            info.claims_7d = bound_ingested_claims(remote.claims_7d);
+                            // Truncated to match the keys `bound_ingested_claims`
+                            // just wrote — see the same pairing in `load_state`.
+                            info.representative_claim =
+                                remote.representative_claim.as_deref().map(truncate_label);
                             info.remaining_requests = remote.remaining_requests;
                             info.remaining_tokens = remote.remaining_tokens;
                             info.limit_requests = remote.limit_requests;
@@ -5278,7 +5886,16 @@ impl AppState {
         // walking the keyspace against a backend that is already slow. A
         // manual cursor loop keeps each page under the ordinary 2s command
         // budget and genuinely ends the scan when this function returns.
-        let mut replicas = 0u64;
+        //
+        // The count is the *cardinality* of the matched keys, not the sum of
+        // page lengths: SCAN guarantees only that a key present for the whole
+        // iteration comes back at least once, and is explicitly allowed to
+        // return it on more than one page, so summing was wrong by
+        // construction. Latent rather than observed (LAB-4554): a scan of the
+        // live store returned one page of distinct, independently-refreshed
+        // ids, so the reported count was right. It stops being one page as
+        // soon as the keyspace outgrows `COUNT`.
+        let mut heartbeats: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut cursor = String::from("0");
         loop {
             let result: Result<(String, Vec<String>), fred::error::RedisError> = redis
@@ -5299,7 +5916,7 @@ impl AppState {
                 .await;
             match result {
                 Ok((next_cursor, keys)) => {
-                    replicas += keys.len() as u64;
+                    heartbeats.extend(keys);
                     cursor = next_cursor;
                     if cursor == "0" {
                         break;
@@ -5312,8 +5929,11 @@ impl AppState {
                 }
             }
         }
+        let replicas = heartbeats.len() as u64;
 
-        // Aggregate budget usage from Redis (batch MGET)
+        // Aggregate budget usage from Redis (batch MGET). The same fetch
+        // re-seeds this replica's local `budget_usage` mirror (LAB-3217) —
+        // see fold_budget_mirror for why it must receive THIS `today`.
         let mut redis_budgets = serde_json::Map::new();
         if redis_ok && !self.client_budgets.is_empty() {
             let today = Self::now_epoch() / 86400;
@@ -5324,14 +5944,19 @@ impl AppState {
                 .collect();
             match redis.mget::<Vec<Option<u64>>, _>(budget_keys).await {
                 Ok(values) => {
-                    for (i, client_id) in client_ids.iter().enumerate() {
-                        let used = values.get(i).copied().flatten().unwrap_or(0);
-                        let limit = self.client_budgets[*client_id];
+                    let used_by_client: Vec<(&str, u64)> = client_ids
+                        .iter()
+                        .enumerate()
+                        .map(|(i, id)| (id.as_str(), values.get(i).copied().flatten().unwrap_or(0)))
+                        .collect();
+                    for &(client_id, used) in &used_by_client {
+                        let limit = self.client_budgets[client_id];
                         redis_budgets.insert(
-                            (*client_id).clone(),
+                            client_id.to_owned(),
                             serde_json::json!({ "limit": limit, "used": used }),
                         );
                     }
+                    self.fold_budget_mirror(today, used_by_client);
                 }
                 Err(e) => {
                     warn!(error = %e, "redis MGET failed for budget aggregation");
@@ -5963,6 +6588,26 @@ impl AppState {
         );
     }
 
+    /// Count + log an upstream 429 on a fast-mode request. The response is
+    /// forwarded to the caller unchanged by `classify_retry_status` (no
+    /// cooldown, no rotation — see the reasoning there); this is the operator
+    /// trace that makes a client looping `speed: "fast"` visible instead of
+    /// silent (LAB-2675).
+    fn note_fast_mode_429(&self, endpoint_name: &str, headers: &reqwest::header::HeaderMap) {
+        if let Ok(mut counts) = self.fast_mode_429.lock() {
+            *counts.entry(endpoint_name.to_owned()).or_insert(0) += 1;
+        }
+        let retry_after_raw = headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        warn!(
+            account = endpoint_name,
+            retry_after_raw,
+            "fast-mode 429 forwarded to caller — account NOT cooled (separate rate bucket)"
+        );
+    }
+
     /// Snapshot the session registry for `/_stats`: TTL-filtered, sorted by
     /// context-window % desc, capped to `SESSIONS_STATS_TOP_N`. Raw IPs and
     /// session ids never leave the registry — the label is a hash of the
@@ -6040,14 +6685,13 @@ impl AppState {
     }
 }
 
+/// Usage-only log line for the unified-OpenAI-endpoint fallback path
+/// (`try_fallback_upstream`), which has no routing/utilization snapshot to
+/// merge with (OpenAI endpoints carry stub `RateLimitInfo`). Kept separate
+/// from `log_proxied` below — LAB-3214 folded the native and openai-compat
+/// paths' `proxied` + `usage` lines into one; this path never had a
+/// `proxied` line to fold into, so its usage echo stays as its own line.
 fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &TokenUsage) {
-    // INFO (temporarily): surfaces per-request cache_read vs cache_write so we can
-    // join it to the `fingerprint` line by req_id and learn whether fan-out agents
-    // share a cacheable preamble (reads) or are independent (creates) — and whether
-    // a real multi-turn session keeps getting reads after fp-keying (the fp
-    // stability check). Revert to debug! once that question is answered. Token
-    // accounting is independent of log level (Prometheus counters + optional
-    // shadow-log); this line is only the human-readable echo.
     info!(
         req_id,
         client_id,
@@ -6059,6 +6703,128 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
         cache_write = usage.cache_creation_input_tokens,
         "usage"
     );
+}
+
+/// Routing/utilization snapshot captured when upstream response headers
+/// arrive (the former standalone `proxied` / `proxied (openai-compat)` INFO
+/// lines), carried through to `finalize_stream` / `finalize_non_stream` so it
+/// can be logged on the SAME line as token usage — known only once the body
+/// or stream completes (LAB-3214: one INFO line per request, not two).
+enum ProxiedCtx {
+    Anthropic {
+        client_ver: String,
+        utilization: String,
+        util_5h: String,
+        util_7d: String,
+        constraint: &'static str,
+        overage: bool,
+        pin: &'static str,
+        total: u64,
+        /// Content fingerprint (12 hex, `content_fingerprints`) joining this
+        /// line to the DEBUG `fingerprint` line by req_id; `"-"` when the
+        /// request body was unparseable.
+        fp: String,
+    },
+    OpenaiCompat {
+        client_ver: String,
+        utilization: String,
+        util_5h: String,
+        util_7d: String,
+        constraint: &'static str,
+        pin: &'static str,
+        stream: bool,
+    },
+}
+
+/// Emit the single per-request INFO line merging routing context with token
+/// usage. Usage fields are simply zero when nothing was extracted (error
+/// response, client disconnect, upstream failure) — still exactly one line,
+/// still carrying req_id/account/status (AC4), so no separate branch is
+/// needed for the no-usage case.
+#[allow(clippy::too_many_arguments)]
+fn log_proxied(
+    req_id: &str,
+    client_id: &str,
+    model: &str,
+    account: &str,
+    client_ip: &str,
+    agent: &str,
+    session: &str,
+    status_code: u16,
+    ctx: &ProxiedCtx,
+    usage: &TokenUsage,
+) {
+    match ctx {
+        ProxiedCtx::Anthropic {
+            client_ver,
+            utilization,
+            util_5h,
+            util_7d,
+            constraint,
+            overage,
+            pin,
+            total,
+            fp,
+        } => {
+            info!(
+                req_id,
+                client = %client_ip,
+                client_id,
+                ver = %client_ver,
+                agent,
+                session,
+                model,
+                account,
+                status = status_code,
+                utilization = %utilization,
+                util_5h = %util_5h,
+                util_7d = %util_7d,
+                constraint = *constraint,
+                overage,
+                pin = *pin,
+                total,
+                fp = %fp,
+                input = usage.input_tokens,
+                output = usage.output_tokens,
+                cached = usage.cache_read_input_tokens,
+                cache_write = usage.cache_creation_input_tokens,
+                "proxied"
+            );
+        }
+        ProxiedCtx::OpenaiCompat {
+            client_ver,
+            utilization,
+            util_5h,
+            util_7d,
+            constraint,
+            pin,
+            stream,
+        } => {
+            info!(
+                req_id,
+                client = %client_ip,
+                client_id,
+                ver = %client_ver,
+                agent,
+                session,
+                model,
+                account,
+                status = status_code,
+                utilization = %utilization,
+                util_5h = %util_5h,
+                util_7d = %util_7d,
+                constraint = *constraint,
+                pin = *pin,
+                openai_compat = true,
+                stream,
+                input = usage.input_tokens,
+                output = usage.output_tokens,
+                cached = usage.cache_read_input_tokens,
+                cache_write = usage.cache_creation_input_tokens,
+                "proxied (openai-compat)"
+            );
+        }
+    }
 }
 
 /// Finalize a streaming response: extract usage, log, and shadow log.
@@ -6075,6 +6841,7 @@ async fn finalize_stream(
     agent: &str,
     session: &str,
     status_code: u16,
+    ctx: ProxiedCtx,
     mut scanner: SseUsageScanner,
     request_start: std::time::Instant,
     client_disconnected: bool,
@@ -6090,9 +6857,6 @@ async fn finalize_stream(
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
     if !usage.is_empty() {
         state.record_usage(ep, client_id, usage_model, usage).await;
-        // Log the same model the metric records, so the usage log and
-        // anthropic_client_model_token_usage_total reconcile.
-        log_usage(req_id, client_id, usage_model, acct_name, usage);
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -6121,6 +6885,7 @@ async fn finalize_stream(
             client_id,
             model,
             account = acct_name,
+            status = status_code,
             reason,
             elapsed_ms,
             sse_bytes = scanner.bytes_seen,
@@ -6130,6 +6895,23 @@ async fn finalize_stream(
             "stream_end_no_usage"
         );
     }
+    // Single terminal line for this request (LAB-3214), routing context
+    // merged with usage — zero-valued when none was captured. `usage_model`
+    // (not `model`) so this reconciles with
+    // `anthropic_client_model_token_usage_total`, which records against the
+    // same response-derived model.
+    log_proxied(
+        req_id,
+        client_id,
+        usage_model,
+        acct_name,
+        client_ip,
+        agent,
+        session,
+        status_code,
+        &ctx,
+        usage,
+    );
     let mut log = serde_json::json!({
         "ts": AppState::now_epoch(),
         "client": client_ip,
@@ -6174,13 +6956,11 @@ async fn finalize_non_stream(
     openai_compat: bool,
     session_key: Option<&str>,
     context_window: u64,
+    ctx: Option<ProxiedCtx>,
 ) {
+    let usage_model = response_model.unwrap_or(model);
     if !usage.is_empty() {
-        let usage_model = response_model.unwrap_or(model);
         state.record_usage(ep, client_id, usage_model, usage).await;
-        // Log the same model the metric records, so the usage log and
-        // anthropic_client_model_token_usage_total reconcile.
-        log_usage(req_id, client_id, usage_model, acct_name, usage);
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -6193,6 +6973,29 @@ async fn finalize_non_stream(
                 context_window,
                 AppState::now_epoch(),
             );
+        }
+    }
+    // Single terminal INFO line for this request (AC1/AC2/AC3/AC4) — merged
+    // routing + usage where a routing snapshot exists. The unified-OpenAI-
+    // endpoint fallback path (no snapshot) keeps its own usage-only echo,
+    // fired only when usage was actually captured (unchanged behavior).
+    match &ctx {
+        Some(c) => log_proxied(
+            req_id,
+            client_id,
+            usage_model,
+            acct_name,
+            client_ip,
+            agent,
+            session,
+            status_code,
+            c,
+            usage,
+        ),
+        None => {
+            if !usage.is_empty() {
+                log_usage(req_id, client_id, usage_model, acct_name, usage);
+            }
         }
     }
     let mut log = serde_json::json!({
@@ -6432,6 +7235,10 @@ impl AppState {
         // Always update local state (for stats + fallback)
         if let Ok(mut map) = self.budget_usage.lock() {
             let entry = map.entry(client_id.to_owned()).or_insert((today, 0));
+            // `!= today` is right HERE because this `today` is fresh. Do not
+            // unify with fold_budget_mirror's stricter `<` / `>` day rule —
+            // that fold receives a `today` fetched earlier and must not
+            // clobber an entry that already rolled past it (LAB-3217).
             if entry.0 != today {
                 *entry = (today, 0); // reset on new day
             }
@@ -6495,6 +7302,42 @@ impl AppState {
                     );
                 }
             }
+        }
+    }
+
+    /// Fold the fleet-wide `alb:budget:{client}:{day}` counters into the local
+    /// `budget_usage` mirror so `/_stats` and the `anthropic_client_budget_*`
+    /// gauges report the shared total on every replica — including one that
+    /// just restarted with an empty mirror (LAB-3217). Runs on every sync tick
+    /// with the values `cluster_info` already MGETs; it touches no Redis key,
+    /// so enforcement (`check_budget` / `record_budget_usage`) is unchanged.
+    ///
+    /// `max`, never overwrite: the local accumulator is also the enforcement
+    /// floor for increments lost to a failed INCRBY (LAB-1962), so a counter
+    /// that is behind must not lower it. A stale (previous-day) entry is
+    /// replaced by today's value, never summed with it; an entry that already
+    /// rolled PAST the fetched day is left alone. `today` MUST be the
+    /// epoch-day the counters were fetched under, not re-derived here: across
+    /// a UTC midnight a re-read would file yesterday's total under today, and
+    /// `max` would then pin that over-report for the whole day. A zero/absent
+    /// counter carries nothing the mirror lacks and is skipped, so the sync
+    /// alone never materialises entries for idle clients.
+    fn fold_budget_mirror<'a>(&self, today: u64, remote: impl IntoIterator<Item = (&'a str, u64)>) {
+        let Ok(mut map) = self.budget_usage.lock() else {
+            return;
+        };
+        for (client_id, used) in remote {
+            if used == 0 {
+                continue;
+            }
+            let entry = map.entry(client_id.to_owned()).or_insert((today, 0));
+            if entry.0 > today {
+                continue;
+            }
+            if entry.0 < today {
+                *entry = (today, 0);
+            }
+            entry.1 = entry.1.max(used);
         }
     }
 
@@ -6675,8 +7518,10 @@ impl AppState {
 
 // ── OAuth system prompt injection ──────────────────────────────────
 
-/// Check whether the request body already contains the OAuth system prompt
-/// as a prefix of the first system block (string or array form).
+/// Check whether the request body already contains the OAuth system prompt:
+/// as a prefix of the `system` string, or as a prefix of ANY block in the
+/// `system` array. The whole array is scanned because Claude Code puts its
+/// attribution block first and the identity prompt after it.
 fn has_oauth_system_prompt(body: &serde_json::Value) -> bool {
     match body.get("system") {
         Some(system) if system.is_string() => system
@@ -6696,16 +7541,18 @@ fn has_oauth_system_prompt(body: &serde_json::Value) -> bool {
     }
 }
 
-/// Inject the Claude Code system prompt as the first system block.
+/// Inject the Claude Code system prompt into the `system` array.
 ///
-/// OAuth tokens (sk-ant-oat*) require this exact prompt as the first system
-/// block to access sonnet/opus models. Haiku works without it, but we inject
-/// unconditionally for OAuth accounts to keep things simple.
+/// OAuth tokens (sk-ant-oat*) require this exact prompt somewhere in `system`
+/// to access sonnet/opus models; it does not have to be first. Haiku works
+/// without it, but we inject unconditionally for OAuth accounts to keep
+/// things simple.
 ///
-/// The prompt is prepended to any existing system content:
 /// - No system field → creates `"system": [{"type":"text","text":"..."}]`
 /// - String system → converts to array with CC prompt first, original second
-/// - Array system → prepends CC prompt block if not already present
+/// - Array system → inserts the CC prompt at index 0, or at index 1 when
+///   `system[0]` is a Claude Code attribution block, so the upstream's
+///   positional strip of that block still fires
 fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
     if has_oauth_system_prompt(body) {
         return;
@@ -6725,9 +7572,14 @@ fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
                     {"type": "text", "text": text}
                 ]);
             } else if let Some(arr) = system.as_array() {
-                // Prepend CC prompt block
-                let mut new_arr = vec![cc_block];
-                new_arr.extend(arr.iter().cloned());
+                // Keep a leading attribution block at index 0 (see ATTRIBUTION_BLOCK_PREFIX).
+                let leads_with_attribution = arr
+                    .first()
+                    .and_then(|b| b["text"].as_str())
+                    .is_some_and(|t| t.starts_with(ATTRIBUTION_BLOCK_PREFIX));
+                let at = if leads_with_attribution { 1 } else { 0 };
+                let mut new_arr = arr.clone();
+                new_arr.insert(at, cc_block);
                 body["system"] = serde_json::Value::Array(new_arr);
             }
         }
@@ -7081,6 +7933,10 @@ fn describe_reqwest_error(e: &reqwest::Error) -> String {
 /// success or 4xx client error) it returns `Ok(resp)` — handing the
 /// response back so the caller can continue.
 ///
+/// One exception: a non-burst 429 on a `speed: "fast"` request returns
+/// `Ok(resp)` too, uncooled and unrotated — fast mode has its own rate
+/// bucket, so that 429 is not evidence about the account (LAB-2675).
+///
 /// `openai_error_shape` picks the error-body format for the terminal 3xx
 /// arm: callers whose downstream parses OpenAI errors (`/v1/chat/completions`
 /// passthrough) get `{"error":{...}}`, Anthropic-surface callers get
@@ -7093,6 +7949,12 @@ async fn classify_retry_status(
     endpoint_name: &str,
     resp: reqwest::Response,
     openai_error_shape: bool,
+    // `fast_mode_body`: the body actually sent upstream, for the fast-mode
+    // test — `None` when the protocol cannot express `speed`. Bytes rather
+    // than a pre-computed bool so the parse happens only on the 429 branch
+    // that needs it, and so no caller can hand this function a `false` that
+    // is only true for non-429 statuses.
+    fast_mode_body: Option<&bytes::Bytes>,
 ) -> Result<reqwest::Response, ForwardOutcome> {
     // 3xx → deliberate 502. The upstream client follows no redirects
     // (`Policy::none()`), because following one would re-send the account
@@ -7146,6 +8008,47 @@ async fn classify_retry_status(
 
     // 429 → mark hard-limited and try next account
     if status == StatusCode::TOO_MANY_REQUESTS {
+        // …unless the request asked for fast mode. Fast mode has its own rate
+        // bucket, separate from the account's standard 5h/7d windows, so a
+        // fast-mode 429 is not evidence the account is exhausted. Cooling the
+        // account here would let one client looping `speed: "fast"` drain each
+        // account's (smaller) fast bucket in turn and deny STANDARD traffic for
+        // every other client until the cooldowns lapse — up to the emergency
+        // brake (LAB-2675, from the LAB-2669 security review).
+        //
+        // Instead the 429 is returned to the caller unchanged: the forward path
+        // reflects upstream's `retry-after` (`reflect_upstream_headers`), leaves
+        // `hard_limited_until` / `remaining_*` alone, and does not rotate. That
+        // is exactly what a direct Anthropic client sees, and the client — not
+        // the proxy — decides whether to back off or retry at standard speed.
+        // Rotating fast requests with a per-account fast cooldown was rejected:
+        // more state, and one client could still sweep every account's bucket.
+        //
+        // The exemption defers to `is_burst_429`. A burst 429 (`x-should-retry`,
+        // no `retry-after`, no rate headers) is a per-minute RPM/concurrency
+        // limit on the ACCOUNT, not on a rate bucket, so it is real evidence
+        // about the account whatever speed the request asked for. Exempting it
+        // would be worse than the bug: `x-should-retry` is not in
+        // `reflect_upstream_headers`'s allow-list, so the caller would get a
+        // bare 429 with no transient hint AND no rotation, while the account
+        // stayed pinned — and standard traffic routed to that same account
+        // would then burst-429 and hard-limit it, reinstating the denial via
+        // the victim's own requests (LAB-2675 panel finding).
+        //
+        // What this does NOT buy: the ticket assumed the utilization ceilings
+        // would still cover a fast request on an exhausted account, because
+        // `update_rate_info_for` consumes the unified headers before
+        // classification. AC-5's live probe disproved that — a fast-mode
+        // response's unified headers describe the fast pool, not the account
+        // — and ingesting them corrupts the account's standard view. Separate
+        // defect in `update_rate_info_for`, tracked as LAB-2693; not fixable
+        // from here, which runs after the ingest.
+        if !is_burst_429(resp.headers())
+            && fast_mode_body.is_some_and(|b| request_wants_fast_mode(b))
+        {
+            state.note_fast_mode_429(endpoint_name, resp.headers());
+            return Ok(resp);
+        }
         state
             .mark_hard_limited_for(rate_info, endpoint_name, resp.headers())
             .await;
@@ -7287,8 +8190,9 @@ fn round_backoff_delay(retry_round: u32, last_saw_529: bool) -> Duration {
 /// round that also saw a 529) stays `429` with NO `Retry-After`: recovery there
 /// is on the order of minutes/hours, so a short retry hint would tight-loop the
 /// client into a still-exhausted pool.
-fn exhaustion_response(last_saw_transient: bool, last_saw_529: bool) -> Response {
+fn exhaustion_response(state: &AppState, last_saw_transient: bool, last_saw_529: bool) -> Response {
     if last_saw_transient && !last_saw_529 {
+        state.pool_exhausted[PoolExhaustion::Transient as usize].fetch_add(1, Ordering::Relaxed);
         warn!("all endpoints transient-failed after backoff; returning retryable 503");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -7297,6 +8201,7 @@ fn exhaustion_response(last_saw_transient: bool, last_saw_529: bool) -> Response
         )
             .into_response();
     }
+    state.pool_exhausted[PoolExhaustion::RateLimited as usize].fetch_add(1, Ordering::Relaxed);
     warn!("all endpoints exhausted (rate-limited)");
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
 }
@@ -7431,6 +8336,52 @@ fn body_wants_stream(body: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// True when the request body asks for fast mode (top-level `"speed":
+/// "fast"`, the body half of the `fast-mode-*` beta). Absent field or an
+/// unparseable body counts as standard speed — Anthropic's default.
+///
+/// Fast mode bills against a rate bucket that is SEPARATE from the account's
+/// standard 5h/7d windows, so a `429` on a fast request says nothing about
+/// the account's standard headroom (LAB-2675).
+fn request_wants_fast_mode(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .map(|v| body_wants_fast_mode(&v))
+        .unwrap_or(false)
+}
+
+/// The fast-mode predicate on an already-parsed body. Single definition,
+/// same split as `request_wants_stream` / `body_wants_stream`, so every
+/// fast-mode decision in the proxy agrees on what "fast" means.
+fn body_wants_fast_mode(body: &serde_json::Value) -> bool {
+    body.get("speed").and_then(|s| s.as_str()) == Some("fast")
+}
+
+/// Caller-identity headers that must not leave this proxy. The IP set is what
+/// fronting hops (cloudflared, the Cloudflare Worker, nginx-ingress) carry the
+/// caller's address in — `resolve_client_ip` reads only `x-forwarded-for`; the
+/// rest are stripped so they cannot leak either. The `x-*-id` set is this
+/// proxy's own client/agent/session vocabulary. Relayed upstream, any of them
+/// ties a pooled-account request to the individual caller behind the proxy
+/// (GH #168). Deliberately absent: Claude Code's native
+/// `x-claude-code-session-id` (GH #171, operator decision) and edge-added
+/// `cf-*`, which the ingress strips (GH #166).
+const CLIENT_IDENTITY_HEADERS: &[&str] = &[
+    "x-forwarded-for",
+    "x-real-ip",
+    "forwarded",
+    "true-client-ip",
+    "x-client-id",
+    "x-agent-id",
+    "x-session-id",
+];
+
+fn strip_client_identity_headers(headers: &mut axum::http::HeaderMap) {
+    for name in CLIENT_IDENTITY_HEADERS {
+        headers.remove(*name);
+    }
+}
+
 /// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
 /// passes the picked endpoint and its pool index (used for `skip` and usage
 /// accounting).
@@ -7445,6 +8396,7 @@ async fn forward_anthropic(
     parts: &axum::http::request::Parts,
     body_bytes: &bytes::Bytes,
     oauth_body_bytes: &bytes::Bytes,
+    is_fast_mode: bool,
     ep: &Endpoint,
     endpoint_idx: usize,
     req_id: &str,
@@ -7454,6 +8406,7 @@ async fn forward_anthropic(
     agent_id: &str,
     session_id: &str,
     model: &str,
+    fp: Option<&str>,
     session_key: Option<&str>,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
@@ -7486,6 +8439,9 @@ async fn forward_anthropic(
     headers.remove("host");
     headers.remove("content-length"); // body size may change after cache injection
     headers.remove("accept-encoding"); // need plaintext SSE to extract token usage
+    if !state.forward_caller_identity {
+        strip_client_identity_headers(&mut headers);
+    }
 
     // Default anthropic-version if client didn't set it
     if !headers.contains_key("anthropic-version") {
@@ -7600,18 +8556,38 @@ async fn forward_anthropic(
 
     // Always update rate limit info and persist
     state
-        .update_rate_info_for(rate_info, endpoint_name, resp.headers())
+        .update_rate_info_for(
+            rate_info,
+            endpoint_name,
+            resp.headers(),
+            // The request's speed picks the rate bucket: a fast-mode body's
+            // response carries fast-pool headers, not the account's
+            // (LAB-2693). Classified once in `proxy_handler`, not re-parsed
+            // from `req_body` on every response.
+            is_fast_mode,
+        )
         .await;
 
     // Update burn rate (after rate-limit headers are parsed)
     state.update_burn_rate(&ep.burn_rate, client_id);
 
     // Classify 429 / 529 / other 5xx into a retry decision (shared helper).
-    let mut resp =
-        match classify_retry_status(state, status, rate_info, endpoint_name, resp, false).await {
-            Ok(resp) => resp,
-            Err(outcome) => return outcome,
-        };
+    let mut resp = match classify_retry_status(
+        state,
+        status,
+        rate_info,
+        endpoint_name,
+        resp,
+        /* openai_error_shape */ false,
+        // The bytes actually sent upstream (the OAuth variant on OAuth
+        // tokens) — that body is what picks the rate bucket.
+        Some(req_body),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(outcome) => return outcome,
+    };
 
     // Clear hard limit and burst counter only on a genuine 2xx success.
     // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
@@ -7637,31 +8613,32 @@ async fn forward_anthropic(
         state.signal_hard_limit_recovery(endpoint_name).await;
     }
 
-    // Log with capacity info + inject budget status header
-    let budget_status = {
+    // Capture the routing/utilization snapshot + inject budget status header.
+    // The `proxied` line itself is deferred to `finalize_stream`/
+    // `finalize_non_stream`, which merge it with token usage once known
+    // (LAB-3214: one INFO line per request, not two).
+    let (budget_status, ctx) = {
         let info = rate_info.read().await;
         let (eff_util, constraint, _adj_5h, _adj_7d) =
             effective_utilization(&info, AppState::now_epoch(), model);
-        info!(
-            req_id,
-            client = %client_ip,
-            client_id = %client_id,
-            ver = %client_ver,
-            agent = %agent_id,
-            session = %session_id,
-            model = %model,
-            account = endpoint_name,
-            status = status.as_u16(),
-            utilization = format_args!("{eff_util:.2}"),
-            util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-            util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+        let ctx = ProxiedCtx::Anthropic {
+            client_ver: client_ver.to_owned(),
+            utilization: format!("{eff_util:.2}"),
+            util_5h: info
+                .utilization_5h
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
+            util_7d: info
+                .utilization_7d
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
             constraint,
-            overage = info.overage_in_use,
-            pin = state.pin_status(client_id, endpoint_idx),
-            total = ep.requests.load(Ordering::Relaxed),
-            "proxied"
-        );
-        compute_pressure_status(eff_util, client_id, state)
+            overage: info.overage_in_use,
+            pin: state.pin_status(client_id, endpoint_idx),
+            total: ep.requests.load(Ordering::Relaxed),
+            fp: fp.unwrap_or("-").to_string(),
+        };
+        (compute_pressure_status(eff_util, client_id, state), ctx)
     };
 
     let latency_ms = request_start.elapsed().as_millis() as u64;
@@ -7746,6 +8723,7 @@ async fn forward_anthropic(
                 &agent_clone,
                 &session_clone,
                 status_code,
+                ctx,
                 scanner,
                 request_start,
                 client_disconnected,
@@ -7771,8 +8749,7 @@ async fn forward_anthropic(
         // previous `unwrap_or_default()` turned a mid-body connection reset into
         // an empty body forwarded under the upstream's 2xx status — the caller
         // (Claude Code) then saw a truncated "success" and reported it as a
-        // socket error, while our logs showed a clean `proxied status=200`
-        // (that line is emitted above, before the body is read). Log loudly and
+        // socket error, while our logs showed no trace of it. Log loudly and
         // return a real 502 so the failure is visible and the SDK gets a
         // well-formed error frame instead of a silent corruption. Mirrors the
         // error-detection structure of the sibling body-read sites
@@ -7788,6 +8765,21 @@ async fn forward_anthropic(
                     status = status.as_u16(),
                     error = %e,
                     "upstream response body read failed mid-stream"
+                );
+                // This branch returns before `finalize_non_stream` — log the
+                // merged line here too (no usage: the body never arrived), so
+                // the routing/utilization snapshot still lands at INFO (AC4).
+                log_proxied(
+                    req_id,
+                    client_id,
+                    model,
+                    endpoint_name,
+                    &client_ip.to_string(),
+                    agent_id,
+                    session_id,
+                    status.as_u16(),
+                    &ctx,
+                    &TokenUsage::default(),
                 );
                 let body = serde_json::json!({
                     "type": "error",
@@ -7841,6 +8833,22 @@ async fn forward_anthropic(
             // into a permanent retry loop against this account (LAB-941).
             if is_model_unsupported_error(status, &parsed) {
                 state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                // This branch returns before `finalize_non_stream` — log the
+                // merged line here too, so a model-unsupported rejection
+                // still gets the routing/utilization snapshot at INFO, same
+                // as the old unconditional `proxied` line did (AC4).
+                log_proxied(
+                    req_id,
+                    client_id,
+                    model,
+                    endpoint_name,
+                    &client_ip.to_string(),
+                    agent_id,
+                    session_id,
+                    status.as_u16(),
+                    &ctx,
+                    &usage,
+                );
                 let response = builder
                     .body(Body::from(resp_body_bytes))
                     .unwrap_or_else(|_| {
@@ -7866,6 +8874,7 @@ async fn forward_anthropic(
             false,
             session_key,
             context_window,
+            Some(ctx),
         )
         .await;
         let response = builder
@@ -7952,6 +8961,76 @@ async fn maybe_cache_store(
     Response::from_parts(parts, Body::from(bytes))
 }
 
+/// LAB-4322/LAB-4341: the one reason string for a `messages` the scanner
+/// cannot read as an array. Both surfaces reach it — `openai_chat_handler`
+/// because translation rewrites the field into an EMPTY array before the
+/// scanner sees it, `proxy_handler` because `ScanInput::from_body` reads it
+/// through the same `.as_array()` and yields nothing to scan. Shared so the
+/// two can never drift into describing the same shape two different ways.
+///
+/// The text covers BOTH causes because the surfaces disagree on which ones
+/// they reject: `/v1/chat/completions` is a single API that requires the
+/// field, so absent is malformed there and takes this reason too, while the
+/// `proxy_handler` fallback must keep forwarding the `messages`-less bodies of
+/// `/v1/complete` and `/v1/models` and so only ever reaches it for a present
+/// field of the wrong shape. Naming one cause would misdescribe the other to
+/// the client reading `error.message`.
+#[cfg(feature = "guard")]
+const GUARD_REASON_MESSAGES_NOT_ARRAY: &str =
+    "request `messages` is missing or not an array and cannot be scanned";
+
+/// LAB-3877: build the HTTP 400 for a `block` verdict. The body carries finding
+/// offsets and labels only — never the matched text — so an error surfaced to a
+/// client (or captured in its logs) cannot itself leak the secret it flagged.
+/// `openai_shape` selects the OpenAI error envelope for `/v1/chat/completions`
+/// clients (same convention as `model_unsupported_response`); the cause is
+/// machine-readable as `error.code` there and `error.type` on the Anthropic side.
+#[cfg(feature = "guard")]
+fn guard_blocked_response(
+    findings: &[guard::Finding],
+    reason: &str,
+    openai_shape: bool,
+) -> Response {
+    let body = if openai_shape {
+        serde_json::json!({
+            "error": {
+                "message": reason,
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "guard_blocked",
+                "findings": findings,
+            }
+        })
+    } else {
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "guard_blocked",
+                "message": reason,
+                "findings": findings,
+            }
+        })
+    };
+    (
+        StatusCode::BAD_REQUEST,
+        [(hyper::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// LAB-3877: stamp an `Annotate` verdict's finding count onto the response as
+/// `X-Guard-Findings`. A decimal count is always a valid header value.
+#[cfg(feature = "guard")]
+fn stamp_guard_findings(mut response: Response, count: Option<usize>) -> Response {
+    if let Some(count) = count {
+        response
+            .headers_mut()
+            .insert("x-guard-findings", HeaderValue::from(count as u64));
+    }
+    response
+}
+
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -8015,8 +9094,38 @@ async fn proxy_handler(
         Err(resp) => return *resp,
     };
 
-    // Parse body once for model extraction and optional cache injection
-    let (body_bytes, oauth_body_bytes, model, fp, cache_key) =
+    // LAB-3877: the guard's scan input is extracted from the parsed body here,
+    // pre-injection, so it sees exactly what the client sent (auto-cache
+    // injection adds cache_control only, but extracting before it keeps the
+    // guard trivially body-neutral). The scan itself runs later, after
+    // `pre_request_gate`. `None` for a non-JSON body — nothing to inspect.
+    #[cfg(feature = "guard")]
+    let mut guard_input: Option<guard::ScanInput> = None;
+    // Whether the body parsed as JSON at all — distinct from whether scannable
+    // user text was found. Under `block`, an UNPARSEABLE body fails closed (a
+    // parse differential vs upstream must not forward unscanned), but a body
+    // that parsed with no scannable text (e.g. an image-only turn) has nothing
+    // to scan and is allowed.
+    #[cfg(feature = "guard")]
+    let mut guard_body_parsed = false;
+    // LAB-4341: `messages` present but NOT an array — a string, an object, a
+    // number, `null`. Tracked apart from `guard_input` because both surface as
+    // `None` there: an image-only turn genuinely has no text and is allowed,
+    // while this is content the scanner structurally cannot reach.
+    //
+    // Keyed on PRESENT-and-wrong-shape, not on "not an array", because this
+    // handler is the router's `.fallback` — `/v1/complete`, `/v1/models`,
+    // `/upstream/<name>/...` all land here and carry no `messages` key at all.
+    // Treating absent as unscannable would take every non-Messages endpoint
+    // offline for `block` clients. That is the opposite of the OpenAI surface,
+    // where `/v1/chat/completions` is one API that requires the field, so
+    // absent there IS a malformed Messages request.
+    #[cfg(feature = "guard")]
+    let mut guard_messages_unscannable: Option<&'static str> = None;
+
+    // Parse body once for model extraction, optional cache injection, and
+    // the fast-mode flag that picks the rate bucket downstream.
+    let (body_bytes, oauth_body_bytes, model, fp, cache_key, is_fast_mode) =
         if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             let model = parsed
                 .get("model")
@@ -8034,6 +9143,17 @@ async fn proxy_handler(
             // double as the affinity discriminator; bps is computed POST-injection
             // (below) to reflect the breakpoints actually forwarded upstream.
             let (fp, fps) = content_fingerprints(&parsed);
+
+            // LAB-3877: extract the newest user text + tool_result blocks for
+            // the guard (never `system`). Read-only borrow of `parsed`.
+            #[cfg(feature = "guard")]
+            {
+                guard_body_parsed = true;
+                guard_input = guard::ScanInput::from_body(&parsed);
+                if matches!(parsed.get("messages"), Some(v) if !v.is_array()) {
+                    guard_messages_unscannable = Some(GUARD_REASON_MESSAGES_NOT_ARRAY);
+                }
+            }
 
             // LAB-933/LAB-929: derive the response-cache key on the
             // PRE-injection body — the request exactly as the client sent
@@ -8099,24 +9219,31 @@ async fn proxy_handler(
             // cache order, for prize-sizing. Computed AFTER auto-injection so it
             // reflects the breakpoints actually forwarded upstream (covers the
             // headerless fleet that relies on the proxy's injected breakpoints).
-            // model is included because caches are per-model. Join to `usage`
-            // (cache_read/write) and `proxied` (account) by req_id offline.
-            let bps = prefix_breakpoint_hashes(&parsed)
-                .into_iter()
-                .map(|(pos, h)| format!("{pos}:{h}"))
-                .collect::<Vec<_>>()
-                .join("|");
-            info!(
-                req_id,
-                client_id = %client_id,
-                session = %session_id,
-                agent = %agent_id,
-                model = %model,
-                fp = %fp,
-                fps = %fps,
-                bps = %bps,
-                "fingerprint"
-            );
+            // model is included because caches are per-model. Join to `proxied`
+            // (account + token usage) by req_id offline.
+            //
+            // DEBUG only (LAB-3214): per-request detail, not the default INFO
+            // line. `bps` is unbounded length, so skip building it entirely
+            // when debug isn't enabled — it's otherwise unused (fp/fps still
+            // feed routing above regardless of log level).
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let bps = prefix_breakpoint_hashes(&parsed)
+                    .into_iter()
+                    .map(|(pos, h)| format!("{pos}:{h}"))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                debug!(
+                    req_id,
+                    client_id = %client_id,
+                    session = %session_id,
+                    agent = %agent_id,
+                    model = %model,
+                    fp = %fp,
+                    fps = %fps,
+                    bps = %bps,
+                    "fingerprint"
+                );
+            }
 
             // Re-serialize. The `preserve_order` feature on serde_json is critical:
             // without it, serde uses BTreeMap which reorders JSON keys alphabetically,
@@ -8129,7 +9256,7 @@ async fn proxy_handler(
                 body_bytes.to_vec()
             };
 
-            // Pre-compute OAuth variant with Claude Code system prompt prepended.
+            // Pre-compute OAuth variant with Claude Code system prompt inserted.
             // OAuth tokens (sk-ant-oat*) require this to access sonnet/opus models.
             // Skip injection when the client already includes the prompt — the
             // normal `bytes` payload (which preserves auto-cache mutations) is
@@ -8142,16 +9269,22 @@ async fn proxy_handler(
                 serde_json::to_vec(&oauth_parsed).unwrap_or_else(|_| bytes.clone())
             };
 
+            // Classified once here rather than re-parsed from the outbound
+            // bytes per upstream response: neither injector above touches
+            // `speed`, so one flag is true of both byte variants (LAB-2693).
+            let is_fast_mode = body_wants_fast_mode(&parsed);
+
             (
                 bytes::Bytes::from(bytes),
                 bytes::Bytes::from(oauth_bytes),
                 model,
                 Some(fp),
                 cache_key,
+                is_fast_mode,
             )
         } else {
             let clone = body_bytes.clone();
-            (body_bytes, clone, String::new(), None, None)
+            (body_bytes, clone, String::new(), None, None, false)
         };
 
     // Build the affinity key now that fp is known. fp is the finest routing
@@ -8175,6 +9308,43 @@ async fn proxy_handler(
         return *resp;
     }
 
+    // LAB-3877: Tier 0 content guard — runs after the gate, before endpoint
+    // selection (see `AppState::guard_hook`). Two causes are unscannable: the
+    // client sent a body and it did not parse, and (LAB-4341) it parsed with a
+    // `messages` field the scanner cannot read. A bodiless request
+    // (`GET /v1/models`) has nothing to scan and is not a scan failure.
+    //
+    // Both are deliberately path-agnostic: the path is forwarded verbatim, so
+    // scoping by route would let `/v1/messages/` or a percent-encoded spelling
+    // skip the fail-closed rule. The shape check stays safe to apply on every
+    // path because it keys on a `messages` that is present and wrong, which no
+    // other API served through this fallback sends — see where it is set.
+    #[cfg(feature = "guard")]
+    let guard_annotate: Option<usize> = {
+        let unscannable = (!guard_body_parsed && !body_bytes.is_empty())
+            .then_some("request body could not be parsed for content scanning")
+            .or(guard_messages_unscannable);
+        match state.guard_hook(
+            &req_id,
+            &client_id,
+            unscannable,
+            guard_input.as_ref(),
+            false,
+        ) {
+            Ok(annotate) => annotate,
+            Err(resp) => return *resp,
+        }
+    };
+
+    // The remaining dispatch is wrapped so an `Annotate` verdict can stamp the
+    // `X-Guard-Findings` header onto whatever response it yields (cache hit,
+    // proxied success, or exhaustion) from one place. The wrapper is an
+    // immediately-awaited async block, so it is behaviourally transparent (and
+    // a no-op when the guard feature is off) — but note every `return` inside
+    // now yields the block's `Response`, not the handler's: a new early-return
+    // added below still exits the handler (via `response`) and simply carries
+    // the annotate header too, which is the intended behaviour.
+    let response: Response = async {
     // LAB-933: serve an opted-in replay from the encrypted response cache.
     // Placed AFTER the gate so budget/emergency policy still applies to
     // opted-in clients; a hit then never touches an upstream — no rate-limit
@@ -8237,6 +9407,7 @@ async fn proxy_handler(
                                 &parts,
                                 &body_bytes,
                                 &oauth_body_bytes,
+                                is_fast_mode,
                                 ep,
                                 i,
                                 &req_id,
@@ -8246,6 +9417,7 @@ async fn proxy_handler(
                                 &agent_id,
                                 &session_id,
                                 &model,
+                                fp.as_deref(),
                                 affinity,
                                 request_start,
                             )
@@ -8359,7 +9531,14 @@ async fn proxy_handler(
             return model_unsupported_response(&model, false);
         }
     }
-    exhaustion_response(last_saw_transient, last_saw_529)
+    exhaustion_response(&state, last_saw_transient, last_saw_529)
+    }
+    .await;
+
+    #[cfg(feature = "guard")]
+    let response = stamp_guard_findings(response, guard_annotate);
+
+    response
 }
 
 // ── Fallback upstream handler ────────────────────────────────────────
@@ -8413,7 +9592,9 @@ fn build_openai_fallback_body(body_bytes: &[u8]) -> FallbackBody {
 /// final wire body: `proxy_handler` pre-translates via
 /// `build_openai_fallback_body` and sets `translate = true` so the *response*
 /// is translated back to Anthropic format; `openai_chat_handler` passes the
-/// raw OpenAI-format bytes with `translate = false` (passthrough).
+/// client's OpenAI-format bytes (temperature-stripped per LAB-798 when the
+/// model hard-rejects it, otherwise verbatim) with `translate = false`
+/// (passthrough).
 ///
 /// Returns `ForwardOutcome` so the caller's retry loop applies the SAME
 /// round-gated policy as the Anthropic path (`apply_round_outcome`): a
@@ -8519,12 +9700,21 @@ async fn try_fallback_upstream(
     // the still-rate-limited endpoint before rotating (GH #97).
     // Downstream parses OpenAI errors on the passthrough path
     // (translate = false); Anthropic errors when translating back.
-    let mut resp =
-        match classify_retry_status(state, status, &ep.rate_info, &ep.name, resp, !translate).await
-        {
-            Ok(resp) => resp,
-            Err(outcome) => return outcome,
-        };
+    let mut resp = match classify_retry_status(
+        state,
+        status,
+        &ep.rate_info,
+        &ep.name,
+        resp,
+        /* openai_error_shape */ !translate,
+        // The OpenAI request shape cannot express `speed` — never fast.
+        None,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(outcome) => return outcome,
+    };
 
     if !status.is_success() {
         let err_body = resp
@@ -8594,8 +9784,8 @@ async fn try_fallback_upstream(
             // Passthrough-only: tracks whether upstream's `[DONE]` terminator
             // has been forwarded verbatim, so an error frame on the next read
             // doesn't ship a second `[DONE]` and break strict OpenAI parsers.
-            // Not needed in the translate branch — translation converts
-            // `[DONE]` to `message_stop`, which has no analogous terminator.
+            // The translate branch tracks its equivalent (`message_stop`
+            // emitted) as `ctx.message_stopped`, set inside the translator.
             let mut sent_done = false;
             // Carries any partial trailing SSE line between chunks so the
             // `[DONE]` terminator is detected across resp.chunk() boundaries.
@@ -8626,7 +9816,10 @@ async fn try_fallback_upstream(
                                         }
                                     }
                                 }
-                                if client_gone {
+                                if client_gone || ctx.upstream_error {
+                                    // upstream_error: the in-band error frame
+                                    // just sent is the stream's final frame —
+                                    // stop draining so nothing can follow it.
                                     break;
                                 }
                             }
@@ -8659,7 +9852,7 @@ async fn try_fallback_upstream(
                                 client_gone = true;
                             }
                         }
-                        if client_gone {
+                        if client_gone || ctx.upstream_error {
                             break;
                         }
                     }
@@ -8669,15 +9862,28 @@ async fn try_fallback_upstream(
                         // Downstream protocol depends on whether we're translating:
                         // translate_response=true → /v1/messages client expects
                         // Anthropic SSE; translate_response=false → /v1/chat/completions
-                        // passthrough, downstream is the OpenAI SSE format. Skip
-                        // the openai error frame when `[DONE]` was already
-                        // forwarded — emitting it would ship a second `[DONE]`.
+                        // passthrough, downstream is the OpenAI SSE format.
                         let msg = format!("upstream stream interrupted: {e}");
-                        let frame = if translate_response {
+                        // Error frame is terminal: mark the ctx so the
+                        // post-loop buffer flush translates to nothing, no
+                        // frame follows the error, and finalization logs the
+                        // stream as failed on both protocols. When the
+                        // success terminator already went out (`message_stop`
+                        // translated, or `[DONE]` forwarded verbatim) the
+                        // client saw a complete stream — no frame is sent and
+                        // the stream stays a success.
+                        let frame = if translate_response && !ctx.message_stopped {
+                            ctx.upstream_error = true;
                             Some(anthropic_error_frame(&msg))
-                        } else if !sent_done {
+                        } else if !translate_response && !sent_done {
+                            ctx.upstream_error = true;
                             Some(openai_error_frame(&msg))
                         } else {
+                            debug!(
+                                req_id,
+                                "fallback: transport error after success \
+                                 terminator — error frame suppressed"
+                            );
                             None
                         };
                         if let Some(frame) = frame {
@@ -8708,11 +9914,19 @@ async fn try_fallback_upstream(
             if client_gone {
                 debug!(req_id, "fallback: client disconnected during stream");
             }
-            info!(
-                req_id,
-                upstream = upstream_name,
-                "fallback: unified endpoint stream complete"
-            );
+            if ctx.upstream_error {
+                warn!(
+                    req_id,
+                    upstream = upstream_name,
+                    "fallback: unified endpoint stream ended with upstream error frame"
+                );
+            } else {
+                info!(
+                    req_id,
+                    upstream = upstream_name,
+                    "fallback: unified endpoint stream complete"
+                );
+            }
         });
 
         return ForwardOutcome::Done(Box::new(
@@ -8780,6 +9994,9 @@ async fn try_fallback_upstream(
         // the session registry (LAB-916) tracks Anthropic-bound traffic only.
         None,
         0,
+        // OpenAI endpoints carry stub RateLimitInfo — no routing snapshot to
+        // merge with; this path keeps its own usage-only log line (LAB-3214).
+        None,
     )
     .await;
 
@@ -9208,7 +10425,6 @@ fn prom_header(buf: &mut String, name: &str, metric_type: &str, help: &str) {
     let _ = writeln!(buf, "# TYPE {name} {metric_type}");
 }
 
-#[allow(dead_code)]
 #[derive(Default, Clone)]
 struct ClaimMetricsSnap {
     key: String,
@@ -9503,6 +10719,12 @@ async fn metrics_handler(
     let cluster_info = state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
     let prompt_too_long: Vec<(String, u64)> = state
         .prompt_too_long
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
+    let fast_mode_429: Vec<(String, u64)> = state
+        .fast_mode_429
         .lock()
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
@@ -9934,6 +11156,49 @@ async fn metrics_handler(
                 &[("account", &s.name), ("claim", &claim.key)],
                 claim.waste_risk,
             );
+        }
+    }
+
+    // Per-claim status and reset (LAB-4189). The account-level siblings are
+    // labelled `window="5h"|"7d"` only, so a model carve-out had neither. Status
+    // is not recoverable from utilization in either direction — see the
+    // per-claim section of the README for the why, and read this rather than
+    // thresholding the percentage.
+    prom_header(
+        &mut buf,
+        "anthropic_claim_rate_limit_status",
+        "gauge",
+        "Per-claim rate-limit status ordinal (0=allowed, 1=warning, 2=throttled, 3=rejected)",
+    );
+    for s in &snaps {
+        for claim in &s.claims {
+            prom_gauge(
+                &mut buf,
+                "anthropic_claim_rate_limit_status",
+                &[("account", &s.name), ("claim", &claim.key)],
+                status_to_ordinal(claim.status.as_deref()),
+            );
+        }
+    }
+    prom_header(
+        &mut buf,
+        "anthropic_claim_reset_seconds",
+        "gauge",
+        "Seconds until this claim's window resets",
+    );
+    for s in &snaps {
+        for claim in &s.claims {
+            // Past-dated resets are omitted rather than clamped to 0, matching
+            // `anthropic_account_reset_seconds`: a stale reset is unknown, not
+            // "resets now".
+            if let Some(r) = claim.reset.filter(|&r| r > now_epoch) {
+                prom_gauge(
+                    &mut buf,
+                    "anthropic_claim_reset_seconds",
+                    &[("account", &s.name), ("claim", &claim.key)],
+                    (r - now_epoch) as f64,
+                );
+            }
         }
     }
 
@@ -10378,6 +11643,26 @@ async fn metrics_handler(
         );
     }
 
+    // Fast-mode 429s by account (LAB-2675). A series appears once an account
+    // has served a fast-mode 429 — which the proxy forwards rather than
+    // cooling the account for — so any sample here means a client is hitting
+    // the separate fast bucket. Sustained growth is the trigger to revisit
+    // that policy.
+    prom_header(
+        &mut buf,
+        "anthropic_fast_mode_429_total",
+        "counter",
+        "Upstream 429s on fast-mode requests, forwarded to the caller without cooling the account",
+    );
+    for (account, n) in &fast_mode_429 {
+        prom_counter(
+            &mut buf,
+            "anthropic_fast_mode_429_total",
+            &[("account", account.as_str())],
+            *n,
+        );
+    }
+
     // Per-client model-allowlist denials (LAB-1083). A non-zero rate here is
     // either a misconfigured caller or a caller reaching for capacity it was
     // deliberately denied — both worth an alert.
@@ -10532,6 +11817,43 @@ async fn metrics_handler(
         state.body_read_timeout_total.load(Ordering::Relaxed),
     );
 
+    // Affinity overrides that migrated a session (GH#156), by the window that
+    // bound the sticky account — see the WARN in pick_sticky_weighted_v2.
+    prom_header(
+        &mut buf,
+        "anthropic_affinity_migrations_total",
+        "counter",
+        "Affinity overrides that migrated a session, by the window that bound the sticky account",
+    );
+    for bind in AffinityBind::ALL {
+        prom_counter(
+            &mut buf,
+            "anthropic_affinity_migrations_total",
+            &[("reason", bind.as_str())],
+            state.affinity_migrations[bind as usize].load(Ordering::Relaxed),
+        );
+    }
+
+    // Client-facing pool exhaustion (LAB-4189): the 429/503 the caller actually
+    // received because every endpoint was gated or failed. The per-account
+    // gauges describe the pool's state but never say whether a request was
+    // turned away because of it. Independent per-replica events, not mirrors of
+    // one upstream value — aggregate with `sum by (kind)`.
+    prom_header(
+        &mut buf,
+        "anthropic_pool_exhausted_total",
+        "counter",
+        "Client-facing pool-exhaustion responses by kind (rate_limited=429, transient=503)",
+    );
+    for kind in PoolExhaustion::ALL {
+        prom_counter(
+            &mut buf,
+            "anthropic_pool_exhausted_total",
+            &[("kind", kind.as_str())],
+            state.pool_exhausted[kind as usize].load(Ordering::Relaxed),
+        );
+    }
+
     // LAB-933/LAB-929 response cache counters (AC12 / LAB-929 AC4). Emitted
     // only when the cache is configured; `messages` and `count_tokens` are
     // separate series on the same metric names, distinguished by the
@@ -10574,6 +11896,58 @@ async fn metrics_handler(
                 );
             }
         }
+    }
+
+    // LAB-3877: Tier 0 guard metrics. Verdicts by (client, scanner, outcome)
+    // and the scan-duration histogram. Both per-replica, in-memory.
+    #[cfg(feature = "guard")]
+    {
+        prom_header(
+            &mut buf,
+            "anthropic_guard_verdicts_total",
+            "counter",
+            "Guard scan verdicts by client, scanner, and outcome (allow/annotate/block)",
+        );
+        for ((client, scanner, verdict), n) in state.guard.verdicts_snapshot() {
+            prom_counter(
+                &mut buf,
+                "anthropic_guard_verdicts_total",
+                &[
+                    ("client", client.as_str()),
+                    ("scanner", scanner),
+                    ("verdict", verdict),
+                ],
+                n,
+            );
+        }
+
+        let (hist, sum, count) = state.guard.scan_hist_snapshot();
+        prom_header(
+            &mut buf,
+            "anthropic_guard_scan_duration_seconds",
+            "histogram",
+            "Guard request-body scan duration in seconds",
+        );
+        for (le, cumulative) in &hist {
+            prom_counter(
+                &mut buf,
+                "anthropic_guard_scan_duration_seconds_bucket",
+                &[("le", le.as_str())],
+                *cumulative,
+            );
+        }
+        prom_gauge(
+            &mut buf,
+            "anthropic_guard_scan_duration_seconds_sum",
+            &[],
+            sum,
+        );
+        prom_counter(
+            &mut buf,
+            "anthropic_guard_scan_duration_seconds_count",
+            &[],
+            count,
+        );
     }
 
     (
@@ -10643,6 +12017,12 @@ struct StreamContext {
     /// Text content buffered while `json_mode` is set, flushed fence-stripped
     /// at end-of-message so streaming content matches the non-streaming strip.
     text_buffer: String,
+    /// Upstream emitted an in-band `event: error` frame. The translator has
+    /// already surfaced it as an OpenAI error frame (which carries its own
+    /// `[DONE]`); the stream loop must stop translating and must NOT emit a
+    /// clean `[DONE]` afterwards — that would fake a successful completion
+    /// after a truncation.
+    upstream_error: bool,
 }
 
 impl Default for StreamContext {
@@ -10656,6 +12036,7 @@ impl Default for StreamContext {
             current_tool_id: String::new(),
             json_mode: false,
             text_buffer: String::new(),
+            upstream_error: false,
         }
     }
 }
@@ -10904,9 +12285,16 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
         .unwrap_or(serde_json::json!(4096));
     out.insert("max_tokens".to_string(), max_tokens);
 
-    // Direct passthrough params
+    // Direct passthrough params — except `temperature` on models that
+    // hard-reject it as deprecated (Claude ≥ 4.7, LAB-798): forwarding it
+    // fails the whole request with a non-retryable 400. Drop policy and
+    // rationale live in `drops_deprecated_temperature`.
+    let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
     for key in &["temperature", "top_p", "top_k", "stream"] {
         if let Some(v) = body.get(*key) {
+            if *key == "temperature" && drops_deprecated_temperature(model_name, v) {
+                continue;
+            }
             out.insert(key.to_string(), v.clone());
         }
     }
@@ -11225,6 +12613,29 @@ fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
                 None => Some("data: [DONE]\n\n".to_string()),
             }
         }
+        "error" => {
+            // In-band upstream failure (e.g. overloaded_error mid-stream).
+            // Surface it in the client's protocol instead of dropping it —
+            // dropping it made the stream end with a clean [DONE] after a
+            // silent truncation. The frame carries its own [DONE];
+            // ctx.upstream_error tells the stream loop to stop and skip the
+            // ensure-[DONE] guard.
+            ctx.upstream_error = true;
+            let err_type = parsed
+                .pointer("/error/type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("api_error");
+            let err_msg = parsed
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("upstream error");
+            warn!(
+                error_type = err_type,
+                error_message = err_msg,
+                "Anthropic upstream emitted in-band error event mid-stream"
+            );
+            Some(openai_error_sse(&format!("{err_type}: {err_msg}")))
+        }
         _ => None, // ping
     }
 }
@@ -11515,9 +12926,16 @@ fn translate_anthropic_request_to_openai(
         out.insert("max_tokens".to_string(), mt.clone());
     }
 
-    // Passthrough params
+    // Passthrough params — same LAB-798 `temperature` guard as the forward
+    // translator: an OpenAI-protocol endpoint can front Claude ≥ 4.7 (empty
+    // `models` list serves everything), and the deprecated param 400s there
+    // too. Policy in `drops_deprecated_temperature`.
+    let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
     for key in &["temperature", "top_p", "stream"] {
         if let Some(v) = body.get(*key) {
+            if *key == "temperature" && drops_deprecated_temperature(model_name, v) {
+                continue;
+            }
             out.insert(key.to_string(), v.clone());
         }
     }
@@ -11664,6 +13082,18 @@ struct ReverseStreamContext {
     block_index: i64,
     in_text_block: bool,
     in_tool_use: bool,
+    /// An Anthropic `event: error` frame has been sent downstream — either
+    /// translated from an in-band `{"error": {...}}` data line, or by the
+    /// stream loop on a transport failure. That frame is terminal: the
+    /// translator emits nothing once this is set (including `[DONE]` →
+    /// `message_stop`), so no success terminator can follow an error.
+    upstream_error: bool,
+    /// The Anthropic success terminator (`message_stop`) has been emitted —
+    /// from a finish_reason chunk or a bare upstream `[DONE]`. The stream is
+    /// complete from the client's view; a later transport failure must not
+    /// ship an error frame after it (mirror of the passthrough `sent_done`
+    /// guard, one protocol over).
+    message_stopped: bool,
 }
 
 impl Default for ReverseStreamContext {
@@ -11675,6 +13105,8 @@ impl Default for ReverseStreamContext {
             block_index: -1,
             in_text_block: false,
             in_tool_use: false,
+            upstream_error: false,
+            message_stopped: false,
         }
     }
 }
@@ -11689,7 +13121,7 @@ fn make_anthropic_event(event_type: &str, data: &serde_json::Value) -> String {
 /// ("socket closed unexpectedly"). Emits a single `event: error` frame; the
 /// Anthropic SSE protocol has no terminator analogous to OpenAI's `[DONE]`,
 /// so the channel may close naturally after this frame.
-fn anthropic_error_frame(message: &str) -> bytes::Bytes {
+fn anthropic_error_sse(message: &str) -> String {
     // `error.type` must be one of Anthropic's documented values
     // (overloaded_error, api_error, invalid_request_error, ...). Using a
     // custom type like "upstream_error" risks the SDK rejecting the frame
@@ -11700,27 +13132,48 @@ fn anthropic_error_frame(message: &str) -> bytes::Bytes {
         "type": "error",
         "error": { "type": "api_error", "message": message }
     });
-    bytes::Bytes::from(make_anthropic_event("error", &body))
+    make_anthropic_event("error", &body)
+}
+
+/// `anthropic_error_sse` as Bytes, for the raw stream-loop send paths.
+fn anthropic_error_frame(message: &str) -> bytes::Bytes {
+    bytes::Bytes::from(anthropic_error_sse(message))
 }
 
 /// Final-frame OpenAI SSE error for downstream. Emits the error JSON
 /// followed by `data: [DONE]` (OpenAI's stream terminator) — callers MUST
 /// NOT emit an additional `[DONE]` after this frame.
-fn openai_error_frame(message: &str) -> bytes::Bytes {
+fn openai_error_sse(message: &str) -> String {
     let err = serde_json::json!({
         "error": { "message": message, "type": "upstream_error" }
     });
-    bytes::Bytes::from(format!("data: {err}\n\ndata: [DONE]\n\n"))
+    format!("data: {err}\n\ndata: [DONE]\n\n")
+}
+
+/// `openai_error_sse` as Bytes, for the raw stream-loop send paths.
+fn openai_error_frame(message: &str) -> bytes::Bytes {
+    bytes::Bytes::from(openai_error_sse(message))
 }
 
 /// Translate an OpenAI SSE chunk to Anthropic SSE events.
 /// Returns Vec because one OpenAI chunk may produce multiple Anthropic events.
 /// `raw` is the raw SSE data line (after stripping "data: " prefix).
 fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) -> Vec<String> {
+    // Both terminators are final. After an in-band upstream error the
+    // Anthropic error frame is the last frame; drop whatever else the
+    // upstream sends (a trailing [DONE] would otherwise emit a message_stop —
+    // a success terminator after an error). Symmetrically, after
+    // `message_stop` nothing may follow — an in-band error line or stray
+    // delta arriving post-completion would violate the protocol the same way.
+    if ctx.upstream_error || ctx.message_stopped {
+        return vec![];
+    }
+
     let trimmed = raw.trim();
     if trimmed == "[DONE]" {
         // Only emit message_stop if we started a message
         if ctx.message_started {
+            ctx.message_stopped = true;
             return vec![make_anthropic_event(
                 "message_stop",
                 &serde_json::json!({"type": "message_stop"}),
@@ -11733,6 +13186,27 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
         Ok(v) => v,
         Err(_) => return vec![],
     };
+
+    // In-band upstream error ({"error": {...}} data line). Without this it
+    // would fall through the missing-choices early-return and vanish — a
+    // not-yet-started message then ends as a 200 with an empty SSE body.
+    if let Some(err) = parsed.get("error").filter(|e| !e.is_null()) {
+        ctx.upstream_error = true;
+        let err_type = err
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("upstream_error");
+        let err_msg = match err.get("message").and_then(|v| v.as_str()) {
+            Some(m) => m.to_string(),
+            None => err.to_string(),
+        };
+        warn!(
+            error_type = err_type,
+            error_message = err_msg,
+            "OpenAI upstream emitted in-band error mid-stream"
+        );
+        return vec![anthropic_error_sse(&format!("{err_type}: {err_msg}"))];
+    }
 
     let mut events: Vec<String> = Vec::new();
 
@@ -11903,7 +13377,9 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
             "message_stop",
             &serde_json::json!({"type": "message_stop"}),
         ));
-        ctx.message_started = false; // prevent duplicate from [DONE]
+        // message_stopped's early-return keeps a trailing [DONE] (or anything
+        // else) from emitting a duplicate message_stop.
+        ctx.message_stopped = true;
     }
 
     events
@@ -11957,6 +13433,9 @@ async fn forward_openai_compat_anthropic(
     }
     headers.remove("content-length"); // body size changes after translation
     headers.remove("accept-encoding"); // we need plaintext to translate the response
+    if !state.forward_caller_identity {
+        strip_client_identity_headers(&mut headers);
+    }
 
     // Inject required Anthropic headers
     headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -12041,18 +13520,36 @@ async fn forward_openai_compat_anthropic(
     // clear the circuit-breaker counter.
     state.record_transport_success(endpoint_idx).await;
     state
-        .update_rate_info_for(rate_info, endpoint_name, resp.headers())
+        .update_rate_info_for(
+            rate_info,
+            endpoint_name,
+            resp.headers(),
+            // The OpenAI request shape cannot express `speed`, so a response
+            // here always answers a standard-speed request (LAB-2693).
+            /* is_fast_mode */
+            false,
+        )
         .await;
 
     // Update burn rate (after rate-limit headers are parsed)
     state.update_burn_rate(&ep.burn_rate, client_id);
 
     // Classify 429 / 529 / other 5xx into a retry decision (shared helper).
-    let mut resp =
-        match classify_retry_status(state, status, rate_info, endpoint_name, resp, true).await {
-            Ok(resp) => resp,
-            Err(outcome) => return outcome,
-        };
+    let mut resp = match classify_retry_status(
+        state,
+        status,
+        rate_info,
+        endpoint_name,
+        resp,
+        /* openai_error_shape */ true,
+        // The OpenAI request shape cannot express `speed` — never fast.
+        None,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(outcome) => return outcome,
+    };
 
     // Clear hard limit and burst counter only on a genuine 2xx success.
     // A 4xx (e.g. invalid_request_error, auth failure) is not evidence
@@ -12078,31 +13575,35 @@ async fn forward_openai_compat_anthropic(
         state.signal_hard_limit_recovery(endpoint_name).await;
     }
 
-    // Compute budget pressure status for response header + log
-    let budget_status = {
+    // Capture the routing/utilization snapshot + inject budget status header.
+    // The `proxied (openai-compat)` line is deferred to `finalize_stream`/
+    // `finalize_non_stream`, which merge it with token usage once known
+    // (LAB-3214: one INFO line per request, not two).
+    // Named `proxied_ctx` (not `ctx`) — this function's streaming branch
+    // already has a local `ctx: StreamContext` for SSE translation.
+    let (budget_status, proxied_ctx) = {
         let info = rate_info.read().await;
         let (eff_util, constraint, _adj_5h, _adj_7d) =
             effective_utilization(&info, AppState::now_epoch(), model);
-        info!(
-            req_id,
-            client = %client_ip,
-            client_id = %client_id,
-            ver = %client_ver,
-            agent = %agent_id,
-            session = %session_id,
-            model = %model,
-            account = endpoint_name,
-            status = status.as_u16(),
-            utilization = format_args!("{eff_util:.2}"),
-            util_5h = info.utilization_5h.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
-            util_7d = info.utilization_7d.map(|v| format!("{v:.2}")).as_deref().unwrap_or("-"),
+        let proxied_ctx = ProxiedCtx::OpenaiCompat {
+            client_ver: client_ver.to_owned(),
+            utilization: format!("{eff_util:.2}"),
+            util_5h: info
+                .utilization_5h
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
+            util_7d: info
+                .utilization_7d
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
             constraint,
-            pin = state.pin_status(client_id, endpoint_idx),
-            openai_compat = true,
-            stream = is_streaming,
-            "proxied (openai-compat)"
-        );
-        compute_pressure_status(eff_util, client_id, state)
+            pin: state.pin_status(client_id, endpoint_idx),
+            stream: is_streaming,
+        };
+        (
+            compute_pressure_status(eff_util, client_id, state),
+            proxied_ctx,
+        )
     };
 
     // Non-2xx: log error detail, translate to OpenAI error format, return
@@ -12121,6 +13622,22 @@ async fn forward_openai_compat_anthropic(
             status = status.as_u16(),
             error_message = ?error_msg,
             "openai-compat: upstream error"
+        );
+        // This branch returns before `finalize_non_stream` — log the merged
+        // line here too (zero usage), so an upstream error still gets the
+        // routing/utilization snapshot at INFO, same as the old unconditional
+        // `proxied (openai-compat)` line did (AC4).
+        log_proxied(
+            req_id,
+            client_id,
+            model,
+            endpoint_name,
+            &client_ip.to_string(),
+            agent_id,
+            session_id,
+            status.as_u16(),
+            &proxied_ctx,
+            &TokenUsage::default(),
         );
 
         // Translate Anthropic error to OpenAI error format so clients
@@ -12225,16 +13742,30 @@ async fn forward_openai_compat_anthropic(
                             }
 
                             if let Some(translated) = translate_sse_event(&event, &mut ctx) {
-                                if translated.trim() == "data: [DONE]" {
+                                // ends_with, not equality: the json_mode flush
+                                // and the in-band error frame both append the
+                                // terminator to another frame in one string.
+                                if translated.ends_with("data: [DONE]\n\n") {
                                     sent_done = true;
+                                }
+                                if ctx.upstream_error {
+                                    // In-band `event: error` — the frame just
+                                    // translated carries its own [DONE]. Treat
+                                    // like a transport error: stop translating,
+                                    // skip the buffer flush and the clean-[DONE]
+                                    // guard, and finalize as a failure.
+                                    upstream_error = true;
                                 }
                                 if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
                                     client_gone = true;
                                     break;
                                 }
+                                if upstream_error {
+                                    break;
+                                }
                             }
                         }
-                        if client_gone {
+                        if client_gone || upstream_error {
                             break;
                         }
                     }
@@ -12266,8 +13797,14 @@ async fn forward_openai_compat_anthropic(
                 let remaining = String::from_utf8_lossy(&buffer).into_owned();
                 if !remaining.trim().is_empty() {
                     if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
-                        if translated.trim() == "data: [DONE]" {
+                        if translated.ends_with("data: [DONE]\n\n") {
                             sent_done = true;
+                        }
+                        if ctx.upstream_error {
+                            // Error event in the trailing buffer (stream
+                            // closed without a final \n\n) — same rules as
+                            // in-loop.
+                            upstream_error = true;
                         }
                         if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
                             client_gone = true;
@@ -12303,6 +13840,7 @@ async fn forward_openai_compat_anthropic(
                 &agent_clone,
                 &session_clone,
                 status_code,
+                proxied_ctx,
                 scanner,
                 request_start,
                 client_gone,
@@ -12332,6 +13870,21 @@ async fn forward_openai_compat_anthropic(
         Ok(b) => b,
         Err(e) => {
             error!("failed to read upstream response: {e}");
+            // This branch returns before `finalize_non_stream` — log the
+            // merged line here too (no usage: the body never arrived), so
+            // the routing/utilization snapshot still lands at INFO (AC4).
+            log_proxied(
+                req_id,
+                client_id,
+                model,
+                endpoint_name,
+                &client_ip.to_string(),
+                agent_id,
+                session_id,
+                status.as_u16(),
+                &proxied_ctx,
+                &TokenUsage::default(),
+            );
             return ForwardOutcome::Done(Box::new(
                 (StatusCode::BAD_GATEWAY, "failed to read upstream response").into_response(),
             ));
@@ -12341,6 +13894,20 @@ async fn forward_openai_compat_anthropic(
     let anthropic_resp: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
         Ok(v) => v,
         Err(_) => {
+            // Same as above: malformed upstream body means we never reach
+            // `finalize_non_stream`, so log the routing snapshot here.
+            log_proxied(
+                req_id,
+                client_id,
+                model,
+                endpoint_name,
+                &client_ip.to_string(),
+                agent_id,
+                session_id,
+                status.as_u16(),
+                &proxied_ctx,
+                &TokenUsage::default(),
+            );
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
@@ -12374,6 +13941,7 @@ async fn forward_openai_compat_anthropic(
         true,
         session_key,
         context_window,
+        Some(proxied_ctx),
     )
     .await;
 
@@ -12437,12 +14005,12 @@ async fn openai_chat_handler(
         Err(resp) => return *resp,
     };
 
-    let body_bytes = match read_body_bounded(&state, body, &req_id).await {
+    let mut body_bytes = match read_body_bounded(&state, body, &req_id).await {
         Ok(b) => b,
         Err(resp) => return *resp,
     };
 
-    let openai_body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+    let mut openai_body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
             error!("failed to parse request JSON: {e}");
@@ -12461,6 +14029,35 @@ async fn openai_chat_handler(
         .unwrap_or("")
         .to_string();
 
+    // LAB-798: `Protocol::OpenAI` endpoints below forward `body_bytes`
+    // verbatim, so a hard-rejected `temperature` must be stripped here,
+    // before either wire body is built — the translated Anthropic arm then
+    // never sees it either, keeping the warn to once per request. Policy in
+    // `drops_deprecated_temperature`.
+    if openai_body
+        .get("temperature")
+        .is_some_and(|v| drops_deprecated_temperature(&model, v))
+    {
+        if let Some(obj) = openai_body.as_object_mut() {
+            obj.remove("temperature");
+        }
+        match serde_json::to_vec(&openai_body) {
+            Ok(b) => body_bytes = bytes::Bytes::from(b),
+            // Can't happen for a Value parsed from JSON (string keys only),
+            // but forwarding the original bytes would silently resend the
+            // rejected param — fail loudly instead, like the serialize arm
+            // below.
+            Err(e) => {
+                error!(req_id, error = %e, "failed to re-serialize request body after temperature strip");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "body serialization failed",
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // Pre-request gate: operator bypass, budget, utilization limit, emergency brake.
     // Note: budget + emergency don't need `model` and could run before body parsing,
     // but those rejections are rare and the JSON parse cost is negligible — not worth
@@ -12470,6 +14067,49 @@ async fn openai_chat_handler(
     }
 
     let mut anthropic_body = translate_openai_to_anthropic(&openai_body);
+
+    // LAB-3877: Tier 0 content guard on the OpenAI-compat surface — the same
+    // hook as `proxy_handler`. The scanner reads the TRANSLATED body (the
+    // Messages shape it understands); the Anthropic arm below forwards that
+    // body, the OpenAI arm forwards the original bytes. Unparseable JSON was
+    // already rejected above.
+    //
+    // The two conditions below are an ENUMERATION, not a rule: each is a
+    // shape translation cannot carry into the Messages document, so the
+    // scanner never sees it while the OpenAI arm still ships it. Anything
+    // else translation drops — `messages[].name`, the top-level `user` field
+    // — is NOT covered here and is unscanned on both surfaces (deferred to
+    // the guard epic). Adding a field to the translator's drop list does not
+    // extend this predicate; extend it by hand.
+    #[cfg(feature = "guard")]
+    let guard_annotate: Option<usize> = {
+        let unscannable = match openai_body.get("messages").and_then(|m| m.as_array()) {
+            // Translation preserves the user text and `tool` content the
+            // scanner reads, but passes any other role (legacy `function`,
+            // `developer`, unknown) through verbatim.
+            Some(msgs) => msgs
+                .iter()
+                .any(|m| {
+                    !matches!(
+                        m.get("role").and_then(|r| r.as_str()),
+                        Some("system" | "user" | "assistant" | "tool")
+                    )
+                })
+                .then_some("request carries an OpenAI message role the scanner cannot read"),
+            // LAB-4322: `messages` is absent or not an array. The translator
+            // reads it through the same `.as_array()` and then writes an array
+            // back unconditionally, so the scanned document gets an EMPTY
+            // `messages` while the original bytes keep every character the
+            // client sent. `/v1/chat/completions` requires an array here, so
+            // nothing legitimate is rejected.
+            None => Some(GUARD_REASON_MESSAGES_NOT_ARRAY),
+        };
+        let guard_input = guard::ScanInput::from_body(&anthropic_body);
+        match state.guard_hook(&req_id, &client_id, unscannable, guard_input.as_ref(), true) {
+            Ok(annotate) => annotate,
+            Err(resp) => return *resp,
+        }
+    };
 
     if state.auto_cache {
         let inj = inject_cache_breakpoints(&mut anthropic_body);
@@ -12510,123 +14150,133 @@ async fn openai_chat_handler(
         }
     };
 
-    let n = state.endpoints.len();
-    let mut last_saw_529 = false;
-    let mut last_saw_transient = false;
-    // Upstream error from the most recent model-unsupported rejection —
-    // returned verbatim if the pool exhausts on nothing but rejections.
-    let mut model_unsupported_resp: Option<Response> = None;
-    for retry_round in 0..=MAX_529_RETRIES {
-        if retry_round > 0 {
-            let delay = round_backoff_delay(retry_round, last_saw_529);
-            warn!(
-                retry_round = retry_round,
-                delay_ms = delay.as_millis() as u64,
-                saw_529 = last_saw_529,
-                "backoff: retrying all endpoints after transient/overload round"
-            );
-            tokio::time::sleep(delay).await;
-        }
-        let mut skip: Vec<EndpointIdx> = Vec::new();
-        let mut saw_529 = false;
-        let mut saw_transient = false;
-        for _attempt in 0..n {
-            // Pick the next endpoint and dispatch by protocol. Both forwards
-            // return a `ForwardOutcome` so the shared round-gated policy in
-            // `apply_round_outcome` covers both.
-            let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
-                .await
-            {
-                Some(i) => {
-                    let ep = &state.endpoints[i];
-                    match ep.protocol {
-                        Protocol::Anthropic => {
-                            let out = forward_openai_compat_anthropic(
-                                &state,
-                                &parts,
-                                ep,
-                                i,
-                                &anthropic_body_bytes,
-                                &oauth_body_bytes,
-                                &req_id,
-                                &client_id,
-                                &client_ver,
-                                &client_ip,
-                                &agent_id,
-                                &session_id,
-                                &model,
-                                affinity,
-                                is_streaming,
-                                json_mode,
-                                request_start,
-                            )
-                            .await;
-                            (out, i)
-                        }
-                        Protocol::OpenAI => {
-                            // The endpoint is OpenAI-native — forward the
-                            // original request body without translation.
-                            let out = try_fallback_upstream(
-                                &state,
-                                &body_bytes,
-                                &req_id,
-                                &client_id,
-                                &client_ip,
-                                &agent_id,
-                                &session_id,
-                                &model,
-                                i,
-                                request_start,
-                                false,
-                                is_streaming,
-                            )
-                            .await;
-                            (out, i)
+    // Wrapped as in `proxy_handler`: every `return` inside yields the block's
+    // `Response`, so `X-Guard-Findings` is stamped once below.
+    let response: Response = async {
+        let n = state.endpoints.len();
+        let mut last_saw_529 = false;
+        let mut last_saw_transient = false;
+        // Upstream error from the most recent model-unsupported rejection —
+        // returned verbatim if the pool exhausts on nothing but rejections.
+        let mut model_unsupported_resp: Option<Response> = None;
+        for retry_round in 0..=MAX_529_RETRIES {
+            if retry_round > 0 {
+                let delay = round_backoff_delay(retry_round, last_saw_529);
+                warn!(
+                    retry_round = retry_round,
+                    delay_ms = delay.as_millis() as u64,
+                    saw_529 = last_saw_529,
+                    "backoff: retrying all endpoints after transient/overload round"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            let mut skip: Vec<EndpointIdx> = Vec::new();
+            let mut saw_529 = false;
+            let mut saw_transient = false;
+            for _attempt in 0..n {
+                // Pick the next endpoint and dispatch by protocol. Both forwards
+                // return a `ForwardOutcome` so the shared round-gated policy in
+                // `apply_round_outcome` covers both.
+                let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
+                    .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
+                    .await
+                {
+                    Some(i) => {
+                        let ep = &state.endpoints[i];
+                        match ep.protocol {
+                            Protocol::Anthropic => {
+                                let out = forward_openai_compat_anthropic(
+                                    &state,
+                                    &parts,
+                                    ep,
+                                    i,
+                                    &anthropic_body_bytes,
+                                    &oauth_body_bytes,
+                                    &req_id,
+                                    &client_id,
+                                    &client_ver,
+                                    &client_ip,
+                                    &agent_id,
+                                    &session_id,
+                                    &model,
+                                    affinity,
+                                    is_streaming,
+                                    json_mode,
+                                    request_start,
+                                )
+                                .await;
+                                (out, i)
+                            }
+                            Protocol::OpenAI => {
+                                // The endpoint is OpenAI-native — forward the
+                                // original request body without translation.
+                                let out = try_fallback_upstream(
+                                    &state,
+                                    &body_bytes,
+                                    &req_id,
+                                    &client_id,
+                                    &client_ip,
+                                    &agent_id,
+                                    &session_id,
+                                    &model,
+                                    i,
+                                    request_start,
+                                    false,
+                                    is_streaming,
+                                )
+                                .await;
+                                (out, i)
+                            }
                         }
                     }
-                }
-                // Candidates exhausted mid-round (all skipped / hard-limited /
-                // model-filtered). Break to the round-end logic rather than
-                // returning here, so a transient-only round still reaches the
-                // transient-aware exhaustion status instead of short-circuiting
-                // to a premature 429.
-                None => break,
-            };
+                    // Candidates exhausted mid-round (all skipped / hard-limited /
+                    // model-filtered). Break to the round-end logic rather than
+                    // returning here, so a transient-only round still reaches the
+                    // transient-aware exhaustion status instead of short-circuiting
+                    // to a premature 429.
+                    None => break,
+                };
 
-            match apply_round_outcome(
-                retry_round,
-                outcome,
-                picked_idx,
-                &mut skip,
-                &mut saw_529,
-                &mut saw_transient,
-                &mut model_unsupported_resp,
-            ) {
-                RetryStep::Return(resp) => return resp,
-                RetryStep::NextAttempt => continue,
-                RetryStep::EndRound => break,
+                match apply_round_outcome(
+                    retry_round,
+                    outcome,
+                    picked_idx,
+                    &mut skip,
+                    &mut saw_529,
+                    &mut saw_transient,
+                    &mut model_unsupported_resp,
+                ) {
+                    RetryStep::Return(resp) => return resp,
+                    RetryStep::NextAttempt => continue,
+                    RetryStep::EndRound => break,
+                }
+            }
+            last_saw_529 = saw_529;
+            last_saw_transient = saw_transient;
+            if !round_should_continue(retry_round, saw_529, saw_transient) {
+                break;
             }
         }
-        last_saw_529 = saw_529;
-        last_saw_transient = saw_transient;
-        if !round_should_continue(retry_round, saw_529, saw_transient) {
-            break;
-        }
-    }
 
-    // Same model-rejection exhaustion rule as `proxy_handler` (LAB-941),
-    // in the OpenAI error shape this handler's clients parse.
-    if !last_saw_529 && !last_saw_transient {
-        if let Some(resp) = model_unsupported_resp {
-            return resp;
+        // Same model-rejection exhaustion rule as `proxy_handler` (LAB-941),
+        // in the OpenAI error shape this handler's clients parse.
+        if !last_saw_529 && !last_saw_transient {
+            if let Some(resp) = model_unsupported_resp {
+                return resp;
+            }
+            if state.model_unsupported_everywhere(&model) {
+                warn!(model, "model unsupported on all eligible endpoints");
+                return model_unsupported_response(&model, true);
+            }
         }
-        if state.model_unsupported_everywhere(&model) {
-            warn!(model, "model unsupported on all eligible endpoints");
-            return model_unsupported_response(&model, true);
-        }
+        exhaustion_response(&state, last_saw_transient, last_saw_529)
     }
-    exhaustion_response(last_saw_transient, last_saw_529)
+    .await;
+
+    #[cfg(feature = "guard")]
+    let response = stamp_guard_findings(response, guard_annotate);
+
+    response
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -12749,6 +14399,12 @@ fn validate_clients(config: &Config) -> Result<(), String> {
                     .to_string(),
             );
         }
+        if c.name == "_other" {
+            return Err(
+                "client: name must not be \"_other\" (the reserved metrics overflow-bucket label — a real client with this name would merge with, and take the warn-once flag of, the (\"_other\", \"_other\") overflow key)"
+                    .to_string(),
+            );
+        }
         if c.key.is_empty() {
             return Err(format!("client '{}': key must not be empty", c.name));
         }
@@ -12780,6 +14436,17 @@ fn validate_clients(config: &Config) -> Result<(), String> {
         }
         seen_names.push(&c.name);
         seen_keys.push(&c.key);
+    }
+
+    // The legacy `client_names` IP map is the third identity entry point
+    // (`resolve_client_id`'s fallback) — an IP mapped to a reserved sentinel
+    // would resolve real traffic to it, bypassing the header filter above.
+    for (ip, name) in &config.client_names {
+        if name == "-" || name == "_operator" || name == "_other" {
+            return Err(format!(
+                "client_names: \"{ip}\" maps to reserved name \"{name}\" (\"-\" = unknown-client sentinel, \"_operator\" = operator-aggregation label, \"_other\" = metrics overflow bucket)"
+            ));
+        }
     }
 
     // One client registry, not five. Every one of these config surfaces keys on
@@ -13180,10 +14847,13 @@ async fn main() {
     // unreachable backend. A process that boots during a backend outage
     // serves local-only (coordination ops gated off via
     // `coordination_redis`) and attaches automatically when the backend
-    // becomes reachable; `None` here means a config error (unparseable URL),
-    // which stays local-only for the process lifetime. Mid-run outage
-    // behaviour is unchanged from LAB-932 AC5: once connected, drops
-    // reconnect with capped exponential backoff.
+    // becomes reachable. A config error (unparseable URL) is different —
+    // LAB-3026: an operator who set `redis_url` has said shared state is
+    // required, so a URL that fails to parse (e.g. a password with an
+    // unescaped `@`/`/`/`?`/`#`/`:`) fails startup outright instead of
+    // silently downgrading to local-only, matching the `response_cache`
+    // config gate below. Mid-run outage behaviour is unchanged from LAB-932
+    // AC5: once connected, drops reconnect with capped exponential backoff.
     let redis = if let Some(ref url) = config.redis_url {
         let perf = PerformanceConfig {
             default_command_timeout: REDIS_COMMAND_TIMEOUT,
@@ -13200,10 +14870,10 @@ async fn main() {
         let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
         match start_coordination_redis(url.as_str(), perf, conn_config, policy) {
             Ok(client) => Some(client),
-            Err(e) => {
-                warn!(error = %e, "invalid redis_url — running in local-only mode");
-                None
-            }
+            // Log only `kind()` (a fixed enum, e.g. `Url`/`Config`) — never
+            // the error's `Display`/`details()`, which for a malformed URL
+            // can echo the offending fragment back, credential included.
+            Err(e) => panic!("redis_url: failed to parse ({:?})", e.kind()),
         }
     } else {
         None
@@ -13230,6 +14900,18 @@ async fn main() {
             Err(msg) => panic!("response_cache config error: {msg}"),
         },
         None => None,
+    };
+
+    // LAB-3877: build the Tier 0 guard once (rule/regex compilation is not
+    // cheap). A broken ruleset fails startup loudly rather than silently
+    // scanning nothing — the same fail-loud posture as the config gates above.
+    #[cfg(feature = "guard")]
+    let guard = match guard::Guard::new() {
+        Ok(g) => {
+            info!("content guard enabled (Tier 0 rules scanners; shadow-mode default)");
+            g
+        }
+        Err(msg) => panic!("guard init failed: {msg}"),
     };
 
     let state = Arc::new(AppState {
@@ -13260,6 +14942,8 @@ async fn main() {
         state_path,
         proxy_key: config.proxy_key.clone(),
         clients: config.clients.clone(),
+        #[cfg(feature = "guard")]
+        guard,
         allowed_ips,
         trusted_proxies,
         auth_throttle: AuthThrottle::new(
@@ -13314,6 +14998,8 @@ async fn main() {
                 .unwrap_or(DEFAULT_BODY_READ_TIMEOUT_SECS),
         ),
         body_read_timeout_total: AtomicU64::new(0),
+        affinity_migrations: Default::default(),
+        pool_exhausted: Default::default(),
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: config
             .session_registry_max
@@ -13324,6 +15010,7 @@ async fn main() {
         expose_upstream_ratelimit_headers: config
             .expose_upstream_ratelimit_headers
             .unwrap_or(false),
+        forward_caller_identity: config.forward_caller_identity.unwrap_or(false),
         allowed_client_betas: config.allowed_client_betas.clone().unwrap_or_else(|| {
             DEFAULT_CLIENT_BETA_ALLOWLIST
                 .iter()
@@ -13332,6 +15019,7 @@ async fn main() {
         }),
         beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
+        fast_mode_429: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache,
