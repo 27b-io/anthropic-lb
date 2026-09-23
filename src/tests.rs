@@ -20605,17 +20605,32 @@ mod redis_integration {
     }
 
     /// Runs without a backend, so a bypass of `Db` fails every `cargo test`,
-    /// not just the ones that happen to collide. Covers all three ways a test
-    /// picks its DB: the two helpers' argument and an inline `…}/N` URL.
+    /// not just the ones that happen to collide. Bans a digit written directly
+    /// after a helper's `(` or an inline URL's `}/`.
+    /// ponytail: text scan — a number passed as a format argument
+    /// (`"{}/{}", base, 3`) slips past. Taking `Db` in the helpers and URL
+    /// builders closes that and retires this scan.
     #[test]
     fn db_numbers_come_only_from_the_db_allocation() {
         let src = include_str!("tests.rs");
         let start = src.find("mod redis_integration {").expect("module present");
         let module = &src[start..];
         let module = &module[..module.find("\n}\n").expect("module end")];
+        // Skip this checker, doc included: its own carrier literals would keep
+        // `seen > 0` true after a helper is renamed.
+        let decl = module
+            .find("fn db_numbers_come_only_from_the_db_allocation")
+            .expect("checker present");
+        let from = module[..decl]
+            .rfind("\n\n")
+            .expect("blank line before checker");
+        let to = decl + module[decl..].find("\n    }\n").expect("checker end");
         for carrier in ["redis_test_conn(", "proxied_conn(", "}/"] {
             let mut seen = 0;
-            for (at, _) in module.match_indices(carrier) {
+            for (at, _) in module
+                .match_indices(carrier)
+                .filter(|(at, _)| !(from..to).contains(at))
+            {
                 seen += 1;
                 let rest = module[at + carrier.len()..].trim_start();
                 let line = src[..start + at].lines().count();
