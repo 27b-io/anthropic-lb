@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.2.5](https://github.com/27b-io/anthropic-lb/compare/v0.2.4...v0.2.5) (2026-09-19)
+
+
+### Features
+
+* **guard:** Tier 0 request content-scan layer (LAB-3877) ([#179](https://github.com/27b-io/anthropic-lb/issues/179)) ([9a97ebb](https://github.com/27b-io/anthropic-lb/commit/9a97ebb9a5a4b36be52bc83fdcd2c02b8ae42504))
+* **LAB-2636:** per-client endpoint pinning via preferred_endpoints with overage spill-over ([#152](https://github.com/27b-io/anthropic-lb/issues/152)) ([1a02002](https://github.com/27b-io/anthropic-lb/commit/1a02002789acbc4d7614c2bbcb48ad003764a38e))
+* **LAB-2669:** allow fast-mode-* client beta through the OAuth allow-list ([#154](https://github.com/27b-io/anthropic-lb/issues/154)) ([32f6ee1](https://github.com/27b-io/anthropic-lb/commit/32f6ee1bc9d69dbd90cc6e9463845fd6503a74ef))
+* **LAB-3287:** carry fp on the merged proxied INFO line ([#174](https://github.com/27b-io/anthropic-lb/issues/174)) ([a67b3bd](https://github.com/27b-io/anthropic-lb/commit/a67b3bd22ea2ca630260229dbb24122113f2a2fd))
+
+
+### Bug Fixes
+
+* **headers:** strip caller-identity headers from upstream requests by default (LAB-3030) ([#170](https://github.com/27b-io/anthropic-lb/issues/170)) ([a5d30ee](https://github.com/27b-io/anthropic-lb/commit/a5d30ee2db4bd432b8e139b50e51f8258198180a))
+* **LAB-2332:** hard-bound model_denied overflow to a global bucket ([#148](https://github.com/27b-io/anthropic-lb/issues/148)) ([bf83116](https://github.com/27b-io/anthropic-lb/commit/bf831168d777350cb8bd34e032d8f133c94c900a))
+* **LAB-2675:** forward a fast-mode 429 instead of hard-limiting the whole account ([#161](https://github.com/27b-io/anthropic-lb/issues/161)) ([1cac9ff](https://github.com/27b-io/anthropic-lb/commit/1cac9ff1a25231c34ad12fedeb1dec4ff23569d0))
+* **LAB-2684:** break affinity on time-free headroom, not waste_risk weight ([#158](https://github.com/27b-io/anthropic-lb/issues/158)) ([a9f9702](https://github.com/27b-io/anthropic-lb/commit/a9f97021765058966b3782e6364eb5c380c7f8f7))
+* **LAB-2693:** a fast-mode 200 no longer corrupts the account's headroom view ([#177](https://github.com/27b-io/anthropic-lb/issues/177)) ([0de4ee7](https://github.com/27b-io/anthropic-lb/commit/0de4ee7c9e9c9fae88203e53aafd1fb6a9a0ec10))
+* **LAB-3026:** fail startup on unparseable redis_url instead of running local-only ([#169](https://github.com/27b-io/anthropic-lb/issues/169)) ([788e5e7](https://github.com/27b-io/anthropic-lb/commit/788e5e79dbf738e91d3466c3940c4ed55fc62412))
+* **LAB-3217:** seed the budget mirror from the shared Redis counter every sync tick ([#173](https://github.com/27b-io/anthropic-lb/issues/173)) ([339b492](https://github.com/27b-io/anthropic-lb/commit/339b4920ea894dc863918771ab86f96b74ee6e4d))
+* **LAB-3963:** allow the auto-mode classifier beta pair through the OAuth allow-list ([#181](https://github.com/27b-io/anthropic-lb/issues/181)) ([2e11082](https://github.com/27b-io/anthropic-lb/commit/2e1108215ebf738b1fa75885542ef722a4625506))
+* **LAB-798:** drop deprecated temperature for Claude &gt;= 4.7 in OpenAI shim ([#149](https://github.com/27b-io/anthropic-lb/issues/149)) ([1f6ce62](https://github.com/27b-io/anthropic-lb/commit/1f6ce62494f0483e04f987282f4024592598d367))
+
 ## [0.2.4](https://github.com/27b-io/anthropic-lb/compare/v0.2.3...v0.2.4) (2026-08-29)
 
 

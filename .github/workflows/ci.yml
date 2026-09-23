@@ -41,9 +41,11 @@ jobs:
       # The "stable" ref only bootstraps rustup. Every cargo command below
       # actually runs the version pinned in rust-toolchain.toml, which
       # rustup resolves ahead of the default toolchain. CI is NOT unpinned.
+      # No `components:` input: rust-toolchain.toml already declares
+      # rustfmt+clippy, and rustup installs them onto the PINNED toolchain.
+      # An input here would install onto the discarded "stable" toolchain
+      # instead — two sources of truth for the same fact.
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Format check
         run: cargo fmt --check
