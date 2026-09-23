@@ -22301,7 +22301,7 @@ async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(state.auth_failures.lock().unwrap().get("proxy"), Some(&5));
+    assert_eq!(auth_failures_for_route(&state, "proxy"), 5);
 }
 
 /// Successful traffic below the limit also leaves the shared IP's failure
@@ -22377,6 +22377,18 @@ fn resolve_client_ip_canonicalizes_v4_mapped_peer() {
     );
 }
 
+/// Sum of `anthropic_auth_failures_total` over the caller labels for one route.
+fn auth_failures_for_route(state: &AppState, route: &str) -> u64 {
+    state
+        .auth_failures
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((r, _, _), _)| *r == route)
+        .map(|(_, n)| *n)
+        .sum()
+}
+
 /// `anthropic_auth_failures_total{route}` is scrape-visible (AC-11).
 #[tokio::test]
 async fn metrics_expose_auth_failures_by_route() {
@@ -22403,8 +22415,124 @@ async fn metrics_expose_auth_failures_by_route() {
         .await
         .unwrap();
     assert!(
-        body.contains("anthropic_auth_failures_total{route=\"stats\"} 1"),
+        body.contains(
+            "anthropic_auth_failures_total{route=\"stats\",cred=\"x-api-key\",ua=\"-\"} 1"
+        ),
         "missing auth-failure counter in:\n{body}"
+    );
+}
+
+/// LAB-4720 AC-1: a rejection is attributable beyond the source IP. The
+/// header shape separates "no key", "key in the wrong header" and "wrong
+/// key"; the fingerprint is one-way and never a run of the key itself.
+#[test]
+fn rejected_credential_shape_and_fingerprint() {
+    assert_eq!(presented_credential(&hdrs(&[])).0, "none");
+    assert_eq!(
+        presented_credential(&hdrs(&[("x-api-key", "k")])).0,
+        "x-api-key"
+    );
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "Bearer k")])).0,
+        "bearer"
+    );
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "Basic dXNlcjpwdw==")])).0,
+        "authorization"
+    );
+    assert_eq!(
+        presented_credential(&hdrs(&[("x-api-key", "k"), ("authorization", "bearer k")])).0,
+        "x-api-key+bearer"
+    );
+
+    let key = "stale-client-key-0123456789abcdefghijklmnopqrstuvwxyz";
+    let fp = credential_fingerprint(Some(key.as_bytes()));
+    assert_eq!(fp.len(), 12);
+    assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(!key.contains(&fp), "fingerprint leaked a run of the key");
+    assert_eq!(
+        fp,
+        credential_fingerprint(Some(key.as_bytes())),
+        "stable per key"
+    );
+    assert_ne!(fp, credential_fingerprint(Some(b"another-client-key")));
+    assert_eq!(credential_fingerprint(None), "-");
+}
+
+/// LAB-4720 security floor: the user-agent is attacker-controlled on an
+/// unauthenticated path — bounded in length, control characters flattened,
+/// and the metrics label capped at `MAX_AUTH_FAILURE_UAS` distinct values.
+#[test]
+fn rejected_user_agent_is_bounded_and_label_capped() {
+    assert_eq!(bounded_user_agent(&hdrs(&[])), "-");
+    assert_eq!(
+        bounded_user_agent(&hdrs(&[("user-agent", "curl/8.5.0")])),
+        "curl/8.5.0"
+    );
+    // Tab is the one control byte a header value may legally carry.
+    assert_eq!(bounded_user_agent(&hdrs(&[("user-agent", "a\tb")])), "a?b");
+    let long = "x".repeat(300);
+    let ua = bounded_user_agent(&hdrs(&[("user-agent", long.as_str())]));
+    assert_eq!(
+        ua.chars().count(),
+        MAX_LABEL_CHARS + 1,
+        "clipped + ellipsis"
+    );
+
+    let state = test_state_base();
+    for i in 0..(MAX_AUTH_FAILURE_UAS + 10) {
+        state.count_auth_failure("proxy", "none", &format!("agent-{i}"));
+    }
+    // A ua already on the board keeps counting under its own label past the cap.
+    state.count_auth_failure("openai", "bearer", "agent-0");
+    let counts = state.auth_failures.lock().unwrap();
+    let distinct: std::collections::HashSet<&str> =
+        counts.keys().map(|(_, _, ua)| ua.as_str()).collect();
+    assert_eq!(distinct.len(), MAX_AUTH_FAILURE_UAS + 1, "cap + _other");
+    assert_eq!(
+        counts.get(&("proxy", "none", "_other".to_owned())),
+        Some(&10)
+    );
+    assert_eq!(
+        counts.get(&("openai", "bearer", "agent-0".to_owned())),
+        Some(&1)
+    );
+}
+
+/// LAB-4720 AC-2: the labelled counter is scrape-visible with the caller
+/// dimensions — a Bearer-only caller on the native surface (the OpenAI-SDK
+/// misconfiguration) shows up as `cred="bearer"` under its user-agent.
+#[tokio::test]
+async fn metrics_expose_auth_failures_by_caller() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = admin_matrix_app(&mock_url);
+    let addr = serve(app).await;
+    let client = Client::new();
+
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("authorization", "Bearer key-geo")
+        .header("user-agent", "Anthropic/JS 0.30.0")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let body = client
+        .get(format!("http://{addr}/metrics"))
+        .header("x-api-key", "key-ops")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains(
+            "anthropic_auth_failures_total{route=\"proxy\",cred=\"bearer\",ua=\"Anthropic/JS 0.30.0\"} 1"
+        ),
+        "missing caller-labelled auth-failure counter in:\n{body}"
     );
 }
 

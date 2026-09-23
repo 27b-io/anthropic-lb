@@ -885,10 +885,13 @@ struct AppState {
     trusted_proxies: Vec<IpAllowEntry>,
     /// Per-client-IP failed-authentication throttle (LAB-1192).
     auth_throttle: AuthThrottle,
-    /// Failed authentication attempts by route, for
-    /// `anthropic_auth_failures_total{route}`. Routes are the four static
-    /// handler names, so cardinality is fixed.
-    auth_failures: Mutex<HashMap<&'static str, u64>>,
+    /// Failed authentication attempts by (route, presented-credential shape,
+    /// user-agent) for `anthropic_auth_failures_total{route,cred,ua}`
+    /// (LAB-4720). Route and cred are fixed vocabularies; `ua` is
+    /// caller-controlled, so `count_auth_failure` caps it at
+    /// `MAX_AUTH_FAILURE_UAS` distinct values (overflow → `_other`) and
+    /// `bounded_user_agent` clips each to `MAX_LABEL_CHARS`.
+    auth_failures: Mutex<HashMap<AuthFailureKey, u64>>,
     /// Last time the `allow_unauthenticated` admin-access warn fired per route,
     /// so it stays visible without one line per scrape (LAB-1192 AC-5).
     open_admin_warn: Mutex<HashMap<&'static str, Instant>>,
@@ -2050,9 +2053,17 @@ impl AppState {
     /// Every rejection is counted per route in
     /// `anthropic_auth_failures_total`; throttle 429s keep the metric rising
     /// through a sustained attack instead of plateauing at the limit.
+    ///
+    /// Rejections also log and count what was presented (LAB-4720): the
+    /// credential's header shape (`cred`), a one-way fingerprint (`key_fp`),
+    /// the bounded user-agent (`ua`) and the peer's source port — because
+    /// behind the host gateway / tailnet VIP every caller resolves to one
+    /// IP, and the fields that normally attribute a request (`client_id`,
+    /// `ver`, `agent`) are derived from the credential that just failed.
     fn authenticate_throttled(
         &self,
         client_ip: &IpAddr,
+        peer_port: u16,
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
         route: &'static str,
@@ -2060,11 +2071,18 @@ impl AppState {
         match self.authenticate(headers, allow_bearer) {
             Ok(principal) => Ok(principal),
             Err(unauthorized) => {
-                self.count_auth_failure(route);
+                let (cred, presented) = presented_credential(headers);
+                let key_fp = credential_fingerprint(presented);
+                let ua = bounded_user_agent(headers);
+                self.count_auth_failure(route, cred, &ua);
                 if let Some(retry_after) = self.auth_throttle.check(client_ip) {
                     warn!(
                         client = %client_ip,
+                        src_port = peer_port,
                         route,
+                        cred,
+                        key_fp = %key_fp,
+                        ua = %ua,
                         retry_after,
                         "rejected: failed-auth throttle active"
                     );
@@ -2078,16 +2096,40 @@ impl AppState {
                     return Err(Box::new(resp));
                 }
                 self.auth_throttle.record_failure(*client_ip);
-                warn!(client = %client_ip, route, "rejected: invalid or missing credential");
+                warn!(
+                    client = %client_ip,
+                    src_port = peer_port,
+                    route,
+                    cred,
+                    key_fp = %key_fp,
+                    ua = %ua,
+                    "rejected: invalid or missing credential"
+                );
                 Err(unauthorized)
             }
         }
     }
 
-    fn count_auth_failure(&self, route: &'static str) {
-        if let Ok(mut counts) = self.auth_failures.lock() {
-            *counts.entry(route).or_insert(0) += 1;
-        }
+    /// Count one rejection under `(route, cred, ua)`. `ua` is the only
+    /// caller-controlled dimension: once `MAX_AUTH_FAILURE_UAS` distinct
+    /// values exist, unseen ones fold into `_other` — a HARD bound of
+    /// cap + 1 user-agents, the `beta_flags_dropped` pattern.
+    fn count_auth_failure(&self, route: &'static str, cred: &'static str, ua: &str) {
+        let Ok(mut counts) = self.auth_failures.lock() else {
+            return;
+        };
+        let ua_known = counts.keys().any(|(_, _, seen)| seen == ua);
+        let distinct_uas = counts
+            .keys()
+            .map(|(_, _, seen)| seen.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let ua = if ua_known || distinct_uas < MAX_AUTH_FAILURE_UAS {
+            ua.to_owned()
+        } else {
+            "_other".to_owned()
+        };
+        *counts.entry((route, cred, ua)).or_insert(0) += 1;
     }
 
     /// Gate an admin surface (`/_stats`, `/metrics`) behind an OPERATOR
@@ -2105,10 +2147,11 @@ impl AppState {
     fn authorize_admin(
         &self,
         client_ip: &IpAddr,
+        peer_port: u16,
         headers: &hyper::HeaderMap,
         route: &'static str,
     ) -> Option<Box<Response>> {
-        match self.authenticate_throttled(client_ip, headers, false, route) {
+        match self.authenticate_throttled(client_ip, peer_port, headers, false, route) {
             Err(resp) => Some(resp),
             Ok(Some(c)) if !self.is_operator(&c.name) => {
                 warn!(
@@ -3267,6 +3310,76 @@ const MAX_DROPPED_BETA_FLAGS: usize = 50;
 /// into every `/metrics` scrape is the cardinality decision's spirit broken
 /// by size instead of count.
 const MAX_DROPPED_BETA_FLAG_LEN: usize = 64;
+
+/// Cardinality bound for the `ua` label on `anthropic_auth_failures_total`
+/// (LAB-4720). The user-agent is attacker-controlled input on an
+/// unauthenticated path; past the cap, failures count under `_other`.
+const MAX_AUTH_FAILURE_UAS: usize = 50;
+
+/// `(route, cred, ua)` — the label set of `anthropic_auth_failures_total`.
+type AuthFailureKey = (&'static str, &'static str, String);
+
+/// Shape of the credential a rejected request presented (LAB-4720). A fixed
+/// vocabulary, so it is safe as a metrics label, and it separates the three
+/// failure modes the IP cannot: no key at all, a key in a header this
+/// surface does not read (OpenAI SDKs send `Authorization: Bearer`, which
+/// the native surface rejects by design), and a key that does not match.
+/// Returns the presented bytes for `credential_fingerprint`.
+fn presented_credential(headers: &hyper::HeaderMap) -> (&'static str, Option<&[u8]>) {
+    let api_key = headers.get("x-api-key").map(|v| v.as_bytes());
+    let auth = headers.get("authorization").map(|v| v.as_bytes());
+    let bearer = auth
+        .filter(|v| v.len() >= 7 && v[..7].eq_ignore_ascii_case(b"bearer "))
+        .map(|v| &v[7..]);
+    match (api_key, bearer, auth) {
+        (Some(k), Some(_), _) => ("x-api-key+bearer", Some(k)),
+        (Some(k), None, _) => ("x-api-key", Some(k)),
+        (None, Some(b), _) => ("bearer", Some(b)),
+        (None, None, Some(a)) => ("authorization", Some(a)),
+        (None, None, None) => ("none", None),
+    }
+}
+
+/// One-way, 12-hex fingerprint of a rejected credential (LAB-4720). Lets an
+/// operator tell "one stale key, one caller" from "many callers", and match
+/// a suspect by hashing its own key the same way — without the log ever
+/// carrying the value or any prefix of it. blake2s over the bytes under a
+/// domain tag, so it can never be cross-referenced with the request `fp=`.
+fn credential_fingerprint(presented: Option<&[u8]>) -> String {
+    use blake2::{Blake2s256, Digest};
+    use std::fmt::Write;
+    let Some(bytes) = presented else {
+        return "-".to_owned();
+    };
+    let mut h = Blake2s256::new();
+    h.update(b"anthropic-lb/auth-fp\x1f");
+    h.update(bytes);
+    h.finalize()
+        .iter()
+        .take(6)
+        .fold(String::with_capacity(12), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+}
+
+/// User-agent of a rejected request, bounded for a log line and a metrics
+/// label (LAB-4720): control characters flattened so one header cannot forge
+/// a second log line, then clipped by `truncate_label`. "-" when absent,
+/// blank, or not visible ASCII.
+fn bounded_user_agent(headers: &hyper::HeaderMap) -> String {
+    let Some(ua) = headers.get("user-agent").and_then(|v| v.to_str().ok()) else {
+        return "-".to_owned();
+    };
+    let clean: String = ua
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if clean.trim().is_empty() {
+        return "-".to_owned();
+    }
+    truncate_label(&clean)
+}
 
 /// "*" suffix-wildcard match, shared by the model allowlist
 /// (`Endpoint::serves_model`) and the beta-flag allowlist
@@ -9048,7 +9161,13 @@ async fn proxy_handler(
     }
 
     // Proxy auth: x-api-key against the [[clients]] table, else legacy proxy_key.
-    let principal = match state.authenticate_throttled(&client_ip, req.headers(), false, "proxy") {
+    let principal = match state.authenticate_throttled(
+        &client_ip,
+        client_addr.port(),
+        req.headers(),
+        false,
+        "proxy",
+    ) {
         Ok(p) => p,
         Err(resp) => return *resp,
     };
@@ -10174,7 +10293,9 @@ async fn stats_handler(
     }
     // AC-4: operator principal required — /_stats discloses other clients'
     // ids, the endpoint account names and pool utilisation.
-    if let Some(resp) = state.authorize_admin(&client_ip, req.headers(), "stats") {
+    if let Some(resp) =
+        state.authorize_admin(&client_ip, client_addr.port(), req.headers(), "stats")
+    {
         return *resp;
     }
 
@@ -10648,7 +10769,9 @@ async fn metrics_handler(
     }
     // AC-4: operator principal required, same gate as /_stats — per-account
     // utilisation and budget gauges are pool reconnaissance.
-    if let Some(resp) = state.authorize_admin(&client_ip, req.headers(), "metrics") {
+    if let Some(resp) =
+        state.authorize_admin(&client_ip, client_addr.port(), req.headers(), "metrics")
+    {
         return *resp;
     }
 
@@ -10741,11 +10864,11 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
-    let auth_failures: Vec<(&'static str, u64)> = state
+    let auth_failures: Vec<(AuthFailureKey, u64)> = state
         .auth_failures
         .lock()
         .ok()
-        .map(|g| g.iter().map(|(k, v)| (*k, *v)).collect())
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
     let (session_buckets, session_tokens_sum) = state.session_tokens_histogram(now_epoch);
 
@@ -11704,13 +11827,14 @@ async fn metrics_handler(
         &mut buf,
         "anthropic_auth_failures_total",
         "counter",
-        "Requests rejected for auth — invalid/missing credential OR throttle 429 — by route",
+        "Requests rejected for auth — invalid/missing credential OR throttle 429 — by route, \
+         presented-credential shape (cred) and user-agent (ua; capped, overflow=_other)",
     );
-    for (route, n) in &auth_failures {
+    for ((route, cred, ua), n) in &auth_failures {
         prom_counter(
             &mut buf,
             "anthropic_auth_failures_total",
-            &[("route", route)],
+            &[("route", route), ("cred", cred), ("ua", ua.as_str())],
             *n,
         );
     }
@@ -13975,7 +14099,13 @@ async fn openai_chat_handler(
 
     // Proxy auth: accept the credential from either x-api-key or
     // Authorization: Bearer — OpenAI SDKs send only the latter.
-    let principal = match state.authenticate_throttled(&client_ip, req.headers(), true, "openai") {
+    let principal = match state.authenticate_throttled(
+        &client_ip,
+        client_addr.port(),
+        req.headers(),
+        true,
+        "openai",
+    ) {
         Ok(p) => p,
         Err(resp) => return *resp,
     };
