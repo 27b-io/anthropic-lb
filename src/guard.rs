@@ -390,6 +390,10 @@ pub const REASON_CONTENT_UNREADABLE: &str =
 /// A non-empty request body that is not JSON at all. Set by the handler, not by
 /// [`ScanInput::from_body`], but it is a guard reason and lives with the rest.
 pub const REASON_BODY_UNPARSEABLE: &str = "request body could not be parsed for content scanning";
+/// A newest turn longer than [`MAX_SCAN_BYTES`], whose tail was never scanned.
+/// Set by the handler from [`ScanInput::truncated`], not by `from_body`.
+pub const REASON_SCAN_TRUNCATED: &str =
+    "request exceeds the guard scan limit and cannot be scanned in full";
 
 /// A `tool_result` block's `content` is either a string or an array of content
 /// blocks (typically `text`). Pull out every text span; ignore image/other.

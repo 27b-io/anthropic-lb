@@ -2265,9 +2265,7 @@ impl AppState {
         // the scan cap.
         let unreadable = match outcome {
             guard::ScanOutcome::Unscannable(reason) => Some(*reason),
-            _ if truncated => {
-                Some("request exceeds the guard scan limit and cannot be scanned in full")
-            }
+            _ if truncated => Some(guard::REASON_SCAN_TRUNCATED),
             _ => None,
         };
         if let Some(reason) = unreadable {

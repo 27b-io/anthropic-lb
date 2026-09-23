@@ -7924,9 +7924,10 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
 /// of `tracing_core::callsite`). A single global subscriber captures every
 /// concurrent test's output into one buffer; callers filter by a marker
 /// unique to their own request instead of relying on line count alone.
-/// Note for a future second caller: the buffer is never cleared and every
+/// Note for further callers: the buffer is never cleared and every
 /// `anthropic_lb`-target INFO line from every test logs into it for the rest
-/// of the run — fine for a couple of callers, not a general-purpose fixture.
+/// of the run — fine for a few callers that each filter by their own marker,
+/// not a general-purpose fixture.
 fn log_capture_buf() -> Arc<Mutex<Vec<u8>>> {
     static BUF: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
     BUF.get_or_init(|| {
@@ -16389,12 +16390,15 @@ async fn guard_block_forwards_conversation_without_user_turn() {
 /// called directly. The tables above pin rejection vs forwarding through the
 /// handlers; what only this pins is the fail-closed LOG, emitted under every
 /// policy (`would-block` when the policy does not enforce) so shadow mode can
-/// size a `block` rollout. `Guard::empty()` suffices: no fail-closed cause
-/// reaches the scanners.
+/// size a `block` rollout. `Guard::empty()` suffices: the log fires before
+/// `evaluate`, and a scanner-less guard never blocks, so every rejection seen
+/// here comes from the fail-closed path.
 #[cfg(feature = "guard")]
 #[test]
 fn guard_hook_logs_fail_closed_cause_under_every_policy() {
-    use crate::guard::{ScanInput, ScanOutcome, MAX_SCAN_BYTES, REASON_MESSAGE_UNREADABLE};
+    use crate::guard::{
+        ScanInput, ScanOutcome, MAX_SCAN_BYTES, REASON_MESSAGE_UNREADABLE, REASON_SCAN_TRUNCATED,
+    };
     let buf = log_capture_buf();
     let mut clients = guard_non_block_clients();
     clients.push(guard_block_client());
@@ -16417,7 +16421,7 @@ fn guard_hook_logs_fail_closed_cause_under_every_policy() {
         (
             "truncated",
             user_turn(MAX_SCAN_BYTES + 1),
-            Some("exceeds the guard scan limit"),
+            Some(REASON_SCAN_TRUNCATED),
         ),
         ("scannable", user_turn(16), None),
         ("nothing-to-scan", ScanOutcome::NothingToScan, None),
