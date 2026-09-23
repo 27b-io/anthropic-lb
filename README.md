@@ -776,10 +776,10 @@ The Anthropic↔OpenAI translation layer is not lossless. When an Anthropic-form
 
 - **Silently dropped** (no OpenAI equivalent, request proceeds without them): `thinking` (extended reasoning), `cache_control` / prompt caching, `top_k`, `metadata`. The passthrough set is only `temperature`, `top_p`, `stream`, `max_tokens`, `stop_sequences`.
 - **Silently dropped**: `tool_choice: {"type": "none"}` — the only unhandled `tool_choice` variant.
-- **Hard 400, no retry** (request itself is the problem, so rotating endpoints won't help): `document` content blocks (PDFs), and image `source.type` values other than `base64`/`url`.
+- **Hard 400, no retry** (request itself is the problem, so rotating endpoints won't help): `document` blocks (PDFs) and image `source.type` values other than `base64`/`url`, when they sit directly in a user message's `content`. The same blocks inside `tool_result.content` or an assistant turn are silently dropped instead.
 - **Streaming responses from `openai` endpoints record no token usage** — budget/utilization checks still run, but nothing is debited (non-streaming has been debited since [#107](https://github.com/27b-io/anthropic-lb/pull/107)).
 - **In-band upstream SSE error events are dropped mid-stream on translated streams** (Anthropic-format requests streamed from an `openai` endpoint) rather than surfaced to the client ([#94](https://github.com/27b-io/anthropic-lb/issues/94), open); direct passthrough (`POST /v1/chat/completions`) forwards them unchanged.
-- **The emergency brake only watches Anthropic endpoints** and fires pre-routing: once the Anthropic pool is saturated it 429s every authenticated non-operator request (operator clients bypass it), even ones whose model is served exclusively by an `openai` endpoint with capacity to spare.
+- **The emergency brake only watches Anthropic endpoints** and fires pre-routing: once the Anthropic pool is saturated it 429s every authenticated non-operator request that clears the model allow-list, budget and utilization checks (operator clients bypass it), even ones whose model is served exclusively by an `openai` endpoint with capacity to spare.
 
 ---
 
