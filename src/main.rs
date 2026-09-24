@@ -511,6 +511,17 @@ const MAX_TRACKED_CLIENTS: usize = 10_000;
 /// mirroring the LAB-2330 fix to `client_model_usage`).
 const MAX_MODEL_DENIED_LABELS: usize = 64;
 
+/// Cap on distinct clients in the pre-request-gate rejection counter
+/// (LAB-2551). Past the cap, rejections for NEW clients lump into a single
+/// global `_other` client key (never per-client overflow keys — the CWE-770
+/// shape), while already-tracked clients may still add entries under new
+/// reasons — a brake event stamps every active client at once, so crossing
+/// the cap mid-incident must not split a tracked client's attribution. The
+/// reason axis is a closed static set of 3, so entries are hard-bounded at
+/// 3 × (cap + 1). Real deployments have tens of clients; only caller-minted
+/// ids under legacy header auth can approach this.
+const MAX_CLIENT_REJECTION_LABELS: usize = 64;
+
 /// Cap on distinct (client, model) pairs in the per-model usage counter
 /// (LAB-2330). The model key is normally response-derived (upstream-validated),
 /// but the request-model fallback is caller-influenced and the client key is
@@ -885,10 +896,10 @@ struct AppState {
     trusted_proxies: Vec<IpAllowEntry>,
     /// Per-client-IP failed-authentication throttle (LAB-1192).
     auth_throttle: AuthThrottle,
-    /// Failed authentication attempts by route, for
-    /// `anthropic_auth_failures_total{route}`. Routes are the four static
-    /// handler names, so cardinality is fixed.
-    auth_failures: Mutex<HashMap<&'static str, u64>>,
+    /// Failed authentication attempts by (route, presented-credential shape)
+    /// for `anthropic_auth_failures_total{route,cred}` (LAB-4720). Both are
+    /// fixed vocabularies, so cardinality is fixed.
+    auth_failures: Mutex<HashMap<AuthFailureKey, u64>>,
     /// Last time the `allow_unauthenticated` admin-access warn fired per route,
     /// so it stays visible without one line per scrape (LAB-1192 AC-5).
     open_admin_warn: Mutex<HashMap<&'static str, Instant>>,
@@ -1012,6 +1023,12 @@ struct AppState {
     /// config, so the label set is bounded by the operator and needs no
     /// `_other` overflow (unlike the caller-controlled `prompt_too_long` key).
     fast_mode_429: Mutex<HashMap<String, u64>>,
+    /// Upstream "out of extra usage" 400s, by account (LAB-4729). The first
+    /// per request is re-sent to another account; the account is NOT cooled
+    /// (see `note_entitlement_400`). Exposed as
+    /// `anthropic_entitlement_400_total{account}`; config-bounded labels, as
+    /// `fast_mode_429`.
+    entitlement_400: Mutex<HashMap<String, u64>>,
     /// Per-client model-allowlist denials, keyed (client, model) (LAB-1083).
     /// Exposed as `anthropic_client_model_denied_total`. Under `[[clients]]`
     /// auth `client` is a credential-bound principal, but under legacy
@@ -1020,6 +1037,14 @@ struct AppState {
     /// single global ("_other", "_other") bucket, hard-bounding the map at
     /// `MAX_MODEL_DENIED_LABELS` + 1 entries (LAB-2332).
     model_denied: Mutex<HashMap<(String, String), u64>>,
+    /// Pre-request-gate 429 rejections, keyed (client, reason) (LAB-2551).
+    /// Exposed as `anthropic_client_rejections_total`. `reason` is the closed
+    /// static set budget / utilization / brake — the three capacity denials in
+    /// `pre_request_gate`; 403 policy denials stay on `model_denied`. `client`
+    /// is caller-controlled under legacy header auth, so it is truncated and
+    /// the map is bounded via a global `_other` overflow
+    /// (`MAX_CLIENT_REJECTION_LABELS`).
+    client_rejections: Mutex<HashMap<(String, &'static str), u64>>,
     /// (endpoint idx, model) pairs an upstream rejected as unsupported — a
     /// gateway without the model, or a plan without access (LAB-941).
     /// `routing_candidates` skips these until the entry expires; because
@@ -2050,9 +2075,18 @@ impl AppState {
     /// Every rejection is counted per route in
     /// `anthropic_auth_failures_total`; throttle 429s keep the metric rising
     /// through a sustained attack instead of plateauing at the limit.
+    ///
+    /// Rejections also log what was presented (LAB-4720), because behind a
+    /// NAT gateway or TCP-forwarding VIP every caller resolves to one IP,
+    /// and the fields that normally attribute a request (`client_id`, `ver`,
+    /// `agent`) are derived from the credential that just failed. The
+    /// user-agent is recorded with `?` (Debug) so it renders quoted and
+    /// escaped: it is caller-controlled, and unquoted it could forge the
+    /// other key=value fields on the same line.
     fn authenticate_throttled(
         &self,
         client_ip: &IpAddr,
+        peer: SocketAddr,
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
         route: &'static str,
@@ -2060,11 +2094,18 @@ impl AppState {
         match self.authenticate(headers, allow_bearer) {
             Ok(principal) => Ok(principal),
             Err(unauthorized) => {
-                self.count_auth_failure(route);
+                let (cred, presented) = presented_credential(headers);
+                let key_fp = credential_fingerprint(presented);
+                let ua = bounded_user_agent(headers);
+                self.count_auth_failure(route, cred);
                 if let Some(retry_after) = self.auth_throttle.check(client_ip) {
                     warn!(
                         client = %client_ip,
+                        peer = %peer,
                         route,
+                        cred,
+                        key_fp = %key_fp,
+                        ua = ?ua,
                         retry_after,
                         "rejected: failed-auth throttle active"
                     );
@@ -2078,15 +2119,27 @@ impl AppState {
                     return Err(Box::new(resp));
                 }
                 self.auth_throttle.record_failure(*client_ip);
-                warn!(client = %client_ip, route, "rejected: invalid or missing credential");
+                warn!(
+                    client = %client_ip,
+                    peer = %peer,
+                    route,
+                    cred,
+                    key_fp = %key_fp,
+                    ua = ?ua,
+                    "rejected: invalid or missing credential"
+                );
                 Err(unauthorized)
             }
         }
     }
 
-    fn count_auth_failure(&self, route: &'static str) {
+    /// Count one rejection under `(route, cred)`. The user-agent is
+    /// deliberately NOT a label: its slots would be claimed first-come by
+    /// unauthenticated callers on the public ingress, blinding the metric
+    /// for every later legitimate caller. It lives on the log line instead.
+    fn count_auth_failure(&self, route: &'static str, cred: &'static str) {
         if let Ok(mut counts) = self.auth_failures.lock() {
-            *counts.entry(route).or_insert(0) += 1;
+            *counts.entry((route, cred)).or_insert(0) += 1;
         }
     }
 
@@ -2105,10 +2158,11 @@ impl AppState {
     fn authorize_admin(
         &self,
         client_ip: &IpAddr,
+        peer: SocketAddr,
         headers: &hyper::HeaderMap,
         route: &'static str,
     ) -> Option<Box<Response>> {
-        match self.authenticate_throttled(client_ip, headers, false, route) {
+        match self.authenticate_throttled(client_ip, peer, headers, false, route) {
             Err(resp) => Some(resp),
             Ok(Some(c)) if !self.is_operator(&c.name) => {
                 warn!(
@@ -2353,6 +2407,38 @@ impl AppState {
                 "rejected: model not in client allow-list"
             );
         }
+    }
+
+    /// Count a pre-request-gate 429 rejection (LAB-2551).
+    ///
+    /// `client_id` is truncated before becoming a map key (caller-controlled
+    /// under legacy header auth), and past `MAX_CLIENT_REJECTION_LABELS`
+    /// distinct clients NEW clients lump into the single global `_other` key
+    /// — keeping the reason label so overflow traffic still charts by cause.
+    /// Callers already log the rejection; this only feeds `/metrics`.
+    fn note_client_rejection(&self, client_id: &str, reason: &'static str) {
+        let Ok(mut counts) = self.client_rejections.lock() else {
+            return;
+        };
+        let key = (truncate_label(client_id), reason);
+        // Tracked = the CLIENT has any entry, not this exact (client, reason)
+        // pair: a tracked client's first rejection under a new reason must
+        // not fall to `_other` just because the cap was crossed in between.
+        // The cap likewise bounds distinct CLIENTS, not (client, reason)
+        // entries — one client on all 3 reasons must burn one slot, not
+        // three. O(cap) scans, only on the rejection path.
+        let tracked = counts.keys().any(|(c, _)| *c == key.0);
+        let distinct_clients = counts
+            .keys()
+            .map(|(c, _)| c.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let key = if tracked || distinct_clients < MAX_CLIENT_REJECTION_LABELS {
+            key
+        } else {
+            ("_other".to_owned(), reason)
+        };
+        *counts.entry(key).or_insert(0) += 1;
     }
 
     /// Resolve client identity: x-client-id header → IP map fallback → "-"
@@ -3256,6 +3342,19 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     // classifier's own follow-up requests.
     "auto-mode-classifier-*",
     "dangerous-tool-use-*",
+    // Claude Code 2.1.278 per-turn family (LAB-3964). All three are
+    // body-paired with fields on the `role:"system"` entry inside `messages`;
+    // the LB forwards bodies verbatim, so stripping the header alone is the
+    // same hard-400 shape as the families above:
+    //  - `mid-conversation-tool-changes-*` ↔ `tool_addition`/`tool_removal`
+    //    content blocks. Claude Code answers the 400 by sticky-rejecting the
+    //    beta for the rest of the conversation.
+    //  - `per-turn-control-*` ↔ `output_config.effort`.
+    //  - `timing-*` ↔ `output_config.timing`. Opt-in (CLAUDE_CODE_PER_TURN_TIMING),
+    //    so not yet seen dropped — listed so the first opt-in does not 400.
+    "mid-conversation-tool-changes-*",
+    "per-turn-control-*",
+    "timing-*",
 ];
 
 /// Cardinality bound for `beta_flags_dropped` — flag names are
@@ -3267,6 +3366,67 @@ const MAX_DROPPED_BETA_FLAGS: usize = 50;
 /// into every `/metrics` scrape is the cardinality decision's spirit broken
 /// by size instead of count.
 const MAX_DROPPED_BETA_FLAG_LEN: usize = 64;
+
+/// `(route, cred)` — the label set of `anthropic_auth_failures_total`.
+type AuthFailureKey = (&'static str, &'static str);
+
+/// Shape of the credential a rejected request presented (LAB-4720) — a
+/// fixed vocabulary, safe as a metrics label, separating the failure modes
+/// the IP cannot: `none` (no key at all), `bearer` (a key in a header the
+/// native surface does not read — OpenAI SDKs send `Authorization: Bearer`,
+/// rejected there by design), `auth-other` (an `Authorization` scheme that
+/// is not Bearer, e.g. Basic or a raw token — labelled but not
+/// fingerprinted, since there is no bare credential to hash: the README's
+/// recipe hashes the key alone, and a scheme-prefixed blob would never
+/// reproduce it) and `x-api-key` (a key in the right header that does not
+/// match; wins when both headers are present, since it is the one compared
+/// first). Returns the presented bytes for `credential_fingerprint`. The
+/// Bearer prefix test mirrors `authenticate`.
+fn presented_credential(headers: &hyper::HeaderMap) -> (&'static str, Option<&[u8]>) {
+    if let Some(k) = headers.get("x-api-key") {
+        return ("x-api-key", Some(k.as_bytes()));
+    }
+    match headers.get("authorization").map(|v| v.as_bytes()) {
+        Some(v) if v.len() >= 7 && v[..7].eq_ignore_ascii_case(b"bearer ") => {
+            ("bearer", Some(&v[7..]))
+        }
+        Some(_) => ("auth-other", None),
+        None => ("none", None),
+    }
+}
+
+/// One-way, 12-hex fingerprint of a rejected credential (LAB-4720). Lets an
+/// operator tell "one stale key, one caller" from "many callers", and match
+/// a suspect by hashing its own key the same way (recipe in the README) —
+/// without the log ever carrying the value or any prefix of it. blake2s-256
+/// over a purpose tag plus the presented bytes, first 6 bytes as hex.
+fn credential_fingerprint(presented: Option<&[u8]>) -> String {
+    use blake2::{Blake2s256, Digest};
+    let Some(bytes) = presented else {
+        return "-".to_owned();
+    };
+    let mut h = Blake2s256::new();
+    h.update(b"anthropic-lb/auth-fp\x1f");
+    h.update(bytes);
+    h.finalize()[..6]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// User-agent of a rejected request, clipped by `truncate_label` for the log
+/// line (LAB-4720). "-" when absent, empty, or not visible ASCII. No further
+/// sanitising: `to_str` admits only visible ASCII plus TAB (hyper's parser
+/// also passes obs-text bytes 0x80-0xFF), and the caller records it with `?`
+/// so it renders quoted and escaped.
+fn bounded_user_agent(headers: &hyper::HeaderMap) -> String {
+    headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(truncate_label)
+        .unwrap_or_else(|| "-".to_owned())
+}
 
 /// "*" suffix-wildcard match, shared by the model allowlist
 /// (`Endpoint::serves_model`) and the beta-flag allowlist
@@ -6099,6 +6259,36 @@ impl TokenUsage {
 /// upstream must not be able to grow scanner memory without bound (LAB-717).
 const SSE_SCAN_MAX_LINE: usize = 64 * 1024;
 
+/// Single-terminator bookkeeping for one downstream SSE stream (LAB-4031).
+///
+/// An SSE stream has exactly one terminator, and an error frame is one:
+/// never an error frame after the success terminator, never a success
+/// terminator after an error frame. Every stream loop and translator gates
+/// terminator emission on this — one vocabulary, so a reviewer can grep
+/// `terminal.` and find each site. The translating loops also synthesise a
+/// terminator when the upstream ends without one; the byte-passthrough
+/// loops forward the upstream's stream as-is and only suppress a second
+/// terminator. It lives where the downstream truth is observable: on
+/// `SseUsageScanner` for the byte-passthrough (downstream == upstream), on
+/// `StreamContext` / `ReverseStreamContext` for the translating loops
+/// (the proxy emits the terminator itself).
+#[derive(Default)]
+struct SseTerminal {
+    /// Success terminator went downstream: Anthropic `message_stop` or
+    /// OpenAI `data: [DONE]`.
+    completed: bool,
+    /// Error frame went downstream — an in-band upstream error translated,
+    /// or one synthesised on a transport failure / premature end of stream.
+    errored: bool,
+}
+
+impl SseTerminal {
+    /// Either terminator has gone downstream — nothing may follow it.
+    fn reached(&self) -> bool {
+        self.completed || self.errored
+    }
+}
+
 /// Incremental SSE token-usage extractor: O(1) memory per in-flight stream.
 ///
 /// Replaces the old whole-stream `sse_buf` / `raw_sse` accumulation (LAB-717):
@@ -6122,6 +6312,8 @@ struct SseUsageScanner {
     event_preview: Vec<String>,
     event_count: usize,
     bytes_seen: usize,
+    /// Terminator state of the bytes forwarded so far.
+    terminal: SseTerminal,
 }
 
 impl SseUsageScanner {
@@ -6174,6 +6366,11 @@ impl SseUsageScanner {
             self.event_count += 1;
             if self.event_preview.len() < 5 {
                 self.event_preview.push(ev.trim_start().to_string());
+            }
+            match ev.trim() {
+                "message_stop" => self.terminal.completed = true,
+                "error" => self.terminal.errored = true,
+                _ => {}
             }
             return;
         }
@@ -6621,6 +6818,26 @@ impl AppState {
             account = endpoint_name,
             retry_after_raw,
             "fast-mode 429 forwarded to caller — account NOT cooled (separate rate bucket)"
+        );
+    }
+
+    /// Count + WARN an upstream entitlement 400 (`is_entitlement_exhausted_400`,
+    /// LAB-4729). The retry loop re-sends the request once; the account is
+    /// deliberately NOT cooled. The refusal is scoped to a class of request
+    /// (e.g. past-band Fable on a credits-exhausted account) — the same account
+    /// keeps serving other traffic — so cooling it hands any client a lever:
+    /// each refused request would cool two accounts (original + re-send), and
+    /// a modest rate of them keeps the whole pool cooled, denying every
+    /// client. Same reasoning as the fast-mode 429 exemption in
+    /// `classify_retry_status`. The cost is one zero-token round trip per
+    /// refused request, visible on this counter.
+    fn note_entitlement_400(&self, endpoint_name: &str) {
+        if let Ok(mut counts) = self.entitlement_400.lock() {
+            *counts.entry(endpoint_name.to_owned()).or_insert(0) += 1;
+        }
+        warn!(
+            account = endpoint_name,
+            "upstream 400: account out of extra usage (account not cooled; request re-sent at most once)"
         );
     }
 
@@ -7488,6 +7705,7 @@ impl AppState {
 
         // 1. Daily token budget (existing)
         if client_id != "-" && self.check_budget(client_id).await.is_err() {
+            self.note_client_rejection(client_id, "budget");
             warn!(client_id = %client_id, "rejected: daily token budget exceeded");
             return Err(Box::new(
                 (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response(),
@@ -7496,6 +7714,7 @@ impl AppState {
 
         // 2. Utilization limit (new)
         if let Err(retry_after) = self.check_utilization_limit(client_id, model).await {
+            self.note_client_rejection(client_id, "utilization");
             warn!(
                 client_id = %client_id,
                 retry_after = retry_after,
@@ -7515,6 +7734,7 @@ impl AppState {
 
         // 3. Emergency brake (new)
         if self.is_emergency_brake_active().await {
+            self.note_client_rejection(client_id, "brake");
             warn!(
                 client_id = %client_id,
                 "rejected: emergency brake active"
@@ -7839,6 +8059,10 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 ///     429 while stashing the upstream's error response, so a model no OTHER
 ///     endpoint can serve still surfaces the real error — a nonexistent-model
 ///     404 must not morph into a synthetic 429 that invites retries.
+///   - `RetryEntitlement(resp)`: the account is out of paid extra usage for
+///     this request (`is_entitlement_exhausted_400`, LAB-4729). The loop
+///     re-sends ONCE, and a second entitlement 400 — or nothing left to try —
+///     returns `resp` to the caller.
 // Response payloads are boxed so the enum stays small (one word per payload):
 // it rides in the Err of `classify_retry_status`'s Result, where an inline
 // `Response` is 128+ bytes on the hot success path (clippy::result_large_err —
@@ -7846,6 +8070,7 @@ fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
 enum ForwardOutcome {
     Done(Box<Response>),
     RetryModelUnsupported(Box<Response>),
+    RetryEntitlement(Box<Response>),
     Retry {
         saw_529: bool,
         push_skip: bool,
@@ -7888,6 +8113,30 @@ fn is_model_unsupported_error(status: StatusCode, body: &serde_json::Value) -> b
         return true;
     }
     msg.to_ascii_lowercase().contains("invalid model name")
+}
+
+/// Anchor for the entitlement 400 (LAB-4729). Only the first sentence: the
+/// second names who can add more ("Ask your workspace admin …") and varies by
+/// plan, the first is the condition itself.
+const ENTITLEMENT_400_ANCHOR: &str = "You're out of extra usage";
+
+/// True when an upstream 400 is Anthropic refusing the request because the
+/// ACCOUNT's paid extra usage is exhausted — account state wearing a client-
+/// error status (LAB-4729). Observed live 2026-09-22:
+///   400 `{"type":"error","error":{"type":"invalid_request_error",
+///   "message":"You're out of extra usage. Ask your workspace admin to add
+///   more so you can keep going."}}`
+/// Every other 400 is the caller's own error and must reach it unchanged, so
+/// this is deliberately narrow: exact `error.type` and a message ANCHORED at
+/// its start — a substring match (`usage`, `extra usage`) would reroute real
+/// client errors that merely mention the word.
+fn is_entitlement_exhausted_400(status: StatusCode, body: &serde_json::Value) -> bool {
+    status == StatusCode::BAD_REQUEST
+        && body.pointer("/error/type").and_then(|v| v.as_str()) == Some("invalid_request_error")
+        && body
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m.starts_with(ENTITLEMENT_400_ANCHOR))
 }
 
 /// Surface the real cause of a `reqwest::Error`. The Display form only shows
@@ -8125,6 +8374,7 @@ enum RetryStep {
 /// `retry_round` gates rotation: a transient (transport-level) failure on round
 /// 0 keeps the affinity/cache-warm endpoint (`EndRound` → backoff → retry IT);
 /// on rounds ≥1 it rotates (push skip). 429/5xx/529 always rotate immediately.
+#[allow(clippy::too_many_arguments)]
 fn apply_round_outcome(
     retry_round: u32,
     outcome: ForwardOutcome,
@@ -8133,7 +8383,17 @@ fn apply_round_outcome(
     saw_529: &mut bool,
     saw_transient: &mut bool,
     model_unsupported_resp: &mut Option<Response>,
+    entitlement_resp: &mut Option<(EndpointIdx, Option<Response>)>,
 ) -> RetryStep {
+    // Any later outcome supersedes a stashed entitlement 400 as the caller's
+    // answer (LAB-4729): the re-send's 404, or the 429 of a merely rate-limited
+    // pool, is the truer terminal cause. The endpoint stays, so the one-shot is
+    // still spent and the refuser still skipped.
+    if !matches!(outcome, ForwardOutcome::RetryEntitlement(_)) {
+        if let Some((_, stashed)) = entitlement_resp.as_mut() {
+            *stashed = None;
+        }
+    }
     match outcome {
         ForwardOutcome::Done(resp) => RetryStep::Return(*resp),
         // Model rejected by this endpoint: rotate immediately (another
@@ -8141,6 +8401,20 @@ fn apply_round_outcome(
         // the case where none does (LAB-941).
         ForwardOutcome::RetryModelUnsupported(resp) => {
             *model_unsupported_resp = Some(*resp);
+            skip.push(picked_idx);
+            RetryStep::NextAttempt
+        }
+        // Account out of extra usage (LAB-4729): re-send ONCE per request.
+        // The refusal is scoped to a class of request, so every account may
+        // give it — rotating on each would sweep the whole pool for a request
+        // nothing can serve. A second one goes to the caller as-is. The
+        // refusing endpoint rides along so every later round skips it too:
+        // it is not cooled, and `skip` resets per round.
+        ForwardOutcome::RetryEntitlement(resp) => {
+            if entitlement_resp.is_some() {
+                return RetryStep::Return(*resp);
+            }
+            *entitlement_resp = Some((picked_idx, Some(*resp)));
             skip.push(picked_idx);
             RetryStep::NextAttempt
         }
@@ -8698,7 +8972,6 @@ async fn forward_anthropic(
         tokio::spawn(async move {
             let mut scanner = SseUsageScanner::default();
             let mut client_disconnected = false;
-            let mut upstream_error = false;
             loop {
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {
@@ -8710,8 +8983,22 @@ async fn forward_anthropic(
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        upstream_error = true;
                         warn!(req_id = req_id_clone, error = %e, "upstream SSE read failed");
+                        // The upstream's own terminator (`message_stop`, or
+                        // an in-band `event: error`) already went downstream
+                        // verbatim: the client saw a complete stream, and an
+                        // error frame after it would make the SDK raise on a
+                        // request that succeeded. Typical trigger: peer drops
+                        // without the chunked terminator right after
+                        // `message_stop` (hyper `IncompleteMessage`).
+                        if scanner.terminal.reached() {
+                            debug!(
+                                req_id = req_id_clone,
+                                "transport error after terminator — error frame suppressed"
+                            );
+                            break;
+                        }
+                        scanner.terminal.errored = true;
                         if tx
                             .send(Ok(anthropic_error_frame(&format!(
                                 "upstream stream interrupted: {e}"
@@ -8728,6 +9015,7 @@ async fn forward_anthropic(
             // Record scanned usage. The detached task only holds a cloned
             // Arc<AppState>; re-index it to recover &Endpoint.
             let ep = &state_clone.endpoints[endpoint_idx];
+            let upstream_error = scanner.terminal.errored;
             finalize_stream(
                 &state_clone,
                 ep,
@@ -8847,12 +9135,25 @@ async fn forward_anthropic(
             // negative-cache the pair and rotate — another account may serve
             // it. Forwarding the 404 as-is wedges affinity-pinned clients
             // into a permanent retry loop against this account (LAB-941).
-            if is_model_unsupported_error(status, &parsed) {
-                state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+            // Out of extra usage: re-send once to another account (LAB-4729).
+            // Both are account state wearing a 4xx. A streaming request lands
+            // here too: upstream sends the 400 as a JSON body, not an event
+            // stream, so it re-sends before any byte reaches the client.
+            let rotate: Option<fn(Box<Response>) -> ForwardOutcome> =
+                if is_model_unsupported_error(status, &parsed) {
+                    state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                    Some(ForwardOutcome::RetryModelUnsupported)
+                } else if is_entitlement_exhausted_400(status, &parsed) {
+                    state.note_entitlement_400(endpoint_name);
+                    Some(ForwardOutcome::RetryEntitlement)
+                } else {
+                    None
+                };
+            if let Some(retry) = rotate {
                 // This branch returns before `finalize_non_stream` — log the
-                // merged line here too, so a model-unsupported rejection
-                // still gets the routing/utilization snapshot at INFO, same
-                // as the old unconditional `proxied` line did (AC4).
+                // merged line here too, so a rotated rejection still gets the
+                // routing/utilization snapshot at INFO, same as the old
+                // unconditional `proxied` line did (AC4).
                 log_proxied(
                     req_id,
                     client_id,
@@ -8870,7 +9171,7 @@ async fn forward_anthropic(
                     .unwrap_or_else(|_| {
                         (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                     });
-                return ForwardOutcome::RetryModelUnsupported(Box::new(response));
+                return retry(Box::new(response));
             }
         }
         finalize_non_stream(
@@ -9064,7 +9365,13 @@ async fn proxy_handler(
     }
 
     // Proxy auth: x-api-key against the [[clients]] table, else legacy proxy_key.
-    let principal = match state.authenticate_throttled(&client_ip, req.headers(), false, "proxy") {
+    let principal = match state.authenticate_throttled(
+        &client_ip,
+        client_addr,
+        req.headers(),
+        false,
+        "proxy",
+    ) {
         Ok(p) => p,
         Err(resp) => return *resp,
     };
@@ -9386,6 +9693,9 @@ async fn proxy_handler(
     // Upstream error from the most recent model-unsupported rejection —
     // returned verbatim if the pool exhausts on nothing but rejections.
     let mut model_unsupported_resp: Option<Response> = None;
+    // First entitlement 400 (LAB-4729): its presence spends the one re-send;
+    // returned if nothing else can serve the request.
+    let mut entitlement_resp: Option<(EndpointIdx, Option<Response>)> = None;
     // OpenAI-shape body, built lazily on the first OpenAI-endpoint attempt
     // and reused across rotations/retries (LAB-716). Lazy so requests served
     // entirely by Anthropic endpoints — the common case — never pay for the
@@ -9402,7 +9712,9 @@ async fn proxy_handler(
             );
             tokio::time::sleep(delay).await;
         }
-        let mut skip: Vec<EndpointIdx> = Vec::new();
+        // Seeded with an entitlement-refusing endpoint (LAB-4729): after a
+        // 529/transient round it must not be re-picked and spend the re-send.
+        let mut skip: Vec<EndpointIdx> = entitlement_resp.iter().map(|(i, _)| *i).collect();
         let mut saw_529 = false;
         let mut saw_transient = false;
         for _attempt in 0..n {
@@ -9504,6 +9816,7 @@ async fn proxy_handler(
                 &mut saw_529,
                 &mut saw_transient,
                 &mut model_unsupported_resp,
+                &mut entitlement_resp,
             ) {
                 // LAB-933: the single success seam — every proxied response
                 // (Anthropic or translated OpenAI) exits proxy_handler here,
@@ -9533,9 +9846,12 @@ async fn proxy_handler(
     // final round) returns the upstream's own error — truthful when the model
     // exists nowhere. Overload/transient exhaustion keeps its retryable
     // status; the negative cache already routes follow-up requests away from
-    // the rejecting endpoints (LAB-941).
+    // the rejecting endpoints (LAB-941). An entitlement 400 whose one re-send
+    // found nothing else to try is returned the same way (LAB-4729): the
+    // caller sees why, not a synthetic 429. Present only if no later attempt
+    // answered — see `apply_round_outcome`.
     if !last_saw_529 && !last_saw_transient {
-        if let Some(resp) = model_unsupported_resp {
+        if let Some(resp) = entitlement_resp.and_then(|(_, r)| r).or(model_unsupported_resp) {
             return resp;
         }
         // Warm-cache path: every eligible endpoint was filtered by the
@@ -9795,14 +10111,14 @@ async fn try_fallback_upstream(
 
         tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
+            // `ctx.terminal` serves both branches. Translate: `completed` by
+            // the translator, `errored` by the translator (in-band error) or
+            // this loop (transport Err / end-of-stream guard). Passthrough:
+            // `completed` is set below when upstream's `[DONE]` has been
+            // forwarded verbatim, so an error frame on the next read doesn't
+            // ship a second `[DONE]` and break strict OpenAI parsers.
             let mut ctx = ReverseStreamContext::default();
             let mut client_gone = false;
-            // Passthrough-only: tracks whether upstream's `[DONE]` terminator
-            // has been forwarded verbatim, so an error frame on the next read
-            // doesn't ship a second `[DONE]` and break strict OpenAI parsers.
-            // The translate branch tracks its equivalent (`message_stop`
-            // emitted) as `ctx.message_stopped`, set inside the translator.
-            let mut sent_done = false;
             // Carries any partial trailing SSE line between chunks so the
             // `[DONE]` terminator is detected across resp.chunk() boundaries.
             // A naive byte-window scan would false-positive on the literal
@@ -9832,15 +10148,15 @@ async fn try_fallback_upstream(
                                         }
                                     }
                                 }
-                                if client_gone || ctx.upstream_error {
-                                    // upstream_error: the in-band error frame
-                                    // just sent is the stream's final frame —
-                                    // stop draining so nothing can follow it.
+                                if client_gone || ctx.terminal.errored {
+                                    // errored: the in-band error frame just
+                                    // sent is the stream's final frame — stop
+                                    // draining so nothing can follow it.
                                     break;
                                 }
                             }
                         } else {
-                            if !sent_done {
+                            if !ctx.terminal.completed {
                                 done_scan_tail.extend_from_slice(&chunk);
                                 while let Some(nl) = done_scan_tail.iter().position(|&b| b == b'\n')
                                 {
@@ -9858,7 +10174,7 @@ async fn try_fallback_upstream(
                                     };
                                     done_scan_tail.drain(..=nl);
                                     if is_done_marker {
-                                        sent_done = true;
+                                        ctx.terminal.completed = true;
                                         done_scan_tail.clear();
                                         break;
                                     }
@@ -9868,44 +10184,40 @@ async fn try_fallback_upstream(
                                 client_gone = true;
                             }
                         }
-                        if client_gone || ctx.upstream_error {
+                        if client_gone || ctx.terminal.errored {
                             break;
                         }
                     }
                     Ok(None) => break,
                     Err(e) => {
                         warn!(req_id, error = %e, "fallback: unified endpoint SSE read failed");
-                        // Downstream protocol depends on whether we're translating:
-                        // translate_response=true → /v1/messages client expects
-                        // Anthropic SSE; translate_response=false → /v1/chat/completions
-                        // passthrough, downstream is the OpenAI SSE format.
-                        let msg = format!("upstream stream interrupted: {e}");
-                        // Error frame is terminal: mark the ctx so the
-                        // post-loop buffer flush translates to nothing, no
-                        // frame follows the error, and finalization logs the
-                        // stream as failed on both protocols. When the
-                        // success terminator already went out (`message_stop`
+                        // When a terminator already went out (`message_stop`
                         // translated, or `[DONE]` forwarded verbatim) the
                         // client saw a complete stream — no frame is sent and
                         // the stream stays a success.
-                        let frame = if translate_response && !ctx.message_stopped {
-                            ctx.upstream_error = true;
-                            Some(anthropic_error_frame(&msg))
-                        } else if !translate_response && !sent_done {
-                            ctx.upstream_error = true;
-                            Some(openai_error_frame(&msg))
-                        } else {
+                        if ctx.terminal.reached() {
                             debug!(
                                 req_id,
-                                "fallback: transport error after success \
-                                 terminator — error frame suppressed"
+                                "fallback: transport error after terminator — error frame suppressed"
                             );
-                            None
+                            break;
+                        }
+                        // Error frame is terminal: mark the ctx so the
+                        // post-loop buffer flush translates to nothing, no
+                        // frame follows the error, and finalization logs the
+                        // stream as failed. Downstream protocol depends on
+                        // whether we're translating: translate_response=true
+                        // → /v1/messages client expects Anthropic SSE; false
+                        // → /v1/chat/completions passthrough, OpenAI SSE.
+                        ctx.terminal.errored = true;
+                        let msg = format!("upstream stream interrupted: {e}");
+                        let frame = if translate_response {
+                            anthropic_error_frame(&msg)
+                        } else {
+                            openai_error_frame(&msg)
                         };
-                        if let Some(frame) = frame {
-                            if tx.send(Ok(frame)).await.is_err() {
-                                client_gone = true;
-                            }
+                        if tx.send(Ok(frame)).await.is_err() {
+                            client_gone = true;
                         }
                         break;
                     }
@@ -9920,6 +10232,7 @@ async fn try_fallback_upstream(
                         let events = translate_openai_sse_to_anthropic(data, &mut ctx);
                         for ev in events {
                             if tx.send(Ok(bytes::Bytes::from(ev))).await.is_err() {
+                                client_gone = true;
                                 break;
                             }
                         }
@@ -9927,10 +10240,36 @@ async fn try_fallback_upstream(
                 }
             }
 
+            // End-of-stream reconciliation, translate branch: the upstream
+            // ended (clean EOF, or a `[DONE]` with no message to stop) without
+            // the Anthropic stream ever reaching a terminator. Left alone the
+            // /v1/messages client would hold `message_start` + deltas and a
+            // closed socket, or a 200 with an empty SSE body. Terminate
+            // explicitly. (The passthrough branch forwards whatever the
+            // upstream sent and does not synthesise terminators for it.)
+            if translate_response && !client_gone && !ctx.terminal.reached() {
+                warn!(
+                    req_id,
+                    upstream = upstream_name,
+                    message_started = ctx.message_started,
+                    "fallback: upstream stream ended without a terminator — error frame sent"
+                );
+                ctx.terminal.errored = true;
+                if tx
+                    .send(Ok(anthropic_error_frame(
+                        "upstream closed stream before completion",
+                    )))
+                    .await
+                    .is_err()
+                {
+                    client_gone = true;
+                }
+            }
+
             if client_gone {
                 debug!(req_id, "fallback: client disconnected during stream");
             }
-            if ctx.upstream_error {
+            if ctx.terminal.errored {
                 warn!(
                     req_id,
                     upstream = upstream_name,
@@ -10190,7 +10529,7 @@ async fn stats_handler(
     }
     // AC-4: operator principal required — /_stats discloses other clients'
     // ids, the endpoint account names and pool utilisation.
-    if let Some(resp) = state.authorize_admin(&client_ip, req.headers(), "stats") {
+    if let Some(resp) = state.authorize_admin(&client_ip, client_addr, req.headers(), "stats") {
         return *resp;
     }
 
@@ -10656,6 +10995,38 @@ async fn build_metrics_snap(
     }
 }
 
+/// Snapshot a `String`-keyed counter map for the `/metrics` render,
+/// recovering — and clearing — a poisoned lock rather than publishing an
+/// empty map.
+///
+/// `.lock().ok().unwrap_or_default()` emits a zero indistinguishable from a
+/// real one, and logging while *still* returning empty would only make the
+/// endpoint lie more loudly. Clearing is the half that matters: every writer
+/// to these maps takes the lock with `let Ok(..) else { return }` / `if let
+/// Ok(..)`, so an uncleared poison kills the counter permanently rather than
+/// leaving it stale. Same recovery rationale as `lock_transport_errors`,
+/// which does it silently — a panicking holder is worth a line.
+///
+/// Nothing in these critical sections can currently panic, so this is
+/// defence against a future edit, not a live incident.
+fn snapshot_counters(
+    counters: &Mutex<HashMap<String, u64>>,
+    map: &'static str,
+) -> Vec<(String, u64)> {
+    let guard = match counters.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            warn!(
+                map,
+                "/metrics: counter lock was poisoned; recovered the counts and cleared it"
+            );
+            counters.clear_poison();
+            poisoned.into_inner()
+        }
+    };
+    guard.iter().map(|(k, v)| (k.clone(), *v)).collect()
+}
+
 async fn metrics_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -10668,7 +11039,7 @@ async fn metrics_handler(
     }
     // AC-4: operator principal required, same gate as /_stats — per-account
     // utilisation and budget gauges are pool reconnaissance.
-    if let Some(resp) = state.authorize_admin(&client_ip, req.headers(), "metrics") {
+    if let Some(resp) = state.authorize_admin(&client_ip, client_addr, req.headers(), "metrics") {
         return *resp;
     }
 
@@ -10749,8 +11120,15 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
+    let entitlement_400 = snapshot_counters(&state.entitlement_400, "entitlement_400");
     let model_denied: Vec<((String, String), u64)> = state
         .model_denied
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
+    let client_rejections: Vec<((String, &'static str), u64)> = state
+        .client_rejections
         .lock()
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
@@ -10761,7 +11139,7 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
-    let auth_failures: Vec<(&'static str, u64)> = state
+    let auth_failures: Vec<(AuthFailureKey, u64)> = state
         .auth_failures
         .lock()
         .ok()
@@ -11705,6 +12083,22 @@ async fn metrics_handler(
         );
     }
 
+    // Entitlement 400s by account (LAB-4729): an account's extra usage is gone.
+    prom_header(
+        &mut buf,
+        "anthropic_entitlement_400_total",
+        "counter",
+        "Upstream 'out of extra usage' 400s by account; the first per request is re-sent to another account",
+    );
+    for (account, n) in &entitlement_400 {
+        prom_counter(
+            &mut buf,
+            "anthropic_entitlement_400_total",
+            &[("account", account.as_str())],
+            *n,
+        );
+    }
+
     // Per-client model-allowlist denials (LAB-1083). A non-zero rate here is
     // either a misconfigured caller or a caller reaching for capacity it was
     // deliberately denied — both worth an alert.
@@ -11719,6 +12113,25 @@ async fn metrics_handler(
             &mut buf,
             "anthropic_client_model_denied_total",
             &[("client", client.as_str()), ("model", model.as_str())],
+            *n,
+        );
+    }
+
+    // Pre-request-gate 429 rejections (LAB-2551). Per-replica, in-memory —
+    // dashboards must rate() before summing across pods. The header is
+    // emitted even at zero series so the family is discoverable before the
+    // first rejection.
+    prom_header(
+        &mut buf,
+        "anthropic_client_rejections_total",
+        "counter",
+        "Requests rejected (429) by the pre-request gate, by client and reason (budget/utilization/brake)",
+    );
+    for ((client, reason), n) in &client_rejections {
+        prom_counter(
+            &mut buf,
+            "anthropic_client_rejections_total",
+            &[("client", client.as_str()), ("reason", reason)],
             *n,
         );
     }
@@ -11746,13 +12159,14 @@ async fn metrics_handler(
         &mut buf,
         "anthropic_auth_failures_total",
         "counter",
-        "Requests rejected for auth — invalid/missing credential OR throttle 429 — by route",
+        "Requests rejected for auth — invalid/missing credential OR throttle 429 — by route \
+         and presented-credential shape (cred: none / x-api-key / bearer / auth-other)",
     );
-    for (route, n) in &auth_failures {
+    for ((route, cred), n) in &auth_failures {
         prom_counter(
             &mut buf,
             "anthropic_auth_failures_total",
-            &[("route", route)],
+            &[("route", route), ("cred", cred)],
             *n,
         );
     }
@@ -12059,12 +12473,15 @@ struct StreamContext {
     /// Text content buffered while `json_mode` is set, flushed fence-stripped
     /// at end-of-message so streaming content matches the non-streaming strip.
     text_buffer: String,
-    /// Upstream emitted an in-band `event: error` frame. The translator has
-    /// already surfaced it as an OpenAI error frame (which carries its own
-    /// `[DONE]`); the stream loop must stop translating and must NOT emit a
-    /// clean `[DONE]` afterwards — that would fake a successful completion
-    /// after a truncation.
-    upstream_error: bool,
+    /// Downstream terminator state. `errored`: the translator surfaced an
+    /// in-band `event: error` as an OpenAI error frame (which carries its
+    /// own `[DONE]`), or the stream loop synthesised one on a transport
+    /// failure; the loop must stop translating and must NOT emit a clean
+    /// `[DONE]` afterwards — that would fake a successful completion after
+    /// a truncation. `completed`: the clean `[DONE]` went downstream (set by
+    /// the loop, which sees every emitted frame; the error frame's own
+    /// `[DONE]` does not count).
+    terminal: SseTerminal,
 }
 
 impl Default for StreamContext {
@@ -12078,7 +12495,7 @@ impl Default for StreamContext {
             current_tool_id: String::new(),
             json_mode: false,
             text_buffer: String::new(),
-            upstream_error: false,
+            terminal: SseTerminal::default(),
         }
     }
 }
@@ -12506,6 +12923,13 @@ fn translate_anthropic_to_openai(body: &serde_json::Value, json_mode: bool) -> s
 /// Parse a raw SSE event block and translate to OpenAI format.
 /// Returns None for events that should be skipped (ping, text content_block_start, etc.).
 fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
+    // Both terminators are final (mirror of the reverse translator): once
+    // `[DONE]` or an error frame is out, a stray upstream event must not
+    // translate into a second `[DONE]`-carrying frame.
+    if ctx.terminal.reached() {
+        return None;
+    }
+
     let mut event_type = String::new();
     let mut data = String::new();
 
@@ -12660,9 +13084,9 @@ fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<String> {
             // Surface it in the client's protocol instead of dropping it —
             // dropping it made the stream end with a clean [DONE] after a
             // silent truncation. The frame carries its own [DONE];
-            // ctx.upstream_error tells the stream loop to stop and skip the
-            // ensure-[DONE] guard.
-            ctx.upstream_error = true;
+            // ctx.terminal.errored tells the stream loop to stop and skip
+            // the ensure-[DONE] guard.
+            ctx.terminal.errored = true;
             let err_type = parsed
                 .pointer("/error/type")
                 .and_then(|v| v.as_str())
@@ -13124,18 +13548,14 @@ struct ReverseStreamContext {
     block_index: i64,
     in_text_block: bool,
     in_tool_use: bool,
-    /// An Anthropic `event: error` frame has been sent downstream — either
-    /// translated from an in-band `{"error": {...}}` data line, or by the
-    /// stream loop on a transport failure. That frame is terminal: the
-    /// translator emits nothing once this is set (including `[DONE]` →
-    /// `message_stop`), so no success terminator can follow an error.
-    upstream_error: bool,
-    /// The Anthropic success terminator (`message_stop`) has been emitted —
-    /// from a finish_reason chunk or a bare upstream `[DONE]`. The stream is
-    /// complete from the client's view; a later transport failure must not
-    /// ship an error frame after it (mirror of the passthrough `sent_done`
-    /// guard, one protocol over).
-    message_stopped: bool,
+    /// Downstream terminator state. `errored`: an Anthropic `event: error`
+    /// frame has been sent — translated from an in-band `{"error": {...}}`
+    /// data line, or by the stream loop on a transport failure / premature
+    /// EOF. `completed`: `message_stop` has been emitted, from a
+    /// finish_reason chunk or a bare upstream `[DONE]`. Both are terminal:
+    /// the translator emits nothing once either is set (so no `[DONE]` →
+    /// `message_stop` after an error, no error frame after `message_stop`).
+    terminal: SseTerminal,
 }
 
 impl Default for ReverseStreamContext {
@@ -13147,8 +13567,7 @@ impl Default for ReverseStreamContext {
             block_index: -1,
             in_text_block: false,
             in_tool_use: false,
-            upstream_error: false,
-            message_stopped: false,
+            terminal: SseTerminal::default(),
         }
     }
 }
@@ -13207,15 +13626,17 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
     // a success terminator after an error). Symmetrically, after
     // `message_stop` nothing may follow — an in-band error line or stray
     // delta arriving post-completion would violate the protocol the same way.
-    if ctx.upstream_error || ctx.message_stopped {
+    if ctx.terminal.reached() {
         return vec![];
     }
 
     let trimmed = raw.trim();
     if trimmed == "[DONE]" {
-        // Only emit message_stop if we started a message
+        // Only emit message_stop if we started a message. With no message
+        // started this returns nothing and leaves `terminal` unset — the
+        // stream loop's end-of-stream guard then terminates explicitly.
         if ctx.message_started {
-            ctx.message_stopped = true;
+            ctx.terminal.completed = true;
             return vec![make_anthropic_event(
                 "message_stop",
                 &serde_json::json!({"type": "message_stop"}),
@@ -13233,7 +13654,7 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
     // would fall through the missing-choices early-return and vanish — a
     // not-yet-started message then ends as a 200 with an empty SSE body.
     if let Some(err) = parsed.get("error").filter(|e| !e.is_null()) {
-        ctx.upstream_error = true;
+        ctx.terminal.errored = true;
         let err_type = err
             .get("type")
             .and_then(|v| v.as_str())
@@ -13419,9 +13840,9 @@ fn translate_openai_sse_to_anthropic(raw: &str, ctx: &mut ReverseStreamContext) 
             "message_stop",
             &serde_json::json!({"type": "message_stop"}),
         ));
-        // message_stopped's early-return keeps a trailing [DONE] (or anything
-        // else) from emitting a duplicate message_stop.
-        ctx.message_stopped = true;
+        // terminal's early-return keeps a trailing [DONE] (or anything else)
+        // from emitting a duplicate message_stop.
+        ctx.terminal.completed = true;
     }
 
     events
@@ -13685,6 +14106,7 @@ async fn forward_openai_compat_anthropic(
         // Translate Anthropic error to OpenAI error format so clients
         // (LiteLLM, etc.) can parse the actual error message.
         let mut model_unsupported = false;
+        let mut entitlement = false;
         let openai_error =
             if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&error_body) {
                 // Count + trace context-window overflows here too (LAB-916) —
@@ -13694,8 +14116,10 @@ async fn forward_openai_compat_anthropic(
                         state.note_prompt_too_long(req_id, model, session_key, msg);
                     }
                 }
-                // Same model-rejection detection as the native path (LAB-941).
+                // Same model-rejection detection as the native path (LAB-941),
+                // and the same entitlement 400 (LAB-4729).
                 model_unsupported = is_model_unsupported_error(status, &parsed);
+                entitlement = is_entitlement_exhausted_400(status, &parsed);
                 // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
                 let msg = parsed
                     .pointer("/error/message")
@@ -13739,6 +14163,10 @@ async fn forward_openai_compat_anthropic(
             state.note_model_unsupported(endpoint_name, endpoint_idx, model);
             return ForwardOutcome::RetryModelUnsupported(Box::new(response));
         }
+        if entitlement {
+            state.note_entitlement_400(endpoint_name);
+            return ForwardOutcome::RetryEntitlement(Box::new(response));
+        }
         return ForwardOutcome::Done(Box::new(response));
     }
 
@@ -13760,14 +14188,13 @@ async fn forward_openai_compat_anthropic(
         tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
             let mut scanner = SseUsageScanner::default();
+            // Terminator state: see `StreamContext::terminal`.
             let mut ctx = StreamContext {
                 json_mode,
                 ..StreamContext::default()
             };
-            let mut sent_done = false;
 
             let mut client_gone = false;
-            let mut upstream_error = false;
 
             loop {
                 match resp.chunk().await {
@@ -13787,45 +14214,52 @@ async fn forward_openai_compat_anthropic(
                                 // ends_with, not equality: the json_mode flush
                                 // and the in-band error frame both append the
                                 // terminator to another frame in one string.
-                                if translated.ends_with("data: [DONE]\n\n") {
-                                    sent_done = true;
-                                }
-                                if ctx.upstream_error {
-                                    // In-band `event: error` — the frame just
-                                    // translated carries its own [DONE]. Treat
-                                    // like a transport error: stop translating,
-                                    // skip the buffer flush and the clean-[DONE]
-                                    // guard, and finalize as a failure.
-                                    upstream_error = true;
+                                // The in-band error frame carries its own
+                                // [DONE]; `errored` (set by the translator)
+                                // already makes it terminal — it is not a
+                                // success completion.
+                                if translated.ends_with("data: [DONE]\n\n") && !ctx.terminal.errored
+                                {
+                                    ctx.terminal.completed = true;
                                 }
                                 if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
                                     client_gone = true;
                                     break;
                                 }
-                                if upstream_error {
+                                if ctx.terminal.errored {
+                                    // Nothing may follow the error frame.
                                     break;
                                 }
                             }
                         }
-                        if client_gone || upstream_error {
+                        if client_gone || ctx.terminal.errored {
                             break;
                         }
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        upstream_error = true;
                         warn!(req_id = req_id_clone, error = %e, "upstream SSE read failed");
+                        // `[DONE]` already went out: the client saw a complete
+                        // stream, and a second `[DONE]` (the error frame carries
+                        // one) would break strict OpenAI parsers.
+                        if ctx.terminal.reached() {
+                            debug!(
+                                req_id = req_id_clone,
+                                "transport error after terminator — error frame suppressed"
+                            );
+                            break;
+                        }
                         // The post-loop "ensure DONE sent" block gates on
-                        // !upstream_error (set above), so emitting the error
-                        // frame here — which already ships [DONE] — cannot
-                        // race with a second [DONE] from the post-loop guard.
-                        if !sent_done
-                            && tx
-                                .send(Ok(openai_error_frame(&format!(
-                                    "upstream stream interrupted: {e}"
-                                ))))
-                                .await
-                                .is_err()
+                        // !terminal.reached(), so emitting the error frame
+                        // here — which already ships [DONE] — cannot race
+                        // with a second [DONE] from the post-loop guard.
+                        ctx.terminal.errored = true;
+                        if tx
+                            .send(Ok(openai_error_frame(&format!(
+                                "upstream stream interrupted: {e}"
+                            ))))
+                            .await
+                            .is_err()
                         {
                             client_gone = true;
                         }
@@ -13834,19 +14268,14 @@ async fn forward_openai_compat_anthropic(
                 }
             }
 
-            // Process any remaining data in buffer (skip if upstream errored)
-            if !upstream_error && !buffer.is_empty() {
+            // Process any remaining data in buffer (skip once a terminator is
+            // out — nothing may follow it)
+            if !ctx.terminal.reached() && !buffer.is_empty() {
                 let remaining = String::from_utf8_lossy(&buffer).into_owned();
                 if !remaining.trim().is_empty() {
                     if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
-                        if translated.ends_with("data: [DONE]\n\n") {
-                            sent_done = true;
-                        }
-                        if ctx.upstream_error {
-                            // Error event in the trailing buffer (stream
-                            // closed without a final \n\n) — same rules as
-                            // in-loop.
-                            upstream_error = true;
+                        if translated.ends_with("data: [DONE]\n\n") && !ctx.terminal.errored {
+                            ctx.terminal.completed = true;
                         }
                         if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
                             client_gone = true;
@@ -13855,10 +14284,10 @@ async fn forward_openai_compat_anthropic(
                 }
             }
 
-            // Ensure [DONE] is always sent (skip on upstream error — would fake clean completion)
-            if !sent_done
+            // Ensure [DONE] is always sent (skip once any terminator is out —
+            // after an error frame it would fake a clean completion)
+            if !ctx.terminal.reached()
                 && !client_gone
-                && !upstream_error
                 && tx
                     .send(Ok(bytes::Bytes::from("data: [DONE]\n\n")))
                     .await
@@ -13886,7 +14315,7 @@ async fn forward_openai_compat_anthropic(
                 scanner,
                 request_start,
                 client_gone,
-                upstream_error,
+                ctx.terminal.errored,
                 true,
                 session_key_clone.as_deref(),
                 context_window,
@@ -14017,7 +14446,13 @@ async fn openai_chat_handler(
 
     // Proxy auth: accept the credential from either x-api-key or
     // Authorization: Bearer — OpenAI SDKs send only the latter.
-    let principal = match state.authenticate_throttled(&client_ip, req.headers(), true, "openai") {
+    let principal = match state.authenticate_throttled(
+        &client_ip,
+        client_addr,
+        req.headers(),
+        true,
+        "openai",
+    ) {
         Ok(p) => p,
         Err(resp) => return *resp,
     };
@@ -14201,6 +14636,8 @@ async fn openai_chat_handler(
         // Upstream error from the most recent model-unsupported rejection —
         // returned verbatim if the pool exhausts on nothing but rejections.
         let mut model_unsupported_resp: Option<Response> = None;
+        // One-shot entitlement re-send, as in `proxy_handler` (LAB-4729).
+        let mut entitlement_resp: Option<(EndpointIdx, Option<Response>)> = None;
         for retry_round in 0..=MAX_529_RETRIES {
             if retry_round > 0 {
                 let delay = round_backoff_delay(retry_round, last_saw_529);
@@ -14212,7 +14649,9 @@ async fn openai_chat_handler(
                 );
                 tokio::time::sleep(delay).await;
             }
-            let mut skip: Vec<EndpointIdx> = Vec::new();
+            // Entitlement-refusing endpoint stays skipped across rounds, as in
+            // `proxy_handler` (LAB-4729).
+            let mut skip: Vec<EndpointIdx> = entitlement_resp.iter().map(|(i, _)| *i).collect();
             let mut saw_529 = false;
             let mut saw_transient = false;
             for _attempt in 0..n {
@@ -14287,6 +14726,7 @@ async fn openai_chat_handler(
                     &mut saw_529,
                     &mut saw_transient,
                     &mut model_unsupported_resp,
+                    &mut entitlement_resp,
                 ) {
                     RetryStep::Return(resp) => return resp,
                     RetryStep::NextAttempt => continue,
@@ -14303,7 +14743,10 @@ async fn openai_chat_handler(
         // Same model-rejection exhaustion rule as `proxy_handler` (LAB-941),
         // in the OpenAI error shape this handler's clients parse.
         if !last_saw_529 && !last_saw_transient {
-            if let Some(resp) = model_unsupported_resp {
+            if let Some(resp) = entitlement_resp
+                .and_then(|(_, r)| r)
+                .or(model_unsupported_resp)
+            {
                 return resp;
             }
             if state.model_unsupported_everywhere(&model) {
@@ -15062,7 +15505,9 @@ async fn main() {
         beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
         fast_mode_429: Mutex::new(HashMap::new()),
+        entitlement_400: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
+        client_rejections: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache,
     });

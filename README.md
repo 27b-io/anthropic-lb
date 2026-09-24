@@ -170,7 +170,7 @@ token = "sk-ant-api03-..."
 | Field | Type | Default | Description |
 |:------|:-----|:--------|:------------|
 | `listen` | `String` | — | Bind address (e.g. `"127.0.0.1:8082"`) |
-| `rate_limit_cooldown_secs` | `u64` | `60` | Seconds to cool down after 429 |
+| `rate_limit_cooldown_secs` | `u64` | `5` | Fallback cooldown after a capacity 429 when upstream sends no usable `retry-after` (burst 429s use their own 5→60s backoff) |
 | `probe_interval_secs` | `u64` | `300` | Seconds between utilization probes (0 = disabled) |
 | `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id` |
 | `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`) |
@@ -367,7 +367,7 @@ Those headers stop here. Once the client IP is resolved, the proxy drops `x-forw
 
 ### Failed-auth throttling
 
-This in-process throttle bounds the volume of detailed `401` responses; it does not reduce credential-comparison throughput. Credential-stuffing and request-rate controls belong at the public ingress. After `auth_failure_limit` failures from one client IP inside `auth_failure_window_secs`, further **invalid** credentials from that IP get `429` with `retry-after`. Credential comparison runs first, before the throttle check, so a known-good principal still passes when NATs and load balancers collapse unrelated callers onto one resolved address. Successful requests do not clear the shared IP's failure window, so invalid traffic remains throttled until expiry. This trade relies on the enforced `MIN_KEY_LEN = 32`; if the credential floor is lowered, the throttle check should run before credential comparison instead. Failures are counted in `anthropic_auth_failures_total{route}` and logged with the resolved client IP. The throttle table is bounded (4096 IPs), so the tracking structure itself cannot be flooded into an OOM — and eviction is threat-aware: expired windows are purged first, then the least-established live entry (lowest failure count, oldest window as tie-breaker) is evicted, so a flood of fresh failures cannot flush an active lockout to reset it.
+This in-process throttle bounds the volume of detailed `401` responses; it does not reduce credential-comparison throughput. Credential-stuffing and request-rate controls belong at the public ingress. After `auth_failure_limit` failures from one client IP inside `auth_failure_window_secs`, further **invalid** credentials from that IP get `429` with `retry-after`. Credential comparison runs first, before the throttle check, so a known-good principal still passes when NATs and load balancers collapse unrelated callers onto one resolved address. Successful requests do not clear the shared IP's failure window, so invalid traffic remains throttled until expiry. This trade relies on the enforced `MIN_KEY_LEN = 32`; if the credential floor is lowered, the throttle check should run before credential comparison instead. Failures are counted in `anthropic_auth_failures_total{route,cred}` and logged with the resolved client IP plus, because every caller behind a NAT gateway or TCP-forwarding VIP resolves to one address, the attribution the IP cannot give: the actual TCP `peer` socket address (IP:port — distinct from the resolved client IP once `trusted_proxies` is in play), the header shape the credential arrived in (`cred`: `none` / `x-api-key` / `bearer` / `auth-other`), a one-way 12-hex `key_fp` of the presented value for `x-api-key`/`bearer` (never the value or any prefix of it — `auth-other` gets no fingerprint, since there is no bare credential to hash), and the `ua` clipped to 64 chars. The user-agent is deliberately not a metric label: its series would be claimed by whoever fails first on a public ingress. To check whether a suspect key is the one being rejected, fingerprint it the same way and compare: `python3 -c 'import hashlib,sys; print(hashlib.blake2s(b"anthropic-lb/auth-fp\x1f" + sys.argv[1].encode()).hexdigest()[:12])' "$KEY"`. The throttle table is bounded (4096 IPs), so the tracking structure itself cannot be flooded into an OOM — and eviction is threat-aware: expired windows are purged first, then the least-established live entry (lowest failure count, oldest window as tie-breaker) is evicted, so a flood of fresh failures cannot flush an active lockout to reset it.
 
 ### Credential-path hardening
 
@@ -393,13 +393,16 @@ can steer are locked down by default:
   `anthropic-beta` values outside `allowed_client_betas` are dropped before
   forwarding, logged at `warn`, and counted in
   `anthropic_beta_flag_dropped_total{flag}`. The built-in default covers the
-  flags the proxy itself needs, the flag families Claude Code sends, and
-  `fast-mode-*`; the authoritative list is `DEFAULT_CLIENT_BETA_ALLOWLIST`
-  in `src/main.rs`. Some families pair with a request-body field (`fast-mode-*`
-  with top-level `speed: "fast"`; the auto-mode classifier pair
-  `dangerous-tool-use-*` + `auto-mode-classifier-*` with top-level
-  `safeguards`), and the body is forwarded verbatim — so dropping the header
-  alone is a hard upstream `400`, not a quiet downgrade.
+  flags the proxy itself needs and the flag families Claude Code sends; the
+  authoritative list is `DEFAULT_CLIENT_BETA_ALLOWLIST` in `src/main.rs`.
+  Some families pair with a request-body field, and the body is forwarded
+  verbatim — so dropping the header alone is a hard upstream `400`, not a
+  quiet downgrade:
+  - `fast-mode-*` ↔ top-level `speed: "fast"`
+  - `dangerous-tool-use-*` + `auto-mode-classifier-*` ↔ top-level `safeguards`
+  - `mid-conversation-tool-changes-*`, `per-turn-control-*`, `timing-*` ↔
+    `tool_addition`/`tool_removal` blocks and `output_config.effort`/`timing`
+    on the `role: "system"` entry in `messages`
 - **A fast-mode `429` is forwarded to the caller, not treated as account
   exhaustion.** Fast mode (`speed: "fast"`) bills against its own rate bucket,
   separate from the account's 5h/7d windows, so a `429` on a fast request does
