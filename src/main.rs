@@ -511,6 +511,17 @@ const MAX_TRACKED_CLIENTS: usize = 10_000;
 /// mirroring the LAB-2330 fix to `client_model_usage`).
 const MAX_MODEL_DENIED_LABELS: usize = 64;
 
+/// Cap on distinct clients in the pre-request-gate rejection counter
+/// (LAB-2551). Past the cap, rejections for NEW clients lump into a single
+/// global `_other` client key (never per-client overflow keys — the CWE-770
+/// shape), while already-tracked clients may still add entries under new
+/// reasons — a brake event stamps every active client at once, so crossing
+/// the cap mid-incident must not split a tracked client's attribution. The
+/// reason axis is a closed static set of 3, so entries are hard-bounded at
+/// 3 × (cap + 1). Real deployments have tens of clients; only caller-minted
+/// ids under legacy header auth can approach this.
+const MAX_CLIENT_REJECTION_LABELS: usize = 64;
+
 /// Cap on distinct (client, model) pairs in the per-model usage counter
 /// (LAB-2330). The model key is normally response-derived (upstream-validated),
 /// but the request-model fallback is caller-influenced and the client key is
@@ -1020,6 +1031,14 @@ struct AppState {
     /// single global ("_other", "_other") bucket, hard-bounding the map at
     /// `MAX_MODEL_DENIED_LABELS` + 1 entries (LAB-2332).
     model_denied: Mutex<HashMap<(String, String), u64>>,
+    /// Pre-request-gate 429 rejections, keyed (client, reason) (LAB-2551).
+    /// Exposed as `anthropic_client_rejections_total`. `reason` is the closed
+    /// static set budget / utilization / brake — the three capacity denials in
+    /// `pre_request_gate`; 403 policy denials stay on `model_denied`. `client`
+    /// is caller-controlled under legacy header auth, so it is truncated and
+    /// the map is bounded via a global `_other` overflow
+    /// (`MAX_CLIENT_REJECTION_LABELS`).
+    client_rejections: Mutex<HashMap<(String, &'static str), u64>>,
     /// (endpoint idx, model) pairs an upstream rejected as unsupported — a
     /// gateway without the model, or a plan without access (LAB-941).
     /// `routing_candidates` skips these until the entry expires; because
@@ -2382,6 +2401,38 @@ impl AppState {
                 "rejected: model not in client allow-list"
             );
         }
+    }
+
+    /// Count a pre-request-gate 429 rejection (LAB-2551).
+    ///
+    /// `client_id` is truncated before becoming a map key (caller-controlled
+    /// under legacy header auth), and past `MAX_CLIENT_REJECTION_LABELS`
+    /// distinct clients NEW clients lump into the single global `_other` key
+    /// — keeping the reason label so overflow traffic still charts by cause.
+    /// Callers already log the rejection; this only feeds `/metrics`.
+    fn note_client_rejection(&self, client_id: &str, reason: &'static str) {
+        let Ok(mut counts) = self.client_rejections.lock() else {
+            return;
+        };
+        let key = (truncate_label(client_id), reason);
+        // Tracked = the CLIENT has any entry, not this exact (client, reason)
+        // pair: a tracked client's first rejection under a new reason must
+        // not fall to `_other` just because the cap was crossed in between.
+        // The cap likewise bounds distinct CLIENTS, not (client, reason)
+        // entries — one client on all 3 reasons must burn one slot, not
+        // three. O(cap) scans, only on the rejection path.
+        let tracked = counts.keys().any(|(c, _)| *c == key.0);
+        let distinct_clients = counts
+            .keys()
+            .map(|(c, _)| c.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let key = if tracked || distinct_clients < MAX_CLIENT_REJECTION_LABELS {
+            key
+        } else {
+            ("_other".to_owned(), reason)
+        };
+        *counts.entry(key).or_insert(0) += 1;
     }
 
     /// Resolve client identity: x-client-id header → IP map fallback → "-"
@@ -3871,39 +3922,69 @@ struct RoutingWeight {
     overage_active: bool,
 }
 
+/// 5h gate: time-adjusted 5h utilization with status floors, falling back to
+/// raw unified, legacy token ratio, or 0.5 (unknown). A fixed 0.5 while the
+/// account's data predates its last hard limit.
+///
+/// Shared by `compute_routing_weight` and `metrics_gate_weight` so the gate
+/// published on `/metrics` cannot drift from the one the router uses (LAB-4441).
+fn gate_5h(info: &RateLimitInfo, now_epoch: u64, stale_after_hard_limit: bool) -> f64 {
+    if stale_after_hard_limit {
+        return 0.5;
+    }
+    time_adjusted_utilization(
+        info.utilization_5h,
+        info.reset_5h,
+        info.status_5h.as_deref(),
+        NEAR_RESET_5H_SECS,
+        now_epoch,
+    )
+    .unwrap_or_else(|| {
+        if let Some(util) = info.utilization {
+            util
+        } else if let Some(remaining) = info.remaining_tokens {
+            let limit = info.limit_tokens.unwrap_or(1_000_000);
+            (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
+        } else {
+            0.5
+        }
+    })
+}
+
+/// Overage gate: `Some` iff the account is serving via paid overage, in which
+/// case this gate REPLACES the exhausted 5h/7d gates — the overage window
+/// governs, and a rejected subscription claim does not skip the account.
+/// `None` while overage is off or the data predates the last hard limit.
+///
+/// Shared by `compute_routing_weight` and `metrics_gate_weight` (LAB-4441:
+/// the metrics path lacked this branch and published gate 1.0 for accounts
+/// the router was actively serving through).
+fn overage_gate(info: &RateLimitInfo, now_epoch: u64, stale_after_hard_limit: bool) -> Option<f64> {
+    if !info.overage_in_use || stale_after_hard_limit {
+        return None;
+    }
+    Some(
+        time_adjusted_utilization(
+            info.overage_utilization,
+            info.overage_reset,
+            info.overage_status.as_deref(),
+            NEAR_RESET_OVERAGE_SECS,
+            now_epoch,
+        )
+        .unwrap_or(0.0),
+    )
+}
+
 fn compute_routing_weight(
     info: &RateLimitInfo,
     model: &str,
     now_epoch: u64,
     stale_after_hard_limit: bool,
 ) -> Option<RoutingWeight> {
-    // Overage active: the account's exhausted subscription window is being covered
-    // by paid overage. The subscription gates are moot — the overage window governs.
-    let overage_active = info.overage_in_use && !stale_after_hard_limit;
+    let gate_overage = overage_gate(info, now_epoch, stale_after_hard_limit);
+    let overage_active = gate_overage.is_some();
 
-    // 5h gate: time-adjusted 5h utilization with status floors
-    let gate_5h = if stale_after_hard_limit {
-        0.5
-    } else {
-        time_adjusted_utilization(
-            info.utilization_5h,
-            info.reset_5h,
-            info.status_5h.as_deref(),
-            NEAR_RESET_5H_SECS,
-            now_epoch,
-        )
-        .unwrap_or_else(|| {
-            // Fallback: raw unified, legacy, or unknown
-            if let Some(util) = info.utilization {
-                util
-            } else if let Some(remaining) = info.remaining_tokens {
-                let limit = info.limit_tokens.unwrap_or(1_000_000);
-                (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
-            } else {
-                0.5
-            }
-        })
-    };
+    let gate_5h = gate_5h(info, now_epoch, stale_after_hard_limit);
 
     // Whether a status floor (`status_to_floor` inside `time_adjusted_utilization`)
     // raised `gate_5h` above its raw time-adjusted utilisation. Compared against
@@ -3981,18 +4062,9 @@ fn compute_routing_weight(
 
     // Effective gate: when overage is in use, the overage window governs — the
     // exhausted 5h/7d gates are superseded. waste_risk is moot for an overage account.
-    let (gate, wr, source) = if overage_active {
-        let gate_overage = time_adjusted_utilization(
-            info.overage_utilization,
-            info.overage_reset,
-            info.overage_status.as_deref(),
-            NEAR_RESET_OVERAGE_SECS,
-            now_epoch,
-        )
-        .unwrap_or(0.0);
-        (gate_overage, 0.0, "overage")
-    } else {
-        (gate_5h.max(gate_7d), wr_7d, source_7d)
+    let (gate, wr, source) = match gate_overage {
+        Some(g) => (g, 0.0, "overage"),
+        None => (gate_5h.max(gate_7d), wr_7d, source_7d),
     };
 
     // Weekly headroom for the affinity override (`affinity_headroom`): 1.0 when
@@ -4437,28 +4509,7 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
         .hard_limited_until
         .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
 
-    // 5h gate — same logic as routing_candidates
-    let gate_5h = if stale_after_hard_limit {
-        0.5
-    } else {
-        time_adjusted_utilization(
-            info.utilization_5h,
-            info.reset_5h,
-            info.status_5h.as_deref(),
-            NEAR_RESET_5H_SECS,
-            now_epoch,
-        )
-        .unwrap_or_else(|| {
-            if let Some(util) = info.utilization {
-                util
-            } else if let Some(remaining) = info.remaining_tokens {
-                let limit = info.limit_tokens.unwrap_or(1_000_000);
-                (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
-            } else {
-                0.5
-            }
-        })
-    };
+    let gate_5h = gate_5h(info, now_epoch, stale_after_hard_limit);
 
     // 7d gate + waste_risk from a SINGLE representative ClaimWindowData
     // — utilization, reset and status are read as a coherent triple
@@ -4502,7 +4553,7 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
             })
     };
 
-    let (gate_7d, wr) = if let Some(claim) = representative {
+    let (gate_7d, wr_7d) = if let Some(claim) = representative {
         let g = if stale_after_hard_limit {
             0.5
         } else {
@@ -4523,7 +4574,12 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
         (g, 0.0)
     };
 
-    let gate = gate_5h.max(gate_7d);
+    // Overage supersedes the subscription gates exactly as in
+    // `compute_routing_weight`: the overage window governs, waste_risk is moot.
+    let (gate, wr) = match overage_gate(info, now_epoch, stale_after_hard_limit) {
+        Some(g) => (g, 0.0),
+        None => (gate_5h.max(gate_7d), wr_7d),
+    };
     let headroom = (1.0 - gate).max(0.01);
     let weight = if wr > 0.0 { wr * headroom } else { headroom };
     let weight = if gate >= 1.0 { 0.0 } else { weight };
@@ -4832,10 +4888,21 @@ impl AppState {
                 // (so the cache warms on the replacement and stays there) yet spread
                 // across sessions (distinct keys → distinct replacements), and
                 // independent of which account is momentarily `best`.
+                //
+                // "Healthy" = the override would not flee it: the negation of the
+                // trigger above. Excluding only `picked` let a 7d-spent account
+                // (gate-healthy, big expiring-quota bucket) replace an equally
+                // spent one, which answered the caller with Anthropic's
+                // entitlement 400 (LAB-4719). The floor also excludes `picked`.
+                // Never empty: `best` always clears it, and clearing it means
+                // headroom > 0, so gate < 1 and weight > 0. The `best` fallback
+                // below is therefore unreachable from routing_candidates; it
+                // stays as a guard, and it would still satisfy the floor.
+                let floor = best_headroom * STICKY_WEIGHTED_OVERRIDE_RATIO;
                 let remaining: Vec<&RoutingCandidate> = effective
                     .iter()
                     .copied()
-                    .filter(|c| c.endpoint != picked.endpoint)
+                    .filter(|c| affinity_headroom(c).0 >= floor)
                     .collect();
                 let remaining_weight: f64 = remaining.iter().map(|c| c.weight).sum();
                 let replacement = if remaining_weight > 0.0 {
@@ -7559,6 +7626,7 @@ impl AppState {
 
         // 1. Daily token budget (existing)
         if client_id != "-" && self.check_budget(client_id).await.is_err() {
+            self.note_client_rejection(client_id, "budget");
             warn!(client_id = %client_id, "rejected: daily token budget exceeded");
             return Err(Box::new(
                 (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response(),
@@ -7567,6 +7635,7 @@ impl AppState {
 
         // 2. Utilization limit (new)
         if let Err(retry_after) = self.check_utilization_limit(client_id, model).await {
+            self.note_client_rejection(client_id, "utilization");
             warn!(
                 client_id = %client_id,
                 retry_after = retry_after,
@@ -7586,6 +7655,7 @@ impl AppState {
 
         // 3. Emergency brake (new)
         if self.is_emergency_brake_active().await {
+            self.note_client_rejection(client_id, "brake");
             warn!(
                 client_id = %client_id,
                 "rejected: emergency brake active"
@@ -10558,6 +10628,8 @@ struct EndpointMetricsSnap {
     last_updated_epoch: Option<u64>,
     overage_in_use: bool,
     overage_utilization: Option<f64>,
+    overage_status: Option<String>,
+    overage_reset: Option<u64>,
     /// Routing-weight gauges, captured from the source struct's atomics at
     /// snap time. Snap-carried so the routing-weight emission is pool-agnostic.
     routing_weight: f64,
@@ -10575,7 +10647,7 @@ fn append_routing_weight_metrics(
         buf,
         "anthropic_account_routing_weight",
         "gauge",
-        "Per-account routing weight (headroom * waste_risk, or plain headroom when no 7d claim)",
+        "Per-account routing weight (headroom * waste_risk, or plain headroom when overage is in use or no 7d claim)",
     );
     prom_header(
         buf,
@@ -10587,7 +10659,7 @@ fn append_routing_weight_metrics(
         buf,
         "anthropic_account_effective_gate",
         "gauge",
-        "Effective routing gate: max(time_adjusted_5h, time_adjusted_7d) with status floors",
+        "Effective routing gate: time_adjusted_overage while overage is in use, else max(time_adjusted_5h, time_adjusted_7d), with status floors",
     );
 
     for (ep, snap) in endpoints.iter().zip(snaps.iter()) {
@@ -10725,6 +10797,8 @@ async fn build_metrics_snap(
         last_updated_epoch: info.last_updated_epoch,
         overage_in_use: info.overage_in_use,
         overage_utilization: info.overage_utilization,
+        overage_status: info.overage_status.clone(),
+        overage_reset: info.overage_reset,
         routing_weight: f64::from_bits(routing_weight_atomic.load(Ordering::Relaxed)),
         routing_share: f64::from_bits(routing_share_atomic.load(Ordering::Relaxed)),
         effective_gate: f64::from_bits(effective_gate_atomic.load(Ordering::Relaxed)),
@@ -10832,6 +10906,12 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
+    let client_rejections: Vec<((String, &'static str), u64)> = state
+        .client_rejections
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
     let beta_flags_dropped: Vec<(String, u64)> = state
         .beta_flags_dropped
         .lock()
@@ -10925,6 +11005,17 @@ async fn metrics_handler(
             &[("account", &s.name), ("window", "7d")],
             status_to_ordinal(s.status_7d.as_deref()),
         );
+        // Overage window: same presence rule as its utilization series —
+        // emitted only while overage is serving (its fields are cleared
+        // otherwise), so the status floor that feeds the overage gate is visible.
+        if s.overage_in_use {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_rate_limit_status",
+                &[("account", &s.name), ("window", "overage")],
+                status_to_ordinal(s.overage_status.as_deref()),
+            );
+        }
     }
 
     // Account reset countdowns
@@ -10948,6 +11039,17 @@ async fn metrics_handler(
                 &mut buf,
                 "anthropic_account_reset_seconds",
                 &[("account", &s.name), ("window", "7d")],
+                (r - now_epoch) as f64,
+            );
+        }
+        if let Some(r) = s
+            .overage_reset
+            .filter(|&r| s.overage_in_use && r > now_epoch)
+        {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_reset_seconds",
+                &[("account", &s.name), ("window", "overage")],
                 (r - now_epoch) as f64,
             );
         }
@@ -11305,7 +11407,7 @@ async fn metrics_handler(
         &mut buf,
         "anthropic_account_routing_weight",
         "gauge",
-        "Per-account routing weight (headroom * waste_risk, or plain headroom when no 7d claim)",
+        "Per-account routing weight (headroom * waste_risk, or plain headroom when overage is in use or no 7d claim)",
     );
     prom_header(
         &mut buf,
@@ -11317,7 +11419,7 @@ async fn metrics_handler(
         &mut buf,
         "anthropic_account_effective_gate",
         "gauge",
-        "Effective routing gate: max(time_adjusted_5h, time_adjusted_7d) with status floors",
+        "Effective routing gate: time_adjusted_overage while overage is in use, else max(time_adjusted_5h, time_adjusted_7d), with status floors",
     );
 
     // Snap-carried gauges (captured at snap time).
@@ -11774,6 +11876,25 @@ async fn metrics_handler(
             &mut buf,
             "anthropic_client_model_denied_total",
             &[("client", client.as_str()), ("model", model.as_str())],
+            *n,
+        );
+    }
+
+    // Pre-request-gate 429 rejections (LAB-2551). Per-replica, in-memory —
+    // dashboards must rate() before summing across pods. The header is
+    // emitted even at zero series so the family is discoverable before the
+    // first rejection.
+    prom_header(
+        &mut buf,
+        "anthropic_client_rejections_total",
+        "counter",
+        "Requests rejected (429) by the pre-request gate, by client and reason (budget/utilization/brake)",
+    );
+    for ((client, reason), n) in &client_rejections {
+        prom_counter(
+            &mut buf,
+            "anthropic_client_rejections_total",
+            &[("client", client.as_str()), ("reason", reason)],
             *n,
         );
     }
@@ -15125,6 +15246,7 @@ async fn main() {
         prompt_too_long: Mutex::new(HashMap::new()),
         fast_mode_429: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
+        client_rejections: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache,
     });
