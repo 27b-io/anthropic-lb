@@ -432,6 +432,7 @@ fn test_state_base() -> AppState {
         beta_flags_dropped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
         fast_mode_429: Mutex::new(HashMap::new()),
+        entitlement_400: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
         client_rejections: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
@@ -3956,7 +3957,7 @@ fn translate_sse_inband_error_emits_openai_error_frame() {
 
     // Flag set → stream loop finalizes as failure and skips the clean [DONE]
     // guard (the error frame carries its own terminator).
-    assert!(ctx.upstream_error);
+    assert!(ctx.terminal.errored);
 
     // Exactly one [DONE], and it belongs to the error frame itself.
     assert_eq!(result.matches("[DONE]").count(), 1);
@@ -4460,7 +4461,7 @@ fn reverse_sse_no_duplicate_message_stop() {
 
 #[test]
 fn reverse_sse_message_stopped_set_by_both_terminator_paths() {
-    // LAB-710: `ctx.message_stopped` gates the transport-error frame — once
+    // LAB-710: `ctx.terminal.completed` gates the transport-error frame — once
     // the client has its `message_stop`, a later read failure must not ship
     // an error frame. Both emit sites must set it: finish_reason (the normal
     // case) and a bare [DONE] with no finish_reason seen.
@@ -4469,12 +4470,12 @@ fn reverse_sse_message_stopped_set_by_both_terminator_paths() {
         "{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}",
         &mut ctx,
     );
-    assert!(!ctx.message_stopped);
+    assert!(!ctx.terminal.completed);
     translate_openai_sse_to_anthropic(
         "{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
         &mut ctx,
     );
-    assert!(ctx.message_stopped, "finish_reason emitted message_stop");
+    assert!(ctx.terminal.completed, "finish_reason emitted message_stop");
 
     // message_stop is terminal inside the translator too: an in-band error
     // line (or stray delta) arriving post-completion must emit nothing.
@@ -4486,7 +4487,7 @@ fn reverse_sse_message_stopped_set_by_both_terminator_paths() {
         after.is_empty(),
         "no frame may follow message_stop, got: {after:?}"
     );
-    assert!(!ctx.upstream_error);
+    assert!(!ctx.terminal.errored);
 
     let mut ctx = ReverseStreamContext::default();
     translate_openai_sse_to_anthropic(
@@ -4495,7 +4496,7 @@ fn reverse_sse_message_stopped_set_by_both_terminator_paths() {
     );
     let done_events = translate_openai_sse_to_anthropic("[DONE]", &mut ctx);
     assert!(done_events[0].contains("message_stop"));
-    assert!(ctx.message_stopped, "bare [DONE] emitted message_stop");
+    assert!(ctx.terminal.completed, "bare [DONE] emitted message_stop");
 }
 
 #[test]
@@ -4508,7 +4509,7 @@ fn reverse_sse_inband_error_before_message_start() {
         "{\"error\":{\"message\":\"The server had an error\",\"type\":\"server_error\"}}",
         &mut ctx,
     );
-    assert!(ctx.upstream_error);
+    assert!(ctx.terminal.errored);
     assert_eq!(events.len(), 1);
     assert!(events[0].starts_with("event: error\n"));
     let data_line = events[0].lines().nth(1).unwrap();
@@ -16965,14 +16966,49 @@ async fn proxy_handler_fallback_streaming() {
 
 #[tokio::test]
 async fn fallback_translated_stream_no_error_frame_after_message_stop() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     // LAB-710: a transport read failure AFTER the upstream's `[DONE]` must
     // not ship an Anthropic error frame — the translated `message_stop`
     // already terminated the stream from the client's view. Mirror of the
-    // passthrough `sent_done` guard, one protocol over.
+    // passthrough `terminal.completed` guard, one protocol over. The mock
+    // drops WITHOUT the 0-length chunked terminator: the proxy's next
+    // resp.chunk() errors after message_stop already went downstream.
+    let mock_addr = spawn_sse_upstream(
+        concat!(
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        false,
+    )
+    .await;
+    let state = fallback_only_state(mock_addr, "done-then-err-test").await;
+    let body = stream_messages(serve(build_router(state)).await).await;
+
+    assert!(
+        body.contains("message_stop"),
+        "stream completed — must carry the success terminator, got: {body:?}"
+    );
+    assert!(
+        !body.contains("event: error"),
+        "no error frame may follow message_stop, got: {body:?}"
+    );
+}
+
+// ── LAB-4031: single-terminator invariant on the remaining stream loops ──
+//
+// An SSE stream has exactly one terminator, and an error frame is one.
+// LAB-710 enforced that on the two translating loops' transport-error
+// arms; these cover the native passthrough and the fallback translate
+// branch's end-of-stream.
+
+/// Raw-TCP SSE upstream: answers one request with `body` as a single HTTP
+/// chunk, then either closes the chunked body cleanly (`0\r\n\r\n` → the
+/// proxy sees `Ok(None)`) or drops the socket without it (→ the proxy's
+/// next `resp.chunk()` errors, hyper `IncompleteMessage`).
+async fn spawn_sse_upstream(body: &'static str, clean_close: bool) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mock_addr = listener.local_addr().unwrap();
+    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut buf = vec![0u8; 8192];
@@ -16982,56 +17018,156 @@ async fn fallback_translated_stream_no_error_frame_after_message_stop() {
              transfer-encoding: chunked\r\n\
              \r\n";
         let _ = stream.write_all(head.as_bytes()).await;
-        let body = concat!(
-            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n",
-        );
         let chunk = format!("{:x}\r\n{}\r\n", body.len(), body);
         let _ = stream.write_all(chunk.as_bytes()).await;
-        // Drop WITHOUT the 0-length chunked terminator: the proxy's next
-        // resp.chunk() errors after message_stop already went downstream.
+        if clean_close {
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        }
         let _ = stream.shutdown().await;
     });
+    addr
+}
 
+/// State whose only routable endpoint is an OpenAI-protocol fallback at
+/// `mock_addr`, so a `/v1/messages` request takes `try_fallback_upstream`'s
+/// translate branch.
+async fn fallback_only_state(mock_addr: SocketAddr, state_file: &str) -> Arc<AppState> {
     let mut openai = make_endpoint("fallback", Protocol::OpenAI);
     openai.base_url = format!("http://{}", mock_addr);
     openai.priority = 100;
     let state = Arc::new(AppState {
         endpoints: vec![mk_endpoint("acct-a", "sk-ant-api-a"), openai],
-        state_path: PathBuf::from("/tmp/anthropic-lb-done-then-err-test.state.json"),
+        state_path: PathBuf::from(format!("/tmp/anthropic-lb-{state_file}.state.json")),
         auto_cache: false,
         ..test_state_base()
     });
-    {
-        let mut info = state.endpoints[0].rate_info.write().await;
-        info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
-    }
+    let mut info = state.endpoints[0].rate_info.write().await;
+    info.hard_limited_until = Some(Instant::now() + Duration::from_secs(3600));
+    drop(info);
+    state
+}
 
-    let addr = serve(build_router(state.clone())).await;
-
+async fn stream_messages(addr: SocketAddr) -> String {
     let resp = Client::new()
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
         .json(&serde_json::json!({
             "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "Hello"}],
-            "max_tokens": 1024,
+            "max_tokens": 16,
             "stream": true
         }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = resp.text().await.unwrap();
+    resp.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn native_stream_no_error_frame_after_message_stop() {
+    // Gap 1: the native /v1/messages passthrough forwarded a complete
+    // message (message_stop went downstream verbatim) and then the peer
+    // dropped without the chunked terminator. The client already has a
+    // complete stream; a trailing `event: error` would make the SDK raise on
+    // a request that succeeded.
+    let mock_addr = spawn_sse_upstream(
+        concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ),
+        false,
+    )
+    .await;
+    let (app, _state) = test_app(&format!("http://{}", mock_addr), None);
+    let body = stream_messages(serve(app).await).await;
 
     assert!(
-        body.contains("message_stop"),
-        "stream completed — must carry the success terminator, got: {body:?}"
+        body.contains("event: message_stop\n"),
+        "upstream's message_stop must be forwarded, got: {body:?}"
     );
     assert!(
         !body.contains("event: error"),
         "no error frame may follow message_stop, got: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn native_stream_no_second_error_frame_after_inband_error() {
+    // The upstream's own `event: error` is a terminator too. When the peer
+    // then drops without the chunked terminator, the passthrough must not
+    // append a second error frame behind the one it already forwarded.
+    let mock_addr = spawn_sse_upstream(
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream boom\"}}\n\n",
+        false,
+    )
+    .await;
+    let (app, _state) = test_app(&format!("http://{}", mock_addr), None);
+    let body = stream_messages(serve(app).await).await;
+
+    assert_eq!(
+        body.matches("event: error\n").count(),
+        1,
+        "exactly one error frame — the upstream's own, got: {body:?}"
+    );
+    assert!(
+        body.contains("upstream boom"),
+        "the upstream's error must be forwarded verbatim, got: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn fallback_translated_stream_clean_eof_mid_message_emits_error_frame() {
+    // Gap 2a: upstream body ends cleanly (an intermediary's read timeout,
+    // say) after content but before finish_reason / [DONE]. The client is
+    // holding message_start + deltas; closing the socket there is a silent
+    // truncation. It must get an explicit `event: error` instead.
+    let mock_addr = spawn_sse_upstream(
+        "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+        true,
+    )
+    .await;
+    let state = fallback_only_state(mock_addr, "clean-eof-mid-message").await;
+    let body = stream_messages(serve(build_router(state)).await).await;
+
+    assert!(
+        body.contains("text_delta"),
+        "content before the cut must still reach the client, got: {body:?}"
+    );
+    assert!(
+        !body.contains("message_stop"),
+        "an unfinished message must not be faked complete, got: {body:?}"
+    );
+    let err_at = body.find("event: error\n").unwrap_or_else(|| {
+        panic!("clean EOF mid-message must terminate with an error frame, got: {body:?}")
+    });
+    assert!(
+        err_at > body.find("text_delta").unwrap(),
+        "error frame must be the stream's last event, got: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn fallback_translated_stream_done_only_emits_error_frame() {
+    // Gap 2b: upstream 200s with `data: [DONE]` and nothing else. The
+    // translator has no message to stop, so pre-fix the client got a 200
+    // with a completely empty SSE body — same shape LAB-710 closed for the
+    // in-band-error case, on the no-error path.
+    let mock_addr = spawn_sse_upstream("data: [DONE]\n\n", true).await;
+    let state = fallback_only_state(mock_addr, "done-only").await;
+    let body = stream_messages(serve(build_router(state)).await).await;
+
+    assert!(
+        !body.contains("message_start") && !body.contains("message_stop"),
+        "no message may be fabricated from an empty stream, got: {body:?}"
+    );
+    assert!(
+        body.contains("event: error\n"),
+        "empty upstream stream must terminate with an error frame, got: {body:?}"
     );
 }
 
@@ -17859,22 +17995,9 @@ fn prompt_too_long_counter_bounds_model_cardinality() {
 /// Canned Anthropic context-window-overflow 400, byte-for-byte.
 const PROMPT_TOO_LONG_BODY: &[u8] = br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213462 tokens > 200000 maximum"}}"#;
 
-/// Upstream that answers every request with the canned 400 — the shared
-/// canned-status helper with `bad_first = MAX` (never recovers). `bad_head`
-/// is a raw pre-formatted response, so the JSON body rides along in it; the
-/// content-length is computed here and the leak is one string per test run.
+/// Upstream that answers every request with the canned 400.
 async fn spawn_prompt_too_long_upstream() -> String {
-    let raw: &'static str = Box::leak(
-        format!(
-            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            PROMPT_TOO_LONG_BODY.len(),
-            std::str::from_utf8(PROMPT_TOO_LONG_BODY).unwrap(),
-        )
-        .into_boxed_str(),
-    );
-    spawn_status_then_ok_upstream(usize::MAX, raw, ANTHROPIC_OK_BODY)
-        .await
-        .0
+    spawn_400_upstream(PROMPT_TOO_LONG_BODY).await.0
 }
 
 #[tokio::test]
@@ -20308,6 +20431,11 @@ fn oauth_beta_filter_keeps_claude_code_flag_set() {
         // body-paired (`safeguards`). Not in the 2.1.220 inventory.
         "auto-mode-classifier-2026-07-16",
         "dangerous-tool-use-2026-09-03",
+        // LAB-3964: per-turn family (2.1.278), body-paired — see
+        // DEFAULT_CLIENT_BETA_ALLOWLIST.
+        "mid-conversation-tool-changes-2026-07-01",
+        "per-turn-control-2026-07-01",
+        "timing-2026-09-09",
     ];
     // Negative control: the point of the allow-list is that it still rejects.
     // Without this, widening the default to "*" would keep the test green.
@@ -20490,11 +20618,11 @@ async fn dropped_beta_flag_appears_in_metrics() {
     );
 }
 
-/// LAB-3963: the auto-mode classifier betas and their `safeguards` body must
-/// reach the upstream together through the real OAuth path (which
-/// re-serialises the body) — see `DEFAULT_CLIENT_BETA_ALLOWLIST` for why.
-#[tokio::test]
-async fn oauth_forwards_auto_mode_classifier_header_and_safeguards_body_together() {
+/// Body-paired beta families must reach the upstream header AND body together
+/// through the real OAuth path (which re-serialises the body) — see
+/// `DEFAULT_CLIENT_BETA_ALLOWLIST` for why. Asserts every flag is forwarded
+/// as an exact token and `must_contain` survives in the body byte-identical.
+async fn assert_oauth_forwards_betas_with_body(flags: &[&str], body: String, must_contain: &str) {
     let (upstream_url, mut seen) =
         spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
     let state = Arc::new(AppState {
@@ -20507,20 +20635,10 @@ async fn oauth_forwards_auto_mode_classifier_header_and_safeguards_body_together
         ..test_state_base()
     });
     let addr = serve(build_router(state)).await;
-
-    // Compact JSON, as Claude Code sends it: the value must survive
-    // byte-for-byte whether the body is forwarded raw or re-serialised.
-    let safeguards = r#"[{"type":"dangerous_tool_use","classifier_context":"rm -rf ./build"}]"#;
-    let body = format!(
-        r#"{{"model":"test","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}],"safeguards":{safeguards}}}"#
-    );
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .header("content-type", "application/json")
-        .header(
-            "anthropic-beta",
-            "auto-mode-classifier-2026-07-16,dangerous-tool-use-2026-09-03",
-        )
+        .header("anthropic-beta", flags.join(","))
         .body(body)
         .send()
         .await
@@ -20530,20 +20648,58 @@ async fn oauth_forwards_auto_mode_classifier_header_and_safeguards_body_together
     let (headers, bytes) = seen.recv().await.expect("upstream must have been hit once");
     let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
     let tokens: Vec<&str> = sent.split(',').map(str::trim).collect();
-    for flag in [
-        "auto-mode-classifier-2026-07-16",
-        "dangerous-tool-use-2026-09-03",
-    ] {
+    for flag in flags {
         assert!(
-            tokens.contains(&flag),
+            tokens.contains(flag),
             "beta not forwarded as an exact token: {flag} (sent: {sent})"
         );
     }
     let raw = std::str::from_utf8(&bytes).unwrap();
     assert!(
-        raw.contains(&format!(r#""safeguards":{safeguards}"#)),
-        "safeguards must reach the upstream byte-identical:\n{raw}"
+        raw.contains(must_contain),
+        "body must reach the upstream byte-identical:\n{raw}"
     );
+}
+
+/// LAB-3963: auto-mode classifier pair ↔ top-level `safeguards`.
+#[tokio::test]
+async fn oauth_forwards_auto_mode_classifier_header_and_safeguards_body_together() {
+    // Compact JSON, as Claude Code sends it.
+    let safeguards = r#"[{"type":"dangerous_tool_use","classifier_context":"rm -rf ./build"}]"#;
+    let body = format!(
+        r#"{{"model":"test","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}],"safeguards":{safeguards}}}"#
+    );
+    assert_oauth_forwards_betas_with_body(
+        &[
+            "auto-mode-classifier-2026-07-16",
+            "dangerous-tool-use-2026-09-03",
+        ],
+        body,
+        &format!(r#""safeguards":{safeguards}"#),
+    )
+    .await;
+}
+
+/// LAB-3964: per-turn family ↔ a `role:"system"` entry in `messages` carrying
+/// `tool_addition` blocks and `output_config` with `effort` + `timing`. Unlike
+/// the top-level `safeguards` key above, this pairing sits INSIDE `messages`,
+/// which the auto-cache path mutates — so it gets its own byte-identical check.
+#[tokio::test]
+async fn oauth_forwards_per_turn_betas_header_and_system_entry_body_together() {
+    let system_entry = r#"{"role":"system","content":[{"type":"tool_addition","tool":{"type":"tool_reference","name":"mcp__x__y"}}],"output_config":{"effort":"high","timing":{"type":"now","now":"2026-09-20T10:00:00+10:00"}}}"#;
+    let body = format!(
+        r#"{{"model":"test","max_tokens":1,"messages":[{{"role":"user","content":"hi"}},{system_entry}]}}"#
+    );
+    assert_oauth_forwards_betas_with_body(
+        &[
+            "mid-conversation-tool-changes-2026-07-01",
+            "per-turn-control-2026-07-01",
+            "timing-2026-09-09",
+        ],
+        body,
+        system_entry,
+    )
+    .await;
 }
 
 /// Panel follow-up (LAB-1191): a client flag that IS one of the required
@@ -23757,4 +23913,429 @@ async fn ingested_representative_claim_is_truncated_to_match_its_key() {
         rep,
         info.claims_7d.keys().collect::<Vec<_>>()
     );
+}
+
+// ── LAB-4729: an "out of extra usage" 400 re-sends once; the account is NOT cooled ──
+
+/// The entitlement 400 as observed live (2026-09-22) — request id replaced.
+const ENTITLEMENT_400_BODY: &[u8] = br#"{"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage. Ask your workspace admin to add more so you can keep going."},"request_id":"req_test_entitlement"}"#;
+
+/// The anchor message under the wrong `error.type` — the nearest miss, since
+/// only the type tells it apart.
+const ENTITLEMENT_MSG_AS_AUTH_ERROR: &[u8] = br#"{"type":"error","error":{"type":"authentication_error","message":"You're out of extra usage. Ask your workspace admin to add more so you can keep going."}}"#;
+
+/// A truncated entitlement body. It never parses, so the forward paths never
+/// ask the predicate about it — pinned end-to-end, not in the unit test.
+const MALFORMED_ENTITLEMENT_400: &[u8] =
+    br#"{"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage."#;
+
+#[test]
+fn entitlement_400_predicate_is_anchored_exact_type_and_400_only() {
+    let live: serde_json::Value = serde_json::from_slice(ENTITLEMENT_400_BODY).unwrap();
+    assert!(is_entitlement_exhausted_400(StatusCode::BAD_REQUEST, &live));
+    // The anchor is the condition, not the plan-specific second sentence.
+    let other_plan = serde_json::json!({"type":"error","error":{
+        "type":"invalid_request_error",
+        "message":"You're out of extra usage. Add more at claude.ai/settings to keep going."}});
+    assert!(is_entitlement_exhausted_400(
+        StatusCode::BAD_REQUEST,
+        &other_plan
+    ));
+
+    // The predicate sees every parsed body, 2xx included — the status guard is real.
+    for status in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+        StatusCode::OK,
+    ] {
+        assert!(
+            !is_entitlement_exhausted_400(status, &live),
+            "only a 400 is the entitlement condition, not {status}"
+        );
+    }
+    let negatives: [(&str, &[u8]); 4] = [
+        ("a different invalid_request_error message", PROMPT_TOO_LONG_BODY),
+        (
+            "the anchor message under authentication_error",
+            ENTITLEMENT_MSG_AS_AUTH_ERROR,
+        ),
+        (
+            "the anchor mid-message, not at its start",
+            br#"{"type":"error","error":{"type":"invalid_request_error","message":"tools.0: You're out of extra usage is not a valid tool name"}}"#,
+        ),
+        (
+            "a message that merely mentions usage",
+            br#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid usage of tool_choice: extra usage fields are not permitted"}}"#,
+        ),
+    ];
+    for (why, raw) in negatives {
+        let body: serde_json::Value = serde_json::from_slice(raw).unwrap();
+        assert!(
+            !is_entitlement_exhausted_400(StatusCode::BAD_REQUEST, &body),
+            "must not match {why}"
+        );
+    }
+}
+
+/// Upstream that answers every request with a 400 carrying `body` and an
+/// upstream `request-id` — the shared canned-status helper with
+/// `bad_first = MAX` (never recovers). One leaked string per call.
+async fn spawn_400_upstream(
+    body: &'static [u8],
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let raw: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nrequest-id: req_upstream_400\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap(),
+        )
+        .into_boxed_str(),
+    );
+    spawn_status_then_ok_upstream(usize::MAX, raw, ANTHROPIC_OK_BODY).await
+}
+
+type Hits = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+/// `spent` (priority 0) always answers `body` as a 400; `healthy` at
+/// priority 1 is `healthy_url`. Priority, not affinity hashing, forces the
+/// first attempt onto `spent`, so hit counts are a clean "did we re-send?"
+/// probe — same trick as `two_endpoint_429_then_healthy`.
+async fn spent_then(body: &'static [u8], healthy_url: &str) -> (Arc<AppState>, SocketAddr, Hits) {
+    let (spent_url, spent_hits) = spawn_400_upstream(body).await;
+    let spent = mk_endpoint_at("spent", "sk-ant-api-s", &spent_url);
+    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", healthy_url);
+    healthy.priority = 1;
+    let state = test_state_with(vec![spent, healthy]);
+    let addr = serve(build_router(state.clone())).await;
+    (state, addr, spent_hits)
+}
+
+/// `spent_then` with an always-200 `healthy`.
+async fn spent_then_healthy(body: &'static [u8]) -> (Arc<AppState>, SocketAddr, Hits, Hits) {
+    let (healthy_url, healthy_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let (state, addr, spent_hits) = spent_then(body, &healthy_url).await;
+    (state, addr, spent_hits, healthy_hits)
+}
+
+const MESSAGES_BODY: &str =
+    r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+
+/// AC-2 / AC-4 / AC-5: the request is re-sent to the next account and THAT
+/// response reaches the caller, the event is counted per account — and a
+/// streaming request gets the same re-send, because the 400 arrives as a JSON
+/// body before any SSE byte. The account is NOT cooled: the refusal is
+/// request-class scoped, and cooling on it would let one client sweep the
+/// pool (see `note_entitlement_400`). So the second request tries it again.
+#[tokio::test]
+async fn entitlement_400_resends_once_and_leaves_account_alone() {
+    use std::sync::atomic::Ordering;
+    for (kind, body) in [
+        ("non-streaming", MESSAGES_BODY),
+        (
+            "streaming",
+            r#"{"model":"claude-opus-5","max_tokens":1,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+    ] {
+        let (_state, addr, spent_hits, healthy_hits) =
+            spent_then_healthy(ENTITLEMENT_400_BODY).await;
+        for _ in 0..2 {
+            let resp = reqwest::Client::new()
+                .post(format!("http://{addr}/v1/messages"))
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::OK,
+                "{kind}: the re-send's response is what the caller sees"
+            );
+        }
+        // A cooled priority-0 account would be filtered out of the second
+        // request, giving (1, 2).
+        assert_eq!(
+            (
+                spent_hits.load(Ordering::SeqCst),
+                healthy_hits.load(Ordering::SeqCst)
+            ),
+            (2, 2),
+            "{kind}: each request tries the uncooled account, then re-sends once"
+        );
+        let m = reqwest::Client::new()
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            m.contains(r#"anthropic_entitlement_400_total{account="spent"} 2"#),
+            "{kind}: the event must be counted per account on /metrics:\n{m}"
+        );
+    }
+}
+
+/// The refusing account is not cooled and `skip` resets per retry round, so
+/// without carrying it across rounds a 529 or transport blip on the re-send
+/// target would re-pick the refuser, whose second 400 would end the request
+/// before the healthy account got its backoff retry.
+#[tokio::test]
+async fn entitlement_refuser_stays_skipped_across_retry_rounds() {
+    use std::sync::atomic::Ordering;
+    const HEAD_529: &str =
+        "HTTP/1.1 529 Overloaded\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    for kind in ["529 then ok", "transport blip then ok"] {
+        let (url, target_hits) = if kind.starts_with("529") {
+            spawn_status_then_ok_upstream(1, HEAD_529, ANTHROPIC_OK_BODY).await
+        } else {
+            spawn_flaky_upstream(1, ANTHROPIC_OK_BODY).await
+        };
+        let (_state, addr, spent_hits) = spent_then(ENTITLEMENT_400_BODY, &url).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(MESSAGES_BODY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{kind}");
+        assert_eq!(
+            (
+                spent_hits.load(Ordering::SeqCst),
+                target_hits.load(Ordering::SeqCst)
+            ),
+            (1, 2),
+            "{kind}: the refuser must not be re-picked in the backoff round"
+        );
+    }
+}
+
+/// AC-2 "no loop": one re-send per request. A second entitlement 400 goes to
+/// the caller verbatim instead of sweeping the rest of the pool — the refusal
+/// is request-class scoped, so every account may give it.
+#[tokio::test]
+async fn second_entitlement_400_reaches_caller_without_sweeping_pool() {
+    use std::sync::atomic::Ordering;
+    let (a_url, a_hits) = spawn_400_upstream(ENTITLEMENT_400_BODY).await;
+    let (b_url, b_hits) = spawn_400_upstream(ENTITLEMENT_400_BODY).await;
+    let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let a = mk_endpoint_at("spent-a", "sk-ant-api-a", &a_url);
+    let mut b = mk_endpoint_at("spent-b", "sk-ant-api-b", &b_url);
+    b.priority = 1;
+    let mut ok = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+    ok.priority = 2;
+    let state = test_state_with(vec![a, b, ok]);
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(MESSAGES_BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(&resp.bytes().await.unwrap()[..], ENTITLEMENT_400_BODY);
+    assert_eq!(
+        (
+            a_hits.load(Ordering::SeqCst),
+            b_hits.load(Ordering::SeqCst),
+            ok_hits.load(Ordering::SeqCst)
+        ),
+        (1, 1, 0),
+        "exactly one re-send: the third account must not be tried"
+    );
+}
+
+/// With nothing else to re-send to, the caller gets the upstream's real 400
+/// (it says why, and that more credit fixes it) — not a synthetic 429 that
+/// tells it to retry into the same refusal.
+#[tokio::test]
+async fn entitlement_400_with_no_other_account_returns_upstream_400() {
+    let (url, _hits) = spawn_400_upstream(ENTITLEMENT_400_BODY).await;
+    let state = test_state_with(vec![mk_endpoint_at("only", "sk-ant-api-o", &url)]);
+    let addr = serve(build_router(state)).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(MESSAGES_BODY)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(&body[..], ENTITLEMENT_400_BODY);
+}
+
+/// AC-3: every other 400 is the caller's own error — returned byte-for-byte
+/// (status, body, upstream `request-id`), not re-sent, nothing counted. The
+/// predicate's negatives are unit-tested; these two rows pin the forward path
+/// on the nearest miss and on a body that never parses.
+#[tokio::test]
+async fn non_entitlement_400_passes_through_byte_for_byte() {
+    use std::sync::atomic::Ordering;
+    for (why, body) in [
+        (
+            "the anchor message under authentication_error",
+            ENTITLEMENT_MSG_AS_AUTH_ERROR,
+        ),
+        (
+            "a malformed (truncated) JSON body",
+            MALFORMED_ENTITLEMENT_400,
+        ),
+    ] {
+        let (state, addr, spent_hits, healthy_hits) = spent_then_healthy(body).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(MESSAGES_BODY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "{why}");
+        assert_eq!(
+            resp.headers()
+                .get("request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("req_upstream_400"),
+            "{why}: upstream request-id must reach the caller"
+        );
+        assert_eq!(&resp.bytes().await.unwrap()[..], body, "{why}");
+        assert_eq!(
+            (
+                spent_hits.load(Ordering::SeqCst),
+                healthy_hits.load(Ordering::SeqCst)
+            ),
+            (1, 0),
+            "{why}: a client error must not be re-sent"
+        );
+        assert!(
+            state.entitlement_400.lock().unwrap().is_empty(),
+            "{why}: must not be counted"
+        );
+    }
+}
+
+/// The OpenAI-compat handler forwards to the same Anthropic accounts, so the
+/// same entitlement 400 re-sends there too (its own `note_entitlement_400`
+/// call site, so its own pin).
+#[tokio::test]
+async fn entitlement_400_resends_on_openai_compat_path() {
+    use std::sync::atomic::Ordering;
+    let (state, addr, spent_hits, healthy_hits) = spent_then_healthy(ENTITLEMENT_400_BODY).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        (
+            spent_hits.load(Ordering::SeqCst),
+            healthy_hits.load(Ordering::SeqCst)
+        ),
+        (1, 1)
+    );
+    assert_eq!(state.entitlement_400.lock().unwrap().get("spent"), Some(&1));
+}
+
+/// AC-2 "the second response is what the caller sees": once the re-send gets
+/// an answer, the first account's entitlement 400 is no longer the terminal
+/// cause. A model rejection surfaces as itself, and a rate-limited re-send
+/// target yields the retryable pool-exhaustion 429 — not a non-retryable
+/// "add credits" for a pool that is merely cooling.
+#[tokio::test]
+async fn resend_outcome_supersedes_stashed_entitlement_400() {
+    use std::sync::atomic::Ordering;
+    for (kind, head, want) in [
+        (
+            "model-unsupported 404",
+            HEAD_404_MODEL,
+            reqwest::StatusCode::NOT_FOUND,
+        ),
+        (
+            "rate-limited 429",
+            HEAD_429_RETRY_AFTER_7,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+        ),
+    ] {
+        let (url, target_hits) = spawn_status_then_ok_upstream(usize::MAX, head, b"{}").await;
+        let (_state, addr, spent_hits) = spent_then(ENTITLEMENT_400_BODY, &url).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(MESSAGES_BODY)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, want, "{kind}: body {body}");
+        assert!(
+            !body.contains("out of extra usage"),
+            "{kind}: the stashed entitlement 400 must not win: {body}"
+        );
+        if want == reqwest::StatusCode::NOT_FOUND {
+            assert!(
+                body.contains("not_found_error") && body.contains("claude-nope-1"),
+                "{kind}: the re-send target's own error must reach the caller: {body}"
+            );
+        }
+        assert_eq!(
+            (
+                spent_hits.load(Ordering::SeqCst),
+                target_hits.load(Ordering::SeqCst)
+            ),
+            (1, 1),
+            "{kind}"
+        );
+    }
+}
+
+/// A poisoned `entitlement_400` lock: `/metrics` publishes the real count and
+/// clears the poison. Driven through the router, not the helper in isolation.
+#[tokio::test]
+async fn entitlement_400_poisoned_lock_is_recovered_not_zeroed() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-aaa")]);
+    state.note_entitlement_400("spent");
+    {
+        let state = state.clone();
+        std::thread::spawn(move || {
+            let _g = state.entitlement_400.lock().unwrap();
+            panic!("deliberate: poison the entitlement-400 counter mutex");
+        })
+        .join()
+        .unwrap_err();
+    }
+    assert!(state.entitlement_400.is_poisoned());
+
+    let addr = serve(build_router(state.clone())).await;
+    let m = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        m.contains(r#"anthropic_entitlement_400_total{account="spent"} 1"#),
+        "/metrics must publish the real count through a poisoned lock:\n{m}"
+    );
+
+    // The render must clear the poison, or the `if let Ok` increment keeps
+    // skipping and the series freezes here for the life of the process.
+    state.note_entitlement_400("spent");
+    assert_eq!(state.entitlement_400.lock().unwrap().get("spent"), Some(&2));
 }

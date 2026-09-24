@@ -394,13 +394,16 @@ can steer are locked down by default:
   `anthropic-beta` values outside `allowed_client_betas` are dropped before
   forwarding, logged at `warn`, and counted in
   `anthropic_beta_flag_dropped_total{flag}`. The built-in default covers the
-  flags the proxy itself needs, the flag families Claude Code sends, and
-  `fast-mode-*`; the authoritative list is `DEFAULT_CLIENT_BETA_ALLOWLIST`
-  in `src/main.rs`. Some families pair with a request-body field (`fast-mode-*`
-  with top-level `speed: "fast"`; the auto-mode classifier pair
-  `dangerous-tool-use-*` + `auto-mode-classifier-*` with top-level
-  `safeguards`), and the body is forwarded verbatim — so dropping the header
-  alone is a hard upstream `400`, not a quiet downgrade.
+  flags the proxy itself needs and the flag families Claude Code sends; the
+  authoritative list is `DEFAULT_CLIENT_BETA_ALLOWLIST` in `src/main.rs`.
+  Some families pair with a request-body field, and the body is forwarded
+  verbatim — so dropping the header alone is a hard upstream `400`, not a
+  quiet downgrade:
+  - `fast-mode-*` ↔ top-level `speed: "fast"`
+  - `dangerous-tool-use-*` + `auto-mode-classifier-*` ↔ top-level `safeguards`
+  - `mid-conversation-tool-changes-*`, `per-turn-control-*`, `timing-*` ↔
+    `tool_addition`/`tool_removal` blocks and `output_config.effort`/`timing`
+    on the `role: "system"` entry in `messages`
 - **A fast-mode `429` is forwarded to the caller, not treated as account
   exhaustion.** Fast mode (`speed: "fast"`) bills against its own rate bucket,
   separate from the account's 5h/7d windows, so a `429` on a fast request does
