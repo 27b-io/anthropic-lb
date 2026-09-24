@@ -20396,6 +20396,11 @@ fn oauth_beta_filter_keeps_claude_code_flag_set() {
         // body-paired (`safeguards`). Not in the 2.1.220 inventory.
         "auto-mode-classifier-2026-07-16",
         "dangerous-tool-use-2026-09-03",
+        // LAB-3964: per-turn family (2.1.278), body-paired — see
+        // DEFAULT_CLIENT_BETA_ALLOWLIST.
+        "mid-conversation-tool-changes-2026-07-01",
+        "per-turn-control-2026-07-01",
+        "timing-2026-09-09",
     ];
     // Negative control: the point of the allow-list is that it still rejects.
     // Without this, widening the default to "*" would keep the test green.
@@ -20578,11 +20583,11 @@ async fn dropped_beta_flag_appears_in_metrics() {
     );
 }
 
-/// LAB-3963: the auto-mode classifier betas and their `safeguards` body must
-/// reach the upstream together through the real OAuth path (which
-/// re-serialises the body) — see `DEFAULT_CLIENT_BETA_ALLOWLIST` for why.
-#[tokio::test]
-async fn oauth_forwards_auto_mode_classifier_header_and_safeguards_body_together() {
+/// Body-paired beta families must reach the upstream header AND body together
+/// through the real OAuth path (which re-serialises the body) — see
+/// `DEFAULT_CLIENT_BETA_ALLOWLIST` for why. Asserts every flag is forwarded
+/// as an exact token and `must_contain` survives in the body byte-identical.
+async fn assert_oauth_forwards_betas_with_body(flags: &[&str], body: String, must_contain: &str) {
     let (upstream_url, mut seen) =
         spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
     let state = Arc::new(AppState {
@@ -20595,20 +20600,10 @@ async fn oauth_forwards_auto_mode_classifier_header_and_safeguards_body_together
         ..test_state_base()
     });
     let addr = serve(build_router(state)).await;
-
-    // Compact JSON, as Claude Code sends it: the value must survive
-    // byte-for-byte whether the body is forwarded raw or re-serialised.
-    let safeguards = r#"[{"type":"dangerous_tool_use","classifier_context":"rm -rf ./build"}]"#;
-    let body = format!(
-        r#"{{"model":"test","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}],"safeguards":{safeguards}}}"#
-    );
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .header("content-type", "application/json")
-        .header(
-            "anthropic-beta",
-            "auto-mode-classifier-2026-07-16,dangerous-tool-use-2026-09-03",
-        )
+        .header("anthropic-beta", flags.join(","))
         .body(body)
         .send()
         .await
@@ -20618,20 +20613,58 @@ async fn oauth_forwards_auto_mode_classifier_header_and_safeguards_body_together
     let (headers, bytes) = seen.recv().await.expect("upstream must have been hit once");
     let sent = headers.get("anthropic-beta").unwrap().to_str().unwrap();
     let tokens: Vec<&str> = sent.split(',').map(str::trim).collect();
-    for flag in [
-        "auto-mode-classifier-2026-07-16",
-        "dangerous-tool-use-2026-09-03",
-    ] {
+    for flag in flags {
         assert!(
-            tokens.contains(&flag),
+            tokens.contains(flag),
             "beta not forwarded as an exact token: {flag} (sent: {sent})"
         );
     }
     let raw = std::str::from_utf8(&bytes).unwrap();
     assert!(
-        raw.contains(&format!(r#""safeguards":{safeguards}"#)),
-        "safeguards must reach the upstream byte-identical:\n{raw}"
+        raw.contains(must_contain),
+        "body must reach the upstream byte-identical:\n{raw}"
     );
+}
+
+/// LAB-3963: auto-mode classifier pair ↔ top-level `safeguards`.
+#[tokio::test]
+async fn oauth_forwards_auto_mode_classifier_header_and_safeguards_body_together() {
+    // Compact JSON, as Claude Code sends it.
+    let safeguards = r#"[{"type":"dangerous_tool_use","classifier_context":"rm -rf ./build"}]"#;
+    let body = format!(
+        r#"{{"model":"test","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}],"safeguards":{safeguards}}}"#
+    );
+    assert_oauth_forwards_betas_with_body(
+        &[
+            "auto-mode-classifier-2026-07-16",
+            "dangerous-tool-use-2026-09-03",
+        ],
+        body,
+        &format!(r#""safeguards":{safeguards}"#),
+    )
+    .await;
+}
+
+/// LAB-3964: per-turn family ↔ a `role:"system"` entry in `messages` carrying
+/// `tool_addition` blocks and `output_config` with `effort` + `timing`. Unlike
+/// the top-level `safeguards` key above, this pairing sits INSIDE `messages`,
+/// which the auto-cache path mutates — so it gets its own byte-identical check.
+#[tokio::test]
+async fn oauth_forwards_per_turn_betas_header_and_system_entry_body_together() {
+    let system_entry = r#"{"role":"system","content":[{"type":"tool_addition","tool":{"type":"tool_reference","name":"mcp__x__y"}}],"output_config":{"effort":"high","timing":{"type":"now","now":"2026-09-20T10:00:00+10:00"}}}"#;
+    let body = format!(
+        r#"{{"model":"test","max_tokens":1,"messages":[{{"role":"user","content":"hi"}},{system_entry}]}}"#
+    );
+    assert_oauth_forwards_betas_with_body(
+        &[
+            "mid-conversation-tool-changes-2026-07-01",
+            "per-turn-control-2026-07-01",
+            "timing-2026-09-09",
+        ],
+        body,
+        system_entry,
+    )
+    .await;
 }
 
 /// Panel follow-up (LAB-1191): a client flag that IS one of the required
@@ -22979,7 +23012,7 @@ async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(state.auth_failures.lock().unwrap().get("proxy"), Some(&5));
+    assert_eq!(state.auth_failures.lock().unwrap().values().sum::<u64>(), 5);
 }
 
 /// Successful traffic below the limit also leaves the shared IP's failure
@@ -23055,21 +23088,33 @@ fn resolve_client_ip_canonicalizes_v4_mapped_peer() {
     );
 }
 
-/// `anthropic_auth_failures_total{route}` is scrape-visible (AC-11).
+/// `anthropic_auth_failures_total{route,cred}` is scrape-visible (LAB-1192
+/// AC-11, LAB-4720 AC-2): a wrong key on the admin surface and a Bearer-only
+/// caller on the native surface (the OpenAI-SDK misconfiguration) land on
+/// distinct, fixed-vocabulary series.
 #[tokio::test]
-async fn metrics_expose_auth_failures_by_route() {
+async fn metrics_expose_auth_failures_by_route_and_cred() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let (app, _state) = admin_matrix_app(&mock_url);
     let addr = serve(app).await;
     let client = Client::new();
 
-    // One failure on the stats route.
+    // One failure on the stats route, key in the right header.
     let _ = client
         .get(format!("http://{addr}/_stats"))
         .header("x-api-key", "key-wrong")
         .send()
         .await
         .unwrap();
+    // One on the proxy route: a valid key, but in the wrong header.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("authorization", "Bearer key-geo")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     let body = client
         .get(format!("http://{addr}/metrics"))
@@ -23080,9 +23125,79 @@ async fn metrics_expose_auth_failures_by_route() {
         .text()
         .await
         .unwrap();
-    assert!(
-        body.contains("anthropic_auth_failures_total{route=\"stats\"} 1"),
-        "missing auth-failure counter in:\n{body}"
+    for line in [
+        "anthropic_auth_failures_total{route=\"stats\",cred=\"x-api-key\"} 1",
+        "anthropic_auth_failures_total{route=\"proxy\",cred=\"bearer\"} 1",
+    ] {
+        assert!(body.contains(line), "missing `{line}` in:\n{body}");
+    }
+}
+
+/// LAB-4720 AC-1: a rejection is attributable beyond the source IP. The
+/// header shape separates "no key", "key in the wrong header" and "wrong
+/// key"; the fingerprint is 12 hex chars, never a run of the key, and
+/// matches the README recipe (`hashlib.blake2s(tag + key).hexdigest()[:12]`);
+/// the user-agent is clipped.
+#[test]
+fn rejected_credential_shape_fingerprint_and_user_agent() {
+    assert_eq!(presented_credential(&hdrs(&[])).0, "none");
+    assert_eq!(
+        presented_credential(&hdrs(&[("x-api-key", "k")])).0,
+        "x-api-key"
+    );
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "Bearer k")])).0,
+        "bearer"
+    );
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "Basic dXNlcjpwdw==")])).0,
+        "auth-other"
+    );
+    // auth-other is labelled but never fingerprinted — no bare credential
+    // to hash, and the README recipe can't reproduce a scheme-prefixed hash.
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "Basic dXNlcjpwdw==")])).1,
+        None
+    );
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "bearer k")])).0,
+        "bearer"
+    );
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "Bearer")])).0,
+        "auth-other"
+    );
+    // Both headers: x-api-key is the one compared first, so it names the shape.
+    assert_eq!(
+        presented_credential(&hdrs(&[("x-api-key", "k"), ("authorization", "bearer k")])).0,
+        "x-api-key"
+    );
+
+    let key = "stale-client-key-0123456789abcdefghijklmnopqrstuvwxyz";
+    let fp = credential_fingerprint(Some(key.as_bytes()));
+    assert_eq!(fp, "67baf0920d1c", "must match the README recipe");
+    assert!(!key.contains(&fp), "fingerprint leaked a run of the key");
+    assert_eq!(credential_fingerprint(None), "-");
+    // The README recipe hashes the bare key, so the Bearer scheme must be
+    // stripped: `presented_credential` hands back the key alone.
+    let bearer = hdrs(&[("authorization", format!("Bearer {key}").as_str())]);
+    assert_eq!(presented_credential(&bearer).1, Some(key.as_bytes()));
+
+    assert_eq!(bounded_user_agent(&hdrs(&[])), "-");
+    assert_eq!(bounded_user_agent(&hdrs(&[("user-agent", "")])), "-");
+    let mut obs_text = hyper::HeaderMap::new();
+    obs_text.insert("user-agent", HeaderValue::from_bytes(b"agent\xff").unwrap());
+    assert_eq!(bounded_user_agent(&obs_text), "-", "not visible ASCII");
+    assert_eq!(
+        bounded_user_agent(&hdrs(&[("user-agent", "curl/8.5.0")])),
+        "curl/8.5.0"
+    );
+    let long = "x".repeat(300);
+    let ua = bounded_user_agent(&hdrs(&[("user-agent", long.as_str())]));
+    assert_eq!(
+        ua.chars().count(),
+        MAX_LABEL_CHARS + 1,
+        "clipped + ellipsis"
     );
 }
 
