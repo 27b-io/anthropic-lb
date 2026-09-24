@@ -16929,10 +16929,11 @@ async fn guard_block_forwards_conversation_without_user_turn() {
 /// LAB-4358: `guard_hook` against every `ScanOutcome` under every policy,
 /// called directly. The tables above pin rejection vs forwarding through the
 /// handlers; what only this pins is the fail-closed LOG, emitted under every
-/// policy (`would-block` when the policy does not enforce) so shadow mode can
-/// size a `block` rollout. `Guard::empty()` suffices: the log fires before
-/// `evaluate`, and a scanner-less guard never blocks, so every rejection seen
-/// here comes from the fail-closed path.
+/// policy (`would-block` at INFO when the policy does not enforce, `block` at
+/// WARN when it does) so shadow mode can size a `block` rollout.
+/// `Guard::empty()` suffices: the log fires before `evaluate`, and a
+/// scanner-less guard never blocks, so every rejection seen here comes from
+/// the fail-closed path.
 #[cfg(feature = "guard")]
 #[test]
 fn guard_hook_logs_fail_closed_cause_under_every_policy() {
@@ -16993,14 +16994,17 @@ fn guard_hook_logs_fail_closed_cause_under_every_policy() {
                 );
                 continue;
             };
-            let verdict = if blocks {
-                r#"verdict="block""#
+            let (level, verdict) = if blocks {
+                (" WARN ", r#"verdict="block""#)
             } else {
-                r#"verdict="would-block""#
+                (" INFO ", r#"verdict="would-block""#)
             };
             assert!(
-                lines.len() == 1 && lines[0].contains(verdict) && lines[0].contains(cause),
-                "{req_id}: expected one {verdict} line naming the cause, got {lines:?}"
+                lines.len() == 1
+                    && lines[0].contains(level)
+                    && lines[0].contains(verdict)
+                    && lines[0].contains(cause),
+                "{req_id}: expected one{level}{verdict} line naming the cause, got {lines:?}"
             );
         }
     }

@@ -2298,16 +2298,29 @@ impl AppState {
             // `block`; a fail-closed cause that only logs once it is already
             // rejecting makes the one number they need unmeasurable until the
             // outage. `would-block` is the same event `block` would reject on.
-            warn!(
+            //
+            // Only `block` is a WARN: it is rejecting traffic. `would-block` is
+            // shadow telemetry, and unconfigured clients default to `annotate`,
+            // so every oversized tool-result turn would otherwise raise a
+            // warning nobody needs to act on. INFO is the production default
+            // filter, so the rollout signal still ships.
+            if policy == guard::GuardPolicy::Block {
+                warn!(
+                    req_id,
+                    client_id = %client_id,
+                    verdict = "block",
+                    reason,
+                    "guard: unscannable request"
+                );
+                return Err(Box::new(guard_blocked_response(&[], reason, openai_shape)));
+            }
+            info!(
                 req_id,
                 client_id = %client_id,
-                verdict = if policy == guard::GuardPolicy::Block { "block" } else { "would-block" },
+                verdict = "would-block",
                 reason,
                 "guard: unscannable request"
             );
-            if policy == guard::GuardPolicy::Block {
-                return Err(Box::new(guard_blocked_response(&[], reason, openai_shape)));
-            }
         }
         let (verdict, findings, reason) = match self.guard.evaluate(policy, client_id, input) {
             guard::Verdict::Allow => return Ok(None),
