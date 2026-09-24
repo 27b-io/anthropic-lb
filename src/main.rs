@@ -373,6 +373,10 @@ struct RedisRateInfo {
 
 #[derive(Default)]
 struct RateLimitInfo {
+    /// Set once this account has refused a claim key for being over
+    /// `MAX_CLAIMS_PER_ACCOUNT`, so the WARN is emitted once per process rather
+    /// than once per request. Runtime-only: never persisted or synced.
+    claim_cap_warned: bool,
     remaining_requests: Option<u64>,
     remaining_tokens: Option<u64>,
     limit_requests: Option<u64>,
@@ -507,6 +511,17 @@ const MAX_TRACKED_CLIENTS: usize = 10_000;
 /// mirroring the LAB-2330 fix to `client_model_usage`).
 const MAX_MODEL_DENIED_LABELS: usize = 64;
 
+/// Cap on distinct clients in the pre-request-gate rejection counter
+/// (LAB-2551). Past the cap, rejections for NEW clients lump into a single
+/// global `_other` client key (never per-client overflow keys — the CWE-770
+/// shape), while already-tracked clients may still add entries under new
+/// reasons — a brake event stamps every active client at once, so crossing
+/// the cap mid-incident must not split a tracked client's attribution. The
+/// reason axis is a closed static set of 3, so entries are hard-bounded at
+/// 3 × (cap + 1). Real deployments have tens of clients; only caller-minted
+/// ids under legacy header auth can approach this.
+const MAX_CLIENT_REJECTION_LABELS: usize = 64;
+
 /// Cap on distinct (client, model) pairs in the per-model usage counter
 /// (LAB-2330). The model key is normally response-derived (upstream-validated),
 /// but the request-model fallback is caller-influenced and the client key is
@@ -531,6 +546,102 @@ fn truncate_label(s: &str) -> String {
     }
     let mut out: String = s.chars().take(MAX_LABEL_CHARS).collect();
     out.push('…');
+    out
+}
+
+/// Cap on distinct UNRESERVED 7d claim keys per account. Keys are minted from
+/// the upstream `representative-claim` header — never from client input, but
+/// still an unvalidated remote string, and each one becomes a permanent `claim`
+/// label on the `anthropic_claim_*` series (CWE-770). Reserved keys are exempt,
+/// so the hard bound per account is `MAX_CLAIMS_PER_ACCOUNT` + the reserved set.
+const MAX_CLAIMS_PER_ACCOUNT: usize = 32;
+
+/// Claim keys the cap must NEVER refuse: the four that gate all traffic plus the
+/// normalised Fable band. A compile-time-closed set, so exempting them costs a
+/// bounded five entries — and not exempting them is a routing hazard, not merely
+/// a lost metric. `effective_utilization` skips its flat-field fallback whenever
+/// `claims_7d` is non-empty, so an account whose map is full of unknown keys
+/// with `seven_day` refused derives NO weekly utilization at all: it would route
+/// as though it had no weekly limit, and drop out of the emergency brake's
+/// all-accounts-saturated test while sitting at 100%.
+fn claim_key_is_reserved(key: &str) -> bool {
+    claim_gates_all_traffic(key) || key == FABLE_BAND_CLAIM
+}
+
+/// Whether a 7d claim key may be stored for this account. Mirrors the
+/// `MAX_TRACKED_CLIENTS` admission rule — keys already present always pass, so
+/// live claims keep updating past the cap — with reserved keys exempt entirely.
+///
+/// Overflow is dropped rather than folded into an `_other` bucket the way the
+/// caller-labelled counters do it, because bucketing would buy nothing here:
+/// both routing lookups (`resolve_7d_claim`, `constraining_7d_claims`) match
+/// exact keys and the brake's input is allowlist-filtered, so an unknown key is
+/// already inert to routing. Reserving the keys that are NOT inert is what makes
+/// the cap safe; the bucket would only add a fake claim to the metrics.
+///
+/// Logged once per account: the refusal fires per request under a claim flood,
+/// so a per-refusal line would let an upstream drive unbounded log volume —
+/// the same exhaustion class the cap itself closes.
+fn claim_admitted(info: &mut RateLimitInfo, key: &str, account: &str) -> bool {
+    if claim_key_is_reserved(key) || info.claims_7d.contains_key(key) {
+        return true;
+    }
+    // Count UNRESERVED keys only, matching `bound_ingested_claims`. Counting the
+    // whole map would let the reserved keys eat the budget, so an account
+    // carrying all five would admit 27 unknown claims rather than the
+    // documented 32 — and the live path would then disagree with the ingest
+    // path about the same bound. The map is at most 37 entries, so the scan is
+    // cheaper than the allocation it avoids.
+    let unreserved = info
+        .claims_7d
+        .keys()
+        .filter(|k| !claim_key_is_reserved(k))
+        .count();
+    if unreserved < MAX_CLAIMS_PER_ACCOUNT {
+        return true;
+    }
+    if !info.claim_cap_warned {
+        info.claim_cap_warned = true;
+        warn!(
+            account,
+            claim = key,
+            cap = MAX_CLAIMS_PER_ACCOUNT,
+            "claim cap reached; refusing unknown 7d claim keys for this account \
+             (routing-relevant keys are still admitted)"
+        );
+    }
+    false
+}
+
+/// Apply the key bound to a claims map that arrived whole rather than through
+/// the header parser — the persisted state file and the Redis mirror both
+/// assign `claims_7d` outright. Without this the bound holds only on the live
+/// path, and a state file written by a pre-cap build (or a peer replica still
+/// running one) restores an unbounded, untruncated map that `contains_key` then
+/// lets every junk key keep updating forever.
+///
+/// Reserved keys always survive. The rest are kept in sorted order so every
+/// replica and every restart retains the same subset rather than a
+/// HashMap-iteration-order lottery.
+fn bound_ingested_claims(
+    claims: HashMap<String, ClaimWindowData>,
+) -> HashMap<String, ClaimWindowData> {
+    let mut out: HashMap<String, ClaimWindowData> = claims
+        .into_iter()
+        .map(|(k, v)| (truncate_label(&k), v))
+        .collect();
+    let mut unreserved: Vec<String> = out
+        .keys()
+        .filter(|k| !claim_key_is_reserved(k))
+        .cloned()
+        .collect();
+    if unreserved.len() <= MAX_CLAIMS_PER_ACCOUNT {
+        return out;
+    }
+    unreserved.sort_unstable();
+    for key in unreserved.into_iter().skip(MAX_CLAIMS_PER_ACCOUNT) {
+        out.remove(&key);
+    }
     out
 }
 const TAU_6H: f64 = 21600.0;
@@ -571,8 +682,15 @@ impl BurnRate {
 const DEFAULT_EMERGENCY_THRESHOLD: f64 = 0.88;
 
 /// Claude Code system prompt required by the Anthropic API for OAuth tokens (sk-ant-oat*)
-/// to access sonnet/opus models. Must be the FIRST system block in the request.
+/// to access sonnet/opus models. Any position in the `system` array satisfies the upstream;
+/// it is inserted at index 0 unless a Claude Code attribution block already holds that slot.
 const OAUTH_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Prefix of the attribution block Claude Code sends as `system[0]` (client version +
+/// conversation fingerprint). The upstream strips it only when it arrives unchanged at
+/// index 0, so anything the proxy inserts must go AFTER it — otherwise the block reaches
+/// the model and the prompt-cache key.
+const ATTRIBUTION_BLOCK_PREFIX: &str = "x-anthropic-billing-header:";
 
 /// Max bytes of 429 response body to include in debug logs.
 const MAX_429_BODY_LOG_BYTES: usize = 512;
@@ -862,9 +980,15 @@ struct AppState {
     /// `body_read_timeout`. Exposed as `anthropic_body_read_timeout_total`.
     body_read_timeout_total: AtomicU64,
     /// Affinity overrides that migrated a session, indexed by `AffinityBind`
-    /// (the window that bound the sticky account). Exposed as
-    /// `anthropic_affinity_migrations_total{reason="loaded"|"spent"}`.
-    affinity_migrations: [AtomicU64; 2],
+    /// (what bound the sticky account). Exposed as
+    /// `anthropic_affinity_migrations_total{reason="loaded"|"spent"|"floored"}`.
+    affinity_migrations: [AtomicU64; 3],
+    /// Client-facing pool-exhaustion responses, indexed by `PoolExhaustion`.
+    /// Exposed as `anthropic_pool_exhausted_total{kind="rate_limited"|"transient"}`.
+    /// The only metric trace of the 429/503 a caller actually received when the
+    /// whole pool was unavailable (LAB-4189) — before this, exhaustion existed
+    /// solely as a `warn!` line, so there was nothing to graph or alert on.
+    pool_exhausted: [AtomicU64; 2],
     /// Reflect upstream `anthropic-ratelimit-*` headers to callers (see
     /// `Config::expose_upstream_ratelimit_headers`). Default: false.
     expose_upstream_ratelimit_headers: bool,
@@ -907,6 +1031,14 @@ struct AppState {
     /// single global ("_other", "_other") bucket, hard-bounding the map at
     /// `MAX_MODEL_DENIED_LABELS` + 1 entries (LAB-2332).
     model_denied: Mutex<HashMap<(String, String), u64>>,
+    /// Pre-request-gate 429 rejections, keyed (client, reason) (LAB-2551).
+    /// Exposed as `anthropic_client_rejections_total`. `reason` is the closed
+    /// static set budget / utilization / brake — the three capacity denials in
+    /// `pre_request_gate`; 403 policy denials stay on `model_denied`. `client`
+    /// is caller-controlled under legacy header auth, so it is truncated and
+    /// the map is bounded via a global `_other` overflow
+    /// (`MAX_CLIENT_REJECTION_LABELS`).
+    client_rejections: Mutex<HashMap<(String, &'static str), u64>>,
     /// (endpoint idx, model) pairs an upstream rejected as unsupported — a
     /// gateway without the model, or a plan without access (LAB-941).
     /// `routing_candidates` skips these until the entry expires; because
@@ -1078,6 +1210,11 @@ struct RoutingCandidate {
     /// never `wr`/`weight` (see `affinity_headroom`).
     unused_7d: f64,
     weight: f64,
+    /// The effective `gate` is set by an Anthropic status floor
+    /// (`status_to_floor`) that exceeds raw utilisation, not by raw load or
+    /// overage. Drives `affinity_headroom`'s `Floored` classification so a
+    /// routine status-floor migration logs at INFO, not WARN (LAB-3295).
+    gate_floor_bound: bool,
     source: &'static str,
 }
 
@@ -2125,20 +2262,26 @@ impl AppState {
     /// secret" bypass). A body that parsed but carried no scannable text (e.g.
     /// an image-only turn) is NOT a scan failure and is allowed. Annotate /
     /// shadow mode never rejects — it measures best-effort.
+    ///
+    /// `unscannable` carries its own reason because the causes are not alike:
+    /// the body that did not parse and the body whose `messages` is the wrong
+    /// shape both reach here, and telling a client the second was a parse
+    /// failure sends whoever debugs it after a JSON syntax error that is not
+    /// there. Reasons are `&'static str` — no request content may enter them.
     #[cfg(feature = "guard")]
     fn guard_hook(
         &self,
         req_id: &str,
         client_id: &str,
-        unscannable: bool,
+        unscannable: Option<&'static str>,
         input: Option<&guard::ScanInput>,
         openai_shape: bool,
     ) -> Result<Option<usize>, Box<Response>> {
         let policy = self.client_guard_policy(client_id);
         let truncated = input.is_some_and(guard::ScanInput::truncated);
         if policy == guard::GuardPolicy::Block {
-            let reason = if unscannable {
-                Some("request body could not be parsed for content scanning")
+            let reason = if let Some(reason) = unscannable {
+                Some(reason)
             } else if truncated {
                 Some("request exceeds the guard scan limit and cannot be scanned in full")
             } else {
@@ -2229,6 +2372,38 @@ impl AppState {
                 "rejected: model not in client allow-list"
             );
         }
+    }
+
+    /// Count a pre-request-gate 429 rejection (LAB-2551).
+    ///
+    /// `client_id` is truncated before becoming a map key (caller-controlled
+    /// under legacy header auth), and past `MAX_CLIENT_REJECTION_LABELS`
+    /// distinct clients NEW clients lump into the single global `_other` key
+    /// — keeping the reason label so overflow traffic still charts by cause.
+    /// Callers already log the rejection; this only feeds `/metrics`.
+    fn note_client_rejection(&self, client_id: &str, reason: &'static str) {
+        let Ok(mut counts) = self.client_rejections.lock() else {
+            return;
+        };
+        let key = (truncate_label(client_id), reason);
+        // Tracked = the CLIENT has any entry, not this exact (client, reason)
+        // pair: a tracked client's first rejection under a new reason must
+        // not fall to `_other` just because the cap was crossed in between.
+        // The cap likewise bounds distinct CLIENTS, not (client, reason)
+        // entries — one client on all 3 reasons must burn one slot, not
+        // three. O(cap) scans, only on the rejection path.
+        let tracked = counts.keys().any(|(c, _)| *c == key.0);
+        let distinct_clients = counts
+            .keys()
+            .map(|(c, _)| c.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let key = if tracked || distinct_clients < MAX_CLIENT_REJECTION_LABELS {
+            key
+        } else {
+            ("_other".to_owned(), reason)
+        };
+        *counts.entry(key).or_insert(0) += 1;
     }
 
     /// Resolve client identity: x-client-id header → IP map fallback → "-"
@@ -2771,7 +2946,11 @@ impl AppState {
                 info.utilization = pa.utilization;
                 info.utilization_7d = pa.utilization_7d;
                 info.utilization_5h = pa.utilization_5h;
-                info.representative_claim = pa.representative_claim.clone();
+                // Truncated alongside the claim map below: `metrics_gate_weight`
+                // looks this key up in `claims_7d`, whose keys
+                // `bound_ingested_claims` truncates, so an untruncated copy
+                // would miss its own entry (same reason as the header path).
+                info.representative_claim = pa.representative_claim.as_deref().map(truncate_label);
                 info.reset_5h = pa.reset_5h;
                 info.status_5h = pa.status_5h.clone();
                 info.overage_in_use = pa.overage_in_use;
@@ -2782,15 +2961,15 @@ impl AppState {
 
                 // Load claims_7d: either from persisted map or migrate from flat fields
                 if !pa.claims_7d.is_empty() {
-                    info.claims_7d = pa.claims_7d.clone();
+                    info.claims_7d = bound_ingested_claims(pa.claims_7d.clone());
                 } else if let Some(util_7d) = pa.utilization_7d {
                     // Migration: old state file with flat 7d fields only
-                    let key = pa
-                        .representative_claim
-                        .as_deref()
-                        .filter(|c| c.starts_with("seven_day"))
-                        .unwrap_or("seven_day")
-                        .to_string();
+                    let key = truncate_label(
+                        pa.representative_claim
+                            .as_deref()
+                            .filter(|c| c.starts_with("seven_day"))
+                            .unwrap_or("seven_day"),
+                    );
                     info.claims_7d.insert(
                         key,
                         ClaimWindowData {
@@ -3169,19 +3348,51 @@ const STICKY_WEIGHTED_OVERRIDE_RATIO: f64 = 0.25;
 /// `AppState::affinity_migrations`.
 #[derive(Clone, Copy)]
 enum AffinityBind {
-    /// The effective gate (5h utilisation, status floors, overage) is tighter.
+    /// The effective gate is tighter, bound by raw (time-adjusted) 5h
+    /// utilisation or overage — the pool is the bottleneck (operator-actionable).
     Loaded = 0,
-    /// Unused weekly quota is tighter.
+    /// Unused weekly quota is tighter — one account's week is nearly spent.
     Spent = 1,
+    /// The gate is tighter, but set by an Anthropic status floor
+    /// (`status_to_floor`) that exceeds raw utilisation — the LB is moving the
+    /// session off an account Anthropic flagged, onto fresh capacity. Routine,
+    /// not a pool-health signal: logged at INFO, not WARN (LAB-3295).
+    Floored = 2,
 }
 
 impl AffinityBind {
-    const ALL: [Self; 2] = [Self::Loaded, Self::Spent];
+    const ALL: [Self; 3] = [Self::Loaded, Self::Spent, Self::Floored];
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Loaded => "loaded",
             Self::Spent => "spent",
+            Self::Floored => "floored",
+        }
+    }
+}
+
+/// Why the proxy gave up on the whole pool and answered the caller itself.
+/// Label value of `anthropic_pool_exhausted_total{kind}`; also indexes
+/// `AppState::pool_exhausted`. Closed by the type system, so this counter's
+/// label set cannot grow.
+#[derive(Clone, Copy)]
+enum PoolExhaustion {
+    /// Every endpoint was rate-limited or gated (or a round saw a 529) — the
+    /// `429 exhausted all endpoints` arm. Recovery is minutes-to-hours.
+    RateLimited = 0,
+    /// Every endpoint failed in transport with no 529 — the retryable
+    /// `503 + Retry-After` arm.
+    Transient = 1,
+}
+
+impl PoolExhaustion {
+    const ALL: [Self; 2] = [Self::RateLimited, Self::Transient];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate_limited",
+            Self::Transient => "transient",
         }
     }
 }
@@ -3197,6 +3408,12 @@ fn affinity_headroom(c: &RoutingCandidate) -> (f64, AffinityBind) {
     let loaded = (1.0 - c.gate).max(0.0);
     if c.unused_7d < loaded {
         (c.unused_7d, AffinityBind::Spent)
+    } else if c.gate_floor_bound {
+        // Same headroom value as `Loaded` — routing decision unchanged — but a
+        // distinct reason so a status-floor-forced migration is not mistaken
+        // for pool exhaustion (LAB-3295). Only when the gate (not weekly quota)
+        // binds; a genuinely spent week is `Spent` above and stays WARN.
+        (loaded, AffinityBind::Floored)
     } else {
         (loaded, AffinityBind::Loaded)
     }
@@ -3439,13 +3656,11 @@ fn status_to_ordinal(status: Option<&str>) -> f64 {
         Some("throttled") => 2.0,
         Some("allowed_warning") => 1.0,
         Some("allowed") | None => 0.0,
-        Some(unknown) => {
-            warn!(
-                status = unknown,
-                "unknown rate-limit status in ordinal mapping"
-            );
-            1.0
-        }
+        // Unknown maps to the warning tier, silently: this is a read-only
+        // exposition helper called once per account per claim per scrape, and
+        // `status_to_floor` already WARNs on the same unknown string where it
+        // actually changes a routing decision.
+        Some(_) => 1.0,
     }
 }
 
@@ -3613,9 +3828,64 @@ struct RoutingWeight {
     /// See `RoutingCandidate::unused_7d`.
     unused_7d: f64,
     weight: f64,
+    /// See `RoutingCandidate::gate_floor_bound`.
+    gate_floor_bound: bool,
     source: &'static str,
     /// Account is serving via paid overage — caller demotes its priority tier.
     overage_active: bool,
+}
+
+/// 5h gate: time-adjusted 5h utilization with status floors, falling back to
+/// raw unified, legacy token ratio, or 0.5 (unknown). A fixed 0.5 while the
+/// account's data predates its last hard limit.
+///
+/// Shared by `compute_routing_weight` and `metrics_gate_weight` so the gate
+/// published on `/metrics` cannot drift from the one the router uses (LAB-4441).
+fn gate_5h(info: &RateLimitInfo, now_epoch: u64, stale_after_hard_limit: bool) -> f64 {
+    if stale_after_hard_limit {
+        return 0.5;
+    }
+    time_adjusted_utilization(
+        info.utilization_5h,
+        info.reset_5h,
+        info.status_5h.as_deref(),
+        NEAR_RESET_5H_SECS,
+        now_epoch,
+    )
+    .unwrap_or_else(|| {
+        if let Some(util) = info.utilization {
+            util
+        } else if let Some(remaining) = info.remaining_tokens {
+            let limit = info.limit_tokens.unwrap_or(1_000_000);
+            (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
+        } else {
+            0.5
+        }
+    })
+}
+
+/// Overage gate: `Some` iff the account is serving via paid overage, in which
+/// case this gate REPLACES the exhausted 5h/7d gates — the overage window
+/// governs, and a rejected subscription claim does not skip the account.
+/// `None` while overage is off or the data predates the last hard limit.
+///
+/// Shared by `compute_routing_weight` and `metrics_gate_weight` (LAB-4441:
+/// the metrics path lacked this branch and published gate 1.0 for accounts
+/// the router was actively serving through).
+fn overage_gate(info: &RateLimitInfo, now_epoch: u64, stale_after_hard_limit: bool) -> Option<f64> {
+    if !info.overage_in_use || stale_after_hard_limit {
+        return None;
+    }
+    Some(
+        time_adjusted_utilization(
+            info.overage_utilization,
+            info.overage_reset,
+            info.overage_status.as_deref(),
+            NEAR_RESET_OVERAGE_SECS,
+            now_epoch,
+        )
+        .unwrap_or(0.0),
+    )
 }
 
 fn compute_routing_weight(
@@ -3624,33 +3894,29 @@ fn compute_routing_weight(
     now_epoch: u64,
     stale_after_hard_limit: bool,
 ) -> Option<RoutingWeight> {
-    // Overage active: the account's exhausted subscription window is being covered
-    // by paid overage. The subscription gates are moot — the overage window governs.
-    let overage_active = info.overage_in_use && !stale_after_hard_limit;
+    let gate_overage = overage_gate(info, now_epoch, stale_after_hard_limit);
+    let overage_active = gate_overage.is_some();
 
-    // 5h gate: time-adjusted 5h utilization with status floors
-    let gate_5h = if stale_after_hard_limit {
-        0.5
-    } else {
-        time_adjusted_utilization(
+    let gate_5h = gate_5h(info, now_epoch, stale_after_hard_limit);
+
+    // Whether a status floor (`status_to_floor` inside `time_adjusted_utilization`)
+    // raised `gate_5h` above its raw time-adjusted utilisation. Compared against
+    // the ALREADY-computed `gate_5h` — not a second status-bearing call — so the
+    // two can't drift AND `status_to_floor` is evaluated only once: a duplicate
+    // status-bearing call would re-emit its unknown-status WARN, the very noise
+    // this ticket removes (CodeRabbit on #175). The floor-free call shares
+    // `gate_5h`'s inputs, so it is `None` exactly on `gate_5h`'s fallback path,
+    // where no floor applies → not floor-bound. False under staleness (gate is a
+    // fixed 0.5). Feeds `AffinityBind::Floored` (LAB-3295).
+    let gate_5h_floor_bound = !stale_after_hard_limit
+        && time_adjusted_utilization(
             info.utilization_5h,
             info.reset_5h,
-            info.status_5h.as_deref(),
+            None,
             NEAR_RESET_5H_SECS,
             now_epoch,
         )
-        .unwrap_or_else(|| {
-            // Fallback: raw unified, legacy, or unknown
-            if let Some(util) = info.utilization {
-                util
-            } else if let Some(remaining) = info.remaining_tokens {
-                let limit = info.limit_tokens.unwrap_or(1_000_000);
-                (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
-            } else {
-                0.5
-            }
-        })
-    };
+        .is_some_and(|unfloored| gate_5h > unfloored);
 
     // 7d model-specific gate and waste risk. For Fable both the band claim and
     // the general weekly claim constrain (headroom = min of the two remainders);
@@ -3709,18 +3975,9 @@ fn compute_routing_weight(
 
     // Effective gate: when overage is in use, the overage window governs — the
     // exhausted 5h/7d gates are superseded. waste_risk is moot for an overage account.
-    let (gate, wr, source) = if overage_active {
-        let gate_overage = time_adjusted_utilization(
-            info.overage_utilization,
-            info.overage_reset,
-            info.overage_status.as_deref(),
-            NEAR_RESET_OVERAGE_SECS,
-            now_epoch,
-        )
-        .unwrap_or(0.0);
-        (gate_overage, 0.0, "overage")
-    } else {
-        (gate_5h.max(gate_7d), wr_7d, source_7d)
+    let (gate, wr, source) = match gate_overage {
+        Some(g) => (g, 0.0, "overage"),
+        None => (gate_5h.max(gate_7d), wr_7d, source_7d),
     };
 
     // Weekly headroom for the affinity override (`affinity_headroom`): 1.0 when
@@ -3750,6 +4007,24 @@ fn compute_routing_weight(
         })
     };
 
+    // Floor-bound: the effective `gate` is set by an Anthropic status floor that
+    // exceeds raw utilisation, not by raw load or overage. Routine — Anthropic
+    // flagged the account and the LB is migrating the session off it — so the
+    // affinity override logs it at INFO, not a pool-health WARN (LAB-3295).
+    // The 7d gate is a pure status floor (`gate_of` forces util=0), so its
+    // winning over gate_5h (which is >= 0) means a non-zero floor bound the gate;
+    // the 5h case is `gate_5h_floor_bound`. Overage never floors (its gate comes
+    // from the overage window); staleness is already excluded by both terms.
+    //
+    // ponytail: `Floored` covers EVERY status floor, not just `allowed_warning`
+    // (0.80) — `throttled` (0.98) and `rejected` (1.0) too. That is intended
+    // (AC-1: "status_to_floor is non-zero and set the gate"): a `rejected`
+    // account has weight 0 so it is never the sticky pick and never reaches
+    // here, and a lone `throttled` account with a healthy alternative is the
+    // same single-account-flagged case, not pool exhaustion. If throttled/
+    // rejected migrations ever need to stay loud, split on the floor tier here.
+    let gate_floor_bound = !overage_active && (gate_7d > gate_5h || gate_5h_floor_bound);
+
     let headroom = (1.0 - gate).max(0.01);
     let weight = if wr > 0.0 { wr * headroom } else { headroom };
     let weight = if gate >= 1.0 { 0.0 } else { weight };
@@ -3760,6 +4035,7 @@ fn compute_routing_weight(
         gate,
         wr,
         unused_7d,
+        gate_floor_bound,
         weight,
         source,
         overage_active,
@@ -3951,6 +4227,7 @@ impl AppState {
                         wr: 0.0,
                         unused_7d: 1.0,
                         weight: 1.0,
+                        gate_floor_bound: false,
                         source: "openai",
                     });
                 }
@@ -4023,6 +4300,7 @@ impl AppState {
                         wr: rw.wr,
                         unused_7d: rw.unused_7d,
                         weight: rw.weight,
+                        gate_floor_bound: rw.gate_floor_bound,
                         source: rw.source,
                     });
                 }
@@ -4144,28 +4422,7 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
         .hard_limited_until
         .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
 
-    // 5h gate — same logic as routing_candidates
-    let gate_5h = if stale_after_hard_limit {
-        0.5
-    } else {
-        time_adjusted_utilization(
-            info.utilization_5h,
-            info.reset_5h,
-            info.status_5h.as_deref(),
-            NEAR_RESET_5H_SECS,
-            now_epoch,
-        )
-        .unwrap_or_else(|| {
-            if let Some(util) = info.utilization {
-                util
-            } else if let Some(remaining) = info.remaining_tokens {
-                let limit = info.limit_tokens.unwrap_or(1_000_000);
-                (1.0 - (remaining as f64 / limit as f64)).clamp(0.0, 1.0)
-            } else {
-                0.5
-            }
-        })
-    };
+    let gate_5h = gate_5h(info, now_epoch, stale_after_hard_limit);
 
     // 7d gate + waste_risk from a SINGLE representative ClaimWindowData
     // — utilization, reset and status are read as a coherent triple
@@ -4209,7 +4466,7 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
             })
     };
 
-    let (gate_7d, wr) = if let Some(claim) = representative {
+    let (gate_7d, wr_7d) = if let Some(claim) = representative {
         let g = if stale_after_hard_limit {
             0.5
         } else {
@@ -4230,7 +4487,12 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
         (g, 0.0)
     };
 
-    let gate = gate_5h.max(gate_7d);
+    // Overage supersedes the subscription gates exactly as in
+    // `compute_routing_weight`: the overage window governs, waste_risk is moot.
+    let (gate, wr) = match overage_gate(info, now_epoch, stale_after_hard_limit) {
+        Some(g) => (g, 0.0),
+        None => (gate_5h.max(gate_7d), wr_7d),
+    };
     let headroom = (1.0 - gate).max(0.01);
     let weight = if wr > 0.0 { wr * headroom } else { headroom };
     let weight = if gate >= 1.0 { 0.0 } else { weight };
@@ -4468,21 +4730,36 @@ impl AppState {
             let (picked_headroom, bind) = affinity_headroom(picked);
             let (other_headroom, _) = affinity_headroom(other);
             if picked_headroom < other_headroom * LEGACY_AFFINITY_OVERRIDE_RATIO {
+                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
                 // Loud on purpose — see the StickyWeightedV2 override below for
                 // the cascade rationale. Breaking affinity is a pool-health
-                // warning sign, not routine.
-                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    strategy = RoutingStrategy::DynamicCapacityV1.as_str(),
-                    affinity = affinity_key.unwrap_or("-"),
-                    reason = bind.as_str(),
-                    picked_account = self.endpoint_name(picked.endpoint),
-                    picked_headroom = format!("{:.3}", picked_headroom),
-                    other_account = self.endpoint_name(other.endpoint),
-                    other_headroom = format!("{:.3}", other_headroom),
-                    ratio = format!("{:.3}", picked_headroom / other_headroom),
-                    "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)"
-                );
+                // warning sign, NOT routine — EXCEPT when a status floor bound
+                // the sticky account (`Floored`): Anthropic flagged it and we're
+                // moving the session onto fresh capacity, which is what the
+                // floor exists for. That case logs at INFO (LAB-3295); the
+                // counter still records every migration by reason. The field set
+                // is identical across levels — only tracing's compile-time level
+                // forces the two arms — so it lives once in this local macro.
+                macro_rules! log_migration {
+                    ($lvl:ident, $msg:literal) => {
+                        $lvl!(
+                            strategy = RoutingStrategy::DynamicCapacityV1.as_str(),
+                            affinity = affinity_key.unwrap_or("-"),
+                            reason = bind.as_str(),
+                            picked_account = self.endpoint_name(picked.endpoint),
+                            picked_headroom = format!("{:.3}", picked_headroom),
+                            other_account = self.endpoint_name(other.endpoint),
+                            other_headroom = format!("{:.3}", other_headroom),
+                            ratio = format!("{:.3}", picked_headroom / other_headroom),
+                            $msg
+                        )
+                    };
+                }
+                if matches!(bind, AffinityBind::Floored) {
+                    log_migration!(info, "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)");
+                } else {
+                    log_migration!(warn, "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)");
+                }
                 picked = other;
             }
             // NOTE: Request-balance override intentionally disabled. The previous
@@ -4524,10 +4801,21 @@ impl AppState {
                 // (so the cache warms on the replacement and stays there) yet spread
                 // across sessions (distinct keys → distinct replacements), and
                 // independent of which account is momentarily `best`.
+                //
+                // "Healthy" = the override would not flee it: the negation of the
+                // trigger above. Excluding only `picked` let a 7d-spent account
+                // (gate-healthy, big expiring-quota bucket) replace an equally
+                // spent one, which answered the caller with Anthropic's
+                // entitlement 400 (LAB-4719). The floor also excludes `picked`.
+                // Never empty: `best` always clears it, and clearing it means
+                // headroom > 0, so gate < 1 and weight > 0. The `best` fallback
+                // below is therefore unreachable from routing_candidates; it
+                // stays as a guard, and it would still satisfy the floor.
+                let floor = best_headroom * STICKY_WEIGHTED_OVERRIDE_RATIO;
                 let remaining: Vec<&RoutingCandidate> = effective
                     .iter()
                     .copied()
-                    .filter(|c| c.endpoint != picked.endpoint)
+                    .filter(|c| affinity_headroom(c).0 >= floor)
                     .collect();
                 let remaining_weight: f64 = remaining.iter().map(|c| c.weight).sum();
                 let replacement = if remaining_weight > 0.0 {
@@ -4539,24 +4827,40 @@ impl AppState {
                 } else {
                     best
                 };
+                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
                 // Loud on purpose. Sustained breaking with reason="loaded" means
                 // the pool is the bottleneck — add capacity, don't tune the
                 // ratio. reason="spent" means one account's week is nearly gone
                 // while others are fresh; expect it to cluster before weekly
-                // resets and vanish after.
-                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    strategy = RoutingStrategy::StickyWeightedV2.as_str(),
-                    affinity = key,
-                    reason = bind.as_str(),
-                    picked_account = self.endpoint_name(picked.endpoint),
-                    picked_headroom = format!("{:.3}", picked_headroom),
-                    replacement_account = self.endpoint_name(replacement.endpoint),
-                    replacement_headroom = format!("{:.3}", affinity_headroom(replacement).0),
-                    best_account = self.endpoint_name(best.endpoint),
-                    ratio = format!("{:.3}", picked_headroom / best_headroom),
-                    "affinity broken: sticky endpoint out of headroom, migrating session to stable replacement"
-                );
+                // resets and vanish after. reason="floored" is neither: Anthropic
+                // put a status floor on the sticky account and we're moving the
+                // session onto fresh capacity — the floor doing its job, not a
+                // pool problem. It logs at INFO so the WARN stays a real signal
+                // (LAB-3295); the counter records all three. Field set is
+                // identical across levels — tracing's compile-time level forces
+                // the two arms — so it lives once in this local macro.
+                macro_rules! log_migration {
+                    ($lvl:ident, $msg:literal) => {
+                        $lvl!(
+                            strategy = RoutingStrategy::StickyWeightedV2.as_str(),
+                            affinity = key,
+                            reason = bind.as_str(),
+                            picked_account = self.endpoint_name(picked.endpoint),
+                            picked_headroom = format!("{:.3}", picked_headroom),
+                            replacement_account = self.endpoint_name(replacement.endpoint),
+                            replacement_headroom =
+                                format!("{:.3}", affinity_headroom(replacement).0),
+                            best_account = self.endpoint_name(best.endpoint),
+                            ratio = format!("{:.3}", picked_headroom / best_headroom),
+                            $msg
+                        )
+                    };
+                }
+                if matches!(bind, AffinityBind::Floored) {
+                    log_migration!(info, "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)");
+                } else {
+                    log_migration!(warn, "affinity broken: sticky endpoint out of headroom, migrating session to stable replacement");
+                }
                 picked = replacement;
             }
         }
@@ -4829,16 +5133,25 @@ impl AppState {
             .map(|s| s.to_string());
 
         if let Some(ref claim) = rep_claim {
-            info.representative_claim = Some(claim.clone());
+            // Truncated for the same reason as the claim key below, plus one of
+            // its own: `refresh_metrics_weights` looks this string up in the
+            // (now truncated) claims map, so an untruncated copy would miss its
+            // own entry and silently report a different claim than the router used.
+            info.representative_claim = Some(truncate_label(claim));
         }
 
         // Determine the claim key for 7d data storage.
         // If claim starts with "seven_day", use it verbatim (e.g., "seven_day_sonnet").
         // Otherwise default to "seven_day" (general bucket).
-        let claim_key_7d = rep_claim
-            .as_deref()
-            .filter(|c| c.starts_with("seven_day"))
-            .unwrap_or("seven_day");
+        // Truncated because the key outlives the response as a `claim` metric
+        // label — see `truncate_label`.
+        let claim_key_7d = truncate_label(
+            rep_claim
+                .as_deref()
+                .filter(|c| c.starts_with("seven_day"))
+                .unwrap_or("seven_day"),
+        );
+        let claim_key_7d = claim_key_7d.as_str();
 
         // Capture 5h utilization (flat — no per-model sub-budgets observed for 5h).
         // Track whether we got utilization for sticky status fix (Bug #1).
@@ -4860,10 +5173,19 @@ impl AppState {
         {
             if let Ok(s) = v.to_str() {
                 if let Ok(util) = s.parse::<f64>() {
-                    let entry = info.claims_7d.entry(claim_key_7d.to_string()).or_default();
-                    entry.utilization = Some(util.clamp(0.0, 1.0));
-                    entry.last_seen = now_epoch;
-                    true
+                    // The header parser's only growth point for `claims_7d`
+                    // (`bound_ingested_claims` covers the two wholesale assigns).
+                    // A refused key reports `false` because it stored nothing —
+                    // reporting parsed 7d utilization for data that was dropped
+                    // would be a lie to every consumer of that flag.
+                    if claim_admitted(&mut info, claim_key_7d, endpoint_name) {
+                        let entry = info.claims_7d.entry(claim_key_7d.to_string()).or_default();
+                        entry.utilization = Some(util.clamp(0.0, 1.0));
+                        entry.last_seen = now_epoch;
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
@@ -5400,8 +5722,11 @@ impl AppState {
                             info.reset_7d = remote.reset_7d;
                             info.status_5h = remote.status_5h;
                             info.status_7d = remote.status_7d;
-                            info.claims_7d = remote.claims_7d;
-                            info.representative_claim = remote.representative_claim;
+                            info.claims_7d = bound_ingested_claims(remote.claims_7d);
+                            // Truncated to match the keys `bound_ingested_claims`
+                            // just wrote — see the same pairing in `load_state`.
+                            info.representative_claim =
+                                remote.representative_claim.as_deref().map(truncate_label);
                             info.remaining_requests = remote.remaining_requests;
                             info.remaining_tokens = remote.remaining_tokens;
                             info.limit_requests = remote.limit_requests;
@@ -5628,7 +5953,16 @@ impl AppState {
         // walking the keyspace against a backend that is already slow. A
         // manual cursor loop keeps each page under the ordinary 2s command
         // budget and genuinely ends the scan when this function returns.
-        let mut replicas = 0u64;
+        //
+        // The count is the *cardinality* of the matched keys, not the sum of
+        // page lengths: SCAN guarantees only that a key present for the whole
+        // iteration comes back at least once, and is explicitly allowed to
+        // return it on more than one page, so summing was wrong by
+        // construction. Latent rather than observed (LAB-4554): a scan of the
+        // live store returned one page of distinct, independently-refreshed
+        // ids, so the reported count was right. It stops being one page as
+        // soon as the keyspace outgrows `COUNT`.
+        let mut heartbeats: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut cursor = String::from("0");
         loop {
             let result: Result<(String, Vec<String>), fred::error::RedisError> = redis
@@ -5649,7 +5983,7 @@ impl AppState {
                 .await;
             match result {
                 Ok((next_cursor, keys)) => {
-                    replicas += keys.len() as u64;
+                    heartbeats.extend(keys);
                     cursor = next_cursor;
                     if cursor == "0" {
                         break;
@@ -5662,6 +5996,7 @@ impl AppState {
                 }
             }
         }
+        let replicas = heartbeats.len() as u64;
 
         // Aggregate budget usage from Redis (batch MGET). The same fetch
         // re-seeds this replica's local `budget_usage` mirror (LAB-3217) —
@@ -7204,6 +7539,7 @@ impl AppState {
 
         // 1. Daily token budget (existing)
         if client_id != "-" && self.check_budget(client_id).await.is_err() {
+            self.note_client_rejection(client_id, "budget");
             warn!(client_id = %client_id, "rejected: daily token budget exceeded");
             return Err(Box::new(
                 (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response(),
@@ -7212,6 +7548,7 @@ impl AppState {
 
         // 2. Utilization limit (new)
         if let Err(retry_after) = self.check_utilization_limit(client_id, model).await {
+            self.note_client_rejection(client_id, "utilization");
             warn!(
                 client_id = %client_id,
                 retry_after = retry_after,
@@ -7231,6 +7568,7 @@ impl AppState {
 
         // 3. Emergency brake (new)
         if self.is_emergency_brake_active().await {
+            self.note_client_rejection(client_id, "brake");
             warn!(
                 client_id = %client_id,
                 "rejected: emergency brake active"
@@ -7250,8 +7588,10 @@ impl AppState {
 
 // ── OAuth system prompt injection ──────────────────────────────────
 
-/// Check whether the request body already contains the OAuth system prompt
-/// as a prefix of the first system block (string or array form).
+/// Check whether the request body already contains the OAuth system prompt:
+/// as a prefix of the `system` string, or as a prefix of ANY block in the
+/// `system` array. The whole array is scanned because Claude Code puts its
+/// attribution block first and the identity prompt after it.
 fn has_oauth_system_prompt(body: &serde_json::Value) -> bool {
     match body.get("system") {
         Some(system) if system.is_string() => system
@@ -7271,16 +7611,18 @@ fn has_oauth_system_prompt(body: &serde_json::Value) -> bool {
     }
 }
 
-/// Inject the Claude Code system prompt as the first system block.
+/// Inject the Claude Code system prompt into the `system` array.
 ///
-/// OAuth tokens (sk-ant-oat*) require this exact prompt as the first system
-/// block to access sonnet/opus models. Haiku works without it, but we inject
-/// unconditionally for OAuth accounts to keep things simple.
+/// OAuth tokens (sk-ant-oat*) require this exact prompt somewhere in `system`
+/// to access sonnet/opus models; it does not have to be first. Haiku works
+/// without it, but we inject unconditionally for OAuth accounts to keep
+/// things simple.
 ///
-/// The prompt is prepended to any existing system content:
 /// - No system field → creates `"system": [{"type":"text","text":"..."}]`
 /// - String system → converts to array with CC prompt first, original second
-/// - Array system → prepends CC prompt block if not already present
+/// - Array system → inserts the CC prompt at index 0, or at index 1 when
+///   `system[0]` is a Claude Code attribution block, so the upstream's
+///   positional strip of that block still fires
 fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
     if has_oauth_system_prompt(body) {
         return;
@@ -7300,9 +7642,14 @@ fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
                     {"type": "text", "text": text}
                 ]);
             } else if let Some(arr) = system.as_array() {
-                // Prepend CC prompt block
-                let mut new_arr = vec![cc_block];
-                new_arr.extend(arr.iter().cloned());
+                // Keep a leading attribution block at index 0 (see ATTRIBUTION_BLOCK_PREFIX).
+                let leads_with_attribution = arr
+                    .first()
+                    .and_then(|b| b["text"].as_str())
+                    .is_some_and(|t| t.starts_with(ATTRIBUTION_BLOCK_PREFIX));
+                let at = if leads_with_attribution { 1 } else { 0 };
+                let mut new_arr = arr.clone();
+                new_arr.insert(at, cc_block);
                 body["system"] = serde_json::Value::Array(new_arr);
             }
         }
@@ -7910,8 +8257,9 @@ fn round_backoff_delay(retry_round: u32, last_saw_529: bool) -> Duration {
 /// round that also saw a 529) stays `429` with NO `Retry-After`: recovery there
 /// is on the order of minutes/hours, so a short retry hint would tight-loop the
 /// client into a still-exhausted pool.
-fn exhaustion_response(last_saw_transient: bool, last_saw_529: bool) -> Response {
+fn exhaustion_response(state: &AppState, last_saw_transient: bool, last_saw_529: bool) -> Response {
     if last_saw_transient && !last_saw_529 {
+        state.pool_exhausted[PoolExhaustion::Transient as usize].fetch_add(1, Ordering::Relaxed);
         warn!("all endpoints transient-failed after backoff; returning retryable 503");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -7920,6 +8268,7 @@ fn exhaustion_response(last_saw_transient: bool, last_saw_529: bool) -> Response
         )
             .into_response();
     }
+    state.pool_exhausted[PoolExhaustion::RateLimited as usize].fetch_add(1, Ordering::Relaxed);
     warn!("all endpoints exhausted (rate-limited)");
     (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
 }
@@ -8680,6 +9029,24 @@ async fn maybe_cache_store(
     Response::from_parts(parts, Body::from(bytes))
 }
 
+/// LAB-4322/LAB-4341: the one reason string for a `messages` the scanner
+/// cannot read as an array. Both surfaces reach it — `openai_chat_handler`
+/// because translation rewrites the field into an EMPTY array before the
+/// scanner sees it, `proxy_handler` because `ScanInput::from_body` reads it
+/// through the same `.as_array()` and yields nothing to scan. Shared so the
+/// two can never drift into describing the same shape two different ways.
+///
+/// The text covers BOTH causes because the surfaces disagree on which ones
+/// they reject: `/v1/chat/completions` is a single API that requires the
+/// field, so absent is malformed there and takes this reason too, while the
+/// `proxy_handler` fallback must keep forwarding the `messages`-less bodies of
+/// `/v1/complete` and `/v1/models` and so only ever reaches it for a present
+/// field of the wrong shape. Naming one cause would misdescribe the other to
+/// the client reading `error.message`.
+#[cfg(feature = "guard")]
+const GUARD_REASON_MESSAGES_NOT_ARRAY: &str =
+    "request `messages` is missing or not an array and cannot be scanned";
+
 /// LAB-3877: build the HTTP 400 for a `block` verdict. The body carries finding
 /// offsets and labels only — never the matched text — so an error surfaced to a
 /// client (or captured in its logs) cannot itself leak the secret it flagged.
@@ -8809,6 +9176,20 @@ async fn proxy_handler(
     // to scan and is allowed.
     #[cfg(feature = "guard")]
     let mut guard_body_parsed = false;
+    // LAB-4341: `messages` present but NOT an array — a string, an object, a
+    // number, `null`. Tracked apart from `guard_input` because both surface as
+    // `None` there: an image-only turn genuinely has no text and is allowed,
+    // while this is content the scanner structurally cannot reach.
+    //
+    // Keyed on PRESENT-and-wrong-shape, not on "not an array", because this
+    // handler is the router's `.fallback` — `/v1/complete`, `/v1/models`,
+    // `/upstream/<name>/...` all land here and carry no `messages` key at all.
+    // Treating absent as unscannable would take every non-Messages endpoint
+    // offline for `block` clients. That is the opposite of the OpenAI surface,
+    // where `/v1/chat/completions` is one API that requires the field, so
+    // absent there IS a malformed Messages request.
+    #[cfg(feature = "guard")]
+    let mut guard_messages_unscannable: Option<&'static str> = None;
 
     // Parse body once for model extraction, optional cache injection, and
     // the fast-mode flag that picks the rate bucket downstream.
@@ -8837,6 +9218,9 @@ async fn proxy_handler(
             {
                 guard_body_parsed = true;
                 guard_input = guard::ScanInput::from_body(&parsed);
+                if matches!(parsed.get("messages"), Some(v) if !v.is_array()) {
+                    guard_messages_unscannable = Some(GUARD_REASON_MESSAGES_NOT_ARRAY);
+                }
             }
 
             // LAB-933/LAB-929: derive the response-cache key on the
@@ -8940,7 +9324,7 @@ async fn proxy_handler(
                 body_bytes.to_vec()
             };
 
-            // Pre-compute OAuth variant with Claude Code system prompt prepended.
+            // Pre-compute OAuth variant with Claude Code system prompt inserted.
             // OAuth tokens (sk-ant-oat*) require this to access sonnet/opus models.
             // Skip injection when the client already includes the prompt — the
             // normal `bytes` payload (which preserves auto-cache mutations) is
@@ -8993,17 +9377,25 @@ async fn proxy_handler(
     }
 
     // LAB-3877: Tier 0 content guard — runs after the gate, before endpoint
-    // selection (see `AppState::guard_hook`). Unscannable = the client sent a
-    // body and it did not parse. Deliberately path-agnostic: the path is
-    // forwarded verbatim, so scoping by route would let `/v1/messages/` or a
-    // percent-encoded spelling skip the fail-closed rule. A bodiless request
+    // selection (see `AppState::guard_hook`). Two causes are unscannable: the
+    // client sent a body and it did not parse, and (LAB-4341) it parsed with a
+    // `messages` field the scanner cannot read. A bodiless request
     // (`GET /v1/models`) has nothing to scan and is not a scan failure.
+    //
+    // Both are deliberately path-agnostic: the path is forwarded verbatim, so
+    // scoping by route would let `/v1/messages/` or a percent-encoded spelling
+    // skip the fail-closed rule. The shape check stays safe to apply on every
+    // path because it keys on a `messages` that is present and wrong, which no
+    // other API served through this fallback sends — see where it is set.
     #[cfg(feature = "guard")]
     let guard_annotate: Option<usize> = {
+        let unscannable = (!guard_body_parsed && !body_bytes.is_empty())
+            .then_some("request body could not be parsed for content scanning")
+            .or(guard_messages_unscannable);
         match state.guard_hook(
             &req_id,
             &client_id,
-            !guard_body_parsed && !body_bytes.is_empty(),
+            unscannable,
             guard_input.as_ref(),
             false,
         ) {
@@ -9207,7 +9599,7 @@ async fn proxy_handler(
             return model_unsupported_response(&model, false);
         }
     }
-    exhaustion_response(last_saw_transient, last_saw_529)
+    exhaustion_response(&state, last_saw_transient, last_saw_529)
     }
     .await;
 
@@ -10101,7 +10493,6 @@ fn prom_header(buf: &mut String, name: &str, metric_type: &str, help: &str) {
     let _ = writeln!(buf, "# TYPE {name} {metric_type}");
 }
 
-#[allow(dead_code)]
 #[derive(Default, Clone)]
 struct ClaimMetricsSnap {
     key: String,
@@ -10140,6 +10531,8 @@ struct EndpointMetricsSnap {
     last_updated_epoch: Option<u64>,
     overage_in_use: bool,
     overage_utilization: Option<f64>,
+    overage_status: Option<String>,
+    overage_reset: Option<u64>,
     /// Routing-weight gauges, captured from the source struct's atomics at
     /// snap time. Snap-carried so the routing-weight emission is pool-agnostic.
     routing_weight: f64,
@@ -10157,7 +10550,7 @@ fn append_routing_weight_metrics(
         buf,
         "anthropic_account_routing_weight",
         "gauge",
-        "Per-account routing weight (headroom * waste_risk, or plain headroom when no 7d claim)",
+        "Per-account routing weight (headroom * waste_risk, or plain headroom when overage is in use or no 7d claim)",
     );
     prom_header(
         buf,
@@ -10169,7 +10562,7 @@ fn append_routing_weight_metrics(
         buf,
         "anthropic_account_effective_gate",
         "gauge",
-        "Effective routing gate: max(time_adjusted_5h, time_adjusted_7d) with status floors",
+        "Effective routing gate: time_adjusted_overage while overage is in use, else max(time_adjusted_5h, time_adjusted_7d), with status floors",
     );
 
     for (ep, snap) in endpoints.iter().zip(snaps.iter()) {
@@ -10307,6 +10700,8 @@ async fn build_metrics_snap(
         last_updated_epoch: info.last_updated_epoch,
         overage_in_use: info.overage_in_use,
         overage_utilization: info.overage_utilization,
+        overage_status: info.overage_status.clone(),
+        overage_reset: info.overage_reset,
         routing_weight: f64::from_bits(routing_weight_atomic.load(Ordering::Relaxed)),
         routing_share: f64::from_bits(routing_share_atomic.load(Ordering::Relaxed)),
         effective_gate: f64::from_bits(effective_gate_atomic.load(Ordering::Relaxed)),
@@ -10412,6 +10807,12 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
+    let client_rejections: Vec<((String, &'static str), u64)> = state
+        .client_rejections
+        .lock()
+        .ok()
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
     let beta_flags_dropped: Vec<(String, u64)> = state
         .beta_flags_dropped
         .lock()
@@ -10505,6 +10906,17 @@ async fn metrics_handler(
             &[("account", &s.name), ("window", "7d")],
             status_to_ordinal(s.status_7d.as_deref()),
         );
+        // Overage window: same presence rule as its utilization series —
+        // emitted only while overage is serving (its fields are cleared
+        // otherwise), so the status floor that feeds the overage gate is visible.
+        if s.overage_in_use {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_rate_limit_status",
+                &[("account", &s.name), ("window", "overage")],
+                status_to_ordinal(s.overage_status.as_deref()),
+            );
+        }
     }
 
     // Account reset countdowns
@@ -10528,6 +10940,17 @@ async fn metrics_handler(
                 &mut buf,
                 "anthropic_account_reset_seconds",
                 &[("account", &s.name), ("window", "7d")],
+                (r - now_epoch) as f64,
+            );
+        }
+        if let Some(r) = s
+            .overage_reset
+            .filter(|&r| s.overage_in_use && r > now_epoch)
+        {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_reset_seconds",
+                &[("account", &s.name), ("window", "overage")],
                 (r - now_epoch) as f64,
             );
         }
@@ -10836,13 +11259,56 @@ async fn metrics_handler(
         }
     }
 
+    // Per-claim status and reset (LAB-4189). The account-level siblings are
+    // labelled `window="5h"|"7d"` only, so a model carve-out had neither. Status
+    // is not recoverable from utilization in either direction — see the
+    // per-claim section of the README for the why, and read this rather than
+    // thresholding the percentage.
+    prom_header(
+        &mut buf,
+        "anthropic_claim_rate_limit_status",
+        "gauge",
+        "Per-claim rate-limit status ordinal (0=allowed, 1=warning, 2=throttled, 3=rejected)",
+    );
+    for s in &snaps {
+        for claim in &s.claims {
+            prom_gauge(
+                &mut buf,
+                "anthropic_claim_rate_limit_status",
+                &[("account", &s.name), ("claim", &claim.key)],
+                status_to_ordinal(claim.status.as_deref()),
+            );
+        }
+    }
+    prom_header(
+        &mut buf,
+        "anthropic_claim_reset_seconds",
+        "gauge",
+        "Seconds until this claim's window resets",
+    );
+    for s in &snaps {
+        for claim in &s.claims {
+            // Past-dated resets are omitted rather than clamped to 0, matching
+            // `anthropic_account_reset_seconds`: a stale reset is unknown, not
+            // "resets now".
+            if let Some(r) = claim.reset.filter(|&r| r > now_epoch) {
+                prom_gauge(
+                    &mut buf,
+                    "anthropic_claim_reset_seconds",
+                    &[("account", &s.name), ("claim", &claim.key)],
+                    (r - now_epoch) as f64,
+                );
+            }
+        }
+    }
+
     // ── Routing weights (refreshed by refresh_metrics_weights per probe cycle) ─────
 
     prom_header(
         &mut buf,
         "anthropic_account_routing_weight",
         "gauge",
-        "Per-account routing weight (headroom * waste_risk, or plain headroom when no 7d claim)",
+        "Per-account routing weight (headroom * waste_risk, or plain headroom when overage is in use or no 7d claim)",
     );
     prom_header(
         &mut buf,
@@ -10854,7 +11320,7 @@ async fn metrics_handler(
         &mut buf,
         "anthropic_account_effective_gate",
         "gauge",
-        "Effective routing gate: max(time_adjusted_5h, time_adjusted_7d) with status floors",
+        "Effective routing gate: time_adjusted_overage while overage is in use, else max(time_adjusted_5h, time_adjusted_7d), with status floors",
     );
 
     // Snap-carried gauges (captured at snap time).
@@ -11315,6 +11781,25 @@ async fn metrics_handler(
         );
     }
 
+    // Pre-request-gate 429 rejections (LAB-2551). Per-replica, in-memory —
+    // dashboards must rate() before summing across pods. The header is
+    // emitted even at zero series so the family is discoverable before the
+    // first rejection.
+    prom_header(
+        &mut buf,
+        "anthropic_client_rejections_total",
+        "counter",
+        "Requests rejected (429) by the pre-request gate, by client and reason (budget/utilization/brake)",
+    );
+    for ((client, reason), n) in &client_rejections {
+        prom_counter(
+            &mut buf,
+            "anthropic_client_rejections_total",
+            &[("client", client.as_str()), ("reason", reason)],
+            *n,
+        );
+    }
+
     // Client anthropic-beta flags dropped by the allow-list (LAB-1191).
     // Per-replica, in-memory; bounded via `_other` overflow.
     prom_header(
@@ -11465,6 +11950,26 @@ async fn metrics_handler(
             "anthropic_affinity_migrations_total",
             &[("reason", bind.as_str())],
             state.affinity_migrations[bind as usize].load(Ordering::Relaxed),
+        );
+    }
+
+    // Client-facing pool exhaustion (LAB-4189): the 429/503 the caller actually
+    // received because every endpoint was gated or failed. The per-account
+    // gauges describe the pool's state but never say whether a request was
+    // turned away because of it. Independent per-replica events, not mirrors of
+    // one upstream value — aggregate with `sum by (kind)`.
+    prom_header(
+        &mut buf,
+        "anthropic_pool_exhausted_total",
+        "counter",
+        "Client-facing pool-exhaustion responses by kind (rate_limited=429, transient=503)",
+    );
+    for kind in PoolExhaustion::ALL {
+        prom_counter(
+            &mut buf,
+            "anthropic_pool_exhausted_total",
+            &[("kind", kind.as_str())],
+            state.pool_exhausted[kind as usize].load(Ordering::Relaxed),
         );
     }
 
@@ -13685,32 +14190,41 @@ async fn openai_chat_handler(
     // LAB-3877: Tier 0 content guard on the OpenAI-compat surface — the same
     // hook as `proxy_handler`. The scanner reads the TRANSLATED body (the
     // Messages shape it understands); the Anthropic arm below forwards that
-    // body, the OpenAI arm forwards the original bytes. Translation preserves
-    // the user text and `tool` content the scanner reads, but passes any other
-    // role (legacy `function`, `developer`, unknown) through verbatim, where
-    // the scanner cannot see it — so under `block` such a body is unscannable,
-    // not silently allowed. Unparseable JSON was already rejected above.
+    // body, the OpenAI arm forwards the original bytes. Unparseable JSON was
+    // already rejected above.
+    //
+    // The two conditions below are an ENUMERATION, not a rule: each is a
+    // shape translation cannot carry into the Messages document, so the
+    // scanner never sees it while the OpenAI arm still ships it. Anything
+    // else translation drops — `messages[].name`, the top-level `user` field
+    // — is NOT covered here and is unscanned on both surfaces (deferred to
+    // the guard epic). Adding a field to the translator's drop list does not
+    // extend this predicate; extend it by hand.
     #[cfg(feature = "guard")]
     let guard_annotate: Option<usize> = {
-        let unmapped_role = openai_body
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .is_some_and(|msgs| {
-                msgs.iter().any(|m| {
+        let unscannable = match openai_body.get("messages").and_then(|m| m.as_array()) {
+            // Translation preserves the user text and `tool` content the
+            // scanner reads, but passes any other role (legacy `function`,
+            // `developer`, unknown) through verbatim.
+            Some(msgs) => msgs
+                .iter()
+                .any(|m| {
                     !matches!(
                         m.get("role").and_then(|r| r.as_str()),
                         Some("system" | "user" | "assistant" | "tool")
                     )
                 })
-            });
+                .then_some("request carries an OpenAI message role the scanner cannot read"),
+            // LAB-4322: `messages` is absent or not an array. The translator
+            // reads it through the same `.as_array()` and then writes an array
+            // back unconditionally, so the scanned document gets an EMPTY
+            // `messages` while the original bytes keep every character the
+            // client sent. `/v1/chat/completions` requires an array here, so
+            // nothing legitimate is rejected.
+            None => Some(GUARD_REASON_MESSAGES_NOT_ARRAY),
+        };
         let guard_input = guard::ScanInput::from_body(&anthropic_body);
-        match state.guard_hook(
-            &req_id,
-            &client_id,
-            unmapped_role,
-            guard_input.as_ref(),
-            true,
-        ) {
+        match state.guard_hook(&req_id, &client_id, unscannable, guard_input.as_ref(), true) {
             Ok(annotate) => annotate,
             Err(resp) => return *resp,
         }
@@ -13874,7 +14388,7 @@ async fn openai_chat_handler(
                 return model_unsupported_response(&model, true);
             }
         }
-        exhaustion_response(last_saw_transient, last_saw_529)
+        exhaustion_response(&state, last_saw_transient, last_saw_529)
     }
     .await;
 
@@ -14604,6 +15118,7 @@ async fn main() {
         ),
         body_read_timeout_total: AtomicU64::new(0),
         affinity_migrations: Default::default(),
+        pool_exhausted: Default::default(),
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: config
             .session_registry_max
@@ -14625,6 +15140,7 @@ async fn main() {
         prompt_too_long: Mutex::new(HashMap::new()),
         fast_mode_429: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
+        client_rejections: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
         response_cache,
     });
