@@ -2080,7 +2080,7 @@ impl AppState {
     fn authenticate_throttled(
         &self,
         client_ip: &IpAddr,
-        peer_port: u16,
+        peer: SocketAddr,
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
         route: &'static str,
@@ -2095,7 +2095,7 @@ impl AppState {
                 if let Some(retry_after) = self.auth_throttle.check(client_ip) {
                     warn!(
                         client = %client_ip,
-                        src_port = peer_port,
+                        peer = %peer,
                         route,
                         cred,
                         key_fp = %key_fp,
@@ -2115,7 +2115,7 @@ impl AppState {
                 self.auth_throttle.record_failure(*client_ip);
                 warn!(
                     client = %client_ip,
-                    src_port = peer_port,
+                    peer = %peer,
                     route,
                     cred,
                     key_fp = %key_fp,
@@ -2152,11 +2152,11 @@ impl AppState {
     fn authorize_admin(
         &self,
         client_ip: &IpAddr,
-        peer_port: u16,
+        peer: SocketAddr,
         headers: &hyper::HeaderMap,
         route: &'static str,
     ) -> Option<Box<Response>> {
-        match self.authenticate_throttled(client_ip, peer_port, headers, false, route) {
+        match self.authenticate_throttled(client_ip, peer, headers, false, route) {
             Err(resp) => Some(resp),
             Ok(Some(c)) if !self.is_operator(&c.name) => {
                 warn!(
@@ -3356,10 +3356,13 @@ type AuthFailureKey = (&'static str, &'static str);
 /// the IP cannot: `none` (no key at all), `bearer` (a key in a header the
 /// native surface does not read — OpenAI SDKs send `Authorization: Bearer`,
 /// rejected there by design), `auth-other` (an `Authorization` scheme that
-/// is not Bearer, e.g. Basic or a raw token) and `x-api-key` (a key in the
-/// right header that does not match; wins when both headers are present,
-/// since it is the one compared first). Returns the presented bytes for
-/// `credential_fingerprint`. The Bearer prefix test mirrors `authenticate`.
+/// is not Bearer, e.g. Basic or a raw token — labelled but not
+/// fingerprinted, since there is no bare credential to hash: the README's
+/// recipe hashes the key alone, and a scheme-prefixed blob would never
+/// reproduce it) and `x-api-key` (a key in the right header that does not
+/// match; wins when both headers are present, since it is the one compared
+/// first). Returns the presented bytes for `credential_fingerprint`. The
+/// Bearer prefix test mirrors `authenticate`.
 fn presented_credential(headers: &hyper::HeaderMap) -> (&'static str, Option<&[u8]>) {
     if let Some(k) = headers.get("x-api-key") {
         return ("x-api-key", Some(k.as_bytes()));
@@ -3368,7 +3371,7 @@ fn presented_credential(headers: &hyper::HeaderMap) -> (&'static str, Option<&[u
         Some(v) if v.len() >= 7 && v[..7].eq_ignore_ascii_case(b"bearer ") => {
             ("bearer", Some(&v[7..]))
         }
-        Some(v) => ("auth-other", Some(v)),
+        Some(_) => ("auth-other", None),
         None => ("none", None),
     }
 }
@@ -9207,7 +9210,7 @@ async fn proxy_handler(
     // Proxy auth: x-api-key against the [[clients]] table, else legacy proxy_key.
     let principal = match state.authenticate_throttled(
         &client_ip,
-        client_addr.port(),
+        client_addr,
         req.headers(),
         false,
         "proxy",
@@ -10337,9 +10340,7 @@ async fn stats_handler(
     }
     // AC-4: operator principal required — /_stats discloses other clients'
     // ids, the endpoint account names and pool utilisation.
-    if let Some(resp) =
-        state.authorize_admin(&client_ip, client_addr.port(), req.headers(), "stats")
-    {
+    if let Some(resp) = state.authorize_admin(&client_ip, client_addr, req.headers(), "stats") {
         return *resp;
     }
 
@@ -10817,9 +10818,7 @@ async fn metrics_handler(
     }
     // AC-4: operator principal required, same gate as /_stats — per-account
     // utilisation and budget gauges are pool reconnaissance.
-    if let Some(resp) =
-        state.authorize_admin(&client_ip, client_addr.port(), req.headers(), "metrics")
-    {
+    if let Some(resp) = state.authorize_admin(&client_ip, client_addr, req.headers(), "metrics") {
         return *resp;
     }
 
@@ -14196,7 +14195,7 @@ async fn openai_chat_handler(
     // Authorization: Bearer — OpenAI SDKs send only the latter.
     let principal = match state.authenticate_throttled(
         &client_ip,
-        client_addr.port(),
+        client_addr,
         req.headers(),
         true,
         "openai",

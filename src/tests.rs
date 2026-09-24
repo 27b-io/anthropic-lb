@@ -22875,6 +22875,12 @@ fn rejected_credential_shape_fingerprint_and_user_agent() {
         presented_credential(&hdrs(&[("authorization", "Basic dXNlcjpwdw==")])).0,
         "auth-other"
     );
+    // auth-other is labelled but never fingerprinted — no bare credential
+    // to hash, and the README recipe can't reproduce a scheme-prefixed hash.
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "Basic dXNlcjpwdw==")])).1,
+        None
+    );
     assert_eq!(
         presented_credential(&hdrs(&[("authorization", "bearer k")])).0,
         "bearer"
