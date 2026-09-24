@@ -3342,6 +3342,19 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     // classifier's own follow-up requests.
     "auto-mode-classifier-*",
     "dangerous-tool-use-*",
+    // Claude Code 2.1.278 per-turn family (LAB-3964). All three are
+    // body-paired with fields on the `role:"system"` entry inside `messages`;
+    // the LB forwards bodies verbatim, so stripping the header alone is the
+    // same hard-400 shape as the families above:
+    //  - `mid-conversation-tool-changes-*` ↔ `tool_addition`/`tool_removal`
+    //    content blocks. Claude Code answers the 400 by sticky-rejecting the
+    //    beta for the rest of the conversation.
+    //  - `per-turn-control-*` ↔ `output_config.effort`.
+    //  - `timing-*` ↔ `output_config.timing`. Opt-in (CLAUDE_CODE_PER_TURN_TIMING),
+    //    so not yet seen dropped — listed so the first opt-in does not 400.
+    "mid-conversation-tool-changes-*",
+    "per-turn-control-*",
+    "timing-*",
 ];
 
 /// Cardinality bound for `beta_flags_dropped` — flag names are
