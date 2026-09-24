@@ -20883,19 +20883,20 @@ mod redis_integration {
 
     /// Runs without a backend, so a bypass of `Db` fails every `cargo test`,
     /// not just the ones that happen to collide. Bans a digit written directly
-    /// after a helper's `(` or an inline URL's `}/`, and a `Db` variant used
-    /// by more than one test fn (repeats inside one test are fine).
+    /// after a helper's `(` or an inline URL's `}/`, and a `Db` variant named
+    /// in a helper or in more than one test fn (repeats in one test are fine).
     /// ponytail: text scan — a number passed as a format argument
     /// (`"{}/{}", base, 3`) slips past. Taking `Db` in the helpers and URL
-    /// builders closes that and retires this scan.
+    /// builders closes that and retires the digit pass; the owner pass stays,
+    /// since types can't stop two tests naming one variant.
     #[test]
     fn db_numbers_come_only_from_the_db_allocation() {
         let src = include_str!("tests.rs");
         let start = src.find("mod redis_integration {").expect("module present");
         let module = &src[start..];
         let module = &module[..module.find("\n}\n").expect("module end")];
-        // Skip this checker, doc included: its own carrier literals would keep
-        // `seen > 0` true after a helper is renamed.
+        // Skip this checker, doc included: its own literals would keep
+        // `seen > 0` true and `owners` non-empty after a rename.
         let decl = module
             .find("fn db_numbers_come_only_from_the_db_allocation")
             .expect("checker present");
@@ -20925,31 +20926,29 @@ mod redis_integration {
         // One test per variant: the enum only keeps numbers distinct, and a
         // test that copies another's variant flushes its fixtures mid-run.
         let mut owners = std::collections::HashMap::new();
-        let (mut test, mut offset) = ("", 0);
-        for line in module.split_inclusive('\n') {
-            let at = offset;
-            offset += line.len();
-            if (from..to).contains(&at) {
-                continue;
-            }
-            if let Some(sig) = line
-                .strip_prefix("    fn ")
-                .or(line.strip_prefix("    async fn "))
-            {
-                test = &sig[..sig.find('(').unwrap_or(sig.len())];
-            }
-            for (i, _) in line.match_indices("Db::") {
-                let variant = line[i + 4..]
-                    .split(|c: char| !c.is_ascii_alphanumeric())
-                    .next()
-                    .unwrap_or_default();
-                let first = *owners.entry(variant).or_insert(test);
-                let line = src[..start + at].lines().count() + 1;
-                assert_eq!(
-                    first, test,
-                    "src/tests.rs:{line}: `Db::{variant}` already belongs to `{first}` — add a variant"
-                );
-            }
+        for (at, _) in module
+            .match_indices("Db::")
+            .filter(|(at, _)| !(from..to).contains(at))
+        {
+            let variant = module[at + 4..]
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .next()
+                .unwrap();
+            let sig = module[..at]
+                .rfind("\n    fn ")
+                .max(module[..at].rfind("\n    async fn "))
+                .expect("`Db::` use outside any fn");
+            let owner = module[sig..].split('(').next().unwrap().trim();
+            let line = src[..start + at].lines().count();
+            assert!(
+                module[..sig].ends_with("test]"),
+                "src/tests.rs:{line}: `Db::{variant}` in helper `{owner}` — take the db from the test"
+            );
+            let first = *owners.entry(variant).or_insert(owner);
+            assert_eq!(
+                first, owner,
+                "src/tests.rs:{line}: `Db::{variant}` already belongs to `{first}` — add a variant"
+            );
         }
         assert!(
             !owners.is_empty(),
