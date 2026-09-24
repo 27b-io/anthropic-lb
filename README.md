@@ -552,9 +552,13 @@ scanner reads. An image-only turn, a conversation with no `user` turn yet, and a
 non-Messages body all forward untouched under `block` — the guard read them and
 there was nothing to scan, which is not a scan failure.
 
-Note what is NOT on that list: `null`. A JSON null cannot hide content, so an
-absent field and a `null` one are treated alike everywhere above — a client
-whose serializer emits `null` for an omitted optional is not rejected.
+A JSON null cannot hide content, so the guard reads `null` as absent. Where an
+absent field passes — a newest-turn `content`, a text block's `text`, a
+`tool_result.content` — so does `null`, and a client whose serializer emits
+`null` for an omitted optional is not rejected. Where absence is rejected — a
+message's `role`, a content block's `type` — so is `null`. The one exception is
+`messages` itself: a body with no `messages` key is not a Messages request and
+forwards, but `messages: null` names the field and is rejected, as listed above.
 
 A block-mode client must therefore send JSON Messages traffic in a shape the
 scanner can parse, and keep scannable content within the limit. `annotate` (shadow mode) never rejects — it

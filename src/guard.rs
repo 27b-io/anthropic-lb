@@ -140,10 +140,16 @@ impl ScanInput {
     /// judged on the newest user turn only — an `assistant` message with
     /// `content: null` is routine and carries nothing this scanner would read.
     ///
-    /// `null` is treated as absent everywhere below, not as present-and-wrong.
-    /// A JSON null cannot be hiding content, so rejecting it would cost
-    /// availability (clients whose codegen emits `null` for an omitted optional,
-    /// which `tool_result.content` is) and buy no coverage.
+    /// Inside a message, `null` is treated as absent, not as present-and-wrong:
+    /// the newest turn's `content`, a text block's `text`, a
+    /// `tool_result.content`. A JSON null cannot be hiding content, so rejecting
+    /// it would cost availability (clients whose codegen emits `null` for an
+    /// omitted optional, which `tool_result.content` is) and buy no coverage.
+    /// `messages` is the one field where `null` and absent differ: a body with
+    /// no `messages` key is not a Messages request and forwards, but
+    /// `messages: null` fails closed as [`REASON_MESSAGES_NOT_ARRAY`]. Every
+    /// endpoint that takes the field requires it, so no client sends `null`
+    /// there as an omitted optional.
     pub fn from_body(body: &Value) -> ScanOutcome {
         // A body that is not a JSON object is not a request any endpoint this
         // proxy serves accepts, and `Value::get` answers `None` on one — so
@@ -818,6 +824,12 @@ mod tests {
                 "null must read as absent, not as unscannable: {body}"
             );
         }
+        // Where the exemption stops: an absent `messages` forwards, a `null` one
+        // fails closed.
+        assert!(matches!(
+            ScanInput::from_body(&json!({"messages": null})),
+            ScanOutcome::Unscannable(REASON_MESSAGES_NOT_ARRAY)
+        ));
     }
 
     /// LAB-4358: a body that parses as JSON but is not an object reads as "no
