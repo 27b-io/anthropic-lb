@@ -20859,7 +20859,8 @@ mod redis_integration {
     /// The logical-DB allocation (see the module doc). An enum, not constants,
     /// so the compiler rejects a reused number (E0081);
     /// `db_numbers_come_only_from_the_db_allocation` rejects a raw number
-    /// that bypasses it. DB 0 is deliberately unused.
+    /// that bypasses it and a variant two tests share. DB 0 is deliberately
+    /// unused.
     #[repr(u8)]
     enum Db {
         MergeHardLimits = 1,
@@ -20882,7 +20883,8 @@ mod redis_integration {
 
     /// Runs without a backend, so a bypass of `Db` fails every `cargo test`,
     /// not just the ones that happen to collide. Bans a digit written directly
-    /// after a helper's `(` or an inline URL's `}/`.
+    /// after a helper's `(` or an inline URL's `}/`, and a `Db` variant used
+    /// by more than one test fn (repeats inside one test are fine).
     /// ponytail: text scan — a number passed as a format argument
     /// (`"{}/{}", base, 3`) slips past. Taking `Db` in the helpers and URL
     /// builders closes that and retires this scan.
@@ -20920,6 +20922,39 @@ mod redis_integration {
                 "`{carrier}` never matched — the scan has gone vacuous"
             );
         }
+        // One test per variant: the enum only keeps numbers distinct, and a
+        // test that copies another's variant flushes its fixtures mid-run.
+        let mut owners = std::collections::HashMap::new();
+        let (mut test, mut offset) = ("", 0);
+        for line in module.split_inclusive('\n') {
+            let at = offset;
+            offset += line.len();
+            if (from..to).contains(&at) {
+                continue;
+            }
+            if let Some(sig) = line
+                .strip_prefix("    fn ")
+                .or(line.strip_prefix("    async fn "))
+            {
+                test = &sig[..sig.find('(').unwrap_or(sig.len())];
+            }
+            for (i, _) in line.match_indices("Db::") {
+                let variant = line[i + 4..]
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .next()
+                    .unwrap_or_default();
+                let first = *owners.entry(variant).or_insert(test);
+                let line = src[..start + at].lines().count() + 1;
+                assert_eq!(
+                    first, test,
+                    "src/tests.rs:{line}: `Db::{variant}` already belongs to `{first}` — add a variant"
+                );
+            }
+        }
+        assert!(
+            !owners.is_empty(),
+            "no `Db::` use matched — the scan has gone vacuous"
+        );
     }
 
     /// Resolve the opt-in backend URL. None (with a SKIP notice) when the
