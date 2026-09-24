@@ -170,7 +170,7 @@ token = "sk-ant-api03-..."
 | Field | Type | Default | Description |
 |:------|:-----|:--------|:------------|
 | `listen` | `String` | — | Bind address (e.g. `"127.0.0.1:8082"`) |
-| `rate_limit_cooldown_secs` | `u64` | `60` | Seconds to cool down after 429 |
+| `rate_limit_cooldown_secs` | `u64` | `5` | Fallback cooldown after a capacity 429 when upstream sends no usable `retry-after` (burst 429s use their own 5→60s backoff) |
 | `probe_interval_secs` | `u64` | `300` | Seconds between utilization probes (0 = disabled) |
 | `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id` |
 | `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`) |
@@ -454,11 +454,18 @@ hot-path latency, at most 32 KiB of that content is scanned per request; a
 larger newest turn has its tail left unscanned (surfaced as `truncated` in the
 guard log).
 
-Scanning is content-driven: any proxied request whose JSON body carries
-`messages` is scanned — `/v1/messages`, `/v1/messages/count_tokens`, and
-`/v1/chat/completions` (scanned after translation to the Messages shape, so the
-same rules apply to both APIs). A request with no body, such as `GET
-/v1/models`, has nothing to scan and passes through.
+Scanning is content-driven: a proxied request is scanned when its JSON body
+carries a Messages-shaped `messages` **array** — `/v1/messages`,
+`/v1/messages/count_tokens`, and `/v1/chat/completions` (scanned after
+translation to the Messages shape, so the same rules apply to both APIs). A
+request with no body, such as `GET /v1/models`, has nothing to scan and passes
+through. Content the Messages shape does not carry is not scanned: fields
+translation drops outright (`messages[].name`, the top-level `user`), content
+blocks of a type the scanner does not read, and a `messages` array whose
+elements the scanner cannot resolve to a newest `user` turn — elements that
+are not role objects, a `role` it does not recognise, or a `content` that is
+neither a string nor a block array. A body with no `messages` field at all
+(`/v1/complete`'s `prompt`, batch requests) is likewise unscanned.
 
 ### Per-client policy
 
@@ -499,15 +506,33 @@ Operator clients are always `off` regardless of configuration.
   OpenAI error envelope (`error.code = "guard_blocked"`).
 
 `block` **fails closed.** A request it cannot scan in full is rejected with the
-same 400, rather than forwarded unscanned, in two cases: the client sent a body
-the scanner cannot read — non-JSON (a parse differential must not smuggle
-content past the scan; this includes multipart uploads such as `/v1/files`), or
-an OpenAI-compat message role the translation does not map — or the
-newest-turn content exceeded the scan limit, so its tail was never inspected
-(otherwise padding past the limit would bypass enforcement). A block-mode
-client must therefore send JSON Messages traffic and keep scannable content
-within the limit. `annotate` (shadow mode) never rejects — it scans best-effort
-and always forwards.
+same 400 rather than forwarded unscanned:
+
+- the body is not JSON — a parse differential must not smuggle content past the
+  scan; this includes multipart uploads such as `/v1/files`;
+- `messages` is present but is not an array — a string, an object, a number,
+  `null`. The scanner reads that field as an array, so none of it reaches the
+  scan while all of it reaches the upstream. This applies on every path. A body
+  carrying **no** `messages` key is not rejected, on any path including
+  `/v1/messages`: the proxy serves every Anthropic endpoint through one
+  handler, and most of them (`/v1/complete`, `/v1/models`) never send the
+  field. Note the narrowness — `messages` can be an **array** and still be
+  unreadable (elements that are not role objects, a `content` the scanner
+  cannot parse); those are not rejected either, and are listed under **What it
+  scans** above;
+- on `/v1/chat/completions` only, `messages` is absent, or a message carries a
+  role outside `system`/`user`/`assistant`/`tool` — that endpoint is a single
+  API which requires the field, and both shapes are lost translating to the
+  Messages document the scanner reads while an `openai`-protocol endpoint
+  forwards the client's original bytes. These are an enumeration, not a general
+  rule: the unscanned content named under **What it scans** above is not
+  rejected;
+- the newest-turn content exceeded the scan limit, so its tail was never
+  inspected — otherwise padding past the limit would bypass enforcement.
+
+A block-mode client must therefore send JSON Messages traffic and keep
+scannable content within the limit. `annotate` (shadow mode) never rejects — it
+scans best-effort and always forwards.
 
 ### Metrics
 
@@ -577,6 +602,61 @@ past 64 distinct pairs lumps into a single global
 `x-client-id: _other` header is ignored, so real traffic can never
 pre-claim the overflow key. `anthropic_client_model_token_usage_total`
 shares the same overflow scheme (bucket at 256 + 1 series).
+
+### Per-claim rate-limit visibility
+
+The API reports model-specific sub-budgets ("claims") alongside the general
+5h/7d windows. Each claim's utilization and waste risk have always been on
+`/metrics`; its **status** and **reset** are exported too:
+
+| Series | Meaning |
+|:-------|:--------|
+| `anthropic_claim_rate_limit_status{account,claim}` | Status ordinal — `0=allowed, 1=warning, 2=throttled, 3=rejected`. Same encoding as `anthropic_account_rate_limit_status`. |
+| `anthropic_claim_reset_seconds{account,claim}` | Seconds until that claim's window resets. Omitted (not zeroed) once the reset is in the past. |
+
+Status is **not** derivable from utilization in either direction, so read it
+rather than thresholding the percentage: an account can sit at 0.98 and still
+be `allowed_warning` — the router keeps routing to it — while another reads
+1.0 and is `rejected`, which makes the router hard-skip it for that claim.
+
+Across replicas these are gauges mirroring the same upstream claim, so
+aggregate with `max by (account, claim)`; `sum` multiplies the reading by the
+replica count.
+
+The `claim` label comes from the upstream `representative-claim` header,
+never from client input, but it is still an unvalidated remote string. It is
+truncated to 64 characters, and each account retains at most 32 distinct
+**unreserved** claim keys. Reserved keys — the four that gate all traffic plus
+the model-band carve-out — are always admitted, so the hard bound is 37 per
+account. That bound holds on the live header path and on the two paths that
+restore the map whole (the persisted state file and the cross-replica mirror),
+so a map written by an older build cannot restore unbounded.
+
+Keys already present keep updating past the cap; a genuinely new one past it is
+dropped, and the refusal is logged once per account rather than once per
+request. Unlike the caller-labelled counters above, overflow is *not* folded
+into an `_other` bucket: both routing lookups match exact keys and the
+emergency brake's input is allowlist-filtered, so an unknown key is already
+inert to routing and a bucket would only add a fake claim to the metrics.
+Reserving the keys that are *not* inert is what makes the cap safe — without
+that, a flood of unknown keys could lock out `seven_day` itself, and an account
+with no derivable weekly utilization routes as though it had no weekly limit.
+
+### Pool exhaustion
+
+`anthropic_pool_exhausted_total{kind}` counts the responses this proxy
+generated itself because no endpoint could serve the request:
+
+| `kind` | Response | Cause |
+|:-------|:---------|:------|
+| `rate_limited` | `429 exhausted all endpoints` (no `Retry-After`) | Every eligible endpoint was rate-limited or gated, or a retry round saw a 529. |
+| `transient` | `503 + Retry-After: 1` | Every eligible endpoint failed in transport, with no 529. |
+
+The per-account gauges describe the pool's *state*; this counter is the only
+signal that a caller was actually turned away because of it. Both label values
+are emitted from process start, so a flat zero is a measurement rather than an
+absence of data. These are independent per-replica event counts — aggregate
+with `sum by (kind)`, where `max` would undercount.
 
 ### OpenAI JSON-mode compatibility
 
