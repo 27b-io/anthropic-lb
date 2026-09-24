@@ -22890,7 +22890,7 @@ async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(state.auth_failures.lock().unwrap().get("proxy"), Some(&5));
+    assert_eq!(state.auth_failures.lock().unwrap().values().sum::<u64>(), 5);
 }
 
 /// Successful traffic below the limit also leaves the shared IP's failure
@@ -22966,21 +22966,33 @@ fn resolve_client_ip_canonicalizes_v4_mapped_peer() {
     );
 }
 
-/// `anthropic_auth_failures_total{route}` is scrape-visible (AC-11).
+/// `anthropic_auth_failures_total{route,cred}` is scrape-visible (LAB-1192
+/// AC-11, LAB-4720 AC-2): a wrong key on the admin surface and a Bearer-only
+/// caller on the native surface (the OpenAI-SDK misconfiguration) land on
+/// distinct, fixed-vocabulary series.
 #[tokio::test]
-async fn metrics_expose_auth_failures_by_route() {
+async fn metrics_expose_auth_failures_by_route_and_cred() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let (app, _state) = admin_matrix_app(&mock_url);
     let addr = serve(app).await;
     let client = Client::new();
 
-    // One failure on the stats route.
+    // One failure on the stats route, key in the right header.
     let _ = client
         .get(format!("http://{addr}/_stats"))
         .header("x-api-key", "key-wrong")
         .send()
         .await
         .unwrap();
+    // One on the proxy route: a valid key, but in the wrong header.
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("authorization", "Bearer key-geo")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     let body = client
         .get(format!("http://{addr}/metrics"))
@@ -22991,9 +23003,79 @@ async fn metrics_expose_auth_failures_by_route() {
         .text()
         .await
         .unwrap();
-    assert!(
-        body.contains("anthropic_auth_failures_total{route=\"stats\"} 1"),
-        "missing auth-failure counter in:\n{body}"
+    for line in [
+        "anthropic_auth_failures_total{route=\"stats\",cred=\"x-api-key\"} 1",
+        "anthropic_auth_failures_total{route=\"proxy\",cred=\"bearer\"} 1",
+    ] {
+        assert!(body.contains(line), "missing `{line}` in:\n{body}");
+    }
+}
+
+/// LAB-4720 AC-1: a rejection is attributable beyond the source IP. The
+/// header shape separates "no key", "key in the wrong header" and "wrong
+/// key"; the fingerprint is 12 hex chars, never a run of the key, and
+/// matches the README recipe (`hashlib.blake2s(tag + key).hexdigest()[:12]`);
+/// the user-agent is clipped.
+#[test]
+fn rejected_credential_shape_fingerprint_and_user_agent() {
+    assert_eq!(presented_credential(&hdrs(&[])).0, "none");
+    assert_eq!(
+        presented_credential(&hdrs(&[("x-api-key", "k")])).0,
+        "x-api-key"
+    );
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "Bearer k")])).0,
+        "bearer"
+    );
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "Basic dXNlcjpwdw==")])).0,
+        "auth-other"
+    );
+    // auth-other is labelled but never fingerprinted — no bare credential
+    // to hash, and the README recipe can't reproduce a scheme-prefixed hash.
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "Basic dXNlcjpwdw==")])).1,
+        None
+    );
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "bearer k")])).0,
+        "bearer"
+    );
+    assert_eq!(
+        presented_credential(&hdrs(&[("authorization", "Bearer")])).0,
+        "auth-other"
+    );
+    // Both headers: x-api-key is the one compared first, so it names the shape.
+    assert_eq!(
+        presented_credential(&hdrs(&[("x-api-key", "k"), ("authorization", "bearer k")])).0,
+        "x-api-key"
+    );
+
+    let key = "stale-client-key-0123456789abcdefghijklmnopqrstuvwxyz";
+    let fp = credential_fingerprint(Some(key.as_bytes()));
+    assert_eq!(fp, "67baf0920d1c", "must match the README recipe");
+    assert!(!key.contains(&fp), "fingerprint leaked a run of the key");
+    assert_eq!(credential_fingerprint(None), "-");
+    // The README recipe hashes the bare key, so the Bearer scheme must be
+    // stripped: `presented_credential` hands back the key alone.
+    let bearer = hdrs(&[("authorization", format!("Bearer {key}").as_str())]);
+    assert_eq!(presented_credential(&bearer).1, Some(key.as_bytes()));
+
+    assert_eq!(bounded_user_agent(&hdrs(&[])), "-");
+    assert_eq!(bounded_user_agent(&hdrs(&[("user-agent", "")])), "-");
+    let mut obs_text = hyper::HeaderMap::new();
+    obs_text.insert("user-agent", HeaderValue::from_bytes(b"agent\xff").unwrap());
+    assert_eq!(bounded_user_agent(&obs_text), "-", "not visible ASCII");
+    assert_eq!(
+        bounded_user_agent(&hdrs(&[("user-agent", "curl/8.5.0")])),
+        "curl/8.5.0"
+    );
+    let long = "x".repeat(300);
+    let ua = bounded_user_agent(&hdrs(&[("user-agent", long.as_str())]));
+    assert_eq!(
+        ua.chars().count(),
+        MAX_LABEL_CHARS + 1,
+        "clipped + ellipsis"
     );
 }
 
