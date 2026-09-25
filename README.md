@@ -800,6 +800,23 @@ with `sum by (kind)`, where `max` would undercount.
 
 </details>
 
+### OpenAI thinking effort
+
+OpenAI clients can set thinking effort on `/v1/chat/completions`:
+`reasoning_effort` is translated to Anthropic's `output_config.effort` when it
+is one of `low`, `medium`, `high`, `xhigh` or `max`. `minimal`, `none` and any
+other value are dropped with a warn log, and the request runs at the model's
+default effort — which can cost more than the low effort the client asked for.
+No `thinking` block is added.
+
+Per-model support is not checked. A model without effort support, or without
+the requested level, rejects the request with a non-retryable 400 (for example
+`This model does not support effort level 'xhigh'. Supported levels: high, low,
+max, medium.`), the same way OpenAI rejects `reasoning_effort` on a
+non-reasoning model. Before this translation existed the field was silently
+ignored, so a client that always sends it must now send it only to models that
+support it.
+
 ---
 
 ## OpenAI-Compatible Upstreams
