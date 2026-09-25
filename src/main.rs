@@ -3365,9 +3365,10 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     "auto-mode-classifier-*",
     "dangerous-tool-use-*",
     // Claude Code 2.1.278 per-turn family (LAB-3964). All three are
-    // body-paired with fields on the `role:"system"` entry inside `messages`;
-    // the LB forwards bodies verbatim, so stripping the header alone is the
-    // same hard-400 shape as the families above:
+    // body-paired with fields on the `role:"system"` entry inside `messages`.
+    // The orphaned-body strip only removes TOP-LEVEL fields, so it never
+    // reaches these nested ones: dropping any of these flags is still a hard
+    // 400 upstream, which is why they must stay on this list:
     //  - `mid-conversation-tool-changes-*` ↔ `tool_addition`/`tool_removal`
     //    content blocks. Claude Code answers the 400 by sticky-rejecting the
     //    beta for the rest of the conversation.
@@ -3527,20 +3528,6 @@ const BASE_BODY_FIELDS: &[&str] = &[
     "top_p",
 ];
 
-/// Beta flag family → the TOP-LEVEL body field it owns, for the paired betas
-/// the LB knows about. A field listed here survives only while its own flag
-/// survives the header filter on the SAME request, so the two halves are
-/// dropped together or kept together (LAB-1261).
-///
-/// Only top-level fields appear here. `extended-cache-ttl-*` pairs with a
-/// NESTED `cache_control.ttl` on content blocks, and `effort-*`/`task-budgets-*`
-/// nest inside `output_config`; none of them can be expressed as a top-level
-/// key, so dropping those families is still incoherent upstream. All three
-/// are on `DEFAULT_CLIENT_BETA_ALLOWLIST`, so none is dropped today.
-/// ponytail: top-level only. If a nested pairing ever fires in the wild, the
-/// upgrade is a targeted strip inside that one known structure — NOT a
-/// recursive unknown-key walk, which would eat `tools[].input_schema` and
-/// `tool_use.input`, both arbitrary client JSON by design.
 /// Every beta family the allow-list can pass, mapped to the TOP-LEVEL body
 /// fields it owns. An empty slice means "owns none" and is a real answer, not
 /// a placeholder — it is what lets the strip tell "this family brought no body
@@ -3565,6 +3552,10 @@ const BASE_BODY_FIELDS: &[&str] = &[
 /// `cache_control.ttl` and `effort-*` nests in `output_config`; both are
 /// listed as owning nothing, which is true of the top level and is the reason
 /// dropping either still 400s upstream.
+/// ponytail: top-level only. If a nested pairing ever fires in the wild, the
+/// upgrade is a targeted strip inside that one known structure — NOT a
+/// recursive unknown-key walk, which would eat `tools[].input_schema` and
+/// `tool_use.input`, both arbitrary client JSON by design.
 const BETA_BODY_FIELDS: &[(&str, &[&str])] = &[
     // The proxy's own flags — unconditionally re-added, never body-paired.
     ("oauth-2025-04-20", &[]),
