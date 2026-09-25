@@ -80,11 +80,11 @@ pub(crate) fn context_window_for(model: &str, has_1m_beta: bool) -> u64 {
     if !model.is_empty() && !model.starts_with("claude") {
         static WARNED: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
             std::sync::OnceLock::new();
-        if let Ok(mut warned) = WARNED.get_or_init(Default::default).lock() {
-            // Bounded like the client maps: model is client-controlled input.
-            if warned.len() < MAX_PROMPT_TOO_LONG_MODELS && warned.insert(model.to_string()) {
-                warn!(model, "unknown model family, assuming 200k context window");
-            }
+        let mut warned =
+            lock_recovering(WARNED.get_or_init(Default::default), "unknown_model_warned");
+        // Bounded like the client maps: model is client-controlled input.
+        if warned.len() < MAX_PROMPT_TOO_LONG_MODELS && warned.insert(model.to_string()) {
+            warn!(model, "unknown model family, assuming 200k context window");
         }
     }
     DEFAULT_CONTEXT_WINDOW
@@ -140,9 +140,7 @@ impl AppState {
             return;
         }
         let (client_id, agent_id, session_id) = rctx;
-        let Ok(mut map) = self.sessions.lock() else {
-            return;
-        };
+        let mut map = self.lock_sessions();
         if !map.contains_key(affinity_key) {
             let ttl = self.session_registry_ttl_secs;
             map.retain(|_, e| now.saturating_sub(e.last_seen) <= ttl);
@@ -190,7 +188,8 @@ impl AppState {
         affinity_key: Option<&str>,
         message: &str,
     ) {
-        if let Ok(mut counts) = self.prompt_too_long.lock() {
+        {
+            let mut counts = lock_recovering(&self.prompt_too_long, "prompt_too_long");
             let label = if counts.len() < MAX_PROMPT_TOO_LONG_MODELS || counts.contains_key(model) {
                 model
             } else {
@@ -221,9 +220,9 @@ impl AppState {
         endpoint_name: &str,
         headers: &reqwest::header::HeaderMap,
     ) {
-        if let Ok(mut counts) = self.fast_mode_429.lock() {
-            *counts.entry(endpoint_name.to_owned()).or_insert(0) += 1;
-        }
+        *lock_recovering(&self.fast_mode_429, "fast_mode_429")
+            .entry(endpoint_name.to_owned())
+            .or_insert(0) += 1;
         let retry_after_raw = headers
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
@@ -246,9 +245,9 @@ impl AppState {
     /// `classify_retry_status`. The cost is one zero-token round trip per
     /// refused request, visible on this counter.
     pub(crate) fn note_entitlement_400(&self, endpoint_name: &str) {
-        if let Ok(mut counts) = self.entitlement_400.lock() {
-            *counts.entry(endpoint_name.to_owned()).or_insert(0) += 1;
-        }
+        *lock_recovering(&self.entitlement_400, "entitlement_400")
+            .entry(endpoint_name.to_owned())
+            .or_insert(0) += 1;
         warn!(
             account = endpoint_name,
             "upstream 400: account out of extra usage (account not cooled; request re-sent at most once)"
@@ -260,42 +259,37 @@ impl AppState {
     /// session ids never leave the registry — the label is a hash of the
     /// affinity key and agent/session ids are truncated to 8 chars.
     pub(crate) fn sessions_snapshot(&self, now: u64) -> Vec<serde_json::Value> {
-        let mut rows: Vec<(f64, serde_json::Value)> = self
-            .sessions
-            .lock()
-            .map(|map| {
-                map.iter()
-                    .filter(|(_, e)| {
-                        now.saturating_sub(e.last_seen) <= self.session_registry_ttl_secs
-                    })
-                    .map(|(key, e)| {
-                        let pct = window_pct(e.last_prompt_tokens, e.context_window);
-                        let client_id = if self.is_operator(&e.client_id) {
-                            "_operator"
-                        } else {
-                            &e.client_id
-                        };
-                        let truncate8 = |s: &str| -> String { s.chars().take(8).collect() };
-                        (
-                            pct,
-                            serde_json::json!({
-                                "session": session_label(key),
-                                "client_id": client_id,
-                                "agent": truncate8(&e.agent_id),
-                                "session_prefix": truncate8(&e.session_id),
-                                "model": e.model,
-                                "endpoint": e.endpoint,
-                                "last_prompt_tokens": e.last_prompt_tokens,
-                                "context_window": e.context_window,
-                                "context_window_pct": pct,
-                                "requests": e.requests,
-                                "last_seen": e.last_seen,
-                            }),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut rows: Vec<(f64, serde_json::Value)> = {
+            let map = self.lock_sessions();
+            map.iter()
+                .filter(|(_, e)| now.saturating_sub(e.last_seen) <= self.session_registry_ttl_secs)
+                .map(|(key, e)| {
+                    let pct = window_pct(e.last_prompt_tokens, e.context_window);
+                    let client_id = if self.is_operator(&e.client_id) {
+                        "_operator"
+                    } else {
+                        &e.client_id
+                    };
+                    let truncate8 = |s: &str| -> String { s.chars().take(8).collect() };
+                    (
+                        pct,
+                        serde_json::json!({
+                            "session": session_label(key),
+                            "client_id": client_id,
+                            "agent": truncate8(&e.agent_id),
+                            "session_prefix": truncate8(&e.session_id),
+                            "model": e.model,
+                            "endpoint": e.endpoint,
+                            "last_prompt_tokens": e.last_prompt_tokens,
+                            "context_window": e.context_window,
+                            "context_window_pct": pct,
+                            "requests": e.requests,
+                            "last_seen": e.last_seen,
+                        }),
+                    )
+                })
+                .collect()
+        };
         rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         rows.truncate(SESSIONS_STATS_TOP_N);
         rows.into_iter().map(|(_, v)| v).collect()
@@ -312,24 +306,17 @@ impl AppState {
     ) -> ([u64; SESSION_TOKENS_BUCKETS.len() + 1], u64) {
         let mut cumulative = [0u64; SESSION_TOKENS_BUCKETS.len() + 1];
         let mut sum = 0u64;
-        match self.sessions.lock() {
-            Ok(map) => {
-                for e in map.values() {
-                    if now.saturating_sub(e.last_seen) > self.session_registry_ttl_secs {
-                        continue;
-                    }
-                    sum += e.last_prompt_tokens;
-                    for (i, le) in SESSION_TOKENS_BUCKETS.iter().enumerate() {
-                        if e.last_prompt_tokens <= *le {
-                            cumulative[i] += 1;
-                        }
-                    }
-                    cumulative[SESSION_TOKENS_BUCKETS.len()] += 1; // +Inf
+        for e in self.lock_sessions().values() {
+            if now.saturating_sub(e.last_seen) > self.session_registry_ttl_secs {
+                continue;
+            }
+            sum += e.last_prompt_tokens;
+            for (i, le) in SESSION_TOKENS_BUCKETS.iter().enumerate() {
+                if e.last_prompt_tokens <= *le {
+                    cumulative[i] += 1;
                 }
             }
-            // All-zero output with no trace would read as "no sessions";
-            // a poisoned registry lock deserves a diagnostic.
-            Err(_) => warn!("session_tokens_histogram: sessions registry lock poisoned"),
+            cumulative[SESSION_TOKENS_BUCKETS.len()] += 1; // +Inf
         }
         (cumulative, sum)
     }
@@ -695,7 +682,8 @@ impl AppState {
                 + usage.output_tokens
                 + usage.cache_creation_input_tokens
                 + usage.cache_read_input_tokens;
-            if let Ok(mut map) = self.client_usage.lock() {
+            {
+                let mut map = self.lock_client_usage();
                 // Bound new-key growth (user-controlled x-client-id); already-tracked
                 // clients keep accumulating past the cap.
                 if map.len() < MAX_TRACKED_CLIENTS || map.contains_key(client_id) {
@@ -715,7 +703,8 @@ impl AppState {
             } else {
                 truncate_label(model)
             };
-            if let Ok(mut map) = self.client_model_usage.lock() {
+            {
+                let mut map = self.lock_client_model_usage();
                 let key = (client_id.to_owned(), model);
                 let key = if map.len() < MAX_CLIENT_MODEL_LABELS || map.contains_key(&key) {
                     key
@@ -741,10 +730,9 @@ impl AppState {
     /// Update burn rate for an account and per-client request tracking.
     pub(crate) fn update_burn_rate(&self, burn_rate: &Mutex<BurnRate>, client_id: &str) {
         let now = Instant::now();
-        if let Ok(mut br) = burn_rate.lock() {
-            br.update(now);
-        }
-        if let Ok(mut rates) = self.client_request_rates.lock() {
+        lock_burn_rate(burn_rate).update(now);
+        {
+            let mut rates = self.lock_client_request_rates();
             // Bound new-key growth (client_id is the user-controlled x-client-id
             // header); already-tracked clients keep updating past the cap.
             if rates.len() < MAX_TRACKED_CLIENTS || rates.contains_key(client_id) {

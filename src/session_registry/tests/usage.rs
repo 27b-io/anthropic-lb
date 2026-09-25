@@ -214,6 +214,8 @@ async fn client_model_usage_is_bounded() {
     assert_eq!(other[0], 100);
 }
 
+// ── LAB-3214: one INFO line per proxied request ─────────────────
+
 /// Regression guard for the `proxied`+`usage` merge (LAB-3214): at the
 /// production default filter (`anthropic_lb=info`), a successful
 /// non-streaming `/v1/messages` request must produce exactly one INFO line

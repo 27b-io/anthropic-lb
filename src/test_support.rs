@@ -184,16 +184,6 @@ pub(crate) fn test_state_with_soft_limit(
     state
 }
 
-/// `test_state_with(vec![])` with a session-registry cap override (0 = off).
-/// Registry unit tests don't route, so no endpoints are needed.
-pub(crate) fn test_state_with_session_max(max: usize) -> Arc<AppState> {
-    let mut state = test_state_with(vec![]);
-    Arc::get_mut(&mut state)
-        .expect("test fixture should be uniquely owned")
-        .session_registry_max = max;
-    state
-}
-
 /// Spawn a mock upstream that returns a canned response with rate-limit headers.
 pub(crate) async fn spawn_mock_upstream() -> (String, tokio::task::JoinHandle<()>) {
     let app = Router::new().fallback(any(mock_upstream_handler));
@@ -484,13 +474,6 @@ pub(crate) async fn spawn_flaky_upstream(
     (format!("http://{addr}"), hits)
 }
 
-/// Raw-TCP upstream that RSTs its FIRST connection then serves a valid
-/// Anthropic 200 on every later connection — a sub-second egress blip.
-pub(crate) async fn spawn_blip_upstream() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>)
-{
-    spawn_flaky_upstream(1, ANTHROPIC_OK_BODY).await
-}
-
 /// Raw-TCP upstream that RSTs EVERY connection — a genuinely-down egress.
 pub(crate) async fn spawn_dead_upstream() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -504,9 +487,6 @@ pub(crate) async fn spawn_dead_upstream() -> String {
     });
     format!("http://{addr}")
 }
-
-// ── GH #97: OpenAI-endpoint 429 hard-limit cooldown + 529 BEBO ───────
-
 /// Raw-TCP upstream that serves `bad_head` (a complete pre-formatted HTTP
 /// response head with an empty body) for its first `bad_first` connections,
 /// then `ok_body` as a 200 on every later connection. Returns
@@ -580,15 +560,9 @@ pub(crate) async fn spawn_capturing_upstream(
     });
     (format!("http://{addr}"), rx)
 }
-
-// ── LAB-2675: a fast-mode 429 must not hard-limit the whole account ──
-
 /// Anthropic-shaped 429 carrying `retry-after: 7`. `connection: close` makes
 /// the (empty) body EOF-delimited, matching the other raw-TCP heads here.
 pub(crate) const HEAD_429_RETRY_AFTER_7: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n";
-
-// ── LAB-941: model-unsupported detection + negative-cache routing ────
-
 /// Raw 404 with Anthropic's model-not-found envelope (`connection: close`, so
 /// the body is EOF-delimited — no content-length needed).
 pub(crate) const HEAD_404_MODEL: &str = "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"model: claude-nope-1\"}}";
@@ -617,8 +591,19 @@ pub(crate) async fn poll_streamed_usage(state: &Arc<AppState>) -> (u64, u64) {
     recorded
 }
 
-// ── LAB-3214: one INFO line per proxied request ─────────────────
-
+/// Panic while holding `mutex`, leaving it poisoned — the state a future
+/// panicking edit inside a critical section would produce.
+pub(crate) fn poison<T: Send>(mutex: &std::sync::Mutex<T>) {
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let _g = mutex.lock().unwrap();
+            panic!("poison the mutex");
+        })
+        .join()
+        .unwrap_err();
+    });
+    assert!(mutex.is_poisoned());
+}
 /// `MakeWriter` over a shared buffer, so a test can capture what the stderr
 /// layer would have written and inspect it after the request completes.
 #[derive(Clone)]
@@ -670,9 +655,6 @@ pub(crate) fn log_capture_buf() -> Arc<Mutex<Vec<u8>>> {
     })
     .clone()
 }
-
-// ── Enforcement tests ──────────────────────────────────────────
-
 /// Helper: set up account utilization for enforcement tests.
 pub(crate) async fn set_account_utilization(
     state: &AppState,
@@ -757,14 +739,6 @@ pub(crate) fn mk_client(name: &str, key: &str, models: &[&str]) -> ClientConfig 
         preferred_endpoints: vec![],
         #[cfg(feature = "guard")]
         guard: crate::guard::GuardPolicy::default(),
-    }
-}
-
-/// `mk_client` with a `preferred_endpoints` pin (LAB-2636).
-pub(crate) fn mk_pinned_client(name: &str, key: &str, preferred: &[&str]) -> ClientConfig {
-    ClientConfig {
-        preferred_endpoints: preferred.iter().map(|s| s.to_string()).collect(),
-        ..mk_client(name, key, &[])
     }
 }
 

@@ -715,9 +715,7 @@ impl Guard {
     }
 
     fn record_verdict(&self, client_id: &str, scanner: &'static str, verdict: &'static str) {
-        let Ok(mut map) = self.verdicts.lock() else {
-            return;
-        };
+        let mut map = crate::lock_recovering(&self.verdicts, "guard_verdicts");
         let key = (client_id.to_owned(), scanner, verdict);
         let bounded = if map.len() < MAX_VERDICT_CLIENTS || map.contains_key(&key) {
             key
@@ -729,11 +727,10 @@ impl Guard {
 
     /// Snapshot of the verdicts counter for `/metrics`.
     pub fn verdicts_snapshot(&self) -> Vec<((String, &'static str, &'static str), u64)> {
-        self.verdicts
-            .lock()
-            .ok()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
-            .unwrap_or_default()
+        crate::lock_recovering(&self.verdicts, "guard_verdicts")
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
     }
 
     /// Snapshot of the scan-duration histogram for `/metrics`.

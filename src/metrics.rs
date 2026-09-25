@@ -187,10 +187,10 @@ async fn build_metrics_snap(
     total_headroom: &mut Option<u64>,
 ) -> EndpointMetricsSnap {
     let info = rate_info.read().await;
-    let (br_5m, br_1h, br_6h) = burn_rate
-        .lock()
-        .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
-        .unwrap_or((0.0, 0.0, 0.0));
+    let (br_5m, br_1h, br_6h) = {
+        let br = lock_burn_rate(burn_rate);
+        (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value)
+    };
 
     let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
         Some(rem)
@@ -288,15 +288,22 @@ async fn build_metrics_snap(
 /// naming it (`name`) so a panicked holder leaves evidence instead of being
 /// silently healed.
 ///
-/// Every map routed through here is a counter or accumulator store: a
-/// panicking holder can leave it stale by at most one update, never logically
-/// inconsistent, so its data is still the best answer. Clearing is the half
-/// that matters: a `Mutex` poison is permanent, so a site that skips on `Err`
-/// (`if let Ok(..)`, `.lock().ok()`) would skip forever after one panic. For
-/// `budget_usage` that skip is fail-OPEN — `check_budget` would grant every
-/// request and `record_budget_usage` would stop counting, for the life of the
-/// process. Recovery keeps enforcement live without making the fault itself a
-/// denial reason: the gate denies only on recovered usage data.
+/// Every production std `Mutex` in this crate is locked through here (the only bare
+/// `.lock()` left is the async `SAVE_LOCK`, which cannot poison). That is
+/// sound because each guarded value is either a counter/accumulator store or
+/// a map of independent, self-expiring entries (auth throttle windows, the
+/// unsupported-model cache, the session registry, log dedup/rate-limit
+/// stamps) or a single replaced value (cluster-info cache, burn-rate EWMAs).
+/// A panicking holder can leave one entry stale by at most one update, never
+/// break an invariant spanning entries, so the recovered data is still the
+/// best answer. Clearing is the half that matters: a `Mutex` poison is
+/// permanent, so a site that skips on `Err` (`if let Ok(..)`, `.lock().ok()`)
+/// would skip forever after one panic. For `budget_usage` and the auth
+/// throttle that skip is fail-OPEN — `check_budget` would grant every request,
+/// `AuthThrottle::check` would report "not throttled", and both would stop
+/// counting, for the life of the process. Recovery keeps enforcement live
+/// without making the fault itself a denial reason: the gate denies only on
+/// recovered data.
 ///
 /// Nothing in the guarded critical sections can currently panic, so this is
 /// defence against a future edit, not a live incident.
@@ -326,6 +333,13 @@ fn snapshot_counters(
         .iter()
         .map(|(k, v)| (k.clone(), *v))
         .collect()
+}
+
+/// Lock an account's burn-rate EWMA via `lock_recovering`. Every
+/// `burn_rate` site goes through here, so a panicked holder cannot freeze the
+/// tracker or pin its `/_stats` and `/metrics` readings at zero.
+pub(crate) fn lock_burn_rate(burn_rate: &Mutex<BurnRate>) -> std::sync::MutexGuard<'_, BurnRate> {
+    lock_recovering(burn_rate, "burn_rate")
 }
 
 pub(crate) async fn metrics_handler(
@@ -381,29 +395,18 @@ pub(crate) async fn metrics_handler(
 
     // Extract global maps once (single lock per map, then drop guard)
     let client_rates: HashMap<String, (u64, f64)> = state
-        .client_request_rates
-        .lock()
-        .ok()
-        .map(|g| {
-            g.iter()
-                .map(|(k, (total, ewma))| (k.clone(), (*total, ewma.value)))
-                .collect()
-        })
-        .unwrap_or_default();
-    let client_usage = state
-        .client_usage
-        .lock()
-        .ok()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+        .lock_client_request_rates()
+        .iter()
+        .map(|(k, (total, ewma))| (k.clone(), (*total, ewma.value)))
+        .collect();
+    let client_usage = state.lock_client_usage().clone();
     let client_model_usage: Vec<((String, String), [u64; 4])> = state
-        .client_model_usage
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
+        .lock_client_model_usage()
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
     let budget_usage = state.lock_budget_usage().clone();
-    let cluster_info = state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
+    let cluster_info = state.lock_cluster_info_cache().clone();
     let prompt_too_long = snapshot_counters(&state.prompt_too_long, "prompt_too_long");
     let fast_mode_429 = snapshot_counters(&state.fast_mode_429, "fast_mode_429");
     let entitlement_400 = snapshot_counters(&state.entitlement_400, "entitlement_400");
@@ -418,11 +421,10 @@ pub(crate) async fn metrics_handler(
     );
     let beta_flags_dropped = snapshot_counters(&state.beta_flags_dropped, "beta_flags_dropped");
     let client_rejections: Vec<((String, &'static str), u64)> = state
-        .client_rejections
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
+        .lock_client_rejections()
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
     let auth_failures: Vec<(AuthFailureKey, u64)> =
         lock_recovering(&state.auth_failures, "auth_failures")
             .iter()

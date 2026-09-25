@@ -1,5 +1,7 @@
 use super::*;
 
+// ── LAB-941: model-unsupported detection + negative-cache routing ────
+
 /// Wire-format detection: only genuine "this account can't serve the model"
 /// errors match; other 4xx (prompt too long, bad path) must not.
 #[test]

@@ -214,9 +214,9 @@ token = "sk-ant-api03-..."
 
 | Prefix | Auth method | Notes |
 |:-------|:------------|:------|
+| `passthrough` | Caller's headers | Exact match, checked before prefix dispatch; forwards client auth as-is |
 | `sk-ant-oat*` | `Authorization: Bearer` | OAuth token; beta headers injected automatically |
 | Any other token | `x-api-key` | Standard API keys, and anything not matching the OAuth prefix |
-| `passthrough` | Caller's headers | Forwards client auth as-is |
 
 > [!TIP]
 > Use `passthrough` when clients have their own Anthropic credentials and you only want load-balancing without token injection.

@@ -33,20 +33,6 @@ async fn budget_check_within_limit() {
     assert!(state.check_budget("unknown").await.is_ok());
 }
 
-/// Panic while holding `mutex`, leaving it poisoned — the state a future
-/// panicking edit inside a critical section would produce.
-fn poison<T: Send>(mutex: &std::sync::Mutex<T>) {
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            let _g = mutex.lock().unwrap();
-            panic!("poison the mutex");
-        })
-        .join()
-        .unwrap_err();
-    });
-    assert!(mutex.is_poisoned());
-}
-
 /// A poisoned `budget_usage` lock must not disable enforcement: `check_budget`
 /// still denies an exhausted client (an `if let Ok` skip returned `Ok(())`,
 /// granting the budget), and the poison is cleared so `record_budget_usage`

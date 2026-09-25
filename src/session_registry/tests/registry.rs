@@ -1,5 +1,15 @@
 use super::*;
 
+/// `test_state_with(vec![])` with a session-registry cap override (0 = off).
+/// Registry unit tests don't route, so no endpoints are needed.
+fn test_state_with_session_max(max: usize) -> Arc<AppState> {
+    let mut state = test_state_with(vec![]);
+    Arc::get_mut(&mut state)
+        .expect("test fixture should be uniquely owned")
+        .session_registry_max = max;
+    state
+}
+
 // ── LAB-916: session registry + context-window visibility ───────────
 
 #[test]

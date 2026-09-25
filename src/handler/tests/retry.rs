@@ -1,5 +1,11 @@
 use super::*;
 
+/// Raw-TCP upstream that RSTs its FIRST connection then serves a valid
+/// Anthropic 200 on every later connection — a sub-second egress blip.
+async fn spawn_blip_upstream() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    spawn_flaky_upstream(1, ANTHROPIC_OK_BODY).await
+}
+
 // ── Task 2: round-gated transient backoff-retry ─────────────────────
 
 /// A transient blip that recovers must surface as 200, not a 429-exhausted.
@@ -109,6 +115,8 @@ async fn proxy_returns_503_when_upstream_unreachable_transiently() {
         "503 exhaustion should carry Retry-After so the client times its backoff"
     );
 }
+
+// ── GH #97: OpenAI-endpoint 429 hard-limit cooldown + 529 BEBO ───────
 
 /// Values a fronting hop / an LB-aware client sends for every entry in
 /// `CLIENT_IDENTITY_HEADERS` — an independent oracle, kept in lockstep by

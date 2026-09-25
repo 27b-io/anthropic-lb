@@ -144,21 +144,3 @@ async fn stats_includes_burn_rate_and_headroom() {
     );
     assert!(body["aggregate"]["consumers"].is_object());
 }
-
-#[test]
-fn epoch_to_iso8601_known_values() {
-    // 2024-01-01T00:00:00Z = 1704067200
-    assert_eq!(
-        AppState::epoch_to_iso8601(1704067200),
-        "2024-01-01T00:00:00Z"
-    );
-    // Unix epoch
-    assert_eq!(AppState::epoch_to_iso8601(0), "1970-01-01T00:00:00Z");
-    // 2026-02-14T12:30:45Z = approximate check
-    let result = AppState::epoch_to_iso8601(1771157445);
-    assert!(
-        result.starts_with("2026-02-"),
-        "expected 2026-02, got {result}"
-    );
-    assert!(result.ends_with('Z'));
-}

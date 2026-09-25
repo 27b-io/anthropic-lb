@@ -27,10 +27,10 @@ async fn build_stats_entry(
     };
 
     // Burn rate from EWMA tracker
-    let (br_5m, br_1h, br_6h) = burn_rate
-        .lock()
-        .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
-        .unwrap_or((0.0, 0.0, 0.0));
+    let (br_5m, br_1h, br_6h) = {
+        let br = lock_burn_rate(burn_rate);
+        (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value)
+    };
 
     // Headroom: prefer remaining_requests header, else (1-util)*limit, else null
     let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
@@ -175,92 +175,84 @@ pub(crate) async fn stats_handler(
     }
 
     // Per-client usage (tokens + request rates)
-    let request_rates = state.client_request_rates.lock().ok();
-    let client_usage: serde_json::Value = state
-        .client_usage
-        .lock()
-        .map(|map| {
-            // Collect all client IDs from both token usage and request rates
-            let mut all_clients: std::collections::HashSet<&String> = map.keys().collect();
-            if let Some(ref rates) = request_rates {
-                all_clients.extend(rates.keys());
-            }
+    let request_rates = state.lock_client_request_rates();
+    let client_usage: serde_json::Value = {
+        let map = state.lock_client_usage();
+        // Collect all client IDs from both token usage and request rates
+        let mut all_clients: std::collections::HashSet<&String> = map.keys().collect();
+        all_clients.extend(request_rates.keys());
 
-            let obj: serde_json::Map<String, serde_json::Value> = all_clients
-                .into_iter()
-                .map(|k| {
-                    // Operator hiding: attribute operator data to a reserved key
-                    let display_key = if state.is_operator(k) {
-                        "_operator".to_string()
-                    } else {
-                        k.clone()
-                    };
-                    let tokens = map.get(k).copied().unwrap_or([0; 4]);
-                    let (req_total, req_per_min) = request_rates
-                        .as_ref()
-                        .and_then(|r| r.get(k))
-                        .map(|(total, ewma)| (*total, ewma.value))
-                        .unwrap_or((0, 0.0));
-                    (
-                        display_key,
-                        serde_json::json!({
-                            "input_tokens": tokens[0],
-                            "output_tokens": tokens[1],
-                            "cache_creation_input_tokens": tokens[2],
-                            "cache_read_input_tokens": tokens[3],
-                            "requests_total": req_total,
-                            "requests_per_minute": (req_per_min * 100.0).round() / 100.0,
-                        }),
-                    )
-                })
-                .collect();
-            serde_json::Value::Object(obj)
-        })
-        .unwrap_or(serde_json::json!({}));
+        let obj: serde_json::Map<String, serde_json::Value> = all_clients
+            .into_iter()
+            .map(|k| {
+                // Operator hiding: attribute operator data to a reserved key
+                let display_key = if state.is_operator(k) {
+                    "_operator".to_string()
+                } else {
+                    k.clone()
+                };
+                let tokens = map.get(k).copied().unwrap_or([0; 4]);
+                let (req_total, req_per_min) = request_rates
+                    .get(k)
+                    .map(|(total, ewma)| (*total, ewma.value))
+                    .unwrap_or((0, 0.0));
+                (
+                    display_key,
+                    serde_json::json!({
+                        "input_tokens": tokens[0],
+                        "output_tokens": tokens[1],
+                        "cache_creation_input_tokens": tokens[2],
+                        "cache_read_input_tokens": tokens[3],
+                        "requests_total": req_total,
+                        "requests_per_minute": (req_per_min * 100.0).round() / 100.0,
+                    }),
+                )
+            })
+            .collect();
+        serde_json::Value::Object(obj)
+    };
 
     // Aggregate: total headroom + per-consumer share
     let aggregate = {
         let mut consumers = serde_json::Map::new();
         let mut total_rpm = 0.0_f64;
-        if let Some(ref rates) = request_rates {
-            for (client, (_, ewma)) in rates.iter() {
-                let display_key = if state.is_operator(client) {
-                    "_operator".to_string()
-                } else {
-                    client.clone()
-                };
-                total_rpm += ewma.value;
-                let entry = consumers.entry(display_key).or_insert_with(
-                    || serde_json::json!({"requests_per_minute": 0.0, "share": 0.0}),
+        for (client, (_, ewma)) in request_rates.iter() {
+            let display_key = if state.is_operator(client) {
+                "_operator".to_string()
+            } else {
+                client.clone()
+            };
+            total_rpm += ewma.value;
+            let entry = consumers
+                .entry(display_key)
+                .or_insert_with(|| serde_json::json!({"requests_per_minute": 0.0, "share": 0.0}));
+            if let Some(obj) = entry.as_object_mut() {
+                let cur = obj
+                    .get("requests_per_minute")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                obj.insert(
+                    "requests_per_minute".to_string(),
+                    serde_json::json!(cur + ewma.value),
                 );
-                if let Some(obj) = entry.as_object_mut() {
-                    let cur = obj
+            }
+        }
+        // Compute shares
+        if total_rpm > 0.0 {
+            for (_client, val) in consumers.iter_mut() {
+                if let Some(obj) = val.as_object_mut() {
+                    let rpm = obj
                         .get("requests_per_minute")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.0);
                     obj.insert(
                         "requests_per_minute".to_string(),
-                        serde_json::json!(cur + ewma.value),
+                        serde_json::json!((rpm * 100.0).round() / 100.0),
                     );
-                }
-            }
-            // Compute shares
-            if total_rpm > 0.0 {
-                for (_client, val) in consumers.iter_mut() {
-                    if let Some(obj) = val.as_object_mut() {
-                        let rpm = obj
-                            .get("requests_per_minute")
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.0);
-                        obj.insert(
-                            "requests_per_minute".to_string(),
-                            serde_json::json!((rpm * 100.0).round() / 100.0),
-                        );
-                        obj.insert(
-                            "share".to_string(),
-                            serde_json::json!(((rpm / total_rpm) * 1000.0).round() / 1000.0),
-                        );
-                    }
+                    obj.insert(
+                        "share".to_string(),
+                        serde_json::json!(((rpm / total_rpm) * 1000.0).round() / 1000.0),
+                    );
                 }
             }
         }
@@ -300,8 +292,7 @@ pub(crate) async fn stats_handler(
 
     // Cluster info (when Redis is available)
     // Read from cache (updated by background sync task) to avoid .await in handler
-    let cluster: Option<serde_json::Value> =
-        state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
+    let cluster: Option<serde_json::Value> = state.lock_cluster_info_cache().clone();
 
     let mut response = serde_json::json!({
         "endpoints": endpoint_stats,

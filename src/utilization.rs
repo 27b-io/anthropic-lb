@@ -1478,9 +1478,7 @@ impl AppState {
             return;
         }
         let now = Instant::now();
-        let Ok(mut map) = self.unsupported_models.lock() else {
-            return;
-        };
+        let mut map = self.lock_unsupported_models();
         map.retain(|_, expiry| *expiry > now);
         // Capacity gates NEW pairs only — refreshing an existing pair's TTL
         // doesn't grow the map and must not starve under sustained rejections.
@@ -1505,14 +1503,11 @@ impl AppState {
             return Vec::new();
         }
         let now = Instant::now();
-        match self.unsupported_models.lock() {
-            Ok(map) => map
-                .iter()
-                .filter(|((_, m), expiry)| m == model && **expiry > now)
-                .map(|((idx, _), _)| *idx)
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        self.lock_unsupported_models()
+            .iter()
+            .filter(|((_, m), expiry)| m == model && **expiry > now)
+            .map(|((idx, _), _)| *idx)
+            .collect()
     }
 
     /// True when EVERY endpoint whose config allows `model` carries a live

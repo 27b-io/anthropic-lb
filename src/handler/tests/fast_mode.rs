@@ -1,5 +1,7 @@
 use super::*;
 
+// ── LAB-2675: a fast-mode 429 must not hard-limit the whole account ──
+
 /// Two Anthropic endpoints: priority-0 always 429s, priority-1 always 200s.
 /// Speed-agnostic — both the fast-mode test and its standard-speed control
 /// drive it; only the request body differs.

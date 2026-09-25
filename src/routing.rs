@@ -1279,9 +1279,7 @@ impl AppState {
 
         // 5. Refresh cluster info cache for /_stats endpoint
         let info = self.cluster_info().await;
-        if let Ok(mut cache) = self.cluster_info_cache.lock() {
-            *cache = info;
-        }
+        *self.lock_cluster_info_cache() = info;
     }
 
     /// Lock the transport-error accumulator via `lock_recovering`. Every
@@ -1299,6 +1297,47 @@ impl AppState {
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<String, (u64, u64)>> {
         lock_recovering(&self.budget_usage, "budget_usage")
+    }
+
+    // One `lock_recovering` accessor per multi-site map, so a new site cannot
+    // reach for a bare `.lock()` and skip on poison for the process lifetime.
+
+    pub(crate) fn lock_client_rejections(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(String, &'static str), u64>> {
+        lock_recovering(&self.client_rejections, "client_rejections")
+    }
+
+    pub(crate) fn lock_client_usage(&self) -> std::sync::MutexGuard<'_, HashMap<String, [u64; 4]>> {
+        lock_recovering(&self.client_usage, "client_usage")
+    }
+
+    pub(crate) fn lock_client_model_usage(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(String, String), [u64; 4]>> {
+        lock_recovering(&self.client_model_usage, "client_model_usage")
+    }
+
+    pub(crate) fn lock_client_request_rates(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, (u64, Ewma)>> {
+        lock_recovering(&self.client_request_rates, "client_request_rates")
+    }
+
+    pub(crate) fn lock_unsupported_models(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(usize, String), Instant>> {
+        lock_recovering(&self.unsupported_models, "unsupported_models")
+    }
+
+    pub(crate) fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionEntry>> {
+        lock_recovering(&self.sessions, "sessions")
+    }
+
+    pub(crate) fn lock_cluster_info_cache(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<serde_json::Value>> {
+        lock_recovering(&self.cluster_info_cache, "cluster_info_cache")
     }
 
     /// Log + count client `anthropic-beta` flags dropped by the allow-list
@@ -1324,9 +1363,7 @@ impl AppState {
                 &f[..end]
             })
             .collect();
-        let Ok(mut map) = self.beta_flags_dropped.lock() else {
-            return;
-        };
+        let mut map = lock_recovering(&self.beta_flags_dropped, "beta_flags_dropped");
         // Loud line only on a flag's FIRST sighting — a misconfigured client
         // sends the same unlisted flag at request rate, and the counter
         // already carries the volume. Repeats log at debug for correlation.
@@ -1404,9 +1441,7 @@ impl AppState {
         // payload hide the actionable field behind eight junk ones and leave
         // no trace that anything else went (Helly R finding 3).
         let over_cap = stripped.len().saturating_sub(keys.len()) as u64;
-        let Ok(mut map) = self.beta_body_fields_stripped.lock() else {
-            return;
-        };
+        let mut map = lock_recovering(&self.beta_body_fields_stripped, "beta_body_fields_stripped");
         if over_cap > 0 {
             *map.entry("_other".to_string()).or_insert(0) += over_cap;
         }

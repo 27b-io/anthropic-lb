@@ -1087,6 +1087,44 @@ async fn poisoned_counter_lock_is_recovered_not_zeroed() {
     );
 }
 
+/// `client_rejections` has no `snapshot_counters` reader to clear its poison:
+/// both its writer and the `/metrics` render skipped on `Err`, so one panicked
+/// holder published an empty series and stopped counting for the life of the
+/// process. Driven through the real `/metrics` render.
+#[tokio::test]
+async fn poisoned_client_rejections_lock_is_recovered_not_zeroed() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-aaa")]);
+    state.note_client_rejection("client-a", "budget");
+    poison(&state.client_rejections);
+
+    let addr = serve(build_router(state.clone())).await;
+    let body = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains(r#"anthropic_client_rejections_total{client="client-a",reason="budget"} 1"#),
+        "/metrics must publish the real count through a poisoned lock:\n{body}"
+    );
+    assert!(!state.client_rejections.is_poisoned());
+
+    state.note_client_rejection("client-a", "budget");
+    assert_eq!(
+        state
+            .client_rejections
+            .lock()
+            .unwrap()
+            .get(&("client-a".to_string(), "budget"))
+            .copied(),
+        Some(2),
+        "counting must resume once the poison is cleared"
+    );
+}
+
 /// Stripped field names are JSON object keys — client-controlled bytes with
 /// none of the CR/LF guarantee hyper gives header tokens. Unsanitized they
 /// reach a plain-text log subscriber, where an embedded newline forges whole

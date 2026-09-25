@@ -1,5 +1,13 @@
 use super::*;
 
+/// `mk_client` with a `preferred_endpoints` pin (LAB-2636).
+fn mk_pinned_client(name: &str, key: &str, preferred: &[&str]) -> ClientConfig {
+    ClientConfig {
+        preferred_endpoints: preferred.iter().map(|s| s.to_string()).collect(),
+        ..mk_client(name, key, &[])
+    }
+}
+
 // ── LAB-2636 / #151: per-client endpoint pinning (preferred_endpoints) ──
 
 /// Two-endpoint pool with a client pinned to "dedicated". `soft_limit` at the

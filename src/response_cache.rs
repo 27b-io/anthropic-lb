@@ -504,6 +504,13 @@ impl AuthThrottle {
         }
     }
 
+    /// Lock the failure table via `lock_recovering`. Every `entries` site
+    /// MUST go through here: a skip-on-poison lock would make `check` report
+    /// "not throttled" and `record_failure` stop counting (fail-open).
+    fn lock_entries(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, (Instant, u32)>> {
+        lock_recovering(&self.entries, "auth_throttle")
+    }
+
     /// Returns `Some(retry_after_secs)` while `ip` is throttled. Expired
     /// windows are removed on sight, so steady-state size tracks only IPs
     /// that failed recently.
@@ -511,7 +518,7 @@ impl AuthThrottle {
         if self.max_failures == 0 {
             return None;
         }
-        let mut entries = self.entries.lock().ok()?;
+        let mut entries = self.lock_entries();
         let (start, count) = *entries.get(ip)?;
         let elapsed = start.elapsed();
         if elapsed >= self.window {
@@ -533,9 +540,7 @@ impl AuthThrottle {
         if self.max_failures == 0 {
             return;
         }
-        let Ok(mut entries) = self.entries.lock() else {
-            return;
-        };
+        let mut entries = self.lock_entries();
         match entries.get_mut(&ip) {
             Some((start, count)) => {
                 if start.elapsed() >= self.window {
@@ -838,9 +843,7 @@ impl AppState {
     /// Rate-limiter for the `allow_unauthenticated` admin-access warn: true at
     /// most once per route per `OPEN_ADMIN_WARN_INTERVAL`.
     fn should_warn_open_admin(&self, route: &'static str) -> bool {
-        let Ok(mut last) = self.open_admin_warn.lock() else {
-            return true;
-        };
+        let mut last = lock_recovering(&self.open_admin_warn, "open_admin_warn");
         let now = Instant::now();
         match last.get(route) {
             Some(t) if t.elapsed() < OPEN_ADMIN_WARN_INTERVAL => false,
@@ -1077,9 +1080,7 @@ impl AppState {
     /// — keeping the reason label so overflow traffic still charts by cause.
     /// Callers already log the rejection; this only feeds `/metrics`.
     pub(crate) fn note_client_rejection(&self, client_id: &str, reason: &'static str) {
-        let Ok(mut counts) = self.client_rejections.lock() else {
-            return;
-        };
+        let mut counts = self.lock_client_rejections();
         let key = (truncate_label(client_id), reason);
         // Tracked = the CLIENT has any entry, not this exact (client, reason)
         // pair: a tracked client's first rejection under a new reason must

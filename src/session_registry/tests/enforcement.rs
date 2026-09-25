@@ -150,6 +150,8 @@ async fn metrics_expose_client_rejections() {
     );
 }
 
+// ── Enforcement tests ──────────────────────────────────────────
+
 #[tokio::test]
 async fn limit_all_below() {
     let now = AppState::now_epoch();
