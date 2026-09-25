@@ -25074,9 +25074,9 @@ fn one_request_cannot_exhaust_the_strip_counter() {
 /// `/metrics` used to read this map with `.lock().ok().unwrap_or_default()`,
 /// so one panicking holder emitted an empty series — a zero no alert can tell
 /// apart from a real one. Logging and still returning empty would not have
-/// fixed it: every writer takes the lock with `let Ok(..) else { return }`,
-/// so after one panic the counter is dead, not merely stale. Clearing the
-/// poison is the half that keeps it alive.
+/// fixed it: a `Mutex` poison is permanent, so any site that skips on `Err`
+/// would skip forever after one panic. Clearing the poison is the half that
+/// keeps it alive.
 ///
 /// Driven through the real router rather than by calling `snapshot_counters`
 /// directly, for the same reason `metrics_local_fallback_recovers_poisoned_lock`
@@ -25114,14 +25114,14 @@ async fn poisoned_counter_lock_is_recovered_not_zeroed() {
         "/metrics must publish the real count through a poisoned lock, not a zero \
          indistinguishable from a genuine one:\n{body}"
     );
-
-    // Clearing the poison is what keeps the counter alive: the increment path
-    // bails on a poisoned lock, so without it the series freezes here.
-    state.record_stripped_body_fields("c1", &["speed".to_string()], &["fast-mode-x".to_string()]);
+    // Checked before the next write: the writer clears poison too, so only
+    // here does this prove the render cleared it.
     assert!(
         !state.beta_body_fields_stripped.is_poisoned(),
-        "the render must have cleared the poison, or counting stops for good"
+        "the /metrics render must have cleared the poison"
     );
+
+    state.record_stripped_body_fields("c1", &["speed".to_string()], &["fast-mode-x".to_string()]);
     assert_eq!(
         state
             .beta_body_fields_stripped
