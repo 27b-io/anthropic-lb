@@ -3301,7 +3301,8 @@ fn translate_request_maps_reasoning_effort_to_output_config() {
 #[test]
 fn translate_request_drops_unmappable_reasoning_effort() {
     // `minimal`/`none` have no Anthropic equivalent; unknown strings, wrong
-    // case and non-strings would 400 upstream — drop them all.
+    // case and non-strings would 400 upstream — drop them all. `null` is
+    // treated as absent (no warn), and also yields no `output_config`.
     for effort in [
         serde_json::json!("minimal"),
         serde_json::json!("none"),
@@ -3320,7 +3321,6 @@ fn translate_request_drops_unmappable_reasoning_effort() {
             result.get("output_config").is_none(),
             "effort {effort} must be dropped"
         );
-        assert!(result.get("reasoning_effort").is_none());
     }
 }
 

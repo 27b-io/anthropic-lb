@@ -3615,15 +3615,21 @@ fn drops_deprecated_temperature(model: &str, value: &serde_json::Value) -> bool 
     true
 }
 
-/// Map an OpenAI `reasoning_effort` onto Anthropic's `output_config.effort`,
-/// so OpenAI clients can set thinking effort. Only values the Anthropic API
-/// accepts pass; `minimal`/`none` (no Anthropic equivalent), unknown strings
-/// and non-strings are dropped with a warn — forwarding them would 400 the
-/// whole request, and the client must not silently lose the effort it asked
-/// for without an operator-visible trace. No `thinking` block is synthesised:
-/// adaptive-thinking models decide when to think on their own.
-fn openai_reasoning_effort(value: &serde_json::Value) -> Option<&str> {
+/// Translate an OpenAI `reasoning_effort` into Anthropic's
+/// `output_config.effort`, so OpenAI clients can set thinking effort. Only
+/// level names the Anthropic API defines pass; per-model support is not
+/// checked here — a model that lacks the level answers with an explicit 400,
+/// the same way OpenAI rejects `reasoning_effort` on non-reasoning models.
+/// `minimal`/`none`, unknown strings and non-strings would 400 on every model,
+/// so they are dropped with a warn that makes the loss visible to operators.
+/// `null` is treated as absent: clients that serialise unset fields must not
+/// warn on every request. No `thinking` block is synthesised: adaptive-thinking
+/// models decide when to think on their own.
+fn translate_reasoning_effort(value: &serde_json::Value) -> Option<&str> {
     const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+    if value.is_null() {
+        return None;
+    }
     let effort = value.as_str().filter(|e| EFFORTS.contains(e));
     if effort.is_none() {
         warn!(
@@ -12777,9 +12783,10 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
         }
     }
 
+    // reasoning_effort -> output_config.effort (policy in `translate_reasoning_effort`)
     if let Some(effort) = body
         .get("reasoning_effort")
-        .and_then(openai_reasoning_effort)
+        .and_then(translate_reasoning_effort)
     {
         out.insert(
             "output_config".to_string(),
