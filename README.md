@@ -52,7 +52,7 @@ Routes requests across multiple Anthropic accounts using dynamic capacity-based 
 | **Shadow logging** | Optional JSONL file with request metadata, tokens, latency |
 | **Model routing** | Per-account model allowlists with wildcard prefix matching |
 | **Client identification** | Via `X-Client-ID` header or IP-based mapping |
-| **Streaming** | SSE/streaming responses flow through with usage extraction |
+| **Streaming** | SSE/streaming responses flow through with usage extraction (streams from `openai` endpoints are forwarded but not debited — see [What doesn't translate](#what-doesnt-translate)) |
 | **State persistence** | Utilization + reset times + status survive restarts |
 | **OpenAI-compatible endpoints** | Route to OpenAI-format APIs as first-class endpoints (`protocol = "openai"`) |
 | **~6 MB binary** | Zero runtime dependencies |
@@ -170,7 +170,7 @@ token = "sk-ant-api03-..."
 | Field | Type | Default | Description |
 |:------|:-----|:--------|:------------|
 | `listen` | `String` | — | Bind address (e.g. `"127.0.0.1:8082"`) |
-| `rate_limit_cooldown_secs` | `u64` | `60` | Seconds to cool down after 429 |
+| `rate_limit_cooldown_secs` | `u64` | `5` | Fallback cooldown after a capacity 429 when upstream sends no usable `retry-after` (burst 429s use their own 5→60s backoff) |
 | `probe_interval_secs` | `u64` | `300` | Seconds between utilization probes (0 = disabled) |
 | `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id` |
 | `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`) |
@@ -195,7 +195,7 @@ token = "sk-ant-api03-..."
 | `emergency_threshold` | `f64` | `0.88` | Utilization threshold for emergency brake |
 | `redis_url` | `String?` | `None` | Redis/Valkey URL for distributed state |
 | `expose_upstream_ratelimit_headers` | `bool` | `false` | Reflect upstream `anthropic-ratelimit-*` headers to callers — they reveal the pooled capacity of every account, so enable on trusted networks only |
-| `allowed_client_betas` | `[String]?` | built-in list | Client `anthropic-beta` flags forwarded upstream on OAuth endpoints (`*` suffix wildcard); a configured list **replaces** the built-in default — copy the defaults alongside additions. Unlisted flags are dropped, logged, and counted (`anthropic_beta_flag_dropped_total`) so a caller can't activate arbitrary beta features against the operator's accounts |
+| `allowed_client_betas` | `[String]?` | built-in list | Client `anthropic-beta` flags forwarded upstream on OAuth endpoints (`*` suffix wildcard); a configured list **replaces** the built-in default — copy the defaults alongside additions. Unlisted flags are dropped, logged, and counted (`anthropic_beta_flag_dropped_total`) so a caller can't activate arbitrary beta features against the operator's accounts. A drop also strips any top-level body field belonging to a dropped flag (`anthropic_beta_body_field_stripped_total`), so a paired beta degrades off instead of failing the request |
 | `endpoints[].name` | `String` | — | Display name for the endpoint |
 | `endpoints[].protocol` | `String` | `"anthropic"` | `"anthropic"` (default) or `"openai"` |
 | `endpoints[].base_url` | `String?` | `https://api.anthropic.com` | Base URL; required and must be `https://` for `openai` |
@@ -215,7 +215,7 @@ token = "sk-ant-api03-..."
 | Prefix | Auth method | Notes |
 |:-------|:------------|:------|
 | `sk-ant-oat*` | `Authorization: Bearer` | OAuth token; beta headers injected automatically |
-| `sk-ant-api*` | `x-api-key` | Standard API key |
+| Any other token | `x-api-key` | Standard API keys, and anything not matching the OAuth prefix |
 | `passthrough` | Caller's headers | Forwards client auth as-is |
 
 > [!TIP]
@@ -367,7 +367,7 @@ Those headers stop here. Once the client IP is resolved, the proxy drops `x-forw
 
 ### Failed-auth throttling
 
-This in-process throttle bounds the volume of detailed `401` responses; it does not reduce credential-comparison throughput. Credential-stuffing and request-rate controls belong at the public ingress. After `auth_failure_limit` failures from one client IP inside `auth_failure_window_secs`, further **invalid** credentials from that IP get `429` with `retry-after`. Credential comparison runs first, before the throttle check, so a known-good principal still passes when NATs and load balancers collapse unrelated callers onto one resolved address. Successful requests do not clear the shared IP's failure window, so invalid traffic remains throttled until expiry. This trade relies on the enforced `MIN_KEY_LEN = 32`; if the credential floor is lowered, the throttle check should run before credential comparison instead. Failures are counted in `anthropic_auth_failures_total{route}` and logged with the resolved client IP. The throttle table is bounded (4096 IPs), so the tracking structure itself cannot be flooded into an OOM — and eviction is threat-aware: expired windows are purged first, then the least-established live entry (lowest failure count, oldest window as tie-breaker) is evicted, so a flood of fresh failures cannot flush an active lockout to reset it.
+This in-process throttle bounds the volume of detailed `401` responses; it does not reduce credential-comparison throughput. Credential-stuffing and request-rate controls belong at the public ingress. After `auth_failure_limit` failures from one client IP inside `auth_failure_window_secs`, further **invalid** credentials from that IP get `429` with `retry-after`. Credential comparison runs first, before the throttle check, so a known-good principal still passes when NATs and load balancers collapse unrelated callers onto one resolved address. Successful requests do not clear the shared IP's failure window, so invalid traffic remains throttled until expiry. This trade relies on the enforced `MIN_KEY_LEN = 32`; if the credential floor is lowered, the throttle check should run before credential comparison instead. Failures are counted in `anthropic_auth_failures_total{route,cred}` and logged with the resolved client IP plus, because every caller behind a NAT gateway or TCP-forwarding VIP resolves to one address, the attribution the IP cannot give: the actual TCP `peer` socket address (IP:port — distinct from the resolved client IP once `trusted_proxies` is in play), the header shape the credential arrived in (`cred`: `none` / `x-api-key` / `bearer` / `auth-other`), a one-way 12-hex `key_fp` of the presented value for `x-api-key`/`bearer` (never the value or any prefix of it — `auth-other` gets no fingerprint, since there is no bare credential to hash), and the `ua` clipped to 64 chars. The user-agent is deliberately not a metric label: its series would be claimed by whoever fails first on a public ingress. To check whether a suspect key is the one being rejected, fingerprint it the same way and compare: `python3 -c 'import hashlib,sys; print(hashlib.blake2s(b"anthropic-lb/auth-fp\x1f" + sys.argv[1].encode()).hexdigest()[:12])' "$KEY"`. The throttle table is bounded (4096 IPs), so the tracking structure itself cannot be flooded into an OOM — and eviction is threat-aware: expired windows are purged first, then the least-established live entry (lowest failure count, oldest window as tie-breaker) is evicted, so a flood of fresh failures cannot flush an active lockout to reset it.
 
 ### Credential-path hardening
 
@@ -395,11 +395,46 @@ can steer are locked down by default:
   `anthropic_beta_flag_dropped_total{flag}`. The built-in default covers the
   flags the proxy itself needs, the flag families Claude Code sends, and
   `fast-mode-*`; the authoritative list is `DEFAULT_CLIENT_BETA_ALLOWLIST`
-  in `src/main.rs`. Some families pair with a request-body field (`fast-mode-*`
-  with top-level `speed: "fast"`; the auto-mode classifier pair
-  `dangerous-tool-use-*` + `auto-mode-classifier-*` with top-level
-  `safeguards`), and the body is forwarded verbatim — so dropping the header
-  alone is a hard upstream `400`, not a quiet downgrade.
+  in `src/main.rs`. Known body pairings — top-level ones degrade quietly
+  when their flag is dropped (next bullet); nested ones still `400`, which is
+  why their flags stay on the default list:
+  - `context-management-*` ↔ top-level `context_management`
+  - `fast-mode-*` ↔ top-level `speed: "fast"`
+  - `dangerous-tool-use-*` + `auto-mode-classifier-*` ↔ top-level `safeguards`
+  - *(nested)* `mid-conversation-tool-changes-*`, `per-turn-control-*`,
+    `timing-*` ↔ `tool_addition`/`tool_removal` blocks and
+    `output_config.effort`/`timing` on the `role: "system"` entry in `messages`
+- **A dropped flag takes its body field with it.** Some beta families pair a
+  header flag with a top-level request-body field that only exists when the
+  flag is declared (the top-level pairings above). Forwarding
+  that field without its flag is a hard upstream `400`, not a quiet downgrade,
+  so when the filter drops anything the proxy also removes every top-level
+  body field that is neither base `/v1/messages` schema nor owned by a flag
+  that survived the SAME request. Scoped to `/v1/messages` and
+  `/v1/messages/count_tokens` — every other route forwards its body
+  byte-for-byte whatever the filter did to the header. Retained fields are
+  spliced through as their original bytes, so nothing below the top level is
+  reformatted.
+
+  The keep-side depends on `BETA_BODY_FIELDS` being **total** over the
+  allow-list: a surviving flag protects its body field only if a row claims
+  it, and a family with no row would have its field deleted out from under a
+  caller entitled to use it. A build-time test enforces that. If a flag
+  survives that has no row at all — an operator's custom
+  `allowed_client_betas` carrying a family this binary predates — the proxy
+  cannot tell that family's fields from an orphan's, so it forwards the body
+  untouched and forgoes the degrade for that request. Restoring a stripped
+  feature therefore needs BOTH an allow-list entry and a `BETA_BODY_FIELDS`
+  row: the allow-list stops the header being dropped, the row is what protects
+  the body half. The feature turns off; the request still
+  works — including for a beta family this proxy has never heard of, with no
+  allow-list change. Strips are counted in
+  `anthropic_beta_body_field_stripped_total{field}` and warned on first
+  sighting; a non-zero rate means a paired family is in live traffic and
+  needs both an allow-list entry and a row. Nested pairings
+  (`extended-cache-ttl-*` → `cache_control.ttl`, and the per-turn family's
+  fields inside `messages`) are out of scope — they are on the default
+  allow-list and so are never dropped.
 - **Fast mode routes around non-entitled orgs.** Fast mode is an
   org-level entitlement, and a pool can span several Anthropic orgs. When an
   account answers a `speed: "fast"` request with the upstream `400` "Fast
@@ -409,9 +444,9 @@ can steer are locked down by default:
   `fast_mode_disabled_remaining_secs` on `/_stats`). Later fast requests skip
   it — a client pinned to it via `preferred_endpoints` spills to the general
   pool — while requests without `speed: "fast"` keep using it. The proxy
-  never strips `speed` on the client's behalf — if no eligible account is entitled, the
-  client gets the upstream `400` verbatim rather than a silent downgrade or a
-  synthetic `429`.
+  never strips `speed` to get around a non-entitled org: if no eligible
+  account is entitled, the client gets the upstream `400` verbatim rather
+  than a silent downgrade or a synthetic `429`.
 - **A fast-mode `429` is forwarded to the caller, not treated as account
   exhaustion.** Fast mode (`speed: "fast"`) bills against its own rate bucket,
   separate from the account's 5h/7d windows, so a `429` on a fast request does
@@ -782,6 +817,17 @@ priority = 100   # tried only after Anthropic tiers are exhausted
 
 The configured `token` is injected as `Authorization: Bearer`, and the request is forwarded to `base_url` with automatic Anthropic↔OpenAI translation (any proxied path) or direct passthrough (`POST /v1/chat/completions`). Routing by `priority` is how an OpenAI endpoint replaces the old `fallback_upstream`: give it a high `priority` so free Anthropic capacity drains first.
 
+### What doesn't translate
+
+The Anthropic↔OpenAI translation layer is not lossless. When an Anthropic-format request is routed to an `openai` endpoint:
+
+- **Silently dropped** (no OpenAI equivalent, request proceeds without them): `thinking` (extended reasoning), `cache_control` / prompt caching, `top_k`, `metadata`. The passthrough set is only `temperature`, `top_p`, `stream`, `max_tokens`, `stop_sequences`.
+- **Silently dropped**: `tool_choice: {"type": "none"}` — the only unhandled `tool_choice` variant.
+- **Hard 400, no retry** (request itself is the problem, so rotating endpoints won't help): `document` blocks (PDFs) and image `source.type` values other than `base64`/`url`, when they sit directly in a user message's `content`. The same blocks inside `tool_result.content` or an assistant turn are silently dropped instead.
+- **Streaming responses from `openai` endpoints record no token usage** — budget/utilization checks still run, but nothing is debited (non-streaming has been debited since [#107](https://github.com/27b-io/anthropic-lb/pull/107)).
+- **In-band upstream SSE error events are dropped mid-stream on translated streams** (Anthropic-format requests streamed from an `openai` endpoint) rather than surfaced to the client ([#94](https://github.com/27b-io/anthropic-lb/issues/94), open); direct passthrough (`POST /v1/chat/completions`) forwards them unchanged.
+- **The emergency brake only watches Anthropic endpoints** and fires pre-routing: once the Anthropic pool is saturated it 429s every authenticated non-operator request that clears the model allow-list, budget and utilization checks (operator clients bypass it), even ones whose model is served exclusively by an `openai` endpoint with capacity to spare.
+
 ---
 
 ## How It Works
@@ -805,8 +851,8 @@ The configured `token` is injected as `Authorization: Bearer`, and the request i
 12. If 429 → mark rate-limited (propagate to Redis), add to skip list, retry with next account
 13. If 5xx/529 → add to skip list, retry with different account
 14. Parse rate-limit headers (utilization per claim, reset times, status)
-15. Extract token usage from response (streaming SSE or JSON body)
-16. Record usage per-account + per-client, update budget (local + Redis)
+15. Extract token usage from response (streaming SSE or JSON body; streams from `openai` endpoints have no usage extraction)
+16. Record extracted usage per-account + per-client, update budget (local + Redis)
 17. Write shadow log entry (async, non-blocking)
 18. State persisted to disk (+ Redis if configured), restored on restart
 ```
