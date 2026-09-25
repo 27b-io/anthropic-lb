@@ -525,10 +525,10 @@ same 400 rather than forwarded unscanned:
 - `messages` is present but is not an array — a string, an object, a number,
   `null`. The scanner reads that field as an array, so none of it reaches the
   scan while all of it reaches the upstream. This applies on every path. A body
-  carrying **no** `messages` key is not rejected, on any path including
-  `/v1/messages`: the proxy serves every Anthropic endpoint through one
-  handler, and most of them (`/v1/complete`, `/v1/models`) never send the
-  field;
+  carrying **no** `messages` key is not rejected on any path but
+  `/v1/chat/completions` (below), `/v1/messages` included: the proxy serves
+  every Anthropic endpoint through one handler, and most of them
+  (`/v1/complete`, `/v1/models`) never send the field;
 - `messages` is an array the scanner cannot read — an element that is not an
   object, a `role` absent / not a string / not `user` or `assistant` (`"User"`
   included: the compare is exact), or a newest-turn `content` present in a shape
@@ -549,16 +549,19 @@ same 400 rather than forwarded unscanned:
 
 What is **not** rejected: a readable document that simply carries no text the
 scanner reads. An image-only turn, a conversation with no `user` turn yet, and a
-non-Messages body all forward untouched under `block` — the guard read them and
-there was nothing to scan, which is not a scan failure.
+non-Messages body on any path but `/v1/chat/completions` all forward untouched
+under `block` — the guard read them and there was nothing to scan, which is not
+a scan failure.
 
 A JSON null cannot hide content, so the guard reads `null` as absent. Where an
 absent field passes — a newest-turn `content`, a text block's `text`, a
 `tool_result.content` — so does `null`, and a client whose serializer emits
 `null` for an omitted optional is not rejected. Where absence is rejected — a
 message's `role`, a content block's `type` — so is `null`. The one exception is
-`messages` itself: a body with no `messages` key is not a Messages request and
-forwards, but `messages: null` names the field and is rejected, as listed above.
+`messages` itself. On any path but `/v1/chat/completions` a body with no
+`messages` key is not a Messages request and forwards, but `messages: null` names
+the field and is rejected. `/v1/chat/completions` requires `messages` and rejects
+both, as listed above.
 
 A block-mode client must therefore send JSON Messages traffic in a shape the
 scanner can parse, and keep scannable content within the limit. `annotate` (shadow mode) never rejects — it
