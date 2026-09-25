@@ -84,7 +84,7 @@ Operational notes that affect the code:
 
 ## Architecture
 
-Single Rust binary: all implementation in `src/main.rs` (~9800 lines) with section markers; tests live in `src/tests.rs`, wired in as `#[path = "tests.rs"] mod tests;` (extracted from inline in LAB-367/#93). No library crate.
+Single Rust binary, no library crate. `src/main.rs` holds startup (`main`, config validation) and declares one module per subsystem (`src/config.rs`, `src/state.rs`, `src/routing.rs`, `src/handler.rs`, `src/metrics.rs`, …), each cut from one `// ── Section ──` block of the former single-file source. The crate keeps one flat namespace: every module opens with `use crate::*;` and `src/main.rs` glob-imports every module that exports names (`use state::*;` …), so an item used outside its own module is `pub(crate)` and nothing needs a module path. `routing` and `persistence` hold only `impl AppState` blocks and have no glob; the first `pub(crate)` item added to one of them needs its `use <module>::*;` line. Tests sit next to the code they test, as `#[cfg(test)] mod tests` in `src/<module>/tests.rs`, split into `src/<module>/tests/<area>.rs` where a module has many; shared fixtures live in `src/test_support.rs` and tests of `src/main.rs` itself in `src/tests.rs`. Put a new item in the module whose section it belongs to; do not grow `src/main.rs`.
 
 ### Core Data Flow
 
@@ -103,7 +103,7 @@ Request → resolve_client_ip(peer, x-forwarded-for vs trusted_proxies) → IP a
 | **Auto-cache** (`inject_cache_breakpoints`) | Injects up to 3 prompt cache breakpoints (last tool, system, last user message) unless cache_control already present |
 | **Handlers** | Four axum handlers: `proxy_handler` (main Anthropic proxy), `stats_handler` (`/_stats` JSON), `metrics_handler` (`/metrics` Prometheus), `openai_chat_handler` (OpenAI→Anthropic format translation) |
 | **OpenAI compatibility** (`translate_*`, `StreamContext`) | Translates `/v1/chat/completions` requests/responses between OpenAI and Anthropic formats, including streaming SSE |
-| **Tests** (`mod tests` → `src/tests.rs`) | Unit + integration tests using mock upstream servers |
+| **Tests** (`src/<module>/tests.rs`, fixtures in `src/test_support.rs`) | Unit + integration tests using mock upstream servers |
 
 ### Endpoint Selection (`pick_endpoint`)
 
