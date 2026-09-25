@@ -1890,6 +1890,13 @@ impl AuthThrottle {
         }
     }
 
+    /// Lock the failure table via `lock_recovering`. Every `entries` site
+    /// MUST go through here: a skip-on-poison lock would make `check` report
+    /// "not throttled" and `record_failure` stop counting (fail-open).
+    fn lock_entries(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, (Instant, u32)>> {
+        lock_recovering(&self.entries, "auth_throttle")
+    }
+
     /// Returns `Some(retry_after_secs)` while `ip` is throttled. Expired
     /// windows are removed on sight, so steady-state size tracks only IPs
     /// that failed recently.
@@ -1897,7 +1904,7 @@ impl AuthThrottle {
         if self.max_failures == 0 {
             return None;
         }
-        let mut entries = self.entries.lock().ok()?;
+        let mut entries = self.lock_entries();
         let (start, count) = *entries.get(ip)?;
         let elapsed = start.elapsed();
         if elapsed >= self.window {
@@ -1919,9 +1926,7 @@ impl AuthThrottle {
         if self.max_failures == 0 {
             return;
         }
-        let Ok(mut entries) = self.entries.lock() else {
-            return;
-        };
+        let mut entries = self.lock_entries();
         match entries.get_mut(&ip) {
             Some((start, count)) => {
                 if start.elapsed() >= self.window {
@@ -2224,9 +2229,7 @@ impl AppState {
     /// Rate-limiter for the `allow_unauthenticated` admin-access warn: true at
     /// most once per route per `OPEN_ADMIN_WARN_INTERVAL`.
     fn should_warn_open_admin(&self, route: &'static str) -> bool {
-        let Ok(mut last) = self.open_admin_warn.lock() else {
-            return true;
-        };
+        let mut last = lock_recovering(&self.open_admin_warn, "open_admin_warn");
         let now = Instant::now();
         match last.get(route) {
             Some(t) if t.elapsed() < OPEN_ADMIN_WARN_INTERVAL => false,
@@ -2311,49 +2314,73 @@ impl AppState {
     /// Fail closed under `block`: a body the guard could not scan in full
     /// cannot be certified clean, so it is rejected rather than forwarded
     /// unscanned (LAB-3877 review). Two cases, both bypasses of an enforcing
-    /// policy otherwise: `unscannable` — the caller sent content the scanner
-    /// cannot read (a non-empty body that did not parse, or an OpenAI shape
-    /// translation cannot map), so a parse differential vs the upstream could
+    /// policy otherwise: [`guard::ScanOutcome::Unscannable`] — the scanner could
+    /// not READ the document, so a parse differential vs the upstream could
     /// smuggle content past the scan — and a newest turn longer than the scan
     /// cap, whose tail was never inspected (the "pad past the cap, then the
-    /// secret" bypass). A body that parsed but carried no scannable text (e.g.
-    /// an image-only turn) is NOT a scan failure and is allowed. Annotate /
-    /// shadow mode never rejects — it measures best-effort.
+    /// secret" bypass). [`guard::ScanOutcome::NothingToScan`] — the document was
+    /// readable and carried no text (e.g. an image-only turn) — is NOT a scan
+    /// failure and is allowed. Annotate / shadow mode never rejects: it measures
+    /// best-effort.
     ///
-    /// `unscannable` carries its own reason because the causes are not alike:
-    /// the body that did not parse and the body whose `messages` is the wrong
-    /// shape both reach here, and telling a client the second was a parse
-    /// failure sends whoever debugs it after a JSON syntax error that is not
-    /// there. Reasons are `&'static str` — no request content may enter them.
+    /// LAB-4358: the discrimination is read straight off the outcome the scanner
+    /// returned. It used to arrive as a separate `unscannable` argument each
+    /// handler derived for itself from the body's `messages` shape, which is how
+    /// the two surfaces drifted into disagreeing about which shapes were
+    /// readable at all. The reason strings are `&'static str` by construction —
+    /// no request content may enter a rejection body or a log line.
     #[cfg(feature = "guard")]
     fn guard_hook(
         &self,
         req_id: &str,
         client_id: &str,
-        unscannable: Option<&'static str>,
-        input: Option<&guard::ScanInput>,
+        outcome: &guard::ScanOutcome,
         openai_shape: bool,
     ) -> Result<Option<usize>, Box<Response>> {
         let policy = self.client_guard_policy(client_id);
+        let input = match outcome {
+            guard::ScanOutcome::Scannable(input) => Some(input),
+            guard::ScanOutcome::NothingToScan | guard::ScanOutcome::Unscannable(_) => None,
+        };
         let truncated = input.is_some_and(guard::ScanInput::truncated);
-        if policy == guard::GuardPolicy::Block {
-            let reason = if let Some(reason) = unscannable {
-                Some(reason)
-            } else if truncated {
-                Some("request exceeds the guard scan limit and cannot be scanned in full")
-            } else {
-                None
-            };
-            if let Some(reason) = reason {
+        // Why this request cannot be certified clean, if it cannot. The two
+        // causes are not alike and neither is `NothingToScan`: the scanner could
+        // not READ the document, or it read a newest turn whose tail ran past
+        // the scan cap.
+        let unreadable = match outcome {
+            guard::ScanOutcome::Unscannable(reason) => Some(*reason),
+            _ if truncated => Some(guard::REASON_SCAN_TRUNCATED),
+            _ => None,
+        };
+        if let Some(reason) = unreadable {
+            // Logged under EVERY policy, not just `block`. Shadow mode exists so
+            // an operator can size the blast radius before flipping a client to
+            // `block`; a fail-closed cause that only logs once it is already
+            // rejecting makes the one number they need unmeasurable until the
+            // outage. `would-block` is the same event `block` would reject on.
+            //
+            // Only `block` is a WARN: it is rejecting traffic. `would-block` is
+            // shadow telemetry, and unconfigured clients default to `annotate`,
+            // so every oversized tool-result turn would otherwise raise a
+            // warning nobody needs to act on. INFO is the production default
+            // filter, so the rollout signal still ships.
+            if policy == guard::GuardPolicy::Block {
                 warn!(
                     req_id,
                     client_id = %client_id,
                     verdict = "block",
                     reason,
-                    "guard: fail-closed (unscannable under block policy)"
+                    "guard: unscannable request"
                 );
                 return Err(Box::new(guard_blocked_response(&[], reason, openai_shape)));
             }
+            info!(
+                req_id,
+                client_id = %client_id,
+                verdict = "would-block",
+                reason,
+                "guard: unscannable request"
+            );
         }
         let (verdict, findings, reason) = match self.guard.evaluate(policy, client_id, input) {
             guard::Verdict::Allow => return Ok(None),
@@ -2439,9 +2466,7 @@ impl AppState {
     /// — keeping the reason label so overflow traffic still charts by cause.
     /// Callers already log the rejection; this only feeds `/metrics`.
     fn note_client_rejection(&self, client_id: &str, reason: &'static str) {
-        let Ok(mut counts) = self.client_rejections.lock() else {
-            return;
-        };
+        let mut counts = self.lock_client_rejections();
         let key = (truncate_label(client_id), reason);
         // Tracked = the CLIENT has any entry, not this exact (client, reason)
         // pair: a tracked client's first rejection under a new reason must
@@ -4564,9 +4589,7 @@ impl AppState {
             return;
         }
         let now = Instant::now();
-        let Ok(mut map) = self.unsupported_models.lock() else {
-            return;
-        };
+        let mut map = self.lock_unsupported_models();
         map.retain(|_, expiry| *expiry > now);
         // Capacity gates NEW pairs only — refreshing an existing pair's TTL
         // doesn't grow the map and must not starve under sustained rejections.
@@ -4591,14 +4614,11 @@ impl AppState {
             return Vec::new();
         }
         let now = Instant::now();
-        match self.unsupported_models.lock() {
-            Ok(map) => map
-                .iter()
-                .filter(|((_, m), expiry)| m == model && **expiry > now)
-                .map(|((idx, _), _)| *idx)
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        self.lock_unsupported_models()
+            .iter()
+            .filter(|((_, m), expiry)| m == model && **expiry > now)
+            .map(|((idx, _), _)| *idx)
+            .collect()
     }
 
     /// True when EVERY endpoint whose config allows `model` carries a live
@@ -6248,9 +6268,7 @@ impl AppState {
 
         // 5. Refresh cluster info cache for /_stats endpoint
         let info = self.cluster_info().await;
-        if let Ok(mut cache) = self.cluster_info_cache.lock() {
-            *cache = info;
-        }
+        *self.lock_cluster_info_cache() = info;
     }
 
     /// Lock the transport-error accumulator via `lock_recovering`. Every
@@ -6264,6 +6282,43 @@ impl AppState {
     /// one panicked holder into permanently disabled budgets (fail-open).
     fn lock_budget_usage(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, u64)>> {
         lock_recovering(&self.budget_usage, "budget_usage")
+    }
+
+    // One `lock_recovering` accessor per multi-site map: a convenience that
+    // pins each map's lock-name string in one place.
+
+    fn lock_client_rejections(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(String, &'static str), u64>> {
+        lock_recovering(&self.client_rejections, "client_rejections")
+    }
+
+    fn lock_client_usage(&self) -> std::sync::MutexGuard<'_, HashMap<String, [u64; 4]>> {
+        lock_recovering(&self.client_usage, "client_usage")
+    }
+
+    fn lock_client_model_usage(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(String, String), [u64; 4]>> {
+        lock_recovering(&self.client_model_usage, "client_model_usage")
+    }
+
+    fn lock_client_request_rates(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, Ewma)>> {
+        lock_recovering(&self.client_request_rates, "client_request_rates")
+    }
+
+    fn lock_unsupported_models(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(usize, String), Instant>> {
+        lock_recovering(&self.unsupported_models, "unsupported_models")
+    }
+
+    fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionEntry>> {
+        lock_recovering(&self.sessions, "sessions")
+    }
+
+    fn lock_cluster_info_cache(&self) -> std::sync::MutexGuard<'_, Option<serde_json::Value>> {
+        lock_recovering(&self.cluster_info_cache, "cluster_info_cache")
     }
 
     /// Log + count client `anthropic-beta` flags dropped by the allow-list
@@ -6289,9 +6344,7 @@ impl AppState {
                 &f[..end]
             })
             .collect();
-        let Ok(mut map) = self.beta_flags_dropped.lock() else {
-            return;
-        };
+        let mut map = lock_recovering(&self.beta_flags_dropped, "beta_flags_dropped");
         // Loud line only on a flag's FIRST sighting — a misconfigured client
         // sends the same unlisted flag at request rate, and the counter
         // already carries the volume. Repeats log at debug for correlation.
@@ -6369,9 +6422,7 @@ impl AppState {
         // payload hide the actionable field behind eight junk ones and leave
         // no trace that anything else went (Helly R finding 3).
         let over_cap = stripped.len().saturating_sub(keys.len()) as u64;
-        let Ok(mut map) = self.beta_body_fields_stripped.lock() else {
-            return;
-        };
+        let mut map = lock_recovering(&self.beta_body_fields_stripped, "beta_body_fields_stripped");
         if over_cap > 0 {
             *map.entry("_other".to_string()).or_insert(0) += over_cap;
         }
@@ -7118,11 +7169,11 @@ fn context_window_for(model: &str, has_1m_beta: bool) -> u64 {
     if !model.is_empty() && !model.starts_with("claude") {
         static WARNED: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
             std::sync::OnceLock::new();
-        if let Ok(mut warned) = WARNED.get_or_init(Default::default).lock() {
-            // Bounded like the client maps: model is client-controlled input.
-            if warned.len() < MAX_PROMPT_TOO_LONG_MODELS && warned.insert(model.to_string()) {
-                warn!(model, "unknown model family, assuming 200k context window");
-            }
+        let mut warned =
+            lock_recovering(WARNED.get_or_init(Default::default), "unknown_model_warned");
+        // Bounded like the client maps: model is client-controlled input.
+        if warned.len() < MAX_PROMPT_TOO_LONG_MODELS && warned.insert(model.to_string()) {
+            warn!(model, "unknown model family, assuming 200k context window");
         }
     }
     DEFAULT_CONTEXT_WINDOW
@@ -7178,9 +7229,7 @@ impl AppState {
             return;
         }
         let (client_id, agent_id, session_id) = rctx;
-        let Ok(mut map) = self.sessions.lock() else {
-            return;
-        };
+        let mut map = self.lock_sessions();
         if !map.contains_key(affinity_key) {
             let ttl = self.session_registry_ttl_secs;
             map.retain(|_, e| now.saturating_sub(e.last_seen) <= ttl);
@@ -7228,7 +7277,8 @@ impl AppState {
         affinity_key: Option<&str>,
         message: &str,
     ) {
-        if let Ok(mut counts) = self.prompt_too_long.lock() {
+        {
+            let mut counts = lock_recovering(&self.prompt_too_long, "prompt_too_long");
             let label = if counts.len() < MAX_PROMPT_TOO_LONG_MODELS || counts.contains_key(model) {
                 model
             } else {
@@ -7255,9 +7305,9 @@ impl AppState {
     /// trace that makes a client looping `speed: "fast"` visible instead of
     /// silent (LAB-2675).
     fn note_fast_mode_429(&self, endpoint_name: &str, headers: &reqwest::header::HeaderMap) {
-        if let Ok(mut counts) = self.fast_mode_429.lock() {
-            *counts.entry(endpoint_name.to_owned()).or_insert(0) += 1;
-        }
+        *lock_recovering(&self.fast_mode_429, "fast_mode_429")
+            .entry(endpoint_name.to_owned())
+            .or_insert(0) += 1;
         let retry_after_raw = headers
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
@@ -7280,9 +7330,9 @@ impl AppState {
     /// `classify_retry_status`. The cost is one zero-token round trip per
     /// refused request, visible on this counter.
     fn note_entitlement_400(&self, endpoint_name: &str) {
-        if let Ok(mut counts) = self.entitlement_400.lock() {
-            *counts.entry(endpoint_name.to_owned()).or_insert(0) += 1;
-        }
+        *lock_recovering(&self.entitlement_400, "entitlement_400")
+            .entry(endpoint_name.to_owned())
+            .or_insert(0) += 1;
         warn!(
             account = endpoint_name,
             "upstream 400: account out of extra usage (account not cooled; request re-sent at most once)"
@@ -7294,42 +7344,37 @@ impl AppState {
     /// session ids never leave the registry — the label is a hash of the
     /// affinity key and agent/session ids are truncated to 8 chars.
     fn sessions_snapshot(&self, now: u64) -> Vec<serde_json::Value> {
-        let mut rows: Vec<(f64, serde_json::Value)> = self
-            .sessions
-            .lock()
-            .map(|map| {
-                map.iter()
-                    .filter(|(_, e)| {
-                        now.saturating_sub(e.last_seen) <= self.session_registry_ttl_secs
-                    })
-                    .map(|(key, e)| {
-                        let pct = window_pct(e.last_prompt_tokens, e.context_window);
-                        let client_id = if self.is_operator(&e.client_id) {
-                            "_operator"
-                        } else {
-                            &e.client_id
-                        };
-                        let truncate8 = |s: &str| -> String { s.chars().take(8).collect() };
-                        (
-                            pct,
-                            serde_json::json!({
-                                "session": session_label(key),
-                                "client_id": client_id,
-                                "agent": truncate8(&e.agent_id),
-                                "session_prefix": truncate8(&e.session_id),
-                                "model": e.model,
-                                "endpoint": e.endpoint,
-                                "last_prompt_tokens": e.last_prompt_tokens,
-                                "context_window": e.context_window,
-                                "context_window_pct": pct,
-                                "requests": e.requests,
-                                "last_seen": e.last_seen,
-                            }),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut rows: Vec<(f64, serde_json::Value)> = {
+            let map = self.lock_sessions();
+            map.iter()
+                .filter(|(_, e)| now.saturating_sub(e.last_seen) <= self.session_registry_ttl_secs)
+                .map(|(key, e)| {
+                    let pct = window_pct(e.last_prompt_tokens, e.context_window);
+                    let client_id = if self.is_operator(&e.client_id) {
+                        "_operator"
+                    } else {
+                        &e.client_id
+                    };
+                    let truncate8 = |s: &str| -> String { s.chars().take(8).collect() };
+                    (
+                        pct,
+                        serde_json::json!({
+                            "session": session_label(key),
+                            "client_id": client_id,
+                            "agent": truncate8(&e.agent_id),
+                            "session_prefix": truncate8(&e.session_id),
+                            "model": e.model,
+                            "endpoint": e.endpoint,
+                            "last_prompt_tokens": e.last_prompt_tokens,
+                            "context_window": e.context_window,
+                            "context_window_pct": pct,
+                            "requests": e.requests,
+                            "last_seen": e.last_seen,
+                        }),
+                    )
+                })
+                .collect()
+        };
         rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         rows.truncate(SESSIONS_STATS_TOP_N);
         rows.into_iter().map(|(_, v)| v).collect()
@@ -7343,24 +7388,17 @@ impl AppState {
     fn session_tokens_histogram(&self, now: u64) -> ([u64; SESSION_TOKENS_BUCKETS.len() + 1], u64) {
         let mut cumulative = [0u64; SESSION_TOKENS_BUCKETS.len() + 1];
         let mut sum = 0u64;
-        match self.sessions.lock() {
-            Ok(map) => {
-                for e in map.values() {
-                    if now.saturating_sub(e.last_seen) > self.session_registry_ttl_secs {
-                        continue;
-                    }
-                    sum += e.last_prompt_tokens;
-                    for (i, le) in SESSION_TOKENS_BUCKETS.iter().enumerate() {
-                        if e.last_prompt_tokens <= *le {
-                            cumulative[i] += 1;
-                        }
-                    }
-                    cumulative[SESSION_TOKENS_BUCKETS.len()] += 1; // +Inf
+        for e in self.lock_sessions().values() {
+            if now.saturating_sub(e.last_seen) > self.session_registry_ttl_secs {
+                continue;
+            }
+            sum += e.last_prompt_tokens;
+            for (i, le) in SESSION_TOKENS_BUCKETS.iter().enumerate() {
+                if e.last_prompt_tokens <= *le {
+                    cumulative[i] += 1;
                 }
             }
-            // All-zero output with no trace would read as "no sessions";
-            // a poisoned registry lock deserves a diagnostic.
-            Err(_) => warn!("session_tokens_histogram: sessions registry lock poisoned"),
+            cumulative[SESSION_TOKENS_BUCKETS.len()] += 1; // +Inf
         }
         (cumulative, sum)
     }
@@ -7726,7 +7764,8 @@ impl AppState {
                 + usage.output_tokens
                 + usage.cache_creation_input_tokens
                 + usage.cache_read_input_tokens;
-            if let Ok(mut map) = self.client_usage.lock() {
+            {
+                let mut map = self.lock_client_usage();
                 // Bound new-key growth (user-controlled x-client-id); already-tracked
                 // clients keep accumulating past the cap.
                 if map.len() < MAX_TRACKED_CLIENTS || map.contains_key(client_id) {
@@ -7746,7 +7785,8 @@ impl AppState {
             } else {
                 truncate_label(model)
             };
-            if let Ok(mut map) = self.client_model_usage.lock() {
+            {
+                let mut map = self.lock_client_model_usage();
                 let key = (client_id.to_owned(), model);
                 let key = if map.len() < MAX_CLIENT_MODEL_LABELS || map.contains_key(&key) {
                     key
@@ -7772,10 +7812,9 @@ impl AppState {
     /// Update burn rate for an account and per-client request tracking.
     fn update_burn_rate(&self, burn_rate: &Mutex<BurnRate>, client_id: &str) {
         let now = Instant::now();
-        if let Ok(mut br) = burn_rate.lock() {
-            br.update(now);
-        }
-        if let Ok(mut rates) = self.client_request_rates.lock() {
+        lock_burn_rate(burn_rate).update(now);
+        {
+            let mut rates = self.lock_client_request_rates();
             // Bound new-key growth (client_id is the user-controlled x-client-id
             // header); already-tracked clients keep updating past the cap.
             if rates.len() < MAX_TRACKED_CLIENTS || rates.contains_key(client_id) {
@@ -8236,7 +8275,12 @@ fn has_oauth_system_prompt(body: &serde_json::Value) -> bool {
 ///   `system[0]` is a Claude Code attribution block, so the upstream's
 ///   positional strip of that block still fires
 fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
-    if has_oauth_system_prompt(body) {
+    // Shared mutator: the `body["system"] = …` assignments below are the
+    // only `IndexMut<&str>` on a client-controlled `Value` in the request
+    // path, and that operator panics on anything but Null/Object. The
+    // invariant lives here, with the lines that need it, not with whatever
+    // callers happen to pre-validate today (LAB-4314).
+    if !body.is_object() || has_oauth_system_prompt(body) {
         return;
     }
 
@@ -8739,12 +8783,9 @@ async fn classify_retry_status(
         // no `retry-after`, no rate headers) is a per-minute RPM/concurrency
         // limit on the ACCOUNT, not on a rate bucket, so it is real evidence
         // about the account whatever speed the request asked for. Exempting it
-        // would be worse than the bug: `x-should-retry` is not in
-        // `reflect_upstream_headers`'s allow-list, so the caller would get a
-        // bare 429 with no transient hint AND no rotation, while the account
-        // stayed pinned — and standard traffic routed to that same account
-        // would then burst-429 and hard-limit it, reinstating the denial via
-        // the victim's own requests (LAB-2675 panel finding).
+        // would leave the account pinned: standard traffic routed to it would
+        // burst-429 and hard-limit it anyway. The caller still gets
+        // `x-should-retry` as its transient hint (LAB-2675 panel finding).
         //
         // What this does NOT buy: the ticket assumed the utilization ceilings
         // would still cover a fast request on an exhausted account, because
@@ -8982,6 +9023,11 @@ fn model_unsupported_response(model: &str, openai_shape: bool) -> Response {
 /// image source type the translator doesn't support). The caller's request
 /// was Anthropic Messages API shaped, so the error response matches that,
 /// regardless of which protocol the fallback endpoint speaks.
+///
+/// Also `proxy_handler`'s rejection of a valid-JSON non-object body
+/// (LAB-4314). That handler is the router fallback, so the rejected request
+/// may be any method on any path; the envelope is still the right shape,
+/// since it is what the Anthropic upstream returns for the same body.
 fn untranslatable_request_response(message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -9010,14 +9056,15 @@ fn reflect_upstream_headers(
     expose_ratelimit: bool,
 ) -> axum::http::response::Builder {
     // What SDKs need to function: body framing (content-type/length),
-    // SSE cache hint, the Anthropic request id for error reports, and
-    // retry-after on forwarded 4xx.
+    // SSE cache hint, the Anthropic request id for error reports, retry-after
+    // on forwarded 4xx, and the upstream's transient retry hint.
     const ALLOWED: &[&str] = &[
         "content-type",
         "content-length",
         "cache-control",
         "request-id",
         "retry-after",
+        "x-should-retry",
     ];
     for (k, v) in headers.iter() {
         let name = k.as_str();
@@ -9276,14 +9323,15 @@ async fn forward_anthropic(
     // Use OAuth variant (with CC system prompt) for OAuth tokens, and its
     // beta-coherent rewrite when the filter orphaned a body field (LAB-1261).
     let req_body = if token.starts_with(OAUTH_TOKEN_PREFIX) {
-        // `dropped` is only ever non-empty on this branch, so a rewrite
-        // without it would mean the filter's contract changed underneath us.
-        debug_assert!(coherent_body.is_none() || token.starts_with(OAUTH_TOKEN_PREFIX));
         match &coherent_body {
             Some((rewritten, _)) => rewritten,
             None => oauth_body_bytes,
         }
     } else {
+        // Only the OAuth arm of `inject_account_auth` fills `dropped`, so a
+        // rewrite here would be discarded after `record_stripped_body_fields`
+        // and the fast-mode reclassification had already acted on it.
+        debug_assert!(coherent_body.is_none());
         body_bytes
     };
     upstream_req = upstream_req.body(req_body.clone());
@@ -9773,24 +9821,6 @@ async fn maybe_cache_store(
     Response::from_parts(parts, Body::from(bytes))
 }
 
-/// LAB-4322/LAB-4341: the one reason string for a `messages` the scanner
-/// cannot read as an array. Both surfaces reach it — `openai_chat_handler`
-/// because translation rewrites the field into an EMPTY array before the
-/// scanner sees it, `proxy_handler` because `ScanInput::from_body` reads it
-/// through the same `.as_array()` and yields nothing to scan. Shared so the
-/// two can never drift into describing the same shape two different ways.
-///
-/// The text covers BOTH causes because the surfaces disagree on which ones
-/// they reject: `/v1/chat/completions` is a single API that requires the
-/// field, so absent is malformed there and takes this reason too, while the
-/// `proxy_handler` fallback must keep forwarding the `messages`-less bodies of
-/// `/v1/complete` and `/v1/models` and so only ever reaches it for a present
-/// field of the wrong shape. Naming one cause would misdescribe the other to
-/// the client reading `error.message`.
-#[cfg(feature = "guard")]
-const GUARD_REASON_MESSAGES_NOT_ARRAY: &str =
-    "request `messages` is missing or not an array and cannot be scanned";
-
 /// LAB-3877: build the HTTP 400 for a `block` verdict. The body carries finding
 /// offsets and labels only — never the matched text — so an error surfaced to a
 /// client (or captured in its logs) cannot itself leak the secret it flagged.
@@ -9916,35 +9946,36 @@ async fn proxy_handler(
     // pre-injection, so it sees exactly what the client sent (auto-cache
     // injection adds cache_control only, but extracting before it keeps the
     // guard trivially body-neutral). The scan itself runs later, after
-    // `pre_request_gate`. `None` for a non-JSON body — nothing to inspect.
-    #[cfg(feature = "guard")]
-    let mut guard_input: Option<guard::ScanInput> = None;
-    // Whether the body parsed as JSON at all — distinct from whether scannable
-    // user text was found. Under `block`, an UNPARSEABLE body fails closed (a
-    // parse differential vs upstream must not forward unscanned), but a body
-    // that parsed with no scannable text (e.g. an image-only turn) has nothing
-    // to scan and is allowed.
-    #[cfg(feature = "guard")]
-    let mut guard_body_parsed = false;
-    // LAB-4341: `messages` present but NOT an array — a string, an object, a
-    // number, `null`. Tracked apart from `guard_input` because both surface as
-    // `None` there: an image-only turn genuinely has no text and is allowed,
-    // while this is content the scanner structurally cannot reach.
+    // `pre_request_gate`.
     //
-    // Keyed on PRESENT-and-wrong-shape, not on "not an array", because this
-    // handler is the router's `.fallback` — `/v1/complete`, `/v1/models`,
-    // `/upstream/<name>/...` all land here and carry no `messages` key at all.
-    // Treating absent as unscannable would take every non-Messages endpoint
-    // offline for `block` clients. That is the opposite of the OpenAI surface,
-    // where `/v1/chat/completions` is one API that requires the field, so
-    // absent there IS a malformed Messages request.
+    // LAB-4358: this holds the scanner's own three-way verdict on the body.
+    // `NothingToScan` is the right default for the bodiless request
+    // (`GET /v1/models`) — nothing was sent, so nothing failed to scan — and is
+    // replaced below by whichever of the three the body turns out to be. No
+    // `messages`-shape predicate is re-derived here: `ScanInput::from_body` owns
+    // that discrimination for both surfaces, so the two cannot drift.
     #[cfg(feature = "guard")]
-    let mut guard_messages_unscannable: Option<&'static str> = None;
+    let mut guard_outcome = guard::ScanOutcome::NothingToScan;
 
     // Parse body once for model extraction, optional cache injection, and
     // the fast-mode flag that picks the rate bucket downstream.
     let (body_bytes, oauth_body_bytes, model, fp, cache_key, is_fast_mode) =
         if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            // Valid JSON but not an object (`[1]`, `"x"`, `7`, `true`,
+            // `null`) can only 400 upstream. Reject it here so it costs no
+            // account headroom, no budget sample and no credentialed
+            // round-trip; the envelope matches what upstream would say
+            // (LAB-4314). Logged like the sibling rejections above so the
+            // client is attributable by req_id.
+            if !parsed.is_object() {
+                warn!(
+                    req_id,
+                    client = %client_ip,
+                    client_id = %client_id,
+                    "rejected: request body is not a JSON object"
+                );
+                return untranslatable_request_response("request body must be a JSON object");
+            }
             let model = parsed
                 .get("model")
                 .and_then(|m| m.as_str())
@@ -9966,11 +9997,7 @@ async fn proxy_handler(
             // the guard (never `system`). Read-only borrow of `parsed`.
             #[cfg(feature = "guard")]
             {
-                guard_body_parsed = true;
-                guard_input = guard::ScanInput::from_body(&parsed);
-                if matches!(parsed.get("messages"), Some(v) if !v.is_array()) {
-                    guard_messages_unscannable = Some(GUARD_REASON_MESSAGES_NOT_ARRAY);
-                }
+                guard_outcome = guard::ScanInput::from_body(&parsed);
             }
 
             // LAB-933/LAB-929: derive the response-cache key on the
@@ -10106,6 +10133,13 @@ async fn proxy_handler(
                 is_fast_mode,
             )
         } else {
+            // Non-empty and not JSON: the scanner cannot read it, and a parse
+            // differential against the upstream could smuggle content past the
+            // scan. A bodiless request keeps the `NothingToScan` default.
+            #[cfg(feature = "guard")]
+            if !body_bytes.is_empty() {
+                guard_outcome = guard::ScanOutcome::Unscannable(guard::REASON_BODY_UNPARSEABLE);
+            }
             let clone = body_bytes.clone();
             (body_bytes, clone, String::new(), None, None, false)
         };
@@ -10132,32 +10166,19 @@ async fn proxy_handler(
     }
 
     // LAB-3877: Tier 0 content guard — runs after the gate, before endpoint
-    // selection (see `AppState::guard_hook`). Two causes are unscannable: the
-    // client sent a body and it did not parse, and (LAB-4341) it parsed with a
-    // `messages` field the scanner cannot read. A bodiless request
-    // (`GET /v1/models`) has nothing to scan and is not a scan failure.
+    // selection (see `AppState::guard_hook`), on the outcome computed above.
     //
-    // Both are deliberately path-agnostic: the path is forwarded verbatim, so
-    // scoping by route would let `/v1/messages/` or a percent-encoded spelling
-    // skip the fail-closed rule. The shape check stays safe to apply on every
-    // path because it keys on a `messages` that is present and wrong, which no
-    // other API served through this fallback sends — see where it is set.
+    // Deliberately path-agnostic: the path is forwarded verbatim, so scoping by
+    // route would let `/v1/messages/` or a percent-encoded spelling skip the
+    // fail-closed rule. That stays safe on every path because `from_body`
+    // returns `NothingToScan` for a body with no `messages` key at all, which is
+    // what `/v1/complete` and `/v1/models` send through this fallback.
     #[cfg(feature = "guard")]
-    let guard_annotate: Option<usize> = {
-        let unscannable = (!guard_body_parsed && !body_bytes.is_empty())
-            .then_some("request body could not be parsed for content scanning")
-            .or(guard_messages_unscannable);
-        match state.guard_hook(
-            &req_id,
-            &client_id,
-            unscannable,
-            guard_input.as_ref(),
-            false,
-        ) {
+    let guard_annotate: Option<usize> =
+        match state.guard_hook(&req_id, &client_id, &guard_outcome, false) {
             Ok(annotate) => annotate,
             Err(resp) => return *resp,
-        }
-    };
+        };
 
     // The remaining dispatch is wrapped so an `Annotate` verdict can stamp the
     // `X-Guard-Findings` header onto whatever response it yields (cache hit,
@@ -10914,10 +10935,10 @@ async fn build_stats_entry(
     };
 
     // Burn rate from EWMA tracker
-    let (br_5m, br_1h, br_6h) = burn_rate
-        .lock()
-        .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
-        .unwrap_or((0.0, 0.0, 0.0));
+    let (br_5m, br_1h, br_6h) = {
+        let br = lock_burn_rate(burn_rate);
+        (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value)
+    };
 
     // Headroom: prefer remaining_requests header, else (1-util)*limit, else null
     let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
@@ -11062,92 +11083,84 @@ async fn stats_handler(
     }
 
     // Per-client usage (tokens + request rates)
-    let request_rates = state.client_request_rates.lock().ok();
-    let client_usage: serde_json::Value = state
-        .client_usage
-        .lock()
-        .map(|map| {
-            // Collect all client IDs from both token usage and request rates
-            let mut all_clients: std::collections::HashSet<&String> = map.keys().collect();
-            if let Some(ref rates) = request_rates {
-                all_clients.extend(rates.keys());
-            }
+    let request_rates = state.lock_client_request_rates();
+    let client_usage: serde_json::Value = {
+        let map = state.lock_client_usage();
+        // Collect all client IDs from both token usage and request rates
+        let mut all_clients: std::collections::HashSet<&String> = map.keys().collect();
+        all_clients.extend(request_rates.keys());
 
-            let obj: serde_json::Map<String, serde_json::Value> = all_clients
-                .into_iter()
-                .map(|k| {
-                    // Operator hiding: attribute operator data to a reserved key
-                    let display_key = if state.is_operator(k) {
-                        "_operator".to_string()
-                    } else {
-                        k.clone()
-                    };
-                    let tokens = map.get(k).copied().unwrap_or([0; 4]);
-                    let (req_total, req_per_min) = request_rates
-                        .as_ref()
-                        .and_then(|r| r.get(k))
-                        .map(|(total, ewma)| (*total, ewma.value))
-                        .unwrap_or((0, 0.0));
-                    (
-                        display_key,
-                        serde_json::json!({
-                            "input_tokens": tokens[0],
-                            "output_tokens": tokens[1],
-                            "cache_creation_input_tokens": tokens[2],
-                            "cache_read_input_tokens": tokens[3],
-                            "requests_total": req_total,
-                            "requests_per_minute": (req_per_min * 100.0).round() / 100.0,
-                        }),
-                    )
-                })
-                .collect();
-            serde_json::Value::Object(obj)
-        })
-        .unwrap_or(serde_json::json!({}));
+        let obj: serde_json::Map<String, serde_json::Value> = all_clients
+            .into_iter()
+            .map(|k| {
+                // Operator hiding: attribute operator data to a reserved key
+                let display_key = if state.is_operator(k) {
+                    "_operator".to_string()
+                } else {
+                    k.clone()
+                };
+                let tokens = map.get(k).copied().unwrap_or([0; 4]);
+                let (req_total, req_per_min) = request_rates
+                    .get(k)
+                    .map(|(total, ewma)| (*total, ewma.value))
+                    .unwrap_or((0, 0.0));
+                (
+                    display_key,
+                    serde_json::json!({
+                        "input_tokens": tokens[0],
+                        "output_tokens": tokens[1],
+                        "cache_creation_input_tokens": tokens[2],
+                        "cache_read_input_tokens": tokens[3],
+                        "requests_total": req_total,
+                        "requests_per_minute": (req_per_min * 100.0).round() / 100.0,
+                    }),
+                )
+            })
+            .collect();
+        serde_json::Value::Object(obj)
+    };
 
     // Aggregate: total headroom + per-consumer share
     let aggregate = {
         let mut consumers = serde_json::Map::new();
         let mut total_rpm = 0.0_f64;
-        if let Some(ref rates) = request_rates {
-            for (client, (_, ewma)) in rates.iter() {
-                let display_key = if state.is_operator(client) {
-                    "_operator".to_string()
-                } else {
-                    client.clone()
-                };
-                total_rpm += ewma.value;
-                let entry = consumers.entry(display_key).or_insert_with(
-                    || serde_json::json!({"requests_per_minute": 0.0, "share": 0.0}),
+        for (client, (_, ewma)) in request_rates.iter() {
+            let display_key = if state.is_operator(client) {
+                "_operator".to_string()
+            } else {
+                client.clone()
+            };
+            total_rpm += ewma.value;
+            let entry = consumers
+                .entry(display_key)
+                .or_insert_with(|| serde_json::json!({"requests_per_minute": 0.0, "share": 0.0}));
+            if let Some(obj) = entry.as_object_mut() {
+                let cur = obj
+                    .get("requests_per_minute")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                obj.insert(
+                    "requests_per_minute".to_string(),
+                    serde_json::json!(cur + ewma.value),
                 );
-                if let Some(obj) = entry.as_object_mut() {
-                    let cur = obj
+            }
+        }
+        // Compute shares
+        if total_rpm > 0.0 {
+            for (_client, val) in consumers.iter_mut() {
+                if let Some(obj) = val.as_object_mut() {
+                    let rpm = obj
                         .get("requests_per_minute")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.0);
                     obj.insert(
                         "requests_per_minute".to_string(),
-                        serde_json::json!(cur + ewma.value),
+                        serde_json::json!((rpm * 100.0).round() / 100.0),
                     );
-                }
-            }
-            // Compute shares
-            if total_rpm > 0.0 {
-                for (_client, val) in consumers.iter_mut() {
-                    if let Some(obj) = val.as_object_mut() {
-                        let rpm = obj
-                            .get("requests_per_minute")
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.0);
-                        obj.insert(
-                            "requests_per_minute".to_string(),
-                            serde_json::json!((rpm * 100.0).round() / 100.0),
-                        );
-                        obj.insert(
-                            "share".to_string(),
-                            serde_json::json!(((rpm / total_rpm) * 1000.0).round() / 1000.0),
-                        );
-                    }
+                    obj.insert(
+                        "share".to_string(),
+                        serde_json::json!(((rpm / total_rpm) * 1000.0).round() / 1000.0),
+                    );
                 }
             }
         }
@@ -11187,8 +11200,7 @@ async fn stats_handler(
 
     // Cluster info (when Redis is available)
     // Read from cache (updated by background sync task) to avoid .await in handler
-    let cluster: Option<serde_json::Value> =
-        state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
+    let cluster: Option<serde_json::Value> = state.lock_cluster_info_cache().clone();
 
     let mut response = serde_json::json!({
         "endpoints": endpoint_stats,
@@ -11517,10 +11529,10 @@ async fn build_metrics_snap(
     total_headroom: &mut Option<u64>,
 ) -> EndpointMetricsSnap {
     let info = rate_info.read().await;
-    let (br_5m, br_1h, br_6h) = burn_rate
-        .lock()
-        .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
-        .unwrap_or((0.0, 0.0, 0.0));
+    let (br_5m, br_1h, br_6h) = {
+        let br = lock_burn_rate(burn_rate);
+        (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value)
+    };
 
     let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
         Some(rem)
@@ -11618,15 +11630,25 @@ async fn build_metrics_snap(
 /// naming it (`name`) so a panicked holder leaves evidence instead of being
 /// silently healed.
 ///
-/// Every map routed through here is a counter or accumulator store: a
-/// panicking holder can leave it stale by at most one update, never logically
-/// inconsistent, so its data is still the best answer. Clearing is the half
-/// that matters: a `Mutex` poison is permanent, so a site that skips on `Err`
-/// (`if let Ok(..)`, `.lock().ok()`) would skip forever after one panic. For
-/// `budget_usage` that skip is fail-OPEN — `check_budget` would grant every
-/// request and `record_budget_usage` would stop counting, for the life of the
-/// process. Recovery keeps enforcement live without making the fault itself a
-/// denial reason: the gate denies only on recovered usage data.
+/// Every std `Mutex` this crate locks directly goes through here (the only bare
+/// `.lock()` left is the async `SAVE_LOCK`, which cannot poison; the debug-log
+/// writer's `Mutex` is locked by tracing-subscriber, not by this crate). That
+/// is sound because each guarded value is either a counter/accumulator store,
+/// a map of independent, self-expiring entries (auth throttle windows, the
+/// unsupported-model cache, the session registry, log dedup/rate-limit
+/// stamps), a single replaced value (cluster-info cache), or the burn-rate
+/// state: three independent EWMAs updated one after another, so a panic
+/// mid-update leaves at worst a monitoring value torn by one update.
+/// A panicking holder can leave one entry stale by at most one update, never
+/// break an invariant spanning entries, so the recovered data is still the
+/// best answer. Clearing is the half that matters: a `Mutex` poison is
+/// permanent, so a site that skips on `Err` (`if let Ok(..)`, `.lock().ok()`)
+/// would skip forever after one panic. For `budget_usage` and the auth
+/// throttle that skip is fail-OPEN — `check_budget` would grant every request,
+/// `AuthThrottle::check` would report "not throttled", and both would stop
+/// counting, for the life of the process. Recovery keeps enforcement live
+/// without making the fault itself a denial reason: the gate denies only on
+/// recovered data.
 ///
 /// Nothing in the guarded critical sections can currently panic, so this is
 /// defence against a future edit, not a live incident.
@@ -11653,6 +11675,13 @@ fn snapshot_counters(
         .iter()
         .map(|(k, v)| (k.clone(), *v))
         .collect()
+}
+
+/// Lock an account's burn-rate EWMA via `lock_recovering`. Every
+/// `burn_rate` site goes through here, so a panicked holder cannot freeze the
+/// tracker or pin its `/_stats` and `/metrics` readings at zero.
+fn lock_burn_rate(burn_rate: &Mutex<BurnRate>) -> std::sync::MutexGuard<'_, BurnRate> {
+    lock_recovering(burn_rate, "burn_rate")
 }
 
 async fn metrics_handler(
@@ -11708,29 +11737,18 @@ async fn metrics_handler(
 
     // Extract global maps once (single lock per map, then drop guard)
     let client_rates: HashMap<String, (u64, f64)> = state
-        .client_request_rates
-        .lock()
-        .ok()
-        .map(|g| {
-            g.iter()
-                .map(|(k, (total, ewma))| (k.clone(), (*total, ewma.value)))
-                .collect()
-        })
-        .unwrap_or_default();
-    let client_usage = state
-        .client_usage
-        .lock()
-        .ok()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+        .lock_client_request_rates()
+        .iter()
+        .map(|(k, (total, ewma))| (k.clone(), (*total, ewma.value)))
+        .collect();
+    let client_usage = state.lock_client_usage().clone();
     let client_model_usage: Vec<((String, String), [u64; 4])> = state
-        .client_model_usage
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
+        .lock_client_model_usage()
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
     let budget_usage = state.lock_budget_usage().clone();
-    let cluster_info = state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
+    let cluster_info = state.lock_cluster_info_cache().clone();
     let prompt_too_long = snapshot_counters(&state.prompt_too_long, "prompt_too_long");
     let fast_mode_429 = snapshot_counters(&state.fast_mode_429, "fast_mode_429");
     let entitlement_400 = snapshot_counters(&state.entitlement_400, "entitlement_400");
@@ -11745,11 +11763,10 @@ async fn metrics_handler(
     );
     let beta_flags_dropped = snapshot_counters(&state.beta_flags_dropped, "beta_flags_dropped");
     let client_rejections: Vec<((String, &'static str), u64)> = state
-        .client_rejections
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
+        .lock_client_rejections()
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
     let auth_failures: Vec<(AuthFailureKey, u64)> =
         lock_recovering(&state.auth_failures, "auth_failures")
             .iter()
@@ -15233,38 +15250,19 @@ async fn openai_chat_handler(
     // body, the OpenAI arm forwards the original bytes. Unparseable JSON was
     // already rejected above.
     //
-    // The two conditions below are an ENUMERATION, not a rule: each is a
-    // shape translation cannot carry into the Messages document, so the
-    // scanner never sees it while the OpenAI arm still ships it. Anything
-    // else translation drops — `messages[].name`, the top-level `user` field
-    // — is NOT covered here and is unscanned on both surfaces (deferred to
-    // the guard epic). Adding a field to the translator's drop list does not
-    // extend this predicate; extend it by hand.
+    // LAB-4358: `from_openai_body` owns the whole discrimination — it judges
+    // readability on the body the client sent (the bytes a `Protocol::OpenAI`
+    // upstream receives) and extracts text from the translated one. The
+    // hand-maintained role enumeration this used to carry is gone: an OpenAI
+    // role translation cannot map is passed through verbatim into the translated
+    // `messages`, where `from_body`'s role rule now rejects it on both surfaces
+    // at once. Fields translation DROPS — `messages[].name`, the top-level
+    // `user` — remain unscanned on both surfaces; that is a coverage question,
+    // not a readability one, and is not addressed here.
     #[cfg(feature = "guard")]
     let guard_annotate: Option<usize> = {
-        let unscannable = match openai_body.get("messages").and_then(|m| m.as_array()) {
-            // Translation preserves the user text and `tool` content the
-            // scanner reads, but passes any other role (legacy `function`,
-            // `developer`, unknown) through verbatim.
-            Some(msgs) => msgs
-                .iter()
-                .any(|m| {
-                    !matches!(
-                        m.get("role").and_then(|r| r.as_str()),
-                        Some("system" | "user" | "assistant" | "tool")
-                    )
-                })
-                .then_some("request carries an OpenAI message role the scanner cannot read"),
-            // LAB-4322: `messages` is absent or not an array. The translator
-            // reads it through the same `.as_array()` and then writes an array
-            // back unconditionally, so the scanned document gets an EMPTY
-            // `messages` while the original bytes keep every character the
-            // client sent. `/v1/chat/completions` requires an array here, so
-            // nothing legitimate is rejected.
-            None => Some(GUARD_REASON_MESSAGES_NOT_ARRAY),
-        };
-        let guard_input = guard::ScanInput::from_body(&anthropic_body);
-        match state.guard_hook(&req_id, &client_id, unscannable, guard_input.as_ref(), true) {
+        let outcome = guard::ScanInput::from_openai_body(&openai_body, &anthropic_body);
+        match state.guard_hook(&req_id, &client_id, &outcome, true) {
             Ok(annotate) => annotate,
             Err(resp) => return *resp,
         }
