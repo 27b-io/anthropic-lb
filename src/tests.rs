@@ -15551,6 +15551,81 @@ fn oauth_system_prompt_handles_null_system() {
     assert_eq!(system[0]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
 }
 
+/// Every valid-JSON shape that is not an object. One list, one defect
+/// class: `serde_json::Value`'s `IndexMut<&str>` auto-vivifies only on
+/// `Null` and `Object` and panics on everything else.
+const NON_OBJECT_JSON_BODIES: [&str; 5] = ["[1,2,3]", "\"x\"", "7", "true", "null"];
+
+/// The shared injector must never index into a non-object: both of its
+/// call sites (`proxy_handler`, `openai_chat_handler`) route through here,
+/// so this is the locus that closes the class for all callers.
+///
+/// Four of the five shapes panicked before this guard existed. `null` did
+/// not: it auto-vivified into `{"system":[…]}`. That case therefore pins a
+/// deliberate behaviour change, not pre-existing behaviour.
+#[test]
+fn oauth_system_prompt_leaves_non_object_body_untouched() {
+    for raw in NON_OBJECT_JSON_BODIES {
+        let mut body: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let before = body.clone();
+        inject_oauth_system_prompt(&mut body);
+        assert_eq!(body, before, "shape {raw} must pass through untouched");
+    }
+}
+
+/// A valid-JSON non-object body on `/v1/messages` must produce an HTTP
+/// response — a 400 in Anthropic's error envelope — rather than a panicked
+/// request task and a dropped connection. Drives the real router and pins
+/// that the upstream is never contacted. The rejection fires before account
+/// selection, so the endpoint's token kind is irrelevant here; the OAuth
+/// token only documents which path used to panic.
+#[tokio::test]
+async fn proxy_rejects_non_object_json_body_with_envelope_400() {
+    use std::sync::atomic::Ordering;
+    let (url, hits) = spawn_status_then_ok_upstream(0, "", b"{}").await;
+    let state = test_state_with(vec![mk_endpoint_at(
+        "oauth-acct",
+        "sk-ant-oat01-test-token",
+        &url,
+    )]);
+    let addr = serve(build_router(state)).await;
+    let client = Client::new();
+
+    for raw in NON_OBJECT_JSON_BODIES {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(raw)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("shape {raw}: no HTTP response: {e}"));
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "shape {raw}"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "shape {raw}"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["type"], "error", "shape {raw}: {body}");
+        assert_eq!(
+            body["error"]["type"], "invalid_request_error",
+            "shape {raw}: {body}"
+        );
+        assert!(body["error"]["message"].is_string(), "shape {raw}: {body}");
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a rejected body must never reach the upstream"
+    );
+}
+
 /// Regression: CC 142+ prepends a billing header as system[0], pushing the
 /// CC identity prompt to system[1+]. has_oauth_system_prompt must scan all
 /// blocks, not just the first — otherwise inject_oauth_system_prompt

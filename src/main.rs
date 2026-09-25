@@ -8227,7 +8227,12 @@ fn has_oauth_system_prompt(body: &serde_json::Value) -> bool {
 ///   `system[0]` is a Claude Code attribution block, so the upstream's
 ///   positional strip of that block still fires
 fn inject_oauth_system_prompt(body: &mut serde_json::Value) {
-    if has_oauth_system_prompt(body) {
+    // Shared mutator: the `body["system"] = …` assignments below are the
+    // only `IndexMut<&str>` on a client-controlled `Value` in the request
+    // path, and that operator panics on anything but Null/Object. The
+    // invariant lives here, with the lines that need it, not with whatever
+    // callers happen to pre-validate today (LAB-4314).
+    if !body.is_object() || has_oauth_system_prompt(body) {
         return;
     }
 
@@ -8973,6 +8978,11 @@ fn model_unsupported_response(model: &str, openai_shape: bool) -> Response {
 /// image source type the translator doesn't support). The caller's request
 /// was Anthropic Messages API shaped, so the error response matches that,
 /// regardless of which protocol the fallback endpoint speaks.
+///
+/// Also `proxy_handler`'s rejection of a valid-JSON non-object body
+/// (LAB-4314). That handler is the router fallback, so the rejected request
+/// may be any method on any path; the envelope is still the right shape,
+/// since it is what the Anthropic upstream returns for the same body.
 fn untranslatable_request_response(message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -9936,6 +9946,21 @@ async fn proxy_handler(
     // the fast-mode flag that picks the rate bucket downstream.
     let (body_bytes, oauth_body_bytes, model, fp, cache_key, is_fast_mode) =
         if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            // Valid JSON but not an object (`[1]`, `"x"`, `7`, `true`,
+            // `null`) can only 400 upstream. Reject it here so it costs no
+            // account headroom, no budget sample and no credentialed
+            // round-trip; the envelope matches what upstream would say
+            // (LAB-4314). Logged like the sibling rejections above so the
+            // client is attributable by req_id.
+            if !parsed.is_object() {
+                warn!(
+                    req_id,
+                    client = %client_ip,
+                    client_id = %client_id,
+                    "rejected: request body is not a JSON object"
+                );
+                return untranslatable_request_response("request body must be a JSON object");
+            }
             let model = parsed
                 .get("model")
                 .and_then(|m| m.as_str())
