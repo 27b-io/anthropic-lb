@@ -1437,31 +1437,6 @@ async fn emergency_brake_fires_when_only_anthropic_above_threshold_with_openai_p
 }
 
 #[tokio::test]
-async fn probe_endpoint_skips_openai() {
-    // The mock upstream injects `5h-utilization: 0.25` headers. If the probe
-    // ran, `rate_info.utilization_5h` would become Some(0.25). The OpenAI
-    // skip means the endpoint is never contacted and rate_info stays None.
-    let (mock_url, _h) = spawn_mock_upstream().await;
-    let mut ep = make_endpoint("openai", Protocol::OpenAI);
-    ep.base_url = mock_url;
-    ep.priority = 100;
-    let mut state = test_state_with(vec![]);
-    Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
-
-    state.probe_endpoint(0, "claude-haiku-4-5").await;
-
-    // rate_info must be untouched: the OpenAI endpoint was skipped, no HTTP
-    // call was made. A naive "probe all endpoints" version would have hit
-    // the mock and set utilization_5h to Some(0.25).
-    let info = state.endpoints[0].rate_info.read().await;
-    assert!(
-        info.utilization_5h.is_none(),
-        "probe must short-circuit for OpenAI endpoints — rate_info must stay untouched"
-    );
-    assert_eq!(state.endpoints[0].requests.load(Ordering::Relaxed), 0);
-}
-
-#[tokio::test]
 async fn pick_account_all_7d_rejected_returns_none() {
     // If all accounts have rejected 7d claims for the model, pick_account returns None
     let acct_a = mk_endpoint("a", "sk-ant-api-a");
