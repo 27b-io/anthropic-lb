@@ -1881,6 +1881,13 @@ impl AuthThrottle {
         }
     }
 
+    /// Lock the failure table via `lock_recovering`. Every `entries` site
+    /// MUST go through here: a skip-on-poison lock would make `check` report
+    /// "not throttled" and `record_failure` stop counting (fail-open).
+    fn lock_entries(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, (Instant, u32)>> {
+        lock_recovering(&self.entries, "auth_throttle")
+    }
+
     /// Returns `Some(retry_after_secs)` while `ip` is throttled. Expired
     /// windows are removed on sight, so steady-state size tracks only IPs
     /// that failed recently.
@@ -1888,7 +1895,7 @@ impl AuthThrottle {
         if self.max_failures == 0 {
             return None;
         }
-        let mut entries = self.entries.lock().ok()?;
+        let mut entries = self.lock_entries();
         let (start, count) = *entries.get(ip)?;
         let elapsed = start.elapsed();
         if elapsed >= self.window {
@@ -1910,9 +1917,7 @@ impl AuthThrottle {
         if self.max_failures == 0 {
             return;
         }
-        let Ok(mut entries) = self.entries.lock() else {
-            return;
-        };
+        let mut entries = self.lock_entries();
         match entries.get_mut(&ip) {
             Some((start, count)) => {
                 if start.elapsed() >= self.window {
@@ -2215,9 +2220,7 @@ impl AppState {
     /// Rate-limiter for the `allow_unauthenticated` admin-access warn: true at
     /// most once per route per `OPEN_ADMIN_WARN_INTERVAL`.
     fn should_warn_open_admin(&self, route: &'static str) -> bool {
-        let Ok(mut last) = self.open_admin_warn.lock() else {
-            return true;
-        };
+        let mut last = lock_recovering(&self.open_admin_warn, "open_admin_warn");
         let now = Instant::now();
         match last.get(route) {
             Some(t) if t.elapsed() < OPEN_ADMIN_WARN_INTERVAL => false,
@@ -2454,9 +2457,7 @@ impl AppState {
     /// — keeping the reason label so overflow traffic still charts by cause.
     /// Callers already log the rejection; this only feeds `/metrics`.
     fn note_client_rejection(&self, client_id: &str, reason: &'static str) {
-        let Ok(mut counts) = self.client_rejections.lock() else {
-            return;
-        };
+        let mut counts = self.lock_client_rejections();
         let key = (truncate_label(client_id), reason);
         // Tracked = the CLIENT has any entry, not this exact (client, reason)
         // pair: a tracked client's first rejection under a new reason must
@@ -4579,9 +4580,7 @@ impl AppState {
             return;
         }
         let now = Instant::now();
-        let Ok(mut map) = self.unsupported_models.lock() else {
-            return;
-        };
+        let mut map = self.lock_unsupported_models();
         map.retain(|_, expiry| *expiry > now);
         // Capacity gates NEW pairs only — refreshing an existing pair's TTL
         // doesn't grow the map and must not starve under sustained rejections.
@@ -4606,14 +4605,11 @@ impl AppState {
             return Vec::new();
         }
         let now = Instant::now();
-        match self.unsupported_models.lock() {
-            Ok(map) => map
-                .iter()
-                .filter(|((_, m), expiry)| m == model && **expiry > now)
-                .map(|((idx, _), _)| *idx)
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        self.lock_unsupported_models()
+            .iter()
+            .filter(|((_, m), expiry)| m == model && **expiry > now)
+            .map(|((idx, _), _)| *idx)
+            .collect()
     }
 
     /// True when EVERY endpoint whose config allows `model` carries a live
@@ -6263,9 +6259,7 @@ impl AppState {
 
         // 5. Refresh cluster info cache for /_stats endpoint
         let info = self.cluster_info().await;
-        if let Ok(mut cache) = self.cluster_info_cache.lock() {
-            *cache = info;
-        }
+        *self.lock_cluster_info_cache() = info;
     }
 
     /// Lock the transport-error accumulator via `lock_recovering`. Every
@@ -6279,6 +6273,43 @@ impl AppState {
     /// one panicked holder into permanently disabled budgets (fail-open).
     fn lock_budget_usage(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, u64)>> {
         lock_recovering(&self.budget_usage, "budget_usage")
+    }
+
+    // One `lock_recovering` accessor per multi-site map: a convenience that
+    // pins each map's lock-name string in one place.
+
+    fn lock_client_rejections(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(String, &'static str), u64>> {
+        lock_recovering(&self.client_rejections, "client_rejections")
+    }
+
+    fn lock_client_usage(&self) -> std::sync::MutexGuard<'_, HashMap<String, [u64; 4]>> {
+        lock_recovering(&self.client_usage, "client_usage")
+    }
+
+    fn lock_client_model_usage(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(String, String), [u64; 4]>> {
+        lock_recovering(&self.client_model_usage, "client_model_usage")
+    }
+
+    fn lock_client_request_rates(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, Ewma)>> {
+        lock_recovering(&self.client_request_rates, "client_request_rates")
+    }
+
+    fn lock_unsupported_models(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(usize, String), Instant>> {
+        lock_recovering(&self.unsupported_models, "unsupported_models")
+    }
+
+    fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionEntry>> {
+        lock_recovering(&self.sessions, "sessions")
+    }
+
+    fn lock_cluster_info_cache(&self) -> std::sync::MutexGuard<'_, Option<serde_json::Value>> {
+        lock_recovering(&self.cluster_info_cache, "cluster_info_cache")
     }
 
     /// Log + count client `anthropic-beta` flags dropped by the allow-list
@@ -6304,9 +6335,7 @@ impl AppState {
                 &f[..end]
             })
             .collect();
-        let Ok(mut map) = self.beta_flags_dropped.lock() else {
-            return;
-        };
+        let mut map = lock_recovering(&self.beta_flags_dropped, "beta_flags_dropped");
         // Loud line only on a flag's FIRST sighting — a misconfigured client
         // sends the same unlisted flag at request rate, and the counter
         // already carries the volume. Repeats log at debug for correlation.
@@ -6384,9 +6413,7 @@ impl AppState {
         // payload hide the actionable field behind eight junk ones and leave
         // no trace that anything else went (Helly R finding 3).
         let over_cap = stripped.len().saturating_sub(keys.len()) as u64;
-        let Ok(mut map) = self.beta_body_fields_stripped.lock() else {
-            return;
-        };
+        let mut map = lock_recovering(&self.beta_body_fields_stripped, "beta_body_fields_stripped");
         if over_cap > 0 {
             *map.entry("_other".to_string()).or_insert(0) += over_cap;
         }
@@ -7133,11 +7160,11 @@ fn context_window_for(model: &str, has_1m_beta: bool) -> u64 {
     if !model.is_empty() && !model.starts_with("claude") {
         static WARNED: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
             std::sync::OnceLock::new();
-        if let Ok(mut warned) = WARNED.get_or_init(Default::default).lock() {
-            // Bounded like the client maps: model is client-controlled input.
-            if warned.len() < MAX_PROMPT_TOO_LONG_MODELS && warned.insert(model.to_string()) {
-                warn!(model, "unknown model family, assuming 200k context window");
-            }
+        let mut warned =
+            lock_recovering(WARNED.get_or_init(Default::default), "unknown_model_warned");
+        // Bounded like the client maps: model is client-controlled input.
+        if warned.len() < MAX_PROMPT_TOO_LONG_MODELS && warned.insert(model.to_string()) {
+            warn!(model, "unknown model family, assuming 200k context window");
         }
     }
     DEFAULT_CONTEXT_WINDOW
@@ -7193,9 +7220,7 @@ impl AppState {
             return;
         }
         let (client_id, agent_id, session_id) = rctx;
-        let Ok(mut map) = self.sessions.lock() else {
-            return;
-        };
+        let mut map = self.lock_sessions();
         if !map.contains_key(affinity_key) {
             let ttl = self.session_registry_ttl_secs;
             map.retain(|_, e| now.saturating_sub(e.last_seen) <= ttl);
@@ -7243,7 +7268,8 @@ impl AppState {
         affinity_key: Option<&str>,
         message: &str,
     ) {
-        if let Ok(mut counts) = self.prompt_too_long.lock() {
+        {
+            let mut counts = lock_recovering(&self.prompt_too_long, "prompt_too_long");
             let label = if counts.len() < MAX_PROMPT_TOO_LONG_MODELS || counts.contains_key(model) {
                 model
             } else {
@@ -7270,9 +7296,9 @@ impl AppState {
     /// trace that makes a client looping `speed: "fast"` visible instead of
     /// silent (LAB-2675).
     fn note_fast_mode_429(&self, endpoint_name: &str, headers: &reqwest::header::HeaderMap) {
-        if let Ok(mut counts) = self.fast_mode_429.lock() {
-            *counts.entry(endpoint_name.to_owned()).or_insert(0) += 1;
-        }
+        *lock_recovering(&self.fast_mode_429, "fast_mode_429")
+            .entry(endpoint_name.to_owned())
+            .or_insert(0) += 1;
         let retry_after_raw = headers
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
@@ -7295,9 +7321,9 @@ impl AppState {
     /// `classify_retry_status`. The cost is one zero-token round trip per
     /// refused request, visible on this counter.
     fn note_entitlement_400(&self, endpoint_name: &str) {
-        if let Ok(mut counts) = self.entitlement_400.lock() {
-            *counts.entry(endpoint_name.to_owned()).or_insert(0) += 1;
-        }
+        *lock_recovering(&self.entitlement_400, "entitlement_400")
+            .entry(endpoint_name.to_owned())
+            .or_insert(0) += 1;
         warn!(
             account = endpoint_name,
             "upstream 400: account out of extra usage (account not cooled; request re-sent at most once)"
@@ -7309,42 +7335,37 @@ impl AppState {
     /// session ids never leave the registry — the label is a hash of the
     /// affinity key and agent/session ids are truncated to 8 chars.
     fn sessions_snapshot(&self, now: u64) -> Vec<serde_json::Value> {
-        let mut rows: Vec<(f64, serde_json::Value)> = self
-            .sessions
-            .lock()
-            .map(|map| {
-                map.iter()
-                    .filter(|(_, e)| {
-                        now.saturating_sub(e.last_seen) <= self.session_registry_ttl_secs
-                    })
-                    .map(|(key, e)| {
-                        let pct = window_pct(e.last_prompt_tokens, e.context_window);
-                        let client_id = if self.is_operator(&e.client_id) {
-                            "_operator"
-                        } else {
-                            &e.client_id
-                        };
-                        let truncate8 = |s: &str| -> String { s.chars().take(8).collect() };
-                        (
-                            pct,
-                            serde_json::json!({
-                                "session": session_label(key),
-                                "client_id": client_id,
-                                "agent": truncate8(&e.agent_id),
-                                "session_prefix": truncate8(&e.session_id),
-                                "model": e.model,
-                                "endpoint": e.endpoint,
-                                "last_prompt_tokens": e.last_prompt_tokens,
-                                "context_window": e.context_window,
-                                "context_window_pct": pct,
-                                "requests": e.requests,
-                                "last_seen": e.last_seen,
-                            }),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut rows: Vec<(f64, serde_json::Value)> = {
+            let map = self.lock_sessions();
+            map.iter()
+                .filter(|(_, e)| now.saturating_sub(e.last_seen) <= self.session_registry_ttl_secs)
+                .map(|(key, e)| {
+                    let pct = window_pct(e.last_prompt_tokens, e.context_window);
+                    let client_id = if self.is_operator(&e.client_id) {
+                        "_operator"
+                    } else {
+                        &e.client_id
+                    };
+                    let truncate8 = |s: &str| -> String { s.chars().take(8).collect() };
+                    (
+                        pct,
+                        serde_json::json!({
+                            "session": session_label(key),
+                            "client_id": client_id,
+                            "agent": truncate8(&e.agent_id),
+                            "session_prefix": truncate8(&e.session_id),
+                            "model": e.model,
+                            "endpoint": e.endpoint,
+                            "last_prompt_tokens": e.last_prompt_tokens,
+                            "context_window": e.context_window,
+                            "context_window_pct": pct,
+                            "requests": e.requests,
+                            "last_seen": e.last_seen,
+                        }),
+                    )
+                })
+                .collect()
+        };
         rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         rows.truncate(SESSIONS_STATS_TOP_N);
         rows.into_iter().map(|(_, v)| v).collect()
@@ -7358,24 +7379,17 @@ impl AppState {
     fn session_tokens_histogram(&self, now: u64) -> ([u64; SESSION_TOKENS_BUCKETS.len() + 1], u64) {
         let mut cumulative = [0u64; SESSION_TOKENS_BUCKETS.len() + 1];
         let mut sum = 0u64;
-        match self.sessions.lock() {
-            Ok(map) => {
-                for e in map.values() {
-                    if now.saturating_sub(e.last_seen) > self.session_registry_ttl_secs {
-                        continue;
-                    }
-                    sum += e.last_prompt_tokens;
-                    for (i, le) in SESSION_TOKENS_BUCKETS.iter().enumerate() {
-                        if e.last_prompt_tokens <= *le {
-                            cumulative[i] += 1;
-                        }
-                    }
-                    cumulative[SESSION_TOKENS_BUCKETS.len()] += 1; // +Inf
+        for e in self.lock_sessions().values() {
+            if now.saturating_sub(e.last_seen) > self.session_registry_ttl_secs {
+                continue;
+            }
+            sum += e.last_prompt_tokens;
+            for (i, le) in SESSION_TOKENS_BUCKETS.iter().enumerate() {
+                if e.last_prompt_tokens <= *le {
+                    cumulative[i] += 1;
                 }
             }
-            // All-zero output with no trace would read as "no sessions";
-            // a poisoned registry lock deserves a diagnostic.
-            Err(_) => warn!("session_tokens_histogram: sessions registry lock poisoned"),
+            cumulative[SESSION_TOKENS_BUCKETS.len()] += 1; // +Inf
         }
         (cumulative, sum)
     }
@@ -7741,7 +7755,8 @@ impl AppState {
                 + usage.output_tokens
                 + usage.cache_creation_input_tokens
                 + usage.cache_read_input_tokens;
-            if let Ok(mut map) = self.client_usage.lock() {
+            {
+                let mut map = self.lock_client_usage();
                 // Bound new-key growth (user-controlled x-client-id); already-tracked
                 // clients keep accumulating past the cap.
                 if map.len() < MAX_TRACKED_CLIENTS || map.contains_key(client_id) {
@@ -7761,7 +7776,8 @@ impl AppState {
             } else {
                 truncate_label(model)
             };
-            if let Ok(mut map) = self.client_model_usage.lock() {
+            {
+                let mut map = self.lock_client_model_usage();
                 let key = (client_id.to_owned(), model);
                 let key = if map.len() < MAX_CLIENT_MODEL_LABELS || map.contains_key(&key) {
                     key
@@ -7787,10 +7803,9 @@ impl AppState {
     /// Update burn rate for an account and per-client request tracking.
     fn update_burn_rate(&self, burn_rate: &Mutex<BurnRate>, client_id: &str) {
         let now = Instant::now();
-        if let Ok(mut br) = burn_rate.lock() {
-            br.update(now);
-        }
-        if let Ok(mut rates) = self.client_request_rates.lock() {
+        lock_burn_rate(burn_rate).update(now);
+        {
+            let mut rates = self.lock_client_request_rates();
             // Bound new-key growth (client_id is the user-controlled x-client-id
             // header); already-tracked clients keep updating past the cap.
             if rates.len() < MAX_TRACKED_CLIENTS || rates.contains_key(client_id) {
@@ -9307,14 +9322,15 @@ async fn forward_anthropic(
     // Use OAuth variant (with CC system prompt) for OAuth tokens, and its
     // beta-coherent rewrite when the filter orphaned a body field (LAB-1261).
     let req_body = if token.starts_with(OAUTH_TOKEN_PREFIX) {
-        // `dropped` is only ever non-empty on this branch, so a rewrite
-        // without it would mean the filter's contract changed underneath us.
-        debug_assert!(coherent_body.is_none() || token.starts_with(OAUTH_TOKEN_PREFIX));
         match &coherent_body {
             Some((rewritten, _)) => rewritten,
             None => oauth_body_bytes,
         }
     } else {
+        // Only the OAuth arm of `inject_account_auth` fills `dropped`, so a
+        // rewrite here would be discarded after `record_stripped_body_fields`
+        // and the fast-mode reclassification had already acted on it.
+        debug_assert!(coherent_body.is_none());
         body_bytes
     };
     upstream_req = upstream_req.body(req_body.clone());
@@ -10918,10 +10934,10 @@ async fn build_stats_entry(
     };
 
     // Burn rate from EWMA tracker
-    let (br_5m, br_1h, br_6h) = burn_rate
-        .lock()
-        .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
-        .unwrap_or((0.0, 0.0, 0.0));
+    let (br_5m, br_1h, br_6h) = {
+        let br = lock_burn_rate(burn_rate);
+        (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value)
+    };
 
     // Headroom: prefer remaining_requests header, else (1-util)*limit, else null
     let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
@@ -11066,92 +11082,84 @@ async fn stats_handler(
     }
 
     // Per-client usage (tokens + request rates)
-    let request_rates = state.client_request_rates.lock().ok();
-    let client_usage: serde_json::Value = state
-        .client_usage
-        .lock()
-        .map(|map| {
-            // Collect all client IDs from both token usage and request rates
-            let mut all_clients: std::collections::HashSet<&String> = map.keys().collect();
-            if let Some(ref rates) = request_rates {
-                all_clients.extend(rates.keys());
-            }
+    let request_rates = state.lock_client_request_rates();
+    let client_usage: serde_json::Value = {
+        let map = state.lock_client_usage();
+        // Collect all client IDs from both token usage and request rates
+        let mut all_clients: std::collections::HashSet<&String> = map.keys().collect();
+        all_clients.extend(request_rates.keys());
 
-            let obj: serde_json::Map<String, serde_json::Value> = all_clients
-                .into_iter()
-                .map(|k| {
-                    // Operator hiding: attribute operator data to a reserved key
-                    let display_key = if state.is_operator(k) {
-                        "_operator".to_string()
-                    } else {
-                        k.clone()
-                    };
-                    let tokens = map.get(k).copied().unwrap_or([0; 4]);
-                    let (req_total, req_per_min) = request_rates
-                        .as_ref()
-                        .and_then(|r| r.get(k))
-                        .map(|(total, ewma)| (*total, ewma.value))
-                        .unwrap_or((0, 0.0));
-                    (
-                        display_key,
-                        serde_json::json!({
-                            "input_tokens": tokens[0],
-                            "output_tokens": tokens[1],
-                            "cache_creation_input_tokens": tokens[2],
-                            "cache_read_input_tokens": tokens[3],
-                            "requests_total": req_total,
-                            "requests_per_minute": (req_per_min * 100.0).round() / 100.0,
-                        }),
-                    )
-                })
-                .collect();
-            serde_json::Value::Object(obj)
-        })
-        .unwrap_or(serde_json::json!({}));
+        let obj: serde_json::Map<String, serde_json::Value> = all_clients
+            .into_iter()
+            .map(|k| {
+                // Operator hiding: attribute operator data to a reserved key
+                let display_key = if state.is_operator(k) {
+                    "_operator".to_string()
+                } else {
+                    k.clone()
+                };
+                let tokens = map.get(k).copied().unwrap_or([0; 4]);
+                let (req_total, req_per_min) = request_rates
+                    .get(k)
+                    .map(|(total, ewma)| (*total, ewma.value))
+                    .unwrap_or((0, 0.0));
+                (
+                    display_key,
+                    serde_json::json!({
+                        "input_tokens": tokens[0],
+                        "output_tokens": tokens[1],
+                        "cache_creation_input_tokens": tokens[2],
+                        "cache_read_input_tokens": tokens[3],
+                        "requests_total": req_total,
+                        "requests_per_minute": (req_per_min * 100.0).round() / 100.0,
+                    }),
+                )
+            })
+            .collect();
+        serde_json::Value::Object(obj)
+    };
 
     // Aggregate: total headroom + per-consumer share
     let aggregate = {
         let mut consumers = serde_json::Map::new();
         let mut total_rpm = 0.0_f64;
-        if let Some(ref rates) = request_rates {
-            for (client, (_, ewma)) in rates.iter() {
-                let display_key = if state.is_operator(client) {
-                    "_operator".to_string()
-                } else {
-                    client.clone()
-                };
-                total_rpm += ewma.value;
-                let entry = consumers.entry(display_key).or_insert_with(
-                    || serde_json::json!({"requests_per_minute": 0.0, "share": 0.0}),
+        for (client, (_, ewma)) in request_rates.iter() {
+            let display_key = if state.is_operator(client) {
+                "_operator".to_string()
+            } else {
+                client.clone()
+            };
+            total_rpm += ewma.value;
+            let entry = consumers
+                .entry(display_key)
+                .or_insert_with(|| serde_json::json!({"requests_per_minute": 0.0, "share": 0.0}));
+            if let Some(obj) = entry.as_object_mut() {
+                let cur = obj
+                    .get("requests_per_minute")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                obj.insert(
+                    "requests_per_minute".to_string(),
+                    serde_json::json!(cur + ewma.value),
                 );
-                if let Some(obj) = entry.as_object_mut() {
-                    let cur = obj
+            }
+        }
+        // Compute shares
+        if total_rpm > 0.0 {
+            for (_client, val) in consumers.iter_mut() {
+                if let Some(obj) = val.as_object_mut() {
+                    let rpm = obj
                         .get("requests_per_minute")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.0);
                     obj.insert(
                         "requests_per_minute".to_string(),
-                        serde_json::json!(cur + ewma.value),
+                        serde_json::json!((rpm * 100.0).round() / 100.0),
                     );
-                }
-            }
-            // Compute shares
-            if total_rpm > 0.0 {
-                for (_client, val) in consumers.iter_mut() {
-                    if let Some(obj) = val.as_object_mut() {
-                        let rpm = obj
-                            .get("requests_per_minute")
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.0);
-                        obj.insert(
-                            "requests_per_minute".to_string(),
-                            serde_json::json!((rpm * 100.0).round() / 100.0),
-                        );
-                        obj.insert(
-                            "share".to_string(),
-                            serde_json::json!(((rpm / total_rpm) * 1000.0).round() / 1000.0),
-                        );
-                    }
+                    obj.insert(
+                        "share".to_string(),
+                        serde_json::json!(((rpm / total_rpm) * 1000.0).round() / 1000.0),
+                    );
                 }
             }
         }
@@ -11191,8 +11199,7 @@ async fn stats_handler(
 
     // Cluster info (when Redis is available)
     // Read from cache (updated by background sync task) to avoid .await in handler
-    let cluster: Option<serde_json::Value> =
-        state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
+    let cluster: Option<serde_json::Value> = state.lock_cluster_info_cache().clone();
 
     let mut response = serde_json::json!({
         "endpoints": endpoint_stats,
@@ -11399,10 +11406,10 @@ async fn build_metrics_snap(
     total_headroom: &mut Option<u64>,
 ) -> EndpointMetricsSnap {
     let info = rate_info.read().await;
-    let (br_5m, br_1h, br_6h) = burn_rate
-        .lock()
-        .map(|br| (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value))
-        .unwrap_or((0.0, 0.0, 0.0));
+    let (br_5m, br_1h, br_6h) = {
+        let br = lock_burn_rate(burn_rate);
+        (br.rate_5m.value, br.rate_1h.value, br.rate_6h.value)
+    };
 
     let headroom: Option<u64> = if let Some(rem) = info.remaining_requests {
         Some(rem)
@@ -11500,15 +11507,25 @@ async fn build_metrics_snap(
 /// naming it (`name`) so a panicked holder leaves evidence instead of being
 /// silently healed.
 ///
-/// Every map routed through here is a counter or accumulator store: a
-/// panicking holder can leave it stale by at most one update, never logically
-/// inconsistent, so its data is still the best answer. Clearing is the half
-/// that matters: a `Mutex` poison is permanent, so a site that skips on `Err`
-/// (`if let Ok(..)`, `.lock().ok()`) would skip forever after one panic. For
-/// `budget_usage` that skip is fail-OPEN — `check_budget` would grant every
-/// request and `record_budget_usage` would stop counting, for the life of the
-/// process. Recovery keeps enforcement live without making the fault itself a
-/// denial reason: the gate denies only on recovered usage data.
+/// Every std `Mutex` this crate locks directly goes through here (the only bare
+/// `.lock()` left is the async `SAVE_LOCK`, which cannot poison; the debug-log
+/// writer's `Mutex` is locked by tracing-subscriber, not by this crate). That
+/// is sound because each guarded value is either a counter/accumulator store,
+/// a map of independent, self-expiring entries (auth throttle windows, the
+/// unsupported-model cache, the session registry, log dedup/rate-limit
+/// stamps), a single replaced value (cluster-info cache), or the burn-rate
+/// state: three independent EWMAs updated one after another, so a panic
+/// mid-update leaves at worst a monitoring value torn by one update.
+/// A panicking holder can leave one entry stale by at most one update, never
+/// break an invariant spanning entries, so the recovered data is still the
+/// best answer. Clearing is the half that matters: a `Mutex` poison is
+/// permanent, so a site that skips on `Err` (`if let Ok(..)`, `.lock().ok()`)
+/// would skip forever after one panic. For `budget_usage` and the auth
+/// throttle that skip is fail-OPEN — `check_budget` would grant every request,
+/// `AuthThrottle::check` would report "not throttled", and both would stop
+/// counting, for the life of the process. Recovery keeps enforcement live
+/// without making the fault itself a denial reason: the gate denies only on
+/// recovered data.
 ///
 /// Nothing in the guarded critical sections can currently panic, so this is
 /// defence against a future edit, not a live incident.
@@ -11535,6 +11552,13 @@ fn snapshot_counters(
         .iter()
         .map(|(k, v)| (k.clone(), *v))
         .collect()
+}
+
+/// Lock an account's burn-rate EWMA via `lock_recovering`. Every
+/// `burn_rate` site goes through here, so a panicked holder cannot freeze the
+/// tracker or pin its `/_stats` and `/metrics` readings at zero.
+fn lock_burn_rate(burn_rate: &Mutex<BurnRate>) -> std::sync::MutexGuard<'_, BurnRate> {
+    lock_recovering(burn_rate, "burn_rate")
 }
 
 async fn metrics_handler(
@@ -11590,29 +11614,18 @@ async fn metrics_handler(
 
     // Extract global maps once (single lock per map, then drop guard)
     let client_rates: HashMap<String, (u64, f64)> = state
-        .client_request_rates
-        .lock()
-        .ok()
-        .map(|g| {
-            g.iter()
-                .map(|(k, (total, ewma))| (k.clone(), (*total, ewma.value)))
-                .collect()
-        })
-        .unwrap_or_default();
-    let client_usage = state
-        .client_usage
-        .lock()
-        .ok()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+        .lock_client_request_rates()
+        .iter()
+        .map(|(k, (total, ewma))| (k.clone(), (*total, ewma.value)))
+        .collect();
+    let client_usage = state.lock_client_usage().clone();
     let client_model_usage: Vec<((String, String), [u64; 4])> = state
-        .client_model_usage
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
+        .lock_client_model_usage()
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
     let budget_usage = state.lock_budget_usage().clone();
-    let cluster_info = state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
+    let cluster_info = state.lock_cluster_info_cache().clone();
     let prompt_too_long = snapshot_counters(&state.prompt_too_long, "prompt_too_long");
     let fast_mode_429 = snapshot_counters(&state.fast_mode_429, "fast_mode_429");
     let entitlement_400 = snapshot_counters(&state.entitlement_400, "entitlement_400");
@@ -11627,11 +11640,10 @@ async fn metrics_handler(
     );
     let beta_flags_dropped = snapshot_counters(&state.beta_flags_dropped, "beta_flags_dropped");
     let client_rejections: Vec<((String, &'static str), u64)> = state
-        .client_rejections
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
+        .lock_client_rejections()
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
     let auth_failures: Vec<(AuthFailureKey, u64)> =
         lock_recovering(&state.auth_failures, "auth_failures")
             .iter()
