@@ -3278,6 +3278,62 @@ fn translate_request_forwards_non_numeric_temperature_unchanged() {
     assert_eq!(result["temperature"], "0.7");
 }
 
+#[test]
+fn translate_request_maps_reasoning_effort_to_output_config() {
+    for effort in ["low", "medium", "high", "xhigh", "max"] {
+        let req = serde_json::json!({
+            "model": "claude-opus-5-5",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "reasoning_effort": effort
+        });
+        let result = translate_openai_to_anthropic(&req);
+        assert_eq!(
+            result["output_config"],
+            serde_json::json!({"effort": effort})
+        );
+        // OpenAI-only field never reaches the Anthropic body
+        assert!(result.get("reasoning_effort").is_none());
+        // adaptive models think on their own; the shim must not synthesise it
+        assert!(result.get("thinking").is_none());
+    }
+}
+
+#[test]
+fn translate_request_drops_unmappable_reasoning_effort() {
+    // `minimal`/`none` have no Anthropic equivalent; unknown strings, wrong
+    // case and non-strings would 400 upstream — drop them all.
+    for effort in [
+        serde_json::json!("minimal"),
+        serde_json::json!("none"),
+        serde_json::json!("ultra"),
+        serde_json::json!("HIGH"),
+        serde_json::json!(3),
+        serde_json::Value::Null,
+    ] {
+        let req = serde_json::json!({
+            "model": "claude-opus-5-5",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "reasoning_effort": effort
+        });
+        let result = translate_openai_to_anthropic(&req);
+        assert!(
+            result.get("output_config").is_none(),
+            "effort {effort} must be dropped"
+        );
+        assert!(result.get("reasoning_effort").is_none());
+    }
+}
+
+#[test]
+fn translate_request_without_reasoning_effort_has_no_output_config() {
+    let req = serde_json::json!({
+        "model": "claude-opus-5-5",
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    let result = translate_openai_to_anthropic(&req);
+    assert!(result.get("output_config").is_none());
+}
+
 /// The Anthropic→OpenAI fallback translator gets the same LAB-798 guard as
 /// the forward shim: an OpenAI-protocol endpoint can front Claude ≥ 4.7.
 #[test]

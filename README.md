@@ -670,6 +670,17 @@ with `sum by (kind)`, where `max` would undercount.
 > model content verbatim. Streaming and non-streaming responses now follow the
 > same rule.
 
+### OpenAI thinking effort
+
+OpenAI clients can set thinking effort on `/v1/chat/completions`:
+`reasoning_effort` is translated to Anthropic's `output_config.effort` when it
+is one of `low`, `medium`, `high`, `xhigh` or `max`. `minimal`, `none` and any
+other value are dropped with a warn log — there is no Anthropic equivalent —
+and the request proceeds at the model's default effort. No `thinking` block is
+added, so a model that does not think adaptively by default keeps its default
+behaviour, and a model that does not support a given effort level answers with
+the upstream 400.
+
 <details>
 <summary><strong>Example <code>/_stats</code> response</strong></summary>
 
