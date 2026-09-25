@@ -23961,6 +23961,65 @@ async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
     assert_eq!(state.auth_failures.lock().unwrap().values().sum::<u64>(), 5);
 }
 
+/// A poisoned throttle table must not switch the throttle off. A
+/// skip-on-poison lock made `check` report "not throttled" and
+/// `record_failure` stop counting for the life of the process. Driven through
+/// the auth path, not `check` in isolation, so the 429 + `retry-after` the
+/// caller sees is what is proven.
+#[tokio::test]
+async fn auth_throttle_keeps_throttling_through_poisoned_lock() {
+    let state = Arc::new(AppState {
+        clients: vec![mk_client("geo", "key-geo", &[])],
+        auth_throttle: AuthThrottle::new(3, Duration::from_secs(60)),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state.clone())).await;
+    let client = Client::new();
+    let bad = || {
+        client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-api-key", "key-wrong")
+            .body("{}")
+            .send()
+    };
+
+    for _ in 0..3 {
+        assert_eq!(
+            bad().await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+    }
+    poison(&state.auth_throttle.entries);
+
+    let resp = bad().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "an IP at max_failures must stay throttled through a poisoned lock"
+    );
+    let retry: u64 = resp
+        .headers()
+        .get("retry-after")
+        .expect("429 must carry retry-after")
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("retry-after must be whole seconds");
+    assert!((1..=60).contains(&retry));
+    assert!(
+        !state.auth_throttle.entries.is_poisoned(),
+        "the poison must be cleared, or record_failure stops counting for good"
+    );
+    let ip: IpAddr = "127.0.0.1".parse().unwrap();
+    let before = state.auth_throttle.entries.lock().unwrap()[&ip].1;
+    state.auth_throttle.record_failure(ip);
+    assert_eq!(
+        state.auth_throttle.entries.lock().unwrap()[&ip].1,
+        before + 1,
+        "failures must keep counting once the poison is cleared"
+    );
+}
+
 /// Successful traffic below the limit also leaves the shared IP's failure
 /// history intact. This keeps an authenticated neighbour from accidentally
 /// defeating the invalid-request throttle for an attacker behind the same NAT.
@@ -25102,6 +25161,44 @@ async fn poisoned_counter_lock_is_recovered_not_zeroed() {
             .lock()
             .unwrap()
             .get("speed")
+            .copied(),
+        Some(2),
+        "counting must resume once the poison is cleared"
+    );
+}
+
+/// `client_rejections` has no `snapshot_counters` reader to clear its poison:
+/// both its writer and the `/metrics` render skipped on `Err`, so one panicked
+/// holder published an empty series and stopped counting for the life of the
+/// process. Driven through the real `/metrics` render.
+#[tokio::test]
+async fn poisoned_client_rejections_lock_is_recovered_not_zeroed() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-aaa")]);
+    state.note_client_rejection("client-a", "budget");
+    poison(&state.client_rejections);
+
+    let addr = serve(build_router(state.clone())).await;
+    let body = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains(r#"anthropic_client_rejections_total{client="client-a",reason="budget"} 1"#),
+        "/metrics must publish the real count through a poisoned lock:\n{body}"
+    );
+    assert!(!state.client_rejections.is_poisoned());
+
+    state.note_client_rejection("client-a", "budget");
+    assert_eq!(
+        state
+            .client_rejections
+            .lock()
+            .unwrap()
+            .get(&("client-a".to_string(), "budget"))
             .copied(),
         Some(2),
         "counting must resume once the poison is cleared"
