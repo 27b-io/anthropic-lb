@@ -33,9 +33,25 @@ which triggers `release.yml` (build + crates.io) and `docker.yml`.
 - **Squash-merge titles must be conventional commits** — `feat: ...`,
   `fix: ...`, `feat!: ...`; ticket refs go in the scope (e.g.
   `fix(LAB-932): ...`). Non-conventional subjects are invisible to
-  release-please and produce no release. Caveat: with the repo's current
-  merge settings the squash subject can come from the *commit* title
-  (single-commit PRs) rather than the PR title — make both conventional.
+  release-please and produce no release. The repo squash-merges with the
+  PR title as the subject and a blank body, so the PR title is the whole
+  commit message release-please sees unless the PR body carries an
+  override block (below).
+- **Scoped breaking changes use the spec form `type(scope)!: summary`**
+  (e.g. `fix(LAB-3214)!: ...`). `type!(scope): ...` is NOT parsed —
+  release-please silently drops the commit (no notes entry, no version
+  bump); #172 was missed this way and its 0.2.5 entry restored by hand.
+- **`BREAKING CHANGE:` footers go in the PR body** (the blank squash body
+  discards branch-commit footers), inside an override block. The block
+  replaces the whole commit message, so repeat the header:
+
+  ```
+  BEGIN_COMMIT_OVERRIDE
+  fix(LAB-3214)!: summary
+
+  BREAKING CHANGE: what breaks
+  END_COMMIT_OVERRIDE
+  ```
 - **Pre-1.0 is pinned**: breaking changes bump the minor (never to 1.0.0),
   features bump the patch, and 0.x GitHub releases are flagged pre-release.
 - **Releasing 1.0.0** is an explicit human act: land a commit with a
@@ -161,7 +177,7 @@ Routing consequences (`constraining_7d_claims`):
 | `allow_unauthenticated` | bool? | false | LAB-1192 default-deny escape hatch: startup FAILS with no credentials unless this is explicitly true. Incompatible with configured credentials. Trusted-network-only; warns at boot, and unauthenticated `/_stats`/`/metrics` access warns at most once per route per 5 min (`OPEN_ADMIN_WARN_INTERVAL`) |
 | `allowed_ips` | string[]? | none (allow all) | IP/CIDR allowlist |
 | `trusted_proxies` | string[]? | none | LBs whose `x-forwarded-for` is honoured (LAB-1192). Peer in list ⇒ client IP = rightmost XFF entry not in list; otherwise peer address, header ignored. One resolution function (`resolve_client_ip`), called once per handler |
-| `auth_failure_limit` | u32? | 10 | Failed-auth attempts per client IP in the window before further invalid credentials get 429 + `retry-after`; valid credentials always pass. 0 disables. Counted in `anthropic_auth_failures_total{route}`; state bounded at 4096 IPs; eviction purges expired windows first, then the least-established live entry (lowest count, oldest window as tie-breaker) so fresh-failure floods can't flush an active lockout |
+| `auth_failure_limit` | u32? | 10 | Failed-auth attempts per client IP in the window before further invalid credentials get 429 + `retry-after`; valid credentials always pass. 0 disables. Counted in `anthropic_auth_failures_total{route,cred}` and logged with `peer` (the actual TCP socket address), `cred` (presented-credential header shape), a one-way `key_fp` (none for `auth-other`) and a clipped `ua` (LAB-4720); state bounded at 4096 IPs; eviction purges expired windows first, then the least-established live entry (lowest count, oldest window as tie-breaker) so fresh-failure floods can't flush an active lockout |
 | `auth_failure_window_secs` | u64? | 300 | Failed-auth throttle window |
 | `auto_cache` | bool? | true | Auto-inject prompt cache breakpoints |
 | `shadow_log` | string? | none | Path for JSONL audit trail |
@@ -183,7 +199,7 @@ Routing consequences (`constraining_7d_claims`):
 | `endpoints[].fable_included` | bool? | true | Plan includes Fable's 50%-of-weekly band. Set false for Pro / standard Team accounts: Fable requests demote the endpoint by `overage_penalty`; non-Fable routing unaffected |
 | `endpoints[].allow_nonstandard_host` | bool? | false | Allow an `anthropic` endpoint whose `base_url` host isn't `api.anthropic.com` (otherwise startup fails — token exfil guard, LAB-1191) |
 | `expose_upstream_ratelimit_headers` | bool? | false | Reflect upstream `anthropic-ratelimit-*` headers to callers (reveals pooled account capacity — trusted networks only, LAB-1191) |
-| `allowed_client_betas` | string[]? | built-in list | Client `anthropic-beta` flags forwarded on OAuth endpoints (`*` suffix wildcard); a configured list REPLACES the default (copy defaults alongside additions); unlisted flags dropped + logged + counted in `anthropic_beta_flag_dropped_total` (LAB-1191) |
+| `allowed_client_betas` | string[]? | built-in list | Client `anthropic-beta` flags forwarded on OAuth endpoints (`*` suffix wildcard); a configured list REPLACES the default (copy defaults alongside additions); unlisted flags dropped + logged + counted in `anthropic_beta_flag_dropped_total` (LAB-1191). When anything is dropped, top-level body fields belonging to a dropped flag are stripped with it (only on `/v1/messages` + `/v1/messages/count_tokens`), so the feature turns off quietly instead of 400ing upstream — counted in `anthropic_beta_body_field_stripped_total` (LAB-1261). Fields owned by a flag that SURVIVED are protected, which requires `BETA_BODY_FIELDS` to stay total over this list (build-time test); a surviving flag with no row switches the strip off for that request rather than risk deleting its field |
 
 
 **Key headers parsed:**
