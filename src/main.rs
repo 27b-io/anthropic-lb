@@ -6860,9 +6860,7 @@ fn inject_account_auth(
     headers.remove("authorization");
     headers.remove("x-api-key");
     let mut dropped: Vec<String> = Vec::new();
-    if token.starts_with("sk-ant-api") {
-        headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
-    } else if token.starts_with(OAUTH_TOKEN_PREFIX) {
+    if token.starts_with(OAUTH_TOKEN_PREFIX) {
         headers.insert(
             "authorization",
             HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
@@ -6904,6 +6902,7 @@ fn inject_account_auth(
             HeaderValue::from_str(&flags.join(",")).unwrap(),
         );
     } else {
+        // Anything that is not OAuth (API keys included) is sent as x-api-key.
         headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
     }
     dropped
