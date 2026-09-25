@@ -215,7 +215,7 @@ token = "sk-ant-api03-..."
 | Prefix | Auth method | Notes |
 |:-------|:------------|:------|
 | `sk-ant-oat*` | `Authorization: Bearer` | OAuth token; beta headers injected automatically |
-| `sk-ant-api*` | `x-api-key` | Standard API key |
+| Any other token | `x-api-key` | Standard API keys, and anything not matching the OAuth prefix |
 | `passthrough` | Caller's headers | Forwards client auth as-is |
 
 > [!TIP]

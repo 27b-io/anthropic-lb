@@ -117,10 +117,10 @@ Headroom-proportional weighted bucket hashing:
 
 ### Token Type Detection
 
-`protocol = "anthropic"` endpoints use prefix-based auth on the configured `token`:
+`protocol = "anthropic"` endpoints dispatch on one prefix of the configured `token` (`OAUTH_TOKEN_PREFIX`):
 
 - `sk-ant-oat*` → `Authorization: Bearer` + injects `anthropic-beta: oauth-2025-04-20` and `anthropic-dangerous-direct-browser-access: true`. The OpenAI-compat handler additionally injects `claude-code-20250219` beta flag.
-- `sk-ant-api*` → `x-api-key` header
+- any other token (API keys included) → `x-api-key` header
 - `passthrough` → forwards caller's auth headers untouched
 
 `protocol = "openai"` endpoints use `Authorization: Bearer` with the configured `token`.

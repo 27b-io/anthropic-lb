@@ -16734,12 +16734,19 @@ async fn openai_compat_translates_upstream_raw_error() {
 }
 
 #[test]
-fn inject_auth_api_key() {
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert("authorization", HeaderValue::from_static("Bearer old"));
-    inject_account_auth(&mut headers, "sk-ant-api-test123", false, &default_betas());
-    assert_eq!(headers.get("x-api-key").unwrap(), "sk-ant-api-test123");
-    assert!(headers.get("authorization").is_none());
+fn inject_auth_non_oauth_token_uses_x_api_key() {
+    // The contract is two-way: only the OAuth prefix selects Bearer auth;
+    // every other token, API key or not, is sent as x-api-key.
+    for token in ["sk-ant-api-test123", "not-an-anthropic-prefix-test123"] {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer old"));
+        inject_account_auth(&mut headers, token, false, &default_betas());
+        assert_eq!(headers.get("x-api-key").unwrap(), token);
+        assert!(headers.get("authorization").is_none());
+        assert!(headers
+            .get("anthropic-dangerous-direct-browser-access")
+            .is_none());
+    }
 }
 
 #[test]
