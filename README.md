@@ -395,16 +395,18 @@ can steer are locked down by default:
   `anthropic_beta_flag_dropped_total{flag}`. The built-in default covers the
   flags the proxy itself needs, the flag families Claude Code sends, and
   `fast-mode-*`; the authoritative list is `DEFAULT_CLIENT_BETA_ALLOWLIST`
-  in `src/main.rs`. Known body pairings:
+  in `src/main.rs`. Known body pairings — top-level ones degrade quietly
+  when their flag is dropped (next bullet); nested ones still `400`, which is
+  why their flags stay on the default list:
+  - `context-management-*` ↔ top-level `context_management`
   - `fast-mode-*` ↔ top-level `speed: "fast"`
   - `dangerous-tool-use-*` + `auto-mode-classifier-*` ↔ top-level `safeguards`
-  - `mid-conversation-tool-changes-*`, `per-turn-control-*`, `timing-*` ↔
-    `tool_addition`/`tool_removal` blocks and `output_config.effort`/`timing`
-    on the `role: "system"` entry in `messages`
+  - *(nested)* `mid-conversation-tool-changes-*`, `per-turn-control-*`,
+    `timing-*` ↔ `tool_addition`/`tool_removal` blocks and
+    `output_config.effort`/`timing` on the `role: "system"` entry in `messages`
 - **A dropped flag takes its body field with it.** Some beta families pair a
   header flag with a top-level request-body field that only exists when the
-  flag is declared (`fast-mode-*` with `speed`, `context-management-*` with
-  `context_management`, `dangerous-tool-use-*` with `safeguards`). Forwarding
+  flag is declared (the top-level pairings above). Forwarding
   that field without its flag is a hard upstream `400`, not a quiet downgrade,
   so when the filter drops anything the proxy also removes every top-level
   body field that is neither base `/v1/messages` schema nor owned by a flag
