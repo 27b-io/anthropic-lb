@@ -8082,6 +8082,83 @@ async fn budget_check_within_limit() {
     assert!(state.check_budget("unknown").await.is_ok());
 }
 
+/// Panic while holding `mutex`, leaving it poisoned — the state a future
+/// panicking edit inside a critical section would produce.
+fn poison<T: Send>(mutex: &std::sync::Mutex<T>) {
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let _g = mutex.lock().unwrap();
+            panic!("poison the mutex");
+        })
+        .join()
+        .unwrap_err();
+    });
+    assert!(mutex.is_poisoned());
+}
+
+/// A poisoned `budget_usage` lock must not disable enforcement: `check_budget`
+/// still denies an exhausted client (an `if let Ok` skip returned `Ok(())`,
+/// granting the budget), and the poison is cleared so `record_budget_usage`
+/// keeps counting afterwards rather than skipping for the life of the process.
+#[tokio::test]
+async fn budget_check_enforces_through_poisoned_lock() {
+    let mut budgets = HashMap::new();
+    budgets.insert("client-a".to_string(), 1000u64);
+    budgets.insert("client-b".to_string(), 1000u64);
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        client_budgets: budgets,
+        ..test_state_base()
+    });
+    state.record_budget_usage("client-a", 1500).await;
+    poison(&state.budget_usage);
+
+    assert_eq!(
+        state.check_budget("client-a").await,
+        Err(0),
+        "an exhausted client must stay denied through a poisoned lock"
+    );
+    assert!(
+        !state.budget_usage.is_poisoned(),
+        "recovery must clear the poison, not just bypass it"
+    );
+
+    // Accumulation survives too: new usage is counted and enforced.
+    state.record_budget_usage("client-b", 1200).await;
+    assert!(state.check_budget("client-b").await.is_err());
+}
+
+/// The accumulator itself going through a poisoned lock: usage recorded
+/// while poisoned must be counted, not silently dropped.
+#[tokio::test]
+async fn budget_record_counts_through_poisoned_lock() {
+    let mut budgets = HashMap::new();
+    budgets.insert("client-a".to_string(), 1000u64);
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        client_budgets: budgets,
+        ..test_state_base()
+    });
+    poison(&state.budget_usage);
+    state.record_budget_usage("client-a", 1500).await;
+    assert!(state.check_budget("client-a").await.is_err());
+}
+
+/// `anthropic_auth_failures_total` is the brute-force signal: a poisoned
+/// lock must not freeze it (writer skips) or zero it (reader skips).
+#[tokio::test]
+async fn auth_failure_counter_survives_poisoned_lock() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    state.count_auth_failure("proxy", "none");
+    poison(&state.auth_failures);
+    state.count_auth_failure("proxy", "none");
+    assert!(!state.auth_failures.is_poisoned());
+    assert_eq!(
+        state.auth_failures.lock().unwrap().get(&("proxy", "none")),
+        Some(&2)
+    );
+}
+
 // ── Unit: pre-request-gate rejection counter (LAB-2551) ────────
 
 /// A budget-exhausted request must both 429 and increment the rejection
