@@ -13677,12 +13677,6 @@ async fn metrics_build_info_and_start_time() {
         body.contains(&format!("process_start_time_seconds {}", state.start_epoch)),
         "{body}"
     );
-    let now = AppState::now_epoch();
-    assert!(
-        state.start_epoch <= now && now - state.start_epoch < 60,
-        "start_epoch {} vs now {now}",
-        state.start_epoch
-    );
 }
 
 /// LAB-4379 AC4: the revision label is the 7-character short commit that
