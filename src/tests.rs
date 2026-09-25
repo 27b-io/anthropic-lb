@@ -6355,7 +6355,7 @@ fn fast_mode_not_enabled_error_detection() {
     ));
 }
 
-/// MF-1: the matcher requires an exact match, not a substring — a message
+/// The matcher requires an exact match, not a substring — a message
 /// that merely CONTAINS the entitlement clause (trailing wording drift, or a
 /// client-echoed field name in an unrelated 400) must not match. Substring
 /// matching plus an unguarded caller let one crafted request walk and mark
@@ -6372,7 +6372,7 @@ fn fast_mode_not_enabled_error_requires_exact_match() {
     );
 }
 
-/// MF-1 integration regression: an entitlement-shaped 400 on a request that
+/// Integration regression: an entitlement-shaped 400 on a request that
 /// never asked for `speed: "fast"` must not be treated as a fast-mode
 /// rejection — no account mark, no rotation, the 400 forwards verbatim.
 /// Otherwise a client could craft such a 400 (e.g. an unrecognized top-level
@@ -6498,7 +6498,7 @@ fn pool_cannot_serve_unions_negative_caches() {
     assert!(!state.pool_cannot_serve("claude-sonnet-5", true, None));
 }
 
-/// MF-2/Cobel HIGH: an OpenAI-protocol endpoint never accrues a fast-mode
+/// An OpenAI-protocol endpoint never accrues a fast-mode
 /// mark (it has no org entitlement to reject) and its request translation
 /// drops `speed` entirely, so routing a fast request there would silently
 /// serve it at standard speed. It must never be a fast-request candidate;
@@ -6525,7 +6525,7 @@ async fn fast_mode_excludes_openai_protocol_endpoints() {
     );
 }
 
-/// MF-2: an Anthropic account fast-disabled plus an OpenAI fallback must be
+/// An Anthropic account fast-disabled plus an OpenAI fallback must be
 /// treated as pool-exhausted for a fast request (truthful error) — the
 /// OpenAI endpoint can't honor `speed:"fast"` and must not count as
 /// "eligible" capacity that masks the exhaustion (that mask is exactly what
@@ -6628,7 +6628,7 @@ async fn fast_mode_disabled_rotates_and_next_fast_request_skips_account() {
     );
 
     // A standard request is unaffected by the mark: priority sends it to
-    // `reject`, same as before. Post-MF-1 the entitlement-shaped 400 is
+    // `reject`, same as before. The entitlement-shaped 400 is
     // gated on `is_fast_mode`, so a standard request that draws it does NOT
     // rotate — it forwards the 400 verbatim (matches
     // `fast_mode_shaped_400_on_standard_request_is_not_marked_or_rotated`).
@@ -6684,8 +6684,8 @@ async fn fast_mode_rejection_plus_rate_limited_pool_stays_retryable() {
     );
 }
 
-/// Model-shaped twin of `fast_mode_rejection_plus_rate_limited_pool_stays_retryable`
-/// (MF-3): the same `pool_cannot_serve` gate governs the pre-existing LAB-941
+/// Model-shaped twin of `fast_mode_rejection_plus_rate_limited_pool_stays_retryable`:
+/// the same `pool_cannot_serve` gate governs the pre-existing LAB-941
 /// model-unsupported rejection, not just the new fast-mode one. A rejection on
 /// ONE account while the rest of the pool is merely rate-limited (never
 /// attempted, so never negative-cached) must stay retryable, not surface the

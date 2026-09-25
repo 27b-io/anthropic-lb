@@ -4613,8 +4613,7 @@ impl AppState {
             // translation drops the field) and never accrues a fast-mode
             // mark, so it must not count as "eligible" for a fast request —
             // otherwise a pool with only OpenAI capacity left would look
-            // servable and the exhaustion reply would never fire (LAB-2687
-            // MF-2/Cobel HIGH).
+            // servable and the exhaustion reply would never fire (LAB-2687).
             if fast && ep.protocol == Protocol::OpenAI {
                 continue;
             }
@@ -5512,7 +5511,7 @@ impl AppState {
             // An OpenAI-protocol endpoint never carries a fast-mode mark (it
             // has no org entitlement to reject) and its request translation
             // drops `speed` entirely — routing a fast request there would
-            // silently serve it at standard speed (LAB-2687 MF-2/Cobel HIGH).
+            // silently serve it at standard speed (LAB-2687).
             if fast && self.endpoints[c.endpoint].protocol == Protocol::OpenAI {
                 trace!(
                     endpoint = self.endpoints[c.endpoint].name,
@@ -8640,8 +8639,9 @@ fn is_model_unsupported_error(status: StatusCode, body: &serde_json::Value) -> b
 
 /// Exact upstream text of the org-level fast-mode entitlement 400 (observed
 /// 2026-09-02, LAB-2687), replayed on the warm negative-cache path where no
-/// upstream response exists. The matcher keys on its "for your organization"
-/// clause, not the whole string, so trailing wording drift still rotates.
+/// upstream response exists. The matcher requires this exact string, so if
+/// upstream rewords it, rotation stops and the 400 reaches the client as it
+/// did before LAB-2687.
 const FAST_MODE_NOT_ENABLED_MSG: &str =
     "Fast mode is not enabled for your organization. An organization admin must enable this feature.";
 
@@ -10471,7 +10471,7 @@ async fn proxy_handler(
     // — one rejection plus rate limits on the rest — is a rate-limited pool
     // and keeps the retryable status.
     //
-    // Deliberate LAB-941 behaviour change (MF-3, 2026-09-23): pre-LAB-2687,
+    // Deliberate LAB-941 behaviour change (LAB-2687): before it,
     // a stashed model-unsupported rejection returned unconditionally here
     // whenever the final round saw no 529/transient, regardless of whether
     // the rest of the pool was ever attempted. That is no longer true — a
@@ -15420,8 +15420,8 @@ async fn openai_chat_handler(
                 return resp;
             }
         }
-        // Same rejection-exhaustion rule as `proxy_handler` (LAB-941, deliberate
-        // MF-3 generalisation), in the OpenAI error shape this handler's
+        // Same rejection-exhaustion rule as `proxy_handler` (LAB-941, as
+        // generalised by LAB-2687), in the OpenAI error shape this handler's
         // clients parse. Never `fast`: the OpenAI→Anthropic translation
         // carries no `speed`.
         if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, false, refused) {
