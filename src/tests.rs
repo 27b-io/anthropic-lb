@@ -522,7 +522,7 @@ async fn mock_upstream_handler(req: Request<Body>) -> Response {
         HeaderValue::from_str(&reset_epoch).unwrap(),
     );
     // Headers a real upstream may attach that must NOT reach the caller by
-    // default (LAB-1191 finding 3) + one allow-listed header that must.
+    // default (LAB-1191 finding 3) + allow-listed headers that must.
     headers.insert(
         "anthropic-ratelimit-unified-5h-status",
         HeaderValue::from_static("allowed"),
@@ -533,6 +533,7 @@ async fn mock_upstream_handler(req: Request<Body>) -> Response {
         HeaderValue::from_static("org-secret"),
     );
     headers.insert("request-id", HeaderValue::from_static("req_mock_123"));
+    headers.insert("x-should-retry", HeaderValue::from_static("true"));
     resp
 }
 
@@ -4873,6 +4874,7 @@ async fn mock_anthropic_streaming_handler(req: Request<Body>) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
+        .header("x-should-retry", "false")
         .body(Body::from(body))
         .unwrap()
 }
@@ -5815,10 +5817,9 @@ async fn standard_speed_429_still_cools_account_and_rotates() {
 /// BURST 429 — `x-should-retry` with no `retry-after` and no rate headers.
 /// Burst limits are per-minute RPM/concurrency on the ACCOUNT, not on a rate
 /// bucket, so they are real evidence about the account whatever speed was
-/// asked for. Exempting them would be worse than the bug this commit fixes:
-/// `x-should-retry` is not reflected to callers, so the client would get a
-/// bare 429 with no transient hint AND no rotation, while standard traffic
-/// routed to the same still-bursting account would hard-limit it anyway.
+/// asked for. Exempting it would leave the account pinned: standard traffic
+/// routed to it would burst-429 and hard-limit it anyway. The caller still
+/// gets `x-should-retry` as its transient hint.
 #[tokio::test]
 async fn fast_mode_burst_429_still_backs_off_and_rotates() {
     use std::sync::atomic::Ordering;
@@ -7193,6 +7194,13 @@ async fn anthropic_streaming_records_usage() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-should-retry")
+            .and_then(|v| v.to_str().ok()),
+        Some("false"),
+        "streaming responses must reflect x-should-retry exactly"
+    );
 
     let body = resp.text().await.unwrap();
     assert!(
@@ -20532,6 +20540,13 @@ async fn upstream_headers_stripped_by_default() {
         Some("req_mock_123"),
         "request-id is allow-listed for SDK error reports"
     );
+    assert_eq!(
+        resp.headers()
+            .get("x-should-retry")
+            .and_then(|v| v.to_str().ok()),
+        Some("true"),
+        "x-should-retry is allow-listed regardless of the ratelimit flag"
+    );
     assert!(resp.headers().contains_key("x-budget-status"));
 }
 
@@ -20574,6 +20589,26 @@ async fn upstream_ratelimit_headers_reflected_with_flag() {
         !resp.headers().contains_key("anthropic-organization-id"),
         "org identity stays stripped even with the ratelimit flag on"
     );
+}
+
+#[test]
+fn upstream_headers_do_not_synthesize_should_retry() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "content-type",
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    let response = reflect_upstream_headers(Response::builder(), &headers, false)
+        .body(())
+        .unwrap();
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
+    assert!(!response.headers().contains_key("x-should-retry"));
 }
 
 fn default_betas() -> Vec<String> {

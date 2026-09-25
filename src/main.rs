@@ -8735,12 +8735,9 @@ async fn classify_retry_status(
         // no `retry-after`, no rate headers) is a per-minute RPM/concurrency
         // limit on the ACCOUNT, not on a rate bucket, so it is real evidence
         // about the account whatever speed the request asked for. Exempting it
-        // would be worse than the bug: `x-should-retry` is not in
-        // `reflect_upstream_headers`'s allow-list, so the caller would get a
-        // bare 429 with no transient hint AND no rotation, while the account
-        // stayed pinned — and standard traffic routed to that same account
-        // would then burst-429 and hard-limit it, reinstating the denial via
-        // the victim's own requests (LAB-2675 panel finding).
+        // would leave the account pinned: standard traffic routed to it would
+        // burst-429 and hard-limit it anyway. The caller still gets
+        // `x-should-retry` as its transient hint (LAB-2675 panel finding).
         //
         // What this does NOT buy: the ticket assumed the utilization ceilings
         // would still cover a fast request on an exhausted account, because
@@ -9011,14 +9008,15 @@ fn reflect_upstream_headers(
     expose_ratelimit: bool,
 ) -> axum::http::response::Builder {
     // What SDKs need to function: body framing (content-type/length),
-    // SSE cache hint, the Anthropic request id for error reports, and
-    // retry-after on forwarded 4xx.
+    // SSE cache hint, the Anthropic request id for error reports, retry-after
+    // on forwarded 4xx, and the upstream's transient retry hint.
     const ALLOWED: &[&str] = &[
         "content-type",
         "content-length",
         "cache-control",
         "request-id",
         "retry-after",
+        "x-should-retry",
     ];
     for (k, v) in headers.iter() {
         let name = k.as_str();
