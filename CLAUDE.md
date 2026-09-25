@@ -84,7 +84,7 @@ Operational notes that affect the code:
 
 ## Architecture
 
-Single Rust binary, no library crate. `src/main.rs` holds startup (`main`, config validation) and declares one module per subsystem (`src/config.rs`, `src/state.rs`, `src/routing.rs`, `src/handler.rs`, `src/metrics.rs`, …), each cut from one `// ── Section ──` block of the former single-file source. The crate keeps one flat namespace: every module opens with `use crate::*;` and `src/main.rs` glob-imports every module that exports names (`use state::*;` …), so an item used outside its own module is `pub(crate)` and nothing needs a module path. `routing` and `persistence` hold only `impl AppState` blocks and have no glob; the first `pub(crate)` item added to one of them needs its `use <module>::*;` line. Tests sit next to the code they test, as `#[cfg(test)] mod tests` in `src/<module>/tests.rs`, split into `src/<module>/tests/<area>.rs` where a module has many; shared fixtures live in `src/test_support.rs` and tests of `src/main.rs` itself in `src/tests.rs`. Put a new item in the module whose section it belongs to; do not grow `src/main.rs`.
+Single Rust binary, no library crate. `src/main.rs` holds startup (`main`, config validation) and declares one module per subsystem; the table below says which file holds what. The crate keeps one flat namespace: every module opens with `use crate::*;` and `src/main.rs` glob-imports every module that exports names (`use state::*;` …), so an item used outside its own module is `pub(crate)` and nothing needs a module path. `routing` and `persistence` export no names today (`routing` is all `impl AppState`; `persistence`'s own types are private to it), so they have no glob: the first `pub(crate)` item another module uses from one of them needs its `use <module>::*;` line. The external imports at the top of `src/main.rs` reach every module through that glob; an import only one module needs goes in that module, below its `use crate::*;`. The feature-gated `guard` module is used by path (`guard::…`). Tests sit next to the code they test, as `#[cfg(test)] mod tests` in `src/<module>/tests.rs`, split into `src/<module>/tests/<area>.rs` where a module has many; fixtures used by the tests of more than one module live in `src/test_support.rs`, and tests of `src/main.rs` itself in `src/tests.rs`. Put a new item in the module that owns its subsystem; do not grow `src/main.rs`.
 
 ### Core Data Flow
 
@@ -92,18 +92,27 @@ Single Rust binary, no library crate. `src/main.rs` holds startup (`main`, confi
 Request → resolve_client_ip(peer, x-forwarded-for vs trusted_proxies) → IP allowlist check → authenticate([[clients]] key, else legacy proxy_key) → throttle failed credentials (valid principals always pass) → resolve client_id (authenticated principal, else x-client-id/IP map) → pre_request_gate(operator bypass → model allow-list → budget → utilization limit → emergency brake) → pick_endpoint(affinity, model, skip) → forward to endpoint → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
 ```
 
-### Key Sections (in source order)
+### Where things live
 
-| Section | What it does |
-|---------|-------------|
-| **Config** (`Config`, `ClientConfig`, `EndpointConfig`) | TOML deserialization structs |
-| **Runtime state** (`AppState`, `Endpoint`, `RateLimitInfo`) | Shared via `Arc<AppState>`, per-endpoint `RwLock<RateLimitInfo>`, atomic counters, optional fred `RedisClient` (auto-reconnecting) |
-| **Persistence** (`PersistedState`) | JSON state file at `<config_path>.state.json`, saved after every request and on shutdown. Redis for cross-replica state when configured. |
-| **Token usage** (`TokenUsage`, `record_usage`) | Extracts token counts from responses (streaming SSE + non-streaming JSON), tracks per-endpoint and per-client |
-| **Auto-cache** (`inject_cache_breakpoints`) | Injects up to 3 prompt cache breakpoints (last tool, system, last user message) unless cache_control already present |
-| **Handlers** | Four axum handlers: `proxy_handler` (main Anthropic proxy), `stats_handler` (`/_stats` JSON), `metrics_handler` (`/metrics` Prometheus), `openai_chat_handler` (OpenAI→Anthropic format translation) |
-| **OpenAI compatibility** (`translate_*`, `StreamContext`) | Translates `/v1/chat/completions` requests/responses between OpenAI and Anthropic formats, including streaming SSE |
-| **Tests** (`src/<module>/tests.rs`, fixtures in `src/test_support.rs`) | Unit + integration tests using mock upstream servers |
+Some module names are older than their contents; this is the map.
+
+| File | Holds |
+|------|-------|
+| `src/config.rs` | TOML config structs (`Config`, `ClientConfig`, `EndpointConfig`, `Protocol`, `RoutingStrategy`) |
+| `src/state.rs` | `AppState`, `Endpoint`, `RateLimitInfo`: shared via `Arc<AppState>`, per-endpoint `RwLock<RateLimitInfo>`, atomic counters, optional fred `RedisClient` (auto-reconnecting). Also EWMA / burn rate, label bounding, request-body admission, affinity hashing and content fingerprints |
+| `src/response_cache.rs` | The encrypted response cache (`ResponseCache`) **and** the admission surface: IP allow-list, failed-auth throttle, `authenticate`, `authorize_admin`, `resolve_client_ip` / `resolve_client_id`, client model allow-lists, the guard hook |
+| `src/persistence.rs` | JSON state file at `<config_path>.state.json`, saved after every request and on shutdown; probes. Its tests hold the Redis coordination suites, including `src/persistence/tests/real_redis.rs` |
+| `src/utilization.rs` | Time-adjusted utilization, 7d claims, waste risk, `compute_routing_weight`, `routing_candidates`. Also the retry / transport / Redis / body-limit constants, `start_coordination_redis`, credential fingerprinting, the client `anthropic-beta` allow-list (`DEFAULT_CLIENT_BETA_ALLOWLIST`) and beta body-field stripping |
+| `src/routing.rs` | `pick_endpoint` and the weighted pickers, rate-limit header ingestion (`update_rate_info_for`), hard-limit marking, transport health, Redis sync / publish, `cluster_info` |
+| `src/token_usage.rs` | `TokenUsage` and the streaming `SseUsageScanner`; upstream auth injection (`inject_account_auth`); `RequestContext` and the affinity key |
+| `src/session_registry.rs` | Session registry (context-window visibility), usage / `proxied` logging, `record_usage`, budgets, the operator check, utilization limit, emergency brake and `pre_request_gate` |
+| `src/oauth_prompt.rs`, `src/auto_cache.rs` | OAuth system-prompt injection; prompt-cache breakpoint injection (up to 3: last tool, system, last user message) |
+| `src/handler.rs` | `proxy_handler` (main Anthropic proxy): retry / rotation outcomes, the upstream client, header reflection and stripping, guard responses |
+| `src/fallback.rs` | Forwarding to `protocol = "openai"` endpoints (`try_fallback_upstream`, called by both handlers) |
+| `src/stats.rs`, `src/metrics.rs` | `stats_handler` (`/_stats` JSON); `metrics_handler` (`/metrics` Prometheus) |
+| `src/openai_compat.rs` | OpenAI→Anthropic translation for `/v1/chat/completions` (`translate_*`, `StreamContext`, streaming SSE) |
+| `src/reverse_translation.rs` | Anthropic→OpenAI translation for `openai` endpoints, SSE error frames, and `openai_chat_handler` (the `/v1/chat/completions` handler) |
+| `src/<module>/tests*`, `src/test_support.rs` | Unit + integration tests using mock upstream servers; shared fixtures |
 
 ### Endpoint Selection (`pick_endpoint`)
 
