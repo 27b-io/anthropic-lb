@@ -1003,6 +1003,19 @@ struct AppState {
     /// client-controlled input, so the map is bounded
     /// (`MAX_DROPPED_BETA_FLAGS`); overflow lands in the `_other` bucket.
     beta_flags_dropped: Mutex<HashMap<String, u64>>,
+    /// Top-level body fields stripped to keep a request coherent after the
+    /// beta filter dropped their header (LAB-1261). Exposed as
+    /// `anthropic_beta_body_field_stripped_total{field}`.
+    ///
+    /// This, not `anthropic_beta_flag_dropped_total`, is the alertable
+    /// signal. A dropped HEADER is routine — clients steadily send flags the
+    /// proxy does not carry, and nothing breaks when they are removed. A
+    /// stripped BODY FIELD means the proxy rewrote a caller's request
+    /// to stop it 400ing, i.e. a paired beta family arrived that the
+    /// allow-list does not know. Keys are JSON object keys from a
+    /// client-controlled body, so the map is bounded the same way
+    /// (`MAX_DROPPED_BETA_FLAGS`, `_other` overflow).
+    beta_body_fields_stripped: Mutex<HashMap<String, u64>>,
     /// Live session registry: affinity routing key → last-seen context-window
     /// occupancy (LAB-916). Visibility only — routing never reads it. Sync
     /// mutex, never held across `.await`; bounded by `session_registry_max`
@@ -3293,6 +3306,13 @@ const DEFAULT_BODY_READ_TIMEOUT_SECS: u64 = 60;
 /// `max_inflight_body_mb` config key; set it to 0 to disable the limit.
 const DEFAULT_MAX_INFLIGHT_BODY_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Prefix identifying an Anthropic OAuth token, as opposed to an
+/// `sk-ant-api*` API key. This is a protocol discriminator, not a
+/// credential: every auth branch that treats a token as OAuth — Bearer
+/// auth, the Claude Code system-prompt injection, the client beta-flag
+/// filter — keys off it, so the six of them must not be able to drift.
+const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
+
 /// Required OAuth beta flags. Both needed: oauth-2025-04-20 for OAuth auth,
 /// claude-code-20250219 for Claude Code API access quota routing.
 const OAUTH_BETA_FLAGS: &[&str] = &["oauth-2025-04-20", "claude-code-20250219"];
@@ -3317,11 +3337,13 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     // taken from anthropic_beta_flag_dropped_total on the lab fleet,
     // 2026-08-01). The first cut of this list under-enumerated them, which
     // 400'd all primary traffic: several of these flags have a BODY-side
-    // counterpart the LB forwards verbatim (context-management →
-    // `context_management`, structured-outputs → `output_format`,
-    // extended-cache-ttl → `cache_control.ttl`), so stripping only the
-    // header leaves an incoherent request that upstream rejects outright
-    // rather than degrading to the non-beta behaviour.
+    // counterpart (context-management → `context_management`,
+    // structured-outputs → `output_format`, extended-cache-ttl →
+    // `cache_control.ttl`). Since LAB-1261 a dropped header takes its
+    // TOP-LEVEL body field with it, so removing one of those from this list
+    // degrades the feature instead of 400ing — but keep them: degraded is
+    // still worse than working, and the NESTED `extended-cache-ttl-*` pairing
+    // is not covered by that mechanism and does still 400.
     "context-management-*",
     "structured-outputs-*",
     "extended-cache-ttl-*",
@@ -3332,14 +3354,14 @@ const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     "fallback-credit-*",
     "redact-thinking-*",
     "afk-mode-*",
-    // Fast mode (LAB-2669): body-paired with top-level `speed` — same
-    // header-stripped/body-forwarded hard-400 shape as the families above.
+    // Fast mode (LAB-2669): body-paired with top-level `speed`, and mapped in
+    // `BETA_BODY_FIELDS` so the pair travels together.
     "fast-mode-*",
     // Auto-mode classifier (LAB-3963): `dangerous-tool-use-*` is body-paired
-    // with top-level `safeguards` — same hard-400 shape as the families above,
-    // and Claude Code answers that 400 by denying every auto-mode tool use for
-    // the rest of the conversation. `auto-mode-classifier-*` rides the
-    // classifier's own follow-up requests.
+    // with top-level `safeguards`, and Claude Code answered that 400 by
+    // denying every auto-mode tool use for the rest of the conversation.
+    // `auto-mode-classifier-*` rides the classifier's own follow-up requests;
+    // both are mapped in `BETA_BODY_FIELDS` to the same `safeguards` field.
     "auto-mode-classifier-*",
     "dangerous-tool-use-*",
     // Claude Code 2.1.278 per-turn family (LAB-3964). All three are
@@ -3366,6 +3388,36 @@ const MAX_DROPPED_BETA_FLAGS: usize = 50;
 /// into every `/metrics` scrape is the cardinality decision's spirit broken
 /// by size instead of count.
 const MAX_DROPPED_BETA_FLAG_LEN: usize = 64;
+
+/// Strips counted (and logged) from any ONE request. A request's top-level
+/// key count is client-controlled; without this the per-key cap above is
+/// reachable from a single request (LAB-1261 panel finding).
+const MAX_STRIPPED_FIELDS_PER_REQUEST: usize = 8;
+
+/// Clamp a client-controlled string to something safe to use as a metric
+/// label and a log field: `[A-Za-z0-9_.-]` only, length-bounded on a char
+/// boundary. Anything else becomes `_invalid` rather than being escaped —
+/// these are JSON object keys, so a legitimate one is always in that set, and
+/// an illegitimate one has nothing worth preserving.
+///
+/// `prom_escape` already stops a crafted key forging a `/metrics` series; this
+/// is the log side, where the plain-text subscriber would otherwise let an
+/// embedded newline forge whole log LINES.
+fn sanitize_metric_key(raw: &str, max_len: usize) -> String {
+    let mut end = raw.len().min(max_len);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let clipped = &raw[..end];
+    if clipped.is_empty()
+        || !clipped
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
+        return "_invalid".to_string();
+    }
+    clipped.to_string()
+}
 
 /// `(route, cred)` — the label set of `anthropic_auth_failures_total`.
 type AuthFailureKey = (&'static str, &'static str);
@@ -3441,6 +3493,289 @@ fn suffix_wildcard_match(pattern: &str, value: &str) -> bool {
 
 fn beta_flag_allowed(allowed: &[String], flag: &str) -> bool {
     allowed.iter().any(|p| suffix_wildcard_match(p, flag))
+}
+
+/// Top-level `/v1/messages` body fields that belong to the BASE (non-beta)
+/// API schema — the set an upstream accepts with no `anthropic-beta` header
+/// at all. Verified against the Messages and count_tokens API references,
+/// 2026-09-20.
+///
+/// This is the list LAB-1261 trades FOR the old one. The beta-flag allow-list
+/// enumerates flag FAMILIES, which Anthropic adds faster than the proxy is
+/// updated, and its decay mode is a fleet-wide 400. The base schema is
+/// bounded and slow-moving, and its decay mode is one feature silently off
+/// on a request that is already carrying an unknown beta. Same enumeration
+/// trick, pointed at the finite set.
+const BASE_BODY_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "max_tokens",
+    "system",
+    "tools",
+    "tool_choice",
+    "thinking",
+    "output_config",
+    "cache_control",
+    "metadata",
+    "container",
+    "inference_geo",
+    "service_tier",
+    "stop_sequences",
+    "stream",
+    "temperature",
+    "top_k",
+    "top_p",
+];
+
+/// Beta flag family → the TOP-LEVEL body field it owns, for the paired betas
+/// the LB knows about. A field listed here survives only while its own flag
+/// survives the header filter on the SAME request, so the two halves are
+/// dropped together or kept together (LAB-1261).
+///
+/// Only top-level fields appear here. `extended-cache-ttl-*` pairs with a
+/// NESTED `cache_control.ttl` on content blocks, and `effort-*`/`task-budgets-*`
+/// nest inside `output_config`; none of them can be expressed as a top-level
+/// key, so dropping those families is still incoherent upstream. All three
+/// are on `DEFAULT_CLIENT_BETA_ALLOWLIST`, so none is dropped today.
+/// ponytail: top-level only. If a nested pairing ever fires in the wild, the
+/// upgrade is a targeted strip inside that one known structure — NOT a
+/// recursive unknown-key walk, which would eat `tools[].input_schema` and
+/// `tool_use.input`, both arbitrary client JSON by design.
+/// Every beta family the allow-list can pass, mapped to the TOP-LEVEL body
+/// fields it owns. An empty slice means "owns none" and is a real answer, not
+/// a placeholder — it is what lets the strip tell "this family brought no body
+/// field" apart from "I have never heard of this family".
+///
+/// **This table must stay TOTAL over `DEFAULT_CLIENT_BETA_ALLOWLIST`**, and
+/// `beta_body_field_table_covers_the_allowlist` fails the build if it is not.
+/// Totality is the whole mechanism (LAB-1261, Helly R finding 1): a surviving
+/// flag protects its body field only if a row claims it, so a missing row
+/// means the proxy DELETES a field belonging to a feature the caller was
+/// entitled to use. `fallback-credit-*` is the worked example — it is on the
+/// allow-list, Claude Code sends it, and its `fallback_credit_token` is a
+/// billing instrument redeemable once within five minutes of a refusal.
+///
+/// A flag that survives while matching NO row means an allow-list this table
+/// has not caught up with — `strip_orphaned_beta_body_fields` then declines to
+/// strip anything, because it cannot tell that family's body fields from an
+/// orphan's. Losing the degrade is the safe failure; deleting a live field is
+/// not.
+///
+/// Only TOP-LEVEL fields belong here. `extended-cache-ttl-*` owns a nested
+/// `cache_control.ttl` and `effort-*` nests in `output_config`; both are
+/// listed as owning nothing, which is true of the top level and is the reason
+/// dropping either still 400s upstream.
+const BETA_BODY_FIELDS: &[(&str, &[&str])] = &[
+    // The proxy's own flags — unconditionally re-added, never body-paired.
+    ("oauth-2025-04-20", &[]),
+    ("claude-code-20250219", &[]),
+    // Body-paired families.
+    ("context-management-*", &["context_management"]),
+    ("structured-outputs-*", &["output_format"]),
+    ("fast-mode-*", &["speed"]),
+    ("fallback-credit-*", &["fallback_credit_token"]),
+    // `safeguards` is claimed by BOTH halves of the auto-mode classifier pair:
+    // an allow-list carrying only one of them must still keep the field.
+    ("dangerous-tool-use-*", &["safeguards"]),
+    ("auto-mode-classifier-*", &["safeguards"]),
+    // Allow-listed and header-only, or paired below the top level.
+    ("interleaved-thinking-*", &[]),
+    ("fine-grained-tool-streaming-*", &[]),
+    ("prompt-caching-*", &[]),
+    ("context-1m*", &[]),
+    ("extended-cache-ttl-*", &[]),
+    ("effort-*", &[]),
+    ("thinking-token-count-*", &[]),
+    ("mid-conversation-system-*", &[]),
+    ("advisor-tool-*", &[]),
+    ("redact-thinking-*", &[]),
+    ("afk-mode-*", &[]),
+    // LAB-3964 per-turn family: paired with fields on the `role:"system"`
+    // entry inside `messages` — base schema, so nothing here to strip or keep.
+    ("mid-conversation-tool-changes-*", &[]),
+    ("per-turn-control-*", &[]),
+    ("timing-*", &[]),
+];
+
+/// Header/body coherence for the beta allow-list (LAB-1261).
+///
+/// `inject_account_auth` filters the `anthropic-beta` HEADER. Several betas
+/// are paired — a header flag plus a body field that only exists when the flag
+/// is declared — so stripping the header alone leaves a request the upstream
+/// must reject outright (`speed: Extra inputs are not permitted`). A filter
+/// meant to degrade a feature gracefully instead hard-fails every request
+/// carrying it: the 2026-08-01 fleet outage, then LAB-2669 (`fast-mode`) and
+/// LAB-3963 (`dangerous-tool-use`) from the field.
+///
+/// So when the filter drops anything, drop the orphaned half of the body too:
+/// remove every top-level field that is neither base schema nor owned by a
+/// flag that SURVIVED this request. The feature turns off quietly instead of
+/// 400ing, and — the point of the ticket — that holds for a beta family the
+/// LB has never seen, with no enumeration change.
+///
+/// **Declines to strip when a surviving flag is not in `BETA_BODY_FIELDS`.**
+/// The keep-side of the rule is only as good as that table is total: an
+/// unrecognised SURVIVING family may own a top-level field, and stripping it
+/// deletes a capability the caller is entitled to (Helly R finding 1 — a
+/// custom `allowed_client_betas` carrying `mcp-client-*` kept the header and
+/// lost `mcp_servers`, leaving `tools[].mcp_server_name` dangling). Forgoing
+/// the degrade costs a 400 the caller already gets today; deleting a live
+/// field costs them a feature, or a billing instrument, silently.
+///
+/// **Scoped to `/v1/messages` and `/v1/messages/count_tokens` by the caller.**
+/// `BASE_BODY_FIELDS` is that one schema, and `proxy_handler` is the router's
+/// catch-all — `/v1/messages/batches`, `/v1/complete` and every other route
+/// reach the same forward path with completely different bodies, which this
+/// would otherwise delete wholesale.
+///
+/// `surviving_betas` is the outbound header value, read back after filtering
+/// rather than derived from config: an operator running a custom
+/// `allowed_client_betas` gets the right answer without a second list to
+/// maintain.
+///
+/// Returns `None` — body forwarded untouched — when nothing was dropped (the
+/// hot path: no parse, no rewrite), when a surviving flag is unrecognised,
+/// when the body is not a JSON object, or when every field is accounted for.
+///
+/// Retained fields are spliced through as `RawValue`, i.e. their original
+/// bytes, so nothing below the top level is reformatted. That is not cosmetic:
+/// a `serde_json::Value` round-trip rewrites an integer too large for `u64` as
+/// a float (`18446744073709551617` → `1.8446744073709552e+19`), silently
+/// changing a value inside retained tool history (Helly R finding 2). Only the
+/// top-level separators are re-emitted, so the cacheable prefix can still
+/// shift on a body that arrived pretty-printed — accepted, since the only
+/// requests reaching the rewrite are the ones answering a hard 400 today.
+fn strip_orphaned_beta_body_fields(
+    body: &bytes::Bytes,
+    surviving_betas: &str,
+    dropped: &[String],
+) -> Option<(bytes::Bytes, Vec<String>)> {
+    if dropped.is_empty() {
+        return None;
+    }
+    let surviving: Vec<&str> = surviving_betas
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Every surviving flag must be one this proxy can account for, or it may
+    // own a top-level field indistinguishable from an orphan.
+    let mut protected: Vec<&str> = Vec::new();
+    for flag in &surviving {
+        let mut known = false;
+        for (pattern, fields) in BETA_BODY_FIELDS {
+            if suffix_wildcard_match(pattern, flag) {
+                known = true;
+                protected.extend_from_slice(fields);
+            }
+        }
+        if !known {
+            debug!(
+                flag = %flag,
+                "beta body coherence: surviving flag is not in BETA_BODY_FIELDS, \
+                 forwarding the body untouched rather than risk deleting a field \
+                 it owns"
+            );
+            return None;
+        }
+    }
+
+    let parsed: TopLevelObject = match serde_json::from_slice(body) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            // Reached only because a flag was already dropped, so the body
+            // goes upstream untouched and will likely earn the hard rejection
+            // this function exists to prevent. Worth a line so the two are
+            // connectable; not worth more than a line.
+            //
+            // `debug!`, not `warn!`: the trigger is a malformed client body,
+            // which one caller can repeat at request rate. The sibling
+            // `record_dropped_beta_flags` warns on first sighting only and
+            // debug-logs the rest for exactly this reason, and it has the
+            // per-client state to do so — this is a free function and does
+            // not, so the quiet level is the honest choice.
+            //
+            // The error is rendered by `classify()` and a length, NOT by its
+            // `Display`. serde embeds the offending value for a type error
+            // (`invalid type: string "<the whole body>", expected …`), so
+            // `%e` over a 25 MiB client body would copy prompt content into
+            // the operator log at roughly 3x after escaping. That variant is
+            // currently unreachable — a non-object body panics earlier in
+            // `inject_oauth_system_prompt` — which makes `%e` safe only by
+            // accident, and a landmine for whoever fixes that panic.
+            debug!(
+                error_kind = ?e.classify(),
+                line = e.line(),
+                column = e.column(),
+                body_len = body.len(),
+                "beta body coherence: unparseable request body, forwarding it untouched — \
+                 the orphaned-field strip cannot run"
+            );
+            return None;
+        }
+    };
+    let mut removed: Vec<String> = Vec::new();
+    let kept: Vec<&(String, Box<serde_json::value::RawValue>)> = parsed
+        .0
+        .iter()
+        .filter(|(key, _)| {
+            if BASE_BODY_FIELDS.contains(&key.as_str()) || protected.contains(&key.as_str()) {
+                return true;
+            }
+            removed.push(key.clone());
+            false
+        })
+        .collect();
+    if removed.is_empty() {
+        return None;
+    }
+    let mut out = String::from("{");
+    for (i, (key, value)) in kept.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        // The key is re-escaped rather than spliced: `RawValue` covers values
+        // only, and a key carrying a quote or a control character must not be
+        // able to break out of the string it is written into.
+        out.push_str(&serde_json::to_string(key).ok()?);
+        out.push(':');
+        out.push_str(value.get());
+    }
+    out.push('}');
+    Some((bytes::Bytes::from(out), removed))
+}
+
+/// A JSON object whose VALUES are kept as their original bytes.
+///
+/// `serde_json::Map<String, Value>` cannot express this, and pulling in an
+/// ordered map crate to hold `RawValue` would be a dependency for thirty
+/// lines. Order is preserved because the entries are simply collected in the
+/// order the parser yields them.
+struct TopLevelObject(Vec<(String, Box<serde_json::value::RawValue>)>);
+
+impl<'de> serde::Deserialize<'de> for TopLevelObject {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Entries;
+        impl<'de> serde::de::Visitor<'de> for Entries {
+            type Value = TopLevelObject;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<TopLevelObject, M::Error> {
+                let mut out = Vec::new();
+                while let Some(entry) =
+                    map.next_entry::<String, Box<serde_json::value::RawValue>>()?
+                {
+                    out.push(entry);
+                }
+                Ok(TopLevelObject(out))
+            }
+        }
+        d.deserialize_map(Entries)
+    }
 }
 
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
@@ -5976,6 +6311,98 @@ impl AppState {
         }
     }
 
+    /// Count + log top-level body fields stripped to keep a request coherent
+    /// with its filtered `anthropic-beta` header (LAB-1261).
+    ///
+    /// Same cardinality discipline as `record_dropped_beta_flags`, plus two
+    /// guards that sibling does not need. Its keys are HEADER tokens, which
+    /// hyper guarantees are free of CR/LF and are bounded in number; these are
+    /// JSON object keys from a request body, so they carry arbitrary bytes and
+    /// arbitrary count:
+    ///
+    /// - **Sanitized before they reach the map or a log field.** A key
+    ///   containing a newline would otherwise forge whole lines into the
+    ///   plain-text log stream.
+    /// - **Capped per request.** Without it, one request carrying 50 junk
+    ///   top-level keys and one junk beta flag permanently fills all
+    ///   `MAX_DROPPED_BETA_FLAGS` slots, after which every genuine paired-beta
+    ///   strip lands in `_other` and the first-sighting warn never fires again
+    ///   — killing the one alertable signal this whole mechanism adds.
+    fn record_stripped_body_fields(
+        &self,
+        client_id: &str,
+        stripped: &[String],
+        dropped: &[String],
+    ) {
+        if stripped.is_empty() {
+            return;
+        }
+        let keys: Vec<String> = stripped
+            .iter()
+            .take(MAX_STRIPPED_FIELDS_PER_REQUEST)
+            .map(|f| sanitize_metric_key(f, MAX_DROPPED_BETA_FLAG_LEN))
+            .collect();
+        // Removals past the cap still happened, so they are still counted —
+        // under `_other`, not discarded. Dropping them outright let an ordered
+        // payload hide the actionable field behind eight junk ones and leave
+        // no trace that anything else went (Helly R finding 3).
+        let over_cap = stripped.len().saturating_sub(keys.len()) as u64;
+        let Ok(mut map) = self.beta_body_fields_stripped.lock() else {
+            return;
+        };
+        if over_cap > 0 {
+            *map.entry("_other".to_string()).or_insert(0) += over_cap;
+        }
+        let mut first_seen: Vec<&str> = Vec::new();
+        for field in &keys {
+            if map.contains_key(field.as_str()) || map.len() < MAX_DROPPED_BETA_FLAGS {
+                if !map.contains_key(field.as_str()) {
+                    first_seen.push(field.as_str());
+                }
+                *map.entry(field.clone()).or_insert(0) += 1;
+            } else {
+                *map.entry("_other".to_string()).or_insert(0) += 1;
+            }
+        }
+        drop(map);
+        if !first_seen.is_empty() {
+            // `dropped` is sanitized here too: it is logged raw by the sibling
+            // only because a header token cannot carry a newline.
+            let context: Vec<String> = dropped
+                .iter()
+                .take(MAX_STRIPPED_FIELDS_PER_REQUEST)
+                .map(|f| sanitize_metric_key(f, MAX_DROPPED_BETA_FLAG_LEN))
+                .collect();
+            warn!(
+                client_id,
+                fields = %first_seen.join(","),
+                dropped_flags = %context.join(","),
+                "stripped top-level body fields orphaned by the anthropic-beta \
+                 allow-list — a PAIRED beta family is in live traffic that the \
+                 allow-list does not carry; the feature is now off for this \
+                 client instead of 400ing. To restore it the family needs BOTH \
+                 an allow-list entry AND a row in BETA_BODY_FIELDS naming this \
+                 field — the allow-list alone only stops the drop; the row is \
+                 what protects the body half"
+            );
+        }
+        // Repeats get their own line even when this call also carried a first
+        // sighting, so every strip leaves a trace on every request — same
+        // contract as `record_dropped_beta_flags` (AC-12).
+        let repeats: Vec<&str> = keys
+            .iter()
+            .map(String::as_str)
+            .filter(|f| !first_seen.contains(f))
+            .collect();
+        if !repeats.is_empty() {
+            debug!(
+                client_id,
+                fields = %repeats.join(","),
+                "stripped orphaned anthropic-beta body fields (previously reported)"
+            );
+        }
+    }
+
     /// Flush this replica's accumulated transport-error deltas into the shared
     /// Redis hash (`TRANSPORT_ERRORS_KEY`) so the fleet-wide count is visible
     /// cluster-wide. `upstream_transport_errors` is a DELTA accumulator: it is
@@ -6444,7 +6871,7 @@ fn inject_account_auth(
     let mut dropped: Vec<String> = Vec::new();
     if token.starts_with("sk-ant-api") {
         headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
-    } else if token.starts_with("sk-ant-oat") {
+    } else if token.starts_with(OAUTH_TOKEN_PREFIX) {
         headers.insert(
             "authorization",
             HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
@@ -8747,6 +9174,49 @@ async fn forward_anthropic(
     );
     state.record_dropped_beta_flags(client_id, &dropped);
 
+    // LAB-1261: header/body coherence. The filter above edits the HEADER;
+    // several betas are paired with a top-level body field that only exists
+    // when the flag is declared, and forwarding that field without its flag
+    // is a hard upstream 400 rather than the graceful degrade the filter was
+    // written for. Strip the orphaned half here so the request stays
+    // coherent — for any beta family, including ones the LB has never seen.
+    //
+    // Reachable only on the OAuth branch (the only one that filters), which
+    // is also the only branch where `req_body` picks the OAuth variant, so
+    // that is the variant rewritten.
+    // Scoped to the Messages schema `BASE_BODY_FIELDS` actually describes.
+    // `proxy_handler` is the router's catch-all, so `/v1/messages/batches`
+    // (`requests`), `/v1/complete` (`prompt`) and anything else arrive here
+    // too — running a Messages-only field list over those bodies deletes them
+    // outright.
+    let coherent_body = if matches!(
+        parts.uri.path(),
+        "/v1/messages" | "/v1/messages/count_tokens"
+    ) {
+        strip_orphaned_beta_body_fields(
+            oauth_body_bytes,
+            headers
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
+            &dropped,
+        )
+    } else {
+        None
+    };
+    if let Some((_, stripped)) = &coherent_body {
+        state.record_stripped_body_fields(client_id, stripped, &dropped);
+    }
+    // Stripping `speed` invalidates the fast-mode classification
+    // `proxy_handler` made on the pre-filter body: what goes upstream is a
+    // standard request, so it draws the standard rate bucket, not the fast
+    // one (LAB-2693). Only reachable under a custom `allowed_client_betas`
+    // that omits `fast-mode-*`; the default carries it.
+    let is_fast_mode = is_fast_mode
+        && !coherent_body
+            .as_ref()
+            .is_some_and(|(_, stripped)| stripped.iter().any(|f| f == "speed"));
+
     // Context window for the session registry: 200k, or 1M when the request
     // carries the `context-1m` beta (per-request, so a mixed client is
     // tracked at the window each request actually ran under). Read from the
@@ -8759,7 +9229,7 @@ async fn forward_anthropic(
     if tracing::enabled!(tracing::Level::DEBUG) {
         let auth_method = if passthrough {
             "passthrough"
-        } else if token.starts_with("sk-ant-oat") {
+        } else if token.starts_with(OAUTH_TOKEN_PREFIX) {
             "oauth"
         } else {
             "api-key"
@@ -8768,7 +9238,7 @@ async fn forward_anthropic(
             req_id,
             account = endpoint_name,
             auth_method,
-            body_bytes = if token.starts_with("sk-ant-oat") {
+            body_bytes = if token.starts_with(OAUTH_TOKEN_PREFIX) {
                 oauth_body_bytes.len()
             } else {
                 body_bytes.len()
@@ -8784,9 +9254,16 @@ async fn forward_anthropic(
     }
 
     upstream_req = upstream_req.headers(headers);
-    // Use OAuth variant (with CC system prompt) for OAuth tokens
-    let req_body = if token.starts_with("sk-ant-oat") {
-        oauth_body_bytes
+    // Use OAuth variant (with CC system prompt) for OAuth tokens, and its
+    // beta-coherent rewrite when the filter orphaned a body field (LAB-1261).
+    let req_body = if token.starts_with(OAUTH_TOKEN_PREFIX) {
+        // `dropped` is only ever non-empty on this branch, so a rewrite
+        // without it would mean the filter's contract changed underneath us.
+        debug_assert!(coherent_body.is_none() || token.starts_with(OAUTH_TOKEN_PREFIX));
+        match &coherent_body {
+            Some((rewritten, _)) => rewritten,
+            None => oauth_body_bytes,
+        }
     } else {
         body_bytes
     };
@@ -8852,8 +9329,9 @@ async fn forward_anthropic(
             resp.headers(),
             // The request's speed picks the rate bucket: a fast-mode body's
             // response carries fast-pool headers, not the account's
-            // (LAB-2693). Classified once in `proxy_handler`, not re-parsed
-            // from `req_body` on every response.
+            // (LAB-2693). Classified in `proxy_handler`, then NARROWED above
+            // when the LAB-1261 strip removed `speed` — use that value, not
+            // the parameter.
             is_fast_mode,
         )
         .await;
@@ -9595,6 +10073,11 @@ async fn proxy_handler(
             // Classified once here rather than re-parsed from the outbound
             // bytes per upstream response: neither injector above touches
             // `speed`, so one flag is true of both byte variants (LAB-2693).
+            //
+            // NOT the last word on it. `forward_anthropic` may strip `speed`
+            // after the beta filter (LAB-1261) and re-derives the flag there;
+            // any new consumer downstream of that filter must read the
+            // narrowed value, or it bills a standard request to the fast pool.
             let is_fast_mode = body_wants_fast_mode(&parsed);
 
             (
@@ -11008,7 +11491,9 @@ async fn build_metrics_snap(
 /// which does it silently — a panicking holder is worth a line.
 ///
 /// Nothing in these critical sections can currently panic, so this is
-/// defence against a future edit, not a live incident.
+/// defence against a future edit, not a live incident. The remaining
+/// `/metrics` maps keep the zeroing pattern only because their value types
+/// do not fit this signature.
 fn snapshot_counters(
     counters: &Mutex<HashMap<String, u64>>,
     map: &'static str,
@@ -11108,18 +11593,8 @@ async fn metrics_handler(
         .map(|g| g.clone())
         .unwrap_or_default();
     let cluster_info = state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
-    let prompt_too_long: Vec<(String, u64)> = state
-        .prompt_too_long
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
-    let fast_mode_429: Vec<(String, u64)> = state
-        .fast_mode_429
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
+    let prompt_too_long = snapshot_counters(&state.prompt_too_long, "prompt_too_long");
+    let fast_mode_429 = snapshot_counters(&state.fast_mode_429, "fast_mode_429");
     let entitlement_400 = snapshot_counters(&state.entitlement_400, "entitlement_400");
     let model_denied: Vec<((String, String), u64)> = state
         .model_denied
@@ -11127,14 +11602,13 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
+    let beta_body_fields_stripped = snapshot_counters(
+        &state.beta_body_fields_stripped,
+        "beta_body_fields_stripped",
+    );
+    let beta_flags_dropped = snapshot_counters(&state.beta_flags_dropped, "beta_flags_dropped");
     let client_rejections: Vec<((String, &'static str), u64)> = state
         .client_rejections
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
-    let beta_flags_dropped: Vec<(String, u64)> = state
-        .beta_flags_dropped
         .lock()
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
@@ -12149,6 +12623,25 @@ async fn metrics_handler(
             &mut buf,
             "anthropic_beta_flag_dropped_total",
             &[("flag", flag.as_str())],
+            *n,
+        );
+    }
+
+    // Body fields stripped to keep a request coherent with the filtered
+    // header (LAB-1261). Rate > 0 means an unrecognised PAIRED beta family
+    // is in live traffic and the allow-list needs a new entry — the alertable
+    // half of the pair; the header-drop counter above is routine noise.
+    prom_header(
+        &mut buf,
+        "anthropic_beta_body_field_stripped_total",
+        "counter",
+        "Top-level body fields stripped after their anthropic-beta header was dropped",
+    );
+    for (field, n) in &beta_body_fields_stripped {
+        prom_counter(
+            &mut buf,
+            "anthropic_beta_body_field_stripped_total",
+            &[("field", field.as_str())],
             *n,
         );
     }
@@ -13912,6 +14405,12 @@ async fn forward_openai_compat_anthropic(
         &state.allowed_client_betas,
     );
     state.record_dropped_beta_flags(client_id, &dropped);
+    // No `strip_orphaned_beta_body_fields` here (LAB-1261). That strip exists
+    // because a CLIENT can put a beta-paired field in the body; this body is
+    // LB-generated by the OpenAI→Anthropic translator, which emits base-schema
+    // fields only. Running the strip over our own output would risk deleting a
+    // field the translator legitimately added, to fix a pairing that cannot
+    // occur on this path.
 
     // Session registry window (LAB-916). OpenAI-compat callers can't send the
     // `context-1m` beta through translation, but check anyway — the header is
@@ -13921,7 +14420,7 @@ async fn forward_openai_compat_anthropic(
     let context_window = context_window_for(model, request_has_1m_beta(&headers));
 
     // Use OAuth variant (with CC system prompt) for OAuth tokens
-    let req_body = if token.starts_with("sk-ant-oat") {
+    let req_body = if token.starts_with(OAUTH_TOKEN_PREFIX) {
         oauth_anthropic_body_bytes
     } else {
         anthropic_body_bytes
@@ -15503,6 +16002,7 @@ async fn main() {
                 .collect()
         }),
         beta_flags_dropped: Mutex::new(HashMap::new()),
+        beta_body_fields_stripped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
         fast_mode_429: Mutex::new(HashMap::new()),
         entitlement_400: Mutex::new(HashMap::new()),
