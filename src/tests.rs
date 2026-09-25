@@ -8520,9 +8520,10 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
 /// of `tracing_core::callsite`). A single global subscriber captures every
 /// concurrent test's output into one buffer; callers filter by a marker
 /// unique to their own request instead of relying on line count alone.
-/// Note for a future second caller: the buffer is never cleared and every
+/// Note for further callers: the buffer is never cleared and every
 /// `anthropic_lb`-target INFO line from every test logs into it for the rest
-/// of the run — fine for a couple of callers, not a general-purpose fixture.
+/// of the run — fine for a few callers that each filter by their own marker,
+/// not a general-purpose fixture.
 fn log_capture_buf() -> Arc<Mutex<Vec<u8>>> {
     static BUF: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
     BUF.get_or_init(|| {
@@ -15940,6 +15941,23 @@ use crate::guard::AWS_DOCS_EXAMPLE_SECRET_KEY;
 #[cfg(feature = "guard")]
 const TEST_ENDPOINT_TOKEN: &str = "sk-ant-api-guard-test-token";
 
+/// The two non-`block` policies, keyed `annotate-key` and `off-key`. `off` is
+/// not a carbon copy of `annotate`: it returns `Allow` from `Guard::evaluate`'s
+/// own early return without reaching the scanners, while `annotate` reaches
+/// them and finds nothing to scan. Same bytes on the wire by two routes, so
+/// both are pinned — against one shared `AppState` per surface, because
+/// `Guard::new()` compiles the bundled rulesets and costs seconds per call.
+#[cfg(feature = "guard")]
+fn guard_non_block_clients() -> Vec<ClientConfig> {
+    vec![
+        mk_client("annotate", "annotate-key", &[]),
+        ClientConfig {
+            guard: crate::guard::GuardPolicy::Off,
+            ..mk_client("off", "off-key", &[])
+        },
+    ]
+}
+
 /// A `[[clients]]` entry with the opt-in `block` guard policy, keyed
 /// `block-key`.
 #[cfg(feature = "guard")]
@@ -16338,6 +16356,12 @@ async fn guard_block_applies_to_openai_chat_completions() {
 /// LAB-3877 (review): an OpenAI message role the translator does not map
 /// (legacy `function`) carries content the scanner cannot see but the
 /// OpenAI-protocol arm would still forward — under `block` it fails closed.
+///
+/// LAB-4358 kept the behaviour and deleted the machinery: this used to be a
+/// hand-maintained allow-list of OpenAI roles in `openai_chat_handler`. The
+/// translator passes an unmapped role through VERBATIM, so the role now lands
+/// in the translated `messages` where `ScanInput::from_body`'s own rule rejects
+/// it — one rule, both surfaces, nothing to keep in sync with the translator.
 #[cfg(feature = "guard")]
 #[tokio::test]
 async fn guard_block_fails_closed_on_unmapped_openai_role() {
@@ -16374,10 +16398,13 @@ async fn guard_block_fails_closed_on_unmapped_openai_role() {
     );
     // LAB-4322 gave each fail-closed cause its own reason. Pinned here because
     // the whole point of that split is that a client debugging this one is not
-    // sent hunting for a JSON syntax error that does not exist.
+    // sent hunting for a JSON syntax error that does not exist. The text is
+    // surface-neutral since LAB-4358 — the same rule now rejects `"User"` on
+    // `/v1/messages`, and naming OpenAI there would have been a lie.
     let err: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
-        err["error"]["message"], "request carries an OpenAI message role the scanner cannot read",
+        err["error"]["message"],
+        crate::guard::REASON_MESSAGE_UNREADABLE,
         "the role reason must not masquerade as a parse failure, got {err}"
     );
     assert!(
@@ -16643,6 +16670,618 @@ async fn guard_block_forwards_fallback_json_body_without_messages() {
         raw.as_bytes(),
         "the body must be forwarded byte-identically"
     );
+}
+
+/// LAB-4358: every `messages` shape the scanner cannot READ, with the AWS docs
+/// example key placed where that unreadability hides it. One row per structural
+/// failure; each is driven against BOTH surfaces by the two tests below, so the
+/// two can never again disagree about which shapes are readable.
+///
+/// Every row yields the SAME reason on both surfaces. That is a property of the
+/// fix, not a coincidence: readability is judged on the body the client sent, so
+/// the translator can no longer turn "this is not a message" into "this role is
+/// not one I know" on the way past.
+#[cfg(feature = "guard")]
+fn guard_unreadable_message_shapes(
+    secret: &str,
+) -> Vec<(&'static str, serde_json::Value, &'static str)> {
+    use crate::guard::{REASON_CONTENT_UNREADABLE, REASON_MESSAGE_UNREADABLE};
+    let leak = format!("aws_secret_access_key = \"{secret}\"");
+    vec![
+        // The array element is not an object at all, so it has no role and the
+        // scanner never looked inside it. The filed reproduction.
+        (
+            "element-not-object",
+            serde_json::json!([leak]),
+            REASON_MESSAGE_UNREADABLE,
+        ),
+        (
+            "role-absent",
+            serde_json::json!([{"content": leak}]),
+            REASON_MESSAGE_UNREADABLE,
+        ),
+        (
+            "role-not-a-string",
+            serde_json::json!([{"role": 1, "content": leak}]),
+            REASON_MESSAGE_UNREADABLE,
+        ),
+        // Role compare is exact, so `"User"` was not the newest user turn and
+        // its content was never scanned. The filed reproduction.
+        (
+            "role-wrong-case",
+            serde_json::json!([{"role": "User", "content": leak}]),
+            REASON_MESSAGE_UNREADABLE,
+        ),
+        // Content is neither the shorthand string nor a block array. The filed
+        // reproduction.
+        (
+            "content-object",
+            serde_json::json!([{"role": "user", "content": {"text": leak}}]),
+            REASON_CONTENT_UNREADABLE,
+        ),
+        // A fourth shape reported alongside these but not reproduced at the
+        // time: a block that claims `type: text` whose `text` is not a string.
+        (
+            "text-block-text-not-a-string",
+            serde_json::json!([{"role": "user", "content": [
+                {"type": "text", "text": {"v": leak}}
+            ]}]),
+            REASON_CONTENT_UNREADABLE,
+        ),
+        (
+            "content-block-not-object",
+            serde_json::json!([{"role": "user", "content": [leak]}]),
+            REASON_CONTENT_UNREADABLE,
+        ),
+        (
+            "tool-result-content-object",
+            serde_json::json!([{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": {"v": leak}}
+            ]}]),
+            REASON_CONTENT_UNREADABLE,
+        ),
+        (
+            "tool-result-inner-text-not-a-string",
+            serde_json::json!([{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": {"v": leak}}
+                ]}
+            ]}]),
+            REASON_CONTENT_UNREADABLE,
+        ),
+    ]
+}
+
+/// LAB-4358: the shapes only the OpenAI wire format can express, one per LOSSY
+/// path in `translate_openai_to_anthropic`. These are the rows the shared table
+/// structurally cannot carry — an Anthropic body has no `role: "tool"` message
+/// and no `image_url` part — and their absence is what hid this class through
+/// two prior fixes on this code.
+///
+/// Each one translates into a readable-but-EMPTY document while the original
+/// bytes keep the secret, so judging readability on the translated document
+/// reports them CLEAN rather than merely unscanned. That is why
+/// `from_openai_body` judges the original.
+#[cfg(feature = "guard")]
+fn guard_openai_translation_loss_shapes(secret: &str) -> Vec<(&'static str, serde_json::Value)> {
+    let leak = format!("aws_secret_access_key = \"{secret}\"");
+    vec![
+        // `.unwrap_or_default()` in the `tool` arm → `tool_result` content "".
+        (
+            "tool-content-object",
+            serde_json::json!([{"role": "tool", "tool_call_id": "t1", "content": {"v": leak}}]),
+        ),
+        // The same arm's array branch joins `p.get("text").as_str()`, so a
+        // non-string `text` is dropped and the join yields "".
+        (
+            "tool-content-inner-text-not-a-string",
+            serde_json::json!([{"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "text", "text": {"v": leak}}
+            ]}]),
+        ),
+        // `pointer("/image_url/url").unwrap_or("")` → an image block with an
+        // empty url, which the scanner skips as an unread block type.
+        (
+            "image-url-not-an-object",
+            serde_json::json!([{"role": "user", "content": [
+                {"type": "image_url", "image_url": leak}
+            ]}]),
+        ),
+    ]
+}
+
+/// LAB-4358 AC2, native surface: every unreadable `messages` shape fails closed
+/// on `/v1/messages` under `block`, with nothing on the wire.
+///
+/// On this surface the document the scanner reads IS the document forwarded, so
+/// before the tri-state each of these returned 200 with the secret in the bytes
+/// the proxy sent upstream. That the upstream would itself reject the shape is
+/// no defence: the bytes have already left.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_fails_closed_on_unreadable_native_messages() {
+    let secret = AWS_DOCS_EXAMPLE_SECRET_KEY;
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-unreadable.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+
+    for (shape, messages, reason) in guard_unreadable_message_shapes(secret) {
+        let resp = Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .header("x-api-key", "block-key")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-6", "max_tokens": 5, "messages": messages
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            400,
+            "{shape}: an unreadable `messages` must fail closed under block"
+        );
+        let err: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            err["error"]["type"], "guard_blocked",
+            "{shape}: native Anthropic error envelope expected, got {err}"
+        );
+        assert_eq!(
+            err["error"]["message"], reason,
+            "{shape}: wrong fail-closed reason"
+        );
+        assert!(
+            !err.to_string().contains(secret),
+            "{shape}: the block response must never echo client text"
+        );
+        assert!(
+            captured.lock().await.is_empty(),
+            "{shape}: not one byte may reach the upstream unscanned"
+        );
+    }
+}
+
+/// LAB-4358 AC2, OpenAI surface: the same table, same fail-closed outcome, on
+/// `/v1/chat/completions` against a `Protocol::OpenAI` endpoint — the arm that
+/// forwards the client's ORIGINAL bytes, so an unscannable body reaching it
+/// ships every character the scanner could not read.
+///
+/// Running one table across both surfaces is the actual regression guard here.
+/// The bypass this closes existed because each handler derived its own idea of
+/// an unreadable `messages`, and `[...]`-wrapping a payload walked between them.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_fails_closed_on_unreadable_openai_messages() {
+    let secret = AWS_DOCS_EXAMPLE_SECRET_KEY;
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = upstream;
+    let state = Arc::new(AppState {
+        endpoints: vec![gw],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-unreadable.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+
+    let rows = guard_unreadable_message_shapes(secret)
+        .into_iter()
+        // The OpenAI-only losses carry no per-surface reason of their own; every
+        // one is an unreadable CONTENT shape in the original body.
+        .chain(
+            guard_openai_translation_loss_shapes(secret)
+                .into_iter()
+                .map(|(shape, messages)| {
+                    (shape, messages, crate::guard::REASON_CONTENT_UNREADABLE)
+                }),
+        );
+    for (shape, messages, reason) in rows {
+        let resp = Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer block-key")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-6", "max_tokens": 5, "messages": messages
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            400,
+            "{shape}: an unreadable `messages` must fail closed under block"
+        );
+        let err: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            err["error"]["code"], "guard_blocked",
+            "{shape}: OpenAI error envelope expected, got {err}"
+        );
+        assert_eq!(
+            err["error"]["message"], reason,
+            "{shape}: wrong fail-closed reason"
+        );
+        assert!(
+            !err.to_string().contains(secret),
+            "{shape}: the block response must never echo client text"
+        );
+        assert!(
+            captured.lock().await.is_empty(),
+            "{shape}: not one byte may reach a Protocol::OpenAI upstream unscanned"
+        );
+    }
+}
+
+/// LAB-4358 AC5: the fail-closed widening is gated on `block`. Under `annotate`
+/// AND `off` every row of the table still forwards, and the bytes on the wire
+/// are byte-identical to the client's — the prompt-cache raw-prefix invariant
+/// that makes this guard safe to run at all. Asserted on both surfaces, on the
+/// arms that forward original bytes.
+///
+/// Every row, not a representative sample: AC5 pins the whole table, and the
+/// expensive fixture (`Guard::new()`) is already shared across them.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_non_block_forwards_unreadable_messages_byte_identically() {
+    let secret = AWS_DOCS_EXAMPLE_SECRET_KEY;
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = upstream.clone();
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+        clients: guard_non_block_clients(),
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-unreadable-shadow.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let native_addr = serve(build_router(state)).await;
+
+    let openai_state = Arc::new(AppState {
+        endpoints: vec![gw],
+        clients: guard_non_block_clients(),
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-unreadable-shadow.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let openai_addr = serve(build_router(openai_state)).await;
+
+    for (shape, messages, _) in guard_unreadable_message_shapes(secret) {
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 5, "messages": messages
+        });
+        // Compare against the exact bytes reqwest serializes, not a re-encode.
+        let raw = serde_json::to_vec(&body).unwrap();
+
+        for (surface, addr, path, header, value, policy) in [
+            (
+                "native",
+                native_addr,
+                "/v1/messages",
+                "x-api-key",
+                "annotate-key",
+                "annotate",
+            ),
+            (
+                "native",
+                native_addr,
+                "/v1/messages",
+                "x-api-key",
+                "off-key",
+                "off",
+            ),
+            (
+                "openai",
+                openai_addr,
+                "/v1/chat/completions",
+                "authorization",
+                "Bearer annotate-key",
+                "annotate",
+            ),
+            (
+                "openai",
+                openai_addr,
+                "/v1/chat/completions",
+                "authorization",
+                "Bearer off-key",
+                "off",
+            ),
+        ] {
+            captured.lock().await.clear();
+            let resp = Client::new()
+                .post(format!("http://{addr}{path}"))
+                .header("content-type", "application/json")
+                .header(header, value)
+                .body(raw.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                200,
+                "{surface}/{policy}/{shape}: a non-block policy must never reject"
+            );
+            assert_eq!(
+                captured.lock().await.as_slice(),
+                raw.as_slice(),
+                "{surface}/{policy}/{shape}: the body must forward byte-identically"
+            );
+        }
+    }
+}
+
+/// LAB-4358 AC3, invariant 1: an image-only turn is NOT a scan failure. The
+/// document is readable and genuinely carries no text this scanner reads, so it
+/// forwards untouched even under `block` — the deliberate allow the tri-state
+/// exists to preserve while everything above it fails closed. Pinned on both
+/// surfaces; a fix that closed the bypasses by treating "no text" as "could not
+/// read" goes red here.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_forwards_image_only_turn() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-image-only.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let native_addr = serve(build_router(state)).await;
+
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = upstream;
+    let openai_state = Arc::new(AppState {
+        endpoints: vec![gw],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-image-only-openai.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let openai_addr = serve(build_router(openai_state)).await;
+
+    // 1x1 transparent PNG.
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk\
+               YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let native = serde_json::to_vec(&serde_json::json!({
+        "model": "claude-sonnet-4-6", "max_tokens": 5,
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png}}
+        ]}]
+    }))
+    .unwrap();
+    let openai = serde_json::to_vec(&serde_json::json!({
+        "model": "claude-sonnet-4-6", "max_tokens": 5,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{png}")}}
+        ]}]
+    }))
+    .unwrap();
+
+    for (surface, addr, path, header, value, raw) in [
+        (
+            "native",
+            native_addr,
+            "/v1/messages",
+            "x-api-key",
+            "block-key",
+            &native,
+        ),
+        (
+            "openai",
+            openai_addr,
+            "/v1/chat/completions",
+            "authorization",
+            "Bearer block-key",
+            &openai,
+        ),
+    ] {
+        captured.lock().await.clear();
+        let resp = Client::new()
+            .post(format!("http://{addr}{path}"))
+            .header("content-type", "application/json")
+            .header(header, value)
+            .body(raw.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "{surface}: an image-only turn has nothing to scan and must forward under block"
+        );
+        assert_eq!(
+            captured.lock().await.as_slice(),
+            raw.as_slice(),
+            "{surface}: the image-only body must forward byte-identically"
+        );
+    }
+}
+
+/// LAB-4358 AC3, invariant 2: a conversation with no `user` turn yet is
+/// readable and empty, not unreadable. Same deliberate allow as the image-only
+/// turn, and the case a strict "every message must be a user message the
+/// scanner read" rule would break.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_forwards_conversation_without_user_turn() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-no-user-turn.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let native_addr = serve(build_router(state)).await;
+
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = upstream;
+    let openai_state = Arc::new(AppState {
+        endpoints: vec![gw],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-no-user-turn-openai.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let openai_addr = serve(build_router(openai_state)).await;
+
+    // An assistant prefill, plus (on the OpenAI surface) a `system` message the
+    // translator hoists out of `messages` entirely — the shape that leaves the
+    // scanned document with an empty `messages` for an entirely legitimate
+    // reason, and so must not be confused with the translator's empty-array
+    // rewrite of an unreadable one.
+    let native = serde_json::to_vec(&serde_json::json!({
+        "model": "claude-sonnet-4-6", "max_tokens": 5,
+        "messages": [{"role": "assistant", "content": "Here is my answer:"}]
+    }))
+    .unwrap();
+    let openai = serde_json::to_vec(&serde_json::json!({
+        "model": "claude-sonnet-4-6", "max_tokens": 5,
+        "messages": [
+            {"role": "system", "content": "you are a helpful assistant"},
+            {"role": "assistant", "content": "Here is my answer:"}
+        ]
+    }))
+    .unwrap();
+
+    for (surface, addr, path, header, value, raw) in [
+        (
+            "native",
+            native_addr,
+            "/v1/messages",
+            "x-api-key",
+            "block-key",
+            &native,
+        ),
+        (
+            "openai",
+            openai_addr,
+            "/v1/chat/completions",
+            "authorization",
+            "Bearer block-key",
+            &openai,
+        ),
+    ] {
+        captured.lock().await.clear();
+        let resp = Client::new()
+            .post(format!("http://{addr}{path}"))
+            .header("content-type", "application/json")
+            .header(header, value)
+            .body(raw.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "{surface}: a conversation with no user turn must forward under block"
+        );
+        assert_eq!(
+            captured.lock().await.as_slice(),
+            raw.as_slice(),
+            "{surface}: the body must forward byte-identically"
+        );
+    }
+}
+
+/// LAB-4358: `guard_hook` against every `ScanOutcome` under every policy,
+/// called directly. The tables above pin rejection vs forwarding through the
+/// handlers; what only this pins is the fail-closed LOG, emitted under every
+/// policy (`would-block` at INFO when the policy does not enforce, `block` at
+/// WARN when it does) so shadow mode can size a `block` rollout.
+/// `Guard::empty()` suffices: the log fires before `evaluate`, and a
+/// scanner-less guard never blocks, so every rejection seen here comes from
+/// the fail-closed path.
+#[cfg(feature = "guard")]
+#[test]
+fn guard_hook_logs_fail_closed_cause_under_every_policy() {
+    use crate::guard::{
+        ScanInput, ScanOutcome, MAX_SCAN_BYTES, REASON_MESSAGE_UNREADABLE, REASON_SCAN_TRUNCATED,
+    };
+    let buf = log_capture_buf();
+    let mut clients = guard_non_block_clients();
+    clients.push(guard_block_client());
+    let state = AppState {
+        clients,
+        ..test_state_base()
+    };
+    let user_turn = |len: usize| {
+        ScanInput::from_body(&serde_json::json!({
+            "messages": [{"role": "user", "content": "a".repeat(len)}]
+        }))
+    };
+    // (label, outcome, the fail-closed cause it must log, if any)
+    let cases = [
+        (
+            "unscannable",
+            ScanOutcome::Unscannable(REASON_MESSAGE_UNREADABLE),
+            Some(REASON_MESSAGE_UNREADABLE),
+        ),
+        (
+            "truncated",
+            user_turn(MAX_SCAN_BYTES + 1),
+            Some(REASON_SCAN_TRUNCATED),
+        ),
+        ("scannable", user_turn(16), None),
+        ("nothing-to-scan", ScanOutcome::NothingToScan, None),
+    ];
+    for (label, outcome, cause) in &cases {
+        for (client, blocks) in [
+            ("blocked-client", true),
+            ("annotate", false),
+            ("off", false),
+        ] {
+            let req_id = format!("lab4358-hook-{label}-{client}");
+            let rejected = state.guard_hook(&req_id, client, outcome, false).is_err();
+            assert_eq!(
+                rejected,
+                blocks && cause.is_some(),
+                "{req_id}: reject iff block AND a fail-closed cause"
+            );
+
+            let marker = format!("req_id=\"{req_id}\"");
+            let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            let lines: Vec<&str> = output
+                .lines()
+                .filter(|l| l.contains(&marker) && l.contains("guard: unscannable request"))
+                .collect();
+            let Some(cause) = cause else {
+                assert!(
+                    lines.is_empty(),
+                    "{req_id}: no fail-closed cause, so no line, got {lines:?}"
+                );
+                continue;
+            };
+            let (level, verdict) = if blocks {
+                (" WARN ", r#"verdict="block""#)
+            } else {
+                (" INFO ", r#"verdict="would-block""#)
+            };
+            assert!(
+                lines.len() == 1
+                    && lines[0].contains(level)
+                    && lines[0].contains(verdict)
+                    && lines[0].contains(cause),
+                "{req_id}: expected one{level}{verdict} line naming the cause, got {lines:?}"
+            );
+        }
+    }
 }
 
 /// Shadow-mode counterpart on the OpenAI-compat surface: `annotate` forwards
