@@ -21849,10 +21849,10 @@ mod redis_integration {
     const TEST_REDIS_ENV: &str = "ALB_TEST_REDIS_URL";
 
     /// The logical-DB allocation (see the module doc). An enum, not constants,
-    /// so the compiler rejects a reused number (E0081);
-    /// `db_numbers_come_only_from_the_db_allocation` rejects a raw number
-    /// that bypasses it and a variant two tests share. DB 0 is deliberately
-    /// unused.
+    /// so the compiler rejects a reused number (E0081), and the helpers take
+    /// `Db`, so no raw number reaches a URL;
+    /// `db_numbers_come_only_from_the_db_allocation` rejects a variant two
+    /// tests share. DB 0 is deliberately unused.
     #[repr(u8)]
     enum Db {
         MergeHardLimits = 1,
@@ -21873,14 +21873,18 @@ mod redis_integration {
         SeedBudgetMirror = 16,
     }
 
-    /// Runs without a backend, so a bypass of `Db` fails every `cargo test`,
-    /// not just the ones that happen to collide. Bans a digit written directly
-    /// after a helper's `(` or an inline URL's `}/`, and a `Db` variant named
-    /// in a helper or in more than one test fn (repeats in one test are fine).
-    /// ponytail: text scan — a number passed as a format argument
-    /// (`"{}/{}", base, 3`) slips past. Taking `Db` in the helpers and URL
-    /// builders closes that and retires the digit pass; the owner pass stays,
-    /// since types can't stop two tests naming one variant.
+    impl Db {
+        /// `base` (`redis://host:port`) with this DB selected — the only
+        /// place a DB number becomes part of a URL.
+        fn url(self, base: &str) -> String {
+            format!("{}/{}", base.trim_end_matches('/'), self as u8)
+        }
+    }
+
+    /// Runs without a backend, so a shared DB fails every `cargo test`, not
+    /// just the runs that happen to collide. Bans a `Db` variant named in a
+    /// helper or in more than one test fn (repeats in one test are fine):
+    /// types can't stop two tests naming one variant.
     #[test]
     fn db_numbers_come_only_from_the_db_allocation() {
         let src = include_str!("tests.rs");
@@ -21896,25 +21900,6 @@ mod redis_integration {
             .rfind("\n\n")
             .expect("blank line before checker");
         let to = decl + module[decl..].find("\n    }\n").expect("checker end");
-        for carrier in ["redis_test_conn(", "proxied_conn(", "}/"] {
-            let mut seen = 0;
-            for (at, _) in module
-                .match_indices(carrier)
-                .filter(|(at, _)| !(from..to).contains(at))
-            {
-                seen += 1;
-                let rest = module[at + carrier.len()..].trim_start();
-                let line = src[..start + at].lines().count();
-                assert!(
-                    !rest.starts_with(|c: char| c.is_ascii_digit()),
-                    "src/tests.rs:{line}: raw DB number after `{carrier}` — add a `Db` variant"
-                );
-            }
-            assert!(
-                seen > 0,
-                "`{carrier}` never matched — the scan has gone vacuous"
-            );
-        }
         // One test per variant: the enum only keeps numbers distinct, and a
         // test that copies another's variant flushes its fixtures mid-run.
         let mut owners = std::collections::HashMap::new();
@@ -21952,7 +21937,7 @@ mod redis_integration {
     /// env var is unset locally; PANICS when unset in CI (`CI` env present),
     /// so no workflow — current or future — can green with this suite
     /// silently skipped. The documented shape (`redis://host:port` — no
-    /// auth, no db suffix) is validated here, once: the callers append
+    /// auth, no db suffix) is validated here, once: `Db::url` appends
     /// `/{db}` for isolation and parse `host:port` for the killable proxy,
     /// both of which silently misbehave on a decorated URL.
     fn test_redis_url() -> Option<String> {
@@ -21995,9 +21980,9 @@ mod redis_integration {
     /// is the test's independent fixture/assertion client (deliberately NOT
     /// the client under test), and the fred client is what goes into
     /// `AppState.redis` — the production coordination path being verified.
-    async fn redis_test_conn(db: u8) -> Option<(redis::aio::ConnectionManager, RedisClient)> {
+    async fn redis_test_conn(db: Db) -> Option<(redis::aio::ConnectionManager, RedisClient)> {
         let base = test_redis_url()?;
-        let url = format!("{}/{db}", base.trim_end_matches('/'));
+        let url = db.url(&base);
         let conn = connect_and_flush(&url).await;
         let fred = fred_test_client(&url).await;
         Some((conn, fred))
@@ -22147,7 +22132,7 @@ mod redis_integration {
     /// fred client (the client under test) routed through a killable proxy.
     /// Same skip/panic contract as `redis_test_conn`. The DB is flushed via
     /// the independent redis-crate client before the fred client connects.
-    async fn proxied_conn(db: u8) -> Option<(RedisClient, KillSwitch)> {
+    async fn proxied_conn(db: Db) -> Option<(RedisClient, KillSwitch)> {
         let base = test_redis_url()?;
         let target = base
             .trim_start_matches("redis://")
@@ -22157,7 +22142,7 @@ mod redis_integration {
             .unwrap()
             .to_string();
         let (proxy_addr, kill) = spawn_killable_proxy(target).await;
-        let url = format!("redis://{proxy_addr}/{db}");
+        let url = db.url(&format!("redis://{proxy_addr}"));
         drop(connect_and_flush(&url).await);
         let fred = fred_test_client(&url).await;
         Some((fred, kill))
@@ -22280,7 +22265,7 @@ mod redis_integration {
     /// nothing. Pairs with the pure `classify_hard_limit_*` unit tests.
     #[tokio::test]
     async fn sync_from_redis_merges_hard_limits_with_real_backend() {
-        let Some((mut conn, fred)) = redis_test_conn(Db::MergeHardLimits as u8).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::MergeHardLimits).await else {
             return;
         };
         let state = state_with_redis(
@@ -22393,7 +22378,7 @@ mod redis_integration {
     /// both directions, plus the absent-key case, against real MGET replies.
     #[tokio::test]
     async fn sync_from_redis_rate_info_most_recent_wins_both_directions() {
-        let Some((mut conn, fred)) = redis_test_conn(Db::RateInfoMostRecent as u8).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::RateInfoMostRecent).await else {
             return;
         };
         let state = state_with_redis(
@@ -22456,7 +22441,7 @@ mod redis_integration {
     /// malformed and absent values touch nothing.
     #[tokio::test]
     async fn sync_from_redis_applies_published_routing_weights() {
-        let Some((mut conn, fred)) = redis_test_conn(Db::RoutingWeights as u8).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::RoutingWeights).await else {
             return;
         };
         let state = state_with_redis(
@@ -22513,7 +22498,7 @@ mod redis_integration {
     /// covered by the pure `classify_hard_limit_*` tests.
     #[tokio::test]
     async fn recovery_sentinel_cas_clears_stale_but_not_live_hard_limits() {
-        let Some((mut conn, fred)) = redis_test_conn(Db::RecoverySentinelCas as u8).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::RecoverySentinelCas).await else {
             return;
         };
         let state = state_with_redis(vec![], fred);
@@ -22570,8 +22555,7 @@ mod redis_integration {
     /// yesterday's spend invisible today.
     #[tokio::test]
     async fn budget_incrby_accumulates_across_replicas_with_expiry() {
-        let Some((mut conn, fred)) = redis_test_conn(Db::BudgetIncrbyAccumulates as u8).await
-        else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::BudgetIncrbyAccumulates).await else {
             return;
         };
         avoid_utc_midnight().await;
@@ -22650,7 +22634,7 @@ mod redis_integration {
     /// `fold_budget_mirror_seeds_floors_and_replaces_stale_day`.
     #[tokio::test]
     async fn sync_from_redis_seeds_budget_mirror_from_shared_counter() {
-        let Some((mut conn, fred)) = redis_test_conn(Db::SeedBudgetMirror as u8).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::SeedBudgetMirror).await else {
             return;
         };
         avoid_utc_midnight().await;
@@ -22776,8 +22760,7 @@ mod redis_integration {
     /// authoritative over larger local state — that pin stands.
     #[tokio::test]
     async fn budget_incrby_poisoned_key_self_heals_and_absent_key_uses_local_floor() {
-        let Some((mut conn, fred)) = redis_test_conn(Db::PoisonedBudgetSelfHeals as u8).await
-        else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::PoisonedBudgetSelfHeals).await else {
             return;
         };
         avoid_utc_midnight().await;
@@ -22933,17 +22916,12 @@ mod redis_integration {
             .unwrap()
             .to_string();
         let (proxy_addr, kill) = spawn_killable_proxy(target.clone()).await;
-        let url = format!("redis://{proxy_addr}/{}", Db::LostIncrbyRevival as u8);
+        let url = Db::LostIncrbyRevival.url(&format!("redis://{proxy_addr}"));
         drop(connect_and_flush(&url).await);
         let fred = fred_test_client(&url).await;
         // Independent assertion client, connected DIRECTLY to the backend so
         // it can verify the increment really was lost (not buffered/replayed).
-        let mut direct = connect(&format!(
-            "{}/{}",
-            base.trim_end_matches('/'),
-            Db::LostIncrbyRevival as u8
-        ))
-        .await;
+        let mut direct = connect(&Db::LostIncrbyRevival.url(&base)).await;
 
         let state = Arc::new(AppState {
             client_budgets: [("lost-cli".to_string(), 100u64)].into(),
@@ -22999,7 +22977,7 @@ mod redis_integration {
     /// undercounts. Budget MGET aggregation is asserted in the same pass.
     #[tokio::test]
     async fn cluster_info_counts_heartbeats_across_multiple_scan_pages() {
-        let Some((mut conn, fred)) = redis_test_conn(Db::ClusterInfoScanPages as u8).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::ClusterInfoScanPages).await else {
             return;
         };
         avoid_utc_midnight().await;
@@ -23038,8 +23016,7 @@ mod redis_integration {
     /// the idle tick refresh the TTL.
     #[tokio::test]
     async fn flush_transport_errors_hincrby_accumulates_across_replicas() {
-        let Some((mut conn, fred)) = redis_test_conn(Db::TransportErrorsAccumulate as u8).await
-        else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::TransportErrorsAccumulate).await else {
             return;
         };
         let replica_a = state_with_redis(vec![], fred.clone());
@@ -23099,7 +23076,7 @@ mod redis_integration {
     /// signal.
     #[tokio::test]
     async fn flush_transport_errors_requeues_deltas_when_redis_dies() {
-        let Some((fred, kill)) = proxied_conn(Db::TransportErrorsRequeue as u8).await else {
+        let Some((fred, kill)) = proxied_conn(Db::TransportErrorsRequeue).await else {
             return;
         };
         let state = state_with_redis(vec![], fred);
@@ -23121,7 +23098,7 @@ mod redis_integration {
     /// is held, and a different model probes under its own lock.
     #[tokio::test]
     async fn probe_lock_grants_one_replica_per_endpoint_model() {
-        let Some((mut conn, fred)) = redis_test_conn(Db::ProbeLockOneReplica as u8).await else {
+        let Some((mut conn, fred)) = redis_test_conn(Db::ProbeLockOneReplica).await else {
             return;
         };
         let (mock_url, hits) = spawn_counting_upstream().await;
@@ -23170,7 +23147,7 @@ mod redis_integration {
     /// probe proceeds anyway (a dead coordinator must not stop probing).
     #[tokio::test]
     async fn probe_lock_fails_open_when_redis_is_down() {
-        let Some((fred, kill)) = proxied_conn(Db::ProbeLockFailsOpen as u8).await else {
+        let Some((fred, kill)) = proxied_conn(Db::ProbeLockFailsOpen).await else {
             return;
         };
         let (mock_url, hits) = spawn_counting_upstream().await;
@@ -23202,7 +23179,7 @@ mod redis_integration {
     /// cold-start absence case; this covers loss of an established backend.
     #[tokio::test]
     async fn backend_death_mid_run_degrades_to_local_only() {
-        let Some((fred, kill)) = proxied_conn(Db::BackendDeathMidRun as u8).await else {
+        let Some((fred, kill)) = proxied_conn(Db::BackendDeathMidRun).await else {
             return;
         };
         avoid_utc_midnight().await;
@@ -23267,18 +23244,13 @@ mod redis_integration {
             .unwrap()
             .to_string();
         let (proxy_addr, kill) = spawn_killable_proxy(target.clone()).await;
-        let url = format!("redis://{proxy_addr}/{}", Db::BackendRecoveryMidRun as u8);
+        let url = Db::BackendRecoveryMidRun.url(&format!("redis://{proxy_addr}"));
         drop(connect_and_flush(&url).await);
         let fred = fred_test_client(&url).await;
         // Independent assertion client, connected DIRECTLY to the backend
         // (not through the killable proxy, and without flushing) so it can
         // verify post-recovery writes actually landed.
-        let direct = connect(&format!(
-            "{}/{}",
-            base.trim_end_matches('/'),
-            Db::BackendRecoveryMidRun as u8
-        ))
-        .await;
+        let direct = connect(&Db::BackendRecoveryMidRun.url(&base)).await;
 
         let state = Arc::new(AppState {
             client_budgets: [("recover-cli".to_string(), 100u64)].into(),
@@ -23364,19 +23336,14 @@ mod redis_integration {
         // Flush this test's DB through a DIRECT connection — the proxy is dead at
         // client creation, so the usual flush-through-proxy path cannot run.
         // The same client later verifies that post-attach writes landed.
-        let direct = connect_and_flush(&format!(
-            "{}/{}",
-            base.trim_end_matches('/'),
-            Db::BackendDownAtStartup as u8
-        ))
-        .await;
+        let direct = connect_and_flush(&Db::BackendDownAtStartup.url(&base)).await;
 
         // Reserve an address, then kill it BEFORE the client under test
         // exists: nothing is listening when the connection task makes its
         // first attempt — the exact boot-during-outage scenario.
         let (proxy_addr, kill) = spawn_killable_proxy(target.clone()).await;
         kill_proxy(kill).await;
-        let url = format!("redis://{proxy_addr}/{}", Db::BackendDownAtStartup as u8);
+        let url = Db::BackendDownAtStartup.url(&format!("redis://{proxy_addr}"));
 
         // The PRODUCTION constructor (fail_fast=false, background connect),
         // with the harness's short budgets and fast constant reconnect.
@@ -23972,6 +23939,65 @@ async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(state.auth_failures.lock().unwrap().values().sum::<u64>(), 5);
+}
+
+/// A poisoned throttle table must not switch the throttle off. A
+/// skip-on-poison lock made `check` report "not throttled" and
+/// `record_failure` stop counting for the life of the process. Driven through
+/// the auth path, not `check` in isolation, so the 429 + `retry-after` the
+/// caller sees is what is proven.
+#[tokio::test]
+async fn auth_throttle_keeps_throttling_through_poisoned_lock() {
+    let state = Arc::new(AppState {
+        clients: vec![mk_client("geo", "key-geo", &[])],
+        auth_throttle: AuthThrottle::new(3, Duration::from_secs(60)),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state.clone())).await;
+    let client = Client::new();
+    let bad = || {
+        client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-api-key", "key-wrong")
+            .body("{}")
+            .send()
+    };
+
+    for _ in 0..3 {
+        assert_eq!(
+            bad().await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+    }
+    poison(&state.auth_throttle.entries);
+
+    let resp = bad().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "an IP at max_failures must stay throttled through a poisoned lock"
+    );
+    let retry: u64 = resp
+        .headers()
+        .get("retry-after")
+        .expect("429 must carry retry-after")
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("retry-after must be whole seconds");
+    assert!((1..=60).contains(&retry));
+    assert!(
+        !state.auth_throttle.entries.is_poisoned(),
+        "the poison must be cleared, or record_failure stops counting for good"
+    );
+    let ip: IpAddr = "127.0.0.1".parse().unwrap();
+    let before = state.auth_throttle.entries.lock().unwrap()[&ip].1;
+    state.auth_throttle.record_failure(ip);
+    assert_eq!(
+        state.auth_throttle.entries.lock().unwrap()[&ip].1,
+        before + 1,
+        "failures must keep counting once the poison is cleared"
+    );
 }
 
 /// Successful traffic below the limit also leaves the shared IP's failure
@@ -25061,9 +25087,9 @@ fn one_request_cannot_exhaust_the_strip_counter() {
 /// `/metrics` used to read this map with `.lock().ok().unwrap_or_default()`,
 /// so one panicking holder emitted an empty series — a zero no alert can tell
 /// apart from a real one. Logging and still returning empty would not have
-/// fixed it: every writer takes the lock with `let Ok(..) else { return }`,
-/// so after one panic the counter is dead, not merely stale. Clearing the
-/// poison is the half that keeps it alive.
+/// fixed it: a `Mutex` poison is permanent, so any site that skips on `Err`
+/// would skip forever after one panic. Clearing the poison is the half that
+/// keeps it alive.
 ///
 /// Driven through the real router rather than by calling `snapshot_counters`
 /// directly, for the same reason `metrics_local_fallback_recovers_poisoned_lock`
@@ -25101,20 +25127,58 @@ async fn poisoned_counter_lock_is_recovered_not_zeroed() {
         "/metrics must publish the real count through a poisoned lock, not a zero \
          indistinguishable from a genuine one:\n{body}"
     );
-
-    // Clearing the poison is what keeps the counter alive: the increment path
-    // bails on a poisoned lock, so without it the series freezes here.
-    state.record_stripped_body_fields("c1", &["speed".to_string()], &["fast-mode-x".to_string()]);
+    // Checked before the next write: the writer clears poison too, so only
+    // here does this prove the render cleared it.
     assert!(
         !state.beta_body_fields_stripped.is_poisoned(),
-        "the render must have cleared the poison, or counting stops for good"
+        "the /metrics render must have cleared the poison"
     );
+
+    state.record_stripped_body_fields("c1", &["speed".to_string()], &["fast-mode-x".to_string()]);
     assert_eq!(
         state
             .beta_body_fields_stripped
             .lock()
             .unwrap()
             .get("speed")
+            .copied(),
+        Some(2),
+        "counting must resume once the poison is cleared"
+    );
+}
+
+/// `client_rejections` has no `snapshot_counters` reader to clear its poison:
+/// both its writer and the `/metrics` render skipped on `Err`, so one panicked
+/// holder published an empty series and stopped counting for the life of the
+/// process. Driven through the real `/metrics` render.
+#[tokio::test]
+async fn poisoned_client_rejections_lock_is_recovered_not_zeroed() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-aaa")]);
+    state.note_client_rejection("client-a", "budget");
+    poison(&state.client_rejections);
+
+    let addr = serve(build_router(state.clone())).await;
+    let body = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains(r#"anthropic_client_rejections_total{client="client-a",reason="budget"} 1"#),
+        "/metrics must publish the real count through a poisoned lock:\n{body}"
+    );
+    assert!(!state.client_rejections.is_poisoned());
+
+    state.note_client_rejection("client-a", "budget");
+    assert_eq!(
+        state
+            .client_rejections
+            .lock()
+            .unwrap()
+            .get(&("client-a".to_string(), "budget"))
             .copied(),
         Some(2),
         "counting must resume once the poison is cleared"
