@@ -8560,9 +8560,17 @@ const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
 ///     for models outside their plan.
 ///   - LiteLLM-style gateways: 400 `{"error":{"message":"... Invalid model
 ///     name passed in model=<id> ..."}}` (observed live from insight-gateway,
-///     2026-07-27).
+///     2026-07-27). Free text, so matched for `Protocol::OpenAI` endpoints
+///     only: Anthropic echoes client-chosen field names into its 400s
+///     (`<field>: Extra inputs are not permitted`), so on an Anthropic
+///     endpoint the phrase is client-controlled and one request could
+///     negative-cache the model for every client (LAB-5235).
 ///   - OpenAI: `{"error":{"code":"model_not_found", ...}}`.
-fn is_model_unsupported_error(status: StatusCode, body: &serde_json::Value) -> bool {
+fn is_model_unsupported_error(
+    status: StatusCode,
+    body: &serde_json::Value,
+    protocol: Protocol,
+) -> bool {
     if status != StatusCode::NOT_FOUND && status != StatusCode::BAD_REQUEST {
         return false;
     }
@@ -8578,7 +8586,7 @@ fn is_model_unsupported_error(status: StatusCode, body: &serde_json::Value) -> b
     if err.get("code").and_then(|v| v.as_str()) == Some("model_not_found") {
         return true;
     }
-    msg.to_ascii_lowercase().contains("invalid model name")
+    protocol == Protocol::OpenAI && msg.to_ascii_lowercase().contains("invalid model name")
 }
 
 /// Anchor for the entitlement 400 (LAB-4729). Only the first sentence: the
@@ -9658,7 +9666,7 @@ async fn forward_anthropic(
             // here too: upstream sends the 400 as a JSON body, not an event
             // stream, so it re-sends before any byte reaches the client.
             let rotate: Option<fn(Box<Response>) -> ForwardOutcome> =
-                if is_model_unsupported_error(status, &parsed) {
+                if is_model_unsupported_error(status, &parsed, ep.protocol) {
                     state.note_model_unsupported(endpoint_name, endpoint_idx, model);
                     Some(ForwardOutcome::RetryModelUnsupported)
                 } else if is_entitlement_exhausted_400(status, &parsed) {
@@ -10560,7 +10568,7 @@ async fn try_fallback_upstream(
         // endpoint just doesn't serve it (LAB-941, observed 2026-07-27 when a
         // 529 storm drained the Anthropic pool into insight-gateway).
         let model_unsupported = serde_json::from_str::<serde_json::Value>(&err_body)
-            .map(|v| is_model_unsupported_error(status, &v))
+            .map(|v| is_model_unsupported_error(status, &v, ep.protocol))
             .unwrap_or(false);
         let response = if translate {
             // Return error in Anthropic format
@@ -14636,7 +14644,7 @@ async fn forward_openai_compat_anthropic(
                 }
                 // Same model-rejection detection as the native path (LAB-941),
                 // and the same entitlement 400 (LAB-4729).
-                model_unsupported = is_model_unsupported_error(status, &parsed);
+                model_unsupported = is_model_unsupported_error(status, &parsed, ep.protocol);
                 entitlement = is_entitlement_exhausted_400(status, &parsed);
                 // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
                 let msg = parsed
