@@ -4592,8 +4592,10 @@ impl AppState {
     /// retryable 429 stays the truth. Endpoints excluded by their config
     /// `models` allowlist never serve the model and don't count; false when
     /// no endpoint could ever serve it (config-only exclusion keeps its
-    /// pre-existing 429 semantics).
-    fn pool_cannot_serve(&self, model: &str, fast: bool) -> bool {
+    /// pre-existing 429 semantics). `refused` is the endpoint that answered
+    /// THIS request with an entitlement 400 (LAB-4729): never negative-cached,
+    /// but skipped for the rest of the request, so it cannot serve it either.
+    fn pool_cannot_serve(&self, model: &str, fast: bool, refused: Option<EndpointIdx>) -> bool {
         if model.is_empty() {
             return false;
         }
@@ -4601,6 +4603,7 @@ impl AppState {
         if fast {
             excluded.extend(self.fast_mode_disabled_endpoints());
         }
+        excluded.extend(refused);
         let mut eligible = 0usize;
         for (i, ep) in self.endpoints.iter().enumerate() {
             if !ep.serves_model(model) {
@@ -10452,9 +10455,11 @@ async fn proxy_handler(
     // the caller as-is (LAB-4729): the caller sees why, not a synthetic 429.
     // Present only if no later attempt answered — see `apply_round_outcome`.
     // Deliberately OUTSIDE the `pool_cannot_serve` gate below: the refusal is
-    // never negative-cached, so that gate can never agree the pool is out.
+    // never negative-cached, so that gate only counts the refuser as out
+    // via `refused`.
+    let (refused, entitlement_resp) = entitlement_resp.unzip();
     if !last_saw_529 && !last_saw_transient {
-        if let Some(resp) = entitlement_resp.and_then(|(_, r)| r) {
+        if let Some(resp) = entitlement_resp.flatten() {
             return resp;
         }
     }
@@ -10478,7 +10483,10 @@ async fn proxy_handler(
     // common state, so this generalisation is intentional, not a
     // regression: it's covered for the model-unsupported case by
     // `model_unsupported_rejection_plus_rate_limited_pool_stays_retryable`.
-    if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, is_fast_mode) {
+    if !last_saw_529
+        && !last_saw_transient
+        && state.pool_cannot_serve(&model, is_fast_mode, refused)
+    {
         if let Some(resp) = rejected_resp {
             return resp;
         }
@@ -10487,7 +10495,7 @@ async fn proxy_handler(
         // Name the cause whose removal would unblock the request: if the
         // pool serves the model at standard speed, only fast-mode marks
         // stand in the way; otherwise the model itself is unservable.
-        if is_fast_mode && !state.pool_cannot_serve(&model, false) {
+        if is_fast_mode && !state.pool_cannot_serve(&model, false, refused) {
             warn!(model, "fast mode not enabled on any eligible endpoint");
             return invalid_request_response(FAST_MODE_NOT_ENABLED_MSG);
         }
@@ -15406,8 +15414,9 @@ async fn openai_chat_handler(
 
         // Entitlement 400 first, outside the rejection gate — as in
         // `proxy_handler` (LAB-4729).
+        let (refused, entitlement_resp) = entitlement_resp.unzip();
         if !last_saw_529 && !last_saw_transient {
-            if let Some(resp) = entitlement_resp.and_then(|(_, r)| r) {
+            if let Some(resp) = entitlement_resp.flatten() {
                 return resp;
             }
         }
@@ -15415,7 +15424,7 @@ async fn openai_chat_handler(
         // MF-3 generalisation), in the OpenAI error shape this handler's
         // clients parse. Never `fast`: the OpenAI→Anthropic translation
         // carries no `speed`.
-        if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, false) {
+        if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, false, refused) {
             if let Some(resp) = rejected_resp {
                 return resp;
             }

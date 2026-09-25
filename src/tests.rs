@@ -6453,14 +6453,14 @@ async fn fast_mode_disabled_filters_fast_routing_until_expiry() {
             .is_some_and(|s| s > FAST_MODE_DISABLED_TTL.as_secs() - 5),
         "/_stats must expose the remaining TTL"
     );
-    assert!(!state.pool_cannot_serve("claude-opus-5", true));
+    assert!(!state.pool_cannot_serve("claude-opus-5", true, None));
 
     // Mark the other account too: the FAST pool is now unservable, the
     // standard pool is untouched.
     state.note_fast_mode_disabled("b", 1);
-    assert!(state.pool_cannot_serve("claude-opus-5", true));
+    assert!(state.pool_cannot_serve("claude-opus-5", true, None));
     assert!(
-        !state.pool_cannot_serve("claude-opus-5", false),
+        !state.pool_cannot_serve("claude-opus-5", false, None),
         "fast-mode marks must not count against a standard request"
     );
 
@@ -6493,9 +6493,9 @@ fn pool_cannot_serve_unions_negative_caches() {
     ]);
     state.note_model_unsupported("a", 0, "claude-opus-5");
     state.note_fast_mode_disabled("b", 1);
-    assert!(state.pool_cannot_serve("claude-opus-5", true));
-    assert!(!state.pool_cannot_serve("claude-opus-5", false));
-    assert!(!state.pool_cannot_serve("claude-sonnet-5", true));
+    assert!(state.pool_cannot_serve("claude-opus-5", true, None));
+    assert!(!state.pool_cannot_serve("claude-opus-5", false, None));
+    assert!(!state.pool_cannot_serve("claude-sonnet-5", true, None));
 }
 
 /// MF-2/Cobel HIGH: an OpenAI-protocol endpoint never accrues a fast-mode
@@ -6539,11 +6539,11 @@ fn pool_cannot_serve_excludes_openai_protocol_for_fast_requests() {
     ]);
     state.note_fast_mode_disabled("anthropic-only", 0);
     assert!(
-        state.pool_cannot_serve("claude-opus-5", true),
+        state.pool_cannot_serve("claude-opus-5", true, None),
         "an OpenAI fallback must not mask a fully fast-disabled Anthropic pool"
     );
     assert!(
-        !state.pool_cannot_serve("claude-opus-5", false),
+        !state.pool_cannot_serve("claude-opus-5", false, None),
         "the same pool can serve a standard request"
     );
 }
@@ -25885,6 +25885,38 @@ async fn resend_outcome_supersedes_stashed_entitlement_400() {
             "{kind}"
         );
     }
+}
+
+/// The 404 case above on the OpenAI-compat path. The refuser is never
+/// negative-cached, so the exhaustion gate must count it out by index
+/// (`pool_cannot_serve`'s `refused`) — otherwise the re-send target's model
+/// rejection turns into a synthetic 429 (LAB-2687 × LAB-4729).
+#[tokio::test]
+async fn resend_404_supersedes_entitlement_400_on_openai_compat_path() {
+    use std::sync::atomic::Ordering;
+    let (url, target_hits) = spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
+    let (_state, addr, spent_hits) = spent_then(ENTITLEMENT_400_BODY, &url).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "body {body}");
+    assert!(
+        !body.contains("out of extra usage"),
+        "the stashed entitlement 400 must not win: {body}"
+    );
+    assert_eq!(
+        (
+            spent_hits.load(Ordering::SeqCst),
+            target_hits.load(Ordering::SeqCst)
+        ),
+        (1, 1)
+    );
 }
 
 /// A poisoned `entitlement_400` lock: `/metrics` publishes the real count and
