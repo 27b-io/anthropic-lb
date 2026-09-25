@@ -1299,8 +1299,8 @@ impl AppState {
         lock_recovering(&self.budget_usage, "budget_usage")
     }
 
-    // One `lock_recovering` accessor per multi-site map, so a new site cannot
-    // reach for a bare `.lock()` and skip on poison for the process lifetime.
+    // One `lock_recovering` accessor per multi-site map: a convenience that
+    // pins each map's lock-name string in one place.
 
     pub(crate) fn lock_client_rejections(
         &self,

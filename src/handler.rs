@@ -796,14 +796,15 @@ pub(crate) async fn forward_anthropic(
     // Use OAuth variant (with CC system prompt) for OAuth tokens, and its
     // beta-coherent rewrite when the filter orphaned a body field (LAB-1261).
     let req_body = if token.starts_with(OAUTH_TOKEN_PREFIX) {
-        // `dropped` is only ever non-empty on this branch, so a rewrite
-        // without it would mean the filter's contract changed underneath us.
-        debug_assert!(coherent_body.is_none() || token.starts_with(OAUTH_TOKEN_PREFIX));
         match &coherent_body {
             Some((rewritten, _)) => rewritten,
             None => oauth_body_bytes,
         }
     } else {
+        // Only the OAuth arm of `inject_account_auth` fills `dropped`, so a
+        // rewrite here would be discarded after `record_stripped_body_fields`
+        // and the fast-mode reclassification had already acted on it.
+        debug_assert!(coherent_body.is_none());
         body_bytes
     };
     upstream_req = upstream_req.body(req_body.clone());
