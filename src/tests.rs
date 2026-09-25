@@ -3279,6 +3279,62 @@ fn translate_request_forwards_non_numeric_temperature_unchanged() {
     assert_eq!(result["temperature"], "0.7");
 }
 
+#[test]
+fn translate_request_maps_reasoning_effort_to_output_config() {
+    for effort in ["low", "medium", "high", "xhigh", "max"] {
+        let req = serde_json::json!({
+            "model": "claude-opus-5-5",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "reasoning_effort": effort
+        });
+        let result = translate_openai_to_anthropic(&req);
+        assert_eq!(
+            result["output_config"],
+            serde_json::json!({"effort": effort})
+        );
+        // OpenAI-only field never reaches the Anthropic body
+        assert!(result.get("reasoning_effort").is_none());
+        // adaptive models think on their own; the shim must not synthesise it
+        assert!(result.get("thinking").is_none());
+    }
+}
+
+#[test]
+fn translate_request_drops_unmappable_reasoning_effort() {
+    // `minimal`/`none` have no Anthropic equivalent; unknown strings, wrong
+    // case and non-strings would 400 upstream — drop them all. `null` is
+    // treated as absent (no warn), and also yields no `output_config`.
+    for effort in [
+        serde_json::json!("minimal"),
+        serde_json::json!("none"),
+        serde_json::json!("ultra"),
+        serde_json::json!("HIGH"),
+        serde_json::json!(3),
+        serde_json::Value::Null,
+    ] {
+        let req = serde_json::json!({
+            "model": "claude-opus-5-5",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "reasoning_effort": effort
+        });
+        let result = translate_openai_to_anthropic(&req);
+        assert!(
+            result.get("output_config").is_none(),
+            "effort {effort} must be dropped"
+        );
+    }
+}
+
+#[test]
+fn translate_request_without_reasoning_effort_has_no_output_config() {
+    let req = serde_json::json!({
+        "model": "claude-opus-5-5",
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    let result = translate_openai_to_anthropic(&req);
+    assert!(result.get("output_config").is_none());
+}
+
 /// The Anthropic→OpenAI fallback translator gets the same LAB-798 guard as
 /// the forward shim: an OpenAI-protocol endpoint can front Claude ≥ 4.7.
 #[test]
@@ -8080,6 +8136,139 @@ async fn budget_check_within_limit() {
 
     // Unknown client has no budget, always ok
     assert!(state.check_budget("unknown").await.is_ok());
+}
+
+/// Panic while holding `mutex`, leaving it poisoned — the state a future
+/// panicking edit inside a critical section would produce.
+fn poison<T: Send>(mutex: &std::sync::Mutex<T>) {
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let _g = mutex.lock().unwrap();
+            panic!("poison the mutex");
+        })
+        .join()
+        .unwrap_err();
+    });
+    assert!(mutex.is_poisoned());
+}
+
+/// A poisoned `budget_usage` lock must not disable enforcement: `check_budget`
+/// still denies an exhausted client (an `if let Ok` skip returned `Ok(())`,
+/// granting the budget), and the poison is cleared so `record_budget_usage`
+/// keeps counting afterwards rather than skipping for the life of the process.
+#[tokio::test]
+async fn budget_check_enforces_through_poisoned_lock() {
+    let mut budgets = HashMap::new();
+    budgets.insert("client-a".to_string(), 1000u64);
+    budgets.insert("client-b".to_string(), 1000u64);
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        client_budgets: budgets,
+        ..test_state_base()
+    });
+    state.record_budget_usage("client-a", 1500).await;
+    poison(&state.budget_usage);
+
+    assert_eq!(
+        state.check_budget("client-a").await,
+        Err(0),
+        "an exhausted client must stay denied through a poisoned lock"
+    );
+    assert!(
+        !state.budget_usage.is_poisoned(),
+        "recovery must clear the poison, not just bypass it"
+    );
+
+    // Accumulation survives too: new usage is counted and enforced.
+    state.record_budget_usage("client-b", 1200).await;
+    assert!(state.check_budget("client-b").await.is_err());
+}
+
+/// The accumulator itself going through a poisoned lock: usage recorded
+/// while poisoned must be counted, not silently dropped.
+#[tokio::test]
+async fn budget_record_counts_through_poisoned_lock() {
+    let mut budgets = HashMap::new();
+    budgets.insert("client-a".to_string(), 1000u64);
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        client_budgets: budgets,
+        ..test_state_base()
+    });
+    poison(&state.budget_usage);
+    state.record_budget_usage("client-a", 1500).await;
+    assert!(state.check_budget("client-a").await.is_err());
+}
+
+/// `anthropic_auth_failures_total` is the brute-force signal: a poisoned
+/// lock must not freeze it (writer skips) or zero it (reader skips).
+#[tokio::test]
+async fn auth_failure_counter_survives_poisoned_lock() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    state.count_auth_failure("proxy", "none");
+    poison(&state.auth_failures);
+    state.count_auth_failure("proxy", "none");
+    assert!(!state.auth_failures.is_poisoned());
+    assert_eq!(
+        state.auth_failures.lock().unwrap().get(&("proxy", "none")),
+        Some(&2)
+    );
+}
+
+/// `note_model_denied` keeps counting through a poisoned lock.
+#[tokio::test]
+async fn model_denied_counter_survives_poisoned_lock() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    state.note_model_denied("client-a", "claude-opus-4-7");
+    poison(&state.model_denied);
+    state.note_model_denied("client-a", "claude-opus-4-7");
+    assert!(!state.model_denied.is_poisoned());
+    let key = ("client-a".to_string(), "claude-opus-4-7".to_string());
+    assert_eq!(state.model_denied.lock().unwrap().get(&key), Some(&2));
+}
+
+/// The `/_stats` and `/metrics` budget readers report recovered usage through
+/// a poisoned lock instead of zero.
+#[tokio::test]
+async fn budget_readers_report_usage_through_poisoned_lock() {
+    let mut budgets = HashMap::new();
+    budgets.insert("client-a".to_string(), 1000u64);
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        client_budgets: budgets,
+        ..test_state_base()
+    });
+    state.record_budget_usage("client-a", 400).await;
+    let addr = serve(build_router(state.clone())).await;
+    let c = reqwest::Client::new();
+
+    poison(&state.budget_usage);
+    let stats: serde_json::Value = c
+        .get(format!("http://{addr}/_stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        stats["client_budgets"]["client-a"]["used_today"], 400,
+        "{stats}"
+    );
+
+    poison(&state.budget_usage);
+    let m = c
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        m.contains("anthropic_client_budget_used{client=\"client-a\"} 400"),
+        "poisoned budget usage must not be reported as zero:\n{m}"
+    );
 }
 
 // ── Unit: pre-request-gate rejection counter (LAB-2551) ────────
@@ -16601,12 +16790,19 @@ async fn openai_compat_translates_upstream_raw_error() {
 }
 
 #[test]
-fn inject_auth_api_key() {
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert("authorization", HeaderValue::from_static("Bearer old"));
-    inject_account_auth(&mut headers, "sk-ant-api-test123", false, &default_betas());
-    assert_eq!(headers.get("x-api-key").unwrap(), "sk-ant-api-test123");
-    assert!(headers.get("authorization").is_none());
+fn inject_auth_non_oauth_token_uses_x_api_key() {
+    // The contract is two-way: only the OAuth prefix selects Bearer auth;
+    // every other token, API key or not, is sent as x-api-key.
+    for token in ["sk-ant-api-test123", "not-an-anthropic-prefix-test123"] {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer old"));
+        inject_account_auth(&mut headers, token, false, &default_betas());
+        assert_eq!(headers.get("x-api-key").unwrap(), token);
+        assert!(headers.get("authorization").is_none());
+        assert!(headers
+            .get("anthropic-dangerous-direct-browser-access")
+            .is_none());
+    }
 }
 
 #[test]

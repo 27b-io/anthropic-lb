@@ -2146,9 +2146,9 @@ impl AppState {
     /// unauthenticated callers on the public ingress, blinding the metric
     /// for every later legitimate caller. It lives on the log line instead.
     fn count_auth_failure(&self, route: &'static str, cred: &'static str) {
-        if let Ok(mut counts) = self.auth_failures.lock() {
-            *counts.entry((route, cred)).or_insert(0) += 1;
-        }
+        *lock_recovering(&self.auth_failures, "auth_failures")
+            .entry((route, cred))
+            .or_insert(0) += 1;
     }
 
     /// Gate an admin surface (`/_stats`, `/metrics`) behind an OPERATOR
@@ -2395,8 +2395,8 @@ impl AppState {
     /// warnings.
     fn note_model_denied(&self, client_id: &str, model: &str) {
         let model = truncate_label(model);
-        let mut first_time = true;
-        if let Ok(mut counts) = self.model_denied.lock() {
+        let first_time = {
+            let mut counts = lock_recovering(&self.model_denied, "model_denied");
             let key = (client_id.to_owned(), model.clone());
             let label = if counts.len() < MAX_MODEL_DENIED_LABELS || counts.contains_key(&key) {
                 key
@@ -2408,9 +2408,9 @@ impl AppState {
                 ("_other".to_owned(), "_other".to_owned())
             };
             let entry = counts.entry(label).or_insert(0);
-            first_time = *entry == 0;
             *entry += 1;
-        }
+            *entry == 1
+        };
         if first_time {
             warn!(
                 client_id = %client_id,
@@ -3943,6 +3943,31 @@ fn drops_deprecated_temperature(model: &str, value: &serde_json::Value) -> bool 
         "dropping `temperature`: deprecated and hard-rejected by this model"
     );
     true
+}
+
+/// Translate an OpenAI `reasoning_effort` into Anthropic's
+/// `output_config.effort`, so OpenAI clients can set thinking effort. Only
+/// level names the Anthropic API defines pass; per-model support is not
+/// checked here — a model that lacks the level answers with an explicit 400,
+/// the same way OpenAI rejects `reasoning_effort` on non-reasoning models.
+/// `minimal`/`none`, unknown strings and non-strings would 400 on every model,
+/// so they are dropped with a warn that makes the loss visible to operators.
+/// `null` is treated as absent: clients that serialise unset fields must not
+/// warn on every request. No `thinking` block is synthesised: adaptive-thinking
+/// models decide when to think on their own.
+fn translate_reasoning_effort(value: &serde_json::Value) -> Option<&str> {
+    const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+    if value.is_null() {
+        return None;
+    }
+    let effort = value.as_str().filter(|e| EFFORTS.contains(e));
+    if effort.is_none() {
+        warn!(
+            reasoning_effort = %truncate_label(&value.to_string()),
+            "dropping `reasoning_effort`: no Anthropic effort equivalent"
+        );
+    }
+    effort
 }
 
 /// Internal claim key for the Fable included-usage band. On Max plans Fable is
@@ -6223,20 +6248,17 @@ impl AppState {
         }
     }
 
-    /// Lock the transport-error accumulator, recovering — and clearing — a
-    /// poisoned lock. The map is a plain counter store: a panicking holder
-    /// cannot leave it logically inconsistent, only stale by one increment.
-    /// Clearing the poison matters because the other lock sites (the two
-    /// increment paths and the local `/metrics` fallback) use `if let Ok` /
-    /// `.map()` and would otherwise silently skip forever after one panic.
+    /// Lock the transport-error accumulator via `lock_recovering`. Every
+    /// `upstream_transport_errors` site goes through here.
     fn lock_transport_errors(&self) -> std::sync::MutexGuard<'_, HashMap<&'static str, u64>> {
-        match self.upstream_transport_errors.lock() {
-            Ok(g) => g,
-            Err(poisoned) => {
-                self.upstream_transport_errors.clear_poison();
-                poisoned.into_inner()
-            }
-        }
+        lock_recovering(&self.upstream_transport_errors, "upstream_transport_errors")
+    }
+
+    /// Lock the per-client budget accumulator via `lock_recovering`. Every
+    /// `budget_usage` site MUST go through here: a bare `if let Ok` would turn
+    /// one panicked holder into permanently disabled budgets (fail-open).
+    fn lock_budget_usage(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, u64)>> {
+        lock_recovering(&self.budget_usage, "budget_usage")
     }
 
     /// Log + count client `anthropic-beta` flags dropped by the allow-list
@@ -6864,9 +6886,7 @@ fn inject_account_auth(
     headers.remove("authorization");
     headers.remove("x-api-key");
     let mut dropped: Vec<String> = Vec::new();
-    if token.starts_with("sk-ant-api") {
-        headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
-    } else if token.starts_with(OAUTH_TOKEN_PREFIX) {
+    if token.starts_with(OAUTH_TOKEN_PREFIX) {
         headers.insert(
             "authorization",
             HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
@@ -6908,6 +6928,7 @@ fn inject_account_auth(
             HeaderValue::from_str(&flags.join(",")).unwrap(),
         );
     } else {
+        // Anything that is not OAuth (API keys included) is sent as x-api-key.
         headers.insert("x-api-key", HeaderValue::from_str(token).unwrap());
     }
     dropped
@@ -7819,11 +7840,9 @@ impl AppState {
         }
 
         // Local fallback
-        if let Ok(map) = self.budget_usage.lock() {
-            if let Some(&(day, used)) = map.get(client_id) {
-                if day == today && used >= limit {
-                    return Err(limit - (used.min(limit)));
-                }
+        if let Some(&(day, used)) = self.lock_budget_usage().get(client_id) {
+            if day == today && used >= limit {
+                return Err(limit - (used.min(limit)));
             }
         }
         Ok(())
@@ -7887,8 +7906,10 @@ impl AppState {
         }
         let today = Self::now_epoch() / 86400;
 
-        // Always update local state (for stats + fallback)
-        if let Ok(mut map) = self.budget_usage.lock() {
+        // Always update local state (for stats + fallback). Scoped so the
+        // guard drops before the INCRBY await below.
+        {
+            let mut map = self.lock_budget_usage();
             let entry = map.entry(client_id.to_owned()).or_insert((today, 0));
             // `!= today` is right HERE because this `today` is fresh. Do not
             // unify with fold_budget_mirror's stricter `<` / `>` day rule —
@@ -7978,9 +7999,7 @@ impl AppState {
     /// counter carries nothing the mirror lacks and is skipped, so the sync
     /// alone never materialises entries for idle clients.
     fn fold_budget_mirror<'a>(&self, today: u64, remote: impl IntoIterator<Item = (&'a str, u64)>) {
-        let Ok(mut map) = self.budget_usage.lock() else {
-            return;
-        };
+        let mut map = self.lock_budget_usage();
         for (client_id, used) in remote {
             if used == 0 {
                 continue;
@@ -9278,9 +9297,7 @@ async fn forward_anthropic(
             } else {
                 "other"
             };
-            if let Ok(mut m) = state.upstream_transport_errors.lock() {
-                *m.entry(kind).or_insert(0) += 1;
-            }
+            *state.lock_transport_errors().entry(kind).or_insert(0) += 1;
             // Feed the per-endpoint circuit breaker: enough consecutive
             // failures and this endpoint leaves the routing pool entirely.
             state.record_transport_failure(endpoint_idx).await;
@@ -10482,9 +10499,7 @@ async fn try_fallback_upstream(
             } else {
                 "other"
             };
-            if let Ok(mut m) = state.upstream_transport_errors.lock() {
-                *m.entry(kind).or_insert(0) += 1;
-            }
+            *state.lock_transport_errors().entry(kind).or_insert(0) += 1;
             // Health signal + transient classification — closes the #69 gap
             // where this branch swallowed transport errors to a bare `None`.
             state.record_transport_failure(endpoint_idx).await;
@@ -11142,14 +11157,13 @@ async fn stats_handler(
         serde_json::json!(null)
     } else {
         let today = AppState::now_epoch() / 86400;
-        let usage_map = state.budget_usage.lock().ok();
+        let usage_map = state.lock_budget_usage();
         let obj: serde_json::Map<String, serde_json::Value> = state
             .client_budgets
             .iter()
             .map(|(client, &limit)| {
                 let used = usage_map
-                    .as_ref()
-                    .and_then(|m| m.get(client))
+                    .get(client)
                     .filter(|(day, _)| *day == today)
                     .map(|(_, used)| *used)
                     .unwrap_or(0);
@@ -11473,38 +11487,45 @@ async fn build_metrics_snap(
     }
 }
 
-/// Snapshot a `String`-keyed counter map for the `/metrics` render,
-/// recovering — and clearing — a poisoned lock rather than publishing an
-/// empty map.
+/// Lock `mutex`, recovering — and clearing — a poisoned lock, with a `warn!`
+/// naming it (`name`) so a panicked holder leaves evidence instead of being
+/// silently healed.
 ///
-/// `.lock().ok().unwrap_or_default()` emits a zero indistinguishable from a
-/// real one, and logging while *still* returning empty would only make the
-/// endpoint lie more loudly. Clearing is the half that matters: every writer
-/// to these maps takes the lock with `let Ok(..) else { return }` / `if let
-/// Ok(..)`, so an uncleared poison kills the counter permanently rather than
-/// leaving it stale. Same recovery rationale as `lock_transport_errors`,
-/// which does it silently — a panicking holder is worth a line.
+/// Every map routed through here is a counter or accumulator store: a
+/// panicking holder can leave it stale by at most one update, never logically
+/// inconsistent, so its data is still the best answer. Clearing is the half
+/// that matters: a `Mutex` poison is permanent, so a site that skips on `Err`
+/// (`if let Ok(..)`, `.lock().ok()`) would skip forever after one panic. For
+/// `budget_usage` that skip is fail-OPEN — `check_budget` would grant every
+/// request and `record_budget_usage` would stop counting, for the life of the
+/// process. Recovery keeps enforcement live without making the fault itself a
+/// denial reason: the gate denies only on recovered usage data.
 ///
-/// Nothing in these critical sections can currently panic, so this is
-/// defence against a future edit, not a live incident. The remaining
-/// `/metrics` maps keep the zeroing pattern only because their value types
-/// do not fit this signature.
+/// Nothing in the guarded critical sections can currently panic, so this is
+/// defence against a future edit, not a live incident.
+fn lock_recovering<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> std::sync::MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            warn!(lock = name, "mutex was poisoned by a panicking holder; recovered its data and cleared the poison");
+            mutex.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Snapshot a `String`-keyed counter map for the `/metrics` render through
+/// `lock_recovering`, rather than `.lock().ok().unwrap_or_default()` — that
+/// emits a zero indistinguishable from a real one, and leaves the poison in
+/// place for every writer.
 fn snapshot_counters(
     counters: &Mutex<HashMap<String, u64>>,
     map: &'static str,
 ) -> Vec<(String, u64)> {
-    let guard = match counters.lock() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            warn!(
-                map,
-                "/metrics: counter lock was poisoned; recovered the counts and cleared it"
-            );
-            counters.clear_poison();
-            poisoned.into_inner()
-        }
-    };
-    guard.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    lock_recovering(counters, map)
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
 }
 
 async fn metrics_handler(
@@ -11581,22 +11602,16 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
-    let budget_usage = state
-        .budget_usage
-        .lock()
-        .ok()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+    let budget_usage = state.lock_budget_usage().clone();
     let cluster_info = state.cluster_info_cache.lock().ok().and_then(|g| g.clone());
     let prompt_too_long = snapshot_counters(&state.prompt_too_long, "prompt_too_long");
     let fast_mode_429 = snapshot_counters(&state.fast_mode_429, "fast_mode_429");
     let entitlement_400 = snapshot_counters(&state.entitlement_400, "entitlement_400");
-    let model_denied: Vec<((String, String), u64)> = state
-        .model_denied
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
+    let model_denied: Vec<((String, String), u64)> =
+        lock_recovering(&state.model_denied, "model_denied")
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
     let beta_body_fields_stripped = snapshot_counters(
         &state.beta_body_fields_stripped,
         "beta_body_fields_stripped",
@@ -11608,12 +11623,11 @@ async fn metrics_handler(
         .ok()
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
-    let auth_failures: Vec<(AuthFailureKey, u64)> = state
-        .auth_failures
-        .lock()
-        .ok()
-        .map(|g| g.iter().map(|(k, v)| (*k, *v)).collect())
-        .unwrap_or_default();
+    let auth_failures: Vec<(AuthFailureKey, u64)> =
+        lock_recovering(&state.auth_failures, "auth_failures")
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
     let (session_buckets, session_tokens_sum) = state.session_tokens_histogram(now_epoch);
 
     // ── Phase 2: Serialize (sync — no locks held) ──────────────────
@@ -13246,6 +13260,17 @@ fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_json::Value 
         }
     }
 
+    // reasoning_effort -> output_config.effort (policy in `translate_reasoning_effort`)
+    if let Some(effort) = body
+        .get("reasoning_effort")
+        .and_then(translate_reasoning_effort)
+    {
+        out.insert(
+            "output_config".to_string(),
+            serde_json::json!({"effort": effort}),
+        );
+    }
+
     // stop -> stop_sequences
     if let Some(stop) = body.get("stop") {
         let sequences = if stop.is_array() {
@@ -14452,9 +14477,7 @@ async fn forward_openai_compat_anthropic(
             } else {
                 "other"
             };
-            if let Ok(mut m) = state.upstream_transport_errors.lock() {
-                *m.entry(kind).or_insert(0) += 1;
-            }
+            *state.lock_transport_errors().entry(kind).or_insert(0) += 1;
             // Feed the per-endpoint circuit breaker: enough consecutive
             // failures and this endpoint leaves the routing pool entirely.
             state.record_transport_failure(endpoint_idx).await;
