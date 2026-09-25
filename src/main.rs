@@ -6219,9 +6219,8 @@ impl AppState {
         }
     }
 
-    /// Lock the transport-error accumulator via `lock_recovering`. Clearing
-    /// the poison matters because the other lock sites (the two increment
-    /// paths and the local `/metrics` fallback) use `if let Ok` / `.map()`.
+    /// Lock the transport-error accumulator via `lock_recovering`. Every
+    /// `upstream_transport_errors` site goes through here.
     fn lock_transport_errors(&self) -> std::sync::MutexGuard<'_, HashMap<&'static str, u64>> {
         lock_recovering(&self.upstream_transport_errors, "upstream_transport_errors")
     }
@@ -9270,9 +9269,7 @@ async fn forward_anthropic(
             } else {
                 "other"
             };
-            if let Ok(mut m) = state.upstream_transport_errors.lock() {
-                *m.entry(kind).or_insert(0) += 1;
-            }
+            *state.lock_transport_errors().entry(kind).or_insert(0) += 1;
             // Feed the per-endpoint circuit breaker: enough consecutive
             // failures and this endpoint leaves the routing pool entirely.
             state.record_transport_failure(endpoint_idx).await;
@@ -10474,9 +10471,7 @@ async fn try_fallback_upstream(
             } else {
                 "other"
             };
-            if let Ok(mut m) = state.upstream_transport_errors.lock() {
-                *m.entry(kind).or_insert(0) += 1;
-            }
+            *state.lock_transport_errors().entry(kind).or_insert(0) += 1;
             // Health signal + transient classification — closes the #69 gap
             // where this branch swallowed transport errors to a bare `None`.
             state.record_transport_failure(endpoint_idx).await;
@@ -11465,7 +11460,7 @@ async fn build_metrics_snap(
 }
 
 /// Lock `mutex`, recovering — and clearing — a poisoned lock, with a `warn!`
-/// naming `lock` so a panicked holder leaves evidence instead of being
+/// naming it (`name`) so a panicked holder leaves evidence instead of being
 /// silently healed.
 ///
 /// Every map routed through here is a counter or accumulator store: a
@@ -11475,16 +11470,16 @@ async fn build_metrics_snap(
 /// (`if let Ok(..)`, `.lock().ok()`) would skip forever after one panic. For
 /// `budget_usage` that skip is fail-OPEN — `check_budget` would grant every
 /// request and `record_budget_usage` would stop counting, for the life of the
-/// process. Recovery keeps the budget gate's posture unchanged (internal
-/// faults never deny traffic) while keeping enforcement live.
+/// process. Recovery keeps enforcement live without making the fault itself a
+/// denial reason: the gate denies only on recovered usage data.
 ///
 /// Nothing in the guarded critical sections can currently panic, so this is
 /// defence against a future edit, not a live incident.
-fn lock_recovering<'a, T>(mutex: &'a Mutex<T>, lock: &'static str) -> std::sync::MutexGuard<'a, T> {
+fn lock_recovering<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> std::sync::MutexGuard<'a, T> {
     match mutex.lock() {
         Ok(g) => g,
         Err(poisoned) => {
-            warn!(lock, "mutex was poisoned by a panicking holder; recovered its data and cleared the poison");
+            warn!(lock = name, "mutex was poisoned by a panicking holder; recovered its data and cleared the poison");
             mutex.clear_poison();
             poisoned.into_inner()
         }
@@ -14443,9 +14438,7 @@ async fn forward_openai_compat_anthropic(
             } else {
                 "other"
             };
-            if let Ok(mut m) = state.upstream_transport_errors.lock() {
-                *m.entry(kind).or_insert(0) += 1;
-            }
+            *state.lock_transport_errors().entry(kind).or_insert(0) += 1;
             // Feed the per-endpoint circuit breaker: enough consecutive
             // failures and this endpoint leaves the routing pool entirely.
             state.record_transport_failure(endpoint_idx).await;
