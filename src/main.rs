@@ -197,7 +197,7 @@ fn validate_clients(config: &Config) -> Result<(), String> {
         }
         if c.name == "_other" {
             return Err(
-                "client: name must not be \"_other\" (the reserved metrics overflow-bucket label — a real client with this name would merge with, and take the warn-once flag of, the (\"_other\", \"_other\") overflow key)"
+                "client: name must not be \"_other\" (the reserved metrics overflow-bucket label — a real client with this name would merge into the (\"_other\", \"_other\") overflow key)"
                     .to_string(),
             );
         }
@@ -238,6 +238,13 @@ fn validate_clients(config: &Config) -> Result<(), String> {
     // (`resolve_client_id`'s fallback) — an IP mapped to a reserved sentinel
     // would resolve real traffic to it, bypassing the header filter above.
     for (ip, name) in &config.client_names {
+        // Same failure as an untrimmed `[[clients]]` name above: resolved
+        // verbatim by `resolve_client_id`, matches no budget key.
+        if name.is_empty() || name != name.trim() {
+            return Err(format!(
+                "client_names: \"{ip}\" maps to \"{name}\" — value must be non-empty with no leading or trailing whitespace"
+            ));
+        }
         if name == "-" || name == "_operator" || name == "_other" {
             return Err(format!(
                 "client_names: \"{ip}\" maps to reserved name \"{name}\" (\"-\" = unknown-client sentinel, \"_operator\" = operator-aggregation label, \"_other\" = metrics overflow bucket)"

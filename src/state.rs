@@ -181,10 +181,9 @@ pub(crate) const TAU_1H: f64 = 3600.0;
 pub(crate) const MAX_TRACKED_CLIENTS: usize = 10_000;
 
 /// Cap on distinct (client, model) labels in the allowlist-denial counter.
-/// The model half is caller-controlled, and under legacy auth the client
-/// half is too (`x-client-id`), so overflow lumps into a single global
-/// ("_other", "_other") bucket — a HARD bound of cap + 1 entries (LAB-2332,
-/// mirroring the LAB-2330 fix to `client_model_usage`).
+/// The model half is caller-controlled; the client half is config-bounded,
+/// so the hard bound is cap + configured clients + 1 — see
+/// `AppState::note_model_denied` for the scheme (LAB-2332, LAB-4028).
 pub(crate) const MAX_MODEL_DENIED_LABELS: usize = 64;
 
 /// Cap on distinct clients in the pre-request-gate rejection counter
@@ -735,12 +734,8 @@ pub(crate) struct AppState {
     /// `fast_mode_429`.
     pub(crate) entitlement_400: Mutex<HashMap<String, u64>>,
     /// Per-client model-allowlist denials, keyed (client, model) (LAB-1083).
-    /// Exposed as `anthropic_client_model_denied_total`. Under `[[clients]]`
-    /// auth `client` is a credential-bound principal, but under legacy
-    /// `proxy_key` / `allow_unauthenticated` it comes from the
-    /// caller-controlled `x-client-id` header — so overflow lumps into a
-    /// single global ("_other", "_other") bucket, hard-bounding the map at
-    /// `MAX_MODEL_DENIED_LABELS` + 1 entries (LAB-2332).
+    /// Exposed as `anthropic_client_model_denied_total`. Cardinality is
+    /// hard-bounded — `note_model_denied` documents the scheme.
     pub(crate) model_denied: Mutex<HashMap<(String, String), u64>>,
     /// Pre-request-gate 429 rejections, keyed (client, reason) (LAB-2551).
     /// Exposed as `anthropic_client_rejections_total`. `reason` is the closed

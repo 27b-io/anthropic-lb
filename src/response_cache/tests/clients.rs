@@ -361,31 +361,73 @@ async fn model_denial_increments_counter_per_client_and_model() {
 }
 
 /// The model label is caller-controlled — unbounded growth here would be a
-/// metrics-cardinality DoS.
+/// metrics-cardinality DoS. Bound is cap + N + 1; `note_model_denied`
+/// documents the scheme (LAB-2332, LAB-4028).
 #[test]
 fn model_denial_labels_are_bounded_by_other_overflow() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     for i in 0..(MAX_MODEL_DENIED_LABELS + 25) {
         state.note_model_denied("limited", &format!("junk-model-{i}"));
     }
-    // Expert-panel finding (LAB-2330, mirrored by LAB-2332): rotating the
-    // caller-controlled client id past the cap must NOT mint per-client
-    // overflow keys — the bound has to hold on the client axis too.
+    // Rotating an unconfigured client id past the cap must NOT mint keys.
     for i in 0..50 {
         state.note_model_denied(&format!("evil-{i}"), "claude-x");
     }
+    // An already-tracked pair keeps its own key past the cap. Without the
+    // `contains_key` clause it would drain into overflow with the bound still
+    // satisfied — attribution lost, tests green.
+    state.note_model_denied("limited", "junk-model-0");
     let counts = state.model_denied.lock().unwrap();
     assert!(
-        counts.len() <= MAX_MODEL_DENIED_LABELS + 1,
+        counts.len() <= MAX_MODEL_DENIED_LABELS + state.clients.len() + 1,
         "label map grew unbounded: {} entries",
         counts.len()
     );
-    // Overflow denials are not dropped — they land in the ONE global bucket:
-    // 25 "limited" overflow models + 50 rotated clients.
+    assert_eq!(
+        counts.get(&("limited".to_string(), "junk-model-0".to_string())),
+        Some(&2),
+        "an already-tracked pair must keep incrementing its own key past the cap"
+    );
+    assert_eq!(
+        counts.get(&("limited".to_string(), "_other".to_string())),
+        Some(&25),
+        "a configured client's overflow must land in its own bucket"
+    );
     assert_eq!(
         counts.get(&("_other".to_string(), "_other".to_string())),
-        Some(&75),
-        "overflow must land in the global _other bucket, not be dropped"
+        Some(&50),
+        "unconfigured ids must share the global _other bucket, not be dropped"
+    );
+}
+
+/// A configured client can ASK for a model literally named `_other`. That
+/// denial must not alias the client's overflow bucket, or overflow counts are
+/// inflated and the client pre-empts its own first-overflow warn (LAB-4028).
+#[tokio::test]
+async fn model_denial_literal_other_model_does_not_alias_overflow_bucket() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    assert!(state
+        .pre_request_gate("-", "limited", "_other")
+        .await
+        .is_err());
+    for i in 0..(MAX_MODEL_DENIED_LABELS + 25) {
+        state.note_model_denied("limited", &format!("junk-model-{i}"));
+    }
+    assert!(state
+        .pre_request_gate("-", "limited", "_other")
+        .await
+        .is_err());
+
+    let counts = state.model_denied.lock().unwrap();
+    assert_eq!(
+        counts.get(&("limited".to_string(), "_other".to_string())),
+        Some(&26),
+        "overflow bucket must count overflow only: 1 literal + 63 junk fill the cap, 26 junk spill"
+    );
+    assert_eq!(
+        counts.get(&("limited".to_string(), "__other".to_string())),
+        Some(&2),
+        "a literal `_other` model must keep a label of its own"
     );
 }
 

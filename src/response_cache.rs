@@ -1028,32 +1028,48 @@ impl AppState {
     /// The model string is caller-controlled and bounded only by the request
     /// body cap, so it is truncated BEFORE becoming a map key: an untruncated
     /// label would be retained for the process lifetime and re-serialized into
-    /// the `/metrics` body on every scrape. Label COUNT is separately
-    /// hard-bounded at `MAX_MODEL_DENIED_LABELS` + 1: once the cap is
-    /// reached, every new pair lumps into a single global
-    /// `("_other", "_other")` bucket.
+    /// the `/metrics` body on every scrape.
     ///
-    /// Logs at `warn` the first time a (client, model) pair is denied and at
-    /// `debug` thereafter — a client hammering a denied model must not be able
-    /// to drive unbounded warn-level log volume. Pairs lumped into the
-    /// overflow bucket share its first-seen flag (deliberate: client-id
-    /// rotation must not mint warns). The counter still records every denial.
+    /// Label COUNT is hard-bounded at `MAX_MODEL_DENIED_LABELS` + N + 1 (N =
+    /// configured `[[clients]]`). Past the cap a new pair lumps into its
+    /// client's `("<client>", "_other")` bucket, so the denial stays
+    /// attributed and that client's first overflow denial still warns; a
+    /// client id NOT in `[[clients]]` lumps into the one global
+    /// `("_other", "_other")` bucket and can never mint a key.
+    ///
+    /// The client axis is config-bounded by reachability, not by the header
+    /// filter: this runs only when `client_allows_model` returned false, which
+    /// needs `client_id` to name a configured client. Under legacy
+    /// `proxy_key` / `allow_unauthenticated` there is no `[[clients]]` table,
+    /// so this is unreachable and the caller-controlled `x-client-id` never
+    /// touches this map. The global bucket is defence-in-depth for a future
+    /// caller that routes an unconfigured id here, not the close of a live
+    /// hole (LAB-2332, LAB-4028).
+    ///
+    /// Logs at `warn` the first time a key is minted and at `debug`
+    /// thereafter — a client hammering a denied model must not drive
+    /// unbounded warn-level log volume. The counter records every denial.
     /// Mirrors the once-per-model pattern used for unsupported-model
     /// warnings.
     pub(crate) fn note_model_denied(&self, client_id: &str, model: &str) {
         let model = truncate_label(model);
         let first_time = {
             let mut counts = lock_recovering(&self.model_denied, "model_denied");
-            let key = (client_id.to_owned(), model.clone());
+            // `_other` is the overflow sentinel below; a request for a model
+            // literally named that must not alias its client's bucket.
+            let model_label = if model == "_other" {
+                "__other".to_owned()
+            } else {
+                model.clone()
+            };
+            let key = (client_id.to_owned(), model_label);
             let label = if counts.len() < MAX_MODEL_DENIED_LABELS || counts.contains_key(&key) {
                 key
+            } else if self.clients.iter().any(|c| c.name == client_id) {
+                // Map full, pair new, client configured: its own bucket.
+                (client_id.to_owned(), "_other".to_owned())
             } else {
-                // Map full and this pair is new: lump into ONE global
-                // overflow bucket — hard bound of MAX_MODEL_DENIED_LABELS
-                // + 1 entries. A per-client ("<client>", "_other") key
-                // would let x-client-id rotation (legacy auth modes) grow
-                // the map without bound (expert-panel finding, LAB-2330;
-                // mirrored here by LAB-2332).
+                // Unconfigured id (unreachable today — see the fn doc).
                 ("_other".to_owned(), "_other".to_owned())
             };
             let entry = counts.entry(label).or_insert(0);
