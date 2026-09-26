@@ -398,7 +398,7 @@ can steer are locked down by default:
   `anthropic_beta_flag_dropped_total{flag}`. The built-in default covers the
   flags the proxy itself needs, the flag families Claude Code sends, and
   `fast-mode-*`; the authoritative list is `DEFAULT_CLIENT_BETA_ALLOWLIST`
-  in `src/main.rs`. Known body pairings — top-level ones degrade quietly
+  in `src/utilization.rs`. Known body pairings — top-level ones degrade quietly
   when their flag is dropped (next bullet); nested ones still `400`, which is
   why their flags stay on the default list:
   - `context-management-*` ↔ top-level `context_management`
