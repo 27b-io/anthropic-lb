@@ -785,7 +785,7 @@ impl AppState {
     }
 
     /// Gate an admin surface (`/_stats`, `/metrics`) behind an OPERATOR
-    /// principal (LAB-1192 AC-4). Returns the rejection response, or `None`
+    /// or ADMIN-READER principal (LAB-1192 AC-4, LAB-4395). Returns the rejection response, or `None`
     /// when the caller may proceed.
     ///
     /// Under `[[clients]]`: unauthenticated → 401, an authenticated principal

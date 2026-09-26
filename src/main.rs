@@ -431,32 +431,35 @@ fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
     // which promote it rather than disable it (see this function's doc):
     //   1. `readers` at the root — the pre-rename spelling, still the natural
     //      guess for anyone working from the original ticket.
-    //   2. `admin_readers` (or `readers`) written UNDER a `[[clients]]` or
-    //      `[[endpoints]]` header — TOML binds a bare key to the table above
-    //      it, so appending the line to the end of a config nests it. This is
-    //      the likelier mistake of the two: the spelling is right and the file
-    //      looks correct. Neither struct has such a field, so no false hits.
+    //   2. `admin_readers` (or `readers`) written under ANY table header —
+    //      TOML binds a bare key to the table above it, so appending the line
+    //      to the end of a config nests it. This is the likelier mistake: the
+    //      spelling is right and the file looks correct. The search walks
+    //      every depth rather than naming sections, because a hand-picked list
+    //      missed `[response_cache]` and `[clients.guard]`, whose structs also
+    //      drop unknown keys. No config struct has either field, so a hit is
+    //      always a misplacement; the name-keyed maps are skipped so a client
+    //      that happens to be called `readers` is not mistaken for one.
     if table.contains_key("readers") {
         return Err(
             "config: `readers` is not a config key — the read-only principal list is `admin_readers` (see README §Config Reference)"
                 .to_string(),
         );
     }
-    for section in ["clients", "endpoints"] {
-        let Some(entries) = table.get(section).and_then(|v| v.as_array()) else {
+    for (section, value) in table {
+        if [
+            "client_names",
+            "client_budgets",
+            "client_utilization_limits",
+        ]
+        .contains(&section.as_str())
+        {
             continue;
-        };
-        for entry in entries {
-            let Some(entry) = entry.as_table() else {
-                continue;
-            };
-            for key in ["admin_readers", "readers"] {
-                if entry.contains_key(key) {
-                    return Err(format!(
-                        "config: `{key}` found inside a [[{section}]] entry — it is a TOP-LEVEL key; a bare key after a [[{section}]] header binds to that entry and is silently dropped. Move `admin_readers` above the first [[{section}]] block (see README §Config Reference)"
-                    ));
-                }
-            }
+        }
+        if let Some(at) = nested_reader_key(value, section) {
+            return Err(format!(
+                "config: `{at}` — `admin_readers` is a TOP-LEVEL key; a bare key after a table header binds to that table and is silently dropped. Move `admin_readers` above the first [section] or [[section]] header (see README §Config Reference)"
+            ));
         }
     }
     // LAB-1083: `proxy_key` is the legacy single shared secret, `[[clients]]`
@@ -471,6 +474,26 @@ fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Path of the first `admin_readers` / `readers` key anywhere inside `value`,
+/// which is a root-level section named `path`. See `reject_legacy_config_keys`.
+fn nested_reader_key(value: &toml::Value, path: &str) -> Option<String> {
+    match value {
+        toml::Value::Table(t) => t.iter().find_map(|(k, v)| {
+            let here = format!("{path}.{k}");
+            if k == "admin_readers" || k == "readers" {
+                Some(here)
+            } else {
+                nested_reader_key(v, &here)
+            }
+        }),
+        toml::Value::Array(a) => a
+            .iter()
+            .enumerate()
+            .find_map(|(i, v)| nested_reader_key(v, &format!("{path}[{i}]"))),
+        _ => None,
+    }
 }
 
 #[tokio::main]
@@ -585,9 +608,10 @@ async fn main() {
         );
     }
 
-    // Operators gate /_stats + /metrics under [[clients]] (LAB-1192 AC-4). An
-    // empty operators list there means NO principal can read them — a silent
-    // way to blind a monitoring scrape. Warn so the omission is visible.
+    // Operators and admin readers gate /_stats + /metrics under [[clients]]
+    // (LAB-1192 AC-4, LAB-4395). Both lists empty there means NO principal can
+    // read them — a silent way to blind a monitoring scrape. Warn so the
+    // omission is visible.
     if !config.clients.is_empty() && config.operators.is_empty() && config.admin_readers.is_empty()
     {
         warn!(

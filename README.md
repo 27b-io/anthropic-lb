@@ -634,7 +634,7 @@ per-client counters.
 All endpoints are gated by `[[clients]]` (or legacy `proxy_key`) and
 `allowed_ips`. `/_stats` and `/metrics` are **operator- and reader-scoped**: under
 `[[clients]]` they require a credential whose name is in `operators` or `admin_readers`
-(401 unauthenticated / 403 non-operator — see §Security).
+(401 unauthenticated / 403 for any other client — see §Security).
 
 ### Session context-window visibility
 
