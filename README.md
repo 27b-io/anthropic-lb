@@ -762,10 +762,19 @@ gauge is `1`, the counter is the fleet-wide total read back from Redis, and
 every such replica reports the same value. Aggregate those with `max`, since
 `sum` multiplies the count by the number of replicas. Everywhere else the
 replica reports its own count: without Redis, before its first sync, or while
-Redis is unreachable. That count covers only the failures it has not yet added
-to the Redis total, all of them when Redis is not configured. Aggregate those
-with `sum`. During a partial outage the fleet total is the `max` over connected
-replicas plus the `sum` over the rest. The HELP text states this on the scrape.
+Redis is unreachable. Aggregate those with `sum`. Without Redis the count is
+every failure the replica has seen. With Redis it is the failures still to be
+flushed, and flushing is at-least-once: a batch whose Redis write fails is kept
+and sent again even if part of it was applied, so some of those failures can
+already be in the fleet total. During a partial outage, the `max` over connected
+replicas plus the `sum` over the rest is therefore an estimate that can
+over-count, not an exact total.
+
+A replica that changes scope also steps its series between the fleet total and
+its local count, which `rate()` and `increase()` read as a counter reset or a
+burst of new failures. Take rates from the fleet total (for example a recording
+rule over the `max` where the gauge is `1`), not from raw per-replica series.
+The HELP text states the scopes on the scrape.
 
 ### OpenAI JSON-mode compatibility
 
