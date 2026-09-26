@@ -8357,7 +8357,7 @@ async fn gate_rejection_counted_by_client_and_reason() {
 
     for expected in [1u64, 2] {
         let resp = state
-            .pre_request_gate("client-a", "claude-sonnet-4-6")
+            .pre_request_gate("-", "client-a", "claude-sonnet-4-6")
             .await
             .expect_err("exhausted budget must reject");
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
