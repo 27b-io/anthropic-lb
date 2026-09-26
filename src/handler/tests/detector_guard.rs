@@ -4,6 +4,7 @@
 
 use super::content_guard::{spawn_guard_body_upstream, TEST_ENDPOINT_TOKEN};
 use super::*;
+use crate::guard::detector::Lane;
 use crate::guard::{Detector, GuardPolicy};
 
 struct Rig {
@@ -81,17 +82,6 @@ fn detector(rig: &Rig) -> &Arc<Detector> {
     rig.state.guard.detector().expect("detector configured")
 }
 
-/// Wait for a background (`annotate`) classification to land.
-async fn wait_for_calls(mock: &MockDetector, n: usize) {
-    for _ in 0..100 {
-        if mock.calls() >= n {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("detector saw {} calls, expected {n}", mock.calls());
-}
-
 fn verdicts(rig: &Rig, client: &str, verdict: &str) -> u64 {
     detector(rig)
         .verdicts_snapshot()
@@ -124,8 +114,6 @@ async fn benign_and_injection_under_each_policy() {
         assert_eq!(resp.status(), 200);
         assert!(resp.headers().get("x-guard-findings").is_none());
         assert_eq!(rig.upstream_body.lock().await.as_slice(), bytes.as_slice());
-        let calls = rig.mock.calls();
-        wait_for_calls(&rig.mock, calls.max(1)).await;
         for _ in 0..100 {
             if verdicts(&rig, "annotate", verdict) == 1 {
                 break;
@@ -182,7 +170,7 @@ async fn block_fail_open_forwards_with_a_guard_unavailable_finding() {
 async fn block_waits_at_most_timeout_ms() {
     let rig = rig(|c| {
         c.fail_open = true;
-        c.chunk_tokens = 65;
+        c.chunk_tokens = 300;
     })
     .await;
     rig.mock.set_mode(MockDetectorMode::Hang);
@@ -222,7 +210,7 @@ async fn detector_downtime_mid_traffic() {
             200
         );
     }
-    assert!(!d.circuit_open());
+    assert!(!d.tripped(Lane::Enforce));
 
     rig.mock.set_mode(MockDetectorMode::Hang);
     let mut slow = 0;
@@ -244,8 +232,8 @@ async fn detector_downtime_mid_traffic() {
         slow <= 3,
         "{slow} block requests paid the timeout; at most 3 may"
     );
-    assert!(d.circuit_open());
-    assert!(d.short_circuited().0 > 0);
+    assert!(d.tripped(Lane::Enforce));
+    assert!(d.turned_away(Lane::Enforce).0 > 0);
 
     // Detector back: after the cooldown one request probes and closes it.
     rig.mock.set_mode(MockDetectorMode::Healthy);
@@ -254,7 +242,7 @@ async fn detector_downtime_mid_traffic() {
         send(&rig, "block-key", body("recovered")).await.status(),
         200
     );
-    assert!(!d.circuit_open(), "the breaker closes on its own");
+    assert!(!d.tripped(Lane::Enforce), "the breaker closes on its own");
 }
 
 #[tokio::test]
@@ -275,9 +263,10 @@ async fn detector_metrics_are_exported() {
         .unwrap();
     for needle in [
         r#"anthropic_guard_detector_errors_total{detector="pg2",kind="status"} 1"#,
-        r#"anthropic_guard_detector_circuit_open{detector="pg2"} 1"#,
-        r#"anthropic_guard_detector_short_circuited_total{detector="pg2",reason="circuit_open"} 1"#,
-        r#"anthropic_guard_detector_short_circuited_total{detector="pg2",reason="saturated"} 0"#,
+        r#"anthropic_guard_detector_circuit_open{detector="pg2",lane="block"} 1"#,
+        r#"anthropic_guard_detector_circuit_open{detector="pg2",lane="annotate"} 0"#,
+        r#"anthropic_guard_detector_short_circuited_total{detector="pg2",lane="block",reason="circuit_open"} 1"#,
+        r#"anthropic_guard_detector_short_circuited_total{detector="pg2",lane="block",reason="saturated"} 0"#,
         r#"anthropic_guard_detector_cache_lookups_total{detector="pg2",result="miss"} 3"#,
         r#"anthropic_guard_verdicts_total{client="block",scanner="pg2",verdict="allow"} 1"#,
         "anthropic_guard_detector_duration_seconds_count",

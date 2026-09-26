@@ -72,7 +72,7 @@ fn prom_header(buf: &mut String, name: &str, metric_type: &str, help: &str) {
 /// Emit one histogram's `_bucket` / `_sum` / `_count` series for a single
 /// label set. `series` is `(le, cumulative_count)` with `+Inf` last — the
 /// shape both `RequestDurationHist::snapshot` and the guard's
-/// `ScanHistogram::snapshot` produce. The family's `# HELP` / `# TYPE` header
+/// `DurationHistogram::snapshot` produce. The family's `# HELP` / `# TYPE` header
 /// is the caller's job: it must appear once even when the family has many
 /// label sets.
 fn prom_histogram(
@@ -1907,28 +1907,36 @@ pub(crate) async fn metrics_handler(
                 &mut buf,
                 "anthropic_guard_detector_circuit_open",
                 "gauge",
-                "1 while the detector circuit breaker is open or awaiting its recovery probe",
+                "1 while a lane's detector circuit breaker is open or awaiting its recovery probe",
             );
-            prom_gauge(
-                &mut buf,
-                "anthropic_guard_detector_circuit_open",
-                &detector,
-                if d.circuit_open() { 1.0 } else { 0.0 },
-            );
+            for lane in guard::detector::Lane::ALL {
+                prom_gauge(
+                    &mut buf,
+                    "anthropic_guard_detector_circuit_open",
+                    &[("detector", d.name()), ("lane", lane.label())],
+                    if d.tripped(lane) { 1.0 } else { 0.0 },
+                );
+            }
             prom_header(
                 &mut buf,
                 "anthropic_guard_detector_short_circuited_total",
                 "counter",
-                "Requests that took the fail_open path without a detector call, by reason (circuit_open/saturated)",
+                "Requests given no verdict without a detector call, by lane and reason (circuit_open/saturated)",
             );
-            let (open, saturated) = d.short_circuited();
-            for (reason, n) in [("circuit_open", open), ("saturated", saturated)] {
-                prom_counter(
-                    &mut buf,
-                    "anthropic_guard_detector_short_circuited_total",
-                    &[("detector", d.name()), ("reason", reason)],
-                    n,
-                );
+            for lane in guard::detector::Lane::ALL {
+                let (open, saturated) = d.turned_away(lane);
+                for (reason, n) in [("circuit_open", open), ("saturated", saturated)] {
+                    prom_counter(
+                        &mut buf,
+                        "anthropic_guard_detector_short_circuited_total",
+                        &[
+                            ("detector", d.name()),
+                            ("lane", lane.label()),
+                            ("reason", reason),
+                        ],
+                        n,
+                    );
+                }
             }
             let (hits, misses) = d.cache_snapshot();
             prom_header(

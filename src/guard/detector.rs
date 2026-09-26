@@ -21,10 +21,15 @@
 //! Failure (timeout, connect error, non-2xx, unreadable response) is fail-closed
 //! by default: under `block`, `fail_open = false` rejects with
 //! `guard_unavailable` and `fail_open = true` forwards with a `guard_unavailable`
-//! finding. A per-detector circuit breaker — the same [`Breaker`] the upstream
-//! transport path uses — stops a dead or saturated detector from costing every
-//! request a full timeout: once open, requests take their failure path
-//! immediately.
+//! finding. A circuit breaker — the same [`Breaker`] the upstream transport
+//! path uses — stops a dead or saturated detector from costing every request a
+//! full timeout: once open, requests take their failure path immediately.
+//!
+//! The two policies are separate [`Lane`]s, each with its own breaker and
+//! in-flight cap. Shadow traffic is every unconfigured client and is free to
+//! send, so if it shared admission with `block` it could fill the slots, or
+//! time the breaker open, and turn a healthy detector into `503`s for the
+//! clients that enforce.
 //!
 //! Wire format: TEI `POST /predict` with a nested-list batch. The FMS Detector
 //! API (`/api/v1/text/contents`) is the contract this is meant to converge on;
@@ -42,7 +47,7 @@ use futures_util::future::join_all;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use super::{detections_summary, Finding, GuardPolicy, ScanHistogram, VerdictCounts};
+use super::{detections_summary, DurationHistogram, Finding, GuardPolicy, VerdictCounts};
 use crate::breaker::Breaker;
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 2000;
@@ -52,18 +57,12 @@ pub const DEFAULT_CACHE_SIZE: u64 = 10_000;
 pub const DEFAULT_BREAKER_THRESHOLD: u32 = crate::utilization::TRANSPORT_FAILURE_THRESHOLD;
 pub const DEFAULT_BREAKER_COOLDOWN_SECS: u64 = 30;
 
-/// Overlap between consecutive chunks, so an injection straddling a boundary
-/// is whole in at least one chunk.
-const OVERLAP_TOKENS: usize = 32;
-/// The proxy has no tokenizer, so chunks are sized in bytes, and a chunk that
-/// overflows the model's window is truncated by the sidecar — its tail is
-/// never classified. Measured on Prompt Guard 2's tokenizer, a 1024-byte slice
-/// is ~285 tokens of English, ~300 of Rust, ~450-520 of JSON, ~270 of CJK and
-/// ~760 of base64; at three bytes per token (1536 bytes) JSON reached ~680 and
-/// lost a quarter of every chunk. JSON tool results are the likeliest carrier
-/// of an indirect injection, so two bytes per token: nothing but encoded blobs
-/// overflows, at the cost of ~1.5x the chunks prose would need.
-const BYTES_PER_TOKEN: usize = 2;
+/// Bytes of overlap between consecutive chunks, so an injection straddling a
+/// boundary is whole in at least one chunk: ~32 tokens of prose, the language
+/// an injection is written in.
+const OVERLAP_BYTES: usize = 128;
+/// `[CLS]` and `[SEP]`, which the sidecar adds to every input.
+const SPECIAL_TOKENS: usize = 2;
 /// TEI's default `--max-client-batch-size`. Larger inputs split into several
 /// batches, issued concurrently.
 const MAX_BATCH: usize = 32;
@@ -72,8 +71,13 @@ const MAX_BATCH: usize = 32;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Labels that mean "nothing found". Every other label at or above `threshold`
 /// is a finding. Covers Prompt Guard 2 (`BENIGN`/`MALICIOUS`) and ProtectAI's
-/// DeBERTa (`SAFE`/`INJECTION`) without a per-model knob.
+/// DeBERTa (`SAFE`/`INJECTION`) without a per-model knob. A model that labels
+/// its classes anything else (`LABEL_0`) flags everything: loud in shadow mode,
+/// and the fail-closed direction under `block`.
 const BENIGN_LABELS: [&str; 2] = ["BENIGN", "SAFE"];
+/// Labels become finding labels, log fields and cache entries, so a sidecar
+/// cannot hand the proxy an arbitrary string for any of them.
+const MAX_LABEL_BYTES: usize = 64;
 /// Finding label for "the detector gave no verdict", and the `error.type` of
 /// the 503 a `fail_open = false` block client receives.
 pub const GUARD_UNAVAILABLE: &str = "guard_unavailable";
@@ -111,17 +115,18 @@ pub struct DetectorConfig {
     /// reject with 503 (false) when the detector gives no verdict.
     #[serde(default)]
     pub fail_open: bool,
-    /// Chunk size in model tokens (approximated in bytes, see `BYTES_PER_TOKEN`).
+    /// The model's input window in tokens; chunks are sized so they always fit
+    /// (see `Detector::new`).
     #[serde(default = "default_chunk_tokens")]
     pub chunk_tokens: usize,
     /// Verdict memo entries, keyed by chunk digest. 0 disables the cache.
     #[serde(default = "default_cache_size")]
     pub cache_size: u64,
-    /// Consecutive failed requests before the breaker opens. Also the cap on
-    /// detector calls in flight at once (see `Detector::admit`).
+    /// Consecutive failed requests before a lane's breaker opens. Also each
+    /// lane's cap on detector calls in flight at once (see `Detector::admit`).
     #[serde(default = "default_breaker_threshold")]
     pub breaker_threshold: u32,
-    /// How long the breaker stays open before one probe is let through.
+    /// How long a lane's breaker stays open before one probe is let through.
     #[serde(default = "default_breaker_cooldown_secs")]
     pub breaker_cooldown_secs: u64,
 }
@@ -206,37 +211,58 @@ pub enum Unavailable {
     Failed(ErrorKind),
 }
 
-impl Unavailable {
-    fn label(self) -> &'static str {
-        match self {
-            Unavailable::CircuitOpen => "circuit_open",
-            Unavailable::Saturated => "saturated",
-            Unavailable::Failed(kind) => kind.label(),
-        }
-    }
-}
-
 /// The inline (`block`) outcome, for `guard_hook` to turn into a response.
 #[derive(Debug)]
 pub enum Enforced {
     Allow,
-    /// Forward, stamping this many findings: the one `guard_unavailable`
-    /// finding a `fail_open = true` client gets when there is no verdict.
-    Annotate(usize),
+    /// No verdict and `fail_open = true`: forward with one `guard_unavailable`
+    /// finding.
+    FailOpen,
     Block(Vec<Finding>),
     /// No verdict and `fail_open = false`.
     Unavailable,
 }
 
-/// Breaker plus the admission bookkeeping. One std mutex, never held across
-/// an await.
+/// Which admission lane a classification uses — one per policy that calls the
+/// detector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    /// `annotate`, in the background.
+    Shadow = 0,
+    /// `block`, inline.
+    Enforce = 1,
+}
+
+impl Lane {
+    pub const ALL: [Lane; 2] = [Lane::Shadow, Lane::Enforce];
+
+    /// The `lane` metric label: the policy the lane serves.
+    pub fn label(self) -> &'static str {
+        match self {
+            Lane::Shadow => "annotate",
+            Lane::Enforce => "block",
+        }
+    }
+}
+
+/// One lane's breaker and admission bookkeeping, plus counts of the requests
+/// it turned away without a call.
 #[derive(Default)]
-struct BreakerState {
+struct Gate {
+    state: Mutex<GateState>,
+    rejected_open: AtomicU64,
+    rejected_saturated: AtomicU64,
+}
+
+/// Behind one std mutex, never held across an await.
+#[derive(Default)]
+struct GateState {
     breaker: Breaker,
-    /// Set while a half-open probe is in flight, to its deadline. A probe whose
-    /// future was dropped (client disconnect under `block`) never records an
-    /// outcome, so the marker expires instead of wedging the breaker open.
-    probe_until: Option<Instant>,
+    /// A half-open probe is in flight. Cleared when its [`Permit`] drops,
+    /// which happens whether the probe finished, timed out, or had its future
+    /// dropped by a disconnecting `block` client — so the marker can neither
+    /// lapse early (letting a second probe in) nor wedge the lane open.
+    probe_in_flight: bool,
     /// Bumped on every OPEN and CLOSED transition. A call's outcome only
     /// counts against the era it was admitted in: a slow call admitted while
     /// closed must not close a breaker that has since opened, nor re-open one
@@ -246,18 +272,21 @@ struct BreakerState {
     in_flight: u32,
 }
 
-/// One admitted detector call. Dropping it releases the in-flight slot, so a
-/// call whose future is dropped mid-flight still gives its slot back.
+/// One admitted detector call. Dropping it releases the in-flight slot (and
+/// the probe marker, for a probe) on every path out of the call.
 struct Permit<'a> {
-    detector: &'a Detector,
+    gate: &'a Gate,
     era: u64,
     probe: bool,
 }
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        let mut s = crate::lock_recovering(&self.detector.breaker, "guard_detector_breaker");
+        let mut s = crate::lock_recovering(&self.gate.state, "guard_detector_gate");
         s.in_flight = s.in_flight.saturating_sub(1);
+        if self.probe {
+            s.probe_in_flight = false;
+        }
     }
 }
 
@@ -271,19 +300,17 @@ pub struct Detector {
     threshold: f64,
     fail_open: bool,
     chunk_bytes: usize,
-    overlap_bytes: usize,
     /// Chunk digest → labels at or above threshold (empty = benign). Holds no
     /// request text.
     cache: moka::sync::Cache<[u8; 32], Arc<[Box<str>]>>,
-    breaker: Mutex<BreakerState>,
+    /// Indexed by [`Lane`].
+    lanes: [Gate; 2],
     breaker_threshold: u32,
     cooldown: Duration,
     errors: [AtomicU64; ErrorKind::ALL.len()],
-    short_circuited: AtomicU64,
-    saturated: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
-    duration: ScanHistogram,
+    duration: DurationHistogram,
     verdicts: VerdictCounts,
 }
 
@@ -318,10 +345,19 @@ impl Detector {
         if !(cfg.threshold > 0.0 && cfg.threshold <= 1.0) {
             return Err(bad("threshold must be in (0, 1]".to_string()));
         }
-        if cfg.chunk_tokens <= 2 * OVERLAP_TOKENS {
+        // Chunks are sized in bytes (the proxy has no tokenizer), and Prompt
+        // Guard 2's tokenizer yields at most one token per byte: the measured
+        // worst case is punctuation, 510 bytes to 512 tokens. So a chunk of
+        // `chunk_tokens - 2` bytes always fits the window. Estimating from
+        // typical density instead (a couple of bytes per token) let dense
+        // content overflow, and the sidecar truncated the tail — which, in a
+        // tool result, the attacker writes. Requests are sent with
+        // `truncate: false`, so a tokenizer that breaks the bound fails the
+        // call instead of dropping text.
+        if cfg.chunk_tokens <= SPECIAL_TOKENS + 2 * OVERLAP_BYTES {
             return Err(bad(format!(
-                "chunk_tokens must be > {} (twice the {OVERLAP_TOKENS}-token overlap)",
-                2 * OVERLAP_TOKENS
+                "chunk_tokens must be > {}",
+                SPECIAL_TOKENS + 2 * OVERLAP_BYTES
             )));
         }
         if cfg.breaker_threshold == 0 {
@@ -347,18 +383,15 @@ impl Detector {
             timeout,
             threshold: cfg.threshold,
             fail_open: cfg.fail_open,
-            chunk_bytes: cfg.chunk_tokens * BYTES_PER_TOKEN,
-            overlap_bytes: OVERLAP_TOKENS * BYTES_PER_TOKEN,
+            chunk_bytes: cfg.chunk_tokens - SPECIAL_TOKENS,
             cache: moka::sync::Cache::new(cfg.cache_size),
-            breaker: Mutex::new(BreakerState::default()),
+            lanes: Default::default(),
             breaker_threshold: cfg.breaker_threshold,
             cooldown: Duration::from_secs(cfg.breaker_cooldown_secs),
             errors: Default::default(),
-            short_circuited: AtomicU64::new(0),
-            saturated: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
-            duration: ScanHistogram::new(DURATION_BUCKETS),
+            duration: DurationHistogram::new(DURATION_BUCKETS),
             verdicts: VerdictCounts::default(),
         })
     }
@@ -367,9 +400,10 @@ impl Detector {
         self.name
     }
 
-    /// Classify `text` for `client_id`, all chunks under one `timeout` deadline.
-    pub async fn classify(&self, client_id: &str, text: &str) -> Classified {
-        let chunks = chunk(text, self.chunk_bytes, self.overlap_bytes);
+    /// Classify `text` for `client_id` in `lane`, all chunks under one
+    /// `timeout` deadline.
+    pub async fn classify(&self, lane: Lane, client_id: &str, text: &str) -> Classified {
+        let chunks = chunk(text, self.chunk_bytes, OVERLAP_BYTES);
         let mut findings = Vec::new();
         let mut misses: Vec<(usize, &str, [u8; 32])> = Vec::new();
         for (start, piece) in chunks {
@@ -392,12 +426,13 @@ impl Detector {
                 unavailable: None,
             };
         }
-        let permit = match self.admit(Instant::now()) {
+        let permit = match self.admit(lane, Instant::now()) {
             Ok(permit) => permit,
             Err(unavailable) => {
+                let gate = self.gate(lane);
                 let counter = match unavailable {
-                    Unavailable::Saturated => &self.saturated,
-                    _ => &self.short_circuited,
+                    Unavailable::Saturated => &gate.rejected_saturated,
+                    _ => &gate.rejected_open,
                 };
                 counter.fetch_add(1, Ordering::Relaxed);
                 return Classified {
@@ -433,7 +468,7 @@ impl Detector {
                 failure
             }
         };
-        self.record_outcome(&permit, failure, Instant::now());
+        self.record_outcome(lane, &permit, failure, Instant::now());
         drop(permit);
         Classified {
             findings,
@@ -451,12 +486,31 @@ impl Detector {
             .json(&predict_request(&texts))
             .send()
             .await
-            .map_err(|e| ErrorKind::from_reqwest(&e))?;
-        if !resp.status().is_success() {
-            return Err(ErrorKind::Status);
+            .map_err(|e| self.call_failed(ErrorKind::from_reqwest(&e), &e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(self.call_failed(ErrorKind::Status, &status));
         }
-        let body = read_capped(resp, MAX_RESPONSE_BYTES).await?;
+        let body = read_capped(resp, MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|(kind, detail)| self.call_failed(kind, &detail))?;
         flagged_labels(&body, expected, self.threshold)
+            .map_err(|detail| self.call_failed(ErrorKind::Decode, &detail))
+    }
+
+    /// Log why one detector call failed — the HTTP status, the transport
+    /// error, what was wrong with the body — and return its kind. The metric
+    /// keeps only the kind; this line is what an operator debugs from. It
+    /// never carries request text, and the breaker bounds how often it fires
+    /// during an outage.
+    fn call_failed(&self, kind: ErrorKind, detail: &dyn std::fmt::Display) -> ErrorKind {
+        warn!(
+            detector = self.name,
+            kind = kind.label(),
+            error = %detail,
+            "guard detector call failed"
+        );
+        kind
     }
 
     fn push_findings(&self, out: &mut Vec<Finding>, start: usize, len: usize, labels: &[Box<str>]) {
@@ -479,23 +533,28 @@ impl Detector {
     /// classifier gains no throughput from concurrent requests (it queues
     /// them), so a request past the cap would mostly have waited in that
     /// queue anyway.
-    fn admit(&self, now: Instant) -> Result<Permit<'_>, Unavailable> {
-        let mut s = crate::lock_recovering(&self.breaker, "guard_detector_breaker");
+    fn gate(&self, lane: Lane) -> &Gate {
+        &self.lanes[lane as usize]
+    }
+
+    fn admit(&self, lane: Lane, now: Instant) -> Result<Permit<'_>, Unavailable> {
+        let gate = self.gate(lane);
+        let mut s = crate::lock_recovering(&gate.state, "guard_detector_gate");
         if s.breaker.is_open(now) {
             return Err(Unavailable::CircuitOpen);
         }
         let probe = s.breaker.is_half_open(now);
         if probe {
-            if s.probe_until.is_some_and(|deadline| now < deadline) {
+            if s.probe_in_flight {
                 return Err(Unavailable::CircuitOpen);
             }
-            s.probe_until = Some(now + self.timeout);
+            s.probe_in_flight = true;
         } else if s.in_flight >= self.breaker_threshold {
             return Err(Unavailable::Saturated);
         }
         s.in_flight += 1;
         Ok(Permit {
-            detector: self,
+            gate,
             era: s.era,
             probe,
         })
@@ -509,16 +568,19 @@ impl Detector {
     ///
     /// An outcome from an earlier era is counted in the error metric and
     /// otherwise ignored; see `BreakerState::era`.
-    fn record_outcome(&self, permit: &Permit<'_>, failure: Option<ErrorKind>, now: Instant) {
+    fn record_outcome(
+        &self,
+        lane: Lane,
+        permit: &Permit<'_>,
+        failure: Option<ErrorKind>,
+        now: Instant,
+    ) {
         if let Some(kind) = failure {
             self.errors[kind as usize].fetch_add(1, Ordering::Relaxed);
         }
-        let mut s = crate::lock_recovering(&self.breaker, "guard_detector_breaker");
+        let mut s = crate::lock_recovering(&permit.gate.state, "guard_detector_gate");
         if permit.era != s.era {
             return;
-        }
-        if permit.probe {
-            s.probe_until = None;
         }
         match failure {
             None => {
@@ -526,6 +588,7 @@ impl Detector {
                     s.era += 1;
                     info!(
                         detector = self.name,
+                        lane = lane.label(),
                         "detector circuit-breaker CLOSED: detector recovered"
                     );
                 }
@@ -540,9 +603,11 @@ impl Detector {
                     s.era += 1;
                     warn!(
                         detector = self.name,
+                        lane = lane.label(),
                         consecutive_failures = s.breaker.consecutive_failures,
                         cooldown_secs = self.cooldown.as_secs(),
-                        "detector circuit-breaker OPEN: requests take the fail_open path without a call"
+                        fail_open = self.fail_open,
+                        "detector circuit-breaker OPEN: requests get no verdict, without a call, until a probe succeeds"
                     );
                 }
             }
@@ -554,14 +619,14 @@ impl Detector {
     pub fn shadow(self: &Arc<Self>, req_id: String, client_id: String, text: String) {
         let detector = Arc::clone(self);
         tokio::spawn(async move {
-            let classified = detector.classify(&client_id, &text).await;
+            let classified = detector.classify(Lane::Shadow, &client_id, &text).await;
             detector.report(&req_id, &client_id, GuardPolicy::Annotate, classified);
         });
     }
 
     /// `block`: classify inline and decide.
     pub async fn enforce(&self, req_id: &str, client_id: &str, text: &str) -> Enforced {
-        let classified = self.classify(client_id, text).await;
+        let classified = self.classify(Lane::Enforce, client_id, text).await;
         self.report(req_id, client_id, GuardPolicy::Block, classified)
     }
 
@@ -600,20 +665,20 @@ impl Detector {
         // per-request line would only flood the log for the length of an
         // outage or a burst.
         let outcome = if self.fail_open {
-            Enforced::Annotate(1)
+            Enforced::FailOpen
         } else {
             Enforced::Unavailable
         };
-        if let Unavailable::Failed(_) = unavailable {
+        if let Unavailable::Failed(kind) = unavailable {
             let verdict = match (enforcing, self.fail_open) {
                 (_, true) => "annotate",
                 (true, false) => "block",
                 (false, false) => "would-block",
             };
             if enforcing && !self.fail_open {
-                warn!(req_id, client_id = %client_id, verdict, reason = GUARD_UNAVAILABLE, cause = unavailable.label(), "guard detector");
+                warn!(req_id, client_id = %client_id, verdict, reason = GUARD_UNAVAILABLE, cause = kind.label(), "guard detector");
             } else {
-                info!(req_id, client_id = %client_id, verdict, reason = GUARD_UNAVAILABLE, cause = unavailable.label(), "guard detector");
+                info!(req_id, client_id = %client_id, verdict, reason = GUARD_UNAVAILABLE, cause = kind.label(), "guard detector");
             }
         }
         outcome
@@ -628,17 +693,20 @@ impl Detector {
             .collect()
     }
 
-    /// Requests turned away without a call: `(breaker open, saturated)`.
-    pub fn short_circuited(&self) -> (u64, u64) {
+    /// Requests `lane` turned away without a call: `(breaker open, saturated)`.
+    pub fn turned_away(&self, lane: Lane) -> (u64, u64) {
+        let gate = self.gate(lane);
         (
-            self.short_circuited.load(Ordering::Relaxed),
-            self.saturated.load(Ordering::Relaxed),
+            gate.rejected_open.load(Ordering::Relaxed),
+            gate.rejected_saturated.load(Ordering::Relaxed),
         )
     }
 
-    /// Open, or cooled down but not yet proven healthy by a probe.
-    pub fn circuit_open(&self) -> bool {
-        crate::lock_recovering(&self.breaker, "guard_detector_breaker")
+    /// `lane`'s breaker has opened and no probe has closed it yet: open, or
+    /// cooled down and awaiting its probe. Wider than `Breaker::is_open`,
+    /// which is false once the cooldown has run out.
+    pub fn tripped(&self, lane: Lane) -> bool {
+        crate::lock_recovering(&self.gate(lane).state, "guard_detector_gate")
             .breaker
             .open_until
             .is_some()
@@ -700,11 +768,12 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
 }
 
 /// TEI `/predict` request for a batch: each input is its own one-element list
-/// (a two-element list would be read as a sentence pair). `truncate` makes an
-/// over-long chunk lose its tail rather than fail the whole batch.
+/// (a two-element list would be read as a sentence pair). `truncate: false`
+/// overrides a server started with `--auto-truncate`: an over-long chunk fails
+/// the call (422) rather than being classified without its tail.
 fn predict_request(texts: &[&str]) -> serde_json::Value {
     let inputs: Vec<[&str; 1]> = texts.iter().map(|t| [*t]).collect();
-    serde_json::json!({ "inputs": inputs, "truncate": true })
+    serde_json::json!({ "inputs": inputs, "truncate": false })
 }
 
 #[derive(Deserialize)]
@@ -715,18 +784,32 @@ struct Prediction {
 
 /// Map a TEI batch response to, per chunk, the non-benign labels scoring at
 /// least `threshold`. A response whose shape or length does not match the
-/// request, or that labels some input with nothing, is `Decode` — a verdict
-/// for the wrong number of chunks is not a verdict.
+/// request, that labels some input with nothing, or that carries a label
+/// outside `MAX_LABEL_BYTES` of `[A-Za-z0-9_-]` is an error — a verdict for the
+/// wrong number of chunks is not a verdict. The error says what was wrong,
+/// never what the body held.
 fn flagged_labels(
     body: &[u8],
     expected: usize,
     threshold: f64,
-) -> Result<Vec<Arc<[Box<str>]>>, ErrorKind> {
+) -> Result<Vec<Arc<[Box<str>]>>, String> {
     let batch: Vec<Vec<Prediction>> =
-        serde_json::from_slice(body).map_err(|_| ErrorKind::Decode)?;
+        serde_json::from_slice(body).map_err(|e| format!("not a TEI batch response: {e}"))?;
+    if batch.len() != expected {
+        return Err(format!("{} predictions for {expected} inputs", batch.len()));
+    }
     // An input with no predictions at all would otherwise read as benign.
-    if batch.len() != expected || batch.iter().any(Vec::is_empty) {
-        return Err(ErrorKind::Decode);
+    if batch.iter().any(Vec::is_empty) {
+        return Err("an input has no predictions".to_string());
+    }
+    let valid = |l: &str| {
+        !l.is_empty()
+            && l.len() <= MAX_LABEL_BYTES
+            && l.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    if batch.iter().flatten().any(|p| !valid(&p.label)) {
+        return Err("a label is empty, too long, or not [A-Za-z0-9_-]".to_string());
     }
     Ok(batch
         .into_iter()
@@ -745,15 +828,18 @@ fn flagged_labels(
         .collect())
 }
 
-async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, ErrorKind> {
+async fn read_capped(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, (ErrorKind, String)> {
     let mut body = Vec::new();
     while let Some(bytes) = resp
         .chunk()
         .await
-        .map_err(|e| ErrorKind::from_reqwest(&e))?
+        .map_err(|e| (ErrorKind::from_reqwest(&e), e.to_string()))?
     {
         if body.len() + bytes.len() > cap {
-            return Err(ErrorKind::Decode);
+            return Err((ErrorKind::Decode, format!("response exceeds {cap} bytes")));
         }
         body.extend_from_slice(&bytes);
     }

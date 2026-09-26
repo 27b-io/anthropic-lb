@@ -621,9 +621,9 @@ url = "http://detector.internal:8080"   # the client POSTs to <url>/predict
 # timeout_ms = 2000            # ceiling for classifying one request, all chunks
 # threshold = 0.5              # minimum label score that counts as a finding
 # fail_open = false            # block clients only: see below
-# chunk_tokens = 512           # chunk size in model tokens (32-token overlap)
+# chunk_tokens = 512           # the model's input window, in tokens
 # cache_size = 10000           # verdicts memoized per chunk digest; 0 disables
-# breaker_threshold = 3        # failures that open the breaker; also the in-flight cap
+# breaker_threshold = 3        # failures that open a lane's breaker; also its in-flight cap
 # breaker_cooldown_secs = 30   # how long it stays open before one probe
 ```
 
@@ -645,9 +645,19 @@ How the detector runs depends on the client's policy:
 - `off` and operator clients — never sent.
 
 Any label other than `BENIGN` / `SAFE` that scores at least `threshold` is a
-finding. Text is chunked by bytes (the proxy has no tokenizer) at two bytes per
-token, which keeps dense content such as JSON inside the model's 512-token
-window; the sidecar truncates anything longer.
+finding. A response whose labels are empty, longer than 64 bytes, or outside
+`[A-Za-z0-9_-]` counts as an unreadable body.
+
+Text is chunked by bytes, because the proxy has no tokenizer. Each chunk is
+`chunk_tokens - 2` bytes, and consecutive chunks overlap by 128 bytes. The
+model's tokenizer yields at most one token per byte, so a chunk always fits the
+window with room for the two special tokens. Requests are sent with
+`truncate: false`, so an input that somehow exceeds the window fails the call
+rather than being classified without its tail.
+
+Only the Tier 0 scan window is classified: the newest user text and
+`tool_result` text blocks. Other block types, such as `document` or
+`search_result`, are not sent to the detector.
 
 **Failure is fail-closed by default.** A timeout, connection error, non-2xx
 response or unreadable body leaves the request without a verdict. Under
@@ -655,33 +665,42 @@ response or unreadable body leaves the request without a verdict. Under
 `guard_unavailable` (nothing is wrong with the request, so a client may retry);
 `fail_open = true` forwards it with one `guard_unavailable` finding counted in
 `X-Guard-Findings`. Under `annotate` nothing is rejected either way; the log
-line records `would-block` or `annotate` accordingly.
+line records `would-block` or `annotate` accordingly. Each failed call is also
+logged with its cause (HTTP status, transport error, or what was wrong with the
+body), never with request text.
 
-**Circuit breaker.** After `breaker_threshold` consecutive failed requests the
-breaker opens for `breaker_cooldown_secs`. While it is open no call is made and
-every request takes its failure path immediately. At most `breaker_threshold`
-detector calls are in flight at once; a request arriving while that many are
-outstanding takes its failure path immediately too (counted as `saturated`).
-Together these mean a detector outage costs at most `breaker_threshold`
-requests one `timeout_ms` each, even under a burst. The classifier gains no
-throughput from concurrent requests, so the cap mostly sheds work that would
-otherwise have queued; under `block` with `fail_open = false`, though, a burst
-of more than `breaker_threshold` long inputs returns `503` to the excess even
-while the detector is healthy, so raise `breaker_threshold` if that matters. Sustained timeouts
-from an overloaded detector count exactly like downtime. After the cooldown one
-request probes: success closes the breaker, failure re-opens it. Chunks already
-in the verdict cache are still answered while the breaker is open. The OPEN and
-CLOSED transitions are logged once each, and the breaker uses the same state
-machine as the upstream transport breaker.
+**Circuit breaker.** `annotate` and `block` traffic go through separate lanes,
+each with its own breaker and in-flight cap. Shadow traffic can therefore never
+open the breaker, or fill the slots, that `block` clients depend on.
+
+In each lane, after `breaker_threshold` consecutive failed requests the breaker
+opens for `breaker_cooldown_secs`. While it is open no call is made, and every
+request takes its failure path immediately. After the cooldown one request
+probes: success closes the breaker, failure re-opens it. Sustained timeouts from
+an overloaded detector count exactly like downtime. Chunks already in the
+verdict cache are still answered while the breaker is open. The OPEN and CLOSED
+transitions are logged once each, and the breaker uses the same state machine as
+the upstream transport breaker.
+
+At most `breaker_threshold` detector calls per lane are in flight at once. A
+request arriving while that many are outstanding takes its failure path
+immediately, and is counted as `saturated`. With the breaker, this means a
+detector outage costs each lane at most `breaker_threshold` requests one
+`timeout_ms` each, even under a burst. The classifier gains no throughput from
+concurrent requests, so the cap mostly sheds work that would otherwise have
+queued. The cost falls on `block` with `fail_open = false`: a burst of more than
+`breaker_threshold` concurrent inputs returns `503` to the excess even while the
+detector is healthy, and one `block` client's oversized inputs can open the
+lane's breaker for the others. Raise `breaker_threshold` if that matters.
 
 Size `timeout_ms` for the slowest input you need classified, not for a typical
-one. On CPU a classifier takes on the order of 100 ms per 512-token chunk for a
-small model and several times that for a larger one, and a full 32 KiB window is
-roughly 35 chunks. An input that cannot finish inside `timeout_ms` counts as a
-failure and feeds the breaker. For shadow-mode data gathering, where latency
-costs requests nothing, a generous value is safe. Treat `block` with
-`fail_open = false` as a commitment to the detector's availability, because
-every outage becomes a `503` for those clients.
+one. A full 32 KiB window is roughly 90 chunks. On CPU a small classifier takes
+a few seconds to get through them all, and a larger one several times that. An
+input that cannot finish inside `timeout_ms` counts as a failure and feeds the
+breaker. For shadow-mode data gathering, where latency costs requests nothing,
+a generous value is safe. Treat `block` with `fail_open = false` as a commitment
+to the detector's availability, because every outage becomes a `503` for those
+clients.
 
 ### Metrics
 
@@ -695,11 +714,11 @@ With a detector configured:
 
 - `anthropic_guard_detector_errors_total{detector, kind}` — requests that got no
   verdict, by `kind`: `timeout`, `connect`, `transport`, `status`, `decode`.
-- `anthropic_guard_detector_circuit_open{detector}` — gauge, 1 while the breaker
-  is open or awaiting its probe.
-- `anthropic_guard_detector_short_circuited_total{detector, reason}` — requests
-  that took the failure path without a call, by `reason`: `circuit_open` or
-  `saturated`.
+- `anthropic_guard_detector_circuit_open{detector, lane}` — gauge, 1 while that
+  lane's breaker is open or awaiting its probe. `lane` is `annotate` or `block`.
+- `anthropic_guard_detector_short_circuited_total{detector, lane, reason}` —
+  requests that took the failure path without a call, by `reason`:
+  `circuit_open` or `saturated`.
 - `anthropic_guard_detector_cache_lookups_total{detector, result}` — per-chunk
   verdict-cache lookups, `hit` or `miss`.
 - `anthropic_guard_detector_duration_seconds{detector}` — histogram of detector

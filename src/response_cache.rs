@@ -1041,9 +1041,10 @@ impl AppState {
             // Under `block`, Tier 0 either rejected above or found nothing, so
             // the detector's outcome is the whole answer.
             guard::GuardPolicy::Block => {
+                debug_assert!(tier0.is_none(), "evaluate never annotates under block");
                 match detector.enforce(req_id, client_id, input.text()).await {
-                    guard::detector::Enforced::Allow => Ok(tier0),
-                    guard::detector::Enforced::Annotate(n) => Ok(Some(tier0.unwrap_or(0) + n)),
+                    guard::detector::Enforced::Allow => Ok(None),
+                    guard::detector::Enforced::FailOpen => Ok(Some(1)),
                     guard::detector::Enforced::Block(findings) => Err(Box::new(
                         guard_blocked_response(&findings, guard::REASON_FLAGGED, openai_shape),
                     )),

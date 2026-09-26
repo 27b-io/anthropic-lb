@@ -871,7 +871,10 @@ pub(crate) async fn spawn_mock_detector() -> MockDetector {
                     .into_response()
             } else {
                 tokio::time::sleep(Duration::from_millis(m.delay_ms.load(Ordering::SeqCst))).await;
-                assert_eq!(body["truncate"], true, "client must ask TEI to truncate");
+                assert_eq!(
+                    body["truncate"], false,
+                    "an over-long chunk must fail, not lose its tail"
+                );
                 let out: Vec<serde_json::Value> = body["inputs"]
                     .as_array()
                     .expect("batched inputs")

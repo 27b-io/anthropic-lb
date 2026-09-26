@@ -560,7 +560,7 @@ const SCAN_DURATION_BUCKETS: &[f64] = &[
 /// A Prometheus-style histogram over durations, lock-free on the hot path.
 /// Per-bucket counts are non-cumulative here; `metrics_handler` cumulates them
 /// at scrape time into the `le`-labelled series Prometheus expects.
-pub struct ScanHistogram {
+pub struct DurationHistogram {
     /// Upper bucket edges in seconds, ascending.
     edges: &'static [f64],
     /// One counter per edge plus a trailing `+Inf` overflow bucket.
@@ -569,7 +569,7 @@ pub struct ScanHistogram {
     count: AtomicU64,
 }
 
-impl ScanHistogram {
+impl DurationHistogram {
     fn new(edges: &'static [f64]) -> Self {
         Self {
             edges,
@@ -662,7 +662,7 @@ pub struct Guard {
     /// that outlives the request.
     detector: Option<Arc<Detector>>,
     verdicts: VerdictCounts,
-    scan_hist: ScanHistogram,
+    scan_hist: DurationHistogram,
 }
 
 impl Guard {
@@ -690,7 +690,7 @@ impl Guard {
             scanners,
             detector,
             verdicts: VerdictCounts::default(),
-            scan_hist: ScanHistogram::new(SCAN_DURATION_BUCKETS),
+            scan_hist: DurationHistogram::new(SCAN_DURATION_BUCKETS),
         })
     }
 
@@ -718,7 +718,7 @@ impl Guard {
             scanners: Vec::new(),
             detector: None,
             verdicts: VerdictCounts::default(),
-            scan_hist: ScanHistogram::new(SCAN_DURATION_BUCKETS),
+            scan_hist: DurationHistogram::new(SCAN_DURATION_BUCKETS),
         }
     }
 
@@ -1142,7 +1142,7 @@ mod tests {
 
     #[test]
     fn histogram_cumulates_and_counts() {
-        let h = ScanHistogram::new(SCAN_DURATION_BUCKETS);
+        let h = DurationHistogram::new(SCAN_DURATION_BUCKETS);
         h.observe(std::time::Duration::from_micros(50)); // <=0.0001
         h.observe(std::time::Duration::from_micros(300)); // <=0.0005
         h.observe(std::time::Duration::from_millis(3)); // <=0.005
