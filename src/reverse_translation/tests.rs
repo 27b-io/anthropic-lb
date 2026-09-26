@@ -1296,6 +1296,135 @@ async fn openai_compat_translates_upstream_raw_error() {
     assert_eq!(body["error"]["type"], "api_error");
 }
 
+/// Find this test's own `proxied (openai-compat)` line (the only line
+/// carrying the client-id marker), then the one line with `message` and
+/// that line's `req_id`, and check it names the same `account`. Test states
+/// share `instance_id` 0, so the `req_id` alone is not unique across tests;
+/// the message narrows it.
+fn compat_log_line_for(output: &str, marker: &str, message: &str) -> String {
+    let proxied = output
+        .lines()
+        .find(|l| l.contains(marker) && l.contains("proxied (openai-compat)"))
+        .unwrap_or_else(|| panic!("no proxied line for {marker}"));
+    let field = |name: &str| {
+        proxied
+            .split_whitespace()
+            .find(|f| f.starts_with(name))
+            .unwrap_or_else(|| panic!("proxied line carries {name}"))
+            .to_owned()
+    };
+    let (req_id, account) = (field("req_id="), field("account="));
+    let mine: Vec<&str> = output
+        .lines()
+        .filter(|l| l.contains(message) && l.contains(&req_id))
+        .collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "expected one {message:?} line with {req_id}, got:\n{}",
+        mine.join("\n")
+    );
+    assert!(
+        mine[0].contains(&account),
+        "{message:?} line must name the request's {account}, got: {}",
+        mine[0]
+    );
+    mine[0].to_owned()
+}
+
+/// LAB-5313: a 2xx upstream body that isn't valid JSON is not a success.
+/// The compat path must return 502 with an OpenAI-shaped error rather than
+/// pass the untranslated bytes through under 200, and log the parse error
+/// with the request's `req_id` and endpoint.
+#[tokio::test]
+async fn openai_compat_non_json_2xx_body_returns_502() {
+    let buf = log_capture_buf();
+    let mock_app = Router::new().fallback(any(|_req: Request<Body>| async {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":"msg_truncated","content":[{"#))
+            .unwrap()
+    }));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+    let (app, _state) = test_openai_app(&format!("http://{mock_addr}"), None);
+    let addr = serve(app).await;
+
+    let marker = "lab5313-non-json-2xx-marker";
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("x-client-id", marker)
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"max_tokens":5}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(body["error"]["message"], "invalid upstream response");
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let line = compat_log_line_for(&output, marker, "upstream 2xx body is not valid JSON");
+    assert!(
+        line.contains(" ERROR ") && line.contains("error="),
+        "parse error must be logged with the endpoint and the error, got: {line}"
+    );
+}
+
+/// LAB-5313: a non-2xx upstream whose error body can't be read (here the
+/// connection drops short of `content-length`) logs the read error as a
+/// field, then carries on with an empty body.
+#[tokio::test]
+async fn openai_compat_error_body_read_failure_is_logged() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let buf = log_capture_buf();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut req = vec![0u8; 4096];
+        let _ = stream.read(&mut req).await;
+        // 422 is non-retryable, so the one response reaches the client.
+        let _ = stream
+            .write_all(b"HTTP/1.1 422 Unprocessable Entity\r\ncontent-length: 100\r\n\r\n{\"type\"")
+            .await;
+        let _ = stream.shutdown().await;
+    });
+    let (app, _state) = test_openai_app(&format!("http://{mock_addr}"), None);
+    let addr = serve(app).await;
+
+    let marker = "lab5313-error-body-read-marker";
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("x-client-id", marker)
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"max_tokens":5}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"]["message"], "",
+        "a failed read carries on with the empty body"
+    );
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let line = compat_log_line_for(&output, marker, "failed to read upstream error body");
+    assert!(
+        line.contains(" WARN ") && line.contains("error="),
+        "error-body read failure must be logged with the error as a field, got: {line}"
+    );
+}
+
 // ── Connection resilience: synthetic SSE error on upstream disconnect ──
 
 #[test]
