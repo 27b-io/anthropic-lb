@@ -193,6 +193,7 @@ token = "sk-ant-api03-..."
 | `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
 | `client_utilization_limits` | `{name: f64}` | `{}` | Per-client utilization ceiling (0.0–1.0) |
 | `operators` | `Vec<String>` | `[]` | Client IDs that bypass all enforcement |
+| `admin_readers` | `Vec<String>` | `[]` | Client IDs granted `/_stats` + `/metrics` and nothing else — every `/v1` surface answers 403. The role for a scrape or a dashboard. Requires `[[clients]]`; a name in both `admin_readers` and `operators` is a startup error |
 | `strategy` | `String` | `dynamic-capacity-v1` | Routing strategy (see note below) |
 | `emergency_threshold` | `f64` | `0.88` | Utilization threshold for emergency brake |
 | `redis_url` | `String?` | `None` | Redis/Valkey URL for distributed state |
@@ -288,7 +289,7 @@ Claude Code sends it as `x-api-key`; the proxy validates it and swaps in the rea
 > [!IMPORTANT]
 > With `[[clients]]` configured, **`x-client-id` and the `client_names` IP map are ignored entirely** — `client_id` comes from the verified credential. That is what makes per-client budgets, utilization ceilings, operator status, model allow-lists and response-cache tenancy enforceable rather than advisory: all five key on `client_id`.
 
-Keys are compared in constant time against the whole table. Startup rejects anything that would otherwise fail silently at runtime: duplicate names, duplicate keys, a name with stray whitespace, and any `client_budgets` / `client_utilization_limits` / `operators` / `[response_cache].clients` entry naming no configured client. That last class matters — an unknown client passes the budget and utilization checks, so a one-character typo would mean *unlimited* spend with no log line and no metric.
+Keys are compared in constant time against the whole table. Startup rejects anything that would otherwise fail silently at runtime: duplicate names, duplicate keys, a name with stray whitespace, and any `client_budgets` / `client_utilization_limits` / `operators` / `admin_readers` / `[response_cache].clients` entry naming no configured client. That last class matters — an unknown client passes the budget and utilization checks, so a one-character typo would mean *unlimited* spend with no log line and no metric.
 
 `[[clients]]` is also incompatible with `token = "passthrough"` endpoints, and that combination is rejected at startup. Passthrough forwards the caller's auth headers upstream untouched, but under `[[clients]]` those headers carry the caller's *proxy* credential — forwarding them would hand every client key to the upstream.
 
@@ -345,6 +346,7 @@ It **fails closed** on a model it cannot read. The proxy takes the model from th
 | **Per-client keys** | `[[clients]]` | Requires a per-client credential; identity = the credential (401) | **startup error** (unless `allow_unauthenticated`) |
 | **Proxy key** (legacy) | `proxy_key = "<64 hex>"` | Requires a single shared `x-api-key` (401) | **startup error** (unless `allow_unauthenticated`) |
 | **Admin surfaces** | `operators = ["ops"]` | `/_stats` + `/metrics` need an operator credential (401/403) | no one can read them under `[[clients]]` |
+| **Read-only principal** | `admin_readers = ["vmagent"]` | Same two surfaces, `/v1` answers 403 | scrapes need an operator key, which bypasses every limit |
 | **Failed-auth throttle** | `auth_failure_limit` / `auth_failure_window_secs` | Further invalid credentials get 429 + `retry-after` per client IP after repeated failures; valid credentials always pass | on (10 / 300s) |
 | **Trusted proxies** | `trusted_proxies = ["192.0.2.0/24"]` | Real client IP recovered from `x-forwarded-for` behind a listed LB | header ignored |
 | **Caller-identity privacy** | `forward_caller_identity = false` | Caller IP and `x-client-id`/`x-agent-id`/`x-session-id` headers dropped before the upstream request | **stripped** |
@@ -354,9 +356,11 @@ IP check runs first, then the credential check; failed credentials are subject t
 
 **TLS terminates at the ingress.** The proxy speaks plain HTTP and its container port must never be published directly to the internet — put it behind a TLS-terminating load balancer or ingress, list that LB in `trusted_proxies`, and let the ingress carry the certificate. Bearer credentials without TLS are credentials in cleartext.
 
-### Admin surfaces are operator-only
+### Admin surfaces are operator- and reader-only
 
-`/_stats` disclosures are a reconnaissance report for anyone planning to spend the pool: raw `client_id`s, agent/session prefixes, models, **endpoint account names**, token counts, per-account utilisation and budgets. So under `[[clients]]` both `/_stats` and `/metrics` answer only to a client named in `operators` — unauthenticated gets `401`, a valid non-operator credential gets `403`. Under legacy `proxy_key` the (single) key holder is the operator by construction. Under `allow_unauthenticated` both surfaces serve, and unauthenticated access logs at `warn` — rate-limited to once per route per 5 minutes, so the open posture stays visible without a per-scrape firehose.
+`/_stats` disclosures are a reconnaissance report for anyone planning to spend the pool: raw `client_id`s, agent/session prefixes, models, **endpoint account names**, token counts, per-account utilisation and budgets. So under `[[clients]]` both `/_stats` and `/metrics` answer only to a client named in `operators` or `admin_readers` — unauthenticated gets `401`, a valid credential in neither list gets `403`. Under legacy `proxy_key` the (single) key holder is the operator by construction. Under `allow_unauthenticated` both surfaces serve, and unauthenticated access logs at `warn` — rate-limited to once per route per 5 minutes, so the open posture stays visible without a per-scrape firehose.
+
+**Give a scrape `admin_readers`, not `operators`.** The two roles reach the same two surfaces, but `operators` also bypasses the model allow-list, the daily budget, the utilization ceiling and the emergency brake — so a monitoring credential handed out as an operator is unmetered authority to spend the pool, and any `client_budgets` entry written for that name is dead config the gate never reads. An `admin_readers` principal gets `403` on every `/v1` surface before endpoint selection, so it cannot reach an upstream at all. Use it for Prometheus/vmagent, uptime checks and Grafana datasources; keep `operators` for the human who genuinely needs the bypass. A name may appear in one list or the other, never both, and `admin_readers` requires `[[clients]]` — under legacy `proxy_key` there is no per-principal identity to scope, so configuring it is a startup error rather than a control that quietly does nothing.
 
 ### Real client IP behind a load balancer
 
@@ -630,8 +634,8 @@ per-client counters.
 | `/metrics` | GET | Prometheus-format metrics |
 
 All endpoints are gated by `[[clients]]` (or legacy `proxy_key`) and
-`allowed_ips`. `/_stats` and `/metrics` are **operator-scoped**: under
-`[[clients]]` they require a credential whose name is in `operators`
+`allowed_ips`. `/_stats` and `/metrics` are **operator- and reader-scoped**: under
+`[[clients]]` they require a credential whose name is in `operators` or `admin_readers`
 (401 unauthenticated / 403 non-operator — see §Security).
 
 ### Session context-window visibility

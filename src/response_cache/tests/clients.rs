@@ -251,7 +251,7 @@ fn client_allow_list_denies_an_unreadable_model() {
 async fn gate_denies_unreadable_model_for_restricted_client() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     let err = state
-        .pre_request_gate("limited", "")
+        .pre_request_gate("-", "limited", "")
         .await
         .expect_err("unknown model must be denied for a restricted client");
     assert_eq!(err.status(), StatusCode::FORBIDDEN);
@@ -311,7 +311,7 @@ async fn denied_model_response_body_is_truncated() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     let huge = "z".repeat(100_000);
     let err = state
-        .pre_request_gate("limited", &huge)
+        .pre_request_gate("-", "limited", &huge)
         .await
         .expect_err("oversized model must be denied");
     let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
@@ -340,12 +340,12 @@ async fn model_denial_increments_counter_per_client_and_model() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     for _ in 0..3 {
         assert!(state
-            .pre_request_gate("limited", "claude-opus-5")
+            .pre_request_gate("-", "limited", "claude-opus-5")
             .await
             .is_err());
     }
     assert!(state
-        .pre_request_gate("limited", "claude-fable-5")
+        .pre_request_gate("-", "limited", "claude-fable-5")
         .await
         .is_err());
 
@@ -406,11 +406,17 @@ fn model_denial_labels_are_bounded_by_other_overflow() {
 #[tokio::test]
 async fn model_denial_literal_other_model_does_not_alias_overflow_bucket() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
-    assert!(state.pre_request_gate("limited", "_other").await.is_err());
+    assert!(state
+        .pre_request_gate("-", "limited", "_other")
+        .await
+        .is_err());
     for i in 0..(MAX_MODEL_DENIED_LABELS + 25) {
         state.note_model_denied("limited", &format!("junk-model-{i}"));
     }
-    assert!(state.pre_request_gate("limited", "_other").await.is_err());
+    assert!(state
+        .pre_request_gate("-", "limited", "_other")
+        .await
+        .is_err());
 
     let counts = state.model_denied.lock().unwrap();
     assert_eq!(
@@ -610,7 +616,7 @@ async fn metrics_exposes_the_model_denial_counter() {
     });
     let app = build_router(state.clone());
     assert!(state
-        .pre_request_gate("limited", "claude-opus-5")
+        .pre_request_gate("-", "limited", "claude-opus-5")
         .await
         .is_err());
 

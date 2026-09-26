@@ -608,6 +608,9 @@ pub(crate) struct AppState {
     pub(crate) client_utilization_limits: HashMap<String, f64>,
     /// Operator client IDs — never throttled by budgets, ceilings, or emergency brake.
     pub(crate) operators: Vec<String>,
+    /// Read-only client IDs — `/_stats` + `/metrics` only, 403 on every `/v1`
+    /// surface. Disjoint from `operators`; the overlap is a boot error.
+    pub(crate) admin_readers: Vec<String>,
     /// Whether the emergency brake is enabled. Default: true.
     pub(crate) emergency_brake: bool,
     /// Emergency brake threshold. Default: 0.88.

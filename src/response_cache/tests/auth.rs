@@ -328,7 +328,8 @@ fn xff_multiple_headers_are_one_logical_list_walked_from_the_right() {
 
 // ── AC-6: admin surfaces × {unauthenticated, non-operator, operator} ──
 
-/// `[[clients]]` app with an operator and a plain client, both surfaces.
+/// `[[clients]]` app with all three principal classes: an operator, a
+/// read-only principal (LAB-4395) and a plain client.
 fn admin_matrix_app(upstream_url: &str) -> (Router, Arc<AppState>) {
     let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
     acct.base_url = upstream_url.to_string();
@@ -336,9 +337,11 @@ fn admin_matrix_app(upstream_url: &str) -> (Router, Arc<AppState>) {
         endpoints: vec![acct],
         clients: vec![
             mk_client("ops", "key-ops", &[]),
+            mk_client("viewer", "key-view", &[]),
             mk_client("geo", "key-geo", &[]),
         ],
         operators: vec!["ops".to_string()],
+        admin_readers: vec!["viewer".to_string()],
         ..test_state_base()
     });
     (build_router(state.clone()), state)
@@ -387,6 +390,234 @@ async fn admin_surfaces_gate_by_operator_principal() {
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK, "{path} operator");
     }
+}
+
+// ── LAB-4395: the read-only principal — read surfaces yes, proxy no ──
+
+/// AC-1, read half: a `admin_readers` principal is admitted to both admin surfaces,
+/// exactly like an operator. The test above stays the proof that the other two
+/// classes did not move.
+#[tokio::test]
+async fn read_only_principal_reaches_the_admin_surfaces() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = admin_matrix_app(&mock_url);
+    let addr = serve(app).await;
+    let client = Client::new();
+
+    for path in ["/_stats", "/metrics"] {
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .header("x-api-key", "key-view")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "{path} read-only principal"
+        );
+    }
+}
+
+/// GH #199 / LAB-4395, found by adversarial review 2026-09-21: the refusal
+/// must happen BEFORE the request-body admission reservation, not after.
+///
+/// Refused after admission, this role was a service-wide denial primitive. Six
+/// reader connections declaring 25 MiB bodies and sending ONE BYTE each
+/// reserved the entire 128 MiB budget on declared `content-length` alone;
+/// unrelated clients then got `503` without reaching an upstream, the readers
+/// got `408` rather than `403` when the read timed out, and the whole thing
+/// was repeatable the instant the timeout released. Removing spend authority
+/// does not make a widely-distributed credential safe if it still controls
+/// admission capacity for everyone else.
+///
+/// The load-bearing assertion is the LAST block, not the first. Six readers
+/// getting `403` shows only that they get `403` — under a 128 MiB budget every
+/// declaration clamps to at most `MAX_REQUEST_BODY_BYTES` (25 MiB) and is
+/// admitted either way, so that block cannot distinguish the orderings, and
+/// nor can sampling `inflight_body_bytes` after the connections are answered
+/// (it proves released, not never-taken). The third block is the proof: a
+/// 1 MiB budget with a declared 4 MiB survives the clamp and cannot be
+/// admitted, so reservation-first answers `503` and identity-first answers
+/// `403`. Re-verification caught the earlier version asserting the property it
+/// did not test: moving the refusal to just below the reservation passed the
+/// whole suite. If you weaken this block, re-run that mutation.
+#[tokio::test]
+async fn read_only_principal_is_refused_before_it_can_reserve_body_budget() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for path in ["/v1/messages", "/v1/chat/completions"] {
+        let (url, hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+        let state = Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
+            clients: vec![
+                mk_client("viewer", "key-view", &[]),
+                mk_client("ops", "key-ops", &[]),
+            ],
+            admin_readers: vec!["viewer".to_string()],
+            operators: vec!["ops".to_string()],
+            max_inflight_body_bytes: 128 * 1024 * 1024,
+            body_read_timeout: Duration::from_secs(2),
+            ..test_state_base()
+        });
+        let addr = serve(build_router(state.clone())).await;
+        let legit = r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+
+        // Six connections that would have pinned the whole budget. Each sends
+        // one byte, so anything read from them is a response to the headers.
+        let mut sockets = Vec::new();
+        for mb in [25, 25, 25, 25, 25, 3] {
+            let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nx-api-key: key-view\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{{",
+                mb * 1024 * 1024
+            );
+            socket.write_all(req.as_bytes()).await.unwrap();
+            sockets.push(socket);
+        }
+
+        for mut socket in sockets {
+            let mut buf = [0; 1024];
+            let n = tokio::time::timeout(Duration::from_secs(4), socket.read(&mut buf))
+                .await
+                .expect("a refused reader must be answered, not left to time out")
+                .unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                head.starts_with("HTTP/1.1 403"),
+                "{path}: reader must get 403 on identity, not 408/503 after admission: {}",
+                head.lines().next().unwrap_or_default()
+            );
+        }
+        assert_eq!(
+            state.inflight_body_bytes.load(Ordering::Acquire),
+            0,
+            "{path}: a refused reader must never hold body budget"
+        );
+
+        // The ordering proof, on its own server with a budget SMALLER than
+        // the clamp. `reserve_request_body` clamps to
+        // `min(content_length, MAX_REQUEST_BODY_BYTES)` = at most 25 MiB, so
+        // against the 128 MiB budget above NO declaration can ever be shed —
+        // asserting 403 there proves only that a reader gets 403, under
+        // either ordering. A 1 MiB budget with a declared 4 MiB clamps to
+        // 4 MiB, which cannot be admitted: reservation-first answers 503,
+        // identity-first answers 403. That difference is the whole property.
+        let tight = Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
+            clients: vec![mk_client("viewer", "key-view", &[])],
+            admin_readers: vec!["viewer".to_string()],
+            max_inflight_body_bytes: 1024 * 1024,
+            ..test_state_base()
+        });
+        let tight_addr = serve(build_router(tight)).await;
+        let mut socket = tokio::net::TcpStream::connect(tight_addr).await.unwrap();
+        socket
+            .write_all(
+                format!(
+                    "POST {path} HTTP/1.1\r\nHost: localhost\r\nx-api-key: key-view\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{{",
+                    4 * 1024 * 1024u64
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(4), socket.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let head = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(
+            head.starts_with("HTTP/1.1 403"),
+            "{path}: a 503 here means the reader reached admission control before identity: {}",
+            head.lines().next().unwrap_or_default()
+        );
+
+        // …and an ordinary client is unaffected throughout. This probe stays
+        // on /v1/messages for both iterations deliberately: the body budget is
+        // global, so the second iteration — readers hammering the OpenAI
+        // surface — proves non-interference ACROSS handlers.
+        let resp = Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-api-key", "key-ops")
+            .body(legit)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "readers on {path} must not shed /v1/messages traffic"
+        );
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "readers on {path}: only the operator request reached the upstream"
+        );
+    }
+}
+
+/// AC-1, deny half: every proxied surface answers 403 — and the refusal is
+/// complete, not cosmetic. The upstream is a COUNTING one, so "no upstream
+/// call" is asserted rather than assumed, and the usage/budget maps must stay
+/// empty: a refused request that still books tokens would reintroduce the
+/// spend authority this role exists to remove.
+///
+/// These three paths stand in for the whole proxied surface: the router is
+/// `/_stats`, `/metrics`, `/v1/chat/completions` and a `.fallback(...)`
+/// catch-all, so `/v1/messages` and `/v1/models` both land in `proxy_handler`
+/// and both handlers reach the same `pre_request_gate`. Caveat: this asserts
+/// against `build_router` here, which hand-copies the table in `main()` — a
+/// route added to `main()` alone would not be covered until the two are one
+/// function (GH #198).
+#[tokio::test]
+async fn read_only_principal_is_refused_on_every_proxy_surface() {
+    let (url, hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
+        clients: vec![mk_client("viewer", "key-view", &[])],
+        admin_readers: vec!["viewer".to_string()],
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state.clone())).await;
+    let client = Client::new();
+    let body = r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    for (method, path) in [
+        ("POST", "/v1/messages"),
+        ("POST", "/v1/chat/completions"),
+        ("GET", "/v1/models"),
+    ] {
+        let req = if method == "POST" {
+            client
+                .post(format!("http://{addr}{path}"))
+                .header("content-type", "application/json")
+                .body(body)
+        } else {
+            client.get(format!("http://{addr}{path}"))
+        };
+        let resp = req.header("x-api-key", "key-view").send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "{method} {path} must refuse a read-only principal"
+        );
+    }
+
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a refused request must never reach the upstream"
+    );
+    assert!(
+        state.client_usage.lock().unwrap().is_empty(),
+        "a refused request must book no usage"
+    );
+    assert!(
+        state.budget_usage.lock().unwrap().is_empty(),
+        "a refused request must book no budget"
+    );
 }
 
 /// AC-5: under `allow_unauthenticated` (no credentials configured), both
