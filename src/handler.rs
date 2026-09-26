@@ -1062,7 +1062,7 @@ pub(crate) async fn forward_anthropic(
 
     if is_streaming {
         // Streaming: tee the byte stream to accumulate SSE text for usage extraction
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+        let (tx, body) = relay_channel();
         let state_clone = state.clone();
         // The detached task can't carry the `ep` borrow across the spawn
         // boundary; capture the Copy index and re-borrow from the owned `Arc`.
@@ -1083,7 +1083,7 @@ pub(crate) async fn forward_anthropic(
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {
                         scanner.push(&chunk);
-                        if tx.send(Ok(chunk)).await.is_err() {
+                        if !relay_send(&tx, chunk, &req_id_clone).await {
                             client_disconnected = true;
                             break;
                         }
@@ -1106,19 +1106,17 @@ pub(crate) async fn forward_anthropic(
                             break;
                         }
                         scanner.terminal.errored = true;
-                        if tx
-                            .send(Ok(anthropic_error_frame(&format!(
-                                "upstream stream interrupted: {e}"
-                            ))))
-                            .await
-                            .is_err()
-                        {
+                        let frame =
+                            anthropic_error_frame(&format!("upstream stream interrupted: {e}"));
+                        if !relay_send(&tx, frame, &req_id_clone).await {
                             client_disconnected = true;
                         }
                         break;
                     }
                 }
             }
+            // Release the upstream before recording usage.
+            drop(resp);
             // Record scanned usage. The detached task only holds a cloned
             // Arc<AppState>; re-index it to recover &Endpoint.
             let ep = &state_clone.endpoints[endpoint_idx];
@@ -1146,12 +1144,9 @@ pub(crate) async fn forward_anthropic(
             .await;
         });
 
-        let body_stream = ReceiverStream::new(rx);
-        let response = builder
-            .body(Body::from_stream(body_stream))
-            .unwrap_or_else(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-            });
+        let response = builder.body(body).unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+        });
         ForwardOutcome::Done(Box::new(response))
     } else {
         // Non-streaming: buffer, extract usage, forward.
