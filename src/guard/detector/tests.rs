@@ -652,7 +652,8 @@ fn decode_errors_never_quote_the_body() {
         serde_json::json!(ECHO),
         serde_json::json!([[ECHO]]),
         serde_json::json!([[{"label": "LABEL_1", "score": ECHO}]]),
-        serde_json::json!([[{"label": ECHO, "score": ECHO}]]),
+        // Decodes; rejected by label validation, whose error must not quote either.
+        serde_json::json!([[{"label": ECHO, "score": 0.99}]]),
     ] {
         let err = flagged_labels(body.to_string().as_bytes(), 1, 0.5).unwrap_err();
         assert!(!err.contains(ECHO), "{err:?} quotes the body");
