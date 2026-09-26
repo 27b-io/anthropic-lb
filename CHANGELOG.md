@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.2.6](https://github.com/27b-io/anthropic-lb/compare/v0.2.5...v0.2.6) (2026-09-26)
+
+
+### Features
+
+* **auth:** attribute credential rejections beyond the client IP (LAB-4720) ([#208](https://github.com/27b-io/anthropic-lb/issues/208)) ([98b8618](https://github.com/27b-io/anthropic-lb/commit/98b8618b3c70cd31518dc8fda83b80f6b458dfcf))
+* **LAB-2551:** count pre-request-gate 429 rejections by client and reason ([#150](https://github.com/27b-io/anthropic-lb/issues/150)) ([b847800](https://github.com/27b-io/anthropic-lb/commit/b847800f62746a093596c9e16dfd8127fc11c5c0))
+* **LAB-4189:** export per-claim rate-limit status, reset, and pool-exhaustion count ([#191](https://github.com/27b-io/anthropic-lb/issues/191)) ([9c0d22b](https://github.com/27b-io/anthropic-lb/commit/9c0d22b9aa2d8027cde27f1be250da48118a3e33))
+* **LAB-4379:** export request latency, process start time and build identity on /metrics ([#195](https://github.com/27b-io/anthropic-lb/issues/195)) ([a334cb3](https://github.com/27b-io/anthropic-lb/commit/a334cb3f17be639ff2c3feb997cc115b68b0b8af))
+* **LAB-4395:** add a read-only principal for /_stats and /metrics ([#196](https://github.com/27b-io/anthropic-lb/issues/196)) ([a8d394c](https://github.com/27b-io/anthropic-lb/commit/a8d394c6dc11d52ef7e96091c0e81240a04a256b))
+* **openai-compat:** translate reasoning_effort to output_config.effort (LAB-5121) ([#213](https://github.com/27b-io/anthropic-lb/issues/213)) ([6433f77](https://github.com/27b-io/anthropic-lb/commit/6433f773c56fd0d6dd4f39c8aba817362c22b2ae))
+
+
+### Bug Fixes
+
+* **beta:** strip orphaned body fields when the beta allow-list drops a flag (LAB-1261) ([#192](https://github.com/27b-io/anthropic-lb/issues/192)) ([c091990](https://github.com/27b-io/anthropic-lb/commit/c091990ab5ceeec814d04012aaa9a3ac14290e4d))
+* **budget:** recover poisoned budget_usage lock instead of failing open (LAB-4315) ([#216](https://github.com/27b-io/anthropic-lb/issues/216)) ([6cac7f3](https://github.com/27b-io/anthropic-lb/commit/6cac7f3a4eb8079f0741eeb8ed8516bb0c36309e))
+* **config:** reject admin_readers nested under any table (LAB-4395) ([#229](https://github.com/27b-io/anthropic-lb/issues/229)) ([842eebc](https://github.com/27b-io/anthropic-lb/commit/842eebc3d6180dfada0373abd77ca6c5e1aea553))
+* **LAB-2299:** reserve the killable proxy's port so the revive bind cannot race ([#165](https://github.com/27b-io/anthropic-lb/issues/165)) ([e9824c9](https://github.com/27b-io/anthropic-lb/commit/e9824c93ad95030e5991438589dfcf36c385de88))
+* **LAB-3295:** status-floor-bound affinity migrations log at INFO, not WARN ([#175](https://github.com/27b-io/anthropic-lb/issues/175)) ([3931fac](https://github.com/27b-io/anthropic-lb/commit/3931fac66292b372d4e79e59d5c80040175b005b))
+* **LAB-3964:** allow the Claude Code per-turn beta family through the OAuth allow-list ([#186](https://github.com/27b-io/anthropic-lb/issues/186)) ([e84a44c](https://github.com/27b-io/anthropic-lb/commit/e84a44cc21c717bbb0e86efc82b2ee9ff3c68e6d))
+* **LAB-4031:** enforce single-terminator SSE invariant on all four stream loops ([#184](https://github.com/27b-io/anthropic-lb/issues/184)) ([e2bddb5](https://github.com/27b-io/anthropic-lb/commit/e2bddb5d4e7a6747472160c67390270e0b67a169))
+* **LAB-4127:** keep Claude Code attribution block first when injecting the OAuth prompt ([#188](https://github.com/27b-io/anthropic-lb/issues/188)) ([ebb5465](https://github.com/27b-io/anthropic-lb/commit/ebb546548a4e3a5fe3d0f2d3e2b5ed01c38ba89e))
+* **LAB-4322:** fail closed when OpenAI `messages` is not an array ([#194](https://github.com/27b-io/anthropic-lb/issues/194)) ([62c8a47](https://github.com/27b-io/anthropic-lb/commit/62c8a47604eb914a182854992b3436a7dec3eff1))
+* **LAB-4358:** fail closed on a `messages` the guard cannot read ([#205](https://github.com/27b-io/anthropic-lb/issues/205)) ([7b07f04](https://github.com/27b-io/anthropic-lb/commit/7b07f047f8f162f0aa12b75577363d412eae7205))
+* **LAB-4719:** sticky migration never lands on an account it would itself flee ([#207](https://github.com/27b-io/anthropic-lb/issues/207)) ([0716ba4](https://github.com/27b-io/anthropic-lb/commit/0716ba4c9d1eb585c71d69b5f16ae009aaee0192))
+* **LAB-4729:** re-send once on an upstream "out of extra usage" 400 ([#209](https://github.com/27b-io/anthropic-lb/issues/209)) ([6aa1685](https://github.com/27b-io/anthropic-lb/commit/6aa16859b573c62f69261b0447ab793fea365fb0))
+* **LAB-4814:** give every redis_integration test its own logical DB ([#211](https://github.com/27b-io/anthropic-lb/issues/211)) ([5980076](https://github.com/27b-io/anthropic-lb/commit/59800769a7c1b16914f8eea6e78edab1ad65dc8a))
+* **LAB-5166:** recover poisoned std Mutex locks instead of skipping them ([#218](https://github.com/27b-io/anthropic-lb/issues/218)) ([68fbfd6](https://github.com/27b-io/anthropic-lb/commit/68fbfd6e2b3b7551086113769c5da47f91c0aac6))
+* **LAB-5235:** match the free-text model-rejection arm on OpenAI endpoints only ([#221](https://github.com/27b-io/anthropic-lb/issues/221)) ([097f264](https://github.com/27b-io/anthropic-lb/commit/097f264b73d7560c616116f1a685fc8d28051f9c))
+* **LAB-5250:** move coherent_body debug_assert to the non-OAuth arm ([#222](https://github.com/27b-io/anthropic-lb/issues/222)) ([7426d18](https://github.com/27b-io/anthropic-lb/commit/7426d18f39c6076805bd6d35117eba879c25fea3))
+* **LAB-5278:** stop echoed request keys from reading as account or model state ([#228](https://github.com/27b-io/anthropic-lb/issues/228)) ([4e7c484](https://github.com/27b-io/anthropic-lb/commit/4e7c484da5275b93c246ddac79f4f805eabe6c7d))
+* **LAB-5313:** report the real outcome on four swallowed error paths ([#226](https://github.com/27b-io/anthropic-lb/issues/226)) ([0f7551d](https://github.com/27b-io/anthropic-lb/commit/0f7551d81bf832912fcd9866384ea9a7aa5d4992))
+* **metrics:** publish the overage gate the router uses (LAB-4441) ([#206](https://github.com/27b-io/anthropic-lb/issues/206)) ([07160df](https://github.com/27b-io/anthropic-lb/commit/07160df62d582964d10949da2a16985d4ea388fd))
+* propagate in-band upstream SSE errors in OpenAI-compat translators (LAB-710) ([#136](https://github.com/27b-io/anthropic-lb/issues/136)) ([d07d1ad](https://github.com/27b-io/anthropic-lb/commit/d07d1ada98a61030af9c635c83dcb807b0cf31ac))
+* reflect upstream x-should-retry header (LAB-4128) ([#187](https://github.com/27b-io/anthropic-lb/issues/187)) ([4abe23b](https://github.com/27b-io/anthropic-lb/commit/4abe23b5b3e667047e87b2f7cb587d017de2218c))
+* reject non-object JSON bodies with a 400 instead of panicking (LAB-4314) ([#193](https://github.com/27b-io/anthropic-lb/issues/193)) ([6d88121](https://github.com/27b-io/anthropic-lb/commit/6d88121b05b5e1b5c05eaf4ce6e6432f120af0d6))
+* **routing:** stop re-sending applied transport-error counts on partial pipeline failure (LAB-5446) ([#233](https://github.com/27b-io/anthropic-lb/issues/233)) ([021c8ce](https://github.com/27b-io/anthropic-lb/commit/021c8ce05f59ed3ce6b3e2c05dcf8432014bc7e6))
+
 ## [0.2.5](https://github.com/27b-io/anthropic-lb/compare/v0.2.4...v0.2.5) (2026-09-19)
 
 
