@@ -888,7 +888,7 @@ pub(crate) async fn read_body_bounded(
     match result {
         Ok(b) => Ok(b),
         Err(e) => {
-            error!("failed to read request body: {e}");
+            error!(req_id, error = %e, "failed to read request body");
             Err(Box::new(
                 (StatusCode::BAD_REQUEST, "bad request body").into_response(),
             ))

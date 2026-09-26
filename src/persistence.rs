@@ -472,8 +472,12 @@ impl AppState {
     pub(crate) async fn load_state(&self) {
         let data = match tokio::fs::read_to_string(&self.state_path).await {
             Ok(d) => d,
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 info!(path = %self.state_path.display(), "no persisted state found, starting fresh");
+                return;
+            }
+            Err(e) => {
+                warn!(path = %self.state_path.display(), error = %e, "failed to read persisted state; starting fresh");
                 return;
             }
         };
