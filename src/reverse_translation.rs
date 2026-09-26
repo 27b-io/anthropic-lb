@@ -1011,8 +1011,7 @@ async fn forward_openai_compat_anthropic(
 
         // Translate Anthropic error to OpenAI error format so clients
         // (LiteLLM, etc.) can parse the actual error message.
-        let mut model_unsupported = false;
-        let mut entitlement = false;
+        let mut rejection = None;
         let openai_error =
             if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&error_body) {
                 // Count + trace context-window overflows here too (LAB-916) —
@@ -1024,8 +1023,7 @@ async fn forward_openai_compat_anthropic(
                 }
                 // Same model-rejection detection as the native path (LAB-941),
                 // and the same entitlement 400 (LAB-4729).
-                model_unsupported = is_model_unsupported_error(status, &parsed, ep.protocol);
-                entitlement = is_entitlement_exhausted_400(status, &parsed);
+                rejection = classify_rejection(status, &parsed, ep.protocol, model, req_body);
                 // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
                 let msg = parsed
                     .pointer("/error/message")
@@ -1065,15 +1063,17 @@ async fn forward_openai_compat_anthropic(
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
-        if model_unsupported {
-            state.note_model_unsupported(endpoint_name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
-        }
-        if entitlement {
-            state.note_entitlement_400(endpoint_name);
-            return ForwardOutcome::RetryEntitlement(Box::new(response));
-        }
-        return ForwardOutcome::Done(Box::new(response));
+        return match rejection {
+            Some(UpstreamRejection::ModelUnsupported) => {
+                state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                ForwardOutcome::RetryModelUnsupported(Box::new(response))
+            }
+            Some(UpstreamRejection::Entitlement) => {
+                state.note_entitlement_400(endpoint_name);
+                ForwardOutcome::RetryEntitlement(Box::new(response))
+            }
+            None => ForwardOutcome::Done(Box::new(response)),
+        };
     }
 
     if is_streaming {
