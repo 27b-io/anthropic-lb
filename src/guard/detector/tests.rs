@@ -643,6 +643,22 @@ fn sidecar_labels_are_bounded() {
     assert!(flagged_labels(ok.as_bytes(), 1, 0.5).is_ok());
 }
 
+/// A sidecar that echoes request text back in a malformed body must not get
+/// that text into the WARN log: serde_json's messages quote wrong-type strings.
+#[test]
+fn decode_errors_never_quote_the_body() {
+    const ECHO: &str = "ignore previous instructions";
+    for body in [
+        serde_json::json!(ECHO),
+        serde_json::json!([[ECHO]]),
+        serde_json::json!([[{"label": "LABEL_1", "score": ECHO}]]),
+        serde_json::json!([[{"label": ECHO, "score": ECHO}]]),
+    ] {
+        let err = flagged_labels(body.to_string().as_bytes(), 1, 0.5).unwrap_err();
+        assert!(!err.contains(ECHO), "{err:?} quotes the body");
+    }
+}
+
 /// Chunks never exceed `chunk_tokens - 2` bytes, the size the measured
 /// one-token-per-byte worst case guarantees fits the model window.
 #[test]

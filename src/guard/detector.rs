@@ -793,8 +793,16 @@ fn flagged_labels(
     expected: usize,
     threshold: f64,
 ) -> Result<Vec<Arc<[Box<str>]>>, String> {
-    let batch: Vec<Vec<Prediction>> =
-        serde_json::from_slice(body).map_err(|e| format!("not a TEI batch response: {e}"))?;
+    // Category and position only: serde_json's message quotes a wrong-type
+    // string, which from a sidecar echoing its input is request text.
+    let batch: Vec<Vec<Prediction>> = serde_json::from_slice(body).map_err(|e| {
+        format!(
+            "not a TEI batch response ({:?} error at line {} column {})",
+            e.classify(),
+            e.line(),
+            e.column()
+        )
+    })?;
     if batch.len() != expected {
         return Err(format!("{} predictions for {expected} inputs", batch.len()));
     }
