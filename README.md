@@ -172,7 +172,7 @@ token = "sk-ant-api03-..."
 | Field | Type | Default | Description |
 |:------|:-----|:--------|:------------|
 | `listen` | `String` | — | Bind address (e.g. `"127.0.0.1:8082"`) |
-| `rate_limit_cooldown_secs` | `u64` | `5` | Fallback cooldown after a capacity 429 when upstream sends no usable `retry-after` (burst 429s use their own 5→60s backoff) |
+| `rate_limit_cooldown_secs` | `u64` | `5` | Fallback cooldown after a capacity 429 when upstream sends no usable `retry-after` (burst 429s use their own 5→60s backoff). Must be `1..=86400`; a value outside it is rejected at startup |
 | `probe_interval_secs` | `u64` | `300` | Seconds between utilization probes (0 = disabled) |
 | `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id` |
 | `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`) |
@@ -636,7 +636,7 @@ per-client counters.
 All endpoints are gated by `[[clients]]` (or legacy `proxy_key`) and
 `allowed_ips`. `/_stats` and `/metrics` are **operator- and reader-scoped**: under
 `[[clients]]` they require a credential whose name is in `operators` or `admin_readers`
-(401 unauthenticated / 403 non-operator — see §Security).
+(401 unauthenticated / 403 for any other client — see §Security).
 
 ### Session context-window visibility
 
@@ -776,16 +776,30 @@ every such replica reports the same value. Aggregate those with `max`, since
 replica reports its own count: without Redis, before its first sync, or while
 Redis is unreachable. Aggregate those with `sum`. Without Redis the count is
 every failure the replica has seen. With Redis it is the failures still to be
-flushed, and flushing is at-least-once: a batch whose Redis write fails is kept
-and sent again even if part of it was applied, so some of those failures can
-already be in the fleet total. During a partial outage, the `max` over connected
-replicas plus the `sum` over the rest is therefore an estimate that can
-over-count, not an exact total.
+flushed. A flush reads Redis's reply to each command, so a count Redis applied
+is never sent again, and a count Redis rejected is kept for the next flush. Only
+when no reply arrives at all (a dropped connection or a timeout) is the whole
+batch kept and sent again, so after a lost reply some of those failures can
+already be in the fleet total. It can also under-count: if Redis rejects writes
+but still serves reads, the gauge stays `1` and that replica's kept failures
+appear in neither term. During a partial outage, the `max` over connected
+replicas plus the `sum` over the rest is therefore an estimate, not an exact
+total.
 
 A replica that changes scope also steps its series between the fleet total and
 its local count, which `rate()` and `increase()` read as a counter reset or a
-burst of new failures. Take rates from the fleet total (for example a recording
-rule over the `max` where the gauge is `1`), not from raw per-replica series.
+burst of new failures. Connected replicas also read the fleet total on their own
+5-second ticks, so a `max` taken before `rate()` falls back to an older reading
+when the freshest replica drops out, and `rate()` reads that as a reset too.
+Keep only fleet-scope readings, take the rate per replica, then take the `max`:
+
+```promql
+max by (kind) (
+  rate((anthropic_upstream_transport_errors_total
+    and on(instance) anthropic_cluster_redis_connected == 1)[5m:])
+)
+```
+
 The HELP text states the scopes on the scrape.
 
 ### OpenAI JSON-mode compatibility

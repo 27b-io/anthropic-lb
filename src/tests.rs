@@ -70,30 +70,50 @@ readers = ["grafana"]
     assert!(err.contains("`readers`"), "{err}");
     assert!(err.contains("`admin_readers`"), "{err}");
 
-    // 2. the right spelling under the wrong header. TOML binds a bare key to
-    //    the table above it, so this nests into the entry and serde drops it.
-    for section in ["clients", "endpoints"] {
-        let toml_str = format!(
-            r#"
-listen = "0.0.0.0:8080"
-
-[[{section}]]
-name = "grafana"
-key = "dummy-key"
-admin_readers = ["grafana"]
-"#
-        );
+    // 2. the right spelling under the wrong header, at any depth. TOML binds
+    //    a bare key to the table above it, so each of these nests the list
+    //    into that table and serde drops it there. `[response_cache]` and
+    //    `[clients.guard]` are the cases a hand-listed section scan missed.
+    let entry = "name = \"grafana\"\nkey = \"dummy-key\"\n";
+    for (header, body, path) in [
+        ("[[clients]]", entry, "clients[0].admin_readers"),
+        ("[[endpoints]]", entry, "endpoints[0].admin_readers"),
+        ("[response_cache]", "", "response_cache.admin_readers"),
+        (
+            "[[clients]]\nname = \"grafana\"\nkey = \"dummy-key\"\n\n[clients.guard]",
+            "",
+            "clients[0].guard.admin_readers",
+        ),
+    ] {
+        let toml_str =
+            format!("listen = \"0.0.0.0:8080\"\n\n{header}\n{body}admin_readers = [\"grafana\"]\n");
         let value: toml::Value = toml::from_str(&toml_str).unwrap();
         // Guard against the test rotting into a tautology: assert the key
         // really did nest before asserting that we catch it nesting.
         assert!(
             value.as_table().unwrap().get("admin_readers").is_none(),
-            "{section}: expected the key to bind to the entry, not the root"
+            "{header}: expected the key to bind to the table, not the root"
         );
         let err = reject_legacy_config_keys(&value).unwrap_err();
-        assert!(err.contains("`admin_readers`"), "{section}: {err}");
-        assert!(err.contains("TOP-LEVEL"), "{section}: {err}");
+        assert!(err.contains(&format!("`{path}`")), "{header}: {err}");
+        assert!(err.contains("TOP-LEVEL"), "{header}: {err}");
     }
+
+    // A client that happens to be NAMED `readers` is a map key in the
+    // name-keyed tables, not a misplaced role list.
+    let named: toml::Value = toml::from_str(
+        r#"
+listen = "0.0.0.0:8080"
+
+[client_budgets]
+readers = 1000
+
+[client_utilization_limits]
+admin_readers = 0.5
+"#,
+    )
+    .unwrap();
+    assert!(reject_legacy_config_keys(&named).is_ok());
 
     // …and the correct placement still boots.
     let ok: toml::Value = toml::from_str(
@@ -602,6 +622,37 @@ fn exposure_rejects_short_credentials_with_the_generation_command() {
     }
     // 32 exactly passes.
     assert!(validate_exposure(&cfg(&format!("proxy_key = \"{}\"\n", "a".repeat(32)))).is_ok());
+}
+
+#[test]
+fn rate_limit_cooldown_rejects_values_outside_one_day() {
+    // 0 makes the capacity-429 cooldown a no-op; i64::MAX is the largest value
+    // TOML carries and overflows `Instant` at the first capacity 429.
+    for secs in ["0", "86401", "9223372036854775807"] {
+        let err =
+            validate_rate_limit_cooldown(&cfg(&format!("rate_limit_cooldown_secs = {secs}\n")))
+                .unwrap_err();
+        assert!(err.starts_with("config:"), "{err}");
+        assert!(err.contains("rate_limit_cooldown_secs"), "{err}");
+        assert!(err.contains("1..=86400"), "{err}");
+    }
+    let mut config = cfg("");
+    config.rate_limit_cooldown_secs = Some(u64::MAX);
+    assert!(validate_rate_limit_cooldown(&config).is_err());
+}
+
+#[test]
+fn rate_limit_cooldown_accepts_one_second_to_one_day_and_the_default() {
+    for fragment in [
+        "rate_limit_cooldown_secs = 1\n",
+        "rate_limit_cooldown_secs = 86400\n",
+        "",
+    ] {
+        assert!(
+            validate_rate_limit_cooldown(&cfg(fragment)).is_ok(),
+            "{fragment:?}"
+        );
+    }
 }
 
 #[test]
