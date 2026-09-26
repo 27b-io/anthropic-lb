@@ -30,7 +30,7 @@ jobs:
           - 6379:6379
         env:
           # Services take no command args; the image appends this to
-          # valkey-server. `Db` in src/tests.rs needs more than 16 DBs.
+          # valkey-server. `Db` in src/persistence/tests/real_redis.rs needs more than 16 DBs.
           VALKEY_EXTRA_FLAGS: --databases 32
         options: >-
           --health-cmd "valkey-cli ping"
