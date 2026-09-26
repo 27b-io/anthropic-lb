@@ -421,9 +421,10 @@ fn collect_block<'a>(block: &'a Value, out: &mut Vec<&'a str>) -> Result<(), &'s
                     Some(Value::String(s)) => out.push(s),
                     Some(Value::Array(inner)) => {
                         for b in inner {
+                            // Read whatever the type, as at top level.
+                            out.extend(string_field(b, "text")?);
                             match b.get("type").and_then(Value::as_str) {
-                                Some("text") => out.extend(string_field(b, "text")?),
-                                Some("image") => {}
+                                Some("text" | "image") => {}
                                 _ => return Err(REASON_CONTENT_UNREADABLE),
                             }
                         }
@@ -1034,6 +1035,14 @@ mod tests {
                 json!({"type": "image", "text": "m-image-text",
                        "source": {"type": "url", "url": "https://example.com/a.png"}}),
                 vec!["m-image-text"],
+            ),
+            // ...including on an `image` inside a document's content source.
+            (
+                json!({"type": "document", "source": {"type": "content", "content": [
+                    {"type": "image", "text": "m-doc-image-text",
+                     "source": {"type": "url", "url": "https://example.com/a.png"}}
+                ]}}),
+                vec!["m-doc-image-text"],
             ),
             // `title` and `context` are read whatever the source.
             (

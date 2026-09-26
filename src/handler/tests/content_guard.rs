@@ -1061,6 +1061,13 @@ fn guard_scanned_block_shapes(secret: &str) -> Vec<(&'static str, serde_json::Va
                 "source": {"type": "url", "url": "https://example.com/a.png"}
             }]),
         ),
+        // Same rule inside a document's content source.
+        (
+            "document-content-source-image-with-text",
+            serde_json::json!([{"type": "document", "source": {"type": "content", "content": [
+                {"type": "image", "text": leak, "source": {"type": "url", "url": "https://example.com/a.png"}}
+            ]}}]),
+        ),
     ]
 }
 
