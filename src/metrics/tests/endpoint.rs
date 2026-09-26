@@ -153,7 +153,7 @@ async fn metrics_endpoint_returns_prometheus_format() {
 
     // Meta metric
     assert!(
-        body.contains("anthropic_lb_info{strategy=\"dynamic-capacity-v1\"} 1"),
+        body.contains("anthropic_lb_info{strategy=\"dynamic-capacity-v1\",version=\""),
         "missing lb_info:\n{body}"
     );
 
@@ -162,6 +162,219 @@ async fn metrics_endpoint_returns_prometheus_format() {
         body.contains("# TYPE anthropic_account_utilization gauge"),
         "missing TYPE header:\n{body}"
     );
+}
+
+/// LAB-4379 AC1: every response the proxy sends lands in the request-duration
+/// histogram under a closed `(route, status)` label set, exposed as a declared
+/// histogram with cumulative `le` buckets, `_sum` and `_count`.
+#[tokio::test]
+async fn metrics_request_duration_histogram() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = test_app(&mock_url, None);
+    let addr = serve(app).await;
+    let client = Client::new();
+    for _ in 0..2 {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+    let scrape = || async {
+        client
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    };
+
+    let body = scrape().await;
+    assert!(
+        body.contains("# TYPE anthropic_http_request_duration_seconds histogram"),
+        "histogram must be declared:\n{body}"
+    );
+    let series = r#"{route="/v1/messages",status="200""#;
+    assert!(
+        body.contains(&format!(
+            "anthropic_http_request_duration_seconds_bucket{series},le=\"+Inf\"}} 2"
+        )),
+        "+Inf bucket must count every observation:\n{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "anthropic_http_request_duration_seconds_bucket{series},le=\"600\"}} 2"
+        )),
+        "buckets must be cumulative (nothing took >600s):\n{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "anthropic_http_request_duration_seconds_count{series}}} 2"
+        )),
+        "_count must match:\n{body}"
+    );
+    assert!(
+        body.lines().any(|l| l.starts_with(&format!(
+            "anthropic_http_request_duration_seconds_sum{series}}} "
+        ))),
+        "_sum must be emitted:\n{body}"
+    );
+
+    // The middleware wraps the admin routes too: the first scrape recorded
+    // itself, so the second one sees it.
+    let body = scrape().await;
+    assert!(
+        body.contains(
+            "anthropic_http_request_duration_seconds_count{route=\"/metrics\",status=\"200\"} 1"
+        ),
+        "admin scrape must be timed like any other response:\n{body}"
+    );
+}
+
+/// LAB-4379 AC1: the `route` label is a closed vocabulary — a caller cannot
+/// mint series by varying the path the fallback proxies.
+#[test]
+fn route_label_is_a_closed_vocabulary() {
+    assert_eq!(route_label("/v1/messages"), "/v1/messages");
+    assert_eq!(
+        route_label("/v1/messages/count_tokens"),
+        "/v1/messages/count_tokens"
+    );
+    assert_eq!(route_label("/v1/chat/completions"), "/v1/chat/completions");
+    assert_eq!(route_label("/_stats"), "/_stats");
+    assert_eq!(route_label("/metrics"), "/metrics");
+    for p in [
+        "/",
+        "/v1/complete",
+        "/v1/messages/",
+        "/v1/Messages",
+        "/anything/the/caller/chooses",
+    ] {
+        assert_eq!(route_label(p), "other", "{p}");
+    }
+}
+
+/// Bucket edges are inclusive upper bounds; overflow lands in `+Inf`; the
+/// sum is in seconds.
+#[test]
+fn request_duration_hist_buckets_and_sum() {
+    let mut h = RequestDurationHist::default();
+    h.observe(Duration::from_millis(50)); // <= 0.1
+    h.observe(Duration::from_millis(100)); // == 0.1, edge is inclusive
+    h.observe(Duration::from_secs(3)); // <= 5.0
+    h.observe(Duration::from_secs(1000)); // > 600 → +Inf
+    assert_eq!(h.buckets[0], 2);
+    assert_eq!(REQUEST_DURATION_BUCKETS[5], 5.0);
+    assert_eq!(h.buckets[5], 1);
+    assert_eq!(h.buckets[REQUEST_DURATION_BUCKETS.len()], 1);
+    assert_eq!(h.buckets.iter().sum::<u64>(), 4);
+    assert!((h.sum_secs - 1003.15).abs() < 1e-9, "{}", h.sum_secs);
+}
+
+/// LAB-4379 AC3/AC4: the exposition identifies the running build and its
+/// start time directly, without inferring either from counter resets.
+#[tokio::test]
+async fn metrics_build_info_and_start_time() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = test_app(&mock_url, None);
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    let info = body
+        .lines()
+        .find(|l| l.starts_with("anthropic_lb_info{"))
+        .expect("lb_info line");
+    assert!(
+        info.contains(&format!("version=\"{}\"", env!("CARGO_PKG_VERSION"))),
+        "{info}"
+    );
+    assert!(info.contains("revision=\""), "{info}");
+
+    assert!(
+        body.contains("# TYPE process_start_time_seconds gauge"),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!("process_start_time_seconds {}", state.start_epoch)),
+        "{body}"
+    );
+}
+
+/// LAB-4379 AC4: the revision label is the 7-character short commit that
+/// `sha-*` image tags use, or `unknown` when the build did not set one.
+#[test]
+fn build_revision_is_short_sha_or_unknown() {
+    assert_eq!(
+        build_revision(Some("9c0d22b9aa2d8027cde27f1be250da48118a3e33")),
+        "9c0d22b"
+    );
+    assert_eq!(build_revision(Some("9c0d22b")), "9c0d22b");
+    assert_eq!(build_revision(Some("abc")), "abc");
+    assert_eq!(build_revision(Some("")), "unknown");
+    assert_eq!(build_revision(None), "unknown");
+}
+
+/// LAB-4379 AC2: whenever the Redis aggregate is not being reported, the
+/// scrape carries this replica's own count and no
+/// `anthropic_cluster_redis_connected 1`, which is the gauge the HELP text tells
+/// a reader to split `max` from `sum` on. Covers both fallback shapes of the
+/// cluster cache: absent (no Redis, or before the first sync) and a failed
+/// Redis read (`redis_connected: false`, no `transport_errors`).
+/// `metrics_prefer_redis_transport_error_aggregate` covers the connected case.
+#[tokio::test]
+async fn metrics_transport_errors_scope_without_redis_aggregate() {
+    let failed_read = serde_json::json!({
+        "redis_connected": false,
+        "replicas_seen": 0,
+        "budget_usage": {},
+    });
+    for cache in [None, Some(failed_read)] {
+        let label = format!("{cache:?}");
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, state) = test_app(&mock_url, None);
+        state.lock_transport_errors().insert("connect", 2);
+        *state.lock_cluster_info_cache() = cache;
+        let addr = serve(app).await;
+        let body = Client::new()
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert!(
+            body.contains("anthropic_upstream_transport_errors_total{kind=\"connect\"} 2"),
+            "{label}: local count must be reported:\n{body}"
+        );
+        assert!(
+            !body.contains("anthropic_cluster_redis_connected 1"),
+            "{label}: must not advertise the fleet scope:\n{body}"
+        );
+        let help = body
+            .lines()
+            .find(|l| l.starts_with("# HELP anthropic_upstream_transport_errors_total "))
+            .expect("HELP line");
+        assert!(
+            help.contains("Where anthropic_cluster_redis_connected is 1"),
+            "{help}"
+        );
+        assert!(help.contains("(aggregate with max)"), "{help}");
+        assert!(help.contains("(aggregate with sum)"), "{help}");
+    }
 }
 
 #[tokio::test]

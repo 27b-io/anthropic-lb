@@ -2,6 +2,7 @@ use axum::{
     body::Body,
     extract::State,
     http::{HeaderValue, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
     Router,
@@ -496,6 +497,24 @@ fn nested_reader_key(value: &toml::Value, path: &str) -> Option<String> {
     }
 }
 
+/// The proxy's router. Shared with the integration tests so they exercise the
+/// production route table and middleware stack rather than a copy of it.
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/_stats", axum::routing::get(stats_handler))
+        .route("/metrics", axum::routing::get(metrics_handler))
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(openai_chat_handler),
+        )
+        .fallback(any(proxy_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_request_duration,
+        ))
+        .with_state(state)
+}
+
 #[tokio::main]
 async fn main() {
     // Parse config first so debug_log path is available for tracing setup
@@ -892,6 +911,8 @@ async fn main() {
         body_read_timeout_total: AtomicU64::new(0),
         affinity_migrations: Default::default(),
         pool_exhausted: Default::default(),
+        request_durations: Mutex::new(HashMap::new()),
+        start_epoch: AppState::now_epoch(),
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: config
             .session_registry_max
@@ -935,15 +956,7 @@ async fn main() {
     // Seed metric weights from restored state so gauges aren't zero on cold start.
     state.refresh_metrics_weights().await;
 
-    let app = Router::new()
-        .route("/_stats", axum::routing::get(stats_handler))
-        .route("/metrics", axum::routing::get(metrics_handler))
-        .route(
-            "/v1/chat/completions",
-            axum::routing::post(openai_chat_handler),
-        )
-        .fallback(any(proxy_handler))
-        .with_state(state.clone());
+    let app = build_router(state.clone());
 
     let addr: SocketAddr = config
         .listen

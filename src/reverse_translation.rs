@@ -974,7 +974,10 @@ async fn forward_openai_compat_anthropic(
 
     // Non-2xx: log error detail, translate to OpenAI error format, return
     if !status.is_success() {
-        let error_body = resp.bytes().await.unwrap_or_default();
+        let error_body = resp.bytes().await.unwrap_or_else(|e| {
+            warn!(req_id, account = endpoint_name, error = %e, "openai-compat: failed to read upstream error body");
+            bytes::Bytes::new()
+        });
         let error_msg = serde_json::from_slice::<serde_json::Value>(&error_body)
             .ok()
             .and_then(|v| {
@@ -1267,7 +1270,8 @@ async fn forward_openai_compat_anthropic(
 
     let anthropic_resp: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
+            error!(req_id, account = endpoint_name, error = %e, "openai-compat: upstream 2xx body is not valid JSON");
             // Same as above: malformed upstream body means we never reach
             // `finalize_non_stream`, so log the routing snapshot here.
             log_proxied(
@@ -1282,11 +1286,24 @@ async fn forward_openai_compat_anthropic(
                 &proxied_ctx,
                 &TokenUsage::default(),
             );
+            // A 2xx we can't translate is not a success: passing the raw
+            // bytes through would hand the client an untranslated payload
+            // under 200. Same OpenAI error shape as the non-2xx branch.
+            let openai_error = serde_json::json!({
+                "error": {
+                    "message": "invalid upstream response",
+                    "type": "api_error",
+                    "param": null,
+                    "code": null
+                }
+            });
             let response = Response::builder()
-                .status(StatusCode::OK)
+                .status(StatusCode::BAD_GATEWAY)
                 .header("content-type", "application/json")
                 .header("x-budget-status", budget_status)
-                .body(Body::from(resp_bytes))
+                .body(Body::from(
+                    serde_json::to_vec(&openai_error).unwrap_or_default(),
+                ))
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
                 });

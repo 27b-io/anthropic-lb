@@ -673,6 +673,14 @@ pub(crate) struct AppState {
     /// whole pool was unavailable (LAB-4189) — before this, exhaustion existed
     /// solely as a `warn!` line, so there was nothing to graph or alert on.
     pub(crate) pool_exhausted: [AtomicU64; 2],
+    /// `anthropic_http_request_duration_seconds` cells keyed by
+    /// `(route, status)`; bounded by construction — see `route_label`.
+    /// Per-process — aggregate with `sum`.
+    pub(crate) request_durations: Mutex<HashMap<(&'static str, u16), RequestDurationHist>>,
+    /// Unix-epoch second this process built its state. Exported as
+    /// `process_start_time_seconds` so a restart is visible directly rather
+    /// than only as a counter reset.
+    pub(crate) start_epoch: u64,
     /// Reflect upstream `anthropic-ratelimit-*` headers to callers (see
     /// `Config::expose_upstream_ratelimit_headers`). Default: false.
     pub(crate) expose_upstream_ratelimit_headers: bool,
@@ -888,7 +896,7 @@ pub(crate) async fn read_body_bounded(
     match result {
         Ok(b) => Ok(b),
         Err(e) => {
-            error!("failed to read request body: {e}");
+            error!(req_id, error = %e, "failed to read request body");
             Err(Box::new(
                 (StatusCode::BAD_REQUEST, "bad request body").into_response(),
             ))
