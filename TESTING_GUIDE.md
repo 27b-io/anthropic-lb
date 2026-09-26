@@ -88,8 +88,9 @@ suffix, no auth):
 
 ```bash
 # Start a throwaway backend (never point this at a Redis holding real data —
-# the tests FLUSHDB the logical DBs they use)
-redis-server --port 16379 --save '' --appendonly no --daemonize yes \
+# the tests FLUSHDB the logical DBs they use). --databases 32 matches CI: the
+# suite uses DBs 1-16, past the default 16 (0-15).
+redis-server --port 16379 --save '' --appendonly no --databases 32 --daemonize yes \
   --pidfile /tmp/alb-test-redis.pid
 
 ALB_TEST_REDIS_URL=redis://127.0.0.1:16379 cargo test redis_integration
