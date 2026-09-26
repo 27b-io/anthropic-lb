@@ -431,12 +431,12 @@ async fn read_only_principal_reaches_the_admin_surfaces() {
 /// does not make a widely-distributed credential safe if it still controls
 /// admission capacity for everyone else.
 ///
-/// The load-bearing assertion is the LAST block, not the first. Six readers
+/// The load-bearing assertion is the MIDDLE block, not the first. Six readers
 /// getting `403` shows only that they get `403` — under a 128 MiB budget every
 /// declaration clamps to at most `MAX_REQUEST_BODY_BYTES` (25 MiB) and is
 /// admitted either way, so that block cannot distinguish the orderings, and
 /// nor can sampling `inflight_body_bytes` after the connections are answered
-/// (it proves released, not never-taken). The third block is the proof: a
+/// (it proves released, not never-taken). The middle block is the proof: a
 /// 1 MiB budget with a declared 4 MiB survives the clamp and cannot be
 /// admitted, so reservation-first answers `503` and identity-first answers
 /// `403`. Re-verification caught the earlier version asserting the property it
