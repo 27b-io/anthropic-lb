@@ -986,6 +986,49 @@ impl AppState {
         self.operators.iter().any(|op| op == client_id)
     }
 
+    /// Check if client_id is a read-only principal (LAB-4395): admitted to
+    /// `/_stats` and `/metrics`, refused on every proxied surface.
+    pub(crate) fn is_admin_reader(&self, client_id: &str) -> bool {
+        self.admin_readers.iter().any(|r| r == client_id)
+    }
+
+    /// Refuse a read-only principal on a proxied surface (LAB-4395).
+    ///
+    /// Split out of `pre_request_gate` so both proxied handlers can run it
+    /// BEFORE `reserve_request_body` and the body read, and called from the
+    /// gate as well so a handler that reaches the gate without the early call
+    /// still fails closed. One predicate, one response, three call sites — the
+    /// duplication that matters is of the DECISION, not of the call.
+    ///
+    /// The early placement is the point. Every other gate denial refuses a
+    /// request the caller had some reason to send, so it is refused after
+    /// admission like any other. This one is identity-only: it needs
+    /// `client_id` and nothing else, and the principal has no legitimate
+    /// reason to send a proxied body at all. Refusing it after admission let
+    /// six reader connections declaring large `content-length`s — one byte
+    /// sent each — pin the whole shared in-flight body budget and 503 every
+    /// other client, then do it again after each read timeout (GH #199,
+    /// reproduced by adversarial review 2026-09-21). A role whose premise is
+    /// "this credential cannot harm the pool" must not hold pool admission
+    /// capacity while being told it has no authority.
+    pub(crate) fn deny_admin_reader(&self, req_id: &str, client_id: &str) -> Option<Box<Response>> {
+        if !self.is_admin_reader(client_id) {
+            return None;
+        }
+        warn!(
+            req_id,
+            client_id = %client_id,
+            "rejected: read-only principal has no proxy authority"
+        );
+        Some(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                "forbidden: read-only principal — /_stats and /metrics only",
+            )
+                .into_response(),
+        ))
+    }
+
     /// Check if all model-compatible endpoints exceed this client's utilization limit.
     /// Returns Ok(()) if no limit configured or at least one endpoint is below the limit.
     /// Returns Err(retry_after_secs) if all endpoints exceed the limit.
@@ -1085,9 +1128,20 @@ impl AppState {
     /// Boxed Err — see `ForwardOutcome` (clippy::result_large_err).
     pub(crate) async fn pre_request_gate(
         &self,
+        req_id: &str,
         client_id: &str,
         model: &str,
     ) -> Result<(), Box<Response>> {
+        // Read-only principal (LAB-4395). Both proxied handlers already ran
+        // this before admitting a body; repeating it here is the backstop for
+        // any future caller of the gate that does not. Checked BEFORE the
+        // operator bypass on purpose — the two roles are disjoint by boot
+        // validation, so the order cannot matter today, but if that check is
+        // ever weakened this arm makes the wider grant lose to the denial
+        // rather than win.
+        if let Some(resp) = self.deny_admin_reader(req_id, client_id) {
+            return Err(resp);
+        }
         if self.is_operator(client_id) {
             return Ok(()); // operator bypasses everything
         }

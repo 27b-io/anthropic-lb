@@ -52,6 +52,84 @@ fallback_upstream = "anything"
     assert!(err.contains("priority"));
 }
 
+/// LAB-4395: both ways to lose the read-only principal silently. Either drop
+/// fails OPEN — an empty `admin_readers` promotes the principal to an ordinary
+/// client with full proxy authority rather than disabling it.
+#[test]
+fn config_rejects_a_dropped_read_only_principal() {
+    // 1. the pre-rename spelling at the root.
+    let value: toml::Value = toml::from_str(
+        r#"
+listen = "0.0.0.0:8080"
+readers = ["grafana"]
+"#,
+    )
+    .unwrap();
+    let err = reject_legacy_config_keys(&value).unwrap_err();
+    // Backticked, so `admin_readers` in the same message cannot satisfy it.
+    assert!(err.contains("`readers`"), "{err}");
+    assert!(err.contains("`admin_readers`"), "{err}");
+
+    // 2. the right spelling under the wrong header, at any depth. TOML binds
+    //    a bare key to the table above it, so each of these nests the list
+    //    into that table and serde drops it there. `[response_cache]` and
+    //    `[clients.guard]` are the cases a hand-listed section scan missed.
+    let entry = "name = \"grafana\"\nkey = \"dummy-key\"\n";
+    for (header, body, path) in [
+        ("[[clients]]", entry, "clients[0].admin_readers"),
+        ("[[endpoints]]", entry, "endpoints[0].admin_readers"),
+        ("[response_cache]", "", "response_cache.admin_readers"),
+        (
+            "[[clients]]\nname = \"grafana\"\nkey = \"dummy-key\"\n\n[clients.guard]",
+            "",
+            "clients[0].guard.admin_readers",
+        ),
+    ] {
+        let toml_str =
+            format!("listen = \"0.0.0.0:8080\"\n\n{header}\n{body}admin_readers = [\"grafana\"]\n");
+        let value: toml::Value = toml::from_str(&toml_str).unwrap();
+        // Guard against the test rotting into a tautology: assert the key
+        // really did nest before asserting that we catch it nesting.
+        assert!(
+            value.as_table().unwrap().get("admin_readers").is_none(),
+            "{header}: expected the key to bind to the table, not the root"
+        );
+        let err = reject_legacy_config_keys(&value).unwrap_err();
+        assert!(err.contains(&format!("`{path}`")), "{header}: {err}");
+        assert!(err.contains("TOP-LEVEL"), "{header}: {err}");
+    }
+
+    // A client that happens to be NAMED `readers` is a map key in the
+    // name-keyed tables, not a misplaced role list.
+    let named: toml::Value = toml::from_str(
+        r#"
+listen = "0.0.0.0:8080"
+
+[client_budgets]
+readers = 1000
+
+[client_utilization_limits]
+admin_readers = 0.5
+"#,
+    )
+    .unwrap();
+    assert!(reject_legacy_config_keys(&named).is_ok());
+
+    // …and the correct placement still boots.
+    let ok: toml::Value = toml::from_str(
+        r#"
+listen = "0.0.0.0:8080"
+admin_readers = ["grafana"]
+
+[[clients]]
+name = "grafana"
+key = "dummy-key"
+"#,
+    )
+    .unwrap();
+    assert!(reject_legacy_config_keys(&ok).is_ok());
+}
+
 #[test]
 fn config_accepts_endpoints_only_schema() {
     let toml_str = r#"
@@ -383,6 +461,66 @@ fn validate_clients_skips_all_crosschecks_without_a_client_table() {
         "operators = [\"anything\"]\n\n[client_budgets]\nanything = 100\n{RC_BLOCK}clients = [\"anything\"]\n"
     );
     assert!(validate_clients(&cfg(&fragment)).is_ok());
+}
+
+/// AC-3 (LAB-4395): `admin_readers` is bound by the same registry rule as every
+/// other name-keyed surface — a typo would silently create a role nobody
+/// holds, leaving the credential it was meant to scope on its old one.
+#[test]
+fn validate_clients_rejects_a_reader_naming_no_configured_client() {
+    let err = validate_clients(&cfg(
+        "admin_readers = [\"grafanna\"]\n\n[[clients]]\nname = \"grafana\"\nkey = \"k1\"\n",
+    ))
+    .unwrap_err();
+    assert!(
+        err.contains("admin_readers"),
+        "must name the surface: {err}"
+    );
+    assert!(err.contains("grafanna"), "must name the typo: {err}");
+}
+
+/// AC-3: one name, one role. `operators` bypasses every policy and `admin_readers`
+/// is refused every request — a name in both is a config whose author meant
+/// one of two opposite things, so it fails at boot instead of silently
+/// resolving to either.
+#[test]
+fn validate_clients_rejects_a_name_in_both_operators_and_readers() {
+    let err = validate_clients(&cfg(
+        "operators = [\"ops\"]\nadmin_readers = [\"ops\"]\n\n[[clients]]\nname = \"ops\"\nkey = \"k1\"\n",
+    ))
+    .unwrap_err();
+    assert!(err.contains("admin_readers"), "{err}");
+    assert!(err.contains("operators"), "{err}");
+    assert!(err.contains("ops"), "must name the offending name: {err}");
+}
+
+/// Unlike the other cross-checks, this one fires on the LEGACY path too:
+/// with one shared `proxy_key` the key holder is the operator by construction
+/// and proxy-path client ids are caller-asserted, so a `admin_readers` entry would
+/// restrict nobody while reading as though it scoped something.
+#[test]
+fn validate_clients_rejects_readers_without_a_client_table() {
+    let err = validate_clients(&cfg("admin_readers = [\"grafana\"]\n")).unwrap_err();
+    assert!(err.contains("admin_readers"), "{err}");
+    assert!(
+        err.contains("[[clients]]"),
+        "must say what it requires: {err}"
+    );
+}
+
+/// The happy path: disjoint roles over configured clients boot fine.
+#[test]
+fn validate_clients_accepts_disjoint_operator_and_reader_roles() {
+    let parsed = cfg(
+        "operators = [\"ops\"]\nadmin_readers = [\"grafana\", \"vmagent\"]\n\n[[clients]]\nname = \"ops\"\nkey = \"k1\"\n\n[[clients]]\nname = \"grafana\"\nkey = \"k2\"\n\n[[clients]]\nname = \"vmagent\"\nkey = \"k3\"\n",
+    );
+    // Guard against the vacuous-pass trap: top-level arrays written after a
+    // table header bind to that table and vanish silently.
+    assert_eq!(
+        parsed.admin_readers,
+        vec!["grafana".to_string(), "vmagent".to_string()]
+    );
+    assert!(validate_clients(&parsed).is_ok());
 }
 
 /// `passthrough` forwards the caller's auth headers upstream untouched. Under

@@ -785,13 +785,16 @@ impl AppState {
     }
 
     /// Gate an admin surface (`/_stats`, `/metrics`) behind an OPERATOR
-    /// principal (LAB-1192 AC-4). Returns the rejection response, or `None`
+    /// or ADMIN-READER principal (LAB-1192 AC-4, LAB-4395). Returns the rejection response, or `None`
     /// when the caller may proceed.
     ///
-    /// Under `[[clients]]`: unauthenticated → 401, authenticated
-    /// non-operator → 403 — `/_stats` discloses other clients' ids and the
-    /// endpoint account names, which a per-client key holder has no business
-    /// reading. Under legacy `proxy_key`, a valid key serves: one shared
+    /// Under `[[clients]]`: unauthenticated → 401, an authenticated principal
+    /// in neither `operators` nor `admin_readers` → 403 — `/_stats` discloses
+    /// other clients' ids and the endpoint account names, which a per-client
+    /// key holder has no business reading. An `admin_readers` principal (LAB-4395) is admitted here and ONLY
+    /// here: it is exactly the credential to hand a scrape or a dashboard,
+    /// because `pre_request_gate` refuses it on every proxied surface.
+    /// Under legacy `proxy_key`, a valid key serves: one shared
     /// secret means the key holder IS the operator. Under
     /// `allow_unauthenticated` (the only way to boot with no credentials),
     /// both surfaces serve but each access logs at `warn` (AC-5) so the open
@@ -805,17 +808,17 @@ impl AppState {
     ) -> Option<Box<Response>> {
         match self.authenticate_throttled(client_ip, peer, headers, false, route) {
             Err(resp) => Some(resp),
-            Ok(Some(c)) if !self.is_operator(&c.name) => {
+            Ok(Some(c)) if !self.is_operator(&c.name) && !self.is_admin_reader(&c.name) => {
                 warn!(
                     client = %client_ip,
                     client_id = %c.name,
                     route,
-                    "rejected: admin surface requires an operator principal"
+                    "rejected: admin surface requires an operator or read-only principal"
                 );
                 Some(Box::new(
                     (
                         StatusCode::FORBIDDEN,
-                        "forbidden: operator principal required",
+                        "forbidden: operator or read-only principal required",
                     )
                         .into_response(),
                 ))
