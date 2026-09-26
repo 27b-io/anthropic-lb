@@ -431,6 +431,28 @@ async fn model_denial_literal_other_model_does_not_alias_overflow_bucket() {
     );
 }
 
+/// The `_other` escape must stay injective: a literal `__other` model must not
+/// share the escaped `_other` label, or the two denials merge into one counter
+/// and the second model never gets its first-denial warn.
+#[tokio::test]
+async fn model_denial_escape_keeps_other_and_dunder_other_distinct() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    for model in ["_other", "__other"] {
+        assert!(state.pre_request_gate("-", "limited", model).await.is_err());
+    }
+
+    let counts = state.model_denied.lock().unwrap();
+    assert_eq!(counts.len(), 2, "two models, two labels: {counts:?}");
+    assert!(
+        counts.values().all(|&n| n == 1),
+        "each model must mint its own key: {counts:?}"
+    );
+    assert!(
+        !counts.contains_key(&("limited".to_string(), "_other".to_string())),
+        "neither model may claim the overflow bucket"
+    );
+}
+
 // ── Integration: both surfaces, through the real router ──
 
 fn authed_app(upstream_url: &str, clients: Vec<ClientConfig>) -> (Router, Arc<AppState>) {

@@ -1056,9 +1056,12 @@ impl AppState {
         let first_time = {
             let mut counts = lock_recovering(&self.model_denied, "model_denied");
             // `_other` is the overflow sentinel below; a request for a model
-            // literally named that must not alias its client's bucket.
-            let model_label = if model == "_other" {
-                "__other".to_owned()
+            // literally named that must not alias its client's bucket. Every
+            // `_…_other` model gains one more `_`, so the escape never yields
+            // `_other` and never merges two models (`_other` ≠ `__other`).
+            let sentinel_like = model.starts_with('_') && model.trim_start_matches('_') == "other";
+            let model_label = if sentinel_like {
+                format!("_{model}")
             } else {
                 model.clone()
             };

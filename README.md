@@ -677,8 +677,9 @@ series (hard bound: 64 + number of `[[clients]]` + 1 series). `_other`
 is a reserved client name: config validation rejects a `[[clients]]` entry or
 `client_names` value named `_other`, and a legacy `x-client-id: _other`
 header is ignored, so real traffic can never pre-claim the global bucket. A
-denied request for a model literally named `_other` is labelled
-`model="__other"`, so it cannot pre-claim a client's bucket either.
+denied model named `_other`, `__other`, … gets one extra leading `_` in its
+label (`_other` is labelled `model="__other"`), so it cannot pre-claim a
+client's bucket or share a series with another model.
 `anthropic_client_model_token_usage_total` instead uses one global
 `client="_other",model="_other"` bucket, because its client id can be
 header-asserted under legacy auth (bounded at 256 + 1 distinct (client,
