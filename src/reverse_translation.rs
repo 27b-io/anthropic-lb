@@ -512,6 +512,74 @@ pub(crate) fn openai_error_frame(message: &str) -> bytes::Bytes {
     bytes::Bytes::from(openai_error_sse(message))
 }
 
+/// Longest a stream relay waits for the client to take one frame before it
+/// treats the client as gone. A client that stops reading but keeps its
+/// socket open (a laptop asleep mid-generation) otherwise parks the relay on
+/// its send forever: no upstream timeout fires while the upstream body goes
+/// unpolled, and the unread bytes hold flow-control window on the shared,
+/// pooled upstream connection that sibling streams need. This bounds one
+/// blocked send, never a stream's length: a client that keeps reading
+/// streams as long as the upstream does. 45 s outlasts the retransmit
+/// backoff of a briefly lossy link and keeps a dead client's hold on the
+/// upstream under a minute.
+pub(crate) const DOWNSTREAM_SEND_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(45)
+};
+
+type RelayFrame = Result<bytes::Bytes, std::io::Error>;
+
+/// Sending half of a stream relay's client body (`relay_channel`).
+pub(crate) struct RelaySender {
+    frames: tokio::sync::mpsc::Sender<RelayFrame>,
+    abort: tokio::sync::mpsc::Sender<RelayFrame>,
+}
+
+/// A stream relay's channel and the client body it feeds. The body yields
+/// the relay's frames, then the one error `relay_send` queues on a stall, so
+/// hyper aborts the response rather than terminating it cleanly: a client
+/// that wakes up sees a failed stream, not a truncated one passing as
+/// complete.
+pub(crate) fn relay_channel() -> (RelaySender, Body) {
+    let (frames, frames_rx) = tokio::sync::mpsc::channel(32);
+    let (abort, abort_rx) = tokio::sync::mpsc::channel(1);
+    let body = Body::from_stream(tokio_stream::StreamExt::chain(
+        ReceiverStream::new(frames_rx),
+        ReceiverStream::new(abort_rx),
+    ));
+    (RelaySender { frames, abort }, body)
+}
+
+/// Hand one frame to a stream relay's client, waiting at most
+/// `DOWNSTREAM_SEND_TIMEOUT`. `false` means the client is gone — it
+/// disconnected, or it stalled past the bound (warned here, once, since the
+/// caller stops sending) — and the relay must take its client-disconnect
+/// exit.
+pub(crate) async fn relay_send(tx: &RelaySender, frame: bytes::Bytes, req_id: &str) -> bool {
+    match tx
+        .frames
+        .send_timeout(Ok(frame), DOWNSTREAM_SEND_TIMEOUT)
+        .await
+    {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::SendTimeoutError::Closed(_)) => false,
+        Err(tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)) => {
+            warn!(
+                req_id,
+                timeout_secs = DOWNSTREAM_SEND_TIMEOUT.as_secs(),
+                "client stopped reading the stream — dropping it"
+            );
+            // Never full: this is its only send.
+            let _ = tx.abort.try_send(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "client stopped reading the stream",
+            )));
+            false
+        }
+    }
+}
+
 /// Translate an OpenAI SSE chunk to Anthropic SSE events.
 /// Returns Vec because one OpenAI chunk may produce multiple Anthropic events.
 /// `raw` is the raw SSE data line (after stripping "data: " prefix).
@@ -1077,7 +1145,7 @@ async fn forward_openai_compat_anthropic(
     }
 
     if is_streaming {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+        let (tx, body) = relay_channel();
         let state_clone = state.clone();
         // The detached task can't carry the `ep` borrow across the spawn
         // boundary; capture the Copy index and re-borrow from the owned `Arc`.
@@ -1128,7 +1196,7 @@ async fn forward_openai_compat_anthropic(
                                 {
                                     ctx.terminal.completed = true;
                                 }
-                                if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
+                                if !relay_send(&tx, translated.into(), &req_id_clone).await {
                                     client_gone = true;
                                     break;
                                 }
@@ -1160,30 +1228,29 @@ async fn forward_openai_compat_anthropic(
                         // here — which already ships [DONE] — cannot race
                         // with a second [DONE] from the post-loop guard.
                         ctx.terminal.errored = true;
-                        if tx
-                            .send(Ok(openai_error_frame(&format!(
-                                "upstream stream interrupted: {e}"
-                            ))))
-                            .await
-                            .is_err()
-                        {
+                        let frame =
+                            openai_error_frame(&format!("upstream stream interrupted: {e}"));
+                        if !relay_send(&tx, frame, &req_id_clone).await {
                             client_gone = true;
                         }
                         break;
                     }
                 }
             }
+            // Done with the upstream: a stalled client must not keep it
+            // pinned while usage is recorded.
+            drop(resp);
 
             // Process any remaining data in buffer (skip once a terminator is
-            // out — nothing may follow it)
-            if !ctx.terminal.reached() && !buffer.is_empty() {
+            // out — nothing may follow it — or the client is gone)
+            if !ctx.terminal.reached() && !client_gone && !buffer.is_empty() {
                 let remaining = String::from_utf8_lossy(&buffer).into_owned();
                 if !remaining.trim().is_empty() {
                     if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
                         if translated.ends_with("data: [DONE]\n\n") && !ctx.terminal.errored {
                             ctx.terminal.completed = true;
                         }
-                        if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
+                        if !relay_send(&tx, translated.into(), &req_id_clone).await {
                             client_gone = true;
                         }
                     }
@@ -1194,10 +1261,7 @@ async fn forward_openai_compat_anthropic(
             // after an error frame it would fake a clean completion)
             if !ctx.terminal.reached()
                 && !client_gone
-                && tx
-                    .send(Ok(bytes::Bytes::from("data: [DONE]\n\n")))
-                    .await
-                    .is_err()
+                && !relay_send(&tx, "data: [DONE]\n\n".into(), &req_id_clone).await
             {
                 client_gone = true;
             }
@@ -1235,7 +1299,7 @@ async fn forward_openai_compat_anthropic(
             .header("cache-control", "no-cache")
             .header("connection", "keep-alive")
             .header("x-budget-status", budget_status)
-            .body(Body::from_stream(ReceiverStream::new(rx)))
+            .body(body)
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
