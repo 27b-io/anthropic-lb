@@ -768,16 +768,30 @@ every such replica reports the same value. Aggregate those with `max`, since
 replica reports its own count: without Redis, before its first sync, or while
 Redis is unreachable. Aggregate those with `sum`. Without Redis the count is
 every failure the replica has seen. With Redis it is the failures still to be
-flushed, and flushing is at-least-once: a batch whose Redis write fails is kept
-and sent again even if part of it was applied, so some of those failures can
-already be in the fleet total. During a partial outage, the `max` over connected
-replicas plus the `sum` over the rest is therefore an estimate that can
-over-count, not an exact total.
+flushed. A flush reads Redis's reply to each command, so a count Redis applied
+is never sent again, and a count Redis rejected is kept for the next flush. Only
+when no reply arrives at all (a dropped connection or a timeout) is the whole
+batch kept and sent again, so after a lost reply some of those failures can
+already be in the fleet total. It can also under-count: if Redis rejects writes
+but still serves reads, the gauge stays `1` and that replica's kept failures
+appear in neither term. During a partial outage, the `max` over connected
+replicas plus the `sum` over the rest is therefore an estimate, not an exact
+total.
 
 A replica that changes scope also steps its series between the fleet total and
 its local count, which `rate()` and `increase()` read as a counter reset or a
-burst of new failures. Take rates from the fleet total (for example a recording
-rule over the `max` where the gauge is `1`), not from raw per-replica series.
+burst of new failures. Connected replicas also read the fleet total on their own
+5-second ticks, so a `max` taken before `rate()` falls back to an older reading
+when the freshest replica drops out, and `rate()` reads that as a reset too.
+Keep only fleet-scope readings, take the rate per replica, then take the `max`:
+
+```promql
+max by (kind) (
+  rate((anthropic_upstream_transport_errors_total
+    and on(instance) anthropic_cluster_redis_connected == 1)[5m:])
+)
+```
+
 The HELP text states the scopes on the scrape.
 
 ### OpenAI JSON-mode compatibility

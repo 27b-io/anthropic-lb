@@ -1498,11 +1498,15 @@ impl AppState {
     /// Flush this replica's accumulated transport-error deltas into the shared
     /// Redis hash (`TRANSPORT_ERRORS_KEY`) so the fleet-wide count is visible
     /// cluster-wide. `upstream_transport_errors` is a DELTA accumulator: it is
-    /// drained here each tick and its counts folded into Redis via `HINCRBY`,
-    /// so the same delta is never pushed twice (no double-counting across
-    /// ticks). On Redis failure the drained deltas are returned to the local
-    /// map — they retry next tick and stay visible via the local metrics
-    /// fallback rather than being lost. No-op without Redis, so single-instance
+    /// drained here each tick and its counts folded into Redis via `HINCRBY`.
+    /// Results are read per command: a kind whose own `HINCRBY` Redis applied
+    /// is never re-sent, a kind whose `HINCRBY` Redis rejected goes back to the
+    /// local map, and an `EXPIRE` error only warns. The whole drained batch is
+    /// re-queued only when no per-command reply arrived (send failure, timeout,
+    /// dropped connection) — the one case where Redis may have applied counts
+    /// we cannot see, so that path is at-least-once. Re-queued deltas retry
+    /// next tick and stay visible via the local metrics fallback rather than
+    /// being lost. No-op without Redis, so single-instance
     /// deployments keep accumulating locally; on an idle tick the TTL is still
     /// refreshed so the fleet-wide hash never expires under healthy traffic.
     pub(crate) async fn flush_transport_errors(&self) {
@@ -1534,9 +1538,9 @@ impl AppState {
         }
 
         // One round-trip: HINCRBY every kind, then refresh the TTL. fred
-        // pipeline commands resolve immediately when queued; `all()` sends the
-        // batch and surfaces the first error, matching the old atomic
-        // success-or-requeue contract.
+        // pipeline commands resolve immediately when queued; `try_all()` sends
+        // the batch and returns one result per command, so a failure in one
+        // command cannot make us re-send counts another command applied.
         let pipe = redis.pipeline();
         for (kind, n) in &deltas {
             let _: Result<(), fred::error::RedisError> =
@@ -1545,27 +1549,53 @@ impl AppState {
         let _: Result<(), fred::error::RedisError> = pipe
             .expire(TRANSPORT_ERRORS_KEY, TRANSPORT_ERRORS_TTL_SECS as i64)
             .await;
+        let results: Vec<Result<RedisValue, fred::error::RedisError>> = pipe.try_all().await;
 
-        let result: Result<Vec<RedisValue>, fred::error::RedisError> = pipe.all().await;
-        if let Err(e) = result {
-            // Redis is unreachable (or the pipeline reply was lost) — return the
-            // drained deltas to the local accumulator so error signal is not
-            // dropped. This is at-least-once: if the connection died AFTER Redis
-            // applied some HINCRBYs, re-queuing can over-count by a few next
-            // tick. For an error *counter* that bias is correct — a slight
-            // over-report beats a silently missed egress fault. (Contrast
-            // record_budget_usage, which never retries a failed INCRBY:
-            // over-counting a budget would wrongly throttle a client, so the
-            // lost increment is covered by the local floor instead —
-            // LAB-1962.) The deltas also stay
-            // visible via the local metrics fallback until Redis heals.
-            warn!(error = %e, "redis HINCRBY failed for transport errors; re-queuing deltas locally");
-            // Poison-recovering lock: an `if let Ok` here would silently DROP
-            // every drained delta if the mutex got poisoned mid-cycle.
-            let mut m = self.lock_transport_errors();
-            for (kind, n) in deltas {
-                *m.entry(kind).or_insert(0) += n;
+        // When the send fails, times out or the connection drops, fred returns
+        // a single `Err` rather than one entry per command. A flush always
+        // queues at least two commands, so a length mismatch means no reply
+        // arrived and we cannot tell which HINCRBYs Redis applied. Re-queue the
+        // whole batch: at-least-once, so a lost reply can over-count by one
+        // batch. For an error *counter* that bias is correct — a slight
+        // over-report beats a silently missed egress fault. (Contrast
+        // record_budget_usage, which never retries a failed INCRBY:
+        // over-counting a budget would wrongly throttle a client, so the lost
+        // increment is covered by the local floor instead.)
+        if results.len() != deltas.len() + 1 {
+            let error = results.into_iter().find_map(Result::err).map_or_else(
+                || "unexpected pipeline reply length".to_owned(),
+                |e| e.to_string(),
+            );
+            warn!(%error, "redis pipeline failed for transport errors; re-queuing deltas locally");
+            self.requeue_transport_errors(deltas);
+            return;
+        }
+
+        let mut results = results.into_iter();
+        let mut rejected = Vec::new();
+        for ((kind, n), result) in deltas.into_iter().zip(results.by_ref()) {
+            if let Err(e) = result {
+                warn!(kind, error = %e, "redis HINCRBY failed for transport errors; re-queuing delta locally");
+                rejected.push((kind, n));
             }
+        }
+        if let Some(Err(e)) = results.next() {
+            warn!(error = %e, "redis EXPIRE failed for transport-errors TTL refresh");
+        }
+        self.requeue_transport_errors(rejected);
+    }
+
+    /// Return drained deltas Redis did not take to the local accumulator, so
+    /// they retry next tick and stay visible via the local metrics fallback.
+    fn requeue_transport_errors(&self, deltas: Vec<(&'static str, u64)>) {
+        if deltas.is_empty() {
+            return;
+        }
+        // Poison-recovering lock: an `if let Ok` here would silently DROP
+        // every drained delta if the mutex got poisoned mid-cycle.
+        let mut m = self.lock_transport_errors();
+        for (kind, n) in deltas {
+            *m.entry(kind).or_insert(0) += n;
         }
     }
     pub(crate) async fn cluster_info(&self) -> Option<serde_json::Value> {

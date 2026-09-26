@@ -1471,16 +1471,16 @@ pub(crate) async fn metrics_handler(
         &mut buf,
         "anthropic_upstream_transport_errors_total",
         "counter",
-        "Upstream transport send-failures by kind. Where anthropic_cluster_redis_connected is 1 this is the Redis fleet-wide total, identical on every replica (aggregate with max). Otherwise it is this process's local count (aggregate with sum): without Redis every failure it has seen; with Redis, before the first sync or while unreachable, the failures it has still to flush, which can include some already counted in the fleet total",
+        "Upstream transport send-failures by kind. Where anthropic_cluster_redis_connected is 1 this is the Redis fleet-wide total, identical on every replica (aggregate with max). Otherwise it is this process's local count (aggregate with sum): without Redis every failure it has seen; with Redis, before the first sync or while unreachable, the failures it has still to flush, which overlap the fleet total only after a flush whose reply was lost",
     );
     // Prefer the Redis fleet-wide aggregate (cached every 5s by the sync task)
     // so multi-replica deployments report a cluster-wide count; fall back to the
     // local accumulator when Redis is absent or the aggregate is unavailable
     // (single-instance, pre-first-sync, or a Redis blip). With Redis that
     // accumulator holds the deltas awaiting a flush, including any re-queued by
-    // a failed one (at-least-once), so the fallback is a per-replica count that
-    // can overlap the fleet total: the HELP text names the gauge that tells the
-    // two scopes apart.
+    // a flush whose reply was lost (at-least-once), so the fallback is a
+    // per-replica count that can overlap the fleet total: the HELP text names
+    // the gauge that tells the two scopes apart.
     let transport_errors: Vec<(String, u64)> = cluster_info
         .as_ref()
         .and_then(|ci| ci.get("transport_errors"))
