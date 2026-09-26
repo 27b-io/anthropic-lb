@@ -63,9 +63,17 @@ pub const DEFAULT_BREAKER_COOLDOWN_SECS: u64 = 30;
 const OVERLAP_BYTES: usize = 128;
 /// `[CLS]` and `[SEP]`, which the sidecar adds to every input.
 const SPECIAL_TOKENS: usize = 2;
-/// TEI's default `--max-client-batch-size`. Larger inputs split into several
-/// batches, issued concurrently.
+/// TEI's default `--max-client-batch-size`. A `block` input larger than this
+/// splits into several batches, issued concurrently.
 const MAX_BATCH: usize = 32;
+/// Chunks per `annotate` call, sent one call at a time. The classifier is one
+/// FIFO queue shared by both lanes, so this bounds the shadow work a `block`
+/// call can find ahead of it: at most `breaker_threshold` shadow calls are in
+/// flight, so at most that many chunks. One, because on CPU each chunk ahead
+/// costs tens to hundreds of milliseconds (measured: three in-flight batches
+/// of eight pushed a short `block` call past a 2 s deadline). Throughput does
+/// not suffer: TEI packs queued inputs from concurrent calls into one pass.
+const SHADOW_BATCH: usize = 1;
 /// Cap on a detector response body. A classifier answer for 32 chunks is a few
 /// KiB; anything near this is a misbehaving sidecar, not a verdict.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -105,7 +113,8 @@ pub struct GuardConfig {
 pub struct DetectorConfig {
     /// Base URL of the classifier; the client POSTs to `<url>/predict`.
     pub url: String,
-    /// Wall-clock ceiling for classifying one request, all chunks included.
+    /// Under `block`, the wall-clock ceiling for classifying one request, all
+    /// chunks included. Under `annotate`, the ceiling per batch of chunks.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
     /// Minimum label score that counts as a finding.
@@ -400,8 +409,8 @@ impl Detector {
         self.name
     }
 
-    /// Classify `text` for `client_id` in `lane`, all chunks under one
-    /// `timeout` deadline.
+    /// Classify `text` for `client_id` in `lane`. Under `Enforce` every chunk
+    /// shares one `timeout` deadline; under `Shadow` each batch has its own.
     pub async fn classify(&self, lane: Lane, client_id: &str, text: &str) -> Classified {
         let chunks = chunk(text, self.chunk_bytes, OVERLAP_BYTES);
         let mut findings = Vec::new();
@@ -443,31 +452,47 @@ impl Detector {
         };
 
         let started = Instant::now();
-        let batches = misses.chunks(MAX_BATCH).map(|batch| {
-            let texts: Vec<&str> = batch.iter().map(|(_, piece, _)| *piece).collect();
-            self.predict(texts)
-        });
-        let outcome = tokio::time::timeout(self.timeout, join_all(batches)).await;
-        self.duration.observe(started.elapsed());
-        let failure = match outcome {
-            // The deadline covers every batch: none of them is a verdict.
-            Err(_) => Some(ErrorKind::Timeout),
-            Ok(results) => {
-                let mut failure = None;
-                for (batch, result) in misses.chunks(MAX_BATCH).zip(results) {
-                    match result {
-                        Ok(per_chunk) => {
-                            for ((start, piece, digest), labels) in batch.iter().zip(per_chunk) {
-                                self.push_findings(&mut findings, *start, piece.len(), &labels);
-                                self.cache.insert(*digest, labels);
+        let failure = match lane {
+            // `block` waits on the answer, so every batch goes out at once
+            // under one deadline: the request is held at most `timeout_ms`.
+            Lane::Enforce => {
+                let batches = misses
+                    .chunks(MAX_BATCH)
+                    .map(|batch| self.predict(texts(batch)));
+                match tokio::time::timeout(self.timeout, join_all(batches)).await {
+                    // The deadline covers every batch: none of them is a verdict.
+                    Err(_) => Some(ErrorKind::Timeout),
+                    Ok(results) => {
+                        let mut failure = None;
+                        for (batch, result) in misses.chunks(MAX_BATCH).zip(results) {
+                            match result {
+                                Ok(labels) => self.absorb(&mut findings, batch, labels),
+                                Err(kind) => failure = failure.or(Some(kind)),
                             }
                         }
-                        Err(kind) => failure = failure.or(Some(kind)),
+                        failure
+                    }
+                }
+            }
+            // Nothing waits on `annotate`, so it trickles: one chunk at a time
+            // (see `SHADOW_BATCH`), each under its own deadline. A long
+            // input takes longer in total, and costs nobody for it.
+            Lane::Shadow => {
+                let mut failure = None;
+                for batch in misses.chunks(SHADOW_BATCH) {
+                    match tokio::time::timeout(self.timeout, self.predict(texts(batch))).await {
+                        Ok(Ok(labels)) => self.absorb(&mut findings, batch, labels),
+                        Ok(Err(kind)) => failure = Some(kind),
+                        Err(_) => failure = Some(ErrorKind::Timeout),
+                    }
+                    if failure.is_some() {
+                        break;
                     }
                 }
                 failure
             }
         };
+        self.duration.observe(started.elapsed());
         self.record_outcome(lane, &permit, failure, Instant::now());
         drop(permit);
         Classified {
@@ -511,6 +536,20 @@ impl Detector {
             "guard detector call failed"
         );
         kind
+    }
+
+    /// Record one batch's verdicts: findings for this request, and the cache
+    /// for the next.
+    fn absorb(
+        &self,
+        findings: &mut Vec<Finding>,
+        batch: &[(usize, &str, [u8; 32])],
+        labels: Vec<Arc<[Box<str>]>>,
+    ) {
+        for ((start, piece, digest), labels) in batch.iter().zip(labels) {
+            self.push_findings(findings, *start, piece.len(), &labels);
+            self.cache.insert(*digest, labels);
+        }
     }
 
     fn push_findings(&self, out: &mut Vec<Finding>, start: usize, len: usize, labels: &[Box<str>]) {
@@ -726,6 +765,10 @@ impl Detector {
     pub fn verdicts_snapshot(&self) -> Vec<((String, &'static str, &'static str), u64)> {
         self.verdicts.snapshot()
     }
+}
+
+fn texts<'a>(batch: &[(usize, &'a str, [u8; 32])]) -> Vec<&'a str> {
+    batch.iter().map(|(_, piece, _)| *piece).collect()
 }
 
 /// Verdict-cache key for one chunk, namespaced by client. A cache shared across

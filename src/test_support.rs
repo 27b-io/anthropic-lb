@@ -823,6 +823,11 @@ pub(crate) struct MockDetector {
     in_flight: Arc<AtomicUsize>,
     /// Added latency per healthy call.
     pub(crate) delay_ms: Arc<AtomicU64>,
+    /// When non-zero, healthy calls are served one at a time in arrival order
+    /// and take this long per input: a stand-in for a CPU classifier's single
+    /// FIFO queue, where concurrency adds no throughput.
+    pub(crate) per_input_ms: Arc<AtomicU64>,
+    serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[cfg(feature = "guard")]
@@ -847,6 +852,8 @@ pub(crate) async fn spawn_mock_detector() -> MockDetector {
         max_in_flight: Arc::new(AtomicUsize::new(0)),
         in_flight: Arc::new(AtomicUsize::new(0)),
         delay_ms: Arc::new(AtomicU64::new(0)),
+        per_input_ms: Arc::new(AtomicU64::new(0)),
+        serial: Arc::new(tokio::sync::Mutex::new(())),
     };
     let m = mock.clone();
     let predict = move |body: axum::Json<serde_json::Value>| {
@@ -871,6 +878,12 @@ pub(crate) async fn spawn_mock_detector() -> MockDetector {
                     .into_response()
             } else {
                 tokio::time::sleep(Duration::from_millis(m.delay_ms.load(Ordering::SeqCst))).await;
+                let per_input = m.per_input_ms.load(Ordering::SeqCst);
+                if per_input > 0 {
+                    let inputs = body["inputs"].as_array().map_or(0, Vec::len) as u64;
+                    let _queue = m.serial.lock().await;
+                    tokio::time::sleep(Duration::from_millis(per_input * inputs)).await;
+                }
                 assert_eq!(
                     body["truncate"], false,
                     "an over-long chunk must fail, not lose its tail"

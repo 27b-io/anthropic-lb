@@ -454,6 +454,31 @@ async fn real_tei_contract_and_latency() {
         .await;
     assert_eq!(dense.unavailable, None, "a chunk overflowed the window");
 
+    // Contention: three full-window shadow requests in flight, then one short
+    // `block` call, which must still answer well inside `timeout_ms`.
+    let busy = Arc::new(detector(&url, |c| c.timeout_ms = 2000));
+    let shadows: Vec<_> = (0..3)
+        .map(|i| {
+            let busy = busy.clone();
+            let text: String =
+                format!("shadow {i} ") + &"Quarterly figures, churn and hiring. ".repeat(900);
+            tokio::spawn(async move { busy.classify(Lane::Shadow, "noisy", &text).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = Instant::now();
+    let short = busy
+        .classify(Lane::Enforce, "enforcing", "Is this email benign?")
+        .await;
+    eprintln!(
+        "block call behind 3 full shadow windows: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(short.unavailable, None);
+    for s in shadows {
+        assert_eq!(s.await.unwrap().unavailable, None);
+    }
+
     for bytes in [1024, 8 * 1024, crate::guard::MAX_SCAN_BYTES] {
         let text: String = "The quarterly report covers revenue, churn and hiring. "
             .chars()
@@ -721,4 +746,44 @@ fn the_probe_marker_lives_as_long_as_the_probe() {
     ));
     drop(probe);
     assert!(d.admit(Lane::Enforce, later).is_ok(), "released on drop");
+}
+
+/// Both lanes share one classifier, and a CPU classifier is one FIFO queue.
+/// Long shadow inputs must not queue so much work ahead of a short `block`
+/// call that it misses `timeout_ms` and trips the enforce lane on a healthy
+/// detector. Against a serial mock (10 ms per chunk), three 32 KiB shadow
+/// requests are ~570 chunks, about 5.7 s of work if sent all at once.
+#[tokio::test]
+async fn long_shadow_work_cannot_starve_a_short_block_call() {
+    let mock = spawn_mock_detector().await;
+    mock.per_input_ms.store(10, Ordering::SeqCst);
+    let d = Arc::new(detector(&mock.url, |c| {
+        c.chunk_tokens = 300;
+        c.timeout_ms = 1000;
+    }));
+    let big = "s".repeat(crate::guard::MAX_SCAN_BYTES);
+    let shadows: Vec<_> = (0..3)
+        .map(|i| {
+            let (d, text) = (d.clone(), format!("{i}{big}"));
+            tokio::spawn(async move { d.classify(Lane::Shadow, "noisy", &text).await })
+        })
+        .collect();
+    // Let the shadow work reach the classifier's queue first.
+    wait_for(|| mock.calls() >= 3).await;
+
+    let started = Instant::now();
+    let out = d.classify(Lane::Enforce, "enforcing", "short input").await;
+    let waited = started.elapsed();
+    assert_eq!(
+        out.unavailable, None,
+        "block call timed out behind shadow work after {waited:?}"
+    );
+    eprintln!("block call behind shadow work: {waited:?}");
+    assert!(waited < Duration::from_millis(200), "queued {waited:?}");
+    assert!(!d.tripped(Lane::Enforce));
+
+    // The shadow requests still finish, however long they take in total.
+    for s in shadows {
+        assert_eq!(s.await.unwrap().unavailable, None, "shadow completes");
+    }
 }

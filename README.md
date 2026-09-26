@@ -670,8 +670,16 @@ logged with its cause (HTTP status, transport error, or what was wrong with the
 body), never with request text.
 
 **Circuit breaker.** `annotate` and `block` traffic go through separate lanes,
-each with its own breaker and in-flight cap. Shadow traffic can therefore never
-open the breaker, or fill the slots, that `block` clients depend on.
+each with its own breaker and in-flight cap, so shadow failures never open the
+breaker, or fill the slots, that `block` clients depend on.
+
+Both lanes still share one classifier, and a CPU classifier works through one
+queue in arrival order. So `annotate` sends one chunk per call, one call after
+another, while `block` sends all its chunks at once. A `block` call therefore
+finds at most `breaker_threshold` shadow chunks ahead of it, however much
+shadow work is pending. The sidecar still batches queued chunks from
+concurrent calls into one pass, so shadow throughput is unchanged. A long
+shadow input simply takes longer to finish, and nothing waits on it.
 
 In each lane, after `breaker_threshold` consecutive failed requests the breaker
 opens for `breaker_cooldown_secs`. While it is open no call is made, and every
@@ -693,12 +701,14 @@ queued. The cost falls on `block` with `fail_open = false`: a burst of more than
 detector is healthy, and one `block` client's oversized inputs can open the
 lane's breaker for the others. Raise `breaker_threshold` if that matters.
 
-Size `timeout_ms` for the slowest input you need classified, not for a typical
-one. A full 32 KiB window is roughly 90 chunks. On CPU a small classifier takes
-a few seconds to get through them all, and a larger one several times that. An
-input that cannot finish inside `timeout_ms` counts as a failure and feeds the
-breaker. For shadow-mode data gathering, where latency costs requests nothing,
-a generous value is safe. Treat `block` with `fail_open = false` as a commitment
+`timeout_ms` means different things in the two lanes. Under `block` it covers
+the whole request, so size it for the slowest input you need classified, plus
+`breaker_threshold` chunks of shadow work that may be queued ahead. A full
+32 KiB window is roughly 90 chunks, and on CPU a small classifier takes a few
+seconds to get through them all; a larger one takes several times that. An
+input that cannot finish in time counts as a failure and feeds the breaker.
+Under `annotate`, `timeout_ms` applies to each one-chunk call, so a long shadow
+input is never timed out for its length. Treat `block` with `fail_open = false` as a commitment
 to the detector's availability, because every outage becomes a `503` for those
 clients.
 
