@@ -135,7 +135,7 @@ async fn pinned_client_spills_on_transport_unhealthy() {
     {
         let mut info = state.endpoints[1].rate_info.write().await;
         info.utilization = Some(0.1);
-        info.transport_unhealthy_until = Some(Instant::now() + Duration::from_secs(3600));
+        info.transport.open_until = Some(Instant::now() + Duration::from_secs(3600));
     }
 
     assert_eq!(

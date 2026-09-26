@@ -946,8 +946,14 @@ impl AppState {
     /// the two surfaces drifted into disagreeing about which shapes were
     /// readable at all. The reason strings are `&'static str` by construction —
     /// no request content may enter a rejection body or a log line.
+    ///
+    /// LAB-3878: then the Tier 1 detector, if one is configured, on the same
+    /// scan input. `annotate` hands it to a background task and returns at once
+    /// (see `guard::detector` for why shadow mode is off the request path);
+    /// `block` waits for it, at most the detector's `timeout_ms`. A Tier 0
+    /// `block` verdict returns before the detector is asked.
     #[cfg(feature = "guard")]
-    pub(crate) fn guard_hook(
+    pub(crate) async fn guard_hook(
         &self,
         req_id: &str,
         client_id: &str,
@@ -999,28 +1005,75 @@ impl AppState {
                 "guard: unscannable request"
             );
         }
-        let (verdict, findings, reason) = match self.guard.evaluate(policy, client_id, input) {
-            guard::Verdict::Allow => return Ok(None),
-            guard::Verdict::Annotate { findings } => ("annotate", findings, None),
-            guard::Verdict::Block { findings, reason } => ("block", findings, Some(reason)),
+        let tier0 = match self.guard.evaluate(policy, client_id, input) {
+            guard::Verdict::Allow => None,
+            guard::Verdict::Annotate { findings } => Some(findings),
+            guard::Verdict::Block { findings, reason } => {
+                self.log_guard_verdict(req_id, client_id, "block", &findings, truncated);
+                return Err(Box::new(guard_blocked_response(
+                    &findings,
+                    &reason,
+                    openai_shape,
+                )));
+            }
         };
+        if let Some(findings) = &tier0 {
+            self.log_guard_verdict(req_id, client_id, "annotate", findings, truncated);
+        }
+        let tier0 = tier0.map(|f| f.len());
+
+        let (Some(detector), Some(input)) = (self.guard.detector(), input) else {
+            return Ok(tier0);
+        };
+        if input.text().is_empty() {
+            return Ok(tier0);
+        }
+        match policy {
+            guard::GuardPolicy::Off => Ok(tier0),
+            guard::GuardPolicy::Annotate => {
+                detector.shadow(
+                    req_id.to_owned(),
+                    client_id.to_owned(),
+                    input.text().to_owned(),
+                );
+                Ok(tier0)
+            }
+            // Under `block`, Tier 0 either rejected above or found nothing, so
+            // the detector's outcome is the whole answer.
+            guard::GuardPolicy::Block => {
+                debug_assert!(tier0.is_none(), "evaluate never annotates under block");
+                match detector.enforce(req_id, client_id, input.text()).await {
+                    guard::detector::Enforced::Allow => Ok(None),
+                    guard::detector::Enforced::FailOpen => Ok(Some(1)),
+                    guard::detector::Enforced::Block(findings) => Err(Box::new(
+                        guard_blocked_response(&findings, guard::REASON_FLAGGED, openai_shape),
+                    )),
+                    guard::detector::Enforced::Unavailable => {
+                        Err(Box::new(guard_unavailable_response(openai_shape)))
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "guard")]
+    fn log_guard_verdict(
+        &self,
+        req_id: &str,
+        client_id: &str,
+        verdict: &'static str,
+        findings: &[guard::Finding],
+        truncated: bool,
+    ) {
         warn!(
             req_id,
             client_id = %client_id,
             verdict,
             findings = findings.len(),
             truncated,
-            detections = %guard::detections_summary(&findings),
+            detections = %guard::detections_summary(findings),
             "guard"
         );
-        match reason {
-            None => Ok(Some(findings.len())),
-            Some(reason) => Err(Box::new(guard_blocked_response(
-                &findings,
-                &reason,
-                openai_shape,
-            ))),
-        }
     }
 
     /// Count + log a model-allowlist denial.

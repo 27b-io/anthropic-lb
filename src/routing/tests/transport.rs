@@ -56,7 +56,7 @@ async fn dead_endpoint_circuit_breaks_and_session_migrates_once() {
     // Breaker is transport state, NOT rate-limit state.
     let info = probe.endpoints[0].rate_info.read().await;
     assert!(
-        info.transport_unhealthy_until.is_some(),
+        info.transport.open_until.is_some(),
         "breaker must be open on the dead endpoint"
     );
     assert!(
@@ -129,11 +129,11 @@ async fn circuit_broken_endpoint_reenters_after_cooldown() {
     // The successful forward must clear the breaker and the counter.
     let info = probe.endpoints[0].rate_info.read().await;
     assert_eq!(
-        info.consecutive_transport_failures, 0,
+        info.transport.consecutive_failures, 0,
         "failure counter must auto-clear on a successful forward"
     );
     assert!(
-        info.transport_unhealthy_until.is_none(),
+        info.transport.open_until.is_none(),
         "breaker must close on a successful forward"
     );
 }
@@ -154,11 +154,11 @@ async fn transport_failure_counter_era_resets_after_cooldown() {
     {
         let info = state.endpoints[0].rate_info.read().await;
         assert_eq!(
-            info.consecutive_transport_failures,
+            info.transport.consecutive_failures,
             TRANSPORT_FAILURE_THRESHOLD
         );
         assert!(
-            info.transport_unhealthy_until.is_some(),
+            info.transport.open_until.is_some(),
             "breaker must open at the threshold"
         );
     }
@@ -167,11 +167,11 @@ async fn transport_failure_counter_era_resets_after_cooldown() {
     state.record_transport_failure(0).await;
     let info = state.endpoints[0].rate_info.read().await;
     assert_eq!(
-        info.consecutive_transport_failures, 1,
+        info.transport.consecutive_failures, 1,
         "counter must reset to a fresh era after the cooldown elapses"
     );
     assert!(
-        info.transport_unhealthy_until.is_none(),
+        info.transport.open_until.is_none(),
         "one post-cooldown failure must not re-open the breaker"
     );
 }
@@ -189,8 +189,8 @@ async fn transport_success_clears_failures_and_leaves_hard_limit_alone() {
     }
     state.record_transport_success(0).await;
     let info = state.endpoints[0].rate_info.read().await;
-    assert_eq!(info.consecutive_transport_failures, 0);
-    assert!(info.transport_unhealthy_until.is_none());
+    assert_eq!(info.transport.consecutive_failures, 0);
+    assert!(info.transport.open_until.is_none());
     assert!(
         info.hard_limited_until.is_some(),
         "clearing transport health must not clear the 429 hard limit"
@@ -207,7 +207,7 @@ async fn pick_endpoint_excludes_transport_unhealthy_endpoints() {
     let state = test_state_with(vec![anthropic, openai]);
     for ep in &state.endpoints {
         let mut info = ep.rate_info.write().await;
-        info.transport_unhealthy_until = Some(Instant::now() + Duration::from_secs(60));
+        info.transport.open_until = Some(Instant::now() + Duration::from_secs(60));
     }
     assert!(
         state.pick_endpoint(None, "", &[]).await.is_none(),
@@ -216,7 +216,7 @@ async fn pick_endpoint_excludes_transport_unhealthy_endpoints() {
     // Close the OpenAI endpoint's breaker → it must become pickable again.
     {
         let mut info = state.endpoints[1].rate_info.write().await;
-        info.transport_unhealthy_until = None;
+        info.transport.open_until = None;
     }
     assert_eq!(
         state.pick_endpoint(None, "", &[]).await,

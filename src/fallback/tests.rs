@@ -568,7 +568,7 @@ async fn try_fallback_upstream_transport_error_is_transient_and_counted() {
     );
     let info = state.endpoints[0].rate_info.read().await;
     assert_eq!(
-        info.consecutive_transport_failures, 1,
+        info.transport.consecutive_failures, 1,
         "the transport failure must feed the per-endpoint circuit breaker"
     );
 }

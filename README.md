@@ -607,12 +607,137 @@ A block-mode client must therefore send JSON Messages traffic in a shape the
 scanner can parse, and keep scannable content within the limit. `annotate` (shadow mode) never rejects — it
 scans best-effort and always forwards.
 
+### ML detector (Tier 1)
+
+The rule scanners catch secrets and PII; they cannot catch prompt injection,
+which is semantic. For that the guard can also send the same scan window to a
+sequence-classification service — for example Prompt Guard 2 served by
+[text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference)
+(TEI) — and treat its labels as findings. One detector is supported:
+
+```toml
+[guard.detectors.pg2]
+url = "http://detector.internal:8080"   # the client POSTs to <url>/predict
+# timeout_ms = 2000            # ceiling for classifying one request, all chunks
+# threshold = 0.5              # minimum label score that counts as a finding
+# fail_open = false            # block clients only: see below
+# chunk_tokens = 512           # the model's input window, in tokens
+# cache_size = 10000           # verdicts memoized per chunk digest; 0 disables
+# breaker_threshold = 3        # failures that open a lane's breaker; also caps its calls
+# breaker_cooldown_secs = 30   # how long it stays open before one probe
+```
+
+Unknown keys are rejected at startup, as is a `[guard]` table on a binary built
+without the `guard` feature. The detector gets its own HTTP client, which never
+follows redirects. It receives user and tool-result text, so reach it over a
+private network or `https`.
+
+How the detector runs depends on the client's policy:
+
+- `annotate` — classified **off the request path**, in the background. The
+  request pays no latency. Verdicts go to the `guard detector` log line and the
+  metrics below, not to `X-Guard-Findings`, because the response has usually
+  left before the verdict exists.
+- `block` — classified inline. The request waits at most `timeout_ms`, however
+  many chunks the input splits into (chunks go out in concurrent batches of up
+  to 32). A detector finding returns the same `400 guard_blocked` as a rule
+  finding, with `scanner` set to the detector's name.
+- `off` and operator clients — never sent.
+
+Any label other than `BENIGN` / `SAFE` that scores at least `threshold` is a
+finding. A response whose labels are empty, longer than 64 bytes, or outside
+`[A-Za-z0-9_-]` counts as an unreadable body.
+
+Text is chunked by bytes, because the proxy has no tokenizer. Each chunk is
+`chunk_tokens - 2` bytes, and consecutive chunks overlap by 128 bytes. The
+model's tokenizer yields at most one token per byte, so a chunk always fits the
+window with room for the two special tokens. Requests are sent with
+`truncate: false`, so an input that somehow exceeds the window fails the call
+rather than being classified without its tail.
+
+Only the Tier 0 scan window is classified: the newest user text and
+`tool_result` text blocks. Other block types, such as `document` or
+`search_result`, are not sent to the detector.
+
+**Failure is fail-closed by default.** A timeout, connection error, non-2xx
+response or unreadable body leaves the request without a verdict. Under
+`block`, `fail_open = false` rejects it with `HTTP 503` and error type
+`guard_unavailable` (nothing is wrong with the request, so a client may retry);
+`fail_open = true` forwards it with one `guard_unavailable` finding counted in
+`X-Guard-Findings`. Under `annotate` nothing is rejected either way; the log
+line records `would-block` or `annotate` accordingly. Each failed call is also
+logged with its cause (HTTP status, transport error, or what was wrong with the
+body), never with request text.
+
+**Circuit breaker.** `annotate` and `block` traffic go through separate lanes,
+each with its own breaker and in-flight cap, so shadow failures never open the
+breaker, or fill the slots, that `block` clients depend on.
+
+Both lanes still share one classifier, and a CPU classifier works through one
+queue in arrival order. So `annotate` sends one chunk per call, one call after
+another, while `block` sends all its chunks at once. A `block` call therefore
+finds at most `breaker_threshold` shadow chunks ahead of it, however much
+shadow work is pending. The price is shadow throughput. The sidecar still
+batches chunks from concurrent shadow calls into one pass, but one-chunk calls
+leave it idle between round trips. In testing, a full shadow lane kept roughly
+85% of the rate of batched calls, and a lone long shadow request roughly 75%. A long
+shadow input simply takes longer to finish, and nothing waits on it.
+
+In each lane, after `breaker_threshold` consecutive failed requests the breaker
+opens for `breaker_cooldown_secs`. While it is open no call is made, and every
+request takes its failure path immediately. After the cooldown one request
+probes: success closes the breaker, failure re-opens it. Sustained timeouts from
+an overloaded detector count exactly like downtime. Chunks already in the
+verdict cache are still answered while the breaker is open. The OPEN and CLOSED
+transitions are logged once each, and the breaker uses the same state machine as
+the upstream transport breaker.
+
+While a lane's breaker is closed, a call is admitted only while calls in flight
+plus failures since the last success are below `breaker_threshold`. A request
+arriving past that takes its failure path immediately, and is counted as
+`saturated`. With the breaker, this means a detector outage costs each lane
+`breaker_threshold` timed-out requests before its breaker opens, whether they
+arrive in a burst or one after another, then one probe per
+`breaker_cooldown_secs`. The classifier gains no throughput from concurrent
+requests, so the cap mostly sheds work that would otherwise have queued. The
+cost falls on `block` with `fail_open = false`: a burst of more than
+`breaker_threshold` concurrent inputs (fewer after a failure, until a call
+succeeds) returns `503` to the excess even while the detector is healthy, and
+one `block` client's oversized inputs can narrow the lane, or open its breaker,
+for the others. Raise `breaker_threshold` if that matters.
+
+`timeout_ms` means different things in the two lanes. Under `block` it covers
+the whole request, so size it for the slowest input you need classified, plus
+`breaker_threshold` chunks of shadow work that may be queued ahead. A full
+32 KiB window is roughly 90 chunks, and on CPU a small classifier takes a few
+seconds to get through them all; a larger one takes several times that. An
+input that cannot finish in time counts as a failure and feeds the breaker.
+Under `annotate`, `timeout_ms` applies to each one-chunk call, so a long shadow
+input is never timed out for its length. Treat `block` with `fail_open = false` as a commitment
+to the detector's availability, because every outage becomes a `503` for those
+clients.
+
 ### Metrics
 
 On `/metrics` (when built with the feature):
 
-- `anthropic_guard_verdicts_total{client, scanner, verdict}` — counter.
+- `anthropic_guard_verdicts_total{client, scanner, verdict}` — counter. The
+  detector's verdicts appear under its own `scanner` label.
 - `anthropic_guard_scan_duration_seconds` — histogram of per-request scan time.
+
+With a detector configured:
+
+- `anthropic_guard_detector_errors_total{detector, kind}` — requests that got no
+  verdict, by `kind`: `timeout`, `connect`, `transport`, `status`, `decode`.
+- `anthropic_guard_detector_circuit_open{detector, lane}` — gauge, 1 while that
+  lane's breaker is open or awaiting its probe. `lane` is `annotate` or `block`.
+- `anthropic_guard_detector_short_circuited_total{detector, lane, reason}` —
+  requests that took the failure path without a call, by `reason`:
+  `circuit_open` or `saturated`.
+- `anthropic_guard_detector_cache_lookups_total{detector, result}` — per-chunk
+  verdict-cache lookups, `hit` or `miss`.
+- `anthropic_guard_detector_duration_seconds{detector}` — histogram of detector
+  wall-clock time per request.
 
 The `client` dimension of the verdicts counter is cardinality-bounded (overflow
 folds into `_other`). Under a legacy shared-secret configuration the client id

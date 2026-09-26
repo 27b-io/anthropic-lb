@@ -1073,24 +1073,14 @@ impl AppState {
     pub(crate) async fn record_transport_failure(&self, endpoint_idx: usize) {
         let ep = &self.endpoints[endpoint_idx];
         let mut info = ep.rate_info.write().await;
-        let now = Instant::now();
-        // Cooldown elapsed → fresh era: the expired breaker's failures don't
-        // carry over, so re-opening takes a full threshold of new evidence.
-        if info
-            .transport_unhealthy_until
-            .is_some_and(|until| now >= until)
-        {
-            info.transport_unhealthy_until = None;
-            info.consecutive_transport_failures = 0;
-        }
-        info.consecutive_transport_failures = info.consecutive_transport_failures.saturating_add(1);
-        if info.consecutive_transport_failures >= TRANSPORT_FAILURE_THRESHOLD
-            && info.transport_unhealthy_until.is_none()
-        {
-            info.transport_unhealthy_until = Some(now + self.transport_cooldown);
+        if info.transport.record_failure(
+            Instant::now(),
+            TRANSPORT_FAILURE_THRESHOLD,
+            self.transport_cooldown,
+        ) {
             warn!(
                 endpoint = ep.name,
-                consecutive_failures = info.consecutive_transport_failures,
+                consecutive_failures = info.transport.consecutive_failures,
                 cooldown_secs = self.transport_cooldown.as_secs(),
                 "transport circuit-breaker OPEN: endpoint leaves the routing pool"
             );
@@ -1103,22 +1093,16 @@ impl AppState {
         let ep = &self.endpoints[endpoint_idx];
         // Fast path: requests are overwhelmingly healthy-on-healthy; skip the
         // write lock unless there is actually state to clear.
-        {
-            let info = ep.rate_info.read().await;
-            if info.consecutive_transport_failures == 0 && info.transport_unhealthy_until.is_none()
-            {
-                return;
-            }
+        if ep.rate_info.read().await.transport.is_clean() {
+            return;
         }
         let mut info = ep.rate_info.write().await;
-        if info.transport_unhealthy_until.is_some() {
+        if info.transport.record_success() {
             info!(
                 endpoint = ep.name,
                 "transport circuit-breaker CLOSED: endpoint recovered"
             );
         }
-        info.consecutive_transport_failures = 0;
-        info.transport_unhealthy_until = None;
     }
 
     /// Sync shared state from Redis: hard limits + rate info.

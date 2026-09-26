@@ -40,6 +40,7 @@ use tracing::{debug, error, info, trace, warn};
 mod guard;
 
 mod auto_cache;
+mod breaker;
 mod config;
 mod fallback;
 mod handler;
@@ -474,6 +475,16 @@ fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
                 .to_string(),
         );
     }
+    // LAB-3878: a `[guard]` table on a binary built without the `guard`
+    // feature would parse and do nothing — an operator who configured a
+    // fail-closed detector would be running with no guard at all.
+    #[cfg(not(feature = "guard"))]
+    if table.contains_key("guard") {
+        return Err(
+            "config: [guard] is set but this binary was built without the `guard` feature — rebuild with `--features guard` or remove the table"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -816,9 +827,12 @@ async fn main() {
     // cheap). A broken ruleset fails startup loudly rather than silently
     // scanning nothing — the same fail-loud posture as the config gates above.
     #[cfg(feature = "guard")]
-    let guard = match guard::Guard::new() {
+    let guard = match guard::Guard::new(&config.guard) {
         Ok(g) => {
-            info!("content guard enabled (Tier 0 rules scanners; shadow-mode default)");
+            info!(
+                detector = g.detector().map(|d| d.name()).unwrap_or("-"),
+                "content guard enabled (Tier 0 rules scanners; shadow-mode default)"
+            );
             g
         }
         Err(msg) => panic!("guard init failed: {msg}"),
