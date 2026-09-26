@@ -57,12 +57,15 @@ pub(crate) const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
 ///     only: Anthropic echoes client-chosen field names into its 400s
 ///     (`<field>: Extra inputs are not permitted`), so on an Anthropic
 ///     endpoint the phrase is client-controlled and one request could
-///     negative-cache the model for every client (LAB-5235).
+///     negative-cache the model for every client (LAB-5235). See
+///     `is_gateway_model_rejection` for why it is anchored and bound to
+///     `model`, the model the request asked for.
 ///   - OpenAI: `{"error":{"code":"model_not_found", ...}}`.
 pub(crate) fn is_model_unsupported_error(
     status: StatusCode,
     body: &serde_json::Value,
     protocol: Protocol,
+    model: &str,
 ) -> bool {
     if status != StatusCode::NOT_FOUND && status != StatusCode::BAD_REQUEST {
         return false;
@@ -79,7 +82,26 @@ pub(crate) fn is_model_unsupported_error(
     if err.get("code").and_then(|v| v.as_str()) == Some("model_not_found") {
         return true;
     }
-    protocol == Protocol::OpenAI && msg.to_ascii_lowercase().contains("invalid model name")
+    protocol == Protocol::OpenAI && is_gateway_model_rejection(msg, model)
+}
+
+/// LiteLLM's own model rejection, as observed live:
+/// `/chat/completions: Invalid model name passed in model=<id>. Call …`.
+/// Anchored at the message start and bound to the requested model, because
+/// the same field carries provider errors the gateway relays, and those can
+/// echo client-chosen keys mid-message, as in
+/// `litellm.BadRequestError: …Exception - {… "<key>: Extra inputs are not
+/// permitted" …}`. A substring match would let a key containing the phrase
+/// mark the model unsupported for everyone.
+fn is_gateway_model_rejection(msg: &str, model: &str) -> bool {
+    let Some((route, rest)) = msg.split_once(": ") else {
+        return false;
+    };
+    route.starts_with('/')
+        && rest
+            .strip_prefix("Invalid model name passed in model=")
+            .and_then(|r| r.strip_prefix(model))
+            .is_some_and(|r| r.starts_with('.'))
 }
 
 /// Anchor for the entitlement 400 (LAB-4729). Only the first sentence: the
@@ -104,6 +126,67 @@ pub(crate) fn is_entitlement_exhausted_400(status: StatusCode, body: &serde_json
             .pointer("/error/message")
             .and_then(|v| v.as_str())
             .is_some_and(|m| m.starts_with(ENTITLEMENT_400_ANCHOR))
+}
+
+/// Account or model state an upstream 4xx reports: the request itself was
+/// fine, and another endpoint may serve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamRejection {
+    /// `is_model_unsupported_error`.
+    ModelUnsupported,
+    /// `is_entitlement_exhausted_400`.
+    Entitlement,
+}
+
+/// Read account or model state out of an upstream error. Every forward path
+/// classifies through here, so the echo veto covers every classifier, the
+/// ones added later included. `model` is the model the request asked for, and
+/// `sent_body` the request body exactly as it went to this endpoint.
+pub(crate) fn classify_rejection(
+    status: StatusCode,
+    err_body: &serde_json::Value,
+    protocol: Protocol,
+    model: &str,
+    sent_body: &[u8],
+) -> Option<UpstreamRejection> {
+    let verdict = if is_model_unsupported_error(status, err_body, protocol, model) {
+        UpstreamRejection::ModelUnsupported
+    } else if is_entitlement_exhausted_400(status, err_body) {
+        UpstreamRejection::Entitlement
+    } else {
+        return None;
+    };
+    // Checked after a match rather than before: it re-parses the request
+    // body, and an error no classifier claims is forwarded unchanged anyway.
+    (!echoes_request_key(err_body, sent_body)).then_some(verdict)
+}
+
+/// True when `error.message` starts with `<key>:` for a top-level key of the
+/// request. Anthropic's 400 for an unknown field reads `<key>: Extra inputs
+/// are not permitted`, with the key echoed verbatim, so that message is text
+/// the client chose and cannot report account or model state.
+///
+/// `model` is exempt: its name is fixed by the API, and the genuine model
+/// rejection reads `model: <id>`. A body that does not parse as a JSON object
+/// counts as an echo, since an echo cannot then be ruled out, and forwarding
+/// the error unchanged is the safe side.
+fn echoes_request_key(err_body: &serde_json::Value, sent_body: &[u8]) -> bool {
+    let Some(msg) = err_body.pointer("/error/message").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if sent_body.is_empty() {
+        return false;
+    }
+    let Ok(keys) = serde_json::from_slice::<HashMap<String, serde::de::IgnoredAny>>(sent_body)
+    else {
+        return true;
+    };
+    keys.keys().any(|k| {
+        k != "model"
+            && msg
+                .strip_prefix(k.as_str())
+                .is_some_and(|rest| rest.starts_with(':'))
+    })
 }
 
 /// Surface the real cause of a `reqwest::Error`. The Display form only shows
@@ -1164,14 +1247,16 @@ pub(crate) async fn forward_anthropic(
             // here too: upstream sends the 400 as a JSON body, not an event
             // stream, so it re-sends before any byte reaches the client.
             let rotate: Option<fn(Box<Response>) -> ForwardOutcome> =
-                if is_model_unsupported_error(status, &parsed, ep.protocol) {
-                    state.note_model_unsupported(endpoint_name, endpoint_idx, model);
-                    Some(ForwardOutcome::RetryModelUnsupported)
-                } else if is_entitlement_exhausted_400(status, &parsed) {
-                    state.note_entitlement_400(endpoint_name);
-                    Some(ForwardOutcome::RetryEntitlement)
-                } else {
-                    None
+                match classify_rejection(status, &parsed, ep.protocol, model, req_body) {
+                    Some(UpstreamRejection::ModelUnsupported) => {
+                        state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                        Some(ForwardOutcome::RetryModelUnsupported)
+                    }
+                    Some(UpstreamRejection::Entitlement) => {
+                        state.note_entitlement_400(endpoint_name);
+                        Some(ForwardOutcome::RetryEntitlement)
+                    }
+                    None => None,
                 };
             if let Some(retry) = rotate {
                 // This branch returns before `finalize_non_stream` — log the

@@ -190,9 +190,13 @@ pub(crate) async fn try_fallback_upstream(
         // misleading "your request is invalid" 400 — the model is fine, this
         // endpoint just doesn't serve it (LAB-941, observed 2026-07-27 when a
         // 529 storm drained the Anthropic pool into insight-gateway).
-        let model_unsupported = serde_json::from_str::<serde_json::Value>(&err_body)
-            .map(|v| is_model_unsupported_error(status, &v, ep.protocol))
-            .unwrap_or(false);
+        // Only the model rejection: this path has never re-sent on an
+        // entitlement 400.
+        let model_unsupported =
+            serde_json::from_str::<serde_json::Value>(&err_body).is_ok_and(|v| {
+                classify_rejection(status, &v, ep.protocol, model, request_body)
+                    == Some(UpstreamRejection::ModelUnsupported)
+            });
         let response = if translate {
             // Return error in Anthropic format
             Response::builder()
