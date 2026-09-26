@@ -677,8 +677,10 @@ Both lanes still share one classifier, and a CPU classifier works through one
 queue in arrival order. So `annotate` sends one chunk per call, one call after
 another, while `block` sends all its chunks at once. A `block` call therefore
 finds at most `breaker_threshold` shadow chunks ahead of it, however much
-shadow work is pending. The sidecar still batches queued chunks from
-concurrent calls into one pass, so shadow throughput is unchanged. A long
+shadow work is pending. The price is shadow throughput. The sidecar still
+batches chunks from concurrent shadow calls into one pass, but one-chunk calls
+leave it idle between round trips. In testing, a full shadow lane kept roughly
+85% of the rate of batched calls, and a lone long shadow request roughly 75%. A long
 shadow input simply takes longer to finish, and nothing waits on it.
 
 In each lane, after `breaker_threshold` consecutive failed requests the breaker

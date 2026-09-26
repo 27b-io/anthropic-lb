@@ -75,8 +75,12 @@ const MAX_BATCH: usize = 32;
 /// call can find ahead of it: at most `breaker_threshold` shadow calls are in
 /// flight, so at most that many chunks. One, because on CPU each chunk ahead
 /// costs tens to hundreds of milliseconds (measured: three in-flight batches
-/// of eight pushed a short `block` call past a 2 s deadline). Throughput does
-/// not suffer: TEI packs queued inputs from concurrent calls into one pass.
+/// of eight pushed a short `block` call past a 2 s deadline). The price is
+/// shadow throughput: TEI still packs queued inputs from concurrent calls into
+/// one pass, but one-chunk calls leave it idle between round trips. Measured
+/// against batched calls, a full shadow lane keeps roughly 85% of the
+/// classifier's rate and a lone long shadow request roughly 75%. Only
+/// `annotate` pays it, and nothing waits on `annotate`.
 const SHADOW_BATCH: usize = 1;
 /// Cap on a detector response body. A classifier answer for 32 chunks is a few
 /// KiB; anything near this is a misbehaving sidecar, not a verdict.
