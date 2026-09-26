@@ -6539,6 +6539,23 @@ async fn fast_mode_disabled_filters_fast_routing_until_expiry() {
     );
 }
 
+/// A poisoned fast-mode cache keeps marking and filtering: skipping on `Err`
+/// would stop both for the life of the process.
+#[tokio::test]
+async fn poisoned_fast_mode_disabled_lock_keeps_marking() {
+    let state = test_state_with(vec![
+        mk_endpoint("a", "sk-ant-api-a"),
+        mk_endpoint("b", "sk-ant-api-b"),
+    ]);
+    poison(&state.fast_mode_disabled);
+
+    state.note_fast_mode_disabled("a", 0);
+
+    assert!(!state.fast_mode_disabled.is_poisoned());
+    assert_eq!(state.fast_mode_disabled_endpoints(), vec![0]);
+    assert!(state.fast_mode_disabled_remaining_secs(0).is_some());
+}
+
 /// Mixed negative caches: one account can't serve the model, the other can't
 /// serve fast. A fast request has nowhere to go (upstream error, not a 429);
 /// a standard request still has the fast-disabled account.

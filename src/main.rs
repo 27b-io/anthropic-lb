@@ -4676,9 +4676,7 @@ impl AppState {
         self.endpoints[endpoint_idx]
             .fast_mode_disabled_total
             .fetch_add(1, Ordering::Relaxed);
-        let Ok(mut map) = self.fast_mode_disabled.lock() else {
-            return;
-        };
+        let mut map = self.lock_fast_mode_disabled();
         warn!(
             account = endpoint_name,
             cooldown_secs = FAST_MODE_DISABLED_TTL.as_secs(),
@@ -4691,21 +4689,18 @@ impl AppState {
     /// `unsupported_endpoints_for`.
     fn fast_mode_disabled_endpoints(&self) -> Vec<usize> {
         let now = Instant::now();
-        match self.fast_mode_disabled.lock() {
-            Ok(map) => map
-                .iter()
-                .filter(|(_, expiry)| **expiry > now)
-                .map(|(idx, _)| *idx)
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        self.lock_fast_mode_disabled()
+            .iter()
+            .filter(|(_, expiry)| **expiry > now)
+            .map(|(idx, _)| *idx)
+            .collect()
     }
 
     /// Seconds left on `endpoint_idx`'s fast-mode-disabled entry; None when
     /// unmarked or expired (`/_stats`, shaped like `hard_limited_remaining_secs`).
     fn fast_mode_disabled_remaining_secs(&self, endpoint_idx: usize) -> Option<u64> {
-        let map = self.fast_mode_disabled.lock().ok()?;
-        map.get(&endpoint_idx)?
+        self.lock_fast_mode_disabled()
+            .get(&endpoint_idx)?
             .checked_duration_since(Instant::now())
             .map(|d| d.as_secs())
     }
@@ -6411,6 +6406,10 @@ impl AppState {
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<(usize, String), Instant>> {
         lock_recovering(&self.unsupported_models, "unsupported_models")
+    }
+
+    fn lock_fast_mode_disabled(&self) -> std::sync::MutexGuard<'_, HashMap<usize, Instant>> {
+        lock_recovering(&self.fast_mode_disabled, "fast_mode_disabled")
     }
 
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionEntry>> {
@@ -11680,8 +11679,8 @@ async fn build_metrics_snap(
 /// writer's `Mutex` is locked by tracing-subscriber, not by this crate). That
 /// is sound because each guarded value is either a counter/accumulator store,
 /// a map of independent, self-expiring entries (auth throttle windows, the
-/// unsupported-model cache, the session registry, log dedup/rate-limit
-/// stamps), a single replaced value (cluster-info cache), or the burn-rate
+/// unsupported-model and fast-mode-disabled caches, the session registry, log
+/// dedup/rate-limit stamps), a single replaced value (cluster-info cache), or the burn-rate
 /// state: three independent EWMAs updated one after another, so a panic
 /// mid-update leaves at worst a monitoring value torn by one update.
 /// A panicking holder can leave one entry stale by at most one update, never
