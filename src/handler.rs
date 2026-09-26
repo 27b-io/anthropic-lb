@@ -1115,8 +1115,7 @@ pub(crate) async fn forward_anthropic(
                     }
                 }
             }
-            // Done with the upstream: a stalled client must not keep it
-            // pinned while usage is recorded.
+            // Release the upstream before recording usage.
             drop(resp);
             // Record scanned usage. The detached task only holds a cloned
             // Arc<AppState>; re-index it to recover &Endpoint.

@@ -537,10 +537,12 @@ pub(crate) struct RelaySender {
 }
 
 /// A stream relay's channel and the client body it feeds. The body yields
-/// the relay's frames, then the one error `relay_send` queues on a stall, so
-/// hyper aborts the response rather than terminating it cleanly: a client
-/// that wakes up sees a failed stream, not a truncated one passing as
-/// complete.
+/// the relay's frames, then the one error `relay_send` queues on a stall.
+/// hyper polls the body only as the client drains it, so the abort lands
+/// when a stalled client resumes: it sees a failed stream, not a truncated
+/// one ended by a clean terminator. A client that never resumes keeps its
+/// connection and the queued frames until its socket dies; the upstream,
+/// the relay task and accounting are already released by then.
 pub(crate) fn relay_channel() -> (RelaySender, Body) {
     let (frames, frames_rx) = tokio::sync::mpsc::channel(32);
     let (abort, abort_rx) = tokio::sync::mpsc::channel(1);
@@ -1237,8 +1239,7 @@ async fn forward_openai_compat_anthropic(
                     }
                 }
             }
-            // Done with the upstream: a stalled client must not keep it
-            // pinned while usage is recorded.
+            // Release the upstream before the tail sends and recording usage.
             drop(resp);
 
             // Process any remaining data in buffer (skip once a terminator is

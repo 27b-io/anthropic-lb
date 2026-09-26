@@ -90,12 +90,18 @@ async fn stalled_request(addr: SocketAddr, path: &str, body: &str) -> tokio::net
 
 /// State with a distinct, non-zero `instance_id`: `req_id` is
 /// `{instance_id:04x}:{n}`, and the log capture buffer is process-global,
-/// so this is what ties a stall warning to this test's request.
+/// so this is what ties a stall warning to this test's request. The
+/// upstream client's total timeout is well past each test's run, so only
+/// the stall exit can close the upstream.
 fn stall_state(endpoints: Vec<Endpoint>, instance_id: u16) -> Arc<AppState> {
     Arc::new(AppState {
         endpoints,
         instance_id,
         auto_cache: false,
+        client: upstream_client_builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .unwrap(),
         ..test_state_base()
     })
 }
@@ -194,6 +200,22 @@ async fn stalled_client_drops_translated_openai_stream() {
     let mut openai = make_endpoint("fallback", Protocol::OpenAI);
     openai.base_url = url;
     let state = stall_state(vec![openai], 0x5a02);
+    assert_stall_drops_upstream(state, "/v1/messages", MESSAGES_BODY, probe).await;
+}
+
+/// SSE lets one event carry several `data:` lines. The stall lands mid-event
+/// here (each ~6 MB event outsizes the ~4.4 MB the path to the client
+/// absorbs), and the relay must not go on to send, and wait on, the event's
+/// remaining lines.
+#[tokio::test]
+async fn stalled_client_drops_translated_multi_data_line_stream() {
+    let line = openai_delta(64 * 1024);
+    let line = line.trim_end_matches('\n');
+    let event = format!("{}\n\n", vec![line; 96].join("\n"));
+    let (url, probe) = spawn_endless_sse_upstream(OPENAI_PRELUDE, event).await;
+    let mut openai = make_endpoint("fallback", Protocol::OpenAI);
+    openai.base_url = url;
+    let state = stall_state(vec![openai], 0x5a06);
     assert_stall_drops_upstream(state, "/v1/messages", MESSAGES_BODY, probe).await;
 }
 

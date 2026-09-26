@@ -275,6 +275,12 @@ pub(crate) async fn try_fallback_upstream(
                                                 break;
                                             }
                                         }
+                                        // An event can carry more `data:`
+                                        // lines; none may be sent once the
+                                        // client is gone.
+                                        if client_gone {
+                                            break;
+                                        }
                                     }
                                 }
                                 if client_gone || ctx.terminal.errored {
@@ -367,6 +373,9 @@ pub(crate) async fn try_fallback_upstream(
                                 client_gone = true;
                                 break;
                             }
+                        }
+                        if client_gone {
+                            break;
                         }
                     }
                 }
