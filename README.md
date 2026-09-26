@@ -623,7 +623,7 @@ url = "http://detector.internal:8080"   # the client POSTs to <url>/predict
 # fail_open = false            # block clients only: see below
 # chunk_tokens = 512           # the model's input window, in tokens
 # cache_size = 10000           # verdicts memoized per chunk digest; 0 disables
-# breaker_threshold = 3        # failures that open a lane's breaker; also its in-flight cap
+# breaker_threshold = 3        # failures that open a lane's breaker; also caps its calls
 # breaker_cooldown_secs = 30   # how long it stays open before one probe
 ```
 
@@ -690,16 +690,19 @@ verdict cache are still answered while the breaker is open. The OPEN and CLOSED
 transitions are logged once each, and the breaker uses the same state machine as
 the upstream transport breaker.
 
-At most `breaker_threshold` detector calls per lane are in flight at once. A
-request arriving while that many are outstanding takes its failure path
-immediately, and is counted as `saturated`. With the breaker, this means a
-detector outage costs each lane at most `breaker_threshold` requests one
-`timeout_ms` each, even under a burst. The classifier gains no throughput from
-concurrent requests, so the cap mostly sheds work that would otherwise have
-queued. The cost falls on `block` with `fail_open = false`: a burst of more than
-`breaker_threshold` concurrent inputs returns `503` to the excess even while the
-detector is healthy, and one `block` client's oversized inputs can open the
-lane's breaker for the others. Raise `breaker_threshold` if that matters.
+While a lane's breaker is closed, a call is admitted only while calls in flight
+plus failures since the last success are below `breaker_threshold`. A request
+arriving past that takes its failure path immediately, and is counted as
+`saturated`. With the breaker, this means a detector outage costs each lane
+`breaker_threshold` timed-out requests before its breaker opens, whether they
+arrive in a burst or one after another, then one probe per
+`breaker_cooldown_secs`. The classifier gains no throughput from concurrent
+requests, so the cap mostly sheds work that would otherwise have queued. The
+cost falls on `block` with `fail_open = false`: a burst of more than
+`breaker_threshold` concurrent inputs (fewer after a failure, until a call
+succeeds) returns `503` to the excess even while the detector is healthy, and
+one `block` client's oversized inputs can narrow the lane, or open its breaker,
+for the others. Raise `breaker_threshold` if that matters.
 
 `timeout_ms` means different things in the two lanes. Under `block` it covers
 the whole request, so size it for the slowest input you need classified, plus

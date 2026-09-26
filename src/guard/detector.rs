@@ -135,8 +135,9 @@ pub struct DetectorConfig {
     /// Verdict memo entries, keyed by chunk digest. 0 disables the cache.
     #[serde(default = "default_cache_size")]
     pub cache_size: u64,
-    /// Consecutive failed requests before a lane's breaker opens. Also each
-    /// lane's cap on detector calls in flight at once (see `Detector::admit`).
+    /// Consecutive failed requests before a lane's breaker opens. Also bounds
+    /// each lane's calls in flight plus failures since the last success (see
+    /// `Detector::admit`).
     #[serde(default = "default_breaker_threshold")]
     pub breaker_threshold: u32,
     /// How long a lane's breaker stays open before one probe is let through.
@@ -218,7 +219,8 @@ pub struct Classified {
 pub enum Unavailable {
     /// The breaker was open: no call was made.
     CircuitOpen,
-    /// `breaker_threshold` calls were already in flight: no call was made.
+    /// Calls in flight plus failures since the last success had reached
+    /// `breaker_threshold`: no call was made.
     Saturated,
     /// A call was made and failed.
     Failed(ErrorKind),
@@ -279,7 +281,8 @@ struct GateState {
     /// Bumped on every OPEN and CLOSED transition. A call's outcome only
     /// counts against the era it was admitted in: a slow call admitted while
     /// closed must not close a breaker that has since opened, nor re-open one
-    /// a probe has since closed.
+    /// a probe has since closed. `admit` already prevents both; the era is a
+    /// second defence in case admission changes.
     era: u64,
     /// Detector calls admitted and not yet finished.
     in_flight: u32,
@@ -567,21 +570,25 @@ impl Detector {
         }));
     }
 
-    /// Admit one detector call, or say why not.
-    ///
-    /// At most `breaker_threshold` calls are in flight at once. Without the
-    /// cap, every request that arrives before the first failure lands is
-    /// admitted to a hung detector, so a burst pays `timeout_ms` a hundred
-    /// times over before the breaker hears about any of it. With it, the
-    /// first `breaker_threshold` calls are the only ones that can be caught
-    /// out, and their failures are exactly what opens the breaker. The
-    /// classifier gains no throughput from concurrent requests (it queues
-    /// them), so a request past the cap would mostly have waited in that
-    /// queue anyway.
     fn gate(&self, lane: Lane) -> &Gate {
         &self.lanes[lane as usize]
     }
 
+    /// Admit one detector call, or say why not.
+    ///
+    /// While the breaker is closed, a call is admitted only while calls in
+    /// flight plus failures since the last success are below
+    /// `breaker_threshold`. Without a cap, every request that arrives before
+    /// the first failure lands is admitted to a hung detector, so a burst pays
+    /// `timeout_ms` a hundred times over before the breaker hears about any of
+    /// it. Capping calls in flight alone is not enough: each slot a timed-out
+    /// call frees would go to a new call before the breaker opens, and a
+    /// steady stream would pay nearly twice the threshold. Counting both, the
+    /// first `breaker_threshold` calls are the only ones that can be caught
+    /// out, their failures are exactly what opens the breaker, and no other
+    /// call is in flight when it opens. The classifier gains no throughput
+    /// from concurrent requests (it queues them), so a request past the cap
+    /// would mostly have waited in that queue anyway.
     fn admit(&self, lane: Lane, now: Instant) -> Result<Permit<'_>, Unavailable> {
         let gate = self.gate(lane);
         let mut s = crate::lock_recovering(&gate.state, "guard_detector_gate");
@@ -594,7 +601,9 @@ impl Detector {
                 return Err(Unavailable::CircuitOpen);
             }
             s.probe_in_flight = true;
-        } else if s.in_flight >= self.breaker_threshold {
+        } else if s.in_flight.saturating_add(s.breaker.consecutive_failures)
+            >= self.breaker_threshold
+        {
             return Err(Unavailable::Saturated);
         }
         s.in_flight += 1;
@@ -612,7 +621,7 @@ impl Detector {
     /// down once, and each extra failure is a request paying `timeout_ms`.
     ///
     /// An outcome from an earlier era is counted in the error metric and
-    /// otherwise ignored; see `BreakerState::era`.
+    /// otherwise ignored; see [`GateState::era`].
     fn record_outcome(
         &self,
         lane: Lane,

@@ -24,7 +24,8 @@ pub(crate) struct Breaker {
 
 impl Breaker {
     /// Record one failure. Returns `true` exactly when this failure opened the
-    /// breaker, so the caller logs the OPEN transition once.
+    /// breaker, so the caller logs the OPEN transition once. The caller bounds
+    /// `cooldown`: `now + cooldown` past what `Instant` can hold panics.
     pub(crate) fn record_failure(
         &mut self,
         now: Instant,

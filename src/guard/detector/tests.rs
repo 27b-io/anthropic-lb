@@ -547,9 +547,53 @@ async fn a_concurrent_burst_against_a_hung_detector_pays_at_most_threshold() {
     assert_eq!(d.turned_away(Lane::Enforce), (0, 17));
 }
 
+/// Requests arriving one after another, not all at once: a slot freed by a
+/// timed-out call must not go to a new call before the breaker has heard
+/// enough, or that call pays `timeout_ms` too and its failure lands in a stale
+/// era. With threshold 3 that would be five timeouts instead of three.
+#[test]
+fn a_steady_stream_against_a_hung_detector_pays_at_most_threshold() {
+    let d = detector("http://127.0.0.1:1", |c| c.breaker_threshold = 3);
+    let now = Instant::now();
+    let fail = Some(ErrorKind::Timeout);
+    let mut in_flight: std::collections::VecDeque<_> = (0..3)
+        .map(|_| d.admit(Lane::Enforce, now).expect("under the cap"))
+        .collect();
+    let mut admitted = 3;
+    let mut refused = Vec::new();
+    while let Some(p) = in_flight.pop_front() {
+        d.record_outcome(Lane::Enforce, &p, fail, now);
+        drop(p);
+        match d.admit(Lane::Enforce, now) {
+            Ok(p) => {
+                admitted += 1;
+                in_flight.push_back(p);
+            }
+            Err(why) => refused.push(why),
+        }
+    }
+    assert_eq!(
+        admitted, 3,
+        "only breaker_threshold calls ever reach the hung detector"
+    );
+    // The failures already counted hold the freed slots until the breaker opens.
+    assert_eq!(
+        refused,
+        [
+            Unavailable::Saturated,
+            Unavailable::Saturated,
+            Unavailable::CircuitOpen
+        ]
+    );
+    assert!(d.tripped(Lane::Enforce));
+}
+
 /// An outcome only counts against the breaker era it was
 /// admitted in. Driven through `admit`/`record_outcome` with explicit clocks
-/// so the completion order is exact.
+/// so the completion order is exact. `admit` never leaves a call in flight
+/// when a breaker opens, so `force_open` fakes that state by recording three
+/// failures against one permit, which production never does: the era check
+/// is the second line of defence, tested alone.
 #[test]
 fn a_stale_outcome_cannot_close_or_reopen_the_breaker() {
     let d = detector("http://127.0.0.1:1", |c| {
@@ -558,13 +602,16 @@ fn a_stale_outcome_cannot_close_or_reopen_the_breaker() {
     });
     let t0 = Instant::now();
     let fail = Some(ErrorKind::Timeout);
+    let force_open = |now| {
+        let p = d.admit(Lane::Enforce, now).expect("under the cap");
+        for _ in 0..3 {
+            d.record_outcome(Lane::Enforce, &p, fail, now);
+        }
+    };
 
     // A slow call admitted while closed.
     let slow = d.admit(Lane::Enforce, t0).expect("closed admits");
-    for _ in 0..3 {
-        let p = d.admit(Lane::Enforce, t0).expect("under the cap");
-        d.record_outcome(Lane::Enforce, &p, fail, t0);
-    }
+    force_open(t0);
     assert!(d.tripped(Lane::Enforce));
 
     // Cooldown over: a probe goes out, then the old call returns success.
@@ -601,10 +648,7 @@ fn a_stale_outcome_cannot_close_or_reopen_the_breaker() {
         assert!(!d.tripped(Lane::Enforce));
         d.admit(Lane::Enforce, t2).expect("closed")
     };
-    for _ in 0..3 {
-        let p = d.admit(Lane::Enforce, t2).expect("under the cap");
-        d.record_outcome(Lane::Enforce, &p, fail, t2);
-    }
+    force_open(t2);
     let t3 = t2 + Duration::from_secs(30);
     let probe = d.admit(Lane::Enforce, t3).expect("probe");
     d.record_outcome(Lane::Enforce, &probe, None, t3);
