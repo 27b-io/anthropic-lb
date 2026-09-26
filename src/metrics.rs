@@ -69,6 +69,127 @@ fn prom_header(buf: &mut String, name: &str, metric_type: &str, help: &str) {
     let _ = writeln!(buf, "# TYPE {name} {metric_type}");
 }
 
+/// Emit one histogram's `_bucket` / `_sum` / `_count` series for a single
+/// label set. `series` is `(le, cumulative_count)` with `+Inf` last — the
+/// shape both `RequestDurationHist::snapshot` and the guard's
+/// `ScanHistogram::snapshot` produce. The family's `# HELP` / `# TYPE` header
+/// is the caller's job: it must appear once even when the family has many
+/// label sets.
+fn prom_histogram(
+    buf: &mut String,
+    family: &str,
+    labels: &[(&str, &str)],
+    series: &[(String, u64)],
+    sum: f64,
+    count: u64,
+) {
+    for (le, cumulative) in series {
+        let mut with_le = labels.to_vec();
+        with_le.push(("le", le.as_str()));
+        prom_counter(buf, &format!("{family}_bucket"), &with_le, *cumulative);
+    }
+    prom_gauge(buf, &format!("{family}_sum"), labels, sum);
+    prom_counter(buf, &format!("{family}_count"), labels, count);
+}
+
+/// Upper edges (seconds) of `anthropic_http_request_duration_seconds`, plus an
+/// implicit `+Inf`. Spans the proxy's own sub-second rejections through the
+/// multi-minute non-streaming generations the upstream client budget allows.
+const REQUEST_DURATION_BUCKETS: [f64; 12] = [
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+];
+
+/// One `(route, status)` cell of the request-duration histogram. Bucket counts
+/// are stored non-cumulative; `snapshot` cumulates them into the `le`-labelled
+/// series Prometheus expects. The total count is the sum of all buckets (the
+/// cumulated `+Inf` at emit time), so it is not stored separately.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RequestDurationHist {
+    buckets: [u64; REQUEST_DURATION_BUCKETS.len() + 1],
+    sum_secs: f64,
+}
+
+impl RequestDurationHist {
+    fn observe(&mut self, elapsed: Duration) {
+        let secs = elapsed.as_secs_f64();
+        let idx = REQUEST_DURATION_BUCKETS
+            .iter()
+            .position(|&edge| secs <= edge)
+            .unwrap_or(REQUEST_DURATION_BUCKETS.len());
+        self.buckets[idx] += 1;
+        self.sum_secs += secs;
+    }
+
+    /// `(le, cumulative_count)` per bucket (last entry `+Inf`), sum in
+    /// seconds, and total count — the shape `prom_histogram` emits.
+    fn snapshot(&self) -> (Vec<(String, u64)>, f64, u64) {
+        let mut cumulative = 0u64;
+        let series = self
+            .buckets
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                cumulative += n;
+                let le = REQUEST_DURATION_BUCKETS
+                    .get(i)
+                    .map_or_else(|| "+Inf".to_string(), |edge| edge.to_string());
+                (le, cumulative)
+            })
+            .collect();
+        (series, self.sum_secs, cumulative)
+    }
+}
+
+/// Collapse a request path onto the closed `route` label vocabulary. Anything
+/// the fallback proxies that is not a known Messages path is `other`, so a
+/// caller cannot mint series by varying the URL.
+fn route_label(path: &str) -> &'static str {
+    match path {
+        "/v1/messages" => "/v1/messages",
+        "/v1/messages/count_tokens" => "/v1/messages/count_tokens",
+        "/v1/chat/completions" => "/v1/chat/completions",
+        "/_stats" => "/_stats",
+        "/metrics" => "/metrics",
+        _ => "other",
+    }
+}
+
+/// Router-wide middleware: time every request from receipt to the moment the
+/// handler yields its response — that is when response headers are ready; for
+/// a streamed body none of the stream time is included — and record it under
+/// `(route, status)`. One site covers every handler, the fallback included.
+/// A request whose client disconnects before the response is ready is not
+/// recorded: the server drops this future, so nothing after `next.run` runs.
+/// The critical section is two additions, so a poisoned mutex holds nothing
+/// inconsistent: `lock_recovering` rather than let the whole family vanish
+/// from `/metrics`.
+pub(crate) async fn record_request_duration(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let route = route_label(req.uri().path());
+    let start = Instant::now();
+    let resp = next.run(req).await;
+    lock_recovering(&state.request_durations, "request_durations")
+        .entry((route, resp.status().as_u16()))
+        .or_default()
+        .observe(start.elapsed());
+    resp
+}
+
+/// Git revision baked in at build time (`ANTHROPIC_LB_GIT_SHA`, which the
+/// Dockerfile sets from its `GIT_SHA` build argument). Truncated to the
+/// 7-character form `sha-*` image tags use, so `anthropic_lb_info{revision}`
+/// compares byte-for-byte against the deployed tag. `unknown` when unset.
+fn build_revision(raw: Option<&'static str>) -> &'static str {
+    let sha = raw.unwrap_or("");
+    if sha.is_empty() {
+        return "unknown";
+    }
+    sha.get(..7).unwrap_or(sha)
+}
+
 #[derive(Default, Clone)]
 struct ClaimMetricsSnap {
     key: String,
@@ -434,6 +555,13 @@ pub(crate) async fn metrics_handler(
             .map(|(k, v)| (*k, *v))
             .collect();
     let (session_buckets, session_tokens_sum) = state.session_tokens_histogram(now_epoch);
+    let mut request_durations: Vec<((&'static str, u16), RequestDurationHist)> =
+        lock_recovering(&state.request_durations, "request_durations")
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+    // Stable order for the humans who diff two scrapes.
+    request_durations.sort_by_key(|(k, _)| *k);
 
     // ── Phase 2: Serialize (sync — no locks held) ──────────────────
 
@@ -444,14 +572,55 @@ pub(crate) async fn metrics_handler(
         &mut buf,
         "anthropic_lb_info",
         "gauge",
-        "Load balancer info, always 1",
+        "Load balancer info, always 1; version is the crate version, revision the short git commit of the build",
     );
     prom_gauge(
         &mut buf,
         "anthropic_lb_info",
-        &[("strategy", state.routing_strategy.as_str())],
+        &[
+            ("strategy", state.routing_strategy.as_str()),
+            ("version", env!("CARGO_PKG_VERSION")),
+            (
+                "revision",
+                build_revision(option_env!("ANTHROPIC_LB_GIT_SHA")),
+            ),
+        ],
         1.0,
     );
+
+    prom_header(
+        &mut buf,
+        "process_start_time_seconds",
+        "gauge",
+        "Start time of the process since unix epoch in seconds",
+    );
+    prom_gauge(
+        &mut buf,
+        "process_start_time_seconds",
+        &[],
+        state.start_epoch as f64,
+    );
+
+    // Request latency by (route, status). Per-process, so unlike the
+    // Redis-mirrored series below this one aggregates with sum.
+    prom_header(
+        &mut buf,
+        "anthropic_http_request_duration_seconds",
+        "histogram",
+        "Seconds from request receipt until response headers are sent (streamed body time excluded; a request the client abandons before headers is not recorded) by route and status; per-process, aggregate with sum",
+    );
+    for ((route, status), hist) in &request_durations {
+        let status = status.to_string();
+        let (series, sum, count) = hist.snapshot();
+        prom_histogram(
+            &mut buf,
+            "anthropic_http_request_duration_seconds",
+            &[("route", route), ("status", &status)],
+            &series,
+            sum,
+            count,
+        );
+    }
 
     // Account utilization
     prom_header(
@@ -1302,12 +1471,16 @@ pub(crate) async fn metrics_handler(
         &mut buf,
         "anthropic_upstream_transport_errors_total",
         "counter",
-        "Upstream transport send-failures by kind",
+        "Upstream transport send-failures by kind. Where anthropic_cluster_redis_connected is 1 this is the Redis fleet-wide total, identical on every replica (aggregate with max). Otherwise it is this process's local count (aggregate with sum): without Redis every failure it has seen; with Redis, before the first sync or while unreachable, the failures it has still to flush, which can include some already counted in the fleet total",
     );
     // Prefer the Redis fleet-wide aggregate (cached every 5s by the sync task)
     // so multi-replica deployments report a cluster-wide count; fall back to the
     // local accumulator when Redis is absent or the aggregate is unavailable
-    // (single-instance, pre-first-sync, or a Redis blip).
+    // (single-instance, pre-first-sync, or a Redis blip). With Redis that
+    // accumulator holds the deltas awaiting a flush, including any re-queued by
+    // a failed one (at-least-once), so the fallback is a per-replica count that
+    // can overlap the fleet total: the HELP text names the gauge that tells the
+    // two scopes apart.
     let transport_errors: Vec<(String, u64)> = cluster_info
         .as_ref()
         .and_then(|ci| ci.get("transport_errors"))
@@ -1691,24 +1864,12 @@ pub(crate) async fn metrics_handler(
             "histogram",
             "Guard request-body scan duration in seconds",
         );
-        for (le, cumulative) in &hist {
-            prom_counter(
-                &mut buf,
-                "anthropic_guard_scan_duration_seconds_bucket",
-                &[("le", le.as_str())],
-                *cumulative,
-            );
-        }
-        prom_gauge(
+        prom_histogram(
             &mut buf,
-            "anthropic_guard_scan_duration_seconds_sum",
+            "anthropic_guard_scan_duration_seconds",
             &[],
+            &hist,
             sum,
-        );
-        prom_counter(
-            &mut buf,
-            "anthropic_guard_scan_duration_seconds_count",
-            &[],
             count,
         );
     }
