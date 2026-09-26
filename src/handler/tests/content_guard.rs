@@ -886,6 +886,12 @@ fn guard_unreadable_block_shapes(secret: &str) -> Vec<(&'static str, serde_json:
             serde_json::json!([{"type": "x", "content": leak}]),
         ),
         (
+            "tool-result-nested",
+            serde_json::json!([{"type": "tool_result", "tool_use_id": "t2", "content": [
+                {"type": "tool_result", "tool_use_id": "t3", "content": leak}
+            ]}]),
+        ),
+        (
             "unknown-type-source",
             serde_json::json!([{"type": "x", "source": text_source(serde_json::json!(leak))}]),
         ),
@@ -984,7 +990,7 @@ fn guard_unreadable_block_shapes(secret: &str) -> Vec<(&'static str, serde_json:
 }
 
 /// LAB-5542: `document` and `search_result` blocks, each carrying the secret in
-/// ONE model-visible field. Every row must be scanned and blocked on its
+/// ONE model-visible field, plus a `text` smuggled onto a non-text block. Every row must be scanned and blocked on its
 /// findings, at top level and inside `tool_result.content`.
 #[cfg(feature = "guard")]
 fn guard_scanned_block_shapes(secret: &str) -> Vec<(&'static str, serde_json::Value)> {
@@ -1046,6 +1052,15 @@ fn guard_scanned_block_shapes(secret: &str) -> Vec<(&'static str, serde_json::Va
             "document-context",
             serde_json::json!([{"type": "document", "source": pdf, "context": leak}]),
         ),
+        // Translation to an OpenAI upstream joins every `tool_result` part's
+        // `text` whatever its type, so this reaches the model there.
+        (
+            "image-with-text",
+            serde_json::json!([{
+                "type": "image", "text": leak,
+                "source": {"type": "url", "url": "https://example.com/a.png"}
+            }]),
+        ),
     ]
 }
 
@@ -1099,6 +1114,12 @@ fn guard_openai_translation_loss_shapes(secret: &str) -> Vec<(&'static str, serd
             serde_json::json!([{"role": "tool", "tool_call_id": "t1", "content": [
                 {"type": "search_result", "text": "", "source": "s", "title": "t",
                  "content": [{"type": "text", "text": leak}]}
+            ]}]),
+        ),
+        (
+            "tool-part-search-result-title-only",
+            serde_json::json!([{"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "search_result", "title": leak}
             ]}]),
         ),
         (
@@ -1252,8 +1273,6 @@ async fn guard_block_fails_closed_on_unreadable_openai_messages() {
 /// on its findings with nothing on the wire — on `/v1/messages` at top level and
 /// inside `tool_result.content`, and on `/v1/chat/completions` as a `user`
 /// content part, which translation clones verbatim.
-///
-/// Before this change every row forwarded: the scanner skipped both block types.
 #[cfg(feature = "guard")]
 #[tokio::test]
 async fn guard_block_scans_document_and_search_result_blocks() {
@@ -1394,7 +1413,7 @@ async fn guard_block_fails_closed_on_oversized_document_text() {
 /// expensive fixture (`Guard::new()`) is already shared across them.
 #[cfg(feature = "guard")]
 #[tokio::test]
-async fn guard_non_block_forwards_unreadable_messages_byte_identically() {
+async fn guard_non_block_forwards_block_rejected_bodies_byte_identically() {
     let secret = AWS_DOCS_EXAMPLE_SECRET_KEY;
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
@@ -1506,17 +1525,13 @@ async fn guard_non_block_forwards_unreadable_messages_byte_identically() {
 /// surfaces; a fix that closed the bypasses by treating "no text" as "could not
 /// read" goes red here.
 ///
-/// LAB-5542 widens the table to the rest of the coverage boundary. Every row is
-/// a block type the scanner knows it cannot or need not read (an `image`
-/// anywhere, including inside a `document` content source; a PDF or file
-/// `document` with benign `title` / `context`; audio and file parts;
-/// `tool_reference` and `browser_state`), or a benign mixed image-and-text
-/// content source. The unknown-type rule must not turn any of them into a
-/// fail-closed 400: `image` carries a `source` field, and an `image` inside
-/// `tool_result.content` is the everyday tool-screenshot shape.
+/// LAB-5542 widens the table to the rest of the coverage boundary. The
+/// unknown-type rule must not turn any row into a 400: `image` carries a
+/// `source` field, and an `image` inside `tool_result.content` is the everyday
+/// tool-screenshot shape.
 #[cfg(feature = "guard")]
 #[tokio::test]
-async fn guard_block_forwards_image_only_turn() {
+async fn guard_block_forwards_coverage_boundary_blocks() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let state = Arc::new(AppState {
         endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],

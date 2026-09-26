@@ -305,12 +305,17 @@ fn openai_message_readable(message: &Value) -> Result<(), &'static str> {
                 // the `tool` arm joins parts through `p.get("text").as_str()`
                 // without consulting `type`, dropping anything else silently.
                 string_field(part, "text")?;
-                // LAB-5542: that join keeps ONLY `text`, so a `tool` part's
-                // `content` or `source` never reaches the scan — whether or not
-                // a `text` sits beside it, since a decoy `"text": ""` would
-                // otherwise scan clean. A `user` part is cloned verbatim and
-                // `from_body` reads those fields on the translated document.
-                if role == "tool" && (carries(part, "content") || carries(part, "source")) {
+                // LAB-5542: that join keeps ONLY `text`, so any other
+                // text-bearing field of a `tool` part never reaches the scan —
+                // whether or not a `text` sits beside it, since a decoy
+                // `"text": ""` would otherwise scan clean. A `user` part is
+                // cloned verbatim and `from_body` reads those fields on the
+                // translated document.
+                if role == "tool"
+                    && TEXT_BEARING_FIELDS
+                        .iter()
+                        .any(|k| *k != "text" && carries(part, k))
+                {
                     return Err(REASON_CONTENT_UNREADABLE);
                 }
                 // `image_url` is read through `pointer("/image_url/url")`, so
@@ -350,9 +355,16 @@ fn carries(block: &Value, key: &str) -> bool {
     block.get(key).is_some_and(|v| !v.is_null())
 }
 
+/// The content-block fields that carry model-visible text: a `text` block's
+/// `text`, a `document`'s `source` / `title` / `context`, a `search_result`'s
+/// `content` / `source` / `title`.
+const TEXT_BEARING_FIELDS: [&str; 5] = ["text", "content", "source", "title", "context"];
+
 /// Pull every model-visible string out of one newest-turn content block, at
-/// top level or inside `tool_result.content` (`tool_result` itself is walked by
-/// [`collect_tool_result`]). `Err` carries the reason the block was unreadable.
+/// top level or inside `tool_result.content` (a newest-turn `tool_result` is
+/// walked by [`collect_tool_result`]; one nested inside another carries
+/// `content`, so it fails closed below). `Err` carries the reason the block was
+/// unreadable.
 ///
 /// LAB-5542: `document` and `search_result` are the retrieval and web-fetch
 /// paths, where indirect prompt injection arrives, so their text is scanned.
@@ -360,8 +372,12 @@ fn carries(block: &Value, key: &str) -> bool {
 /// is binary or not in the request at all. That is a coverage limit, not a
 /// readability failure, and the image-only turn stays a deliberate allow.
 ///
-/// Any other type is skipped only while it carries no text-bearing field
-/// (`text`, `content`, `source`). One that does is content the scanner cannot
+/// A `text` field is scanned whatever the type says: translating to an OpenAI
+/// upstream joins every `tool_result` part's `text` without consulting `type`,
+/// so a `text` on an `image` block becomes model-visible there.
+///
+/// Any other type is skipped only while it carries none of
+/// [`TEXT_BEARING_FIELDS`]. One that does is content the scanner cannot
 /// read that the upstream receives, so it fails closed: skipping it let
 /// `{"type":"x","text":"<secret>"}` through, and the next new block type would
 /// reopen the gap. This is not an allowlist of types — audio, file,
@@ -372,9 +388,9 @@ fn collect_block<'a>(block: &'a Value, out: &mut Vec<&'a str>) -> Result<(), &'s
     let Some(block_type) = block.get("type").and_then(Value::as_str) else {
         return Err(REASON_CONTENT_UNREADABLE);
     };
+    out.extend(string_field(block, "text")?);
     match block_type {
-        "text" => out.extend(string_field(block, "text")?),
-        "image" => {}
+        "text" | "image" => {}
         "search_result" => {
             out.extend(string_field(block, "title")?);
             out.extend(string_field(block, "source")?);
@@ -418,10 +434,7 @@ fn collect_block<'a>(block: &'a Value, out: &mut Vec<&'a str>) -> Result<(), &'s
                 _ => return Err(REASON_CONTENT_UNREADABLE),
             }
         }
-        _ if ["text", "content", "source"]
-            .iter()
-            .any(|k| carries(block, k)) =>
-        {
+        _ if TEXT_BEARING_FIELDS.iter().any(|k| carries(block, k)) => {
             return Err(REASON_CONTENT_UNREADABLE);
         }
         _ => {}
@@ -1016,6 +1029,12 @@ mod tests {
                 ]}}),
                 vec!["m-content-array-1", "m-content-array-2"],
             ),
+            // A `text` is read whatever the type: the OpenAI translation joins it.
+            (
+                json!({"type": "image", "text": "m-image-text",
+                       "source": {"type": "url", "url": "https://example.com/a.png"}}),
+                vec!["m-image-text"],
+            ),
             // `title` and `context` are read whatever the source.
             (
                 json!({"type": "document", "title": "m-pdf-title", "context": "m-pdf-context",
@@ -1060,7 +1079,6 @@ mod tests {
             json!({"type": "search_result", "source": null, "title": null, "content": null}),
             json!({"type": "tool_reference", "tool_name": "get_weather"}),
             json!({"type": "browser_state", "tabs": [{"tab_id": 1, "title": "t", "url": "https://example.com/"}]}),
-            json!({"type": "input_audio", "input_audio": {"data": "UklG", "format": "wav"}}),
             json!({"type": "x", "text": null, "content": null, "source": null}),
         ] {
             for body in [

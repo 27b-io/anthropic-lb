@@ -487,7 +487,7 @@ content: its `text` blocks, the text of its `document` and `search_result`
 blocks, and the same inside its `tool_result` blocks. For a `document` that is a
 `text` source's `data`, a `content` source's string or `text` blocks, and the
 `title` and `context` of any document; for a `search_result`, its `text` blocks,
-`title` and `source`. Those are the retrieval and web-fetch paths, where
+`title` and `source`; and a `text` field on any block. Those are the retrieval and web-fetch paths, where
 indirect prompt injection arrives. The `system` prompt is never scanned (it is
 operator-trusted and a known false-positive surface). Detection is strictly
 read-only: the body forwarded upstream is byte-identical to what the client
@@ -504,7 +504,7 @@ body, such as `GET /v1/models`, has nothing to scan and passes through.
 On `/v1/chat/completions` the body is scanned after translation to the Messages
 shape, but judged **readable** on the body the client sent. The translator is
 lossy in three places — a non-array `messages`, a `tool` message's non-string
-`content` or any field of a `tool` content part other than `text`, and a
+`content` or a `tool` content part's fields other than `text`, and a
 malformed `image_url` part all collapse to empty before the scanner sees them —
 so a document that is unreadable on the wire would otherwise read as clean,
 which is worse than reading as unscanned.
@@ -524,8 +524,8 @@ not `user`/`assistant`, or a newest-turn `content` that is present in a shape th
 scanner cannot walk (an object, a text block whose `text` is not a string, a
 `tool_result` whose content is neither string nor block array, a `document` or
 `search_result` in a shape the API does not define), or a content block of a
-type the scanner does not know that carries a `text`, `content` or `source`
-field. Those are not "nothing to scan" — the guard could not tell what it was looking at, and under
+type the scanner does not know that carries a `text`, `content`, `source`,
+`title` or `context` field. Those are not "nothing to scan" — the guard could not tell what it was looking at, and under
 `block` they fail closed (below). Note an absent field is not the same as a
 present unreadable one: absent content cannot be hiding anything.
 
@@ -583,10 +583,10 @@ same 400 rather than forwarded unscanned:
   object, a `role` absent / not a string / not `user` or `assistant` (`"User"`
   included: the compare is exact), or a newest-turn `content` present in a shape
   it cannot walk. That includes a malformed `document` or `search_result`, and
-  a block of a type the scanner does not know that carries a `text`, `content`
-  or `source` field (`{"type": "x", "text": "..."}`). Image, audio, file,
-  `tool_reference` and `browser_state` blocks carry none of those and still
-  pass. Each of these is content the guard never saw and the upstream would
+  a block of a type the scanner does not know that carries a `text`, `content`,
+  `source`, `title` or `context` field (`{"type": "x", "text": "..."}`).
+  Audio, file, `tool_reference` and `browser_state` blocks carry none of those
+  and still pass; images are skipped as a known binary type. Each of these is content the guard never saw and the upstream would
   have;
 - the body parsed as JSON but is not an object — a bare string or array is not a
   request any endpoint here accepts, and reads as "no `messages` field" without
@@ -594,8 +594,8 @@ same 400 rather than forwarded unscanned:
 - on `/v1/chat/completions` only, `messages` is absent or not an array, or a
   `user`/`tool` message's content is in a shape translation would flatten (a
   non-string `tool` content, a content part with no string `type`, a `text` that
-  is not a string, a `tool` content part carrying `content` or `source` —
-  translation keeps only its `text` — or an `image_url` that is not an object
+  is not a string, a `tool` content part carrying `content`, `source`, `title`
+  or `context` — translation keeps only its `text` — or an `image_url` that is not an object
   with a string `url`).
   That endpoint is a single API which requires `messages`, and an
   `openai`-protocol endpoint forwards the client's original bytes, so what
