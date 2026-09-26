@@ -50,7 +50,10 @@ pub(crate) const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
 /// conservatively against observed wire formats:
 ///   - Anthropic: 404 `{"type":"error","error":{"type":"not_found_error",
 ///     "message":"model: <id>"}}` — also what subscription accounts return
-///     for models outside their plan.
+///     for models outside their plan. Matched only when `<id>` is `model`,
+///     the model the request asked for, so a 404 can mark only the model it
+///     names, even where the proxy and upstream read a different one of two
+///     duplicate `model` keys.
 ///   - LiteLLM-style gateways: 400 `{"error":{"message":"... Invalid model
 ///     name passed in model=<id> ..."}}` (observed live from insight-gateway,
 ///     2026-07-27). Free text, so matched for `Protocol::OpenAI` endpoints
@@ -75,7 +78,7 @@ pub(crate) fn is_model_unsupported_error(
     };
     let msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("");
     if err.get("type").and_then(|v| v.as_str()) == Some("not_found_error")
-        && msg.starts_with("model:")
+        && msg.strip_prefix("model: ") == Some(model)
     {
         return true;
     }

@@ -339,11 +339,15 @@ async fn resend_outcome_supersedes_stashed_entitlement_400() {
         ),
     ] {
         let (url, target_hits) = spawn_status_then_ok_upstream(usize::MAX, head, b"{}").await;
-        let (_state, addr, spent_hits) = spent_then(ENTITLEMENT_400_BODY, &url).await;
+        let (state, addr, spent_hits) = spent_then(ENTITLEMENT_400_BODY, &url).await;
+        // The model `HEAD_404_MODEL` names, so its 404 reads as a model
+        // rejection of THIS request rather than as a plain client error.
         let resp = reqwest::Client::new()
             .post(format!("http://{addr}/v1/messages"))
             .header("content-type", "application/json")
-            .body(MESSAGES_BODY)
+            .body(
+                r#"{"model":"claude-nope-1","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+            )
             .send()
             .await
             .unwrap();
@@ -358,6 +362,14 @@ async fn resend_outcome_supersedes_stashed_entitlement_400() {
             assert!(
                 body.contains("not_found_error") && body.contains("claude-nope-1"),
                 "{kind}: the re-send target's own error must reach the caller: {body}"
+            );
+            assert!(
+                state
+                    .unsupported_models
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(1, "claude-nope-1".to_string())),
+                "{kind}: the re-send must end on the model-rejection outcome"
             );
         }
         assert_eq!(

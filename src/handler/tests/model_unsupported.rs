@@ -158,13 +158,15 @@ async fn model_unsupported_filters_routing_until_expiry() {
     assert_eq!(candidates.len(), 2, "expired entry must not filter routing");
 }
 
-/// The learn map is bounded: past UNSUPPORTED_MODEL_MAX distinct pairs, new
-/// learns are dropped — model strings are client-supplied input. An EXISTING
-/// pair must still refresh its TTL at capacity (refresh doesn't grow the map).
+/// The learn map is bounded: past UNSUPPORTED_MODEL_MAX distinct pairs, a new
+/// learn evicts the entry nearest expiry — model strings are client-supplied
+/// input. An EXISTING pair must still refresh its TTL at capacity (refresh
+/// doesn't grow the map).
 #[test]
 fn model_unsupported_map_is_bounded() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a")]);
-    for i in 0..(UNSUPPORTED_MODEL_MAX + 50) {
+    let last = UNSUPPORTED_MODEL_MAX + 49;
+    for i in 0..=last {
         state.note_model_unsupported("a", 0, &format!("model-{i}"));
     }
     assert_eq!(
@@ -174,12 +176,12 @@ fn model_unsupported_map_is_bounded() {
 
     // Shorten one live entry's TTL, then re-note it with the map still full:
     // the refresh must land (expiry back to ~full TTL), not be dropped.
-    let key = (0usize, "model-0".to_string());
+    let key = (0usize, format!("model-{last}"));
     {
         let mut map = state.unsupported_models.lock().unwrap();
         map.insert(key.clone(), Instant::now() + Duration::from_secs(1));
     }
-    state.note_model_unsupported("a", 0, "model-0");
+    state.note_model_unsupported("a", 0, &format!("model-{last}"));
     {
         let map = state.unsupported_models.lock().unwrap();
         assert_eq!(
@@ -711,4 +713,92 @@ async fn gateway_echo_of_client_key_does_not_negative_cache() {
             "{kind}: the model must not be negative-cached"
         );
     }
+}
+
+// ── Negative-cache hardening: client model strings ──
+
+/// A spray of distinct bogus models fills the map; a genuine rejection that
+/// arrives afterwards is still learned, and the next request for that model
+/// routes away from the endpoint that rejected it.
+#[tokio::test]
+async fn bogus_model_spray_cannot_block_a_genuine_learn() {
+    use std::sync::atomic::Ordering;
+    const HEAD_400_LITELLM: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"/chat/completions: Invalid model name passed in model=claude-opus-5. Call `/v1/models` to view available models for your key.\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"400\"}}";
+    let (gw_url, gw_hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_400_LITELLM, OPENAI_OK_BODY).await;
+    let (ok_url, _h) = spawn_mock_upstream().await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = gw_url;
+    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+    healthy.priority = 1;
+    let state = test_state_with(vec![gw, healthy]);
+    for i in 0..UNSUPPORTED_MODEL_MAX {
+        state.note_model_unsupported("healthy", 1, &format!("bogus-{i}"));
+    }
+    let addr = serve(build_router(state.clone())).await;
+
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+    assert_eq!(
+        gw_hits.load(Ordering::SeqCst),
+        1,
+        "the genuine learn must land in a full map, so the second request skips the gateway"
+    );
+    let map = state.unsupported_models.lock().unwrap();
+    assert_eq!(map.len(), UNSUPPORTED_MODEL_MAX, "the map stays bounded");
+    assert!(map.contains_key(&(0, "claude-opus-5".to_string())));
+}
+
+/// A model 404 marks only the model it names. With two `model` keys the proxy
+/// reads the last one; an upstream that read the first would reject a model
+/// the proxy never asked for, and must not get the requested one cached.
+#[tokio::test]
+async fn model_404_naming_another_model_does_not_negative_cache() {
+    use std::sync::atomic::Ordering;
+    assert!(!is_model_unsupported_error(
+        StatusCode::NOT_FOUND,
+        &serde_json::json!({"type":"error","error":{"type":"not_found_error","message":"model: claude-nope-1"}}),
+        Protocol::Anthropic,
+        "claude-opus-5"
+    ));
+    let (url, hits) = spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
+    let (other_url, other_hits) = spawn_status_then_ok_upstream(0, "", b"{}").await;
+    let rejecting = mk_endpoint_at("rejecting", "sk-ant-api-r", &url);
+    let mut other = mk_endpoint_at("other", "sk-ant-api-o", &other_url);
+    other.priority = 1;
+    let state = test_state_with(vec![rejecting, other]);
+    let addr = serve(build_router(state.clone())).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-nope-1","model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "the upstream's 404 reaches the caller as-is"
+    );
+    assert_eq!(
+        (
+            hits.load(Ordering::SeqCst),
+            other_hits.load(Ordering::SeqCst)
+        ),
+        (1, 0),
+        "a 404 for another model must not rotate the request"
+    );
+    assert!(
+        state.unsupported_models.lock().unwrap().is_empty(),
+        "the requested model must not be negative-cached"
+    );
 }

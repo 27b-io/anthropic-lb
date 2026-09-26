@@ -78,8 +78,9 @@ const UNSUPPORTED_MODEL_TTL: Duration = Duration::from_secs(900);
 
 /// Bound on distinct learned (endpoint, model) rejections. Model names are
 /// client-supplied, so without a cap a client spraying junk model names could
-/// grow the map without limit. When full, new learns are dropped (that only
-/// costs the pre-LAB-941 behaviour) and TTL expiry drains the map.
+/// grow the map without limit. When full, a new learn evicts the entry nearest
+/// expiry: dropping new learns instead would let a spray of bogus models lock
+/// genuine ones out until the spray's own entries expired.
 pub(crate) const UNSUPPORTED_MODEL_MAX: usize = 256;
 
 /// Sentinel value written to `alb:hard:{account}` when a replica has observed
@@ -1480,11 +1481,20 @@ impl AppState {
         let now = Instant::now();
         let mut map = self.lock_unsupported_models();
         map.retain(|_, expiry| *expiry > now);
-        // Capacity gates NEW pairs only — refreshing an existing pair's TTL
-        // doesn't grow the map and must not starve under sustained rejections.
+        // Capacity touches NEW pairs only — refreshing an existing pair's TTL
+        // doesn't grow the map. Every entry has the same TTL, so the one
+        // nearest expiry is the least recently learned. Under a sustained
+        // spray a genuine learn can be evicted early; re-learning it costs one
+        // upstream attempt, never a refusal.
         let key = (endpoint_idx, model.to_string());
         if !map.contains_key(&key) && map.len() >= UNSUPPORTED_MODEL_MAX {
-            return;
+            let oldest = map
+                .iter()
+                .min_by_key(|(_, expiry)| **expiry)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                map.remove(&oldest);
+            }
         }
         warn!(
             account = endpoint_name,
