@@ -191,7 +191,7 @@ pub(crate) async fn try_fallback_upstream(
         // endpoint just doesn't serve it (LAB-941, observed 2026-07-27 when a
         // 529 storm drained the Anthropic pool into insight-gateway).
         let model_unsupported = serde_json::from_str::<serde_json::Value>(&err_body)
-            .map(|v| is_model_unsupported_error(status, &v))
+            .map(|v| is_model_unsupported_error(status, &v, ep.protocol))
             .unwrap_or(false);
         let response = if translate {
             // Return error in Anthropic format
