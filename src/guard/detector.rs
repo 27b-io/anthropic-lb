@@ -56,6 +56,10 @@ pub const DEFAULT_CHUNK_TOKENS: usize = 512;
 pub const DEFAULT_CACHE_SIZE: u64 = 10_000;
 pub const DEFAULT_BREAKER_THRESHOLD: u32 = crate::utilization::TRANSPORT_FAILURE_THRESHOLD;
 pub const DEFAULT_BREAKER_COOLDOWN_SECS: u64 = 30;
+/// A day, the ceiling the proxy already puts on an upstream `retry-after`. The
+/// breaker computes `now + cooldown` when it opens, and a value past what
+/// `Instant` can hold would panic there instead of opening it.
+const MAX_BREAKER_COOLDOWN_SECS: u64 = 86_400;
 
 /// Bytes of overlap between consecutive chunks, so an injection straddling a
 /// boundary is whole in at least one chunk: ~32 tokens of prose, the language
@@ -372,8 +376,10 @@ impl Detector {
         if cfg.breaker_threshold == 0 {
             return Err(bad("breaker_threshold must be >= 1".to_string()));
         }
-        if cfg.breaker_cooldown_secs == 0 {
-            return Err(bad("breaker_cooldown_secs must be >= 1".to_string()));
+        if !(1..=MAX_BREAKER_COOLDOWN_SECS).contains(&cfg.breaker_cooldown_secs) {
+            return Err(bad(format!(
+                "breaker_cooldown_secs must be in 1..={MAX_BREAKER_COOLDOWN_SECS}"
+            )));
         }
         let timeout = Duration::from_millis(cfg.timeout_ms);
         // The detector sees request content, so it gets its own client: no

@@ -31,13 +31,16 @@ fn unknown_keys_are_rejected() {
 #[test]
 fn invalid_configs_fail_startup() {
     type Case = (&'static str, fn(&mut DetectorConfig));
-    let cases: [Case; 7] = [
+    let cases: [Case; 9] = [
         ("scheme", |c| c.url = "ftp://detector".into()),
         ("credentials", |c| c.url = "http://user:pw@detector".into()),
         ("unparseable", |c| c.url = "not a url".into()),
         ("threshold", |c| c.threshold = 0.0),
         ("chunk_tokens", |c| c.chunk_tokens = 64),
         ("breaker_threshold", |c| c.breaker_threshold = 0),
+        ("cooldown zero", |c| c.breaker_cooldown_secs = 0),
+        // `now + cooldown` overflows `Instant` and panics at the first OPEN.
+        ("cooldown overflow", |c| c.breaker_cooldown_secs = u64::MAX),
         ("timeout", |c| c.timeout_ms = 0),
     ];
     for (label, tweak) in cases {
@@ -49,6 +52,9 @@ fn invalid_configs_fail_startup() {
         );
     }
     assert!(Detector::new("bad name", &detector_cfg("http://x")).is_err());
+    detector("http://127.0.0.1:1", |c| {
+        c.breaker_cooldown_secs = MAX_BREAKER_COOLDOWN_SECS
+    });
 }
 
 #[test]
