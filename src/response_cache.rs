@@ -1052,7 +1052,14 @@ impl AppState {
         let model = truncate_label(model);
         let first_time = {
             let mut counts = lock_recovering(&self.model_denied, "model_denied");
-            let key = (client_id.to_owned(), model.clone());
+            // `_other` is the overflow sentinel below; a request for a model
+            // literally named that must not alias its client's bucket.
+            let model_label = if model == "_other" {
+                "__other".to_owned()
+            } else {
+                model.clone()
+            };
+            let key = (client_id.to_owned(), model_label);
             let label = if counts.len() < MAX_MODEL_DENIED_LABELS || counts.contains_key(&key) {
                 key
             } else if self.clients.iter().any(|c| c.name == client_id) {

@@ -666,12 +666,15 @@ The 400 itself is forwarded to the client unchanged.
 Requests rejected by a client's model allow-list are counted as
 `anthropic_client_model_denied_total{client,model}` and logged at WARN. The
 `model` label is caller-controlled, so the label set is bounded — past 64
-distinct pairs a client's further denials lump into its own
-`client="<name>",model="_other"` bucket, so attribution and the first-overflow
-WARN survive (hard bound: 64 + number of `[[clients]]` + 1 series). `_other`
+distinct pairs a denial for a NEW (client, model) pair lumps into that
+client's `client="<name>",model="_other"` bucket, so attribution and the
+first-overflow WARN survive; already-tracked pairs keep counting on their own
+series (hard bound: 64 + number of `[[clients]]` + 1 series). `_other`
 is a reserved client name: config validation rejects a `[[clients]]` entry or
 `client_names` value named `_other`, and a legacy `x-client-id: _other`
-header is ignored, so real traffic can never pre-claim the global bucket.
+header is ignored, so real traffic can never pre-claim the global bucket. A
+denied request for a model literally named `_other` is labelled
+`model="__other"`, so it cannot pre-claim a client's bucket either.
 `anthropic_client_model_token_usage_total` instead uses one global
 `client="_other",model="_other"` bucket, because its client id can be
 header-asserted under legacy auth (bounded at 256 + 1 distinct (client,

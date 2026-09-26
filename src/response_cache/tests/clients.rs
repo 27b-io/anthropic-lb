@@ -400,6 +400,31 @@ fn model_denial_labels_are_bounded_by_other_overflow() {
     );
 }
 
+/// A configured client can ASK for a model literally named `_other`. That
+/// denial must not alias the client's overflow bucket, or overflow counts are
+/// inflated and the client pre-empts its own first-overflow warn (LAB-4028).
+#[tokio::test]
+async fn model_denial_literal_other_model_does_not_alias_overflow_bucket() {
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    assert!(state.pre_request_gate("limited", "_other").await.is_err());
+    for i in 0..(MAX_MODEL_DENIED_LABELS + 25) {
+        state.note_model_denied("limited", &format!("junk-model-{i}"));
+    }
+    assert!(state.pre_request_gate("limited", "_other").await.is_err());
+
+    let counts = state.model_denied.lock().unwrap();
+    assert_eq!(
+        counts.get(&("limited".to_string(), "_other".to_string())),
+        Some(&26),
+        "overflow bucket must count overflow only: 1 literal + 63 junk fill the cap, 26 junk spill"
+    );
+    assert_eq!(
+        counts.get(&("limited".to_string(), "__other".to_string())),
+        Some(&2),
+        "a literal `_other` model must keep a label of its own"
+    );
+}
+
 // ── Integration: both surfaces, through the real router ──
 
 fn authed_app(upstream_url: &str, clients: Vec<ClientConfig>) -> (Router, Arc<AppState>) {
