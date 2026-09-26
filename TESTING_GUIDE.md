@@ -77,7 +77,7 @@ cargo test --test config_test test_minimal_valid_config
 
 ## Redis Integration Tests
 
-The `redis_integration` module (`src/tests.rs`) exercises the cross-replica
+The `redis_integration` module (`src/persistence/tests/real_redis.rs`) exercises the cross-replica
 coordination layer — budget INCRBY/EXPIRE, hard-limit propagation, the Lua
 CAS recovery sentinel, the `sync_from_redis` MGET merge, `SCAN` pagination,
 pipelined `HINCRBY`, and the `SET NX EX` probe lock — against a **real

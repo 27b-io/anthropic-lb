@@ -139,7 +139,7 @@ probe_interval_secs = 300
 #       <-> tool_addition/tool_removal blocks and output_config.effort/timing
 #           on the role:"system" entry in messages
 # To allow one extra flag, copy every entry of DEFAULT_CLIENT_BETA_ALLOWLIST in
-# src/main.rs (the authoritative list) and add yours:
+# src/utilization.rs (the authoritative list) and add yours:
 # allowed_client_betas = [
 #   # ...every DEFAULT_CLIENT_BETA_ALLOWLIST entry...
 #   "my-extra-beta-*",
