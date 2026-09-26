@@ -1035,7 +1035,9 @@ impl AppState {
     /// client's `("<client>", "_other")` bucket, so the denial stays
     /// attributed and that client's first overflow denial still warns; a
     /// client id NOT in `[[clients]]` lumps into the one global
-    /// `("_other", "_other")` bucket and can never mint a key.
+    /// `("_other", "_other")` bucket and can never mint a key. A model named
+    /// `_other`, `__other`, … gains one more leading `_` in its label, so it
+    /// never pre-claims its client's bucket and no two models share a label.
     ///
     /// The client axis is config-bounded by reachability, not by the header
     /// filter: this runs only when `client_allows_model` returned false, which
@@ -1055,10 +1057,7 @@ impl AppState {
         let model = truncate_label(model);
         let first_time = {
             let mut counts = lock_recovering(&self.model_denied, "model_denied");
-            // `_other` is the overflow sentinel below; a request for a model
-            // literally named that must not alias its client's bucket. Every
-            // `_…_other` model gains one more `_`, so the escape never yields
-            // `_other` and never merges two models (`_other` ≠ `__other`).
+            // Escape `_…_other` models off the overflow sentinel (fn doc).
             let sentinel_like = model.starts_with('_') && model.trim_start_matches('_') == "other";
             let model_label = if sentinel_like {
                 format!("_{model}")
