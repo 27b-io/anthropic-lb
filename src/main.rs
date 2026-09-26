@@ -345,7 +345,7 @@ fn validate_exposure(config: &Config) -> Result<(), String> {
         return Err(
             "config: no credentials configured — add [[clients]] entries (or legacy proxy_key), \
              or explicitly set allow_unauthenticated = true for a trusted-network-only deployment \
-             (see README §Authentication)"
+             (see README §Client Setup)"
                 .to_string(),
         );
     }
@@ -356,7 +356,7 @@ fn validate_exposure(config: &Config) -> Result<(), String> {
     if has_credentials && allow_unauthenticated {
         return Err(
             "config: allow_unauthenticated = true is incompatible with configured credentials — \
-             remove it, or remove [[clients]]/proxy_key (see README §Authentication)"
+             remove it, or remove [[clients]]/proxy_key (see README §Client Setup)"
                 .to_string(),
         );
     }
@@ -470,7 +470,7 @@ fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
     // migration half-applied and the weaker one left in force.
     if table.contains_key("proxy_key") && table.contains_key("clients") {
         return Err(
-            "config: proxy_key and [[clients]] are mutually exclusive — [[clients]] supersedes it; remove proxy_key (see README §Authentication)"
+            "config: proxy_key and [[clients]] are mutually exclusive — [[clients]] supersedes it; remove proxy_key (see README §Client Setup)"
                 .to_string(),
         );
     }
@@ -700,7 +700,7 @@ async fn main() {
             "per-client authentication enabled — x-client-id is ignored, identity comes from the credential"
         );
     } else if config.proxy_key.is_some() {
-        warn!("legacy shared proxy_key in use — every caller shares one identity; migrate to [[clients]] (see README §Authentication)");
+        warn!("legacy shared proxy_key in use — every caller shares one identity; migrate to [[clients]] (see README §Client Setup)");
     } else {
         // validate_exposure guarantees this state is only reachable with the
         // flag explicitly set (AC-2).
