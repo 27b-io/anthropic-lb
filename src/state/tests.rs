@@ -1144,3 +1144,37 @@ async fn ingested_representative_claim_is_truncated_to_match_its_key() {
         info.claims_7d.keys().collect::<Vec<_>>()
     );
 }
+
+/// LAB-5313: a request-body read failure logs `req_id` and the error as
+/// structured fields, not interpolated into the message.
+#[tokio::test]
+async fn read_body_bounded_logs_read_error_with_req_id() {
+    let buf = log_capture_buf();
+    let state = test_state_with(vec![]);
+    let body = Body::from_stream(tokio_stream::iter([Err::<bytes::Bytes, _>(
+        std::io::Error::other("lab5313 client reset"),
+    )]));
+    let resp = read_body_bounded(&state, body, "lab5313-body-read")
+        .await
+        .unwrap_err();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let mine: Vec<&str> = output
+        .lines()
+        .filter(|l| l.contains(r#"req_id="lab5313-body-read""#))
+        .collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "expected one line, got:\n{}",
+        mine.join("\n")
+    );
+    assert!(
+        mine[0].contains(" ERROR ")
+            && mine[0].contains("failed to read request body")
+            && mine[0].contains("error=lab5313 client reset"),
+        "body read failure must log the error as a field, got: {}",
+        mine[0]
+    );
+}

@@ -53,9 +53,17 @@ pub(crate) const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
 ///     for models outside their plan.
 ///   - LiteLLM-style gateways: 400 `{"error":{"message":"... Invalid model
 ///     name passed in model=<id> ..."}}` (observed live from insight-gateway,
-///     2026-07-27).
+///     2026-07-27). Free text, so matched for `Protocol::OpenAI` endpoints
+///     only: Anthropic echoes client-chosen field names into its 400s
+///     (`<field>: Extra inputs are not permitted`), so on an Anthropic
+///     endpoint the phrase is client-controlled and one request could
+///     negative-cache the model for every client (LAB-5235).
 ///   - OpenAI: `{"error":{"code":"model_not_found", ...}}`.
-pub(crate) fn is_model_unsupported_error(status: StatusCode, body: &serde_json::Value) -> bool {
+pub(crate) fn is_model_unsupported_error(
+    status: StatusCode,
+    body: &serde_json::Value,
+    protocol: Protocol,
+) -> bool {
     if status != StatusCode::NOT_FOUND && status != StatusCode::BAD_REQUEST {
         return false;
     }
@@ -71,7 +79,7 @@ pub(crate) fn is_model_unsupported_error(status: StatusCode, body: &serde_json::
     if err.get("code").and_then(|v| v.as_str()) == Some("model_not_found") {
         return true;
     }
-    msg.to_ascii_lowercase().contains("invalid model name")
+    protocol == Protocol::OpenAI && msg.to_ascii_lowercase().contains("invalid model name")
 }
 
 /// Anchor for the entitlement 400 (LAB-4729). Only the first sentence: the
@@ -493,6 +501,7 @@ pub(crate) fn model_unsupported_response(model: &str, openai_shape: bool) -> Res
 
 /// Anthropic-shaped JSON error envelope for the proxy-generated admission
 /// denials (LAB-4129): `authenticate` 401, `pre_request_gate` 403/429,
+/// `deny_admin_reader`'s read-only-principal 403 (LAB-4395),
 /// `reserve_request_body` 503, `read_body_bounded` 408, the
 /// untranslatable-request 400, and `proxy_handler`'s 400 for a valid-JSON
 /// non-object body (LAB-4314) — the router fallback, so any method on any
@@ -1172,7 +1181,7 @@ pub(crate) async fn forward_anthropic(
             // here too: upstream sends the 400 as a JSON body, not an event
             // stream, so it re-sends before any byte reaches the client.
             let rotate: Option<fn(Box<Response>) -> ForwardOutcome> =
-                if is_model_unsupported_error(status, &parsed) {
+                if is_model_unsupported_error(status, &parsed, ep.protocol) {
                     state.note_model_unsupported(endpoint_name, endpoint_idx, model);
                     Some(ForwardOutcome::RetryModelUnsupported)
                 } else if is_entitlement_exhausted_400(status, &parsed) {
@@ -1408,6 +1417,13 @@ pub(crate) async fn proxy_handler(
     } = rctx;
     // affinity_key is built AFTER the body is parsed, so the content fingerprint
     // (fp) can be folded in as the finest routing discriminator.
+
+    // LAB-4395 / GH #199: a read-only principal is refused here, on identity
+    // alone, before it can reserve any of the shared body budget or have a
+    // byte of its body read. `pre_request_gate` repeats the check.
+    if let Some(resp) = state.deny_admin_reader(&req_id, &client_id) {
+        return *resp;
+    }
 
     // Debug: dump all inbound request headers
     if tracing::enabled!(tracing::Level::DEBUG) {
@@ -1654,7 +1670,7 @@ pub(crate) async fn proxy_handler(
     // Note: budget + emergency don't need `model` and could run before body parsing,
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
-    if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
+    if let Err(resp) = state.pre_request_gate(&req_id, &client_id, &model).await {
         return *resp;
     }
 

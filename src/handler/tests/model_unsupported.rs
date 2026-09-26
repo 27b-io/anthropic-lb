@@ -12,10 +12,15 @@ fn model_unsupported_error_detection() {
     });
     assert!(is_model_unsupported_error(
         StatusCode::NOT_FOUND,
-        &anthropic_404
+        &anthropic_404,
+        Protocol::Anthropic
     ));
     assert!(
-        !is_model_unsupported_error(StatusCode::INTERNAL_SERVER_ERROR, &anthropic_404),
+        !is_model_unsupported_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &anthropic_404,
+            Protocol::Anthropic
+        ),
         "status gate: a 5xx is never a model rejection"
     );
 
@@ -24,7 +29,7 @@ fn model_unsupported_error_detection() {
         "error": {"type": "not_found_error", "message": "Not Found"}
     });
     assert!(
-        !is_model_unsupported_error(StatusCode::NOT_FOUND, &path_404),
+        !is_model_unsupported_error(StatusCode::NOT_FOUND, &path_404, Protocol::Anthropic),
         "URL-path 404 lacks the 'model:' prefix and must not match"
     );
 
@@ -37,7 +42,8 @@ fn model_unsupported_error_detection() {
     });
     assert!(is_model_unsupported_error(
         StatusCode::BAD_REQUEST,
-        &litellm_400
+        &litellm_400,
+        Protocol::OpenAI
     ));
 
     let openai_code = serde_json::json!({
@@ -45,7 +51,8 @@ fn model_unsupported_error_detection() {
     });
     assert!(is_model_unsupported_error(
         StatusCode::NOT_FOUND,
-        &openai_code
+        &openai_code,
+        Protocol::OpenAI
     ));
 
     let too_long = serde_json::json!({
@@ -53,9 +60,32 @@ fn model_unsupported_error_detection() {
         "error": {"type": "invalid_request_error", "message": "prompt is too long: 210000 tokens > 200000 maximum"}
     });
     assert!(
-        !is_model_unsupported_error(StatusCode::BAD_REQUEST, &too_long),
+        !is_model_unsupported_error(StatusCode::BAD_REQUEST, &too_long, Protocol::Anthropic),
         "prompt-too-long 400 must not be treated as a model rejection"
     );
+
+    // LAB-5235: on an Anthropic endpoint the free-text phrase is client-seedable
+    // — Anthropic echoes an unknown top-level field name into its 400. Only the
+    // structured arms may count there.
+    let echoed_field = serde_json::json!({
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": "invalid model name: Extra inputs are not permitted"}
+    });
+    assert!(
+        !is_model_unsupported_error(StatusCode::BAD_REQUEST, &echoed_field, Protocol::Anthropic),
+        "an echoed client field name must not read as a model rejection on an Anthropic endpoint"
+    );
+    assert!(
+        !is_model_unsupported_error(StatusCode::BAD_REQUEST, &litellm_400, Protocol::Anthropic),
+        "the free-text arm belongs to OpenAI-protocol gateways only"
+    );
+    for protocol in [Protocol::Anthropic, Protocol::OpenAI] {
+        assert!(
+            is_model_unsupported_error(StatusCode::NOT_FOUND, &anthropic_404, protocol)
+                && is_model_unsupported_error(StatusCode::NOT_FOUND, &openai_code, protocol),
+            "structured arms match on every protocol ({protocol:?})"
+        );
+    }
 }
 
 /// The negative cache removes the (endpoint, model) pair from routing — for
@@ -320,5 +350,90 @@ async fn gateway_invalid_model_rotates_to_serving_account() {
         gw_hits.load(Ordering::SeqCst),
         1,
         "the second request must skip the gateway for this model"
+    );
+}
+
+/// LAB-5235: Anthropic's 400 for an unknown top-level field, where the field
+/// is literally named "invalid model name" — the phrase the LiteLLM arm keys on.
+const HEAD_400_ECHOED_FIELD: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"invalid model name: Extra inputs are not permitted\"}}";
+
+/// Two Anthropic endpoints: `echo` (tried first) always answers with the
+/// echoed-field 400, `other` would serve. Returns the state (to inspect the
+/// negative cache), the proxy address and both hit counters.
+async fn echoed_field_endpoints() -> (
+    Arc<AppState>,
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (echo_url, echo_hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_400_ECHOED_FIELD, b"{}").await;
+    let (other_url, other_hits) = spawn_status_then_ok_upstream(0, "", b"{}").await;
+    let echo = mk_endpoint_at("echo", "sk-ant-api-e", &echo_url);
+    let mut other = mk_endpoint_at("other", "sk-ant-api-x", &other_url);
+    other.priority = 1;
+    let state = test_state_with(vec![echo, other]);
+    let addr = serve(build_router(state.clone())).await;
+    (state, addr, echo_hits, other_hits)
+}
+
+/// LAB-5235 native path: the echoed-field 400 is the client's own malformed
+/// request. It must reach that client as-is — no negative-cache entry (which
+/// would deny the model to every other client), no rotation.
+#[tokio::test]
+async fn echoed_field_name_400_does_not_negative_cache_native() {
+    use std::sync::atomic::Ordering;
+    let (state, addr, echo_hits, other_hits) = echoed_field_endpoints().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"invalid model name":1}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "the client's own 400 must be forwarded, not rotated away"
+    );
+    assert_eq!(echo_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        other_hits.load(Ordering::SeqCst),
+        0,
+        "an echoed field name must not rotate the request"
+    );
+    assert!(
+        state.unsupported_models.lock().unwrap().is_empty(),
+        "an echoed field name must not negative-cache the model"
+    );
+}
+
+/// LAB-5235 OpenAI-compat path: `/v1/chat/completions` forwards to the same
+/// Anthropic accounts, so the same echoed-field 400 must not learn or rotate.
+#[tokio::test]
+async fn echoed_field_name_400_does_not_negative_cache_openai_compat() {
+    use std::sync::atomic::Ordering;
+    let (state, addr, echo_hits, other_hits) = echoed_field_endpoints().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "the client's own 400 must be forwarded, not rotated away"
+    );
+    assert_eq!(echo_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        other_hits.load(Ordering::SeqCst),
+        0,
+        "an echoed field name must not rotate the request"
+    );
+    assert!(
+        state.unsupported_models.lock().unwrap().is_empty(),
+        "an echoed field name must not negative-cache the model"
     );
 }

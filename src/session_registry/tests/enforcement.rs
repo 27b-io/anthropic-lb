@@ -57,7 +57,7 @@ async fn gate_rejection_counted_by_client_and_reason() {
 
     for expected in [1u64, 2] {
         let resp = state
-            .pre_request_gate("client-a", "claude-sonnet-4-6")
+            .pre_request_gate("-", "client-a", "claude-sonnet-4-6")
             .await
             .expect_err("exhausted budget must reject");
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -278,7 +278,7 @@ async fn limit_operator_bypass() {
     set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
     // Operator bypasses everything
     assert!(state.is_operator("ray"));
-    assert!(state.pre_request_gate("ray", "").await.is_ok());
+    assert!(state.pre_request_gate("-", "ray", "").await.is_ok());
     // Non-operator does not bypass
     assert!(!state.is_operator("gastown"));
 }
@@ -401,9 +401,9 @@ async fn emergency_operator_bypass() {
     set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
     assert!(state.is_emergency_brake_active().await);
     // Operator bypasses pre_request_gate even during emergency
-    assert!(state.pre_request_gate("ray", "").await.is_ok());
+    assert!(state.pre_request_gate("-", "ray", "").await.is_ok());
     // Non-operator gets blocked
-    assert!(state.pre_request_gate("gastown", "").await.is_err());
+    assert!(state.pre_request_gate("-", "gastown", "").await.is_err());
 }
 
 #[tokio::test]
@@ -884,7 +884,7 @@ async fn no_new_config_identical_behavior() {
 async fn gate_denies_model_outside_client_allow_list_with_403_naming_both() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     let err = state
-        .pre_request_gate("limited", "claude-opus-5")
+        .pre_request_gate("-", "limited", "claude-opus-5")
         .await
         .expect_err("opus must be denied");
     assert_eq!(
@@ -910,7 +910,7 @@ async fn gate_denies_model_outside_client_allow_list_with_403_naming_both() {
 async fn gate_allows_model_inside_client_allow_list() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
     assert!(state
-        .pre_request_gate("limited", "claude-haiku-4-5")
+        .pre_request_gate("-", "limited", "claude-haiku-4-5")
         .await
         .is_ok());
 }
@@ -924,7 +924,7 @@ async fn gate_allow_list_bypassed_by_operators() {
     });
     assert!(
         state
-            .pre_request_gate("limited", "claude-opus-5")
+            .pre_request_gate("-", "limited", "claude-opus-5")
             .await
             .is_ok(),
         "operators bypass the allow-list like every other gate check"
@@ -964,7 +964,7 @@ async fn gate_429_budget_returns_json_envelope_with_retry_after() {
             .unwrap()
             .insert("budgeted".to_string(), (today, 200));
         let err = state
-            .pre_request_gate("budgeted", "")
+            .pre_request_gate("-", "budgeted", "")
             .await
             .expect_err("exceeded budget must be denied");
         assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1003,7 +1003,7 @@ async fn gate_429_utilization_returns_json_envelope() {
     });
     set_account_utilization(&state, 0, 0.95, 0.95, now + 10000, now + 100000).await;
     let err = state
-        .pre_request_gate("capped", "")
+        .pre_request_gate("-", "capped", "")
         .await
         .expect_err("utilization above limit must be denied");
     assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1035,7 +1035,7 @@ async fn gate_429_emergency_brake_returns_json_envelope_without_retry_after() {
     });
     set_account_utilization(&state, 0, 0.95, 0.95, now + 10000, now + 100000).await;
     let err = state
-        .pre_request_gate("anyone", "")
+        .pre_request_gate("-", "anyone", "")
         .await
         .expect_err("emergency brake must deny");
     assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1064,4 +1064,55 @@ async fn authenticate_401_returns_json_envelope() {
     assert_eq!(json["type"], "error");
     assert_eq!(json["error"]["type"], "authentication_error");
     assert_eq!(json["error"]["message"], "unauthorized");
+}
+
+/// Also the ONLY test pinning the `pre_request_gate` backstop call: both
+/// proxied handlers refuse a reader earlier, so every other reader test passes
+/// with the gate's own check removed. If this test is ever retired as
+/// "unreachable state", that call site goes unpinned with it.
+///
+/// The denial is checked ABOVE the operator bypass, so a name that somehow
+/// reached both lists loses its bypass rather than keeping it.
+/// `validate_clients` rejects that config at boot — this pins the runtime
+/// behaviour as fail-closed if the boot check is ever weakened.
+#[tokio::test]
+async fn gate_denial_beats_the_operator_bypass_when_a_name_holds_both_roles() {
+    let state = Arc::new(AppState {
+        clients: vec![mk_client("both", "k1", &[])],
+        operators: vec!["both".to_string()],
+        admin_readers: vec!["both".to_string()],
+        ..test_state_base()
+    });
+    assert!(
+        state
+            .pre_request_gate("-", "both", "claude-opus-5")
+            .await
+            .is_err(),
+        "overlap must resolve to the denial, never to the bypass"
+    );
+}
+
+/// AC-2: a plain client — neither operator nor reader — keeps exactly its
+/// current gate treatment. The new arm must not shadow the allow-list.
+#[tokio::test]
+async fn gate_leaves_a_plain_client_on_its_existing_policy() {
+    let state = Arc::new(AppState {
+        clients: vec![mk_client("limited", "k1", &["claude-haiku-*"])],
+        admin_readers: vec!["viewer".to_string()],
+        ..test_state_base()
+    });
+    assert!(
+        state
+            .pre_request_gate("-", "limited", "claude-haiku-4-5")
+            .await
+            .is_ok(),
+        "an allowed model still passes"
+    );
+    assert!(
+        state
+            .pre_request_gate("-", "limited", "claude-opus-5")
+            .await
+            .is_err(),
+        "the allow-list still denies"
+    );
 }

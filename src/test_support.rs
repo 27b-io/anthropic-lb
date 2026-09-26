@@ -113,6 +113,7 @@ pub(crate) fn test_state_base() -> AppState {
         budget_usage: Mutex::new(HashMap::new()),
         client_utilization_limits: HashMap::new(),
         operators: vec![],
+        admin_readers: vec![],
         emergency_brake: true,
         emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
         client_request_rates: Mutex::new(HashMap::new()),
@@ -137,6 +138,8 @@ pub(crate) fn test_state_base() -> AppState {
         body_read_timeout_total: AtomicU64::new(0),
         affinity_migrations: Default::default(),
         pool_exhausted: Default::default(),
+        request_durations: Mutex::new(HashMap::new()),
+        start_epoch: AppState::now_epoch(),
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: DEFAULT_SESSION_REGISTRY_MAX,
         session_registry_ttl_secs: DEFAULT_SESSION_REGISTRY_TTL_SECS,
@@ -268,20 +271,6 @@ fn test_app_with_strategy(
     });
 
     (build_router(state.clone()), state)
-}
-
-/// Build a router from a pre-configured state. Used by integration tests
-/// that need custom AppState (operator, utilization limits, etc.).
-pub(crate) fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/_stats", axum::routing::get(stats_handler))
-        .route("/metrics", axum::routing::get(metrics_handler))
-        .route(
-            "/v1/chat/completions",
-            axum::routing::post(openai_chat_handler),
-        )
-        .fallback(any(proxy_handler))
-        .with_state(state)
 }
 
 /// Start a test server and return its address. Spawns the axum server

@@ -5,7 +5,10 @@ WORKDIR /app
 # whatever stable the base image ships — untested by CI.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src/ src/
-RUN cargo build --release --locked
+# GIT_SHA feeds anthropic_lb_info{revision} on /metrics; defaults to "unknown"
+# so a plain `docker build .` still works.
+ARG GIT_SHA=unknown
+RUN ANTHROPIC_LB_GIT_SHA=$GIT_SHA cargo build --release --locked
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
