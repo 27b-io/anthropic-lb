@@ -738,24 +738,34 @@ including the 401/403/429/503 the proxy generates itself before any upstream is
 contacted. `route` is a closed vocabulary (`/v1/messages`,
 `/v1/messages/count_tokens`, `/v1/chat/completions`, `/_stats`, `/metrics`,
 `other`) and `status` is the HTTP code, so a caller cannot mint series by
-varying the URL. Per-replica: aggregate with `sum by (le, route, status)`
+varying the URL. A request the client abandons before response headers is not
+recorded, because the server drops the in-flight request when the client
+disconnects. Under an upstream stall the slowest requests can therefore be
+missing from the tail. Per-replica: aggregate with `sum by (le, route, status)`
 before `histogram_quantile`.
 
 `process_start_time_seconds` is the standard start-time gauge:
 `time() - process_start_time_seconds` is uptime and
-`changes(process_start_time_seconds[1h])` counts restarts, so a recycle no
-longer has to be inferred from counter resets.
+`changes(process_start_time_seconds[1h])` counts restarts behind one scrape
+target, so a recycle no longer has to be inferred from counter resets. A
+replacement that comes up under a new `instance` label is a new series, which
+`changes()` does not count.
 
 `anthropic_lb_info{strategy, version, revision}` identifies the running build.
 `version` is the crate version; `revision` is the 7-character git commit taken
 from the `GIT_SHA` Docker build argument (`unknown` when built without it), so
 it compares directly against a `sha-*` image tag.
 
-`anthropic_upstream_transport_errors_total` is Redis-mirrored: with
-coordination configured it is the fleet-wide total and every replica reports
-the same value — aggregate with `max`, not `sum`, or the count multiplies by
-the number of replicas. Without Redis it is this process's own count. Its HELP
-text states this on the scrape.
+`anthropic_upstream_transport_errors_total` has two scopes, and
+`anthropic_cluster_redis_connected` tells them apart on each scrape. Where that
+gauge is `1`, the counter is the fleet-wide total read back from Redis, and
+every such replica reports the same value. Aggregate those with `max`, since
+`sum` multiplies the count by the number of replicas. Everywhere else the
+replica reports its own count: without Redis, before its first sync, or while
+Redis is unreachable. That count covers only the failures it has not yet added
+to the Redis total, all of them when Redis is not configured. Aggregate those
+with `sum`. During a partial outage the fleet total is the `max` over connected
+replicas plus the `sum` over the rest. The HELP text states this on the scrape.
 
 ### OpenAI JSON-mode compatibility
 

@@ -24,7 +24,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, PoisonError,
+        Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };

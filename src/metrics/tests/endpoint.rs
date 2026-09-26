@@ -326,28 +326,55 @@ fn build_revision_is_short_sha_or_unknown() {
     assert_eq!(build_revision(None), "unknown");
 }
 
-/// LAB-4379 AC2: the transport-error counter's HELP text states its
-/// aggregation scope, so a reader of one scrape knows not to sum replicas.
+/// LAB-4379 AC2: whenever the Redis aggregate is not being reported, the
+/// scrape carries this replica's own count and no
+/// `anthropic_cluster_redis_connected 1`, which is the gauge the HELP text tells
+/// a reader to split `max` from `sum` on. Covers both fallback shapes of the
+/// cluster cache: absent (no Redis, or before the first sync) and a failed
+/// Redis read (`redis_connected: false`, no `transport_errors`).
+/// `metrics_prefer_redis_transport_error_aggregate` covers the connected case.
 #[tokio::test]
-async fn metrics_transport_errors_help_states_scope() {
-    let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, _state) = test_app(&mock_url, None);
-    let addr = serve(app).await;
-    let body = Client::new()
-        .get(format!("http://{addr}/metrics"))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let help = body
-        .lines()
-        .find(|l| l.starts_with("# HELP anthropic_upstream_transport_errors_total "))
-        .expect("HELP line");
-    assert!(help.contains("fleet-wide"), "{help}");
-    assert!(help.contains("max, not sum"), "{help}");
-    assert!(help.contains("this process only"), "{help}");
+async fn metrics_transport_errors_scope_without_redis_aggregate() {
+    let failed_read = serde_json::json!({
+        "redis_connected": false,
+        "replicas_seen": 0,
+        "budget_usage": {},
+    });
+    for cache in [None, Some(failed_read)] {
+        let label = format!("{cache:?}");
+        let (mock_url, _handle) = spawn_mock_upstream().await;
+        let (app, state) = test_app(&mock_url, None);
+        state.lock_transport_errors().insert("connect", 2);
+        *state.lock_cluster_info_cache() = cache;
+        let addr = serve(app).await;
+        let body = Client::new()
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert!(
+            body.contains("anthropic_upstream_transport_errors_total{kind=\"connect\"} 2"),
+            "{label}: local count must be reported:\n{body}"
+        );
+        assert!(
+            !body.contains("anthropic_cluster_redis_connected 1"),
+            "{label}: must not advertise the fleet scope:\n{body}"
+        );
+        let help = body
+            .lines()
+            .find(|l| l.starts_with("# HELP anthropic_upstream_transport_errors_total "))
+            .expect("HELP line");
+        assert!(
+            help.contains("Where anthropic_cluster_redis_connected is 1"),
+            "{help}"
+        );
+        assert!(help.contains("(aggregate with max)"), "{help}");
+        assert!(help.contains("(aggregate with sum)"), "{help}");
+    }
 }
 
 #[tokio::test]

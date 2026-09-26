@@ -158,9 +158,11 @@ fn route_label(path: &str) -> &'static str {
 /// handler yields its response — that is when response headers are ready; for
 /// a streamed body none of the stream time is included — and record it under
 /// `(route, status)`. One site covers every handler, the fallback included.
+/// A request whose client disconnects before the response is ready is not
+/// recorded: the server drops this future, so nothing after `next.run` runs.
 /// The critical section is two additions, so a poisoned mutex holds nothing
-/// inconsistent: recover it (as `lock_transport_errors` does) rather than let
-/// the whole family silently vanish from `/metrics`.
+/// inconsistent: `lock_recovering` rather than let the whole family vanish
+/// from `/metrics`.
 pub(crate) async fn record_request_duration(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
@@ -169,10 +171,7 @@ pub(crate) async fn record_request_duration(
     let route = route_label(req.uri().path());
     let start = Instant::now();
     let resp = next.run(req).await;
-    state
-        .request_durations
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    lock_recovering(&state.request_durations, "request_durations")
         .entry((route, resp.status().as_u16()))
         .or_default()
         .observe(start.elapsed());
@@ -556,13 +555,11 @@ pub(crate) async fn metrics_handler(
             .map(|(k, v)| (*k, *v))
             .collect();
     let (session_buckets, session_tokens_sum) = state.session_tokens_histogram(now_epoch);
-    let mut request_durations: Vec<((&'static str, u16), RequestDurationHist)> = state
-        .request_durations
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .map(|(k, v)| (*k, *v))
-        .collect();
+    let mut request_durations: Vec<((&'static str, u16), RequestDurationHist)> =
+        lock_recovering(&state.request_durations, "request_durations")
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
     // Stable order for the humans who diff two scrapes.
     request_durations.sort_by_key(|(k, _)| *k);
 
@@ -610,7 +607,7 @@ pub(crate) async fn metrics_handler(
         &mut buf,
         "anthropic_http_request_duration_seconds",
         "histogram",
-        "Seconds from request receipt until response headers are sent (streamed body time excluded) by route and status; per-process, aggregate with sum",
+        "Seconds from request receipt until response headers are sent (streamed body time excluded; a request the client abandons before headers is not recorded) by route and status; per-process, aggregate with sum",
     );
     for ((route, status), hist) in &request_durations {
         let status = status.to_string();
@@ -1474,12 +1471,14 @@ pub(crate) async fn metrics_handler(
         &mut buf,
         "anthropic_upstream_transport_errors_total",
         "counter",
-        "Upstream transport send-failures by kind. With Redis coordination this is the fleet-wide total and every replica reports the same value (aggregate with max, not sum); without it, this process only",
+        "Upstream transport send-failures by kind. Where anthropic_cluster_redis_connected is 1 this is the Redis fleet-wide total, identical on every replica (aggregate with max). Otherwise (no Redis, before the first sync, or Redis unreachable) it is the failures this process has not yet added to that total, all of them without Redis (aggregate with sum)",
     );
     // Prefer the Redis fleet-wide aggregate (cached every 5s by the sync task)
     // so multi-replica deployments report a cluster-wide count; fall back to the
     // local accumulator when Redis is absent or the aggregate is unavailable
-    // (single-instance, pre-first-sync, or a Redis blip).
+    // (single-instance, pre-first-sync, or a Redis blip). With Redis that
+    // accumulator holds only the deltas not yet flushed, so the fallback is a
+    // per-replica count: the HELP text names the gauge that tells them apart.
     let transport_errors: Vec<(String, u64)> = cluster_info
         .as_ref()
         .and_then(|ci| ci.get("transport_errors"))
