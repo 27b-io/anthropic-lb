@@ -36,6 +36,9 @@ fn openai_delta(len: usize) -> String {
     )
 }
 
+/// Largest single write of the endless upstream (`spawn_endless_sse_upstream`).
+const PROBE_WRITE: usize = 16 * 1024;
+
 /// What the endless upstream saw: when its last write landed and when its
 /// connection failed.
 #[derive(Default)]
@@ -47,6 +50,12 @@ struct UpstreamProbe {
 /// Raw-TCP upstream answering one request with a chunked SSE stream that
 /// never ends: `prelude`, then `frame` repeated until a write fails, i.e.
 /// until the proxy drops the connection.
+///
+/// Writes go out in `PROBE_WRITE` slices, each stamping `last_write`, so the
+/// stamp marks when the proxy stopped reading. A whole multi-MB frame per
+/// write stamps only when the kernel takes its last byte: with default TCP
+/// buffers that is while the proxy is still reading and scanning megabytes of
+/// it, and that work then lands in the stall measurement.
 async fn spawn_endless_sse_upstream(
     prelude: &'static str,
     frame: String,
@@ -63,11 +72,13 @@ async fn spawn_endless_sse_upstream(
         let mut out = format!("{head}{:x}\r\n{prelude}\r\n", prelude.len());
         let chunk = format!("{:x}\r\n{frame}\r\n", frame.len());
         loop {
-            if s.write_all(out.as_bytes()).await.is_err() {
-                *p.closed_at.lock().unwrap() = Some(Instant::now());
-                return;
+            for piece in out.as_bytes().chunks(PROBE_WRITE) {
+                if s.write_all(piece).await.is_err() {
+                    *p.closed_at.lock().unwrap() = Some(Instant::now());
+                    return;
+                }
+                *p.last_write.lock().unwrap() = Some(Instant::now());
             }
-            *p.last_write.lock().unwrap() = Some(Instant::now());
             out.clone_from(&chunk);
         }
     });
