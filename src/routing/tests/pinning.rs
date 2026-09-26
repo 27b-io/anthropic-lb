@@ -305,7 +305,7 @@ async fn openai_compat_surface_pins_authenticated_client_to_preferred_endpoint()
 /// overage window supersedes its exhausted subscription windows) but is
 /// priority-demoted — the pin must NOT treat it as viable, or the pinned
 /// client would bill paid overage forever while free general-pool capacity
-/// sits idle (expert-panel CRIT on the initial LAB-2636 cut).
+/// sits idle (LAB-2636).
 #[tokio::test]
 async fn pinned_client_spills_when_preferred_endpoint_at_paid_overage() {
     let state = pinned_test_state();

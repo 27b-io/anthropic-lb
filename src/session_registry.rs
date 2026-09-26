@@ -713,7 +713,7 @@ impl AppState {
                     // overflow bucket — hard bound of MAX_CLIENT_MODEL_LABELS
                     // + 1 entries. A per-client ("<client>", "_other") key
                     // would let x-client-id rotation (legacy auth modes) grow
-                    // the map without bound (expert-panel finding, LAB-2330).
+                    // the map without bound (LAB-2330).
                     ("_other".to_owned(), "_other".to_owned())
                 };
                 let entry = map.entry(key).or_insert([0; 4]);
