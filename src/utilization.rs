@@ -83,6 +83,11 @@ const UNSUPPORTED_MODEL_TTL: Duration = Duration::from_secs(900);
 /// genuine ones out until the spray's own entries expired.
 pub(crate) const UNSUPPORTED_MODEL_MAX: usize = 256;
 
+/// Longest model name the negative cache learns, in bytes. The count cap
+/// above does not bound an entry's size, and a model string is bounded only
+/// by the request body cap. Real model ids are far shorter.
+pub(crate) const UNSUPPORTED_MODEL_MAX_BYTES: usize = 256;
+
 /// Sentinel value written to `alb:hard:{account}` when a replica has observed
 /// recovery from a hard rate limit. Other replicas interpret this as an
 /// instruction to proactively clear their local `hard_limited_until`, which
@@ -652,36 +657,35 @@ pub(crate) fn strip_orphaned_beta_body_fields(
     Some((bytes::Bytes::from(out), removed))
 }
 
-/// A JSON object whose VALUES are kept as their original bytes.
+/// A JSON object's top-level entries, in the order the parser yields them and
+/// with duplicate keys kept. By default the VALUES are kept as their original
+/// bytes; `TopLevelObject<IgnoredAny>` reads the keys alone.
 ///
-/// `serde_json::Map<String, Value>` cannot express this, and pulling in an
-/// ordered map crate to hold `RawValue` would be a dependency for thirty
-/// lines. Order is preserved because the entries are simply collected in the
-/// order the parser yields them.
-struct TopLevelObject(Vec<(String, Box<serde_json::value::RawValue>)>);
+/// `serde_json::Map<String, Value>` cannot express this: it keeps one entry
+/// per key. Pulling in an ordered map crate to hold `RawValue` would be a
+/// dependency for thirty lines.
+pub(crate) struct TopLevelObject<V = Box<serde_json::value::RawValue>>(pub(crate) Vec<(String, V)>);
 
-impl<'de> serde::Deserialize<'de> for TopLevelObject {
+impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for TopLevelObject<V> {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct Entries;
-        impl<'de> serde::de::Visitor<'de> for Entries {
-            type Value = TopLevelObject;
+        struct Entries<V>(std::marker::PhantomData<V>);
+        impl<'de, V: serde::Deserialize<'de>> serde::de::Visitor<'de> for Entries<V> {
+            type Value = TopLevelObject<V>;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str("a JSON object")
             }
             fn visit_map<M: serde::de::MapAccess<'de>>(
                 self,
                 mut map: M,
-            ) -> Result<TopLevelObject, M::Error> {
+            ) -> Result<TopLevelObject<V>, M::Error> {
                 let mut out = Vec::new();
-                while let Some(entry) =
-                    map.next_entry::<String, Box<serde_json::value::RawValue>>()?
-                {
+                while let Some(entry) = map.next_entry::<String, V>()? {
                     out.push(entry);
                 }
                 Ok(TopLevelObject(out))
             }
         }
-        d.deserialize_map(Entries)
+        d.deserialize_map(Entries(std::marker::PhantomData))
     }
 }
 
@@ -1475,17 +1479,19 @@ impl AppState {
         endpoint_idx: usize,
         model: &str,
     ) {
-        if model.is_empty() {
+        // An oversized name is not learned: the request still rotates, and
+        // the next one for it costs one upstream attempt, as with no entry.
+        if model.is_empty() || model.len() > UNSUPPORTED_MODEL_MAX_BYTES {
             return;
         }
         let now = Instant::now();
         let mut map = self.lock_unsupported_models();
         map.retain(|_, expiry| *expiry > now);
-        // Capacity touches NEW pairs only — refreshing an existing pair's TTL
-        // doesn't grow the map. Every entry has the same TTL, so the one
-        // nearest expiry is the least recently learned. Under a sustained
-        // spray a genuine learn can be evicted early; re-learning it costs one
-        // upstream attempt, never a refusal.
+        // Eviction applies only to NEW pairs — refreshing an existing pair's
+        // TTL doesn't grow the map. Every entry has the same TTL, so the one
+        // nearest expiry is the least recently noted (learned or refreshed).
+        // Under a sustained spray a genuine learn can be evicted early;
+        // re-learning it costs one upstream attempt, never a refusal.
         let key = (endpoint_idx, model.to_string());
         if !map.contains_key(&key) && map.len() >= UNSUPPORTED_MODEL_MAX {
             let oldest = map
@@ -1498,7 +1504,7 @@ impl AppState {
         }
         warn!(
             account = endpoint_name,
-            model,
+            model = %truncate_label(model),
             cooldown_secs = UNSUPPORTED_MODEL_TTL.as_secs(),
             "model unsupported on account, routing away"
         );

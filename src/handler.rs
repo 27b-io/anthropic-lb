@@ -142,9 +142,9 @@ pub(crate) enum UpstreamRejection {
 }
 
 /// Read account or model state out of an upstream error. Every forward path
-/// classifies through here, so the echo veto covers every classifier, the
-/// ones added later included. `model` is the model the request asked for, and
-/// `sent_body` the request body exactly as it went to this endpoint.
+/// classifies through here, so the request-body veto covers every classifier,
+/// the ones added later included. `model` is the model the request asked for,
+/// and `sent_body` the request body exactly as it went to this endpoint.
 pub(crate) fn classify_rejection(
     status: StatusCode,
     err_body: &serde_json::Value,
@@ -161,30 +161,40 @@ pub(crate) fn classify_rejection(
     };
     // Checked after a match rather than before: it re-parses the request
     // body, and an error no classifier claims is forwarded unchanged anyway.
-    (!echoes_request_key(err_body, sent_body)).then_some(verdict)
+    (!request_explains_error(err_body, sent_body)).then_some(verdict)
 }
 
-/// True when `error.message` starts with `<key>:` for a top-level key of the
-/// request. Anthropic's 400 for an unknown field reads `<key>: Extra inputs
-/// are not permitted`, with the key echoed verbatim, so that message is text
-/// the client chose and cannot report account or model state.
+/// True when the request body itself can account for the error, so the error
+/// cannot report account or model state:
+///   - `error.message` starts with `<key>:` for a top-level key of the
+///     request. Anthropic's 400 for an unknown field reads `<key>: Extra
+///     inputs are not permitted`, with the key echoed verbatim, so that
+///     message is text the client chose. `model` is exempt: its name is fixed
+///     by the API, and the genuine model rejection reads `model: <id>`.
+///   - The body has more than one top-level `model` key. The proxy reads the
+///     last one; an upstream that reads the first rejects a model the proxy
+///     never asked for, and the `model_not_found` arm, which names no model,
+///     would pin that rejection on the requested one.
 ///
-/// `model` is exempt: its name is fixed by the API, and the genuine model
-/// rejection reads `model: <id>`. A body that does not parse as a JSON object
-/// counts as an echo, since an echo cannot then be ruled out, and forwarding
-/// the error unchanged is the safe side.
-fn echoes_request_key(err_body: &serde_json::Value, sent_body: &[u8]) -> bool {
-    let Some(msg) = err_body.pointer("/error/message").and_then(|v| v.as_str()) else {
-        return false;
-    };
+/// A body that does not parse as a JSON object counts, since neither can then
+/// be ruled out, and forwarding the error unchanged is the safe side.
+fn request_explains_error(err_body: &serde_json::Value, sent_body: &[u8]) -> bool {
     if sent_body.is_empty() {
         return false;
     }
-    let Ok(keys) = serde_json::from_slice::<HashMap<String, serde::de::IgnoredAny>>(sent_body)
+    // Not a map: a map keeps one of two duplicate keys and hides the second.
+    let Ok(TopLevelObject(entries)) =
+        serde_json::from_slice::<TopLevelObject<serde::de::IgnoredAny>>(sent_body)
     else {
         return true;
     };
-    keys.keys().any(|k| {
+    if entries.iter().filter(|(k, _)| k == "model").count() > 1 {
+        return true;
+    }
+    let Some(msg) = err_body.pointer("/error/message").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    entries.iter().any(|(k, _)| {
         k != "model"
             && msg
                 .strip_prefix(k.as_str())
