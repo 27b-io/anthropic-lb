@@ -607,12 +607,95 @@ A block-mode client must therefore send JSON Messages traffic in a shape the
 scanner can parse, and keep scannable content within the limit. `annotate` (shadow mode) never rejects — it
 scans best-effort and always forwards.
 
+### ML detector (Tier 1)
+
+The rule scanners catch secrets and PII; they cannot catch prompt injection,
+which is semantic. For that the guard can also send the same scan window to a
+sequence-classification service — for example Prompt Guard 2 served by
+[text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference)
+(TEI) — and treat its labels as findings. One detector is supported:
+
+```toml
+[guard.detectors.pg2]
+url = "http://detector.internal:8080"   # the client POSTs to <url>/predict
+# timeout_ms = 2000            # ceiling for classifying one request, all chunks
+# threshold = 0.5              # minimum label score that counts as a finding
+# fail_open = false            # block clients only: see below
+# chunk_tokens = 512           # chunk size in model tokens (32-token overlap)
+# cache_size = 10000           # verdicts memoized per chunk digest; 0 disables
+# breaker_threshold = 3        # consecutive failed requests that open the breaker
+# breaker_cooldown_secs = 30   # how long it stays open before one probe
+```
+
+Unknown keys are rejected at startup, as is a `[guard]` table on a binary built
+without the `guard` feature. The detector gets its own HTTP client, which never
+follows redirects. It receives user and tool-result text, so reach it over a
+private network or `https`.
+
+How the detector runs depends on the client's policy:
+
+- `annotate` — classified **off the request path**, in the background. The
+  request pays no latency. Verdicts go to the `guard detector` log line and the
+  metrics below, not to `X-Guard-Findings`, because the response has usually
+  left before the verdict exists.
+- `block` — classified inline. The request waits at most `timeout_ms`, however
+  many chunks the input splits into (chunks go out in concurrent batches of up
+  to 32). A detector finding returns the same `400 guard_blocked` as a rule
+  finding, with `scanner` set to the detector's name.
+- `off` and operator clients — never sent.
+
+Any label other than `BENIGN` / `SAFE` that scores at least `threshold` is a
+finding. Text is chunked by bytes (the proxy has no tokenizer) at two bytes per
+token, which keeps dense content such as JSON inside the model's 512-token
+window; the sidecar truncates anything longer.
+
+**Failure is fail-closed by default.** A timeout, connection error, non-2xx
+response or unreadable body leaves the request without a verdict. Under
+`block`, `fail_open = false` rejects it with `HTTP 503` and error type
+`guard_unavailable` (nothing is wrong with the request, so a client may retry);
+`fail_open = true` forwards it with one `guard_unavailable` finding counted in
+`X-Guard-Findings`. Under `annotate` nothing is rejected either way; the log
+line records `would-block` or `annotate` accordingly.
+
+**Circuit breaker.** After `breaker_threshold` consecutive failed requests the
+breaker opens for `breaker_cooldown_secs`. While it is open no call is made and
+every request takes its failure path immediately, so a detector outage costs at
+most `breaker_threshold` requests one `timeout_ms` each. Sustained timeouts
+from an overloaded detector count exactly like downtime. After the cooldown one
+request probes: success closes the breaker, failure re-opens it. Chunks already
+in the verdict cache are still answered while the breaker is open. The OPEN and
+CLOSED transitions are logged once each, and the breaker uses the same state
+machine as the upstream transport breaker.
+
+Size `timeout_ms` for the slowest input you need classified, not for a typical
+one. On CPU a classifier takes on the order of 100 ms per 512-token chunk for a
+small model and several times that for a larger one, and a full 32 KiB window is
+roughly 35 chunks. An input that cannot finish inside `timeout_ms` counts as a
+failure and feeds the breaker. For shadow-mode data gathering, where latency
+costs requests nothing, a generous value is safe. Treat `block` with
+`fail_open = false` as a commitment to the detector's availability, because
+every outage becomes a `503` for those clients.
+
 ### Metrics
 
 On `/metrics` (when built with the feature):
 
-- `anthropic_guard_verdicts_total{client, scanner, verdict}` — counter.
+- `anthropic_guard_verdicts_total{client, scanner, verdict}` — counter. The
+  detector's verdicts appear under its own `scanner` label.
 - `anthropic_guard_scan_duration_seconds` — histogram of per-request scan time.
+
+With a detector configured:
+
+- `anthropic_guard_detector_errors_total{detector, kind}` — requests that got no
+  verdict, by `kind`: `timeout`, `connect`, `transport`, `status`, `decode`.
+- `anthropic_guard_detector_circuit_open{detector}` — gauge, 1 while the breaker
+  is open or awaiting its probe.
+- `anthropic_guard_detector_short_circuited_total{detector}` — requests that took
+  the failure path without a call.
+- `anthropic_guard_detector_cache_lookups_total{detector, result}` — per-chunk
+  verdict-cache lookups, `hit` or `miss`.
+- `anthropic_guard_detector_duration_seconds{detector}` — histogram of detector
+  wall-clock time per request.
 
 The `client` dimension of the verdicts counter is cardinality-bounded (overflow
 folds into `_other`). Under a legacy shared-secret configuration the client id

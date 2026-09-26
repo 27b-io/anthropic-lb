@@ -1844,7 +1844,20 @@ pub(crate) async fn metrics_handler(
             "counter",
             "Guard scan verdicts by client, scanner, and outcome (allow/annotate/block)",
         );
-        for ((client, scanner, verdict), n) in state.guard.verdicts_snapshot() {
+        // The detector's verdicts share this family under its own `scanner`
+        // label, and must be emitted in the same group: the text format does
+        // not allow a family's samples to be split by another family's.
+        let detector_verdicts = state
+            .guard
+            .detector()
+            .map(|d| d.verdicts_snapshot())
+            .unwrap_or_default();
+        for ((client, scanner, verdict), n) in state
+            .guard
+            .verdicts_snapshot()
+            .into_iter()
+            .chain(detector_verdicts)
+        {
             prom_counter(
                 &mut buf,
                 "anthropic_guard_verdicts_total",
@@ -1872,6 +1885,79 @@ pub(crate) async fn metrics_handler(
             sum,
             count,
         );
+
+        // LAB-3878: Tier 1 detector.
+        if let Some(d) = state.guard.detector() {
+            let detector = [("detector", d.name())];
+            prom_header(
+                &mut buf,
+                "anthropic_guard_detector_errors_total",
+                "counter",
+                "Detector requests that got no verdict, by cause (timeout/connect/transport/status/decode)",
+            );
+            for (kind, n) in d.errors_snapshot() {
+                prom_counter(
+                    &mut buf,
+                    "anthropic_guard_detector_errors_total",
+                    &[("detector", d.name()), ("kind", kind)],
+                    n,
+                );
+            }
+            prom_header(
+                &mut buf,
+                "anthropic_guard_detector_circuit_open",
+                "gauge",
+                "1 while the detector circuit breaker is open or awaiting its recovery probe",
+            );
+            prom_gauge(
+                &mut buf,
+                "anthropic_guard_detector_circuit_open",
+                &detector,
+                if d.circuit_open() { 1.0 } else { 0.0 },
+            );
+            prom_header(
+                &mut buf,
+                "anthropic_guard_detector_short_circuited_total",
+                "counter",
+                "Requests that took the fail_open path without a detector call because the breaker was open",
+            );
+            prom_counter(
+                &mut buf,
+                "anthropic_guard_detector_short_circuited_total",
+                &detector,
+                d.short_circuited(),
+            );
+            let (hits, misses) = d.cache_snapshot();
+            prom_header(
+                &mut buf,
+                "anthropic_guard_detector_cache_lookups_total",
+                "counter",
+                "Detector verdict-cache lookups per chunk, by result (hit/miss)",
+            );
+            for (result, n) in [("hit", hits), ("miss", misses)] {
+                prom_counter(
+                    &mut buf,
+                    "anthropic_guard_detector_cache_lookups_total",
+                    &[("detector", d.name()), ("result", result)],
+                    n,
+                );
+            }
+            let (hist, sum, count) = d.duration_snapshot();
+            prom_header(
+                &mut buf,
+                "anthropic_guard_detector_duration_seconds",
+                "histogram",
+                "Wall-clock time of detector calls per request, all chunks included",
+            );
+            prom_histogram(
+                &mut buf,
+                "anthropic_guard_detector_duration_seconds",
+                &detector,
+                &hist,
+                sum,
+                count,
+            );
+        }
     }
 
     (

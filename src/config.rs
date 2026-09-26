@@ -143,6 +143,11 @@ pub(crate) struct Config {
     /// any caller could activate arbitrary beta features against the
     /// operator's accounts (LAB-1191).
     pub(crate) allowed_client_betas: Option<Vec<String>>,
+    /// LAB-3878: `[guard]` — the Tier 1 detector (`[guard.detectors.<name>]`).
+    /// Per-client policy stays on `[[clients]].guard`.
+    #[cfg(feature = "guard")]
+    #[serde(default)]
+    pub(crate) guard: guard::GuardConfig,
 }
 
 /// `[[clients]]` — one authenticated caller. The `key` IS the identity: it is

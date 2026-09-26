@@ -17,9 +17,13 @@
 //! and the 400 body alike. The matched secret never leaves the scanner.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub mod detector;
+pub use detector::{Detector, GuardConfig};
 
 /// Per-client enforcement policy. Deserialized from `[[clients]].guard` in the
 /// operator config; defaults to `annotate` (shadow mode).
@@ -396,6 +400,8 @@ pub const REASON_CONTENT_UNREADABLE: &str =
 /// A non-empty request body that is not JSON at all. Set by the handler, not by
 /// [`ScanInput::from_body`], but it is a guard reason and lives with the rest.
 pub const REASON_BODY_UNPARSEABLE: &str = "request body could not be parsed for content scanning";
+/// Content a scanner or the detector flagged, under `block`.
+pub const REASON_FLAGGED: &str = "request body contains content flagged by the guard layer";
 /// A newest turn longer than [`MAX_SCAN_BYTES`], whose tail was never scanned.
 /// Set by the handler from [`ScanInput::truncated`], not by `from_body`.
 pub const REASON_SCAN_TRUNCATED: &str =
@@ -547,25 +553,27 @@ impl Scanner for LeakGuardScanner {
 /// Upper edges (seconds) of the `anthropic_guard_scan_duration_seconds`
 /// histogram, plus an implicit `+Inf`. Sized around the sub-2ms budget so the
 /// interesting quantiles land on real bucket boundaries.
-const SCAN_DURATION_BUCKETS: [f64; 9] = [
+const SCAN_DURATION_BUCKETS: &[f64] = &[
     0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05,
 ];
 
-/// A Prometheus-style histogram over scan durations, lock-free on the hot path.
+/// A Prometheus-style histogram over durations, lock-free on the hot path.
 /// Per-bucket counts are non-cumulative here; `metrics_handler` cumulates them
 /// at scrape time into the `le`-labelled series Prometheus expects.
 pub struct ScanHistogram {
-    /// One counter per bucket in [`SCAN_DURATION_BUCKETS`] plus a trailing
-    /// `+Inf` overflow bucket.
-    buckets: [AtomicU64; SCAN_DURATION_BUCKETS.len() + 1],
+    /// Upper bucket edges in seconds, ascending.
+    edges: &'static [f64],
+    /// One counter per edge plus a trailing `+Inf` overflow bucket.
+    buckets: Box<[AtomicU64]>,
     sum_nanos: AtomicU64,
     count: AtomicU64,
 }
 
 impl ScanHistogram {
-    fn new() -> Self {
+    fn new(edges: &'static [f64]) -> Self {
         Self {
-            buckets: Default::default(),
+            edges,
+            buckets: (0..=edges.len()).map(|_| AtomicU64::new(0)).collect(),
             sum_nanos: AtomicU64::new(0),
             count: AtomicU64::new(0),
         }
@@ -573,10 +581,11 @@ impl ScanHistogram {
 
     fn observe(&self, elapsed: std::time::Duration) {
         let secs = elapsed.as_secs_f64();
-        let idx = SCAN_DURATION_BUCKETS
+        let idx = self
+            .edges
             .iter()
             .position(|&edge| secs <= edge)
-            .unwrap_or(SCAN_DURATION_BUCKETS.len());
+            .unwrap_or(self.edges.len());
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
         self.sum_nanos
             .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
@@ -592,8 +601,8 @@ impl ScanHistogram {
             cumulative += b.load(Ordering::Relaxed);
             // f64 Display gives the plain decimal Prometheus wants for these
             // edges (`0.0001`, not `1e-4`); no custom formatter needed.
-            let le = if i < SCAN_DURATION_BUCKETS.len() {
-                SCAN_DURATION_BUCKETS[i].to_string()
+            let le = if i < self.edges.len() {
+                self.edges[i].to_string()
             } else {
                 "+Inf".to_string()
             };
@@ -617,31 +626,87 @@ pub(crate) const AWS_DOCS_EXAMPLE_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxR
 /// Overflow folds into `_other`. Mirrors the `beta_flags_dropped` posture.
 const MAX_VERDICT_CLIENTS: usize = 256;
 
-/// The assembled guard: the scanners plus their metrics. Constructed once and
-/// held in `AppState`.
+/// `{(client, scanner, verdict) -> count}` for `anthropic_guard_verdicts_total`.
+/// Tier 0 and the Tier 1 detector each hold one; their `scanner` labels never
+/// collide, so both emit into the same metric family.
+#[derive(Default)]
+pub struct VerdictCounts(
+    std::sync::Mutex<std::collections::HashMap<(String, &'static str, &'static str), u64>>,
+);
+
+impl VerdictCounts {
+    fn record(&self, client_id: &str, scanner: &'static str, verdict: &'static str) {
+        let mut map = crate::lock_recovering(&self.0, "guard_verdicts");
+        let key = (client_id.to_owned(), scanner, verdict);
+        let bounded = if map.len() < MAX_VERDICT_CLIENTS || map.contains_key(&key) {
+            key
+        } else {
+            ("_other".to_owned(), scanner, verdict)
+        };
+        *map.entry(bounded).or_insert(0) += 1;
+    }
+
+    fn snapshot(&self) -> Vec<((String, &'static str, &'static str), u64)> {
+        crate::lock_recovering(&self.0, "guard_verdicts")
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+}
+
+/// The assembled guard: the scanners, the optional Tier 1 detector, and their
+/// metrics. Constructed once and held in `AppState`.
 pub struct Guard {
     scanners: Vec<Box<dyn Scanner>>,
-    /// `{(client, scanner, verdict) -> count}` for
-    /// `anthropic_guard_verdicts_total`.
-    verdicts:
-        std::sync::Mutex<std::collections::HashMap<(String, &'static str, &'static str), u64>>,
+    /// Tier 1 (LAB-3878). `Arc` so `annotate` can classify in a spawned task
+    /// that outlives the request.
+    detector: Option<Arc<Detector>>,
+    verdicts: VerdictCounts,
     scan_hist: ScanHistogram,
 }
 
 impl Guard {
-    /// Build the guard with the two Tier 0 scanners. Fails if the secrets
-    /// ruleset cannot be loaded — a broken guard fails loud at startup rather
-    /// than silently scanning nothing.
-    pub fn new() -> Result<Self, String> {
+    /// Build the guard with the two Tier 0 scanners and any configured
+    /// detector. Fails if the secrets ruleset cannot be loaded or the detector
+    /// config is invalid — a broken guard fails loud at startup rather than
+    /// silently scanning nothing.
+    pub fn new(config: &GuardConfig) -> Result<Self, String> {
         let scanners: Vec<Box<dyn Scanner>> = vec![
             Box::new(SecretsScanner::new()?),
             Box::new(LeakGuardScanner::new()),
         ];
+        // One detector in v1: chaining several is out of scope, and silently
+        // using only the first of two configured would be worse than refusing.
+        if config.detectors.len() > 1 {
+            return Err("guard.detectors: at most one detector is supported".to_string());
+        }
+        let detector = config
+            .detectors
+            .iter()
+            .next()
+            .map(|(name, cfg)| Detector::new(name, cfg).map(Arc::new))
+            .transpose()?;
         Ok(Self {
             scanners,
-            verdicts: std::sync::Mutex::new(std::collections::HashMap::new()),
-            scan_hist: ScanHistogram::new(),
+            detector,
+            verdicts: VerdictCounts::default(),
+            scan_hist: ScanHistogram::new(SCAN_DURATION_BUCKETS),
         })
+    }
+
+    /// The Tier 1 detector, if one is configured.
+    pub fn detector(&self) -> Option<&Arc<Detector>> {
+        self.detector.as_ref()
+    }
+
+    /// Test-only: a guard with the given (or no) detector and no Tier 0
+    /// scanners, so a detector test's verdicts come from the detector alone.
+    #[cfg(test)]
+    pub fn with_detector(detector: Option<Detector>) -> Self {
+        Self {
+            detector: detector.map(Arc::new),
+            ..Self::empty()
+        }
     }
 
     /// A guard with no scanners — always `Allow`. Test-only, so `AppState`
@@ -651,8 +716,9 @@ impl Guard {
     pub fn empty() -> Self {
         Self {
             scanners: Vec::new(),
-            verdicts: std::sync::Mutex::new(std::collections::HashMap::new()),
-            scan_hist: ScanHistogram::new(),
+            detector: None,
+            verdicts: VerdictCounts::default(),
+            scan_hist: ScanHistogram::new(SCAN_DURATION_BUCKETS),
         }
     }
 
@@ -699,7 +765,7 @@ impl Guard {
             } else {
                 "annotate"
             };
-            self.record_verdict(client_id, name, verdict);
+            self.verdicts.record(client_id, name, verdict);
         }
 
         if all.is_empty() {
@@ -707,30 +773,16 @@ impl Guard {
         } else if blocked {
             Verdict::Block {
                 findings: all,
-                reason: "request body contains content flagged by the guard layer".to_string(),
+                reason: REASON_FLAGGED.to_string(),
             }
         } else {
             Verdict::Annotate { findings: all }
         }
     }
 
-    fn record_verdict(&self, client_id: &str, scanner: &'static str, verdict: &'static str) {
-        let mut map = crate::lock_recovering(&self.verdicts, "guard_verdicts");
-        let key = (client_id.to_owned(), scanner, verdict);
-        let bounded = if map.len() < MAX_VERDICT_CLIENTS || map.contains_key(&key) {
-            key
-        } else {
-            ("_other".to_owned(), scanner, verdict)
-        };
-        *map.entry(bounded).or_insert(0) += 1;
-    }
-
     /// Snapshot of the verdicts counter for `/metrics`.
     pub fn verdicts_snapshot(&self) -> Vec<((String, &'static str, &'static str), u64)> {
-        crate::lock_recovering(&self.verdicts, "guard_verdicts")
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect()
+        self.verdicts.snapshot()
     }
 
     /// Snapshot of the scan-duration histogram for `/metrics`.
@@ -938,7 +990,7 @@ mod tests {
 
     #[test]
     fn policy_dispatch_all_three_modes() {
-        let g = Guard::new().expect("guard");
+        let g = Guard::new(&GuardConfig::default()).expect("guard");
         let dirty = input("contact alice@example.com");
 
         // off: never scans, always Allow.
@@ -998,7 +1050,7 @@ mod tests {
             ]}
         ]});
         let before = serde_json::to_vec(&body).unwrap();
-        let g = Guard::new().expect("guard");
+        let g = Guard::new(&GuardConfig::default()).expect("guard");
         let si = scannable(ScanInput::from_body(&body));
         let _ = g.evaluate(GuardPolicy::Block, "c", Some(&si));
         let after = serde_json::to_vec(&body).unwrap();
@@ -1048,7 +1100,7 @@ mod tests {
         // assert the tight 2 ms bound only in release (run
         // `cargo test --release --features guard` for the real measurement) and
         // a loose sanity bound in debug.
-        let g = Guard::new().expect("guard");
+        let g = Guard::new(&GuardConfig::default()).expect("guard");
         // Go through the real extraction path so the cap is part of the
         // measurement, then reuse the (capped) input across iterations to time
         // the scan itself.
@@ -1090,7 +1142,7 @@ mod tests {
 
     #[test]
     fn histogram_cumulates_and_counts() {
-        let h = ScanHistogram::new();
+        let h = ScanHistogram::new(SCAN_DURATION_BUCKETS);
         h.observe(std::time::Duration::from_micros(50)); // <=0.0001
         h.observe(std::time::Duration::from_micros(300)); // <=0.0005
         h.observe(std::time::Duration::from_millis(3)); // <=0.005

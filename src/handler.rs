@@ -1314,13 +1314,47 @@ pub(crate) fn guard_blocked_response(
     reason: &str,
     openai_shape: bool,
 ) -> Response {
+    guard_error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        "guard_blocked",
+        reason,
+        findings,
+        openai_shape,
+    )
+}
+
+/// LAB-3878: the detector gave no verdict and the client's detector is
+/// `fail_open = false`. 503, not 400: nothing is wrong with the request, and a
+/// client that retries after the detector recovers should succeed.
+#[cfg(feature = "guard")]
+pub(crate) fn guard_unavailable_response(openai_shape: bool) -> Response {
+    guard_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "api_error",
+        guard::detector::GUARD_UNAVAILABLE,
+        guard::detector::REASON_GUARD_UNAVAILABLE,
+        &[],
+        openai_shape,
+    )
+}
+
+#[cfg(feature = "guard")]
+fn guard_error_response(
+    status: StatusCode,
+    openai_type: &str,
+    code: &str,
+    reason: &str,
+    findings: &[guard::Finding],
+    openai_shape: bool,
+) -> Response {
     let body = if openai_shape {
         serde_json::json!({
             "error": {
                 "message": reason,
-                "type": "invalid_request_error",
+                "type": openai_type,
                 "param": null,
-                "code": "guard_blocked",
+                "code": code,
                 "findings": findings,
             }
         })
@@ -1328,14 +1362,14 @@ pub(crate) fn guard_blocked_response(
         serde_json::json!({
             "type": "error",
             "error": {
-                "type": "guard_blocked",
+                "type": code,
                 "message": reason,
                 "findings": findings,
             }
         })
     };
     (
-        StatusCode::BAD_REQUEST,
+        status,
         [(hyper::header::CONTENT_TYPE, "application/json")],
         body.to_string(),
     )
@@ -1662,11 +1696,13 @@ pub(crate) async fn proxy_handler(
     // returns `NothingToScan` for a body with no `messages` key at all, which is
     // what `/v1/complete` and `/v1/models` send through this fallback.
     #[cfg(feature = "guard")]
-    let guard_annotate: Option<usize> =
-        match state.guard_hook(&req_id, &client_id, &guard_outcome, false) {
-            Ok(annotate) => annotate,
-            Err(resp) => return *resp,
-        };
+    let guard_annotate: Option<usize> = match state
+        .guard_hook(&req_id, &client_id, &guard_outcome, false)
+        .await
+    {
+        Ok(annotate) => annotate,
+        Err(resp) => return *resp,
+    };
 
     // The remaining dispatch is wrapped so an `Annotate` verdict can stamp the
     // `X-Guard-Findings` header onto whatever response it yields (cache hit,

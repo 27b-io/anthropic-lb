@@ -1489,7 +1489,7 @@ pub(crate) async fn openai_chat_handler(
     #[cfg(feature = "guard")]
     let guard_annotate: Option<usize> = {
         let outcome = guard::ScanInput::from_openai_body(&openai_body, &anthropic_body);
-        match state.guard_hook(&req_id, &client_id, &outcome, true) {
+        match state.guard_hook(&req_id, &client_id, &outcome, true).await {
             Ok(annotate) => annotate,
             Err(resp) => return *resp,
         }

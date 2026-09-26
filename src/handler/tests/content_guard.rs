@@ -11,7 +11,7 @@ use crate::guard::AWS_DOCS_EXAMPLE_SECRET_KEY;
 /// `Bearer`, so a token without it silently changes which header these tests
 /// exercise.
 #[cfg(feature = "guard")]
-const TEST_ENDPOINT_TOKEN: &str = "sk-ant-api-guard-test-token";
+pub(super) const TEST_ENDPOINT_TOKEN: &str = "sk-ant-api-guard-test-token";
 
 /// The two non-`block` policies, keyed `annotate-key` and `off-key`. `off` is
 /// not a carbon copy of `annotate`: it returns `Allow` from `Guard::evaluate`'s
@@ -47,7 +47,8 @@ fn guard_block_client() -> ClientConfig {
 /// returns a minimal valid response with rate-limit headers. Returns the
 /// listener address and the shared capture buffer.
 #[cfg(feature = "guard")]
-async fn spawn_guard_body_upstream() -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<u8>>>) {
+pub(super) async fn spawn_guard_body_upstream(
+) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<u8>>>) {
     let captured: std::sync::Arc<tokio::sync::Mutex<Vec<u8>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let cap = captured.clone();
@@ -108,7 +109,7 @@ async fn guard_annotate_forwards_byte_identical_and_stamps_header() {
         endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-annotate.state.json"),
         auto_cache: false, // clean byte-identity signal
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let app = build_router(state);
@@ -161,7 +162,7 @@ async fn guard_block_returns_400_with_offsets_and_skips_upstream() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-block.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let app = build_router(state);
@@ -223,7 +224,7 @@ async fn guard_block_fails_closed_on_oversized_body() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-oversized.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let app = build_router(state);
@@ -274,7 +275,7 @@ async fn guard_block_fails_closed_on_unparseable_body() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-unparseable.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let app = build_router(state);
@@ -311,7 +312,7 @@ async fn guard_annotate_forwards_oversized_body() {
         endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-annotate-oversized.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let app = build_router(state);
@@ -353,7 +354,7 @@ async fn guard_block_passes_bodiless_get_through() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-get.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let app = build_router(state);
@@ -385,7 +386,7 @@ async fn guard_block_applies_to_openai_chat_completions() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-block.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let app = build_router(state);
@@ -443,7 +444,7 @@ async fn guard_block_fails_closed_on_unmapped_openai_role() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-role.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let app = build_router(state);
@@ -505,7 +506,7 @@ async fn guard_block_fails_closed_on_non_array_openai_messages() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-shape.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let addr = serve(build_router(state)).await;
@@ -590,7 +591,7 @@ async fn guard_non_block_forwards_non_array_openai_messages_byte_identically() {
         ],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-shape-shadow.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let addr = serve(build_router(state)).await;
@@ -639,7 +640,7 @@ async fn guard_block_fails_closed_on_non_array_native_messages() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-shape.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let addr = serve(build_router(state)).await;
@@ -716,7 +717,7 @@ async fn guard_block_forwards_fallback_json_body_without_messages() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-no-messages.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let addr = serve(build_router(state)).await;
@@ -879,7 +880,7 @@ async fn guard_block_fails_closed_on_unreadable_native_messages() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-unreadable.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let addr = serve(build_router(state)).await;
@@ -941,7 +942,7 @@ async fn guard_block_fails_closed_on_unreadable_openai_messages() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-unreadable.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let addr = serve(build_router(state)).await;
@@ -1014,7 +1015,7 @@ async fn guard_non_block_forwards_unreadable_messages_byte_identically() {
         clients: guard_non_block_clients(),
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-unreadable-shadow.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let native_addr = serve(build_router(state)).await;
@@ -1024,7 +1025,7 @@ async fn guard_non_block_forwards_unreadable_messages_byte_identically() {
         clients: guard_non_block_clients(),
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-unreadable-shadow.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let openai_addr = serve(build_router(openai_state)).await;
@@ -1108,7 +1109,7 @@ async fn guard_block_forwards_image_only_turn() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-image-only.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let native_addr = serve(build_router(state)).await;
@@ -1120,7 +1121,7 @@ async fn guard_block_forwards_image_only_turn() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-image-only-openai.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let openai_addr = serve(build_router(openai_state)).await;
@@ -1196,7 +1197,7 @@ async fn guard_block_forwards_conversation_without_user_turn() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-no-user-turn.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let native_addr = serve(build_router(state)).await;
@@ -1208,7 +1209,7 @@ async fn guard_block_forwards_conversation_without_user_turn() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-no-user-turn-openai.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let openai_addr = serve(build_router(openai_state)).await;
@@ -1281,8 +1282,8 @@ async fn guard_block_forwards_conversation_without_user_turn() {
 /// scanner-less guard never blocks, so every rejection seen here comes from
 /// the fail-closed path.
 #[cfg(feature = "guard")]
-#[test]
-fn guard_hook_logs_fail_closed_cause_under_every_policy() {
+#[tokio::test]
+async fn guard_hook_logs_fail_closed_cause_under_every_policy() {
     use crate::guard::{
         ScanInput, ScanOutcome, MAX_SCAN_BYTES, REASON_MESSAGE_UNREADABLE, REASON_SCAN_TRUNCATED,
     };
@@ -1320,7 +1321,10 @@ fn guard_hook_logs_fail_closed_cause_under_every_policy() {
             ("off", false),
         ] {
             let req_id = format!("lab4358-hook-{label}-{client}");
-            let rejected = state.guard_hook(&req_id, client, outcome, false).is_err();
+            let rejected = state
+                .guard_hook(&req_id, client, outcome, false)
+                .await
+                .is_err();
             assert_eq!(
                 rejected,
                 blocks && cause.is_some(),
@@ -1366,7 +1370,7 @@ async fn guard_annotate_stamps_header_on_openai_chat_completions() {
         endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-annotate.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let app = build_router(state);
