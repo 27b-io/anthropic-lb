@@ -64,7 +64,7 @@ pub(crate) const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
 ///     `is_gateway_model_rejection` for why it is anchored and bound to
 ///     `model`, the model the request asked for.
 ///   - OpenAI: `{"error":{"code":"model_not_found", ...}}`.
-pub(crate) fn is_model_unsupported_error(
+fn is_model_unsupported_error(
     status: StatusCode,
     body: &serde_json::Value,
     protocol: Protocol,
@@ -122,7 +122,7 @@ const ENTITLEMENT_400_ANCHOR: &str = "You're out of extra usage";
 /// this is deliberately narrow: exact `error.type` and a message ANCHORED at
 /// its start — a substring match (`usage`, `extra usage`) would reroute real
 /// client errors that merely mention the word.
-pub(crate) fn is_entitlement_exhausted_400(status: StatusCode, body: &serde_json::Value) -> bool {
+fn is_entitlement_exhausted_400(status: StatusCode, body: &serde_json::Value) -> bool {
     status == StatusCode::BAD_REQUEST
         && body.pointer("/error/type").and_then(|v| v.as_str()) == Some("invalid_request_error")
         && body
@@ -141,10 +141,12 @@ pub(crate) enum UpstreamRejection {
     Entitlement,
 }
 
-/// Read account or model state out of an upstream error. Every forward path
-/// classifies through here, so the request-body veto covers every classifier,
-/// the ones added later included. `model` is the model the request asked for,
-/// and `sent_body` the request body exactly as it went to this endpoint.
+/// Read account or model state out of an upstream error. The classifiers it
+/// calls are private to this module, and that is what keeps every forward
+/// path behind the request-body veto: code outside this module cannot reach
+/// them except through here. A classifier added later must stay private too.
+/// `model` is the model the request asked for, and `sent_body` the request
+/// body exactly as it went to this endpoint.
 pub(crate) fn classify_rejection(
     status: StatusCode,
     err_body: &serde_json::Value,
@@ -177,7 +179,10 @@ pub(crate) fn classify_rejection(
 ///     would pin that rejection on the requested one.
 ///
 /// A body that does not parse as a JSON object counts, since neither can then
-/// be ruled out, and forwarding the error unchanged is the safe side.
+/// be ruled out, and forwarding the error unchanged is the safe side. An empty
+/// body has no keys, so it explains nothing and vetoes nothing: bodiless
+/// requests do reach upstream, and vetoing them would stop a genuine
+/// entitlement 400 from re-sending.
 fn request_explains_error(err_body: &serde_json::Value, sent_body: &[u8]) -> bool {
     if sent_body.is_empty() {
         return false;
