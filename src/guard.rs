@@ -91,8 +91,9 @@ pub enum Verdict {
 // bound.
 pub const MAX_SCAN_BYTES: usize = 32 * 1024;
 
-/// The subset of a request body a scanner is allowed to see: the newest `user`
-/// text blocks and the newest `tool_result` blocks. The `system` prompt is
+/// The subset of a request body a scanner is allowed to see: the text of the
+/// newest `user` turn — its `text`, `document` and `search_result` blocks, and
+/// the same inside its `tool_result` blocks. The `system` prompt is
 /// deliberately excluded — it is operator-trusted here and a known
 /// false-positive surface.
 pub struct ScanInput {
@@ -118,8 +119,8 @@ impl ScanInput {
     }
 
     /// Build a scan input from a parsed Anthropic Messages body, extracting only
-    /// the newest `user` message's text and tool_result blocks. `system` is
-    /// never read.
+    /// the newest `user` message's text (see [`collect_block`] for which blocks
+    /// carry it). `system` is never read.
     ///
     /// "Newest" = the last element of `messages` whose role is `user`. That is
     /// the turn being sent for completion (and, after tool use, the turn that
@@ -205,24 +206,14 @@ impl ScanInput {
             Some(Value::String(s)) => segments.push(s),
             Some(Value::Array(blocks)) => {
                 for block in blocks {
-                    match block.get("type").and_then(Value::as_str) {
-                        Some("text") => match text_block_segment(block) {
-                            Ok(Some(t)) => segments.push(t),
-                            Ok(None) => {}
-                            Err(reason) => return ScanOutcome::Unscannable(reason),
-                        },
-                        Some("tool_result") => {
-                            if let Err(reason) = collect_tool_result(block, &mut segments) {
-                                return ScanOutcome::Unscannable(reason);
-                            }
-                        }
-                        // A block type this scanner does not read — `image`,
-                        // `document`, `thinking`. A question of content coverage,
-                        // NOT a readability failure: the image-only turn is a
-                        // deliberate allow and must stay one.
-                        Some(_) => {}
-                        // No string `type`: not a content block at all.
-                        None => return ScanOutcome::Unscannable(REASON_CONTENT_UNREADABLE),
+                    let collected =
+                        if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                            collect_tool_result(block, &mut segments)
+                        } else {
+                            collect_block(block, &mut segments)
+                        };
+                    if let Err(reason) = collected {
+                        return ScanOutcome::Unscannable(reason);
                     }
                 }
             }
@@ -260,8 +251,10 @@ impl ScanInput {
     /// 2. A `tool` message's `content` — funnelled through
     ///    `.as_str() → .as_array()+text-join → .unwrap_or_default()`, so an
     ///    object, a scalar, or an array whose `text` is not a string collapses
-    ///    to `""`. The scanner then reads an empty `tool_result` and reports it
-    ///    CLEAN, which is worse than reporting nothing.
+    ///    to `""`, and every part field but `text` (a `search_result`'s
+    ///    `content`, a `document`'s `source`) is dropped. The scanner then reads
+    ///    an empty `tool_result` and reports it CLEAN, which is worse than
+    ///    reporting nothing.
     /// 3. An `image_url` part — rewritten through
     ///    `pointer("/image_url/url").unwrap_or("")`, so a part whose `image_url`
     ///    is not an object with a string `url` becomes an empty image block.
@@ -311,7 +304,15 @@ fn openai_message_readable(message: &Value) -> Result<(), &'static str> {
                 // A present `text` must be a string whatever the part type says:
                 // the `tool` arm joins parts through `p.get("text").as_str()`
                 // without consulting `type`, dropping anything else silently.
-                text_block_segment(part)?;
+                string_field(part, "text")?;
+                // LAB-5542: that join keeps ONLY `text`, so a `tool` part's
+                // `content` or `source` never reaches the scan — whether or not
+                // a `text` sits beside it, since a decoy `"text": ""` would
+                // otherwise scan clean. A `user` part is cloned verbatim and
+                // `from_body` reads those fields on the translated document.
+                if role == "tool" && (carries(part, "content") || carries(part, "source")) {
+                    return Err(REASON_CONTENT_UNREADABLE);
+                }
                 // `image_url` is read through `pointer("/image_url/url")`, so
                 // any other shape loses its content to an empty url.
                 if part_type == "image_url"
@@ -329,19 +330,103 @@ fn openai_message_readable(message: &Value) -> Result<(), &'static str> {
     }
 }
 
-/// The `text` of one content block: `Ok(Some)` when it carries a string,
-/// `Ok(None)` when absent (nothing can be hiding there), `Err` when present in
-/// a shape this scanner cannot read.
+/// The string at `key` in one content block (a text block's `text`, a
+/// document's `title`): `Ok(Some)` when it carries a string, `Ok(None)` when
+/// absent or `null` (nothing can be hiding there), `Err` when present in a shape
+/// this scanner cannot read.
 ///
-/// One predicate, three call sites (user text blocks, `tool_result` inner
-/// blocks, and the OpenAI original-body walk). Keeping three copies of a
-/// fail-closed rule in sync is the debt this change just paid off elsewhere.
-fn text_block_segment(block: &Value) -> Result<Option<&str>, &'static str> {
-    match block.get("text") {
+/// One predicate for every string field the scanner reads, so the fail-closed
+/// rule has one copy to keep right.
+fn string_field<'a>(block: &'a Value, key: &str) -> Result<Option<&'a str>, &'static str> {
+    match block.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(t)) => Ok(Some(t)),
         Some(_) => Err(REASON_CONTENT_UNREADABLE),
     }
+}
+
+/// Whether `key` is present and not `null`. A `null` cannot be hiding content.
+fn carries(block: &Value, key: &str) -> bool {
+    block.get(key).is_some_and(|v| !v.is_null())
+}
+
+/// Pull every model-visible string out of one newest-turn content block, at
+/// top level or inside `tool_result.content` (`tool_result` itself is walked by
+/// [`collect_tool_result`]). `Err` carries the reason the block was unreadable.
+///
+/// LAB-5542: `document` and `search_result` are the retrieval and web-fetch
+/// paths, where indirect prompt injection arrives, so their text is scanned.
+/// `image` and the PDF / URL / file document sources are skipped: their content
+/// is binary or not in the request at all. That is a coverage limit, not a
+/// readability failure, and the image-only turn stays a deliberate allow.
+///
+/// Any other type is skipped only while it carries no text-bearing field
+/// (`text`, `content`, `source`). One that does is content the scanner cannot
+/// read that the upstream receives, so it fails closed: skipping it let
+/// `{"type":"x","text":"<secret>"}` through, and the next new block type would
+/// reopen the gap. This is not an allowlist of types — audio, file,
+/// `tool_reference` and `browser_state` blocks carry none of those fields and
+/// still pass.
+fn collect_block<'a>(block: &'a Value, out: &mut Vec<&'a str>) -> Result<(), &'static str> {
+    // No string `type`: not a content block at all.
+    let Some(block_type) = block.get("type").and_then(Value::as_str) else {
+        return Err(REASON_CONTENT_UNREADABLE);
+    };
+    match block_type {
+        "text" => out.extend(string_field(block, "text")?),
+        "image" => {}
+        "search_result" => {
+            out.extend(string_field(block, "title")?);
+            out.extend(string_field(block, "source")?);
+            match block.get("content") {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(inner)) => {
+                    for b in inner {
+                        if b.get("type").and_then(Value::as_str) != Some("text") {
+                            return Err(REASON_CONTENT_UNREADABLE);
+                        }
+                        out.extend(string_field(b, "text")?);
+                    }
+                }
+                Some(_) => return Err(REASON_CONTENT_UNREADABLE),
+            }
+        }
+        "document" => {
+            out.extend(string_field(block, "title")?);
+            out.extend(string_field(block, "context")?);
+            // `source` is required, so absent or `null` is malformed here.
+            let Some(source) = block.get("source").filter(|s| s.is_object()) else {
+                return Err(REASON_CONTENT_UNREADABLE);
+            };
+            match source.get("type").and_then(Value::as_str) {
+                Some("text") => out.extend(string_field(source, "data")?),
+                Some("content") => match source.get("content") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(s)) => out.push(s),
+                    Some(Value::Array(inner)) => {
+                        for b in inner {
+                            match b.get("type").and_then(Value::as_str) {
+                                Some("text") => out.extend(string_field(b, "text")?),
+                                Some("image") => {}
+                                _ => return Err(REASON_CONTENT_UNREADABLE),
+                            }
+                        }
+                    }
+                    Some(_) => return Err(REASON_CONTENT_UNREADABLE),
+                },
+                Some("base64" | "url" | "file") => {}
+                _ => return Err(REASON_CONTENT_UNREADABLE),
+            }
+        }
+        _ if ["text", "content", "source"]
+            .iter()
+            .any(|k| carries(block, k)) =>
+        {
+            return Err(REASON_CONTENT_UNREADABLE);
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// What [`ScanInput::from_body`] could make of a request body (LAB-4358).
@@ -402,7 +487,7 @@ pub const REASON_SCAN_TRUNCATED: &str =
     "request exceeds the guard scan limit and cannot be scanned in full";
 
 /// A `tool_result` block's `content` is either a string or an array of content
-/// blocks (typically `text`). Pull out every text span; ignore image/other.
+/// blocks, each walked by [`collect_block`].
 ///
 /// `Err` carries the reason the block was unreadable: a `content` (or an inner
 /// block) in a shape this function cannot walk, which under `block` policy must
@@ -414,11 +499,7 @@ fn collect_tool_result<'a>(block: &'a Value, out: &mut Vec<&'a str>) -> Result<(
         Some(Value::String(s)) => out.push(s),
         Some(Value::Array(inner)) => {
             for b in inner {
-                match b.get("type").and_then(Value::as_str) {
-                    Some("text") => out.extend(text_block_segment(b)?),
-                    Some(_) => {}
-                    None => return Err(REASON_CONTENT_UNREADABLE),
-                }
+                collect_block(b, out)?;
             }
         }
         Some(_) => return Err(REASON_CONTENT_UNREADABLE),
@@ -867,6 +948,14 @@ mod tests {
             json!({"messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": "not-an-object"}
             ]}]}),
+            // LAB-5542: the join drops a part's `content` / `source`, decoy
+            // `text` or not.
+            json!({"messages": [{"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "search_result", "text": "", "content": [{"type": "text", "text": "x"}]}
+            ]}]}),
+            json!({"messages": [{"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "text", "text": "hello", "source": {"type": "text", "data": "x"}}
+            ]}]}),
         ] {
             assert!(
                 matches!(
@@ -895,6 +984,96 @@ mod tests {
                     ScanOutcome::Scannable(_) => unreachable!(),
                 }
             ),
+        }
+    }
+
+    /// LAB-5542: every model-visible string of a `search_result` or text-bearing
+    /// `document` block is extracted, at top level and inside
+    /// `tool_result.content`. Each field carries its own marker so a walk that
+    /// drops one field is caught by name.
+    #[test]
+    fn document_and_search_result_text_is_extracted() {
+        let rows = [
+            (
+                json!({"type": "search_result", "source": "m-sr-source", "title": "m-sr-title",
+                       "content": [{"type": "text", "text": "m-sr-text-1"}, {"type": "text", "text": "m-sr-text-2"}]}),
+                vec!["m-sr-source", "m-sr-title", "m-sr-text-1", "m-sr-text-2"],
+            ),
+            (
+                json!({"type": "document", "title": "m-doc-title", "context": "m-doc-context",
+                       "source": {"type": "text", "media_type": "text/plain", "data": "m-text-data"}}),
+                vec!["m-doc-title", "m-doc-context", "m-text-data"],
+            ),
+            (
+                json!({"type": "document", "source": {"type": "content", "content": "m-content-string"}}),
+                vec!["m-content-string"],
+            ),
+            (
+                json!({"type": "document", "source": {"type": "content", "content": [
+                    {"type": "text", "text": "m-content-array-1"},
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+                    {"type": "text", "text": "m-content-array-2"}
+                ]}}),
+                vec!["m-content-array-1", "m-content-array-2"],
+            ),
+            // `title` and `context` are read whatever the source.
+            (
+                json!({"type": "document", "title": "m-pdf-title", "context": "m-pdf-context",
+                       "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}}),
+                vec!["m-pdf-title", "m-pdf-context"],
+            ),
+        ];
+        for (block, markers) in rows {
+            for body in [
+                json!({"messages": [{"role": "user", "content": [block.clone()]}]}),
+                json!({"messages": [{"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [block.clone()]}
+                ]}]}),
+            ] {
+                let si = scannable(ScanInput::from_body(&body));
+                for marker in &markers {
+                    assert!(
+                        si.text().contains(marker),
+                        "{marker} not extracted from {body}"
+                    );
+                }
+                // The PDF bytes are never read as text.
+                assert!(
+                    !si.text().contains("JVBERi0="),
+                    "binary source read as text: {body}"
+                );
+            }
+        }
+    }
+
+    /// LAB-5542: the known blocks the scanner cannot read text from, and the
+    /// unknown ones that carry no text-bearing field, are a coverage limit, not
+    /// a readability failure. `null` reads as absent throughout, so an unknown
+    /// block whose `text` is `null` carries nothing.
+    #[test]
+    fn blocks_without_readable_text_are_nothing_to_scan() {
+        for block in [
+            json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"}}),
+            json!({"type": "document", "source": {"type": "url", "url": "https://example.com/a.pdf"}}),
+            json!({"type": "document", "source": {"type": "file", "file_id": "file_1"}}),
+            json!({"type": "document", "title": null, "source": {"type": "content", "content": null}}),
+            json!({"type": "search_result", "source": null, "title": null, "content": null}),
+            json!({"type": "tool_reference", "tool_name": "get_weather"}),
+            json!({"type": "browser_state", "tabs": [{"tab_id": 1, "title": "t", "url": "https://example.com/"}]}),
+            json!({"type": "input_audio", "input_audio": {"data": "UklG", "format": "wav"}}),
+            json!({"type": "x", "text": null, "content": null, "source": null}),
+        ] {
+            for body in [
+                json!({"messages": [{"role": "user", "content": [block.clone()]}]}),
+                json!({"messages": [{"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [block.clone()]}
+                ]}]}),
+            ] {
+                assert!(
+                    matches!(ScanInput::from_body(&body), ScanOutcome::NothingToScan),
+                    "no readable text and nothing unreadable: {body}"
+                );
+            }
         }
     }
 
