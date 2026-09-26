@@ -1021,7 +1021,7 @@ async fn forward_openai_compat_anthropic(
                 }
                 // Same model-rejection detection as the native path (LAB-941),
                 // and the same entitlement 400 (LAB-4729).
-                model_unsupported = is_model_unsupported_error(status, &parsed);
+                model_unsupported = is_model_unsupported_error(status, &parsed, ep.protocol);
                 entitlement = is_entitlement_exhausted_400(status, &parsed);
                 // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
                 let msg = parsed

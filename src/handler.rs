@@ -53,9 +53,17 @@ pub(crate) const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
 ///     for models outside their plan.
 ///   - LiteLLM-style gateways: 400 `{"error":{"message":"... Invalid model
 ///     name passed in model=<id> ..."}}` (observed live from insight-gateway,
-///     2026-07-27).
+///     2026-07-27). Free text, so matched for `Protocol::OpenAI` endpoints
+///     only: Anthropic echoes client-chosen field names into its 400s
+///     (`<field>: Extra inputs are not permitted`), so on an Anthropic
+///     endpoint the phrase is client-controlled and one request could
+///     negative-cache the model for every client (LAB-5235).
 ///   - OpenAI: `{"error":{"code":"model_not_found", ...}}`.
-pub(crate) fn is_model_unsupported_error(status: StatusCode, body: &serde_json::Value) -> bool {
+pub(crate) fn is_model_unsupported_error(
+    status: StatusCode,
+    body: &serde_json::Value,
+    protocol: Protocol,
+) -> bool {
     if status != StatusCode::NOT_FOUND && status != StatusCode::BAD_REQUEST {
         return false;
     }
@@ -71,7 +79,7 @@ pub(crate) fn is_model_unsupported_error(status: StatusCode, body: &serde_json::
     if err.get("code").and_then(|v| v.as_str()) == Some("model_not_found") {
         return true;
     }
-    msg.to_ascii_lowercase().contains("invalid model name")
+    protocol == Protocol::OpenAI && msg.to_ascii_lowercase().contains("invalid model name")
 }
 
 /// Anchor for the entitlement 400 (LAB-4729). Only the first sentence: the
@@ -1156,7 +1164,7 @@ pub(crate) async fn forward_anthropic(
             // here too: upstream sends the 400 as a JSON body, not an event
             // stream, so it re-sends before any byte reaches the client.
             let rotate: Option<fn(Box<Response>) -> ForwardOutcome> =
-                if is_model_unsupported_error(status, &parsed) {
+                if is_model_unsupported_error(status, &parsed, ep.protocol) {
                     state.note_model_unsupported(endpoint_name, endpoint_idx, model);
                     Some(ForwardOutcome::RetryModelUnsupported)
                 } else if is_entitlement_exhausted_400(status, &parsed) {
