@@ -682,6 +682,64 @@ async fn load_state_warns_and_starts_clean_on_legacy_accounts_key() {
     );
 }
 
+/// LAB-5313: only a missing state file means a fresh start, and it keeps
+/// the INFO fresh-start line.
+#[tokio::test]
+async fn load_state_missing_file_logs_info_fresh_start() {
+    let buf = log_capture_buf();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.state.json");
+    let mut state = test_state_with(vec![]);
+    Arc::get_mut(&mut state).unwrap().state_path = path.clone();
+    state.load_state().await;
+
+    let marker = format!("path={}", path.display());
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let mine: Vec<&str> = output.lines().filter(|l| l.contains(&marker)).collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "expected one line for {marker}, got:\n{}",
+        mine.join("\n")
+    );
+    assert!(
+        mine[0].contains(" INFO ") && mine[0].contains("no persisted state found"),
+        "a missing state file must log the INFO fresh-start line, got: {}",
+        mine[0]
+    );
+}
+
+/// LAB-5313: a state file that exists but can't be read must not pass
+/// itself off as "no persisted state" — it warns with the path and the
+/// read error. Invalid UTF-8 gives a portable non-`NotFound` error;
+/// `chmod 000` doesn't fail when the tests run as root.
+#[tokio::test]
+async fn load_state_unreadable_file_warns_with_path_and_error() {
+    let buf = log_capture_buf();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), [0xff, 0xfe, 0xfd]).unwrap();
+    let mut state = test_state_with(vec![]);
+    Arc::get_mut(&mut state).unwrap().state_path = tmp.path().to_path_buf();
+    state.load_state().await;
+
+    let marker = format!("path={}", tmp.path().display());
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let mine: Vec<&str> = output.lines().filter(|l| l.contains(&marker)).collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "expected one line for {marker}, got:\n{}",
+        mine.join("\n")
+    );
+    assert!(
+        mine[0].contains(" WARN ")
+            && mine[0].contains("failed to read persisted state")
+            && mine[0].contains("error=stream did not contain valid UTF-8"),
+        "an unreadable state file must warn with the read error, got: {}",
+        mine[0]
+    );
+}
+
 #[tokio::test]
 async fn save_load_roundtrip_unified_endpoints() {
     let tmp = tempfile::NamedTempFile::new().unwrap();

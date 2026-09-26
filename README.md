@@ -739,6 +739,55 @@ are emitted from process start, so a flat zero is a measurement rather than an
 absence of data. These are independent per-replica event counts — aggregate
 with `sum by (kind)`, where `max` would undercount.
 
+### Request latency, restarts and build identity
+
+`anthropic_http_request_duration_seconds{route, status}` is a histogram of the
+time from request receipt to the moment the proxy sends response headers. For a
+streamed response none of the stream time is included: the proxy returns the
+upstream headers and pumps the body outside the measured span. It is recorded
+by router-wide middleware, so every response counts,
+including the 401/403/429/503 the proxy generates itself before any upstream is
+contacted. `route` is a closed vocabulary (`/v1/messages`,
+`/v1/messages/count_tokens`, `/v1/chat/completions`, `/_stats`, `/metrics`,
+`other`) and `status` is the HTTP code, so a caller cannot mint series by
+varying the URL. A request the client abandons before response headers is not
+recorded, because the server drops the in-flight request when the client
+disconnects. Under an upstream stall the slowest requests can therefore be
+missing from the tail. Per-replica: aggregate with `sum by (le, route, status)`
+before `histogram_quantile`.
+
+`process_start_time_seconds` is the standard start-time gauge:
+`time() - process_start_time_seconds` is uptime and
+`changes(process_start_time_seconds[1h])` counts restarts behind one scrape
+target, so a recycle no longer has to be inferred from counter resets. A
+replacement that comes up under a new `instance` label is a new series, which
+`changes()` does not count.
+
+`anthropic_lb_info{strategy, version, revision}` identifies the running build.
+`version` is the crate version; `revision` is the 7-character git commit taken
+from the `GIT_SHA` Docker build argument (`unknown` when built without it), so
+it compares directly against a `sha-*` image tag.
+
+`anthropic_upstream_transport_errors_total` has two scopes, and
+`anthropic_cluster_redis_connected` tells them apart on each scrape. Where that
+gauge is `1`, the counter is the fleet-wide total read back from Redis, and
+every such replica reports the same value. Aggregate those with `max`, since
+`sum` multiplies the count by the number of replicas. Everywhere else the
+replica reports its own count: without Redis, before its first sync, or while
+Redis is unreachable. Aggregate those with `sum`. Without Redis the count is
+every failure the replica has seen. With Redis it is the failures still to be
+flushed, and flushing is at-least-once: a batch whose Redis write fails is kept
+and sent again even if part of it was applied, so some of those failures can
+already be in the fleet total. During a partial outage, the `max` over connected
+replicas plus the `sum` over the rest is therefore an estimate that can
+over-count, not an exact total.
+
+A replica that changes scope also steps its series between the fleet total and
+its local count, which `rate()` and `increase()` read as a counter reset or a
+burst of new failures. Take rates from the fleet total (for example a recording
+rule over the `max` where the gauge is `1`), not from raw per-replica series.
+The HELP text states the scopes on the scrape.
+
 ### OpenAI JSON-mode compatibility
 
 > [!IMPORTANT]
@@ -1096,7 +1145,8 @@ sudo systemctl enable --now anthropic-lb
 ### Docker
 
 ```bash
-docker build -t anthropic-lb .
+# GIT_SHA bakes the commit into anthropic_lb_info{revision} (omit it → "unknown")
+docker build --build-arg GIT_SHA=$(git rev-parse HEAD) -t anthropic-lb .
 docker run -v /path/to/config.toml:/etc/anthropic-lb/config.toml anthropic-lb
 ```
 
