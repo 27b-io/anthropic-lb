@@ -623,6 +623,37 @@ fn exposure_rejects_short_credentials_with_the_generation_command() {
 }
 
 #[test]
+fn rate_limit_cooldown_rejects_values_outside_one_day() {
+    // 0 makes the capacity-429 cooldown a no-op; i64::MAX is the largest value
+    // TOML carries and overflows `Instant` at the first capacity 429.
+    for secs in ["0", "86401", "9223372036854775807"] {
+        let err =
+            validate_rate_limit_cooldown(&cfg(&format!("rate_limit_cooldown_secs = {secs}\n")))
+                .unwrap_err();
+        assert!(err.starts_with("config:"), "{err}");
+        assert!(err.contains("rate_limit_cooldown_secs"), "{err}");
+        assert!(err.contains("1..=86400"), "{err}");
+    }
+    let mut config = cfg("");
+    config.rate_limit_cooldown_secs = Some(u64::MAX);
+    assert!(validate_rate_limit_cooldown(&config).is_err());
+}
+
+#[test]
+fn rate_limit_cooldown_accepts_one_second_to_one_day_and_the_default() {
+    for fragment in [
+        "rate_limit_cooldown_secs = 1\n",
+        "rate_limit_cooldown_secs = 86400\n",
+        "",
+    ] {
+        assert!(
+            validate_rate_limit_cooldown(&cfg(fragment)).is_ok(),
+            "{fragment:?}"
+        );
+    }
+}
+
+#[test]
 fn exposure_rejects_a_zero_window_with_the_throttle_enabled() {
     let err = validate_exposure(&cfg(&format!(
         "proxy_key = \"{STRONG_KEY}\"\nauth_failure_window_secs = 0\n"

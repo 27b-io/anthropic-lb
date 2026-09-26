@@ -333,6 +333,24 @@ fn validate_clients(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// A day, the ceiling the proxy already puts on an upstream `retry-after`. A
+/// capacity 429 without one cools the account down for `now + cooldown`, and a
+/// value past what `Instant` can hold would panic that request instead.
+const MAX_RATE_LIMIT_COOLDOWN_SECS: u64 = 86_400;
+
+/// Reject a `rate_limit_cooldown_secs` that would be a no-op (0) or overflow
+/// `Instant` at the first capacity 429. A boot error, not a clamp, so the typo
+/// is seen.
+fn validate_rate_limit_cooldown(config: &Config) -> Result<(), String> {
+    let secs = config.rate_limit_cooldown_secs.unwrap_or(5);
+    if !(1..=MAX_RATE_LIMIT_COOLDOWN_SECS).contains(&secs) {
+        return Err(format!(
+            "config: rate_limit_cooldown_secs must be in 1..={MAX_RATE_LIMIT_COOLDOWN_SECS}, got {secs}"
+        ));
+    }
+    Ok(())
+}
+
 /// Startup exposure posture (LAB-1192): unauthenticated is a BOOT FAILURE,
 /// not a default. Same shape as `reject_legacy_config_keys` — a named error
 /// at startup instead of a silent misconfiguration in production, where an
@@ -538,6 +556,9 @@ async fn main() {
         panic!("config: {msg}");
     }
     if let Err(msg) = validate_exposure(&config) {
+        panic!("{msg}");
+    }
+    if let Err(msg) = validate_rate_limit_cooldown(&config) {
         panic!("{msg}");
     }
 
