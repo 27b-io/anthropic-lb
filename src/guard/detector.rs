@@ -344,13 +344,13 @@ impl Detector {
         self.name
     }
 
-    /// Classify `text`, all chunks under one `timeout` deadline.
-    pub async fn classify(&self, text: &str) -> Classified {
+    /// Classify `text` for `client_id`, all chunks under one `timeout` deadline.
+    pub async fn classify(&self, client_id: &str, text: &str) -> Classified {
         let chunks = chunk(text, self.chunk_bytes, self.overlap_bytes);
         let mut findings = Vec::new();
         let mut misses: Vec<(usize, &str, [u8; 32])> = Vec::new();
         for (start, piece) in chunks {
-            let digest: [u8; 32] = Blake2s256::digest(piece.as_bytes()).into();
+            let digest = cache_key(client_id, piece);
             match self.cache.get(&digest) {
                 Some(labels) => {
                     self.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -494,14 +494,14 @@ impl Detector {
     pub fn shadow(self: &Arc<Self>, req_id: String, client_id: String, text: String) {
         let detector = Arc::clone(self);
         tokio::spawn(async move {
-            let classified = detector.classify(&text).await;
+            let classified = detector.classify(&client_id, &text).await;
             detector.report(&req_id, &client_id, GuardPolicy::Annotate, classified);
         });
     }
 
     /// `block`: classify inline and decide.
     pub async fn enforce(&self, req_id: &str, client_id: &str, text: &str) -> Enforced {
-        let classified = self.classify(text).await;
+        let classified = self.classify(client_id, text).await;
         self.report(req_id, client_id, GuardPolicy::Block, classified)
     }
 
@@ -595,6 +595,20 @@ impl Detector {
     }
 }
 
+/// Verdict-cache key for one chunk, namespaced by client. A cache shared across
+/// clients would be a timing oracle: under `block` a hit answers a detector
+/// round-trip faster than a miss, so one client could test whether another had
+/// recently sent a given chunk. Retries and resent turns — what the cache is
+/// for — come from the same client anyway. The length prefix keeps
+/// `(client, chunk)` pairs from colliding by concatenation.
+fn cache_key(client_id: &str, chunk: &str) -> [u8; 32] {
+    let mut h = Blake2s256::new();
+    h.update((client_id.len() as u64).to_le_bytes());
+    h.update(client_id.as_bytes());
+    h.update(chunk.as_bytes());
+    h.finalize().into()
+}
+
 /// Split `text` into chunks of at most `size` bytes, each starting `overlap`
 /// bytes before the previous one ended, on UTF-8 boundaries. Returns
 /// `(byte_offset, chunk)` pairs. Requires `size > 2 * overlap` (validated at
@@ -636,8 +650,8 @@ struct Prediction {
 
 /// Map a TEI batch response to, per chunk, the non-benign labels scoring at
 /// least `threshold`. A response whose shape or length does not match the
-/// request is `Decode` — a verdict for the wrong number of chunks is not a
-/// verdict.
+/// request, or that labels some input with nothing, is `Decode` — a verdict
+/// for the wrong number of chunks is not a verdict.
 fn flagged_labels(
     body: &[u8],
     expected: usize,
@@ -645,7 +659,8 @@ fn flagged_labels(
 ) -> Result<Vec<Arc<[Box<str>]>>, ErrorKind> {
     let batch: Vec<Vec<Prediction>> =
         serde_json::from_slice(body).map_err(|_| ErrorKind::Decode)?;
-    if batch.len() != expected {
+    // An input with no predictions at all would otherwise read as benign.
+    if batch.len() != expected || batch.iter().any(Vec::is_empty) {
         return Err(ErrorKind::Decode);
     }
     Ok(batch
