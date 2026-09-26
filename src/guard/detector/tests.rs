@@ -338,7 +338,7 @@ async fn breaker_opens_short_circuits_and_recovers_on_a_probe() {
         calls_at_open,
         "an open breaker makes no calls"
     );
-    assert_eq!(d.short_circuited(), 7);
+    assert_eq!(d.short_circuited(), (7, 0));
 
     // The detector comes back; after the cooldown one probe closes the breaker.
     mock.set_mode(MockDetectorMode::Healthy);
@@ -458,4 +458,148 @@ async fn real_tei_contract_and_latency() {
             started.elapsed()
         );
     }
+}
+
+/// Helly R, finding 1: a burst that arrives before any failure lands must not
+/// all pay `timeout_ms`. At most `breaker_threshold` calls are admitted; the
+/// rest are turned away at once, and the admitted ones open the breaker.
+#[tokio::test]
+async fn a_concurrent_burst_against_a_hung_detector_pays_at_most_threshold() {
+    let mock = spawn_mock_detector().await;
+    mock.set_mode(MockDetectorMode::Hang);
+    let d = Arc::new(detector(&mock.url, |c| {
+        c.timeout_ms = 200;
+        c.breaker_threshold = 3;
+    }));
+    let burst: Vec<_> = (0..20)
+        .map(|i| {
+            let d = d.clone();
+            tokio::spawn(async move {
+                let started = Instant::now();
+                let out = d.classify("c", &format!("burst {i}")).await;
+                (started.elapsed(), out.unavailable)
+            })
+        })
+        .collect();
+    let mut paid = 0;
+    for task in burst {
+        let (elapsed, unavailable) = task.await.unwrap();
+        if elapsed >= Duration::from_millis(200) {
+            paid += 1;
+            assert_eq!(unavailable, Some(Unavailable::Failed(ErrorKind::Timeout)));
+        } else {
+            assert_eq!(unavailable, Some(Unavailable::Saturated));
+        }
+    }
+    assert_eq!(
+        paid, 3,
+        "exactly breaker_threshold requests pay the timeout"
+    );
+    assert_eq!(mock.calls(), 3);
+    assert!(d.circuit_open(), "the admitted failures open the breaker");
+    assert_eq!(d.short_circuited(), (0, 17));
+}
+
+/// Helly R, finding 2: an outcome only counts against the breaker era it was
+/// admitted in. Driven through `admit`/`record_outcome` with explicit clocks
+/// so the completion order is exact.
+#[test]
+fn a_stale_outcome_cannot_close_or_reopen_the_breaker() {
+    let d = detector("http://127.0.0.1:1", |c| {
+        c.breaker_threshold = 3;
+        c.breaker_cooldown_secs = 30;
+    });
+    let t0 = Instant::now();
+    let fail = Some(ErrorKind::Timeout);
+
+    // A slow call admitted while closed.
+    let slow = d.admit(t0).expect("closed admits");
+    for _ in 0..3 {
+        let p = d.admit(t0).expect("under the cap");
+        d.record_outcome(&p, fail, t0);
+    }
+    assert!(d.circuit_open());
+
+    // Cooldown over: a probe goes out, then the old call returns success.
+    let t1 = t0 + Duration::from_secs(30);
+    let probe = d.admit(t1).expect("half-open admits one probe");
+    assert!(probe.probe);
+    d.record_outcome(&slow, None, t1);
+    drop(slow);
+    assert!(
+        d.circuit_open(),
+        "a stale success must not close the breaker"
+    );
+    assert!(
+        matches!(d.admit(t1), Err(Unavailable::CircuitOpen)),
+        "nor clear the probe marker and let a second call through"
+    );
+    // The probe fails: it re-opens at once, as a probe failure should.
+    d.record_outcome(&probe, fail, t1);
+    drop(probe);
+    assert!(matches!(d.admit(t1), Err(Unavailable::CircuitOpen)));
+
+    // Reverse order: a probe closes it, then an old failure arrives.
+    let t2 = t1 + Duration::from_secs(30);
+    let old = {
+        // Re-enter a closed era with a call in flight.
+        let probe = d.admit(t2).expect("probe");
+        d.record_outcome(&probe, None, t2);
+        drop(probe);
+        assert!(!d.circuit_open());
+        d.admit(t2).expect("closed")
+    };
+    for _ in 0..3 {
+        let p = d.admit(t2).expect("under the cap");
+        d.record_outcome(&p, fail, t2);
+    }
+    let t3 = t2 + Duration::from_secs(30);
+    let probe = d.admit(t3).expect("probe");
+    d.record_outcome(&probe, None, t3);
+    drop(probe);
+    assert!(!d.circuit_open(), "the probe closed it");
+    d.record_outcome(&old, fail, t3);
+    drop(old);
+    let s = crate::lock_recovering(&d.breaker, "test");
+    assert_eq!(
+        s.breaker.consecutive_failures, 0,
+        "a stale failure must not count against the recovered era"
+    );
+    assert_eq!(s.in_flight, 0, "every permit gave its slot back");
+}
+
+#[tokio::test]
+async fn a_dropped_call_releases_its_slot() {
+    let mock = spawn_mock_detector().await;
+    mock.set_mode(MockDetectorMode::Hang);
+    let d = Arc::new(detector(&mock.url, |c| {
+        c.breaker_threshold = 1;
+        c.timeout_ms = 10_000;
+    }));
+    let call = tokio::spawn({
+        let d = d.clone();
+        async move { d.classify("c", "abandoned").await }
+    });
+    wait_for(|| mock.calls() == 1).await;
+    assert!(matches!(
+        d.admit(Instant::now()),
+        Err(Unavailable::Saturated)
+    ));
+    // A `block` client disconnecting drops the future mid-call.
+    call.abort();
+    let _ = call.await;
+    assert!(
+        d.admit(Instant::now()).is_ok(),
+        "the aborted call's slot is free"
+    );
+}
+
+async fn wait_for(cond: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("condition not met");
 }

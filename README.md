@@ -623,7 +623,7 @@ url = "http://detector.internal:8080"   # the client POSTs to <url>/predict
 # fail_open = false            # block clients only: see below
 # chunk_tokens = 512           # chunk size in model tokens (32-token overlap)
 # cache_size = 10000           # verdicts memoized per chunk digest; 0 disables
-# breaker_threshold = 3        # consecutive failed requests that open the breaker
+# breaker_threshold = 3        # failures that open the breaker; also the in-flight cap
 # breaker_cooldown_secs = 30   # how long it stays open before one probe
 ```
 
@@ -659,8 +659,15 @@ line records `would-block` or `annotate` accordingly.
 
 **Circuit breaker.** After `breaker_threshold` consecutive failed requests the
 breaker opens for `breaker_cooldown_secs`. While it is open no call is made and
-every request takes its failure path immediately, so a detector outage costs at
-most `breaker_threshold` requests one `timeout_ms` each. Sustained timeouts
+every request takes its failure path immediately. At most `breaker_threshold`
+detector calls are in flight at once; a request arriving while that many are
+outstanding takes its failure path immediately too (counted as `saturated`).
+Together these mean a detector outage costs at most `breaker_threshold`
+requests one `timeout_ms` each, even under a burst. The classifier gains no
+throughput from concurrent requests, so the cap mostly sheds work that would
+otherwise have queued; under `block` with `fail_open = false`, though, a burst
+of more than `breaker_threshold` long inputs returns `503` to the excess even
+while the detector is healthy, so raise `breaker_threshold` if that matters. Sustained timeouts
 from an overloaded detector count exactly like downtime. After the cooldown one
 request probes: success closes the breaker, failure re-opens it. Chunks already
 in the verdict cache are still answered while the breaker is open. The OPEN and
@@ -690,8 +697,9 @@ With a detector configured:
   verdict, by `kind`: `timeout`, `connect`, `transport`, `status`, `decode`.
 - `anthropic_guard_detector_circuit_open{detector}` — gauge, 1 while the breaker
   is open or awaiting its probe.
-- `anthropic_guard_detector_short_circuited_total{detector}` — requests that took
-  the failure path without a call.
+- `anthropic_guard_detector_short_circuited_total{detector, reason}` — requests
+  that took the failure path without a call, by `reason`: `circuit_open` or
+  `saturated`.
 - `anthropic_guard_detector_cache_lookups_total{detector, result}` — per-chunk
   verdict-cache lookups, `hit` or `miss`.
 - `anthropic_guard_detector_duration_seconds{detector}` — histogram of detector

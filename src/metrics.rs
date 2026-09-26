@@ -1919,14 +1919,17 @@ pub(crate) async fn metrics_handler(
                 &mut buf,
                 "anthropic_guard_detector_short_circuited_total",
                 "counter",
-                "Requests that took the fail_open path without a detector call because the breaker was open",
+                "Requests that took the fail_open path without a detector call, by reason (circuit_open/saturated)",
             );
-            prom_counter(
-                &mut buf,
-                "anthropic_guard_detector_short_circuited_total",
-                &detector,
-                d.short_circuited(),
-            );
+            let (open, saturated) = d.short_circuited();
+            for (reason, n) in [("circuit_open", open), ("saturated", saturated)] {
+                prom_counter(
+                    &mut buf,
+                    "anthropic_guard_detector_short_circuited_total",
+                    &[("detector", d.name()), ("reason", reason)],
+                    n,
+                );
+            }
             let (hits, misses) = d.cache_snapshot();
             prom_header(
                 &mut buf,

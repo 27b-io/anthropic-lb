@@ -117,7 +117,8 @@ pub struct DetectorConfig {
     /// Verdict memo entries, keyed by chunk digest. 0 disables the cache.
     #[serde(default = "default_cache_size")]
     pub cache_size: u64,
-    /// Consecutive failed requests before the breaker opens.
+    /// Consecutive failed requests before the breaker opens. Also the cap on
+    /// detector calls in flight at once (see `Detector::admit`).
     #[serde(default = "default_breaker_threshold")]
     pub breaker_threshold: u32,
     /// How long the breaker stays open before one probe is let through.
@@ -199,6 +200,8 @@ pub struct Classified {
 pub enum Unavailable {
     /// The breaker was open: no call was made.
     CircuitOpen,
+    /// `breaker_threshold` calls were already in flight: no call was made.
+    Saturated,
     /// A call was made and failed.
     Failed(ErrorKind),
 }
@@ -207,6 +210,7 @@ impl Unavailable {
     fn label(self) -> &'static str {
         match self {
             Unavailable::CircuitOpen => "circuit_open",
+            Unavailable::Saturated => "saturated",
             Unavailable::Failed(kind) => kind.label(),
         }
     }
@@ -224,7 +228,7 @@ pub enum Enforced {
     Unavailable,
 }
 
-/// Breaker plus the half-open probe marker. One std mutex, never held across
+/// Breaker plus the admission bookkeeping. One std mutex, never held across
 /// an await.
 #[derive(Default)]
 struct BreakerState {
@@ -233,11 +237,28 @@ struct BreakerState {
     /// future was dropped (client disconnect under `block`) never records an
     /// outcome, so the marker expires instead of wedging the breaker open.
     probe_until: Option<Instant>,
+    /// Bumped on every OPEN and CLOSED transition. A call's outcome only
+    /// counts against the era it was admitted in: a slow call admitted while
+    /// closed must not close a breaker that has since opened, nor re-open one
+    /// a probe has since closed.
+    era: u64,
+    /// Detector calls admitted and not yet finished.
+    in_flight: u32,
 }
 
-enum Admit {
-    Call,
-    ShortCircuit,
+/// One admitted detector call. Dropping it releases the in-flight slot, so a
+/// call whose future is dropped mid-flight still gives its slot back.
+struct Permit<'a> {
+    detector: &'a Detector,
+    era: u64,
+    probe: bool,
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        let mut s = crate::lock_recovering(&self.detector.breaker, "guard_detector_breaker");
+        s.in_flight = s.in_flight.saturating_sub(1);
+    }
 }
 
 pub struct Detector {
@@ -259,6 +280,7 @@ pub struct Detector {
     cooldown: Duration,
     errors: [AtomicU64; ErrorKind::ALL.len()],
     short_circuited: AtomicU64,
+    saturated: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     duration: ScanHistogram,
@@ -333,6 +355,7 @@ impl Detector {
             cooldown: Duration::from_secs(cfg.breaker_cooldown_secs),
             errors: Default::default(),
             short_circuited: AtomicU64::new(0),
+            saturated: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             duration: ScanHistogram::new(DURATION_BUCKETS),
@@ -369,13 +392,20 @@ impl Detector {
                 unavailable: None,
             };
         }
-        if let Admit::ShortCircuit = self.admit(Instant::now()) {
-            self.short_circuited.fetch_add(1, Ordering::Relaxed);
-            return Classified {
-                findings,
-                unavailable: Some(Unavailable::CircuitOpen),
-            };
-        }
+        let permit = match self.admit(Instant::now()) {
+            Ok(permit) => permit,
+            Err(unavailable) => {
+                let counter = match unavailable {
+                    Unavailable::Saturated => &self.saturated,
+                    _ => &self.short_circuited,
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                return Classified {
+                    findings,
+                    unavailable: Some(unavailable),
+                };
+            }
+        };
 
         let started = Instant::now();
         let batches = misses.chunks(MAX_BATCH).map(|batch| {
@@ -403,7 +433,8 @@ impl Detector {
                 failure
             }
         };
-        self.record_outcome(failure, Instant::now());
+        self.record_outcome(&permit, failure, Instant::now());
+        drop(permit);
         Classified {
             findings,
             unavailable: failure.map(Unavailable::Failed),
@@ -437,34 +468,62 @@ impl Detector {
         }));
     }
 
-    fn admit(&self, now: Instant) -> Admit {
+    /// Admit one detector call, or say why not.
+    ///
+    /// At most `breaker_threshold` calls are in flight at once. Without the
+    /// cap, every request that arrives before the first failure lands is
+    /// admitted to a hung detector, so a burst pays `timeout_ms` a hundred
+    /// times over before the breaker hears about any of it. With it, the
+    /// first `breaker_threshold` calls are the only ones that can be caught
+    /// out, and their failures are exactly what opens the breaker. The
+    /// classifier gains no throughput from concurrent requests (it queues
+    /// them), so a request past the cap would mostly have waited in that
+    /// queue anyway.
+    fn admit(&self, now: Instant) -> Result<Permit<'_>, Unavailable> {
         let mut s = crate::lock_recovering(&self.breaker, "guard_detector_breaker");
         if s.breaker.is_open(now) {
-            return Admit::ShortCircuit;
+            return Err(Unavailable::CircuitOpen);
         }
-        if s.breaker.is_half_open(now) {
+        let probe = s.breaker.is_half_open(now);
+        if probe {
             if s.probe_until.is_some_and(|deadline| now < deadline) {
-                return Admit::ShortCircuit;
+                return Err(Unavailable::CircuitOpen);
             }
             s.probe_until = Some(now + self.timeout);
+        } else if s.in_flight >= self.breaker_threshold {
+            return Err(Unavailable::Saturated);
         }
-        Admit::Call
+        s.in_flight += 1;
+        Ok(Permit {
+            detector: self,
+            era: s.era,
+            probe,
+        })
     }
 
-    /// Feed the breaker one request's outcome. After the cooldown the first
+    /// Feed the breaker one call's outcome. After the cooldown the probe's
     /// outcome decides: a success closes the breaker, a failure re-opens it at
     /// once (a threshold of one) rather than waiting for a fresh run of
     /// `breaker_threshold` failures — the detector has already proved itself
     /// down once, and each extra failure is a request paying `timeout_ms`.
-    fn record_outcome(&self, failure: Option<ErrorKind>, now: Instant) {
+    ///
+    /// An outcome from an earlier era is counted in the error metric and
+    /// otherwise ignored; see `BreakerState::era`.
+    fn record_outcome(&self, permit: &Permit<'_>, failure: Option<ErrorKind>, now: Instant) {
         if let Some(kind) = failure {
             self.errors[kind as usize].fetch_add(1, Ordering::Relaxed);
         }
         let mut s = crate::lock_recovering(&self.breaker, "guard_detector_breaker");
-        s.probe_until = None;
+        if permit.era != s.era {
+            return;
+        }
+        if permit.probe {
+            s.probe_until = None;
+        }
         match failure {
             None => {
                 if s.breaker.record_success() {
+                    s.era += 1;
                     info!(
                         detector = self.name,
                         "detector circuit-breaker CLOSED: detector recovered"
@@ -472,12 +531,13 @@ impl Detector {
                 }
             }
             Some(_) => {
-                let threshold = if s.breaker.is_half_open(now) {
+                let threshold = if permit.probe {
                     1
                 } else {
                     self.breaker_threshold
                 };
                 if s.breaker.record_failure(now, threshold, self.cooldown) {
+                    s.era += 1;
                     warn!(
                         detector = self.name,
                         consecutive_failures = s.breaker.consecutive_failures,
@@ -535,15 +595,16 @@ impl Detector {
             self.verdicts.record(client_id, self.name, "allow");
             return Enforced::Allow;
         };
-        // No verdict. An open breaker already logged its OPEN line and counts
-        // every short-circuit, so a per-request line would only flood the log
-        // for the length of an outage.
+        // No verdict. An open breaker already logged its OPEN line, and both
+        // it and saturation count every request they turn away, so a
+        // per-request line would only flood the log for the length of an
+        // outage or a burst.
         let outcome = if self.fail_open {
             Enforced::Annotate(1)
         } else {
             Enforced::Unavailable
         };
-        if unavailable != Unavailable::CircuitOpen {
+        if let Unavailable::Failed(_) = unavailable {
             let verdict = match (enforcing, self.fail_open) {
                 (_, true) => "annotate",
                 (true, false) => "block",
@@ -567,8 +628,12 @@ impl Detector {
             .collect()
     }
 
-    pub fn short_circuited(&self) -> u64 {
-        self.short_circuited.load(Ordering::Relaxed)
+    /// Requests turned away without a call: `(breaker open, saturated)`.
+    pub fn short_circuited(&self) -> (u64, u64) {
+        (
+            self.short_circuited.load(Ordering::Relaxed),
+            self.saturated.load(Ordering::Relaxed),
+        )
     }
 
     /// Open, or cooled down but not yet proven healthy by a probe.

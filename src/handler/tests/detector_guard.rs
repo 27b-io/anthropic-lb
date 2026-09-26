@@ -245,7 +245,7 @@ async fn detector_downtime_mid_traffic() {
         "{slow} block requests paid the timeout; at most 3 may"
     );
     assert!(d.circuit_open());
-    assert!(d.short_circuited() > 0);
+    assert!(d.short_circuited().0 > 0);
 
     // Detector back: after the cooldown one request probes and closes it.
     rig.mock.set_mode(MockDetectorMode::Healthy);
@@ -276,7 +276,8 @@ async fn detector_metrics_are_exported() {
     for needle in [
         r#"anthropic_guard_detector_errors_total{detector="pg2",kind="status"} 1"#,
         r#"anthropic_guard_detector_circuit_open{detector="pg2"} 1"#,
-        r#"anthropic_guard_detector_short_circuited_total{detector="pg2"} 1"#,
+        r#"anthropic_guard_detector_short_circuited_total{detector="pg2",reason="circuit_open"} 1"#,
+        r#"anthropic_guard_detector_short_circuited_total{detector="pg2",reason="saturated"} 0"#,
         r#"anthropic_guard_detector_cache_lookups_total{detector="pg2",result="miss"} 3"#,
         r#"anthropic_guard_verdicts_total{client="block",scanner="pg2",verdict="allow"} 1"#,
         "anthropic_guard_detector_duration_seconds_count",
