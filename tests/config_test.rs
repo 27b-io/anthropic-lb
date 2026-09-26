@@ -571,3 +571,29 @@ token = "sk-ant-api-test"
         "redis_url should be absent when not configured"
     );
 }
+
+// The unit tests call `validate_rate_limit_cooldown` directly and would stay
+// green if `main` stopped calling it; this runs the real binary. The
+// unparseable `listen` is a tripwire: without the check, startup panics on it
+// instead of serving, so the regression fails fast rather than hanging.
+#[test]
+fn test_binary_rejects_out_of_range_rate_limit_cooldown_at_startup() {
+    for secs in ["0", "86401"] {
+        let temp_file = create_temp_config(&format!(
+            "listen = \"not-an-address\"\nallow_unauthenticated = true\nrate_limit_cooldown_secs = {secs}\n"
+        ));
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_anthropic-lb"))
+            .arg(temp_file.path())
+            .output()
+            .expect("Failed to run anthropic-lb");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(!output.status.success(), "startup should fail: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "config: rate_limit_cooldown_secs must be in 1..=86400, got {secs}"
+            )),
+            "startup should name the cooldown error: {stderr}"
+        );
+    }
+}
