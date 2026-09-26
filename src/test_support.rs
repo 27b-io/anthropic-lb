@@ -113,6 +113,7 @@ pub(crate) fn test_state_base() -> AppState {
         budget_usage: Mutex::new(HashMap::new()),
         client_utilization_limits: HashMap::new(),
         operators: vec![],
+        admin_readers: vec![],
         emergency_brake: true,
         emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
         client_request_rates: Mutex::new(HashMap::new()),

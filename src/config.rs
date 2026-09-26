@@ -72,6 +72,21 @@ pub(crate) struct Config {
     /// header is not verified against client_names IP mapping.
     #[serde(default)]
     pub(crate) operators: Vec<String>,
+    /// Client IDs granted the admin READ surfaces (`/_stats`, `/metrics`) and
+    /// nothing else — every `/v1` surface answers 403 (LAB-4395).
+    ///
+    /// `operators` is one bit meaning two things: "may read the dashboards"
+    /// and "bypasses every request policy". A monitoring scrape or a Grafana
+    /// datasource needs only the first, but granting it hands out unbudgeted
+    /// spend authority over the whole pool — and any per-client budget written
+    /// for that name is dead config, because `pre_request_gate` returns before
+    /// reading it. This splits the read bit out.
+    ///
+    /// Only meaningful under `[[clients]]`, where identity is credential-derived:
+    /// `validate_clients` rejects the key on the legacy path rather than let it
+    /// pretend to scope a shared secret it cannot scope.
+    #[serde(default)]
+    pub(crate) admin_readers: Vec<String>,
     /// Enable the emergency brake. Default: true.
     pub(crate) emergency_brake: Option<bool>,
     /// Emergency brake threshold (0.0-1.0). When ALL accounts exceed this,

@@ -1379,6 +1379,12 @@ pub(crate) async fn openai_chat_handler(
         session_id,
     } = rctx;
 
+    // LAB-4395 / GH #199: same identity-only refusal as `proxy_handler`, and
+    // for the same reason — ahead of the reservation below.
+    if let Some(resp) = state.deny_admin_reader(&req_id, &client_id) {
+        return *resp;
+    }
+
     // Admission control (P1-01): same body-memory backstop as proxy_handler.
     let _body_reservation = match reserve_request_body(&state, &parts, &req_id, client_ip) {
         Ok(g) => g,
@@ -1442,7 +1448,7 @@ pub(crate) async fn openai_chat_handler(
     // Note: budget + emergency don't need `model` and could run before body parsing,
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
-    if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
+    if let Err(resp) = state.pre_request_gate(&req_id, &client_id, &model).await {
         return *resp;
     }
 

@@ -1401,6 +1401,13 @@ pub(crate) async fn proxy_handler(
     // affinity_key is built AFTER the body is parsed, so the content fingerprint
     // (fp) can be folded in as the finest routing discriminator.
 
+    // LAB-4395 / GH #199: a read-only principal is refused here, on identity
+    // alone, before it can reserve any of the shared body budget or have a
+    // byte of its body read. `pre_request_gate` repeats the check.
+    if let Some(resp) = state.deny_admin_reader(&req_id, &client_id) {
+        return *resp;
+    }
+
     // Debug: dump all inbound request headers
     if tracing::enabled!(tracing::Level::DEBUG) {
         debug!(req_id, client_id = %client_id, ver = %client_ver, ">>> inbound request");
@@ -1642,7 +1649,7 @@ pub(crate) async fn proxy_handler(
     // Note: budget + emergency don't need `model` and could run before body parsing,
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
-    if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
+    if let Err(resp) = state.pre_request_gate(&req_id, &client_id, &model).await {
         return *resp;
     }
 
