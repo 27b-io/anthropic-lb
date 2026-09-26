@@ -1064,7 +1064,7 @@ async fn forward_openai_compat_anthropic(
             });
         if model_unsupported {
             state.note_model_unsupported(endpoint_name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
+            return ForwardOutcome::RetryRejectedByAccount(Box::new(response));
         }
         if entitlement {
             state.note_entitlement_400(endpoint_name);
@@ -1517,9 +1517,9 @@ pub(crate) async fn openai_chat_handler(
         let n = state.endpoints.len();
         let mut last_saw_529 = false;
         let mut last_saw_transient = false;
-        // Upstream error from the most recent model-unsupported rejection —
+        // Upstream error from the most recent account-level rejection —
         // returned verbatim if the pool exhausts on nothing but rejections.
-        let mut model_unsupported_resp: Option<Response> = None;
+        let mut rejected_resp: Option<Response> = None;
         // One-shot entitlement re-send, as in `proxy_handler` (LAB-4729).
         let mut entitlement_resp: Option<(EndpointIdx, Option<Response>)> = None;
         for retry_round in 0..=MAX_529_RETRIES {
@@ -1542,8 +1542,9 @@ pub(crate) async fn openai_chat_handler(
                 // Pick the next endpoint and dispatch by protocol. Both forwards
                 // return a `ForwardOutcome` so the shared round-gated policy in
                 // `apply_round_outcome` covers both.
+                // OpenAI→Anthropic translation carries no `speed`: never fast.
                 let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                    .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
+                    .pick_endpoint_for_client(affinity, &model, &skip, &client_id, false)
                     .await
                 {
                     Some(i) => {
@@ -1609,7 +1610,7 @@ pub(crate) async fn openai_chat_handler(
                     &mut skip,
                     &mut saw_529,
                     &mut saw_transient,
-                    &mut model_unsupported_resp,
+                    &mut rejected_resp,
                     &mut entitlement_resp,
                 ) {
                     RetryStep::Return(resp) => return resp,
@@ -1624,19 +1625,24 @@ pub(crate) async fn openai_chat_handler(
             }
         }
 
-        // Same model-rejection exhaustion rule as `proxy_handler` (LAB-941),
-        // in the OpenAI error shape this handler's clients parse.
+        // Entitlement 400 first, outside the rejection gate — as in
+        // `proxy_handler` (LAB-4729).
+        let (refused, entitlement_resp) = entitlement_resp.unzip();
         if !last_saw_529 && !last_saw_transient {
-            if let Some(resp) = entitlement_resp
-                .and_then(|(_, r)| r)
-                .or(model_unsupported_resp)
-            {
+            if let Some(resp) = entitlement_resp.flatten() {
                 return resp;
             }
-            if state.model_unsupported_everywhere(&model) {
-                warn!(model, "model unsupported on all eligible endpoints");
-                return model_unsupported_response(&model, true);
+        }
+        // Same rejection-exhaustion rule as `proxy_handler` (LAB-941, as
+        // generalised by LAB-2687), in the OpenAI error shape this handler's
+        // clients parse. Never `fast`: the OpenAI→Anthropic translation
+        // carries no `speed`.
+        if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, false, refused) {
+            if let Some(resp) = rejected_resp {
+                return resp;
             }
+            warn!(model, "model unsupported on all eligible endpoints");
+            return model_unsupported_response(&model, true);
         }
         exhaustion_response(&state, last_saw_transient, last_saw_529)
     }

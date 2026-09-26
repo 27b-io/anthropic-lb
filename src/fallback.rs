@@ -222,7 +222,7 @@ pub(crate) async fn try_fallback_upstream(
         };
         if model_unsupported {
             state.note_model_unsupported(&ep.name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
+            return ForwardOutcome::RetryRejectedByAccount(Box::new(response));
         }
         return ForwardOutcome::Done(Box::new(response));
     }

@@ -293,8 +293,8 @@ async fn build_metrics_snap(
 /// writer's `Mutex` is locked by tracing-subscriber, not by this crate). That
 /// is sound because each guarded value is either a counter/accumulator store,
 /// a map of independent, self-expiring entries (auth throttle windows, the
-/// unsupported-model cache, the session registry, log dedup/rate-limit
-/// stamps), a single replaced value (cluster-info cache), or the burn-rate
+/// unsupported-model and fast-mode-disabled caches, the session registry, log
+/// dedup/rate-limit stamps), a single replaced value (cluster-info cache), or the burn-rate
 /// state: three independent EWMAs updated one after another, so a panic
 /// mid-update leaves at worst a monitoring value torn by one update.
 /// A panicking holder can leave one entry stale by at most one update, never
@@ -709,6 +709,24 @@ pub(crate) async fn metrics_handler(
             "anthropic_account_hard_limited_remaining_seconds",
             &[("account", &s.name)],
             s.hard_limited_secs,
+        );
+    }
+
+    // Org-level fast-mode entitlement marks (LAB-2687): one increment per
+    // "Fast mode is not enabled" 400 an account returned. Non-zero on an
+    // account means its org needs fast mode enabled — an operator action.
+    prom_header(
+        &mut buf,
+        "anthropic_fast_mode_disabled_total",
+        "counter",
+        "Upstream 'Fast mode is not enabled for your organization' 400 responses by account",
+    );
+    for ep in &state.endpoints {
+        prom_counter(
+            &mut buf,
+            "anthropic_fast_mode_disabled_total",
+            &[("account", &ep.name)],
+            ep.fast_mode_disabled_total.load(Ordering::Relaxed),
         );
     }
 

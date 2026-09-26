@@ -560,6 +560,7 @@ async fn main() {
                 priority: ec.priority,
                 fable_included: ec.fable_included.unwrap_or(true),
                 requests: AtomicU64::new(0),
+                fast_mode_disabled_total: AtomicU64::new(0),
                 rate_info: RwLock::new(RateLimitInfo::default()),
                 burn_rate: Mutex::new(BurnRate::new()),
                 input_tokens: AtomicU64::new(0),
@@ -820,6 +821,7 @@ async fn main() {
         model_denied: Mutex::new(HashMap::new()),
         client_rejections: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
+        fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache,
     });
 

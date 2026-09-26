@@ -502,6 +502,9 @@ pub(crate) struct Endpoint {
     /// here (Pro plan) → Fable requests demote this endpoint by `overage_penalty`.
     pub(crate) fable_included: bool,
     pub(crate) requests: AtomicU64,
+    /// `anthropic_fast_mode_disabled_total`: upstream "Fast mode is not
+    /// enabled for your organization" 400s this account returned (LAB-2687).
+    pub(crate) fast_mode_disabled_total: AtomicU64,
     pub(crate) rate_info: RwLock<RateLimitInfo>,
     pub(crate) burn_rate: Mutex<BurnRate>,
     pub(crate) input_tokens: AtomicU64,
@@ -747,6 +750,13 @@ pub(crate) struct AppState {
     /// mutex, never held across `.await`; bounded by UNSUPPORTED_MODEL_MAX
     /// + TTL eviction. Per-replica: a fresh replica re-learns in one attempt.
     pub(crate) unsupported_models: Mutex<HashMap<(usize, String), Instant>>,
+    /// Endpoint idx → expiry for accounts whose org has fast mode disabled,
+    /// learned from the upstream's own 400 (LAB-2687). Only `speed: "fast"`
+    /// requests skip them. Kept apart from `unsupported_models` so a client
+    /// spraying junk model names can't fill that cap and starve this learn;
+    /// keyed by endpoint index, so bounded by config. Sync mutex, never held
+    /// across `.await`; per-replica like `unsupported_models`.
+    pub(crate) fast_mode_disabled: Mutex<HashMap<usize, Instant>>,
     /// Opt-in encrypted response cache on non-streaming /v1/messages
     /// (LAB-933). None = feature off — the no-config case is byte-identical
     /// to pre-cache behaviour (AC1).

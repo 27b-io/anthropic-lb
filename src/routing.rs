@@ -437,8 +437,9 @@ impl AppState {
         }
     }
 
-    /// Test-only convenience: pick with no client identity, so no pinning
-    /// applies. Keeps the pre-LAB-2636 routing tests byte-identical.
+    /// Test-only convenience: pick with no client identity and standard
+    /// speed — no pinning, no fast-mode exclusion. Keeps the pre-LAB-2636
+    /// routing tests byte-identical.
     #[cfg(test)]
     pub(crate) async fn pick_endpoint(
         &self,
@@ -446,7 +447,7 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
     ) -> Option<EndpointIdx> {
-        self.pick_endpoint_for_client(affinity_key, model, skip, "")
+        self.pick_endpoint_for_client(affinity_key, model, skip, "", false)
             .await
     }
 
@@ -467,6 +468,10 @@ impl AppState {
     /// free general-pool capacity — violating the free-before-paid guarantee
     /// below, which the retain would otherwise bypass.
     ///
+    /// `fast` (LAB-2687): a `speed: "fast"` request also drops
+    /// `fast_mode_disabled` accounts BEFORE the pin filter, so a non-entitled
+    /// pin spills rather than serving.
+    ///
     /// Tiers are tried strictly in ascending priority order. Within a tier:
     /// healthy candidates (`gate < soft_limit`) are preferred; if none are healthy
     /// the tier degrades to its soft-limited candidates. Only when a tier has zero
@@ -480,8 +485,37 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
         client_id: &str,
+        fast: bool,
     ) -> Option<EndpointIdx> {
         let mut candidates = self.routing_candidates(model, skip).await;
+        let fast_disabled = if fast {
+            self.fast_mode_disabled_endpoints()
+        } else {
+            Vec::new()
+        };
+        candidates.retain(|c| {
+            if fast_disabled.contains(&c.endpoint) {
+                trace!(
+                    endpoint = self.endpoints[c.endpoint].name,
+                    model,
+                    "pick: skipping, fast mode disabled on endpoint"
+                );
+                return false;
+            }
+            // An OpenAI-protocol endpoint never carries a fast-mode mark (it
+            // has no org entitlement to reject) and its request translation
+            // drops `speed` entirely — routing a fast request there would
+            // silently serve it at standard speed (LAB-2687).
+            if fast && self.endpoints[c.endpoint].protocol == Protocol::OpenAI {
+                trace!(
+                    endpoint = self.endpoints[c.endpoint].name,
+                    model,
+                    "pick: skipping, openai-protocol endpoint can't honor speed:\"fast\""
+                );
+                return false;
+            }
+            true
+        });
         if let Some(preferred) = self.client_preferred_endpoints(client_id) {
             let is_preferred =
                 |c: &RoutingCandidate| self.endpoint_is_preferred(preferred, c.endpoint);
@@ -501,7 +535,11 @@ impl AppState {
                 // account(s) and will consume shared-pool cache/claims.
                 info!(
                     client_id,
-                    model, "pick: no preferred endpoint viable — spilling to general pool"
+                    model,
+                    fast_mode_disabled = fast_disabled
+                        .iter()
+                        .any(|&i| self.endpoint_is_preferred(preferred, i)),
+                    "pick: no preferred endpoint viable — spilling to general pool"
                 );
             }
         }
@@ -1328,6 +1366,12 @@ impl AppState {
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<(usize, String), Instant>> {
         lock_recovering(&self.unsupported_models, "unsupported_models")
+    }
+
+    pub(crate) fn lock_fast_mode_disabled(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<usize, Instant>> {
+        lock_recovering(&self.fast_mode_disabled, "fast_mode_disabled")
     }
 
     pub(crate) fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionEntry>> {

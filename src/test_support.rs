@@ -17,6 +17,7 @@ pub(crate) fn mk_endpoint(name: &str, token: &str) -> Endpoint {
         priority: 0,
         fable_included: true,
         requests: AtomicU64::new(0),
+        fast_mode_disabled_total: AtomicU64::new(0),
         rate_info: RwLock::new(RateLimitInfo::default()),
         burn_rate: Mutex::new(BurnRate::new()),
         input_tokens: AtomicU64::new(0),
@@ -54,6 +55,7 @@ pub(crate) fn make_endpoint(name: &str, protocol: Protocol) -> Endpoint {
         priority: 0,
         fable_included: true,
         requests: AtomicU64::new(0),
+        fast_mode_disabled_total: AtomicU64::new(0),
         rate_info: RwLock::new(RateLimitInfo::default()),
         burn_rate: Mutex::new(BurnRate::new()),
         input_tokens: AtomicU64::new(0),
@@ -154,6 +156,7 @@ pub(crate) fn test_state_base() -> AppState {
         model_denied: Mutex::new(HashMap::new()),
         client_rejections: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
+        fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache: None,
     }
 }
@@ -566,6 +569,8 @@ pub(crate) const HEAD_429_RETRY_AFTER_7: &str = "HTTP/1.1 429 Too Many Requests\
 /// Raw 404 with Anthropic's model-not-found envelope (`connection: close`, so
 /// the body is EOF-delimited — no content-length needed).
 pub(crate) const HEAD_404_MODEL: &str = "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"model: claude-nope-1\"}}";
+
+pub(crate) const FAST_BODY: &str = r#"{"model":"claude-opus-5","max_tokens":1,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#;
 
 /// Poll endpoint token counters until streamed usage lands (the finalize
 /// task is detached, so recording races the client seeing end-of-stream).
