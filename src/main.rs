@@ -6303,8 +6303,8 @@ impl AppState {
         lock_recovering(&self.budget_usage, "budget_usage")
     }
 
-    // One `lock_recovering` accessor per multi-site map, so a new site cannot
-    // reach for a bare `.lock()` and skip on poison for the process lifetime.
+    // One `lock_recovering` accessor per multi-site map: a convenience that
+    // pins each map's lock-name string in one place.
 
     fn lock_client_rejections(
         &self,
@@ -9364,14 +9364,15 @@ async fn forward_anthropic(
     // Use OAuth variant (with CC system prompt) for OAuth tokens, and its
     // beta-coherent rewrite when the filter orphaned a body field (LAB-1261).
     let req_body = if token.starts_with(OAUTH_TOKEN_PREFIX) {
-        // `dropped` is only ever non-empty on this branch, so a rewrite
-        // without it would mean the filter's contract changed underneath us.
-        debug_assert!(coherent_body.is_none() || token.starts_with(OAUTH_TOKEN_PREFIX));
         match &coherent_body {
             Some((rewritten, _)) => rewritten,
             None => oauth_body_bytes,
         }
     } else {
+        // Only the OAuth arm of `inject_account_auth` fills `dropped`, so a
+        // rewrite here would be discarded after `record_stripped_body_fields`
+        // and the fast-mode reclassification had already acted on it.
+        debug_assert!(coherent_body.is_none());
         body_bytes
     };
     upstream_req = upstream_req.body(req_body.clone());
@@ -11554,12 +11555,15 @@ async fn build_metrics_snap(
 /// naming it (`name`) so a panicked holder leaves evidence instead of being
 /// silently healed.
 ///
-/// Every production std `Mutex` in this crate is locked through here (the only bare
-/// `.lock()` left is the async `SAVE_LOCK`, which cannot poison). That is
-/// sound because each guarded value is either a counter/accumulator store or
+/// Every std `Mutex` this crate locks directly goes through here (the only bare
+/// `.lock()` left is the async `SAVE_LOCK`, which cannot poison; the debug-log
+/// writer's `Mutex` is locked by tracing-subscriber, not by this crate). That
+/// is sound because each guarded value is either a counter/accumulator store,
 /// a map of independent, self-expiring entries (auth throttle windows, the
 /// unsupported-model cache, the session registry, log dedup/rate-limit
-/// stamps) or a single replaced value (cluster-info cache, burn-rate EWMAs).
+/// stamps), a single replaced value (cluster-info cache), or the burn-rate
+/// state: three independent EWMAs updated one after another, so a panic
+/// mid-update leaves at worst a monitoring value torn by one update.
 /// A panicking holder can leave one entry stale by at most one update, never
 /// break an invariant spanning entries, so the recovered data is still the
 /// best answer. Clearing is the half that matters: a `Mutex` poison is
