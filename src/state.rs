@@ -848,12 +848,13 @@ pub(crate) fn reserve_request_body(
                 "rejected: in-flight request-body memory budget exhausted (load-shedding)"
             );
             state.body_shed_total.fetch_add(1, Ordering::Relaxed);
-            let resp = (
+            let mut resp = proxy_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                [("retry-after", "1")],
+                "overloaded_error",
                 "overloaded: request-body memory budget exhausted",
-            )
-                .into_response();
+            );
+            resp.headers_mut()
+                .insert("retry-after", HeaderValue::from_static("1"));
             Err(Box::new(resp))
         }
     }
@@ -887,9 +888,11 @@ pub(crate) async fn read_body_bounded(
                     timeout_secs = state.body_read_timeout.as_secs(),
                     "request body read timed out (releasing body-memory reservation)"
                 );
-                let resp =
-                    (StatusCode::REQUEST_TIMEOUT, "request body read timed out").into_response();
-                return Err(Box::new(resp));
+                return Err(Box::new(proxy_error_response(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "timeout_error",
+                    "request body read timed out",
+                )));
             }
         }
     };

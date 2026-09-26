@@ -65,6 +65,8 @@ use handler::*;
 use metrics::*;
 use oauth_prompt::*;
 use openai_compat::*;
+#[cfg(test)]
+use persistence::*;
 use response_cache::*;
 use reverse_translation::*;
 use session_registry::*;

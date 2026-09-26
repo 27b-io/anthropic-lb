@@ -754,6 +754,20 @@ pub(crate) const TEST_IP: &str = "10.0.0.7";
 pub(crate) fn test_ip() -> IpAddr {
     TEST_IP.parse().unwrap()
 }
+/// Parse a proxy-generated denial into its JSON envelope, pinning AC-1 for
+/// every site that goes through it: `content-type: application/json` and a
+/// body that parses.
+pub(crate) async fn parse_error_envelope(resp: Box<Response>) -> serde_json::Value {
+    assert_eq!(
+        resp.headers().get("content-type").map(|v| v.as_bytes()),
+        Some(&b"application/json"[..]),
+        "denial must be content-type: application/json"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).expect("denial must be valid JSON")
+}
 
 /// Build a `Config` from a TOML fragment. Goes through the real deserializer,
 /// so these tests also pin the config surface, and it beats hand-writing

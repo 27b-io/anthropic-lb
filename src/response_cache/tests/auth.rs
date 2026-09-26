@@ -603,6 +603,16 @@ async fn read_only_principal_is_refused_on_every_proxy_surface() {
             reqwest::StatusCode::FORBIDDEN,
             "{method} {path} must refuse a read-only principal"
         );
+        // Per surface: `/v1/chat/completions` refuses from its own handler, and
+        // it gets the Anthropic envelope too, on purpose (LAB-4129).
+        assert_eq!(
+            resp.headers().get("content-type").map(|v| v.as_bytes()),
+            Some(&b"application/json"[..]),
+            "{method} {path}: reader 403 must be a JSON envelope"
+        );
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(json["type"], "error", "{method} {path}");
+        assert_eq!(json["error"]["type"], "permission_error", "{method} {path}");
     }
 
     assert_eq!(

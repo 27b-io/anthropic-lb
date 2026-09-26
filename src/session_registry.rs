@@ -1020,13 +1020,11 @@ impl AppState {
             client_id = %client_id,
             "rejected: read-only principal has no proxy authority"
         );
-        Some(Box::new(
-            (
-                StatusCode::FORBIDDEN,
-                "forbidden: read-only principal — /_stats and /metrics only",
-            )
-                .into_response(),
-        ))
+        Some(Box::new(proxy_error_response(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "forbidden: read-only principal — /_stats and /metrics only",
+        )))
     }
 
     /// Check if all model-compatible endpoints exceed this client's utilization limit.
@@ -1155,7 +1153,7 @@ impl AppState {
             self.note_model_denied(client_id, model);
             // `model` is caller-controlled and echoed back — truncate it here
             // too, so a 25 MB model field cannot become a 25 MB error body.
-            let body = if model.is_empty() {
+            let msg = if model.is_empty() {
                 format!(
                     "client '{client_id}' has a model allow-list, but no model could be read from the request"
                 )
@@ -1165,16 +1163,26 @@ impl AppState {
                     truncate_label(model)
                 )
             };
-            return Err(Box::new((StatusCode::FORBIDDEN, body).into_response()));
+            return Err(Box::new(proxy_error_response(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                &msg,
+            )));
         }
 
         // 1. Daily token budget (existing)
         if client_id != "-" && self.check_budget(client_id).await.is_err() {
             self.note_client_rejection(client_id, "budget");
-            warn!(client_id = %client_id, "rejected: daily token budget exceeded");
-            return Err(Box::new(
-                (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response(),
-            ));
+            let retry_after = 86400 - (Self::now_epoch() % 86400);
+            warn!(client_id = %client_id, retry_after, "rejected: daily token budget exceeded");
+            let mut resp = proxy_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "daily token budget exceeded",
+            );
+            resp.headers_mut()
+                .insert("retry-after", HeaderValue::from(retry_after));
+            return Err(Box::new(resp));
         }
 
         // 2. Utilization limit (new)
@@ -1185,15 +1193,13 @@ impl AppState {
                 retry_after = retry_after,
                 "rejected: utilization limit exceeded"
             );
-            let mut resp = (
+            let mut resp = proxy_error_response(
                 StatusCode::TOO_MANY_REQUESTS,
-                format!("utilization limit exceeded for client '{client_id}'"),
-            )
-                .into_response();
-            resp.headers_mut().insert(
-                "retry-after",
-                HeaderValue::from_str(&retry_after.to_string()).unwrap(),
+                "rate_limit_error",
+                &format!("utilization limit exceeded for client '{client_id}'"),
             );
+            resp.headers_mut()
+                .insert("retry-after", HeaderValue::from(retry_after));
             return Err(Box::new(resp));
         }
 
@@ -1204,13 +1210,15 @@ impl AppState {
                 client_id = %client_id,
                 "rejected: emergency brake active"
             );
-            return Err(Box::new(
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "emergency: all accounts near exhaustion",
-                )
-                    .into_response(),
-            ));
+            // No `retry-after`: the brake is the same condition as
+            // `exhaustion_response`'s rate-limited branch — recovery is
+            // minutes to hours, and a short hint would tight-loop clients
+            // into a still-saturated pool. Fail fast instead.
+            return Err(Box::new(proxy_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "emergency: all accounts near exhaustion",
+            )));
         }
 
         Ok(())

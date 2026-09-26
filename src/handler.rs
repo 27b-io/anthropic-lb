@@ -499,23 +499,40 @@ pub(crate) fn model_unsupported_response(model: &str, openai_shape: bool) -> Res
         .into_response()
 }
 
-/// 400 in Anthropic's error envelope when an Anthropic request can't be
-/// faithfully translated for an OpenAI-compat fallback endpoint (e.g. an
-/// image source type the translator doesn't support). The caller's request
-/// was Anthropic Messages API shaped, so the error response matches that,
-/// regardless of which protocol the fallback endpoint speaks.
+/// Anthropic-shaped JSON error envelope for the proxy-generated admission
+/// denials (LAB-4129): `authenticate` 401, `pre_request_gate` 403/429,
+/// `deny_admin_reader`'s read-only-principal 403 (LAB-4395),
+/// `reserve_request_body` 503, `read_body_bounded` 408, the
+/// untranslatable-request 400, and `proxy_handler`'s 400 for a valid-JSON
+/// non-object body (LAB-4314) — the router fallback, so any method on any
+/// path. This is not the whole error surface — the IP-allowlist 403, retry
+/// exhaustion, the failed-auth throttle and the other bad-body 400s still
+/// return `text/plain`.
 ///
-/// Also `proxy_handler`'s rejection of a valid-JSON non-object body
-/// (LAB-4314). That handler is the router fallback, so the rejected request
-/// may be any method on any path; the envelope is still the right shape,
-/// since it is what the Anthropic upstream returns for the same body.
-fn untranslatable_request_response(message: &str) -> Response {
+/// All three 429s share `rate_limit_error`: that is the type Anthropic binds
+/// to 429, and a narrower invented one would break SDK matching. What
+/// separates them on the wire is `retry-after` — budget and utilization
+/// carry one, the emergency brake deliberately does not. Two types are ours
+/// rather than Anthropic's, which binds `overloaded_error` to 529 and has no
+/// 408 type at all: `503 overloaded_error` and `408 timeout_error` name load
+/// shed *here*, not an upstream condition relayed.
+///
+/// Deliberately NOT surface-shaped, unlike `guard_blocked_response` and
+/// `model_unsupported_response`: those carry a machine-readable cause in
+/// `error.code` that OpenAI-compat clients match on. For these denials the
+/// status code is the signal — OpenAI SDKs map it to the exception class and
+/// read `error.message`, which both envelope shapes carry.
+pub(crate) fn proxy_error_response(
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+) -> Response {
     (
-        StatusCode::BAD_REQUEST,
+        status,
         [("content-type", "application/json")],
         serde_json::json!({
             "type": "error",
-            "error": { "type": "invalid_request_error", "message": message }
+            "error": { "type": error_type, "message": message }
         })
         .to_string(),
     )
@@ -1462,7 +1479,11 @@ pub(crate) async fn proxy_handler(
                     client_id = %client_id,
                     "rejected: request body is not a JSON object"
                 );
-                return untranslatable_request_response("request body must be a JSON object");
+                return proxy_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "request body must be a JSON object",
+                );
             }
             let model = parsed
                 .get("model")
@@ -1800,7 +1821,9 @@ pub(crate) async fn proxy_handler(
                                     // Terminal, not a retry: the request itself
                                     // is the problem, so rotating would fail the
                                     // same way on every endpoint.
-                                    ForwardOutcome::Done(Box::new(untranslatable_request_response(
+                                    ForwardOutcome::Done(Box::new(proxy_error_response(
+                                        StatusCode::BAD_REQUEST,
+                                        "invalid_request_error",
                                         msg,
                                     )))
                                 }

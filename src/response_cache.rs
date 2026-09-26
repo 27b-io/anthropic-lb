@@ -647,7 +647,7 @@ impl AppState {
     /// carry the caller's own upstream token in `passthrough` mode; widening
     /// acceptance there would be a gratuitous auth surface on a ticket whose
     /// whole purpose is to narrow one.
-    fn authenticate(
+    pub(crate) fn authenticate(
         &self,
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
@@ -655,7 +655,11 @@ impl AppState {
         // Boxed Err, matching `reserve_request_body` — an inline `Response` is
         // 128+ bytes on the hot success path (clippy::result_large_err).
         let unauthorized = || -> Box<Response> {
-            Box::new((StatusCode::UNAUTHORIZED, "unauthorized").into_response())
+            Box::new(proxy_error_response(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "unauthorized",
+            ))
         };
         let from_header = headers.get("x-api-key").and_then(|v| v.to_str().ok());
         let from_bearer = if allow_bearer {
