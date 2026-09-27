@@ -190,12 +190,14 @@ impl AppState {
     ) {
         {
             let mut counts = lock_recovering(&self.prompt_too_long, "prompt_too_long");
-            let label = if counts.len() < MAX_PROMPT_TOO_LONG_MODELS || counts.contains_key(model) {
-                model
-            } else {
-                "_other"
-            };
-            *counts.entry(label.to_owned()).or_insert(0) += 1;
+            let model_label = escape_sentinel(model, &["other"]);
+            let label =
+                if counts.len() < MAX_PROMPT_TOO_LONG_MODELS || counts.contains_key(&model_label) {
+                    model_label
+                } else {
+                    "_other".to_owned()
+                };
+            *counts.entry(label).or_insert(0) += 1;
         }
         let (observed, max) = parse_prompt_too_long(message)
             .map(|(o, m)| (Some(o), Some(m)))

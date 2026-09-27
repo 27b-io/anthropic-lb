@@ -1037,7 +1037,9 @@ impl AppState {
     /// client id NOT in `[[clients]]` lumps into the one global
     /// `("_other", "_other")` bucket and can never mint a key. A model named
     /// `_other`, `__other`, … gains one more leading `_` in its label, so it
-    /// never pre-claims its client's bucket and no two models share a label.
+    /// never pre-claims its client's bucket. The escape never merges two
+    /// models' labels; truncation can — models sharing their first
+    /// `MAX_LABEL_CHARS` (64) characters share one label.
     ///
     /// The client axis is config-bounded by reachability, not by the header
     /// filter: this runs only when `client_allows_model` returned false, which
@@ -1057,14 +1059,8 @@ impl AppState {
         let model = truncate_label(model);
         let first_time = {
             let mut counts = lock_recovering(&self.model_denied, "model_denied");
-            // Escape `_…_other` models off the overflow sentinel (fn doc).
-            let sentinel_like = model.starts_with('_') && model.trim_start_matches('_') == "other";
-            let model_label = if sentinel_like {
-                format!("_{model}")
-            } else {
-                model.clone()
-            };
-            let key = (client_id.to_owned(), model_label);
+            // Escape `_other`, `__other`, … off the overflow sentinel (fn doc).
+            let key = (client_id.to_owned(), escape_sentinel(&model, &["other"]));
             let label = if counts.len() < MAX_MODEL_DENIED_LABELS || counts.contains_key(&key) {
                 key
             } else if self.clients.iter().any(|c| c.name == client_id) {
