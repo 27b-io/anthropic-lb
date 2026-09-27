@@ -1081,13 +1081,13 @@ impl AppState {
         if first_time {
             warn!(
                 client_id = %client_id,
-                model = %model,
+                model = ?model,
                 "rejected: model not in client allow-list"
             );
         } else {
             debug!(
                 client_id = %client_id,
-                model = %model,
+                model = ?model,
                 "rejected: model not in client allow-list"
             );
         }

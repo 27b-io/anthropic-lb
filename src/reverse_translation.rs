@@ -833,7 +833,7 @@ async fn forward_openai_compat_anthropic(
     };
     debug!(
         account = endpoint_name,
-        model = %model,
+        model = ?model,
         body_len = req_body.len(),
         "openai-compat: upstream request"
     );
@@ -987,7 +987,7 @@ async fn forward_openai_compat_anthropic(
             });
         warn!(
             account = endpoint_name,
-            model = %model,
+            model = ?model,
             status = status.as_u16(),
             error_message = ?error_msg,
             "openai-compat: upstream error"
