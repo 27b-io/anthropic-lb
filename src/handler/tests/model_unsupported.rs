@@ -224,6 +224,27 @@ fn model_unsupported_skips_oversized_model_names() {
     assert!(!map.contains_key(&(0, oversized)));
 }
 
+/// The learn's log line records the model escaped: a newline in a
+/// client-supplied model name must not start a forged log line.
+#[test]
+fn model_unsupported_log_escapes_the_model_name() {
+    let buf = log_capture_buf();
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a")]);
+    state.note_model_unsupported("a", 0, "negcache-log\nFORGED-NEGCACHE fake line");
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|l| l.contains("model unsupported on account")
+                && l.contains(r#"model="negcache-log\nFORGED-NEGCACHE fake line""#)),
+        "the learn must log the model quoted and escaped, got:\n{output}"
+    );
+    assert!(
+        !output.lines().any(|l| l.starts_with("FORGED-NEGCACHE")),
+        "a newline in the model name must not start a new log line"
+    );
+}
+
 /// LAB-941 native path: an account 404-rejecting the model rotates to the
 /// next account within the request, and the negative cache makes the NEXT
 /// request skip the rejecting account outright instead of re-pinning it via

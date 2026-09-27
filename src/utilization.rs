@@ -1504,7 +1504,9 @@ impl AppState {
         }
         warn!(
             account = endpoint_name,
-            model = %truncate_label(model),
+            // Debug, not Display: the name is client input, and Display would
+            // write a newline or escape in it into the log unescaped.
+            model = ?truncate_label(model),
             cooldown_secs = UNSUPPORTED_MODEL_TTL.as_secs(),
             "model unsupported on account, routing away"
         );
