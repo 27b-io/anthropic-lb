@@ -70,7 +70,7 @@ async fn pinned_client_always_routes_to_preferred_endpoint() {
     for i in 0..100 {
         let key = format!("client:sess:{i}");
         if state
-            .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[], "other")
+            .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[], "other", false)
             .await
             == Some(0)
         {
@@ -78,7 +78,7 @@ async fn pinned_client_always_routes_to_preferred_endpoint() {
         }
         assert_eq!(
             state
-                .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[], "passbolt")
+                .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[], "passbolt", false)
                 .await,
             Some(1),
             "pinned client must land on 'dedicated' for every affinity key"
@@ -100,7 +100,7 @@ async fn pinned_client_spills_on_soft_limit_overage() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
             .await,
         Some(0),
         "soft-limited preferred endpoint must spill to the general pool"
@@ -120,7 +120,7 @@ async fn pinned_client_spills_on_hard_limit() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
             .await,
         Some(0),
         "hard-limited preferred endpoint must spill to the general pool"
@@ -140,7 +140,7 @@ async fn pinned_client_spills_on_transport_unhealthy() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
             .await,
         Some(0),
         "transport-unhealthy preferred endpoint must spill to the general pool"
@@ -161,7 +161,7 @@ async fn pinned_client_spills_on_model_mismatch() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
             .await,
         Some(0),
         "model not served by the preferred endpoint must spill to the general pool"
@@ -169,9 +169,46 @@ async fn pinned_client_spills_on_model_mismatch() {
     // Sanity: a model the pin DOES serve stays pinned.
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-haiku-4-5", &[], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-haiku-4-5", &[], "passbolt", false)
             .await,
         Some(1)
+    );
+}
+
+/// AC-11 (LAB-2687): a pinned account whose org lacks fast mode is not a
+/// viable preferred candidate for a `speed: "fast"` request — the exclusion
+/// runs before the pin filter, so the request spills to the general pool.
+#[tokio::test]
+async fn pinned_client_fast_request_spills_when_pin_is_fast_mode_disabled() {
+    let state = pinned_test_state();
+    state.endpoints[0].rate_info.write().await.utilization = Some(0.1);
+    state.endpoints[1].rate_info.write().await.utilization = Some(0.1);
+    state.note_fast_mode_disabled("dedicated", 1);
+
+    assert_eq!(
+        state
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", true)
+            .await,
+        Some(0),
+        "fast request must spill off a fast-mode-disabled pin"
+    );
+}
+
+/// AC-11 (LAB-2687): the same pin, same client, standard request — the
+/// fast-mode mark is irrelevant and the pin holds.
+#[tokio::test]
+async fn pinned_client_standard_request_keeps_fast_mode_disabled_pin() {
+    let state = pinned_test_state();
+    state.endpoints[0].rate_info.write().await.utilization = Some(0.1);
+    state.endpoints[1].rate_info.write().await.utilization = Some(0.1);
+    state.note_fast_mode_disabled("dedicated", 1);
+
+    assert_eq!(
+        state
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
+            .await,
+        Some(1),
+        "standard request must stay pinned despite the fast-mode mark"
     );
 }
 
@@ -197,7 +234,7 @@ async fn pinned_client_rotation_prefers_remaining_preferred_then_spills() {
         let key = format!("client:sess:{i}");
         assert_eq!(
             state
-                .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[1], "passbolt")
+                .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[1], "passbolt", false)
                 .await,
             Some(2),
             "with one preferred endpoint skipped, the remaining one must serve"
@@ -206,7 +243,7 @@ async fn pinned_client_rotation_prefers_remaining_preferred_then_spills() {
     // Both preferred endpoints skipped → spill to the general pool.
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[1, 2], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[1, 2], "passbolt", false)
             .await,
         Some(0),
         "with all preferred endpoints skipped, the general pool must serve"
@@ -322,7 +359,7 @@ async fn pinned_client_spills_when_preferred_endpoint_at_paid_overage() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt")
+            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
             .await,
         Some(0),
         "an overage-covered preferred endpoint must spill to free general-pool capacity"

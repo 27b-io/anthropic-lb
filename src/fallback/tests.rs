@@ -414,6 +414,95 @@ async fn fallback_translated_stream_done_only_emits_error_frame() {
     );
 }
 
+// ── LAB-6017: O→O passthrough sees the upstream's in-band error ──
+
+const PASSTHROUGH_INBAND_ERROR: &str = concat!(
+    "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}],\"error\":null}\n\n",
+    "data: {\"error\":{\"message\":\"upstream boom\",\"type\":\"server_error\"}}\n\n",
+);
+
+/// Stream `mock_addr` through `try_fallback_upstream`'s passthrough branch
+/// (translate = false) and return the client-visible body.
+async fn stream_passthrough(mock_addr: SocketAddr, req_id: &str) -> String {
+    let mut ep = make_endpoint("gw", Protocol::OpenAI);
+    ep.base_url = format!("http://{}", mock_addr);
+    let state = Arc::new(AppState {
+        endpoints: vec![ep],
+        ..test_state_base()
+    });
+    let body = bytes::Bytes::from_static(br#"{"model":"gpt-4","messages":[],"stream":true}"#);
+    let ForwardOutcome::Done(resp) = try_fallback_upstream(
+        &state,
+        &body,
+        req_id,
+        "client-1",
+        &"127.0.0.1".parse().unwrap(),
+        "-",
+        "-",
+        "gpt-4",
+        0,
+        Instant::now(),
+        false,
+        true,
+    )
+    .await
+    else {
+        panic!("a 200 SSE stream must be Done");
+    };
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[test]
+fn inband_openai_error_detection() {
+    assert!(is_inband_openai_error(br#"{"error":{"message":"boom"}}"#));
+    // Healthy chunks from some upstreams carry `"error": null`.
+    assert!(!is_inband_openai_error(br#"{"choices":[],"error":null}"#));
+    assert!(!is_inband_openai_error(br#"{"choices":[]}"#));
+    assert!(!is_inband_openai_error(b"[DONE]"));
+}
+
+#[tokio::test]
+async fn fallback_passthrough_inband_error_logs_stream_as_failed() {
+    // The in-band `{"error": …}` line went downstream verbatim, but the
+    // stream was never marked errored, so a failed stream logged as
+    // "stream complete" — operators saw a 100% success rate.
+    let buf = log_capture_buf();
+    let mock_addr = spawn_sse_upstream(PASSTHROUGH_INBAND_ERROR, true).await;
+    let req_id = "lab6017-passthrough-inband-error-clean-eof";
+    let body = stream_passthrough(mock_addr, req_id).await;
+    assert!(body.contains("upstream boom"), "got: {body:?}");
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let mine: Vec<&str> = output.lines().filter(|l| l.contains(req_id)).collect();
+    assert!(
+        mine.iter()
+            .any(|l| l.contains("stream ended with upstream error frame")),
+        "in-band error must log the stream as failed, got: {mine:?}"
+    );
+    assert!(
+        !mine.iter().any(|l| l.contains("stream complete")),
+        "got: {mine:?}"
+    );
+}
+
+#[tokio::test]
+async fn fallback_passthrough_no_second_error_frame_after_inband_error() {
+    // The upstream's own error line is the terminator: when the peer then
+    // drops, no synthesised error frame (with its own [DONE]) may follow it.
+    let mock_addr = spawn_sse_upstream(PASSTHROUGH_INBAND_ERROR, false).await;
+    let body = stream_passthrough(mock_addr, "lab6017-passthrough-inband-error-drop").await;
+
+    assert_eq!(
+        body.matches("\"error\":{").count(),
+        1,
+        "exactly one error frame — the upstream's own, got: {body:?}"
+    );
+    assert!(!body.contains("[DONE]"), "got: {body:?}");
+}
+
 #[tokio::test]
 async fn proxy_handler_no_fallback_returns_429() {
     // With no fallback endpoint, an exhausted pool yields None (→ 429).

@@ -15,6 +15,7 @@ async fn build_stats_entry(
     burn_rate: &Mutex<BurnRate>,
     requests: &AtomicU64,
     token_counters: [&AtomicU64; 4],
+    fast_mode_disabled_secs: Option<u64>,
     now_epoch: u64,
     total_headroom: &mut Option<u64>,
 ) -> serde_json::Value {
@@ -108,6 +109,7 @@ async fn build_stats_entry(
         "limit_requests": info.limit_requests,
         "limit_tokens": info.limit_tokens,
         "hard_limited_remaining_secs": hard_limited,
+        "fast_mode_disabled_remaining_secs": fast_mode_disabled_secs,
         "burn_rate": {
             "last_5m": (br_5m * 100.0).round() / 100.0,
             "last_1h": (br_1h * 100.0).round() / 100.0,
@@ -147,7 +149,7 @@ pub(crate) async fn stats_handler(
     let now_epoch = AppState::now_epoch();
     let mut total_headroom: Option<u64> = Some(0);
     let mut endpoint_stats = Vec::new();
-    for ep in &state.endpoints {
+    for (i, ep) in state.endpoints.iter().enumerate() {
         let protocol = match ep.protocol {
             Protocol::Anthropic => "anthropic",
             Protocol::OpenAI => "openai",
@@ -167,6 +169,7 @@ pub(crate) async fn stats_handler(
                     &ep.cache_creation_tokens,
                     &ep.cache_read_tokens,
                 ],
+                state.fast_mode_disabled_remaining_secs(i),
                 now_epoch,
                 &mut total_headroom,
             )

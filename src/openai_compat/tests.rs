@@ -863,6 +863,51 @@ fn translate_sse_inband_error_emits_openai_error_frame() {
     assert!(msg.contains("Overloaded"));
 }
 
+/// LAB-6017: an `event: error` whose payload can't be read must still end the
+/// stream as an error — dropping it let the loop's ensure-`[DONE]` guard fake
+/// a clean completion after a silent truncation.
+fn assert_malformed_inband_error_terminates(raw: &str) {
+    let mut ctx = StreamContext::default();
+    let result = translate_sse_event(raw, &mut ctx)
+        .unwrap_or_else(|| panic!("error event must not be dropped: {raw:?}"));
+
+    assert!(ctx.terminal.errored);
+    assert_eq!(result.matches("[DONE]").count(), 1);
+    let first_event = result.split("\n\n").next().unwrap();
+    let chunk: serde_json::Value =
+        serde_json::from_str(first_event.strip_prefix("data: ").unwrap()).unwrap();
+    assert_eq!(chunk["error"]["type"], "upstream_error");
+    assert_eq!(chunk["error"]["message"], "api_error: upstream error");
+
+    // Terminal: a trailing upstream event translates to nothing.
+    let stop = "event: message_stop\ndata: {\"type\":\"message_stop\"}";
+    assert!(translate_sse_event(stop, &mut ctx).is_none());
+}
+
+#[test]
+fn translate_sse_inband_error_empty_data_still_errors() {
+    assert_malformed_inband_error_terminates("event: error\ndata: ");
+}
+
+#[test]
+fn translate_sse_inband_error_non_json_data_still_errors() {
+    assert_malformed_inband_error_terminates("event: error\ndata: <html>502 Bad Gateway</html>");
+}
+
+#[test]
+fn translate_sse_non_error_event_with_unreadable_data_is_skipped() {
+    // The error-event carve-out must not widen to other events.
+    let mut ctx = StreamContext::default();
+    for raw in [
+        "event: content_block_delta\ndata: ",
+        "event: content_block_delta\ndata: {not json",
+        "event: message_stop\ndata: ",
+    ] {
+        assert!(translate_sse_event(raw, &mut ctx).is_none(), "{raw:?}");
+    }
+    assert!(!ctx.terminal.reached());
+}
+
 #[test]
 fn translate_sse_text_block_start_skipped() {
     let mut ctx = StreamContext::default();
