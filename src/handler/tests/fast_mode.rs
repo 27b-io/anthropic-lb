@@ -404,6 +404,7 @@ fn fast_mode_body_predicate() {
 const HEAD_400_FAST_MODE: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Fast mode is not enabled for your organization. An organization admin must enable this feature.\"}}";
 const STANDARD_BODY: &str =
     r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+const FAST_BODY: &str = r#"{"model":"claude-opus-5","max_tokens":1,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#;
 
 /// AC-1: only the org-entitlement 400 matches. The proxy-induced
 /// `speed: Extra inputs are not permitted` 400 (beta header stripped, body
@@ -811,7 +812,7 @@ async fn fast_mode_disabled_rotates_and_next_fast_request_skips_account() {
     );
 }
 
-/// Panel finding: a rejection on ONE account while the rest of the pool is
+/// A rejection on ONE account while the rest of the pool is
 /// merely rate-limited is a rate-limited pool. The stashed non-retryable 400
 /// must not surface — SDKs would give up on a request that will succeed
 /// once the cooldown lifts.

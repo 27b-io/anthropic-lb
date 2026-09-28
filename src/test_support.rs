@@ -559,8 +559,6 @@ pub(crate) const HEAD_429_RETRY_AFTER_7: &str = "HTTP/1.1 429 Too Many Requests\
 /// the body is EOF-delimited — no content-length needed).
 pub(crate) const HEAD_404_MODEL: &str = "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"model: claude-nope-1\"}}";
 
-pub(crate) const FAST_BODY: &str = r#"{"model":"claude-opus-5","max_tokens":1,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#;
-
 /// Poll endpoint token counters until streamed usage lands (the finalize
 /// task is detached, so recording races the client seeing end-of-stream).
 pub(crate) async fn poll_streamed_usage(state: &Arc<AppState>) -> (u64, u64) {
