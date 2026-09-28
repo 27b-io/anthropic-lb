@@ -538,11 +538,14 @@ pub(crate) fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<
         }
     }
 
-    if data.is_empty() {
-        return None;
-    }
-
-    let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
+    // An `event: error` must reach the client whatever its payload: an empty
+    // or non-JSON one parses as Null and the "error" arm defaults the missing
+    // type/message. Dropping it let the loop fake a clean [DONE] (LAB-6017).
+    let parsed: serde_json::Value = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(_) if event_type == "error" => serde_json::Value::Null,
+        Err(_) => return None,
+    };
 
     match event_type.as_str() {
         "message_start" => {
