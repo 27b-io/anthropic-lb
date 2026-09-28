@@ -122,8 +122,8 @@ const FAST_MODE_NOT_ENABLED_MSG: &str =
 /// this clause (an unrecognized top-level field literally named the phrase),
 /// so a `.contains` match plus an unguarded caller could walk and mark every
 /// reachable account on a single crafted request. The caller additionally
-/// requires a fast request — a fast-mode-shaped 400 on a request that never
-/// asked for fast mode is never grounds to mark the account.
+/// requires a fast request on a non-passthrough endpoint — otherwise the
+/// 400 is not about this account's org, and never grounds to mark it.
 fn is_fast_mode_not_enabled_error(status: StatusCode, body: &serde_json::Value) -> bool {
     status == StatusCode::BAD_REQUEST
         && body.pointer("/error/type").and_then(|v| v.as_str()) == Some("invalid_request_error")
@@ -166,7 +166,8 @@ pub(crate) enum UpstreamRejection {
     /// `is_entitlement_exhausted_400`.
     Entitlement,
     /// `is_fast_mode_not_enabled_error`. Reports this account's org only
-    /// when the request asked for fast mode; the caller decides.
+    /// when the request asked for fast mode and the endpoint sent its own
+    /// credential; the caller decides.
     FastModeDisabled,
 }
 
@@ -1308,12 +1309,15 @@ pub(crate) async fn forward_anthropic(
                         state.note_model_unsupported(endpoint_name, endpoint_idx, model);
                         Some(ForwardOutcome::RetryRejectedByAccount)
                     }
-                    Some(UpstreamRejection::FastModeDisabled) if is_fast_mode => {
+                    Some(UpstreamRejection::FastModeDisabled) if is_fast_mode && !passthrough => {
                         state.note_fast_mode_disabled(endpoint_name, endpoint_idx);
                         Some(ForwardOutcome::RetryRejectedByAccount)
                     }
-                    // A standard request never asked for fast mode, so the
-                    // 400 is not about this account's org: forward it as-is.
+                    // Not this account's state: a standard request never asked
+                    // for fast mode, and a passthrough endpoint sent the
+                    // caller's own credential, so the 400 is about the
+                    // caller's org. Marking the endpoint would switch fast
+                    // mode off for every other caller of it.
                     Some(UpstreamRejection::FastModeDisabled) => None,
                     Some(UpstreamRejection::Entitlement) => {
                         state.note_entitlement_400(endpoint_name);

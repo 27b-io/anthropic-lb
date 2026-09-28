@@ -506,6 +506,52 @@ async fn fast_mode_shaped_400_on_standard_request_is_not_marked_or_rotated() {
     );
 }
 
+/// A passthrough endpoint forwards the caller's own credential, so its
+/// fast-mode 400 describes the caller's org, not the endpoint. It must reach
+/// that caller unchanged and must not mark the endpoint: a mark would take it
+/// out of fast routing for every other caller for the TTL, and one repeated
+/// request would keep it out.
+#[tokio::test]
+async fn fast_mode_400_on_passthrough_endpoint_is_not_marked_or_rotated() {
+    use std::sync::atomic::Ordering;
+    let (pt_url, pt_hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_400_FAST_MODE, b"{}").await;
+    let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+    healthy.priority = 1;
+    let state = test_state_with(vec![mk_endpoint_at("pt", "passthrough", &pt_url), healthy]);
+    assert!(state.endpoints[0].passthrough);
+    let addr = serve(build_router(state.clone())).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "sk-ant-api-caller")
+        .body(FAST_BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body.pointer("/error/message").and_then(|v| v.as_str()),
+        Some(FAST_MODE_NOT_ENABLED_MSG),
+        "the caller must see its own org's 400, got: {body}"
+    );
+    assert!(
+        state.fast_mode_disabled_endpoints().is_empty(),
+        "a passthrough endpoint's fast-mode 400 must not mark the endpoint"
+    );
+    assert_eq!(
+        (
+            pt_hits.load(Ordering::SeqCst),
+            ok_hits.load(Ordering::SeqCst)
+        ),
+        (1, 0),
+        "must not rotate off a 400 that describes the caller"
+    );
+}
+
 /// AC-3/AC-4: a marked endpoint leaves the pool for fast requests only —
 /// affinity or not — standard requests still see it, and an expired mark
 /// restores it without a restart.
