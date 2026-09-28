@@ -646,8 +646,44 @@ pub(crate) fn strip_orphaned_beta_body_fields(
     if removed.is_empty() {
         return None;
     }
+    Some((render_top_level(kept)?, removed))
+}
+
+/// Remove top-level `fallbacks` from a Messages body (LAB-5970).
+///
+/// Both `models` gates — the client's (`client_allows_model`) and the
+/// endpoint's (`Endpoint::serves_model`) — read only the top-level `model`,
+/// while `fallbacks` asks Anthropic to serve a refusal from ANOTHER model.
+/// The `"default"` form names no target at all (Anthropic routes it by refusal
+/// category), so the targets cannot be checked here without hard-coding
+/// Anthropic's fallback policy. A restricted principal therefore loses the
+/// field: its request runs, and a refusal comes back as a refusal.
+///
+/// Only the field goes, not the `server-side-fallback-*` header: without the
+/// field no fallback runs (the API does not fall back unless asked), and the
+/// header also grants `fallback_credit_token`, whose redemption is a new
+/// request that passes both gates on its own top-level `model`.
+///
+/// Every `fallbacks` entry goes, so a duplicate key cannot keep one alive.
+/// Returns `None` — body untouched — when there is none, or when the body is
+/// not a JSON object: a restricted CLIENT never gets here with one
+/// (`client_allows_model` fails closed on an unreadable model), and an
+/// endpoint gate already routes an unreadable body unnarrowed.
+pub(crate) fn strip_fallbacks(body: &bytes::Bytes) -> Option<bytes::Bytes> {
+    let parsed: TopLevelObject = serde_json::from_slice(body).ok()?;
+    if !parsed.0.iter().any(|(key, _)| key == "fallbacks") {
+        return None;
+    }
+    render_top_level(parsed.0.iter().filter(|(key, _)| key != "fallbacks"))
+}
+
+/// Re-emit top-level entries as a JSON object, values spliced through as their
+/// original bytes (see `strip_orphaned_beta_body_fields` for why).
+fn render_top_level<'a>(
+    entries: impl IntoIterator<Item = &'a (String, Box<serde_json::value::RawValue>)>,
+) -> Option<bytes::Bytes> {
     let mut out = String::from("{");
-    for (i, (key, value)) in kept.iter().enumerate() {
+    for (i, (key, value)) in entries.into_iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -659,7 +695,7 @@ pub(crate) fn strip_orphaned_beta_body_fields(
         out.push_str(value.get());
     }
     out.push('}');
-    Some((bytes::Bytes::from(out), removed))
+    Some(bytes::Bytes::from(out))
 }
 
 /// A JSON object whose VALUES are kept as their original bytes.

@@ -246,9 +246,10 @@ token = "sk-ant-oat01-..."
 ```
 
 When a request specifies a model, only accounts whose `models` list matches (exact or prefix wildcard) are considered. Accounts with an empty `models` list serve all models.
-This gate (and the per-client `models` list below) reads only the top-level
-`model`: a request carrying `server-side-fallback-*` may have a refusal served
-by a fallback model neither list names.
+A server-side refusal fallback (`fallbacks`) could be served by a model this
+list does not name, so when the chosen endpoint or the client (see
+`[[clients]]` below) has a non-empty `models` list, the proxy strips the
+top-level `fallbacks` field and a refusal is returned as a refusal.
 
 ---
 

@@ -911,6 +911,111 @@ fn surviving_server_side_fallback_keeps_fallbacks_and_dropped_one_strips_it() {
     assert_eq!(parsed["fallbacks"], "default");
 }
 
+/// LAB-5970: `strip_fallbacks` removes every top-level `fallbacks` (a
+/// duplicate key must not keep one alive) and nothing else, retained values
+/// byte-identical.
+#[test]
+fn strip_fallbacks_removes_only_fallbacks() {
+    let body = bytes::Bytes::from_static(
+        br#"{"model":"claude-opus-5","fallbacks":"default","max_tokens":18446744073709551617,"fallbacks":[{"model":"claude-opus-4-8"}],"messages":[]}"#,
+    );
+    let out = strip_fallbacks(&body).expect("fallbacks must be stripped");
+    assert_eq!(
+        std::str::from_utf8(&out).unwrap(),
+        r#"{"model":"claude-opus-5","max_tokens":18446744073709551617,"messages":[]}"#
+    );
+    // Nothing to strip, or nothing we can read: body untouched.
+    assert!(strip_fallbacks(&bytes::Bytes::from_static(br#"{"model":"m"}"#)).is_none());
+    assert!(strip_fallbacks(&bytes::Bytes::from_static(b"not json")).is_none());
+}
+
+/// What the upstream received for a `fallbacks` request, sent as `client_key`
+/// (`None` = no client table) to a single endpoint.
+async fn fallbacks_body_seen_upstream(
+    clients: Vec<ClientConfig>,
+    client_key: Option<&str>,
+    endpoint_token: &str,
+    endpoint_models: &[&str],
+) -> String {
+    let (upstream_url, mut seen) =
+        spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
+    let mut ep = mk_endpoint_at("acct-a", endpoint_token, &upstream_url);
+    ep.models = endpoint_models.iter().map(|m| m.to_string()).collect();
+    let state = Arc::new(AppState {
+        endpoints: vec![ep],
+        clients,
+        auto_cache: false,
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("anthropic-beta", "server-side-fallback-2026-07-01")
+        .body(
+            r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"fallbacks":"default"}"#,
+        );
+    if let Some(key) = client_key {
+        req = req.header("x-api-key", key);
+    }
+    let resp = req.send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let (headers, bytes) = seen.recv().await.expect("upstream must have been hit once");
+    // The header is never the lever — only the field triggers a fallback.
+    assert!(
+        headers
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("server-side-fallback-2026-07-01")),
+        "the server-side-fallback header must still be forwarded"
+    );
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// LAB-5970: a client restricted to Opus 5 must not be
+/// served a refusal by a fallback model its `models` list does not name.
+#[tokio::test]
+async fn restricted_client_loses_fallbacks_on_oauth_endpoint() {
+    let body = fallbacks_body_seen_upstream(
+        vec![mk_client("limited", "key-limited", &["claude-opus-5*"])],
+        Some("key-limited"),
+        "sk-ant-oat01-test-aaa",
+        &[],
+    )
+    .await;
+    assert!(!body.contains("fallbacks"), "fallbacks forwarded: {body}");
+    assert!(body.contains(r#""model":"claude-opus-5""#), "{body}");
+}
+
+/// The endpoint gate, on an API-key endpoint: that auth type forwards client
+/// betas unfiltered, so enforcement cannot live in the beta allow-list.
+#[tokio::test]
+async fn restricted_endpoint_loses_fallbacks_on_api_key_endpoint() {
+    let body =
+        fallbacks_body_seen_upstream(vec![], None, "sk-ant-api-test-aaa", &["claude-opus-5*"])
+            .await;
+    assert!(!body.contains("fallbacks"), "fallbacks forwarded: {body}");
+}
+
+/// Negative control for both: unrestricted on both gates keeps the fallback,
+/// so the two tests above are not passing on a strip that always fires.
+#[tokio::test]
+async fn unrestricted_client_and_endpoint_keep_fallbacks() {
+    for token in ["sk-ant-oat01-test-aaa", "sk-ant-api-test-aaa"] {
+        let body = fallbacks_body_seen_upstream(
+            vec![mk_client("open", "key-open", &[])],
+            Some("key-open"),
+            token,
+            &[],
+        )
+        .await;
+        assert!(
+            body.contains(r#""fallbacks":"default""#),
+            "{token}: fallbacks lost: {body}"
+        );
+    }
+}
+
 /// Helly R finding 1, second half: a custom `allowed_client_betas` can pass a
 /// family this proxy has no row for. It may own a top-level field, and the
 /// proxy cannot tell that field from an orphan — so it declines to strip at

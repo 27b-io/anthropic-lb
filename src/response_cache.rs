@@ -882,6 +882,15 @@ impl AppState {
         hit
     }
 
+    /// Whether `client_id` has a non-empty `models` list — i.e. whether a
+    /// server-side fallback could serve it a model that list does not name
+    /// (LAB-5970). Same identity semantics as `client_allows_model`.
+    pub(crate) fn client_restricts_models(&self, client_id: &str) -> bool {
+        self.clients
+            .iter()
+            .any(|c| c.name == client_id && !c.models.is_empty())
+    }
+
     /// Whether `client_id` may request `model` (LAB-1083).
     ///
     /// Unknown client, or a client with an empty list, allows everything.
