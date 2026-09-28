@@ -1023,7 +1023,8 @@ async fn forward_openai_compat_anthropic(
                 }
                 // Same model-rejection detection as the native path (LAB-941),
                 // and the same entitlement 400 (LAB-4729).
-                rejection = classify_rejection(status, &parsed, ep.protocol, model, req_body);
+                rejection =
+                    classify_rejection(status, &parsed, ep.protocol, model, req_body, passthrough);
                 // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
                 let msg = parsed
                     .pointer("/error/message")

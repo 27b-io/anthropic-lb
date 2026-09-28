@@ -480,3 +480,56 @@ async fn entitlement_key_never_reaches_upstream_on_openai_compat() {
         "the client's unknown key must not reach upstream: {sent}"
     );
 }
+
+/// LAB-6005: a passthrough endpoint's entitlement 400 is about the caller's
+/// own credential. Re-sending would move that caller onto a pooled account's
+/// extra usage to cover its own exhausted plan, and the per-account counter
+/// would charge the caller's state to the endpoint. It reaches the caller
+/// unchanged on both Anthropic paths: no re-send, no count.
+#[tokio::test]
+async fn entitlement_400_on_passthrough_endpoint_is_not_resent() {
+    use std::sync::atomic::Ordering;
+    for (path, body) in [
+        ("/v1/messages", MESSAGES_BODY),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+    ] {
+        let (pt_url, pt_hits) = spawn_400_upstream(ENTITLEMENT_400_BODY).await;
+        let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+        let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+        healthy.priority = 1;
+        let state = test_state_with(vec![mk_endpoint_at("pt", "passthrough", &pt_url), healthy]);
+        let addr = serve(build_router(state.clone())).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}{path}"))
+            .header("content-type", "application/json")
+            .header("x-api-key", "sk-ant-api-caller")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "{path}");
+        let got: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            got.pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .is_some_and(|m| m.starts_with(ENTITLEMENT_400_ANCHOR)),
+            "{path}: the caller must see its own 400, got: {got}"
+        );
+        assert_eq!(
+            (
+                pt_hits.load(Ordering::SeqCst),
+                ok_hits.load(Ordering::SeqCst)
+            ),
+            (1, 0),
+            "{path}: must not re-send a 400 that describes the caller"
+        );
+        assert!(
+            state.entitlement_400.lock().unwrap().is_empty(),
+            "{path}: the caller's state must not be counted against the endpoint"
+        );
+    }
+}

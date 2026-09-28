@@ -223,6 +223,7 @@ token = "sk-ant-api03-..."
 
 > [!TIP]
 > Use `passthrough` when clients have their own Anthropic credentials and you only want load-balancing without token injection.
+> A model rejection (`404 model: …`) or an out-of-extra-usage `400` from a passthrough endpoint describes the caller's own plan, so it reaches the caller unchanged: the proxy neither re-sends it to another account nor marks the endpoint for other callers.
 
 ### Model Routing
 

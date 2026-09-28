@@ -139,16 +139,27 @@ pub(crate) enum UpstreamRejection {
 }
 
 /// Read account or model state out of an upstream error. Every forward path
-/// classifies through here, so the echo veto covers every classifier, the
-/// ones added later included. `model` is the model the request asked for, and
-/// `sent_body` the request body exactly as it went to this endpoint.
+/// classifies through here, so the echo and caller-credential vetoes cover
+/// every classifier, the ones added later included. `model` is the model the
+/// request asked for, and `sent_body` the request body exactly as it went to
+/// this endpoint.
+///
+/// `caller_credential` is true when the request went out with the caller's
+/// own auth (a passthrough endpoint). The error then describes the caller's
+/// plan, not the endpoint, so it is never endpoint state: marking the
+/// endpoint would take it away from every other caller, and re-sending would
+/// cover the caller's own limits with a pooled account (LAB-6005).
 pub(crate) fn classify_rejection(
     status: StatusCode,
     err_body: &serde_json::Value,
     protocol: Protocol,
     model: &str,
     sent_body: &[u8],
+    caller_credential: bool,
 ) -> Option<UpstreamRejection> {
+    if caller_credential {
+        return None;
+    }
     let verdict = if is_model_unsupported_error(status, err_body, protocol, model) {
         UpstreamRejection::ModelUnsupported
     } else if is_entitlement_exhausted_400(status, err_body) {
@@ -1263,21 +1274,29 @@ pub(crate) async fn forward_anthropic(
             // it. Forwarding the 404 as-is wedges affinity-pinned clients
             // into a permanent retry loop against this account (LAB-941).
             // Out of extra usage: re-send once to another account (LAB-4729).
-            // Both are account state wearing a 4xx. A streaming request lands
-            // here too: upstream sends the 400 as a JSON body, not an event
-            // stream, so it re-sends before any byte reaches the client.
-            let rotate: Option<fn(Box<Response>) -> ForwardOutcome> =
-                match classify_rejection(status, &parsed, ep.protocol, model, req_body) {
-                    Some(UpstreamRejection::ModelUnsupported) => {
-                        state.note_model_unsupported(endpoint_name, endpoint_idx, model);
-                        Some(ForwardOutcome::RetryModelUnsupported)
-                    }
-                    Some(UpstreamRejection::Entitlement) => {
-                        state.note_entitlement_400(endpoint_name);
-                        Some(ForwardOutcome::RetryEntitlement)
-                    }
-                    None => None,
-                };
+            // Both are account state wearing a 4xx, except on a passthrough
+            // endpoint, where they are the caller's own and are forwarded
+            // as-is (LAB-6005). A streaming request lands here too: upstream
+            // sends the 400 as a JSON body, not an event stream, so it
+            // re-sends before any byte reaches the client.
+            let rotate: Option<fn(Box<Response>) -> ForwardOutcome> = match classify_rejection(
+                status,
+                &parsed,
+                ep.protocol,
+                model,
+                req_body,
+                passthrough,
+            ) {
+                Some(UpstreamRejection::ModelUnsupported) => {
+                    state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                    Some(ForwardOutcome::RetryModelUnsupported)
+                }
+                Some(UpstreamRejection::Entitlement) => {
+                    state.note_entitlement_400(endpoint_name);
+                    Some(ForwardOutcome::RetryEntitlement)
+                }
+                None => None,
+            };
             if let Some(retry) = rotate {
                 // This branch returns before `finalize_non_stream` — log the
                 // merged line here too, so a rotated rejection still gets the
