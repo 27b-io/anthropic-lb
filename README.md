@@ -246,6 +246,10 @@ token = "sk-ant-oat01-..."
 ```
 
 When a request specifies a model, only accounts whose `models` list matches (exact or prefix wildcard) are considered. Accounts with an empty `models` list serve all models.
+A server-side refusal fallback (`fallbacks`) could be served by a model this
+list does not name, so when the chosen endpoint or the client (see
+`[[clients]]` below) has a non-empty `models` list, the proxy strips the
+top-level `fallbacks` field and a refusal is returned as a refusal.
 
 ---
 
@@ -408,6 +412,7 @@ can steer are locked down by default:
   - `context-management-*` ↔ top-level `context_management`
   - `fast-mode-*` ↔ top-level `speed: "fast"`
   - `dangerous-tool-use-*` + `auto-mode-classifier-*` ↔ top-level `safeguards`
+  - `server-side-fallback-*` ↔ top-level `fallbacks`
   - *(nested)* `mid-conversation-tool-changes-*`, `per-turn-control-*`,
     `timing-*` ↔ `tool_addition`/`tool_removal` blocks and
     `output_config.effort`/`timing` on the `role: "system"` entry in `messages`

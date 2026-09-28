@@ -819,10 +819,11 @@ pub(crate) async fn forward_anthropic(
     // (`requests`), `/v1/complete` (`prompt`) and anything else arrive here
     // too — running a Messages-only field list over those bodies deletes them
     // outright.
-    let coherent_body = if matches!(
+    let messages_schema = matches!(
         parts.uri.path(),
         "/v1/messages" | "/v1/messages/count_tokens"
-    ) {
+    );
+    let coherent_body = if messages_schema {
         strip_orphaned_beta_body_fields(
             oauth_body_bytes,
             headers
@@ -898,6 +899,25 @@ pub(crate) async fn forward_anthropic(
         debug_assert!(coherent_body.is_none());
         body_bytes
     };
+    // LAB-5970: a `models` allow-list on the client or on THIS endpoint (the
+    // retry loop may land on a differently restricted one) would be escaped by
+    // a server-side fallback to a model it does not name — see
+    // `strip_fallbacks`. Applied to every auth type: API-key and passthrough
+    // endpoints forward client betas unfiltered, so this cannot ride on the
+    // beta allow-list. Batches nest the field and Anthropic rejects it there.
+    let models_restricted = !ep.models.is_empty() || state.client_restricts_models(client_id);
+    let fallback_free = (messages_schema && models_restricted)
+        .then(|| strip_fallbacks(req_body))
+        .flatten();
+    if fallback_free.is_some() {
+        debug!(
+            req_id,
+            client_id,
+            account = endpoint_name,
+            "models allow-list: stripped top-level fallbacks"
+        );
+    }
+    let req_body = fallback_free.as_ref().unwrap_or(req_body);
     upstream_req = upstream_req.body(req_body.clone());
 
     let resp = match upstream_req.send().await {
