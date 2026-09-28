@@ -447,6 +447,23 @@ can steer are locked down by default:
   (`extended-cache-ttl-*` → `cache_control.ttl`, and the per-turn family's
   fields inside `messages`) are out of scope — they are on the default
   allow-list and so are never dropped.
+- **Fast mode routes around non-entitled orgs.** Fast mode is an
+  org-level entitlement, and a pool can span several Anthropic orgs. When an
+  account answers a `speed: "fast"` request with the upstream `400` "Fast
+  mode is not enabled for your organization", the proxy rotates that request
+  to another account and marks the endpoint fast-mode-disabled for 15
+  minutes (`anthropic_fast_mode_disabled_total{account}` on `/metrics`,
+  `fast_mode_disabled_remaining_secs` on `/_stats`). Later fast requests skip
+  it — a client pinned to it via `preferred_endpoints` spills to the general
+  pool — while requests without `speed: "fast"` keep using it. The proxy
+  never strips `speed` to get around a non-entitled org: if no eligible
+  account is entitled, the client gets a `400` with the upstream's error type
+  and message rather than a silent downgrade or a synthetic `429`. The first
+  such request gets the upstream response itself; while the marks last, the
+  proxy answers with the same type and message and no upstream headers. A
+  `passthrough` endpoint is never marked: it sends the caller's own
+  credential, so its `400` is about the caller's org and reaches that caller
+  unchanged.
 - **A fast-mode `429` is forwarded to the caller, not treated as account
   exhaustion.** Fast mode (`speed: "fast"`) bills against its own rate bucket,
   separate from the account's 5h/7d windows, so a `429` on a fast request does
