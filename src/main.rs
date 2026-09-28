@@ -197,7 +197,7 @@ fn validate_clients(config: &Config) -> Result<(), String> {
         }
         if c.name == "_other" {
             return Err(
-                "client: name must not be \"_other\" (the reserved metrics overflow-bucket label — a real client with this name would merge with, and take the warn-once flag of, the (\"_other\", \"_other\") overflow key)"
+                "client: name must not be \"_other\" (the reserved metrics overflow-bucket label — a real client with this name would merge into the (\"_other\", \"_other\") overflow key)"
                     .to_string(),
             );
         }
@@ -238,6 +238,13 @@ fn validate_clients(config: &Config) -> Result<(), String> {
     // (`resolve_client_id`'s fallback) — an IP mapped to a reserved sentinel
     // would resolve real traffic to it, bypassing the header filter above.
     for (ip, name) in &config.client_names {
+        // Same failure as an untrimmed `[[clients]]` name above: resolved
+        // verbatim by `resolve_client_id`, matches no budget key.
+        if name.is_empty() || name != name.trim() {
+            return Err(format!(
+                "client_names: \"{ip}\" maps to \"{name}\" — value must be non-empty with no leading or trailing whitespace"
+            ));
+        }
         if name == "-" || name == "_operator" || name == "_other" {
             return Err(format!(
                 "client_names: \"{ip}\" maps to reserved name \"{name}\" (\"-\" = unknown-client sentinel, \"_operator\" = operator-aggregation label, \"_other\" = metrics overflow bucket)"
@@ -329,6 +336,24 @@ fn validate_clients(config: &Config) -> Result<(), String> {
                 "{surface}: \"{name}\" names no configured [[clients]] entry"
             ));
         }
+    }
+    Ok(())
+}
+
+/// A day, the ceiling the proxy already puts on an upstream `retry-after`. A
+/// capacity 429 without one cools the account down for `now + cooldown`, and a
+/// value past what `Instant` can hold would panic that request instead.
+const MAX_RATE_LIMIT_COOLDOWN_SECS: u64 = 86_400;
+
+/// Reject a `rate_limit_cooldown_secs` that would be a no-op (0) or overflow
+/// `Instant` at the first capacity 429. A boot error, not a clamp, so the typo
+/// is seen.
+fn validate_rate_limit_cooldown(config: &Config) -> Result<(), String> {
+    let secs = config.rate_limit_cooldown_secs.unwrap_or(5);
+    if !(1..=MAX_RATE_LIMIT_COOLDOWN_SECS).contains(&secs) {
+        return Err(format!(
+            "config: rate_limit_cooldown_secs must be in 1..={MAX_RATE_LIMIT_COOLDOWN_SECS}, got {secs}"
+        ));
     }
     Ok(())
 }
@@ -540,6 +565,9 @@ async fn main() {
     if let Err(msg) = validate_exposure(&config) {
         panic!("{msg}");
     }
+    if let Err(msg) = validate_rate_limit_cooldown(&config) {
+        panic!("{msg}");
+    }
 
     // Set up tracing: stderr (info+) always, plus optional debug log file
     {
@@ -675,6 +703,7 @@ async fn main() {
                 priority: ec.priority,
                 fable_included: ec.fable_included.unwrap_or(true),
                 requests: AtomicU64::new(0),
+                fast_mode_disabled_total: AtomicU64::new(0),
                 rate_info: RwLock::new(RateLimitInfo::default()),
                 burn_rate: Mutex::new(BurnRate::new()),
                 input_tokens: AtomicU64::new(0),
@@ -938,6 +967,7 @@ async fn main() {
         model_denied: Mutex::new(HashMap::new()),
         client_rejections: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
+        fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache,
     });
 

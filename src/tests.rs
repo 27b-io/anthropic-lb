@@ -377,10 +377,12 @@ fn validate_clients_rejects_bad_names_and_empty_keys() {
         ("[[clients]]\nname = \"_other\"\nkey = \"k1\"\n", "_other"),
         // The legacy client_names IP map is the third identity entry point
         // (resolve_client_id's fallback) — its values must not claim a
-        // reserved sentinel either (expert-panel finding, #148 follow-up).
+        // reserved sentinel either (#148 follow-up).
         ("[client_names]\n\"10.0.0.5\" = \"-\"\n", "reserved"),
         ("[client_names]\n\"10.0.0.5\" = \"_operator\"\n", "reserved"),
         ("[client_names]\n\"10.0.0.5\" = \"_other\"\n", "reserved"),
+        ("[client_names]\n\"10.0.0.5\" = \"\"\n", "non-empty"),
+        ("[client_names]\n\"10.0.0.5\" = \"alice \"\n", "whitespace"),
         ("[[clients]]\nname = \"geo\"\nkey = \"\"\n", "key"),
         // Untrimmed: stored verbatim, so it would become a client_id matching
         // no client_budgets / operators / response_cache.clients key.
@@ -620,6 +622,37 @@ fn exposure_rejects_short_credentials_with_the_generation_command() {
     }
     // 32 exactly passes.
     assert!(validate_exposure(&cfg(&format!("proxy_key = \"{}\"\n", "a".repeat(32)))).is_ok());
+}
+
+#[test]
+fn rate_limit_cooldown_rejects_values_outside_one_day() {
+    // 0 makes the capacity-429 cooldown a no-op; i64::MAX is the largest value
+    // TOML carries and overflows `Instant` at the first capacity 429.
+    for secs in ["0", "86401", "9223372036854775807"] {
+        let err =
+            validate_rate_limit_cooldown(&cfg(&format!("rate_limit_cooldown_secs = {secs}\n")))
+                .unwrap_err();
+        assert!(err.starts_with("config:"), "{err}");
+        assert!(err.contains("rate_limit_cooldown_secs"), "{err}");
+        assert!(err.contains("1..=86400"), "{err}");
+    }
+    let mut config = cfg("");
+    config.rate_limit_cooldown_secs = Some(u64::MAX);
+    assert!(validate_rate_limit_cooldown(&config).is_err());
+}
+
+#[test]
+fn rate_limit_cooldown_accepts_one_second_to_one_day_and_the_default() {
+    for fragment in [
+        "rate_limit_cooldown_secs = 1\n",
+        "rate_limit_cooldown_secs = 86400\n",
+        "",
+    ] {
+        assert!(
+            validate_rate_limit_cooldown(&cfg(fragment)).is_ok(),
+            "{fragment:?}"
+        );
+    }
 }
 
 #[test]

@@ -88,6 +88,11 @@ pub(crate) const UNSUPPORTED_MODEL_MAX: usize = 256;
 /// by the request body cap. Real model ids are far shorter.
 pub(crate) const UNSUPPORTED_MODEL_MAX_BYTES: usize = 256;
 
+/// Fast-mode-disabled hold (LAB-2687): same hold as the model cache — the
+/// entitlement flips only by org-admin action; expiry is the self-heal and
+/// costs one wasted upstream 400 that trips no cooldown.
+pub(crate) const FAST_MODE_DISABLED_TTL: Duration = UNSUPPORTED_MODEL_TTL;
+
 /// Sentinel value written to `alb:hard:{account}` when a replica has observed
 /// recovery from a hard rate limit. Other replicas interpret this as an
 /// instruction to proactively clear their local `hard_limited_until`, which
@@ -299,6 +304,11 @@ pub(crate) const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     "mid-conversation-tool-changes-*",
     "per-turn-control-*",
     "timing-*",
+    // Server-side refusal fallback: body-paired with top-level `fallbacks`,
+    // used by both the `-2026-06-01` array form and the `-2026-07-01`
+    // `"default"` form, and mapped in `BETA_BODY_FIELDS` so the pair travels
+    // together.
+    "server-side-fallback-*",
 ];
 
 /// Cardinality bound for `beta_flags_dropped` — flag names are
@@ -486,6 +496,12 @@ const BETA_BODY_FIELDS: &[(&str, &[&str])] = &[
     ("structured-outputs-*", &["output_format"]),
     ("fast-mode-*", &["speed"]),
     ("fallback-credit-*", &["fallback_credit_token"]),
+    // `fallbacks` is this family's own field; `fallback_credit_token` is also
+    // granted by the `-2026-07-01` flag, so it is claimed by both rows.
+    (
+        "server-side-fallback-*",
+        &["fallbacks", "fallback_credit_token"],
+    ),
     // `safeguards` is claimed by BOTH halves of the auto-mode classifier pair:
     // an allow-list carrying only one of them must still keep the field.
     ("dangerous-tool-use-*", &["safeguards"]),
@@ -641,8 +657,44 @@ pub(crate) fn strip_orphaned_beta_body_fields(
     if removed.is_empty() {
         return None;
     }
+    Some((render_top_level(kept)?, removed))
+}
+
+/// Remove top-level `fallbacks` from a Messages body (LAB-5970).
+///
+/// Both `models` gates — the client's (`client_allows_model`) and the
+/// endpoint's (`Endpoint::serves_model`) — read only the top-level `model`,
+/// while `fallbacks` asks Anthropic to serve a refusal from ANOTHER model.
+/// The `"default"` form names no target at all (Anthropic routes it by refusal
+/// category), so the targets cannot be checked here without hard-coding
+/// Anthropic's fallback policy. A restricted principal therefore loses the
+/// field: its request runs, and a refusal comes back as a refusal.
+///
+/// Only the field goes, not the `server-side-fallback-*` header: without the
+/// field no fallback runs (the API does not fall back unless asked), and the
+/// header also grants `fallback_credit_token`, whose redemption is a new
+/// request that passes both gates on its own top-level `model`.
+///
+/// Every `fallbacks` entry goes, so a duplicate key cannot keep one alive.
+/// Returns `None` — body untouched — when there is none, or when the body is
+/// not a JSON object: a restricted CLIENT never gets here with one
+/// (`client_allows_model` fails closed on an unreadable model), and an
+/// endpoint gate already routes an unreadable body unnarrowed.
+pub(crate) fn strip_fallbacks(body: &bytes::Bytes) -> Option<bytes::Bytes> {
+    let parsed: TopLevelObject = serde_json::from_slice(body).ok()?;
+    if !parsed.0.iter().any(|(key, _)| key == "fallbacks") {
+        return None;
+    }
+    render_top_level(parsed.0.iter().filter(|(key, _)| key != "fallbacks"))
+}
+
+/// Re-emit top-level entries as a JSON object, values spliced through as their
+/// original bytes (see `strip_orphaned_beta_body_fields` for why).
+fn render_top_level<'a>(
+    entries: impl IntoIterator<Item = &'a (String, Box<serde_json::value::RawValue>)>,
+) -> Option<bytes::Bytes> {
     let mut out = String::from("{");
-    for (i, (key, value)) in kept.iter().enumerate() {
+    for (i, (key, value)) in entries.into_iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -654,7 +706,7 @@ pub(crate) fn strip_orphaned_beta_body_fields(
         out.push_str(value.get());
     }
     out.push('}');
-    Some((bytes::Bytes::from(out), removed))
+    Some(bytes::Bytes::from(out))
 }
 
 /// A JSON object's top-level entries, in the order the parser yields them and
@@ -1529,30 +1581,86 @@ impl AppState {
     }
 
     /// True when EVERY endpoint whose config allows `model` carries a live
-    /// unsupported-model entry — the pool cannot serve the model at all,
-    /// regardless of capacity. Used at exhaustion: on a warm negative cache
-    /// the candidate pool empties before any forward attempt runs, so there
-    /// is no stashed upstream 404 — this check lets the handler synthesize
-    /// one instead of degrading to a retryable 429 (LAB-941 follow-up).
-    /// Endpoints excluded by their config `models` allowlist never serve the
-    /// model and don't count; false when no endpoint could ever serve it
-    /// (config-only exclusion keeps its pre-existing 429 semantics).
-    pub(crate) fn model_unsupported_everywhere(&self, model: &str) -> bool {
+    /// negative-cache entry — unsupported model (LAB-941) or, for a
+    /// `speed: "fast"` request, fast mode disabled on its org (LAB-2687) — so
+    /// no rotation can help. Gates the exhaustion reply: only then is a
+    /// stashed upstream 4xx returned (or synthesized on the warm path, where
+    /// the pool emptied before any forward ran). A rejection on one account
+    /// plus rate limits on the rest is a rate-limited pool, and the
+    /// retryable 429 stays the truth. Endpoints excluded by their config
+    /// `models` allowlist never serve the model and don't count; false when
+    /// no endpoint could ever serve it (config-only exclusion keeps its
+    /// pre-existing 429 semantics). `refused` is the endpoint that answered
+    /// THIS request with an entitlement 400 (LAB-4729): never negative-cached,
+    /// but skipped for the rest of the request, so it cannot serve it either.
+    pub(crate) fn pool_cannot_serve(
+        &self,
+        model: &str,
+        fast: bool,
+        refused: Option<EndpointIdx>,
+    ) -> bool {
         if model.is_empty() {
             return false;
         }
-        let unsupported = self.unsupported_endpoints_for(model);
+        let mut excluded = self.unsupported_endpoints_for(model);
+        if fast {
+            excluded.extend(self.fast_mode_disabled_endpoints());
+        }
+        excluded.extend(refused);
         let mut eligible = 0usize;
         for (i, ep) in self.endpoints.iter().enumerate() {
             if !ep.serves_model(model) {
                 continue;
             }
+            // An OpenAI-protocol endpoint can never honor speed:"fast" (its
+            // translation drops the field) and never accrues a fast-mode
+            // mark, so it must not count as "eligible" for a fast request —
+            // otherwise a pool with only OpenAI capacity left would look
+            // servable and the exhaustion reply would never fire (LAB-2687).
+            if fast && ep.protocol == Protocol::OpenAI {
+                continue;
+            }
             eligible += 1;
-            if !unsupported.contains(&i) {
+            if !excluded.contains(&i) {
                 return false;
             }
         }
         eligible > 0
+    }
+
+    /// Record that `endpoint_idx`'s org has fast mode disabled — the upstream
+    /// itself said so (LAB-2687). Fast requests skip it for FAST_MODE_DISABLED_TTL.
+    pub(crate) fn note_fast_mode_disabled(&self, endpoint_name: &str, endpoint_idx: usize) {
+        self.endpoints[endpoint_idx]
+            .fast_mode_disabled_total
+            .fetch_add(1, Ordering::Relaxed);
+        let mut map = self.lock_fast_mode_disabled();
+        warn!(
+            account = endpoint_name,
+            cooldown_secs = FAST_MODE_DISABLED_TTL.as_secs(),
+            "fast mode not enabled on account's org, routing fast requests away"
+        );
+        map.insert(endpoint_idx, Instant::now() + FAST_MODE_DISABLED_TTL);
+    }
+
+    /// Live fast-mode-disabled endpoint indices — the `speed: "fast"` twin of
+    /// `unsupported_endpoints_for`.
+    pub(crate) fn fast_mode_disabled_endpoints(&self) -> Vec<usize> {
+        let now = Instant::now();
+        self.lock_fast_mode_disabled()
+            .iter()
+            .filter(|(_, expiry)| **expiry > now)
+            .map(|(idx, _)| *idx)
+            .collect()
+    }
+
+    /// Seconds left on `endpoint_idx`'s fast-mode-disabled entry; None when
+    /// unmarked or expired (`/_stats`, shaped like `hard_limited_remaining_secs`).
+    pub(crate) fn fast_mode_disabled_remaining_secs(&self, endpoint_idx: usize) -> Option<u64> {
+        self.lock_fast_mode_disabled()
+            .get(&endpoint_idx)?
+            .checked_duration_since(Instant::now())
+            .map(|d| d.as_secs())
     }
 
     pub(crate) async fn routing_candidates(

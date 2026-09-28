@@ -570,16 +570,17 @@ impl AppState {
                 info.limit_requests = pa.limit_requests;
                 info.limit_tokens = pa.limit_tokens;
 
-                if let Some(until_epoch) = pa.hard_limited_until_epoch {
-                    if until_epoch > now_epoch {
-                        let remaining_secs = until_epoch - now_epoch;
-                        info.hard_limited_until =
-                            Some(now_instant + Duration::from_secs(remaining_secs));
-                        info!(
-                            account = pa.name,
-                            remaining_secs, "restored hard limit from persisted state"
-                        );
-                    }
+                // Same clamp as the Redis sync path: a corrupt file value
+                // (e.g. u64::MAX) must not overflow Instant and panic boot.
+                if let HardLimitSync::Update(until) =
+                    classify_hard_limit_sync(pa.hard_limited_until_epoch, now_epoch, now_instant)
+                {
+                    info.hard_limited_until = Some(until);
+                    info!(
+                        account = pa.name,
+                        remaining_secs = (until - now_instant).as_secs(),
+                        "restored hard limit from persisted state"
+                    );
                 }
 
                 info.last_updated = Some(now_instant);
