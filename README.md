@@ -246,6 +246,9 @@ token = "sk-ant-oat01-..."
 ```
 
 When a request specifies a model, only accounts whose `models` list matches (exact or prefix wildcard) are considered. Accounts with an empty `models` list serve all models.
+This gate (and the per-client `models` list below) reads only the top-level
+`model`: a request carrying `server-side-fallback-*` may have a refusal served
+by a fallback model neither list names.
 
 ---
 
@@ -408,6 +411,7 @@ can steer are locked down by default:
   - `context-management-*` ↔ top-level `context_management`
   - `fast-mode-*` ↔ top-level `speed: "fast"`
   - `dangerous-tool-use-*` + `auto-mode-classifier-*` ↔ top-level `safeguards`
+  - `server-side-fallback-*` ↔ top-level `fallbacks`
   - *(nested)* `mid-conversation-tool-changes-*`, `per-turn-control-*`,
     `timing-*` ↔ `tool_addition`/`tool_removal` blocks and
     `output_config.effort`/`timing` on the `role: "system"` entry in `messages`

@@ -90,6 +90,8 @@ fn oauth_beta_filter_keeps_claude_code_flag_set() {
         "mid-conversation-tool-changes-2026-07-01",
         "per-turn-control-2026-07-01",
         "timing-2026-09-09",
+        // Server-side refusal fallback, body-paired (`fallbacks`).
+        "server-side-fallback-2026-07-01",
     ];
     // Negative control: the point of the allow-list is that it still rejects.
     // Without this, widening the default to "*" would keep the test green.
@@ -861,6 +863,52 @@ fn surviving_flag_protects_its_field_against_an_unrelated_drop() {
         .is_none(),
         "an unrelated dropped flag must not cost the caller their fallback credit"
     );
+}
+
+/// Server-side refusal fallback: the `"default"` form of `fallbacks` survives
+/// an unrelated drop while its flag survives, and goes with the flag when the
+/// flag itself is dropped — the second half proves the first is not vacuous,
+/// and the third proves the first is the row's doing.
+#[test]
+fn surviving_server_side_fallback_keeps_fallbacks_and_dropped_one_strips_it() {
+    let body = bytes::Bytes::from_static(
+        br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1,"fallbacks":"default"}"#,
+    );
+    assert!(
+        strip_orphaned_beta_body_fields(
+            &body,
+            "server-side-fallback-2026-07-01,oauth-2025-04-20",
+            &["totally-made-up-beta-2026-01-01".to_string()],
+        )
+        .is_none(),
+        "an unrelated dropped flag must not cost the caller their refusal fallback"
+    );
+    let (rewritten, stripped) = strip_orphaned_beta_body_fields(
+        &body,
+        "oauth-2025-04-20",
+        &["server-side-fallback-2026-07-01".to_string()],
+    )
+    .expect("fallbacks must be stripped when its flag is dropped");
+    assert_eq!(stripped, vec!["fallbacks".to_string()]);
+    let parsed: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+    assert!(parsed.get("fallbacks").is_none());
+
+    // Only the row makes the keep-side above mean anything: without it the
+    // surviving flag is unrecognised and switches the strip off, which also
+    // returns `None`. With a real orphan alongside, the row must keep
+    // `fallbacks` while the orphan goes.
+    let with_orphan = bytes::Bytes::from_static(
+        br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1,"fallbacks":"default","orphan_field":1}"#,
+    );
+    let (rewritten, stripped) = strip_orphaned_beta_body_fields(
+        &with_orphan,
+        "server-side-fallback-2026-07-01,oauth-2025-04-20",
+        &["totally-made-up-beta-2026-01-01".to_string()],
+    )
+    .expect("a surviving server-side-fallback flag must be recognised, not disable the strip");
+    assert_eq!(stripped, vec!["orphan_field".to_string()]);
+    let parsed: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+    assert_eq!(parsed["fallbacks"], "default");
 }
 
 /// Helly R finding 1, second half: a custom `allowed_client_betas` can pass a

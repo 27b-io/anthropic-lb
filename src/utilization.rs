@@ -293,6 +293,11 @@ pub(crate) const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     "mid-conversation-tool-changes-*",
     "per-turn-control-*",
     "timing-*",
+    // Server-side refusal fallback: body-paired with top-level `fallbacks`,
+    // used by both the `-2026-06-01` array form and the `-2026-07-01`
+    // `"default"` form, and mapped in `BETA_BODY_FIELDS` so the pair travels
+    // together.
+    "server-side-fallback-*",
 ];
 
 /// Cardinality bound for `beta_flags_dropped` — flag names are
@@ -480,6 +485,12 @@ const BETA_BODY_FIELDS: &[(&str, &[&str])] = &[
     ("structured-outputs-*", &["output_format"]),
     ("fast-mode-*", &["speed"]),
     ("fallback-credit-*", &["fallback_credit_token"]),
+    // `fallbacks` is this family's own field; `fallback_credit_token` is also
+    // granted by the `-2026-07-01` flag, so it is claimed by both rows.
+    (
+        "server-side-fallback-*",
+        &["fallbacks", "fallback_credit_token"],
+    ),
     // `safeguards` is claimed by BOTH halves of the auto-mode classifier pair:
     // an allow-list carrying only one of them must still keep the field.
     ("dangerous-tool-use-*", &["safeguards"]),
