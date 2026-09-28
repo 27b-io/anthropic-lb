@@ -150,6 +150,8 @@ probe_interval_secs = 300
 # redis_url = "redis://redis.example.com:6379"
 
 # IP-to-client-name mapping (optional, fallback when no X-Client-ID header)
+# Values must be non-empty, trimmed, and not a reserved name ("-", "_operator",
+# "_other") — rejected at startup.
 # [client_names]
 # "192.0.2.10" = "alice-desktop"
 # "192.0.2.11" = "bob-laptop"
@@ -170,7 +172,7 @@ token = "sk-ant-api03-..."
 | Field | Type | Default | Description |
 |:------|:-----|:--------|:------------|
 | `listen` | `String` | — | Bind address (e.g. `"127.0.0.1:8082"`) |
-| `rate_limit_cooldown_secs` | `u64` | `5` | Fallback cooldown after a capacity 429 when upstream sends no usable `retry-after` (burst 429s use their own 5→60s backoff) |
+| `rate_limit_cooldown_secs` | `u64` | `5` | Fallback cooldown after a capacity 429 when upstream sends no usable `retry-after` (burst 429s use their own 5→60s backoff). Must be `1..=86400`; a value outside it is rejected at startup |
 | `probe_interval_secs` | `u64` | `300` | Seconds between utilization probes (0 = disabled) |
 | `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id` |
 | `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`) |
@@ -191,6 +193,7 @@ token = "sk-ant-api03-..."
 | `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
 | `client_utilization_limits` | `{name: f64}` | `{}` | Per-client utilization ceiling (0.0–1.0) |
 | `operators` | `Vec<String>` | `[]` | Client IDs that bypass all enforcement |
+| `admin_readers` | `Vec<String>` | `[]` | Client IDs granted `/_stats` + `/metrics` and nothing else — every `/v1` surface answers 403. The role for a scrape or a dashboard. Requires `[[clients]]`; a name in both `admin_readers` and `operators` is a startup error |
 | `strategy` | `String` | `dynamic-capacity-v1` | Routing strategy (see note below) |
 | `emergency_threshold` | `f64` | `0.88` | Utilization threshold for emergency brake |
 | `redis_url` | `String?` | `None` | Redis/Valkey URL for distributed state |
@@ -243,6 +246,10 @@ token = "sk-ant-oat01-..."
 ```
 
 When a request specifies a model, only accounts whose `models` list matches (exact or prefix wildcard) are considered. Accounts with an empty `models` list serve all models.
+A server-side refusal fallback (`fallbacks`) could be served by a model this
+list does not name, so when the chosen endpoint or the client (see
+`[[clients]]` below) has a non-empty `models` list, the proxy strips the
+top-level `fallbacks` field and a refusal is returned as a refusal.
 
 ---
 
@@ -286,7 +293,7 @@ Claude Code sends it as `x-api-key`; the proxy validates it and swaps in the rea
 > [!IMPORTANT]
 > With `[[clients]]` configured, **`x-client-id` and the `client_names` IP map are ignored entirely** — `client_id` comes from the verified credential. That is what makes per-client budgets, utilization ceilings, operator status, model allow-lists and response-cache tenancy enforceable rather than advisory: all five key on `client_id`.
 
-Keys are compared in constant time against the whole table. Startup rejects anything that would otherwise fail silently at runtime: duplicate names, duplicate keys, a name with stray whitespace, and any `client_budgets` / `client_utilization_limits` / `operators` / `[response_cache].clients` entry naming no configured client. That last class matters — an unknown client passes the budget and utilization checks, so a one-character typo would mean *unlimited* spend with no log line and no metric.
+Keys are compared in constant time against the whole table. Startup rejects anything that would otherwise fail silently at runtime: duplicate names, duplicate keys, a name with stray whitespace, and any `client_budgets` / `client_utilization_limits` / `operators` / `admin_readers` / `[response_cache].clients` entry naming no configured client. That last class matters — an unknown client passes the budget and utilization checks, so a one-character typo would mean *unlimited* spend with no log line and no metric.
 
 `[[clients]]` is also incompatible with `token = "passthrough"` endpoints, and that combination is rejected at startup. Passthrough forwards the caller's auth headers upstream untouched, but under `[[clients]]` those headers carry the caller's *proxy* credential — forwarding them would hand every client key to the upstream.
 
@@ -343,6 +350,7 @@ It **fails closed** on a model it cannot read. The proxy takes the model from th
 | **Per-client keys** | `[[clients]]` | Requires a per-client credential; identity = the credential (401) | **startup error** (unless `allow_unauthenticated`) |
 | **Proxy key** (legacy) | `proxy_key = "<64 hex>"` | Requires a single shared `x-api-key` (401) | **startup error** (unless `allow_unauthenticated`) |
 | **Admin surfaces** | `operators = ["ops"]` | `/_stats` + `/metrics` need an operator credential (401/403) | no one can read them under `[[clients]]` |
+| **Read-only principal** | `admin_readers = ["vmagent"]` | Same two surfaces, `/v1` answers 403 | scrapes need an operator key, which bypasses every limit |
 | **Failed-auth throttle** | `auth_failure_limit` / `auth_failure_window_secs` | Further invalid credentials get 429 + `retry-after` per client IP after repeated failures; valid credentials always pass | on (10 / 300s) |
 | **Trusted proxies** | `trusted_proxies = ["192.0.2.0/24"]` | Real client IP recovered from `x-forwarded-for` behind a listed LB | header ignored |
 | **Caller-identity privacy** | `forward_caller_identity = false` | Caller IP and `x-client-id`/`x-agent-id`/`x-session-id` headers dropped before the upstream request | **stripped** |
@@ -352,9 +360,11 @@ IP check runs first, then the credential check; failed credentials are subject t
 
 **TLS terminates at the ingress.** The proxy speaks plain HTTP and its container port must never be published directly to the internet — put it behind a TLS-terminating load balancer or ingress, list that LB in `trusted_proxies`, and let the ingress carry the certificate. Bearer credentials without TLS are credentials in cleartext.
 
-### Admin surfaces are operator-only
+### Admin surfaces are operator- and reader-only
 
-`/_stats` disclosures are a reconnaissance report for anyone planning to spend the pool: raw `client_id`s, agent/session prefixes, models, **endpoint account names**, token counts, per-account utilisation and budgets. So under `[[clients]]` both `/_stats` and `/metrics` answer only to a client named in `operators` — unauthenticated gets `401`, a valid non-operator credential gets `403`. Under legacy `proxy_key` the (single) key holder is the operator by construction. Under `allow_unauthenticated` both surfaces serve, and unauthenticated access logs at `warn` — rate-limited to once per route per 5 minutes, so the open posture stays visible without a per-scrape firehose.
+`/_stats` disclosures are a reconnaissance report for anyone planning to spend the pool: raw `client_id`s, agent/session prefixes, models, **endpoint account names**, token counts, per-account utilisation and budgets. So under `[[clients]]` both `/_stats` and `/metrics` answer only to a client named in `operators` or `admin_readers` — unauthenticated gets `401`, a valid credential in neither list gets `403`. Under legacy `proxy_key` the (single) key holder is the operator by construction. Under `allow_unauthenticated` both surfaces serve, and unauthenticated access logs at `warn` — rate-limited to once per route per 5 minutes, so the open posture stays visible without a per-scrape firehose.
+
+**Give a scrape `admin_readers`, not `operators`.** The two roles reach the same two surfaces, but `operators` also bypasses the model allow-list, the daily budget, the utilization ceiling and the emergency brake — so a monitoring credential handed out as an operator is unmetered authority to spend the pool, and any `client_budgets` entry written for that name is dead config the gate never reads. An `admin_readers` principal gets `403` on every `/v1` surface before endpoint selection, so it cannot reach an upstream at all. Use it for Prometheus/vmagent, uptime checks and Grafana datasources; keep `operators` for the human who genuinely needs the bypass. A name may appear in one list or the other, never both, and `admin_readers` requires `[[clients]]` — under legacy `proxy_key` there is no per-principal identity to scope, so configuring it is a startup error rather than a control that quietly does nothing.
 
 ### Real client IP behind a load balancer
 
@@ -402,6 +412,7 @@ can steer are locked down by default:
   - `context-management-*` ↔ top-level `context_management`
   - `fast-mode-*` ↔ top-level `speed: "fast"`
   - `dangerous-tool-use-*` + `auto-mode-classifier-*` ↔ top-level `safeguards`
+  - `server-side-fallback-*` ↔ top-level `fallbacks`
   - *(nested)* `mid-conversation-tool-changes-*`, `per-turn-control-*`,
     `timing-*` ↔ `tool_addition`/`tool_removal` blocks and
     `output_config.effort`/`timing` on the `role: "system"` entry in `messages`
@@ -640,9 +651,9 @@ per-client counters.
 | `/metrics` | GET | Prometheus-format metrics |
 
 All endpoints are gated by `[[clients]]` (or legacy `proxy_key`) and
-`allowed_ips`. `/_stats` and `/metrics` are **operator-scoped**: under
-`[[clients]]` they require a credential whose name is in `operators`
-(401 unauthenticated / 403 non-operator — see §Security).
+`allowed_ips`. `/_stats` and `/metrics` are **operator- and reader-scoped**: under
+`[[clients]]` they require a credential whose name is in `operators` or `admin_readers`
+(401 unauthenticated / 403 for any other client — see §Security).
 
 ### Session context-window visibility
 
@@ -675,14 +686,21 @@ The 400 itself is forwarded to the client unchanged.
 
 Requests rejected by a client's model allow-list are counted as
 `anthropic_client_model_denied_total{client,model}` and logged at WARN. The
-`model` label is caller-controlled, so the label set is bounded — overflow
-past 64 distinct pairs lumps into a single global
-`client="_other",model="_other"` bucket (hard bound: 64 + 1 series).
-`_other` is a reserved client name: config validation rejects a
-`[[clients]]` entry or `client_names` value named `_other`, and a legacy
-`x-client-id: _other` header is ignored, so real traffic can never
-pre-claim the overflow key. `anthropic_client_model_token_usage_total`
-shares the same overflow scheme (bucket at 256 + 1 series).
+`model` label is caller-controlled, so the label set is bounded — past 64
+distinct pairs a denial for a NEW (client, model) pair lumps into that
+client's `client="<name>",model="_other"` bucket, so attribution and the
+first-overflow WARN survive; already-tracked pairs keep counting on their own
+series (hard bound: 64 + number of `[[clients]]` + 1 series). `_other`
+is a reserved client name: config validation rejects a `[[clients]]` entry or
+`client_names` value named `_other`, and a legacy `x-client-id: _other`
+header is ignored, so real traffic can never pre-claim the global bucket. A
+denied model named `_other`, `__other`, … gets one extra leading `_` in its
+label (`_other` is labelled `model="__other"`), so it cannot pre-claim a
+client's bucket or share a series with another model.
+`anthropic_client_model_token_usage_total` instead uses one global
+`client="_other",model="_other"` bucket, because its client id can be
+header-asserted under legacy auth (bounded at 256 + 1 distinct (client,
+model) pairs).
 
 ### Per-claim rate-limit visibility
 
@@ -738,6 +756,69 @@ signal that a caller was actually turned away because of it. Both label values
 are emitted from process start, so a flat zero is a measurement rather than an
 absence of data. These are independent per-replica event counts — aggregate
 with `sum by (kind)`, where `max` would undercount.
+
+### Request latency, restarts and build identity
+
+`anthropic_http_request_duration_seconds{route, status}` is a histogram of the
+time from request receipt to the moment the proxy sends response headers. For a
+streamed response none of the stream time is included: the proxy returns the
+upstream headers and pumps the body outside the measured span. It is recorded
+by router-wide middleware, so every response counts,
+including the 401/403/429/503 the proxy generates itself before any upstream is
+contacted. `route` is a closed vocabulary (`/v1/messages`,
+`/v1/messages/count_tokens`, `/v1/chat/completions`, `/_stats`, `/metrics`,
+`other`) and `status` is the HTTP code, so a caller cannot mint series by
+varying the URL. A request the client abandons before response headers is not
+recorded, because the server drops the in-flight request when the client
+disconnects. Under an upstream stall the slowest requests can therefore be
+missing from the tail. Per-replica: aggregate with `sum by (le, route, status)`
+before `histogram_quantile`.
+
+`process_start_time_seconds` is the standard start-time gauge:
+`time() - process_start_time_seconds` is uptime and
+`changes(process_start_time_seconds[1h])` counts restarts behind one scrape
+target, so a recycle no longer has to be inferred from counter resets. A
+replacement that comes up under a new `instance` label is a new series, which
+`changes()` does not count.
+
+`anthropic_lb_info{strategy, version, revision}` identifies the running build.
+`version` is the crate version; `revision` is the 7-character git commit taken
+from the `GIT_SHA` Docker build argument (`unknown` when built without it), so
+it compares directly against a `sha-*` image tag.
+
+`anthropic_upstream_transport_errors_total` has two scopes, and
+`anthropic_cluster_redis_connected` tells them apart on each scrape. Where that
+gauge is `1`, the counter is the fleet-wide total read back from Redis, and
+every such replica reports the same value. Aggregate those with `max`, since
+`sum` multiplies the count by the number of replicas. Everywhere else the
+replica reports its own count: without Redis, before its first sync, or while
+Redis is unreachable. Aggregate those with `sum`. Without Redis the count is
+every failure the replica has seen. With Redis it is the failures still to be
+flushed. A flush reads Redis's reply to each command, so a count Redis applied
+is never sent again, and a count Redis rejected is kept for the next flush. Only
+when no reply arrives at all (a dropped connection or a timeout) is the whole
+batch kept and sent again, so after a lost reply some of those failures can
+already be in the fleet total. It can also under-count: if Redis rejects writes
+but still serves reads, the gauge stays `1` and that replica's kept failures
+appear in neither term. During a partial outage, the `max` over connected
+replicas plus the `sum` over the rest is therefore an estimate, not an exact
+total.
+
+A replica that changes scope also steps its series between the fleet total and
+its local count, which `rate()` and `increase()` read as a counter reset or a
+burst of new failures. Connected replicas also read the fleet total on their own
+5-second ticks, so a `max` taken before `rate()` falls back to an older reading
+when the freshest replica drops out, and `rate()` reads that as a reset too.
+Keep only fleet-scope readings, take the rate per replica, then take the `max`:
+
+```promql
+max by (kind) (
+  rate((anthropic_upstream_transport_errors_total
+    and on(instance) anthropic_cluster_redis_connected == 1)[5m:])
+)
+```
+
+The HELP text states the scopes on the scrape.
 
 ### OpenAI JSON-mode compatibility
 
@@ -1096,7 +1177,8 @@ sudo systemctl enable --now anthropic-lb
 ### Docker
 
 ```bash
-docker build -t anthropic-lb .
+# GIT_SHA bakes the commit into anthropic_lb_info{revision} (omit it → "unknown")
+docker build --build-arg GIT_SHA=$(git rev-parse HEAD) -t anthropic-lb .
 docker run -v /path/to/config.toml:/etc/anthropic-lb/config.toml anthropic-lb
 ```
 

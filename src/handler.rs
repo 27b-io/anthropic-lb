@@ -54,9 +54,20 @@ pub(crate) const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
 ///     for models outside their plan.
 ///   - LiteLLM-style gateways: 400 `{"error":{"message":"... Invalid model
 ///     name passed in model=<id> ..."}}` (observed live from insight-gateway,
-///     2026-07-27).
+///     2026-07-27). Free text, so matched for `Protocol::OpenAI` endpoints
+///     only: Anthropic echoes client-chosen field names into its 400s
+///     (`<field>: Extra inputs are not permitted`), so on an Anthropic
+///     endpoint the phrase is client-controlled and one request could
+///     negative-cache the model for every client (LAB-5235). See
+///     `is_gateway_model_rejection` for why it is anchored and bound to
+///     `model`, the model the request asked for.
 ///   - OpenAI: `{"error":{"code":"model_not_found", ...}}`.
-pub(crate) fn is_model_unsupported_error(status: StatusCode, body: &serde_json::Value) -> bool {
+pub(crate) fn is_model_unsupported_error(
+    status: StatusCode,
+    body: &serde_json::Value,
+    protocol: Protocol,
+    model: &str,
+) -> bool {
     if status != StatusCode::NOT_FOUND && status != StatusCode::BAD_REQUEST {
         return false;
     }
@@ -72,7 +83,26 @@ pub(crate) fn is_model_unsupported_error(status: StatusCode, body: &serde_json::
     if err.get("code").and_then(|v| v.as_str()) == Some("model_not_found") {
         return true;
     }
-    msg.to_ascii_lowercase().contains("invalid model name")
+    protocol == Protocol::OpenAI && is_gateway_model_rejection(msg, model)
+}
+
+/// LiteLLM's own model rejection, as observed live:
+/// `/chat/completions: Invalid model name passed in model=<id>. Call …`.
+/// Anchored at the message start and bound to the requested model, because
+/// the same field carries provider errors the gateway relays, and those can
+/// echo client-chosen keys mid-message, as in
+/// `litellm.BadRequestError: …Exception - {… "<key>: Extra inputs are not
+/// permitted" …}`. A substring match would let a key containing the phrase
+/// mark the model unsupported for everyone.
+fn is_gateway_model_rejection(msg: &str, model: &str) -> bool {
+    let Some((route, rest)) = msg.split_once(": ") else {
+        return false;
+    };
+    route.starts_with('/')
+        && rest
+            .strip_prefix("Invalid model name passed in model=")
+            .and_then(|r| r.strip_prefix(model))
+            .is_some_and(|r| r.starts_with('.'))
 }
 
 /// Exact upstream text of the org-level fast-mode entitlement 400 (observed
@@ -92,8 +122,8 @@ const FAST_MODE_NOT_ENABLED_MSG: &str =
 /// this clause (an unrecognized top-level field literally named the phrase),
 /// so a `.contains` match plus an unguarded caller could walk and mark every
 /// reachable account on a single crafted request. The caller additionally
-/// gates this on `is_fast_mode` — a fast-mode-shaped 400 on a request that
-/// never asked for fast mode is never grounds to mark the account.
+/// requires a fast request — a fast-mode-shaped 400 on a request that never
+/// asked for fast mode is never grounds to mark the account.
 fn is_fast_mode_not_enabled_error(status: StatusCode, body: &serde_json::Value) -> bool {
     status == StatusCode::BAD_REQUEST
         && body.pointer("/error/type").and_then(|v| v.as_str()) == Some("invalid_request_error")
@@ -125,6 +155,72 @@ pub(crate) fn is_entitlement_exhausted_400(status: StatusCode, body: &serde_json
             .pointer("/error/message")
             .and_then(|v| v.as_str())
             .is_some_and(|m| m.starts_with(ENTITLEMENT_400_ANCHOR))
+}
+
+/// Account or model state an upstream 4xx reports: the request itself was
+/// fine, and another endpoint may serve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamRejection {
+    /// `is_model_unsupported_error`.
+    ModelUnsupported,
+    /// `is_entitlement_exhausted_400`.
+    Entitlement,
+    /// `is_fast_mode_not_enabled_error`. Reports this account's org only
+    /// when the request asked for fast mode; the caller decides.
+    FastModeDisabled,
+}
+
+/// Read account or model state out of an upstream error. Every forward path
+/// classifies through here, so the echo veto covers every classifier, the
+/// ones added later included. `model` is the model the request asked for, and
+/// `sent_body` the request body exactly as it went to this endpoint.
+pub(crate) fn classify_rejection(
+    status: StatusCode,
+    err_body: &serde_json::Value,
+    protocol: Protocol,
+    model: &str,
+    sent_body: &[u8],
+) -> Option<UpstreamRejection> {
+    let verdict = if is_model_unsupported_error(status, err_body, protocol, model) {
+        UpstreamRejection::ModelUnsupported
+    } else if is_entitlement_exhausted_400(status, err_body) {
+        UpstreamRejection::Entitlement
+    } else if is_fast_mode_not_enabled_error(status, err_body) {
+        UpstreamRejection::FastModeDisabled
+    } else {
+        return None;
+    };
+    // Checked after a match rather than before: it re-parses the request
+    // body, and an error no classifier claims is forwarded unchanged anyway.
+    (!echoes_request_key(err_body, sent_body)).then_some(verdict)
+}
+
+/// True when `error.message` starts with `<key>:` for a top-level key of the
+/// request. Anthropic's 400 for an unknown field reads `<key>: Extra inputs
+/// are not permitted`, with the key echoed verbatim, so that message is text
+/// the client chose and cannot report account or model state.
+///
+/// `model` is exempt: its name is fixed by the API, and the genuine model
+/// rejection reads `model: <id>`. A body that does not parse as a JSON object
+/// counts as an echo, since an echo cannot then be ruled out, and forwarding
+/// the error unchanged is the safe side.
+fn echoes_request_key(err_body: &serde_json::Value, sent_body: &[u8]) -> bool {
+    let Some(msg) = err_body.pointer("/error/message").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if sent_body.is_empty() {
+        return false;
+    }
+    let Ok(keys) = serde_json::from_slice::<HashMap<String, serde::de::IgnoredAny>>(sent_body)
+    else {
+        return true;
+    };
+    keys.keys().any(|k| {
+        k != "model"
+            && msg
+                .strip_prefix(k.as_str())
+                .is_some_and(|rest| rest.starts_with(':'))
+    })
 }
 
 /// Surface the real cause of a `reqwest::Error`. The Display form only shows
@@ -758,10 +854,11 @@ pub(crate) async fn forward_anthropic(
     // (`requests`), `/v1/complete` (`prompt`) and anything else arrive here
     // too — running a Messages-only field list over those bodies deletes them
     // outright.
-    let coherent_body = if matches!(
+    let messages_schema = matches!(
         parts.uri.path(),
         "/v1/messages" | "/v1/messages/count_tokens"
-    ) {
+    );
+    let coherent_body = if messages_schema {
         strip_orphaned_beta_body_fields(
             oauth_body_bytes,
             headers
@@ -837,6 +934,25 @@ pub(crate) async fn forward_anthropic(
         debug_assert!(coherent_body.is_none());
         body_bytes
     };
+    // LAB-5970: a `models` allow-list on the client or on THIS endpoint (the
+    // retry loop may land on a differently restricted one) would be escaped by
+    // a server-side fallback to a model it does not name — see
+    // `strip_fallbacks`. Applied to every auth type: API-key and passthrough
+    // endpoints forward client betas unfiltered, so this cannot ride on the
+    // beta allow-list. Batches nest the field and Anthropic rejects it there.
+    let models_restricted = !ep.models.is_empty() || state.client_restricts_models(client_id);
+    let fallback_free = (messages_schema && models_restricted)
+        .then(|| strip_fallbacks(req_body))
+        .flatten();
+    if fallback_free.is_some() {
+        debug!(
+            req_id,
+            client_id,
+            account = endpoint_name,
+            "models allow-list: stripped top-level fallbacks"
+        );
+    }
+    let req_body = fallback_free.as_ref().unwrap_or(req_body);
     upstream_req = upstream_req.body(req_body.clone());
 
     let resp = match upstream_req.send().await {
@@ -1187,17 +1303,23 @@ pub(crate) async fn forward_anthropic(
             // here too: upstream sends the 400 as a JSON body, not an event
             // stream, so it re-sends before any byte reaches the client.
             let rotate: Option<fn(Box<Response>) -> ForwardOutcome> =
-                if is_model_unsupported_error(status, &parsed) {
-                    state.note_model_unsupported(endpoint_name, endpoint_idx, model);
-                    Some(ForwardOutcome::RetryRejectedByAccount)
-                } else if is_fast_mode && is_fast_mode_not_enabled_error(status, &parsed) {
-                    state.note_fast_mode_disabled(endpoint_name, endpoint_idx);
-                    Some(ForwardOutcome::RetryRejectedByAccount)
-                } else if is_entitlement_exhausted_400(status, &parsed) {
-                    state.note_entitlement_400(endpoint_name);
-                    Some(ForwardOutcome::RetryEntitlement)
-                } else {
-                    None
+                match classify_rejection(status, &parsed, ep.protocol, model, req_body) {
+                    Some(UpstreamRejection::ModelUnsupported) => {
+                        state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                        Some(ForwardOutcome::RetryRejectedByAccount)
+                    }
+                    Some(UpstreamRejection::FastModeDisabled) if is_fast_mode => {
+                        state.note_fast_mode_disabled(endpoint_name, endpoint_idx);
+                        Some(ForwardOutcome::RetryRejectedByAccount)
+                    }
+                    // A standard request never asked for fast mode, so the
+                    // 400 is not about this account's org: forward it as-is.
+                    Some(UpstreamRejection::FastModeDisabled) => None,
+                    Some(UpstreamRejection::Entitlement) => {
+                        state.note_entitlement_400(endpoint_name);
+                        Some(ForwardOutcome::RetryEntitlement)
+                    }
+                    None => None,
                 };
             if let Some(retry) = rotate {
                 // This branch returns before `finalize_non_stream` — log the
@@ -1426,6 +1548,13 @@ pub(crate) async fn proxy_handler(
     } = rctx;
     // affinity_key is built AFTER the body is parsed, so the content fingerprint
     // (fp) can be folded in as the finest routing discriminator.
+
+    // LAB-4395 / GH #199: a read-only principal is refused here, on identity
+    // alone, before it can reserve any of the shared body budget or have a
+    // byte of its body read. `pre_request_gate` repeats the check.
+    if let Some(resp) = state.deny_admin_reader(&req_id, &client_id) {
+        return *resp;
+    }
 
     // Debug: dump all inbound request headers
     if tracing::enabled!(tracing::Level::DEBUG) {
@@ -1670,7 +1799,7 @@ pub(crate) async fn proxy_handler(
     // Note: budget + emergency don't need `model` and could run before body parsing,
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
-    if let Err(resp) = state.pre_request_gate(&client_id, &model).await {
+    if let Err(resp) = state.pre_request_gate(&req_id, &client_id, &model).await {
         return *resp;
     }
 

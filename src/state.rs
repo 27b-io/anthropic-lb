@@ -181,10 +181,9 @@ pub(crate) const TAU_1H: f64 = 3600.0;
 pub(crate) const MAX_TRACKED_CLIENTS: usize = 10_000;
 
 /// Cap on distinct (client, model) labels in the allowlist-denial counter.
-/// The model half is caller-controlled, and under legacy auth the client
-/// half is too (`x-client-id`), so overflow lumps into a single global
-/// ("_other", "_other") bucket — a HARD bound of cap + 1 entries (LAB-2332,
-/// mirroring the LAB-2330 fix to `client_model_usage`).
+/// The model half is caller-controlled; the client half is config-bounded,
+/// so the hard bound is cap + configured clients + 1 — see
+/// `AppState::note_model_denied` for the scheme (LAB-2332, LAB-4028).
 pub(crate) const MAX_MODEL_DENIED_LABELS: usize = 64;
 
 /// Cap on distinct clients in the pre-request-gate rejection counter
@@ -612,6 +611,9 @@ pub(crate) struct AppState {
     pub(crate) client_utilization_limits: HashMap<String, f64>,
     /// Operator client IDs — never throttled by budgets, ceilings, or emergency brake.
     pub(crate) operators: Vec<String>,
+    /// Read-only client IDs — `/_stats` + `/metrics` only, 403 on every `/v1`
+    /// surface. Disjoint from `operators`; the overlap is a boot error.
+    pub(crate) admin_readers: Vec<String>,
     /// Whether the emergency brake is enabled. Default: true.
     pub(crate) emergency_brake: bool,
     /// Emergency brake threshold. Default: 0.88.
@@ -673,6 +675,14 @@ pub(crate) struct AppState {
     /// whole pool was unavailable (LAB-4189) — before this, exhaustion existed
     /// solely as a `warn!` line, so there was nothing to graph or alert on.
     pub(crate) pool_exhausted: [AtomicU64; 2],
+    /// `anthropic_http_request_duration_seconds` cells keyed by
+    /// `(route, status)`; bounded by construction — see `route_label`.
+    /// Per-process — aggregate with `sum`.
+    pub(crate) request_durations: Mutex<HashMap<(&'static str, u16), RequestDurationHist>>,
+    /// Unix-epoch second this process built its state. Exported as
+    /// `process_start_time_seconds` so a restart is visible directly rather
+    /// than only as a counter reset.
+    pub(crate) start_epoch: u64,
     /// Reflect upstream `anthropic-ratelimit-*` headers to callers (see
     /// `Config::expose_upstream_ratelimit_headers`). Default: false.
     pub(crate) expose_upstream_ratelimit_headers: bool,
@@ -727,12 +737,8 @@ pub(crate) struct AppState {
     /// `fast_mode_429`.
     pub(crate) entitlement_400: Mutex<HashMap<String, u64>>,
     /// Per-client model-allowlist denials, keyed (client, model) (LAB-1083).
-    /// Exposed as `anthropic_client_model_denied_total`. Under `[[clients]]`
-    /// auth `client` is a credential-bound principal, but under legacy
-    /// `proxy_key` / `allow_unauthenticated` it comes from the
-    /// caller-controlled `x-client-id` header — so overflow lumps into a
-    /// single global ("_other", "_other") bucket, hard-bounding the map at
-    /// `MAX_MODEL_DENIED_LABELS` + 1 entries (LAB-2332).
+    /// Exposed as `anthropic_client_model_denied_total`. Cardinality is
+    /// hard-bounded — `note_model_denied` documents the scheme.
     pub(crate) model_denied: Mutex<HashMap<(String, String), u64>>,
     /// Pre-request-gate 429 rejections, keyed (client, reason) (LAB-2551).
     /// Exposed as `anthropic_client_rejections_total`. `reason` is the closed
@@ -895,7 +901,7 @@ pub(crate) async fn read_body_bounded(
     match result {
         Ok(b) => Ok(b),
         Err(e) => {
-            error!("failed to read request body: {e}");
+            error!(req_id, error = %e, "failed to read request body");
             Err(Box::new(
                 (StatusCode::BAD_REQUEST, "bad request body").into_response(),
             ))

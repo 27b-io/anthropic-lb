@@ -2,6 +2,7 @@ use axum::{
     body::Body,
     extract::State,
     http::{HeaderValue, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
     Router,
@@ -196,7 +197,7 @@ fn validate_clients(config: &Config) -> Result<(), String> {
         }
         if c.name == "_other" {
             return Err(
-                "client: name must not be \"_other\" (the reserved metrics overflow-bucket label — a real client with this name would merge with, and take the warn-once flag of, the (\"_other\", \"_other\") overflow key)"
+                "client: name must not be \"_other\" (the reserved metrics overflow-bucket label — a real client with this name would merge into the (\"_other\", \"_other\") overflow key)"
                     .to_string(),
             );
         }
@@ -237,6 +238,13 @@ fn validate_clients(config: &Config) -> Result<(), String> {
     // (`resolve_client_id`'s fallback) — an IP mapped to a reserved sentinel
     // would resolve real traffic to it, bypassing the header filter above.
     for (ip, name) in &config.client_names {
+        // Same failure as an untrimmed `[[clients]]` name above: resolved
+        // verbatim by `resolve_client_id`, matches no budget key.
+        if name.is_empty() || name != name.trim() {
+            return Err(format!(
+                "client_names: \"{ip}\" maps to \"{name}\" — value must be non-empty with no leading or trailing whitespace"
+            ));
+        }
         if name == "-" || name == "_operator" || name == "_other" {
             return Err(format!(
                 "client_names: \"{ip}\" maps to reserved name \"{name}\" (\"-\" = unknown-client sentinel, \"_operator\" = operator-aggregation label, \"_other\" = metrics overflow bucket)"
@@ -254,6 +262,37 @@ fn validate_clients(config: &Config) -> Result<(), String> {
     // cache inert. Only enforceable when [[clients]] is configured — on the
     // legacy path client ids are header-derived and there is no registry to
     // check against.
+
+    // `admin_readers` (LAB-4395) is the one cross-check surface that must fire on
+    // the legacy path too, because there it cannot work at all: with a single
+    // shared `proxy_key` the key holder IS the operator (`authenticate`
+    // returns no principal, so `authorize_admin` serves), and `client_id` on
+    // the proxy path is caller-asserted via `x-client-id`. An `admin_readers` entry
+    // would therefore restrict nobody and grant nobody — a control that reads
+    // as scoping while scoping nothing. Reject rather than half-handle,
+    // exactly as with `passthrough` below. Unlike `operators`, there are no
+    // pre-existing configs carrying this key, so nothing regresses.
+    if !config.admin_readers.is_empty() && clients.is_empty() {
+        return Err(
+            "admin_readers: requires [[clients]] — under legacy proxy_key the key holder is the operator by construction and client ids are caller-asserted, so a read-only role cannot be enforced"
+                .to_string(),
+        );
+    }
+    // One name, one role. `operators` bypasses every request policy and
+    // `admin_readers` is refused every proxied request; a name in both is a config
+    // whose author meant one of two opposite things. `pre_request_gate`
+    // resolves the overlap to the denial, but silently resolving it is how a
+    // typo becomes an outage or an unmetered key — so name it at boot.
+    if let Some(dup) = config
+        .admin_readers
+        .iter()
+        .find(|r| config.operators.contains(r))
+    {
+        return Err(format!(
+            "admin_readers: \"{dup}\" is also in operators — a client is either a read-only principal or an operator, never both"
+        ));
+    }
+
     if clients.is_empty() {
         return Ok(());
     }
@@ -284,6 +323,7 @@ fn validate_clients(config: &Config) -> Result<(), String> {
                 .map(|k| ("client_utilization_limits", k)),
         )
         .chain(config.operators.iter().map(|k| ("operators", k)))
+        .chain(config.admin_readers.iter().map(|k| ("admin_readers", k)))
         .chain(
             config
                 .response_cache
@@ -300,6 +340,24 @@ fn validate_clients(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// A day, the ceiling the proxy already puts on an upstream `retry-after`. A
+/// capacity 429 without one cools the account down for `now + cooldown`, and a
+/// value past what `Instant` can hold would panic that request instead.
+const MAX_RATE_LIMIT_COOLDOWN_SECS: u64 = 86_400;
+
+/// Reject a `rate_limit_cooldown_secs` that would be a no-op (0) or overflow
+/// `Instant` at the first capacity 429. A boot error, not a clamp, so the typo
+/// is seen.
+fn validate_rate_limit_cooldown(config: &Config) -> Result<(), String> {
+    let secs = config.rate_limit_cooldown_secs.unwrap_or(5);
+    if !(1..=MAX_RATE_LIMIT_COOLDOWN_SECS).contains(&secs) {
+        return Err(format!(
+            "config: rate_limit_cooldown_secs must be in 1..={MAX_RATE_LIMIT_COOLDOWN_SECS}, got {secs}"
+        ));
+    }
+    Ok(())
+}
+
 /// Startup exposure posture (LAB-1192): unauthenticated is a BOOT FAILURE,
 /// not a default. Same shape as `reject_legacy_config_keys` — a named error
 /// at startup instead of a silent misconfiguration in production, where an
@@ -312,7 +370,7 @@ fn validate_exposure(config: &Config) -> Result<(), String> {
         return Err(
             "config: no credentials configured — add [[clients]] entries (or legacy proxy_key), \
              or explicitly set allow_unauthenticated = true for a trusted-network-only deployment \
-             (see README §Authentication)"
+             (see README §Client Setup)"
                 .to_string(),
         );
     }
@@ -323,7 +381,7 @@ fn validate_exposure(config: &Config) -> Result<(), String> {
     if has_credentials && allow_unauthenticated {
         return Err(
             "config: allow_unauthenticated = true is incompatible with configured credentials — \
-             remove it, or remove [[clients]]/proxy_key (see README §Authentication)"
+             remove it, or remove [[clients]]/proxy_key (see README §Client Setup)"
                 .to_string(),
         );
     }
@@ -366,6 +424,12 @@ fn validate_exposure(config: &Config) -> Result<(), String> {
 ///
 /// `serde` silently drops unknown keys by default; this gives the operator
 /// a clear migration message instead of a silent misconfiguration.
+///
+/// The `admin_readers` arm also rejects a MISPLACED spelling, not just a
+/// removed one, because that drop fails OPEN: an empty `admin_readers` does
+/// not disable the read-only principal, it promotes it to an ordinary client
+/// with full proxy authority, and `validate_clients`' overlap and membership
+/// cross-checks never run for want of a name to check.
 fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
     let table = match value.as_table() {
         Some(t) => t,
@@ -389,6 +453,41 @@ fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
                 .to_string(),
         );
     }
+    // LAB-4395. Two ways to lose the read-only principal silently, both of
+    // which promote it rather than disable it (see this function's doc):
+    //   1. `readers` at the root — the pre-rename spelling, still the natural
+    //      guess for anyone working from the original ticket.
+    //   2. `admin_readers` (or `readers`) written under ANY table header —
+    //      TOML binds a bare key to the table above it, so appending the line
+    //      to the end of a config nests it. This is the likelier mistake: the
+    //      spelling is right and the file looks correct. The search walks
+    //      every depth rather than naming sections, because a hand-picked list
+    //      missed `[response_cache]` and `[clients.guard]`, whose structs also
+    //      drop unknown keys. No config struct has either field, so a hit is
+    //      always a misplacement; the name-keyed maps are skipped so a client
+    //      that happens to be called `readers` is not mistaken for one.
+    if table.contains_key("readers") {
+        return Err(
+            "config: `readers` is not a config key — the read-only principal list is `admin_readers` (see README §Config Reference)"
+                .to_string(),
+        );
+    }
+    for (section, value) in table {
+        if [
+            "client_names",
+            "client_budgets",
+            "client_utilization_limits",
+        ]
+        .contains(&section.as_str())
+        {
+            continue;
+        }
+        if let Some(at) = nested_reader_key(value, section) {
+            return Err(format!(
+                "config: `{at}` — `admin_readers` is a TOP-LEVEL key; a bare key after a table header binds to that table and is silently dropped. Move `admin_readers` above the first [section] or [[section]] header (see README §Config Reference)"
+            ));
+        }
+    }
     // LAB-1083: `proxy_key` is the legacy single shared secret, `[[clients]]`
     // its per-client replacement. Rejecting the combination rather than
     // precedence-ordering it is deliberate — a silent winner between two
@@ -396,11 +495,49 @@ fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
     // migration half-applied and the weaker one left in force.
     if table.contains_key("proxy_key") && table.contains_key("clients") {
         return Err(
-            "config: proxy_key and [[clients]] are mutually exclusive — [[clients]] supersedes it; remove proxy_key (see README §Authentication)"
+            "config: proxy_key and [[clients]] are mutually exclusive — [[clients]] supersedes it; remove proxy_key (see README §Client Setup)"
                 .to_string(),
         );
     }
     Ok(())
+}
+
+/// Path of the first `admin_readers` / `readers` key anywhere inside `value`,
+/// which is a root-level section named `path`. See `reject_legacy_config_keys`.
+fn nested_reader_key(value: &toml::Value, path: &str) -> Option<String> {
+    match value {
+        toml::Value::Table(t) => t.iter().find_map(|(k, v)| {
+            let here = format!("{path}.{k}");
+            if k == "admin_readers" || k == "readers" {
+                Some(here)
+            } else {
+                nested_reader_key(v, &here)
+            }
+        }),
+        toml::Value::Array(a) => a
+            .iter()
+            .enumerate()
+            .find_map(|(i, v)| nested_reader_key(v, &format!("{path}[{i}]"))),
+        _ => None,
+    }
+}
+
+/// The proxy's router. Shared with the integration tests so they exercise the
+/// production route table and middleware stack rather than a copy of it.
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/_stats", axum::routing::get(stats_handler))
+        .route("/metrics", axum::routing::get(metrics_handler))
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(openai_chat_handler),
+        )
+        .fallback(any(proxy_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_request_duration,
+        ))
+        .with_state(state)
 }
 
 #[tokio::main]
@@ -426,6 +563,9 @@ async fn main() {
         panic!("config: {msg}");
     }
     if let Err(msg) = validate_exposure(&config) {
+        panic!("{msg}");
+    }
+    if let Err(msg) = validate_rate_limit_cooldown(&config) {
         panic!("{msg}");
     }
 
@@ -515,14 +655,17 @@ async fn main() {
         );
     }
 
-    // Operators gate /_stats + /metrics under [[clients]] (LAB-1192 AC-4). An
-    // empty operators list there means NO principal can read them — a silent
-    // way to blind a monitoring scrape. Warn so the omission is visible.
-    if !config.clients.is_empty() && config.operators.is_empty() {
+    // Operators and admin readers gate /_stats + /metrics under [[clients]]
+    // (LAB-1192 AC-4, LAB-4395). Both lists empty there means NO principal can
+    // read them — a silent way to blind a monitoring scrape. Warn so the
+    // omission is visible.
+    if !config.clients.is_empty() && config.operators.is_empty() && config.admin_readers.is_empty()
+    {
         warn!(
-            "[[clients]] configured with an empty operators list — /_stats and /metrics will \
-             reject EVERY caller (403); name at least one client in operators or your \
-             monitoring scrape goes blind"
+            "[[clients]] configured with empty operators AND admin_readers lists — /_stats and \
+             /metrics will reject EVERY caller (403); name at least one client in admin_readers \
+             (read-only, the right role for a scrape) or operators, or your monitoring \
+             goes blind"
         );
     }
 
@@ -586,7 +729,7 @@ async fn main() {
             "per-client authentication enabled — x-client-id is ignored, identity comes from the credential"
         );
     } else if config.proxy_key.is_some() {
-        warn!("legacy shared proxy_key in use — every caller shares one identity; migrate to [[clients]] (see README §Authentication)");
+        warn!("legacy shared proxy_key in use — every caller shares one identity; migrate to [[clients]] (see README §Client Setup)");
     } else {
         // validate_exposure guarantees this state is only reachable with the
         // flag explicitly set (AC-2).
@@ -764,6 +907,7 @@ async fn main() {
         budget_usage: Mutex::new(HashMap::new()),
         client_utilization_limits: config.client_utilization_limits.clone(),
         operators: config.operators.clone(),
+        admin_readers: config.admin_readers.clone(),
         emergency_brake: config.emergency_brake.unwrap_or(true),
         emergency_threshold: config
             .emergency_threshold
@@ -796,6 +940,8 @@ async fn main() {
         body_read_timeout_total: AtomicU64::new(0),
         affinity_migrations: Default::default(),
         pool_exhausted: Default::default(),
+        request_durations: Mutex::new(HashMap::new()),
+        start_epoch: AppState::now_epoch(),
         sessions: Mutex::new(HashMap::new()),
         session_registry_max: config
             .session_registry_max
@@ -840,15 +986,7 @@ async fn main() {
     // Seed metric weights from restored state so gauges aren't zero on cold start.
     state.refresh_metrics_weights().await;
 
-    let app = Router::new()
-        .route("/_stats", axum::routing::get(stats_handler))
-        .route("/metrics", axum::routing::get(metrics_handler))
-        .route(
-            "/v1/chat/completions",
-            axum::routing::post(openai_chat_handler),
-        )
-        .fallback(any(proxy_handler))
-        .with_state(state.clone());
+    let app = build_router(state.clone());
 
     let addr: SocketAddr = config
         .listen

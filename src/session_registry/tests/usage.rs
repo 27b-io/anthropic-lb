@@ -187,7 +187,7 @@ async fn client_model_usage_is_bounded() {
             .record_usage(&state.endpoints[0], "c1", &format!("model-{i}"), &usage)
             .await;
     }
-    // Expert-panel finding (LAB-2330): rotating the caller-controlled client
+    // LAB-2330: rotating the caller-controlled client
     // id past the cap must NOT mint per-client overflow keys — the bound has
     // to hold on the client axis too.
     for i in 0..50 {

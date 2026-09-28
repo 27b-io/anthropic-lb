@@ -682,6 +682,120 @@ async fn load_state_warns_and_starts_clean_on_legacy_accounts_key() {
     );
 }
 
+/// Load a state file whose only endpoint carries `hard_limited_until_epoch`,
+/// and return the restored hard limit as seconds from the call's start.
+async fn restored_hard_limit_secs(until_epoch: u64) -> Option<u64> {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tmp.path(),
+        format!(
+            r#"{{"endpoints":[{{"name":"a","requests_total":0,"hard_limited_until_epoch":{until_epoch}}}],"saved_at":0}}"#
+        ),
+    )
+    .unwrap();
+    let mut state = test_state_with(vec![mk_endpoint("a", "sk-ant")]);
+    Arc::get_mut(&mut state).unwrap().state_path = tmp.path().to_path_buf();
+    let before = Instant::now();
+    state.load_state().await;
+    let info = state.endpoints[0].rate_info.read().await;
+    info.hard_limited_until.map(|t| (t - before).as_secs())
+}
+
+/// LAB-5682: a corrupt `u64::MAX` epoch must not overflow `Instant` and
+/// panic boot; it is clamped to the 24h ceiling like the Redis sync path.
+#[tokio::test]
+async fn load_state_clamps_u64_max_hard_limit() {
+    let secs = restored_hard_limit_secs(u64::MAX)
+        .await
+        .expect("hard limit applied");
+    assert!(secs <= 86_400, "u64::MAX must clamp to 24h, got {secs}s");
+}
+
+#[tokio::test]
+async fn load_state_clamps_hard_limit_beyond_24h() {
+    let secs = restored_hard_limit_secs(AppState::now_epoch() + 172_800)
+        .await
+        .expect("hard limit applied");
+    assert!(secs <= 86_400, "48h must clamp to 24h, got {secs}s");
+}
+
+#[tokio::test]
+async fn load_state_restores_hard_limit_within_ceiling() {
+    let secs = restored_hard_limit_secs(AppState::now_epoch() + 3600)
+        .await
+        .expect("hard limit applied");
+    assert!(
+        (3590..=3600).contains(&secs),
+        "expected ~3600s, got {secs}s"
+    );
+}
+
+#[tokio::test]
+async fn load_state_ignores_past_hard_limit() {
+    assert_eq!(
+        restored_hard_limit_secs(AppState::now_epoch() - 10).await,
+        None
+    );
+}
+
+/// LAB-5313: only a missing state file means a fresh start, and it keeps
+/// the INFO fresh-start line.
+#[tokio::test]
+async fn load_state_missing_file_logs_info_fresh_start() {
+    let buf = log_capture_buf();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.state.json");
+    let mut state = test_state_with(vec![]);
+    Arc::get_mut(&mut state).unwrap().state_path = path.clone();
+    state.load_state().await;
+
+    let marker = format!("path={}", path.display());
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let mine: Vec<&str> = output.lines().filter(|l| l.contains(&marker)).collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "expected one line for {marker}, got:\n{}",
+        mine.join("\n")
+    );
+    assert!(
+        mine[0].contains(" INFO ") && mine[0].contains("no persisted state found"),
+        "a missing state file must log the INFO fresh-start line, got: {}",
+        mine[0]
+    );
+}
+
+/// LAB-5313: a state file that exists but can't be read must not pass
+/// itself off as "no persisted state" — it warns with the path and the
+/// read error. Invalid UTF-8 gives a portable non-`NotFound` error;
+/// `chmod 000` doesn't fail when the tests run as root.
+#[tokio::test]
+async fn load_state_unreadable_file_warns_with_path_and_error() {
+    let buf = log_capture_buf();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), [0xff, 0xfe, 0xfd]).unwrap();
+    let mut state = test_state_with(vec![]);
+    Arc::get_mut(&mut state).unwrap().state_path = tmp.path().to_path_buf();
+    state.load_state().await;
+
+    let marker = format!("path={}", tmp.path().display());
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let mine: Vec<&str> = output.lines().filter(|l| l.contains(&marker)).collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "expected one line for {marker}, got:\n{}",
+        mine.join("\n")
+    );
+    assert!(
+        mine[0].contains(" WARN ")
+            && mine[0].contains("failed to read persisted state")
+            && mine[0].contains("error=stream did not contain valid UTF-8"),
+        "an unreadable state file must warn with the read error, got: {}",
+        mine[0]
+    );
+}
+
 #[tokio::test]
 async fn save_load_roundtrip_unified_endpoints() {
     let tmp = tempfile::NamedTempFile::new().unwrap();

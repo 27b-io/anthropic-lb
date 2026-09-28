@@ -12,10 +12,17 @@ fn model_unsupported_error_detection() {
     });
     assert!(is_model_unsupported_error(
         StatusCode::NOT_FOUND,
-        &anthropic_404
+        &anthropic_404,
+        Protocol::Anthropic,
+        "claude-nope-1"
     ));
     assert!(
-        !is_model_unsupported_error(StatusCode::INTERNAL_SERVER_ERROR, &anthropic_404),
+        !is_model_unsupported_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &anthropic_404,
+            Protocol::Anthropic,
+            "claude-nope-1"
+        ),
         "status gate: a 5xx is never a model rejection"
     );
 
@@ -24,7 +31,12 @@ fn model_unsupported_error_detection() {
         "error": {"type": "not_found_error", "message": "Not Found"}
     });
     assert!(
-        !is_model_unsupported_error(StatusCode::NOT_FOUND, &path_404),
+        !is_model_unsupported_error(
+            StatusCode::NOT_FOUND,
+            &path_404,
+            Protocol::Anthropic,
+            "claude-nope-1"
+        ),
         "URL-path 404 lacks the 'model:' prefix and must not match"
     );
 
@@ -37,7 +49,9 @@ fn model_unsupported_error_detection() {
     });
     assert!(is_model_unsupported_error(
         StatusCode::BAD_REQUEST,
-        &litellm_400
+        &litellm_400,
+        Protocol::OpenAI,
+        "claude-opus-5"
     ));
 
     let openai_code = serde_json::json!({
@@ -45,7 +59,9 @@ fn model_unsupported_error_detection() {
     });
     assert!(is_model_unsupported_error(
         StatusCode::NOT_FOUND,
-        &openai_code
+        &openai_code,
+        Protocol::OpenAI,
+        "x"
     ));
 
     let too_long = serde_json::json!({
@@ -53,9 +69,51 @@ fn model_unsupported_error_detection() {
         "error": {"type": "invalid_request_error", "message": "prompt is too long: 210000 tokens > 200000 maximum"}
     });
     assert!(
-        !is_model_unsupported_error(StatusCode::BAD_REQUEST, &too_long),
+        !is_model_unsupported_error(
+            StatusCode::BAD_REQUEST,
+            &too_long,
+            Protocol::Anthropic,
+            "claude-opus-5"
+        ),
         "prompt-too-long 400 must not be treated as a model rejection"
     );
+
+    // LAB-5235: on an Anthropic endpoint the free-text phrase is client-seedable
+    // — Anthropic echoes an unknown top-level field name into its 400. Only the
+    // structured arms may count there.
+    let echoed_field = serde_json::json!({
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": "invalid model name: Extra inputs are not permitted"}
+    });
+    assert!(
+        !is_model_unsupported_error(
+            StatusCode::BAD_REQUEST,
+            &echoed_field,
+            Protocol::Anthropic,
+            "claude-opus-5"
+        ),
+        "an echoed client field name must not read as a model rejection on an Anthropic endpoint"
+    );
+    assert!(
+        !is_model_unsupported_error(
+            StatusCode::BAD_REQUEST,
+            &litellm_400,
+            Protocol::Anthropic,
+            "claude-opus-5"
+        ),
+        "the free-text arm belongs to OpenAI-protocol gateways only"
+    );
+    for protocol in [Protocol::Anthropic, Protocol::OpenAI] {
+        assert!(
+            is_model_unsupported_error(
+                StatusCode::NOT_FOUND,
+                &anthropic_404,
+                protocol,
+                "claude-nope-1"
+            ) && is_model_unsupported_error(StatusCode::NOT_FOUND, &openai_code, protocol, "x"),
+            "structured arms match on every protocol ({protocol:?})"
+        );
+    }
 }
 
 /// The negative cache removes the (endpoint, model) pair from routing — for
@@ -321,4 +379,336 @@ async fn gateway_invalid_model_rotates_to_serving_account() {
         1,
         "the second request must skip the gateway for this model"
     );
+}
+
+/// LAB-5235: Anthropic's 400 for an unknown top-level field, where the field
+/// is literally named "invalid model name" — the phrase the LiteLLM arm keys on.
+const HEAD_400_ECHOED_FIELD: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"invalid model name: Extra inputs are not permitted\"}}";
+
+/// Two Anthropic endpoints: `echo` (tried first) always answers with the
+/// echoed-field 400, `other` would serve. Returns the state (to inspect the
+/// negative cache), the proxy address and both hit counters.
+async fn echoed_field_endpoints() -> (
+    Arc<AppState>,
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (echo_url, echo_hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_400_ECHOED_FIELD, b"{}").await;
+    let (other_url, other_hits) = spawn_status_then_ok_upstream(0, "", b"{}").await;
+    let echo = mk_endpoint_at("echo", "sk-ant-api-e", &echo_url);
+    let mut other = mk_endpoint_at("other", "sk-ant-api-x", &other_url);
+    other.priority = 1;
+    let state = test_state_with(vec![echo, other]);
+    let addr = serve(build_router(state.clone())).await;
+    (state, addr, echo_hits, other_hits)
+}
+
+/// LAB-5235 native path: the echoed-field 400 is the client's own malformed
+/// request. It must reach that client as-is — no negative-cache entry (which
+/// would deny the model to every other client), no rotation.
+#[tokio::test]
+async fn echoed_field_name_400_does_not_negative_cache_native() {
+    use std::sync::atomic::Ordering;
+    let (state, addr, echo_hits, other_hits) = echoed_field_endpoints().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"invalid model name":1}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "the client's own 400 must be forwarded, not rotated away"
+    );
+    assert_eq!(
+        echo_hits.load(Ordering::SeqCst),
+        1,
+        "the request must reach the echoing account exactly once"
+    );
+    assert_eq!(
+        other_hits.load(Ordering::SeqCst),
+        0,
+        "an echoed field name must not rotate the request"
+    );
+    assert!(
+        state.unsupported_models.lock().unwrap().is_empty(),
+        "an echoed field name must not negative-cache the model"
+    );
+}
+
+/// LAB-5235 OpenAI-compat path: `/v1/chat/completions` forwards to the same
+/// Anthropic accounts, so the same echoed-field 400 must not learn or rotate.
+///
+/// The mock answers with the echo whatever the body, and the request carries
+/// no extra key: the translation copies known fields only, so a client key
+/// cannot reach the account here. This pins the classifier's verdict at this
+/// call site, not the attack's reachability.
+#[tokio::test]
+async fn echoed_field_name_400_does_not_negative_cache_openai_compat() {
+    use std::sync::atomic::Ordering;
+    let (state, addr, echo_hits, other_hits) = echoed_field_endpoints().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "the client's own 400 must be forwarded, not rotated away"
+    );
+    assert_eq!(
+        echo_hits.load(Ordering::SeqCst),
+        1,
+        "the request must reach the echoing account exactly once"
+    );
+    assert_eq!(
+        other_hits.load(Ordering::SeqCst),
+        0,
+        "an echoed field name must not rotate the request"
+    );
+    assert!(
+        state.unsupported_models.lock().unwrap().is_empty(),
+        "an echoed field name must not negative-cache the model"
+    );
+}
+
+// ── The echo veto and the anchored gateway arm ──
+
+/// Every forward path classifies through `classify_rejection`. An error
+/// message that starts with one of the request's own top-level keys is the
+/// client's own error, whatever a classifier would read into it; the genuine
+/// signals, `model: <id>` included, still classify.
+#[test]
+fn classify_rejection_vetoes_echoed_request_keys_only() {
+    let err =
+        |ty: &str, msg: &str| serde_json::json!({"type":"error","error":{"type":ty,"message":msg}});
+    let body = |extra: &str| {
+        format!(
+            r#"{{"model":"claude-opus-5","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]{extra}}}"#
+        )
+    };
+    let plain = body("");
+    let entitlement = err(
+        "invalid_request_error",
+        "You're out of extra usage. Ask your workspace admin to add more so you can keep going.",
+    );
+    let litellm = serde_json::json!({"error":{"message":"/chat/completions: Invalid model name passed in model=claude-opus-5. Call `/v1/models` to view available models for your key.","type":"invalid_request_error","param":null,"code":"400"}});
+    let genuine: [(
+        &str,
+        StatusCode,
+        serde_json::Value,
+        Protocol,
+        UpstreamRejection,
+    ); 4] = [
+        (
+            "the Anthropic model 404, whose prefix is the request's own `model` key",
+            StatusCode::NOT_FOUND,
+            err("not_found_error", "model: claude-opus-5"),
+            Protocol::Anthropic,
+            UpstreamRejection::ModelUnsupported,
+        ),
+        (
+            "the OpenAI model_not_found code",
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error":{"message":"The model `claude-opus-5` does not exist","type":"invalid_request_error","code":"model_not_found"}}),
+            Protocol::OpenAI,
+            UpstreamRejection::ModelUnsupported,
+        ),
+        (
+            "the gateway's own invalid-model 400",
+            StatusCode::BAD_REQUEST,
+            litellm.clone(),
+            Protocol::OpenAI,
+            UpstreamRejection::ModelUnsupported,
+        ),
+        (
+            "the extra-usage 400",
+            StatusCode::BAD_REQUEST,
+            entitlement.clone(),
+            Protocol::Anthropic,
+            UpstreamRejection::Entitlement,
+        ),
+    ];
+    for (why, status, e, protocol, want) in genuine {
+        assert_eq!(
+            classify_rejection(status, &e, protocol, "claude-opus-5", plain.as_bytes()),
+            Some(want),
+            "{why} must still classify"
+        );
+    }
+    // A bodiless request has no key to echo; the verdict stands.
+    assert_eq!(
+        classify_rejection(
+            StatusCode::BAD_REQUEST,
+            &entitlement,
+            Protocol::Anthropic,
+            "",
+            b""
+        ),
+        Some(UpstreamRejection::Entitlement)
+    );
+
+    let echoes: [(&str, &str, serde_json::Value, Protocol); 5] = [
+        (
+            "a key named with the entitlement anchor",
+            r#","You're out of extra usage":1"#,
+            err(
+                "invalid_request_error",
+                "You're out of extra usage: Extra inputs are not permitted",
+            ),
+            Protocol::Anthropic,
+        ),
+        (
+            "the same key past a tightened anchor",
+            r#","You're out of extra usage. x":1"#,
+            err(
+                "invalid_request_error",
+                "You're out of extra usage. x: Extra inputs are not permitted",
+            ),
+            Protocol::Anthropic,
+        ),
+        (
+            "a key that spells the gateway's own rejection",
+            r#","/x: Invalid model name passed in model=claude-opus-5.":1"#,
+            serde_json::json!({"error":{"message":"/x: Invalid model name passed in model=claude-opus-5.: Extra inputs are not permitted"}}),
+            Protocol::OpenAI,
+        ),
+        (
+            "a key whose name contains a colon",
+            r#","You're out of extra usage: yes":1"#,
+            err(
+                "invalid_request_error",
+                "You're out of extra usage: yes: Extra inputs are not permitted",
+            ),
+            Protocol::Anthropic,
+        ),
+        (
+            "a duplicated key",
+            r#","You're out of extra usage":1,"You're out of extra usage":2"#,
+            err(
+                "invalid_request_error",
+                "You're out of extra usage: Extra inputs are not permitted",
+            ),
+            Protocol::Anthropic,
+        ),
+    ];
+    for (why, extra, e, protocol) in echoes {
+        let sent = body(extra);
+        assert_eq!(
+            classify_rejection(
+                StatusCode::BAD_REQUEST,
+                &e,
+                protocol,
+                "claude-opus-5",
+                sent.as_bytes()
+            ),
+            None,
+            "{why}: the echo is the client's own error"
+        );
+    }
+    // A body that does not parse cannot rule an echo out, so it forwards.
+    assert_eq!(
+        classify_rejection(
+            StatusCode::BAD_REQUEST,
+            &entitlement,
+            Protocol::Anthropic,
+            "claude-opus-5",
+            br#"{"model":"claude-opus-5","#
+        ),
+        None
+    );
+}
+
+/// The gateway arm matches its own framing only, at the start of the message
+/// and naming the model the request asked for. Provider errors the gateway
+/// relays sit later in the same field and can echo client-chosen keys.
+#[test]
+fn gateway_model_arm_is_anchored_and_bound_to_requested_model() {
+    let msg = |m: &str| serde_json::json!({"error":{"message":m,"type":"invalid_request_error","code":"400"}});
+    let hit = |m: &str, model: &str| {
+        is_model_unsupported_error(StatusCode::BAD_REQUEST, &msg(m), Protocol::OpenAI, model)
+    };
+    let own = "/chat/completions: Invalid model name passed in model=claude-opus-5. Call `/v1/models` to view available models for your key.";
+    assert!(hit(own, "claude-opus-5"));
+    assert!(
+        !hit(own, "claude-opus-4"),
+        "a rejection naming another model must not mark the requested one"
+    );
+    assert!(
+        !hit(own, "claude-opus-5-1"),
+        "the bound model must be the whole id, not a prefix of it"
+    );
+    for relayed in [
+        r#"litellm.BadRequestError: AnthropicException - {"type":"error","error":{"type":"invalid_request_error","message":"Invalid model name passed in model=claude-opus-5.: Extra inputs are not permitted"}}"#,
+        "litellm.BadRequestError: OpenAIException - Unrecognized request argument supplied: /chat/completions: Invalid model name passed in model=claude-opus-5.",
+        "Invalid model name passed in model=claude-opus-5. no route prefix",
+    ] {
+        assert!(!hit(relayed, "claude-opus-5"), "must not match: {relayed}");
+    }
+}
+
+/// End to end on an OpenAI-protocol endpoint: a gateway 400 made of the
+/// client's own key neither learns nor rotates, whether the key comes back at
+/// the start of the message (the echo veto) or relayed mid-message (the
+/// anchored arm). The healthy account would serve if the request rotated.
+#[tokio::test]
+async fn gateway_echo_of_client_key_does_not_negative_cache() {
+    use std::sync::atomic::Ordering;
+    const HEAD_START_ECHO: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"/x: Invalid model name passed in model=claude-opus-5.: Extra inputs are not permitted\",\"type\":\"invalid_request_error\",\"code\":\"400\"}}";
+    const HEAD_RELAYED_ECHO: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"litellm.BadRequestError: AnthropicException - {\\\"type\\\":\\\"error\\\",\\\"error\\\":{\\\"type\\\":\\\"invalid_request_error\\\",\\\"message\\\":\\\"Invalid model name passed in model=claude-opus-5.: Extra inputs are not permitted\\\"}}\",\"type\":\"invalid_request_error\",\"code\":\"400\"}}";
+    for (kind, head, key) in [
+        (
+            "echo at the start",
+            HEAD_START_ECHO,
+            "/x: Invalid model name passed in model=claude-opus-5.",
+        ),
+        (
+            "echo relayed mid-message",
+            HEAD_RELAYED_ECHO,
+            "Invalid model name passed in model=claude-opus-5.",
+        ),
+    ] {
+        let (gw_url, gw_hits) =
+            spawn_status_then_ok_upstream(usize::MAX, head, OPENAI_OK_BODY).await;
+        let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+        let mut gw = make_endpoint("gw", Protocol::OpenAI);
+        gw.base_url = gw_url;
+        let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+        healthy.priority = 1;
+        let state = test_state_with(vec![gw, healthy]);
+        let addr = serve(build_router(state.clone())).await;
+        let mut req = serde_json::json!({"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]});
+        req[key] = serde_json::json!(1);
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(req.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{kind}: the client's own 400 must be forwarded"
+        );
+        assert_eq!(
+            (
+                gw_hits.load(Ordering::SeqCst),
+                ok_hits.load(Ordering::SeqCst)
+            ),
+            (1, 0),
+            "{kind}: the request must not rotate"
+        );
+        assert!(
+            state.unsupported_models.lock().unwrap().is_empty(),
+            "{kind}: the model must not be negative-cached"
+        );
+    }
 }

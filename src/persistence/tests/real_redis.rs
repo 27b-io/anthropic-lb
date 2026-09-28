@@ -57,6 +57,8 @@ mod redis_integration {
         BackendDownAtStartup = 14,
         LostIncrbyRevival = 15,
         SeedBudgetMirror = 16,
+        TransportErrorsExpireDenied = 17,
+        TransportErrorsHincrbyRejected = 18,
     }
 
     impl Db {
@@ -1276,6 +1278,91 @@ mod redis_integration {
             state.lock_transport_errors().get("reset"),
             Some(&4),
             "failed flush must re-queue drained deltas for the next tick"
+        );
+    }
+
+    /// A persistent failure in a command that carries no counts (here
+    /// `EXPIRE`, denied by ACL) must not re-send `HINCRBY`s Redis already
+    /// applied: the hash holds exactly the failures that happened, however
+    /// many ticks the fault lasts.
+    #[tokio::test]
+    async fn flush_transport_errors_does_not_resend_applied_counts_when_expire_fails() {
+        let Some((mut conn, _)) = redis_test_conn(Db::TransportErrorsExpireDenied).await else {
+            return;
+        };
+        let base = test_redis_url().expect("backend url");
+        let user = format!("alb-expire-denied-{}", std::process::id());
+        let created: redis::RedisResult<()> = redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg(&user)
+            .arg(&["reset", "on", "nopass", "~*", "&*", "+@all", "-expire"])
+            .query_async(&mut conn)
+            .await;
+        created.unwrap_or_else(|e| panic!("ACL SETUSER failed: {e}"));
+        let url = Db::TransportErrorsExpireDenied.url(&base).replacen(
+            "redis://",
+            &format!("redis://{user}:unused@"),
+            1,
+        );
+        let state = state_with_redis(vec![], fred_test_client(&url).await);
+        state.lock_transport_errors().insert("connect", 2);
+        for _ in 0..3 {
+            state.flush_transport_errors().await;
+        }
+        let deleted: redis::RedisResult<()> = redis::cmd("ACL")
+            .arg("DELUSER")
+            .arg(&user)
+            .query_async(&mut conn)
+            .await;
+        deleted.unwrap_or_else(|e| panic!("ACL DELUSER failed: {e}"));
+
+        let map: HashMap<String, u64> = conn.hgetall(TRANSPORT_ERRORS_KEY).await.unwrap();
+        assert_eq!(
+            map.get("connect"),
+            Some(&2),
+            "an EXPIRE failure must not re-send HINCRBYs Redis applied"
+        );
+        assert_eq!(
+            state.lock_transport_errors().get("connect"),
+            None,
+            "an applied kind must not be re-queued locally"
+        );
+    }
+
+    /// A kind whose own `HINCRBY` Redis rejects (a non-integer field) is
+    /// re-queued locally; a kind in the same flush whose `HINCRBY` applied is
+    /// not re-sent.
+    #[tokio::test]
+    async fn flush_transport_errors_requeues_only_rejected_kinds() {
+        let Some((mut conn, fred)) = redis_test_conn(Db::TransportErrorsHincrbyRejected).await
+        else {
+            return;
+        };
+        let _: () = conn
+            .hset(TRANSPORT_ERRORS_KEY, "timeout", "not-a-number")
+            .await
+            .unwrap();
+        let state = state_with_redis(vec![], fred);
+        {
+            let mut m = state.lock_transport_errors();
+            m.insert("connect", 2);
+            m.insert("timeout", 3);
+        }
+        state.flush_transport_errors().await;
+        state.flush_transport_errors().await;
+
+        let connect: Option<u64> = conn.hget(TRANSPORT_ERRORS_KEY, "connect").await.unwrap();
+        assert_eq!(connect, Some(2), "an applied kind must not be re-sent");
+        let m = state.lock_transport_errors();
+        assert_eq!(
+            m.get("timeout"),
+            Some(&3),
+            "a rejected kind must be re-queued"
+        );
+        assert_eq!(
+            m.get("connect"),
+            None,
+            "an applied kind must not be re-queued"
         );
     }
 

@@ -411,6 +411,11 @@ async fn metrics_prefer_redis_transport_error_aggregate() {
     assert!(
         !m.contains("anthropic_upstream_transport_errors_total{kind=\"timeout\"} 2"),
         "local delta must not leak once the fleet aggregate is present:\n{m}"
+    ); // LAB-4379: the gauge the HELP text names as the scope switch must read 1
+       // whenever the fleet total is what is exported.
+    assert!(
+        m.contains("anthropic_cluster_redis_connected 1"),
+        "fleet scope must be advertised by the gauge:\n{m}"
     );
 }
 
