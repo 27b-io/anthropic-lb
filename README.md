@@ -150,6 +150,8 @@ probe_interval_secs = 300
 # redis_url = "redis://redis.example.com:6379"
 
 # IP-to-client-name mapping (optional, fallback when no X-Client-ID header)
+# Values must be non-empty, trimmed, and not a reserved name ("-", "_operator",
+# "_other") — rejected at startup.
 # [client_names]
 # "192.0.2.10" = "alice-desktop"
 # "192.0.2.11" = "bob-laptop"
@@ -170,7 +172,7 @@ token = "sk-ant-api03-..."
 | Field | Type | Default | Description |
 |:------|:-----|:--------|:------------|
 | `listen` | `String` | — | Bind address (e.g. `"127.0.0.1:8082"`) |
-| `rate_limit_cooldown_secs` | `u64` | `5` | Fallback cooldown after a capacity 429 when upstream sends no usable `retry-after` (burst 429s use their own 5→60s backoff) |
+| `rate_limit_cooldown_secs` | `u64` | `5` | Fallback cooldown after a capacity 429 when upstream sends no usable `retry-after` (burst 429s use their own 5→60s backoff). Must be `1..=86400`; a value outside it is rejected at startup |
 | `probe_interval_secs` | `u64` | `300` | Seconds between utilization probes (0 = disabled) |
 | `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id` |
 | `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`) |
@@ -244,6 +246,10 @@ token = "sk-ant-oat01-..."
 ```
 
 When a request specifies a model, only accounts whose `models` list matches (exact or prefix wildcard) are considered. Accounts with an empty `models` list serve all models.
+A server-side refusal fallback (`fallbacks`) could be served by a model this
+list does not name, so when the chosen endpoint or the client (see
+`[[clients]]` below) has a non-empty `models` list, the proxy strips the
+top-level `fallbacks` field and a refusal is returned as a refusal.
 
 ---
 
@@ -406,6 +412,7 @@ can steer are locked down by default:
   - `context-management-*` ↔ top-level `context_management`
   - `fast-mode-*` ↔ top-level `speed: "fast"`
   - `dangerous-tool-use-*` + `auto-mode-classifier-*` ↔ top-level `safeguards`
+  - `server-side-fallback-*` ↔ top-level `fallbacks`
   - *(nested)* `mid-conversation-tool-changes-*`, `per-turn-control-*`,
     `timing-*` ↔ `tool_addition`/`tool_removal` blocks and
     `output_config.effort`/`timing` on the `role: "system"` entry in `messages`
@@ -440,6 +447,23 @@ can steer are locked down by default:
   (`extended-cache-ttl-*` → `cache_control.ttl`, and the per-turn family's
   fields inside `messages`) are out of scope — they are on the default
   allow-list and so are never dropped.
+- **Fast mode routes around non-entitled orgs.** Fast mode is an
+  org-level entitlement, and a pool can span several Anthropic orgs. When an
+  account answers a `speed: "fast"` request with the upstream `400` "Fast
+  mode is not enabled for your organization", the proxy rotates that request
+  to another account and marks the endpoint fast-mode-disabled for 15
+  minutes (`anthropic_fast_mode_disabled_total{account}` on `/metrics`,
+  `fast_mode_disabled_remaining_secs` on `/_stats`). Later fast requests skip
+  it — a client pinned to it via `preferred_endpoints` spills to the general
+  pool — while requests without `speed: "fast"` keep using it. The proxy
+  never strips `speed` to get around a non-entitled org: if no eligible
+  account is entitled, the client gets a `400` with the upstream's error type
+  and message rather than a silent downgrade or a synthetic `429`. The first
+  such request gets the upstream response itself; while the marks last, the
+  proxy answers with the same type and message and no upstream headers. A
+  `passthrough` endpoint is never marked: it sends the caller's own
+  credential, so its `400` is about the caller's org and reaches that caller
+  unchanged.
 - **A fast-mode `429` is forwarded to the caller, not treated as account
   exhaustion.** Fast mode (`speed: "fast"`) bills against its own rate bucket,
   separate from the account's 5h/7d windows, so a `429` on a fast request does
@@ -634,7 +658,7 @@ per-client counters.
 All endpoints are gated by `[[clients]]` (or legacy `proxy_key`) and
 `allowed_ips`. `/_stats` and `/metrics` are **operator- and reader-scoped**: under
 `[[clients]]` they require a credential whose name is in `operators` or `admin_readers`
-(401 unauthenticated / 403 non-operator — see §Security).
+(401 unauthenticated / 403 for any other client — see §Security).
 
 ### Session context-window visibility
 
@@ -667,14 +691,21 @@ The 400 itself is forwarded to the client unchanged.
 
 Requests rejected by a client's model allow-list are counted as
 `anthropic_client_model_denied_total{client,model}` and logged at WARN. The
-`model` label is caller-controlled, so the label set is bounded — overflow
-past 64 distinct pairs lumps into a single global
-`client="_other",model="_other"` bucket (hard bound: 64 + 1 series).
-`_other` is a reserved client name: config validation rejects a
-`[[clients]]` entry or `client_names` value named `_other`, and a legacy
-`x-client-id: _other` header is ignored, so real traffic can never
-pre-claim the overflow key. `anthropic_client_model_token_usage_total`
-shares the same overflow scheme (bucket at 256 + 1 series).
+`model` label is caller-controlled, so the label set is bounded — past 64
+distinct pairs a denial for a NEW (client, model) pair lumps into that
+client's `client="<name>",model="_other"` bucket, so attribution and the
+first-overflow WARN survive; already-tracked pairs keep counting on their own
+series (hard bound: 64 + number of `[[clients]]` + 1 series). `_other`
+is a reserved client name: config validation rejects a `[[clients]]` entry or
+`client_names` value named `_other`, and a legacy `x-client-id: _other`
+header is ignored, so real traffic can never pre-claim the global bucket. A
+denied model named `_other`, `__other`, … gets one extra leading `_` in its
+label (`_other` is labelled `model="__other"`), so it cannot pre-claim a
+client's bucket or share a series with another model.
+`anthropic_client_model_token_usage_total` instead uses one global
+`client="_other",model="_other"` bucket, because its client id can be
+header-asserted under legacy auth (bounded at 256 + 1 distinct (client,
+model) pairs).
 
 ### Per-claim rate-limit visibility
 
@@ -768,16 +799,30 @@ every such replica reports the same value. Aggregate those with `max`, since
 replica reports its own count: without Redis, before its first sync, or while
 Redis is unreachable. Aggregate those with `sum`. Without Redis the count is
 every failure the replica has seen. With Redis it is the failures still to be
-flushed, and flushing is at-least-once: a batch whose Redis write fails is kept
-and sent again even if part of it was applied, so some of those failures can
-already be in the fleet total. During a partial outage, the `max` over connected
-replicas plus the `sum` over the rest is therefore an estimate that can
-over-count, not an exact total.
+flushed. A flush reads Redis's reply to each command, so a count Redis applied
+is never sent again, and a count Redis rejected is kept for the next flush. Only
+when no reply arrives at all (a dropped connection or a timeout) is the whole
+batch kept and sent again, so after a lost reply some of those failures can
+already be in the fleet total. It can also under-count: if Redis rejects writes
+but still serves reads, the gauge stays `1` and that replica's kept failures
+appear in neither term. During a partial outage, the `max` over connected
+replicas plus the `sum` over the rest is therefore an estimate, not an exact
+total.
 
 A replica that changes scope also steps its series between the fleet total and
 its local count, which `rate()` and `increase()` read as a counter reset or a
-burst of new failures. Take rates from the fleet total (for example a recording
-rule over the `max` where the gauge is `1`), not from raw per-replica series.
+burst of new failures. Connected replicas also read the fleet total on their own
+5-second ticks, so a `max` taken before `rate()` falls back to an older reading
+when the freshest replica drops out, and `rate()` reads that as a reset too.
+Keep only fleet-scope readings, take the rate per replica, then take the `max`:
+
+```promql
+max by (kind) (
+  rate((anthropic_upstream_transport_errors_total
+    and on(instance) anthropic_cluster_redis_connected == 1)[5m:])
+)
+```
+
 The HELP text states the scopes on the scrape.
 
 ### OpenAI JSON-mode compatibility

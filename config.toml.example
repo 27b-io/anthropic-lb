@@ -147,6 +147,7 @@ probe_interval_secs = 300
 # downgrade:
 #   fast-mode-*                                  <-> top-level speed: "fast"
 #   dangerous-tool-use-* + auto-mode-classifier-* <-> top-level safeguards
+#   server-side-fallback-*                       <-> top-level fallbacks
 #   mid-conversation-tool-changes-* / per-turn-control-* / timing-*
 #       <-> tool_addition/tool_removal blocks and output_config.effort/timing
 #           on the role:"system" entry in messages

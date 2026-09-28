@@ -181,10 +181,9 @@ pub(crate) const TAU_1H: f64 = 3600.0;
 pub(crate) const MAX_TRACKED_CLIENTS: usize = 10_000;
 
 /// Cap on distinct (client, model) labels in the allowlist-denial counter.
-/// The model half is caller-controlled, and under legacy auth the client
-/// half is too (`x-client-id`), so overflow lumps into a single global
-/// ("_other", "_other") bucket — a HARD bound of cap + 1 entries (LAB-2332,
-/// mirroring the LAB-2330 fix to `client_model_usage`).
+/// The model half is caller-controlled; the client half is config-bounded,
+/// so the hard bound is cap + configured clients + 1 — see
+/// `AppState::note_model_denied` for the scheme (LAB-2332, LAB-4028).
 pub(crate) const MAX_MODEL_DENIED_LABELS: usize = 64;
 
 /// Cap on distinct clients in the pre-request-gate rejection counter
@@ -502,6 +501,9 @@ pub(crate) struct Endpoint {
     /// here (Pro plan) → Fable requests demote this endpoint by `overage_penalty`.
     pub(crate) fable_included: bool,
     pub(crate) requests: AtomicU64,
+    /// `anthropic_fast_mode_disabled_total`: upstream "Fast mode is not
+    /// enabled for your organization" 400s this account returned (LAB-2687).
+    pub(crate) fast_mode_disabled_total: AtomicU64,
     pub(crate) rate_info: RwLock<RateLimitInfo>,
     pub(crate) burn_rate: Mutex<BurnRate>,
     pub(crate) input_tokens: AtomicU64,
@@ -735,12 +737,8 @@ pub(crate) struct AppState {
     /// `fast_mode_429`.
     pub(crate) entitlement_400: Mutex<HashMap<String, u64>>,
     /// Per-client model-allowlist denials, keyed (client, model) (LAB-1083).
-    /// Exposed as `anthropic_client_model_denied_total`. Under `[[clients]]`
-    /// auth `client` is a credential-bound principal, but under legacy
-    /// `proxy_key` / `allow_unauthenticated` it comes from the
-    /// caller-controlled `x-client-id` header — so overflow lumps into a
-    /// single global ("_other", "_other") bucket, hard-bounding the map at
-    /// `MAX_MODEL_DENIED_LABELS` + 1 entries (LAB-2332).
+    /// Exposed as `anthropic_client_model_denied_total`. Cardinality is
+    /// hard-bounded — `note_model_denied` documents the scheme.
     pub(crate) model_denied: Mutex<HashMap<(String, String), u64>>,
     /// Pre-request-gate 429 rejections, keyed (client, reason) (LAB-2551).
     /// Exposed as `anthropic_client_rejections_total`. `reason` is the closed
@@ -758,6 +756,13 @@ pub(crate) struct AppState {
     /// mutex, never held across `.await`; bounded by UNSUPPORTED_MODEL_MAX
     /// + TTL eviction. Per-replica: a fresh replica re-learns in one attempt.
     pub(crate) unsupported_models: Mutex<HashMap<(usize, String), Instant>>,
+    /// Endpoint idx → expiry for accounts whose org has fast mode disabled,
+    /// learned from the upstream's own 400 (LAB-2687). Only `speed: "fast"`
+    /// requests skip them. Kept apart from `unsupported_models` so a client
+    /// spraying junk model names can't fill that cap and starve this learn;
+    /// keyed by endpoint index, so bounded by config. Sync mutex, never held
+    /// across `.await`; per-replica like `unsupported_models`.
+    pub(crate) fast_mode_disabled: Mutex<HashMap<usize, Instant>>,
     /// Opt-in encrypted response cache on non-streaming /v1/messages
     /// (LAB-933). None = feature off — the no-config case is byte-identical
     /// to pre-cache behaviour (AC1).

@@ -47,6 +47,14 @@ pub(crate) fn build_openai_fallback_body(body_bytes: &[u8]) -> FallbackBody {
     }
 }
 
+/// An OpenAI SSE `data:` payload carrying a top-level in-band error. Non-null
+/// only, as in the O→A translator: some upstreams send `"error": null` in
+/// healthy chunks.
+fn is_inband_openai_error(payload: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .is_ok_and(|v| v.get("error").is_some_and(|e| !e.is_null()))
+}
+
 /// Forward a request to a `Protocol::OpenAI` endpoint. Callers hand over the
 /// final wire body: `proxy_handler` pre-translates via
 /// `build_openai_fallback_body` and sets `translate = true` so the *response*
@@ -190,9 +198,13 @@ pub(crate) async fn try_fallback_upstream(
         // misleading "your request is invalid" 400 — the model is fine, this
         // endpoint just doesn't serve it (LAB-941, observed 2026-07-27 when a
         // 529 storm drained the Anthropic pool into insight-gateway).
-        let model_unsupported = serde_json::from_str::<serde_json::Value>(&err_body)
-            .map(|v| is_model_unsupported_error(status, &v, ep.protocol))
-            .unwrap_or(false);
+        // Only the model rejection: this path has never re-sent on an
+        // entitlement 400.
+        let model_unsupported =
+            serde_json::from_str::<serde_json::Value>(&err_body).is_ok_and(|v| {
+                classify_rejection(status, &v, ep.protocol, model, request_body)
+                    == Some(UpstreamRejection::ModelUnsupported)
+            });
         let response = if translate {
             // Return error in Anthropic format
             Response::builder()
@@ -222,7 +234,7 @@ pub(crate) async fn try_fallback_upstream(
         };
         if model_unsupported {
             state.note_model_unsupported(&ep.name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
+            return ForwardOutcome::RetryRejectedByAccount(Box::new(response));
         }
         return ForwardOutcome::Done(Box::new(response));
     }
@@ -239,9 +251,10 @@ pub(crate) async fn try_fallback_upstream(
             // `ctx.terminal` serves both branches. Translate: `completed` by
             // the translator, `errored` by the translator (in-band error) or
             // this loop (transport Err / end-of-stream guard). Passthrough:
-            // `completed` is set below when upstream's `[DONE]` has been
-            // forwarded verbatim, so an error frame on the next read doesn't
-            // ship a second `[DONE]` and break strict OpenAI parsers.
+            // `completed` / `errored` are set below when upstream's `[DONE]`
+            // / in-band `{"error": …}` line has been forwarded verbatim, so
+            // an error frame on the next read doesn't ship a second
+            // terminator, and the stream logs as failed after an error.
             let mut ctx = ReverseStreamContext::default();
             let mut client_gone = false;
             // Carries any partial trailing SSE line between chunks so the
@@ -281,7 +294,7 @@ pub(crate) async fn try_fallback_upstream(
                                 }
                             }
                         } else {
-                            if !ctx.terminal.completed {
+                            if !ctx.terminal.reached() {
                                 done_scan_tail.extend_from_slice(&chunk);
                                 while let Some(nl) = done_scan_tail.iter().position(|&b| b == b'\n')
                                 {
@@ -290,16 +303,18 @@ pub(crate) async fn try_fallback_upstream(
                                     } else {
                                         nl
                                     };
-                                    let is_done_marker = if let Some(payload) =
-                                        done_scan_tail[..line_end].strip_prefix(b"data:")
-                                    {
-                                        payload.trim_ascii() == b"[DONE]"
-                                    } else {
-                                        false
-                                    };
-                                    done_scan_tail.drain(..=nl);
-                                    if is_done_marker {
+                                    let payload = done_scan_tail[..line_end]
+                                        .strip_prefix(b"data:")
+                                        .map(<[u8]>::trim_ascii);
+                                    if payload == Some(b"[DONE]".as_slice()) {
                                         ctx.terminal.completed = true;
+                                    } else if payload.is_some_and(is_inband_openai_error) {
+                                        // The upstream's own error line is
+                                        // the terminator (LAB-6017).
+                                        ctx.terminal.errored = true;
+                                    }
+                                    done_scan_tail.drain(..=nl);
+                                    if ctx.terminal.reached() {
                                         done_scan_tail.clear();
                                         break;
                                     }
@@ -309,7 +324,10 @@ pub(crate) async fn try_fallback_upstream(
                                 client_gone = true;
                             }
                         }
-                        if client_gone || ctx.terminal.errored {
+                        // Passthrough keeps forwarding after an in-band
+                        // error, like the native passthrough: it only
+                        // suppresses a second terminator.
+                        if client_gone || (translate_response && ctx.terminal.errored) {
                             break;
                         }
                     }

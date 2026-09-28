@@ -12,10 +12,11 @@ use crate::*;
 ///     (ETIMEDOUT/reset/closed/DNS) — the loop treats these with round-gated
 ///     rotation (retry the affinity/cache-warm endpoint in place on round 0,
 ///     rotate only on later rounds) and a transient-aware exhaustion status.
-///   - `RetryModelUnsupported(resp)`: the endpoint rejected the request's
-///     MODEL, not the request itself (LAB-941). The forward path has already
-///     negative-cached the (endpoint, model) pair; the loop rotates like a
-///     429 while stashing the upstream's error response, so a model no OTHER
+///   - `RetryRejectedByAccount(resp)`: the ACCOUNT rejected the request, not
+///     the request itself — its plan lacks the model (LAB-941) or its org
+///     lacks fast mode (LAB-2687). The forward path has already
+///     negative-cached the endpoint; the loop rotates like a 429 while
+///     stashing the upstream's error response, so a request no OTHER
 ///     endpoint can serve still surfaces the real error — a nonexistent-model
 ///     404 must not morph into a synthetic 429 that invites retries.
 ///   - `RetryEntitlement(resp)`: the account is out of paid extra usage for
@@ -28,7 +29,7 @@ use crate::*;
 // same pattern as `authenticate` / `reserve_request_body`).
 pub(crate) enum ForwardOutcome {
     Done(Box<Response>),
-    RetryModelUnsupported(Box<Response>),
+    RetryRejectedByAccount(Box<Response>),
     RetryEntitlement(Box<Response>),
     Retry {
         saw_529: bool,
@@ -57,12 +58,15 @@ pub(crate) const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
 ///     only: Anthropic echoes client-chosen field names into its 400s
 ///     (`<field>: Extra inputs are not permitted`), so on an Anthropic
 ///     endpoint the phrase is client-controlled and one request could
-///     negative-cache the model for every client (LAB-5235).
+///     negative-cache the model for every client (LAB-5235). See
+///     `is_gateway_model_rejection` for why it is anchored and bound to
+///     `model`, the model the request asked for.
 ///   - OpenAI: `{"error":{"code":"model_not_found", ...}}`.
 pub(crate) fn is_model_unsupported_error(
     status: StatusCode,
     body: &serde_json::Value,
     protocol: Protocol,
+    model: &str,
 ) -> bool {
     if status != StatusCode::NOT_FOUND && status != StatusCode::BAD_REQUEST {
         return false;
@@ -79,7 +83,54 @@ pub(crate) fn is_model_unsupported_error(
     if err.get("code").and_then(|v| v.as_str()) == Some("model_not_found") {
         return true;
     }
-    protocol == Protocol::OpenAI && msg.to_ascii_lowercase().contains("invalid model name")
+    protocol == Protocol::OpenAI && is_gateway_model_rejection(msg, model)
+}
+
+/// LiteLLM's own model rejection, as observed live:
+/// `/chat/completions: Invalid model name passed in model=<id>. Call …`.
+/// Anchored at the message start and bound to the requested model, because
+/// the same field carries provider errors the gateway relays, and those can
+/// echo client-chosen keys mid-message, as in
+/// `litellm.BadRequestError: …Exception - {… "<key>: Extra inputs are not
+/// permitted" …}`. A substring match would let a key containing the phrase
+/// mark the model unsupported for everyone.
+fn is_gateway_model_rejection(msg: &str, model: &str) -> bool {
+    let Some((route, rest)) = msg.split_once(": ") else {
+        return false;
+    };
+    route.starts_with('/')
+        && rest
+            .strip_prefix("Invalid model name passed in model=")
+            .and_then(|r| r.strip_prefix(model))
+            .is_some_and(|r| r.starts_with('.'))
+}
+
+/// Exact upstream text of the org-level fast-mode entitlement 400 (observed
+/// 2026-09-02, LAB-2687), replayed on the warm negative-cache path where no
+/// upstream response exists. The matcher requires this exact string, so if
+/// upstream rewords it, rotation stops and the 400 reaches the client as it
+/// did before LAB-2687.
+const FAST_MODE_NOT_ENABLED_MSG: &str =
+    "Fast mode is not enabled for your organization. An organization admin must enable this feature.";
+
+/// True when an upstream 400 says this ACCOUNT's org has fast mode disabled
+/// (LAB-2687): 400 `{"type":"error","error":{"type":"invalid_request_error",
+/// "message":"Fast mode is not enabled for your organization. ..."}}`.
+/// Exact-matched against `FAST_MODE_NOT_ENABLED_MSG`, not a substring: the
+/// message is upstream text the client does not control, but a client can
+/// still provoke an unrelated 400 whose echoed content happens to contain
+/// this clause (an unrecognized top-level field literally named the phrase),
+/// so a `.contains` match plus an unguarded caller could walk and mark every
+/// reachable account on a single crafted request. The caller additionally
+/// requires a fast request on a non-passthrough endpoint — otherwise the
+/// 400 is not about this account's org, and never grounds to mark it.
+fn is_fast_mode_not_enabled_error(status: StatusCode, body: &serde_json::Value) -> bool {
+    status == StatusCode::BAD_REQUEST
+        && body.pointer("/error/type").and_then(|v| v.as_str()) == Some("invalid_request_error")
+        && body
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m == FAST_MODE_NOT_ENABLED_MSG)
 }
 
 /// Anchor for the entitlement 400 (LAB-4729). Only the first sentence: the
@@ -104,6 +155,73 @@ pub(crate) fn is_entitlement_exhausted_400(status: StatusCode, body: &serde_json
             .pointer("/error/message")
             .and_then(|v| v.as_str())
             .is_some_and(|m| m.starts_with(ENTITLEMENT_400_ANCHOR))
+}
+
+/// Account or model state an upstream 4xx reports: the request itself was
+/// fine, and another endpoint may serve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamRejection {
+    /// `is_model_unsupported_error`.
+    ModelUnsupported,
+    /// `is_entitlement_exhausted_400`.
+    Entitlement,
+    /// `is_fast_mode_not_enabled_error`. Reports this account's org only
+    /// when the request asked for fast mode and the endpoint sent its own
+    /// credential; the caller decides.
+    FastModeDisabled,
+}
+
+/// Read account or model state out of an upstream error. Every forward path
+/// classifies through here, so the echo veto covers every classifier, the
+/// ones added later included. `model` is the model the request asked for, and
+/// `sent_body` the request body exactly as it went to this endpoint.
+pub(crate) fn classify_rejection(
+    status: StatusCode,
+    err_body: &serde_json::Value,
+    protocol: Protocol,
+    model: &str,
+    sent_body: &[u8],
+) -> Option<UpstreamRejection> {
+    let verdict = if is_model_unsupported_error(status, err_body, protocol, model) {
+        UpstreamRejection::ModelUnsupported
+    } else if is_entitlement_exhausted_400(status, err_body) {
+        UpstreamRejection::Entitlement
+    } else if is_fast_mode_not_enabled_error(status, err_body) {
+        UpstreamRejection::FastModeDisabled
+    } else {
+        return None;
+    };
+    // Checked after a match rather than before: it re-parses the request
+    // body, and an error no classifier claims is forwarded unchanged anyway.
+    (!echoes_request_key(err_body, sent_body)).then_some(verdict)
+}
+
+/// True when `error.message` starts with `<key>:` for a top-level key of the
+/// request. Anthropic's 400 for an unknown field reads `<key>: Extra inputs
+/// are not permitted`, with the key echoed verbatim, so that message is text
+/// the client chose and cannot report account or model state.
+///
+/// `model` is exempt: its name is fixed by the API, and the genuine model
+/// rejection reads `model: <id>`. A body that does not parse as a JSON object
+/// counts as an echo, since an echo cannot then be ruled out, and forwarding
+/// the error unchanged is the safe side.
+fn echoes_request_key(err_body: &serde_json::Value, sent_body: &[u8]) -> bool {
+    let Some(msg) = err_body.pointer("/error/message").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if sent_body.is_empty() {
+        return false;
+    }
+    let Ok(keys) = serde_json::from_slice::<HashMap<String, serde::de::IgnoredAny>>(sent_body)
+    else {
+        return true;
+    };
+    keys.keys().any(|k| {
+        k != "model"
+            && msg
+                .strip_prefix(k.as_str())
+                .is_some_and(|rest| rest.starts_with(':'))
+    })
 }
 
 /// Surface the real cause of a `reqwest::Error`. The Display form only shows
@@ -346,7 +464,7 @@ pub(crate) fn apply_round_outcome(
     skip: &mut Vec<EndpointIdx>,
     saw_529: &mut bool,
     saw_transient: &mut bool,
-    model_unsupported_resp: &mut Option<Response>,
+    rejected_resp: &mut Option<Response>,
     entitlement_resp: &mut Option<(EndpointIdx, Option<Response>)>,
 ) -> RetryStep {
     // Any later outcome supersedes a stashed entitlement 400 as the caller's
@@ -360,11 +478,11 @@ pub(crate) fn apply_round_outcome(
     }
     match outcome {
         ForwardOutcome::Done(resp) => RetryStep::Return(*resp),
-        // Model rejected by this endpoint: rotate immediately (another
-        // account may serve it) but keep the upstream's error in hand for
-        // the case where none does (LAB-941).
-        ForwardOutcome::RetryModelUnsupported(resp) => {
-            *model_unsupported_resp = Some(*resp);
+        // Account-level rejection (model outside its plan, LAB-941; org lacks
+        // fast mode, LAB-2687): rotate immediately (another account may serve
+        // it) but keep the upstream's error in hand for the case where none does.
+        ForwardOutcome::RetryRejectedByAccount(resp) => {
+            *rejected_resp = Some(*resp);
             skip.push(picked_idx);
             RetryStep::NextAttempt
         }
@@ -503,11 +621,12 @@ pub(crate) fn model_unsupported_response(model: &str, openai_shape: bool) -> Res
 /// denials (LAB-4129): `authenticate` 401, `pre_request_gate` 403/429,
 /// `deny_admin_reader`'s read-only-principal 403 (LAB-4395),
 /// `reserve_request_body` 503, `read_body_bounded` 408, the
-/// untranslatable-request 400, and `proxy_handler`'s 400 for a valid-JSON
-/// non-object body (LAB-4314) — the router fallback, so any method on any
-/// path. This is not the whole error surface — the IP-allowlist 403, retry
-/// exhaustion, the failed-auth throttle and the other bad-body 400s still
-/// return `text/plain`.
+/// untranslatable-request 400, the fast-mode entitlement 400 replayed on
+/// the warm negative-cache path (LAB-2687), and `proxy_handler`'s 400 for
+/// a valid-JSON non-object body (LAB-4314) — the router fallback, so any
+/// method on any path. This is not the whole error surface — the
+/// IP-allowlist 403, retry exhaustion, the failed-auth throttle and the
+/// other bad-body 400s still return `text/plain`.
 ///
 /// All three 429s share `rate_limit_error`: that is the type Anthropic binds
 /// to 429, and a narrower invented one would break SDK matching. What
@@ -753,10 +872,11 @@ pub(crate) async fn forward_anthropic(
     // (`requests`), `/v1/complete` (`prompt`) and anything else arrive here
     // too — running a Messages-only field list over those bodies deletes them
     // outright.
-    let coherent_body = if matches!(
+    let messages_schema = matches!(
         parts.uri.path(),
         "/v1/messages" | "/v1/messages/count_tokens"
-    ) {
+    );
+    let coherent_body = if messages_schema {
         strip_orphaned_beta_body_fields(
             oauth_body_bytes,
             headers
@@ -832,6 +952,25 @@ pub(crate) async fn forward_anthropic(
         debug_assert!(coherent_body.is_none());
         body_bytes
     };
+    // LAB-5970: a `models` allow-list on the client or on THIS endpoint (the
+    // retry loop may land on a differently restricted one) would be escaped by
+    // a server-side fallback to a model it does not name — see
+    // `strip_fallbacks`. Applied to every auth type: API-key and passthrough
+    // endpoints forward client betas unfiltered, so this cannot ride on the
+    // beta allow-list. Batches nest the field and Anthropic rejects it there.
+    let models_restricted = !ep.models.is_empty() || state.client_restricts_models(client_id);
+    let fallback_free = (messages_schema && models_restricted)
+        .then(|| strip_fallbacks(req_body))
+        .flatten();
+    if fallback_free.is_some() {
+        debug!(
+            req_id,
+            client_id,
+            account = endpoint_name,
+            "models allow-list: stripped top-level fallbacks"
+        );
+    }
+    let req_body = fallback_free.as_ref().unwrap_or(req_body);
     upstream_req = upstream_req.body(req_body.clone());
 
     let resp = match upstream_req.send().await {
@@ -1172,29 +1311,42 @@ pub(crate) async fn forward_anthropic(
                     state.note_prompt_too_long(req_id, model, session_key, msg);
                 }
             }
-            // Model unsupported on THIS account (e.g. outside its plan):
-            // negative-cache the pair and rotate — another account may serve
-            // it. Forwarding the 404 as-is wedges affinity-pinned clients
-            // into a permanent retry loop against this account (LAB-941).
+            // THIS account rejected the request — model outside its plan
+            // (LAB-941) or fast mode not enabled on its org (LAB-2687):
+            // negative-cache it and rotate — another account may serve it.
+            // Forwarding the 4xx as-is wedges affinity-pinned clients into a
+            // permanent retry loop against this account.
             // Out of extra usage: re-send once to another account (LAB-4729).
-            // Both are account state wearing a 4xx. A streaming request lands
+            // All are account state wearing a 4xx. A streaming request lands
             // here too: upstream sends the 400 as a JSON body, not an event
             // stream, so it re-sends before any byte reaches the client.
             let rotate: Option<fn(Box<Response>) -> ForwardOutcome> =
-                if is_model_unsupported_error(status, &parsed, ep.protocol) {
-                    state.note_model_unsupported(endpoint_name, endpoint_idx, model);
-                    Some(ForwardOutcome::RetryModelUnsupported)
-                } else if is_entitlement_exhausted_400(status, &parsed) {
-                    state.note_entitlement_400(endpoint_name);
-                    Some(ForwardOutcome::RetryEntitlement)
-                } else {
-                    None
+                match classify_rejection(status, &parsed, ep.protocol, model, req_body) {
+                    Some(UpstreamRejection::ModelUnsupported) => {
+                        state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                        Some(ForwardOutcome::RetryRejectedByAccount)
+                    }
+                    Some(UpstreamRejection::FastModeDisabled) if is_fast_mode && !passthrough => {
+                        state.note_fast_mode_disabled(endpoint_name, endpoint_idx);
+                        Some(ForwardOutcome::RetryRejectedByAccount)
+                    }
+                    // Not this account's state: a standard request never asked
+                    // for fast mode, and a passthrough endpoint sent the
+                    // caller's own credential, so the 400 is about the
+                    // caller's org. Marking the endpoint would switch fast
+                    // mode off for every other caller of it.
+                    Some(UpstreamRejection::FastModeDisabled) => None,
+                    Some(UpstreamRejection::Entitlement) => {
+                        state.note_entitlement_400(endpoint_name);
+                        Some(ForwardOutcome::RetryEntitlement)
+                    }
+                    None => None,
                 };
             if let Some(retry) = rotate {
                 // This branch returns before `finalize_non_stream` — log the
                 // merged line here too, so a rotated rejection still gets the
                 // routing/utilization snapshot at INFO, same as the old
-                // unconditional `proxied` line did (AC4).
+                // unconditional `proxied` line did (LAB-3214 AC4).
                 log_proxied(
                     req_id,
                     client_id,
@@ -1463,7 +1615,7 @@ pub(crate) async fn proxy_handler(
     let mut guard_outcome = guard::ScanOutcome::NothingToScan;
 
     // Parse body once for model extraction, optional cache injection, and
-    // the fast-mode flag that picks the rate bucket downstream.
+    // the fast-mode flag that picks the rate bucket and routing pool downstream.
     let (body_bytes, oauth_body_bytes, model, fp, cache_key, is_fast_mode) =
         if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             // Valid JSON but not an object (`[1]`, `"x"`, `7`, `true`,
@@ -1626,6 +1778,8 @@ pub(crate) async fn proxy_handler(
             // Classified once here rather than re-parsed from the outbound
             // bytes per upstream response: neither injector above touches
             // `speed`, so one flag is true of both byte variants (LAB-2693).
+            // The same flag keeps fast requests off accounts whose org lacks
+            // the entitlement (LAB-2687).
             //
             // NOT the last word on it. `forward_anthropic` may strip `speed`
             // after the beta filter (LAB-1261) and re-derives the flag there;
@@ -1720,9 +1874,9 @@ pub(crate) async fn proxy_handler(
     let n = state.endpoints.len();
     let mut last_saw_529 = false;
     let mut last_saw_transient = false;
-    // Upstream error from the most recent model-unsupported rejection —
+    // Upstream error from the most recent account-level rejection —
     // returned verbatim if the pool exhausts on nothing but rejections.
-    let mut model_unsupported_resp: Option<Response> = None;
+    let mut rejected_resp: Option<Response> = None;
     // First entitlement 400 (LAB-4729): its presence spends the one re-send;
     // returned if nothing else can serve the request.
     let mut entitlement_resp: Option<(EndpointIdx, Option<Response>)> = None;
@@ -1753,7 +1907,7 @@ pub(crate) async fn proxy_handler(
             // (OpenAI). Both return a `ForwardOutcome` so the shared
             // round-gated policy in `apply_round_outcome` covers both.
             let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
+                .pick_endpoint_for_client(affinity, &model, &skip, &client_id, is_fast_mode)
                 .await
             {
                 Some(i) => {
@@ -1847,7 +2001,7 @@ pub(crate) async fn proxy_handler(
                 &mut skip,
                 &mut saw_529,
                 &mut saw_transient,
-                &mut model_unsupported_resp,
+                &mut rejected_resp,
                 &mut entitlement_resp,
             ) {
                 // LAB-933: the single success seam — every proxied response
@@ -1874,26 +2028,60 @@ pub(crate) async fn proxy_handler(
         }
     }
 
-    // A pool exhausted purely by model rejections (no 529/transient in the
-    // final round) returns the upstream's own error — truthful when the model
-    // exists nowhere. Overload/transient exhaustion keeps its retryable
-    // status; the negative cache already routes follow-up requests away from
-    // the rejecting endpoints (LAB-941). An entitlement 400 whose one re-send
-    // found nothing else to try is returned the same way (LAB-4729): the
-    // caller sees why, not a synthetic 429. Present only if no later attempt
-    // answered — see `apply_round_outcome`.
+    // An entitlement 400 whose one re-send found nothing else to try goes to
+    // the caller as-is (LAB-4729): the caller sees why, not a synthetic 429.
+    // Present only if no later attempt answered — see `apply_round_outcome`.
+    // Deliberately OUTSIDE the `pool_cannot_serve` gate below: the refusal is
+    // never negative-cached, so that gate only counts the refuser as out
+    // via `refused`.
+    let (refused, entitlement_resp) = entitlement_resp.unzip();
     if !last_saw_529 && !last_saw_transient {
-        if let Some(resp) = entitlement_resp.and_then(|(_, r)| r).or(model_unsupported_resp) {
+        if let Some(resp) = entitlement_resp.flatten() {
             return resp;
         }
-        // Warm-cache path: every eligible endpoint was filtered by the
-        // negative cache BEFORE any forward ran, so nothing was stashed.
-        // Synthesize the same truthful 404 the first request returned —
-        // a 429 here would invite retries of a permanently-failing model.
-        if state.model_unsupported_everywhere(&model) {
-            warn!(model, "model unsupported on all eligible endpoints");
-            return model_unsupported_response(&model, false);
+    }
+    // A pool exhausted by account-level rejections alone (no 529/transient
+    // in the final round, and the negative caches agree EVERY eligible
+    // account rejects) returns the upstream's own error — truthful when no
+    // account can serve the request, where a 429 would invite retries of a
+    // permanently-failing request (LAB-941, LAB-2687). Anything short of that
+    // — one rejection plus rate limits on the rest — is a rate-limited pool
+    // and keeps the retryable status.
+    //
+    // Deliberate LAB-941 behaviour change (LAB-2687): before it,
+    // a stashed model-unsupported rejection returned unconditionally here
+    // whenever the final round saw no 529/transient, regardless of whether
+    // the rest of the pool was ever attempted. That is no longer true — a
+    // single rejection alongside accounts that are merely rate-limited
+    // (never negative-cached because never tried) now stays retryable
+    // (429) instead of surfacing the stashed 4xx, exactly as it already did
+    // for fast-mode-disabled (`fast_mode_rejection_plus_rate_limited_pool_stays_retryable`).
+    // On a large headroom-routed pool "some account is cooling" is the
+    // common state, so this generalisation is intentional, not a
+    // regression: it's covered for the model-unsupported case by
+    // `model_unsupported_rejection_plus_rate_limited_pool_stays_retryable`.
+    if !last_saw_529
+        && !last_saw_transient
+        && state.pool_cannot_serve(&model, is_fast_mode, refused)
+    {
+        if let Some(resp) = rejected_resp {
+            return resp;
         }
+        // Warm-cache path: the pool emptied BEFORE any forward ran, so
+        // nothing was stashed — synthesize the error the first request got.
+        // Name the cause whose removal would unblock the request: if the
+        // pool serves the model at standard speed, only fast-mode marks
+        // stand in the way; otherwise the model itself is unservable.
+        if is_fast_mode && !state.pool_cannot_serve(&model, false, refused) {
+            warn!(model, "fast mode not enabled on any eligible endpoint");
+            return proxy_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                FAST_MODE_NOT_ENABLED_MSG,
+            );
+        }
+        warn!(model, "model unsupported on all eligible endpoints");
+        return model_unsupported_response(&model, false);
     }
     exhaustion_response(&state, last_saw_transient, last_saw_529)
     }

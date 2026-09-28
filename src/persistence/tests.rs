@@ -682,6 +682,62 @@ async fn load_state_warns_and_starts_clean_on_legacy_accounts_key() {
     );
 }
 
+/// Load a state file whose only endpoint carries `hard_limited_until_epoch`,
+/// and return the restored hard limit as seconds from the call's start.
+async fn restored_hard_limit_secs(until_epoch: u64) -> Option<u64> {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tmp.path(),
+        format!(
+            r#"{{"endpoints":[{{"name":"a","requests_total":0,"hard_limited_until_epoch":{until_epoch}}}],"saved_at":0}}"#
+        ),
+    )
+    .unwrap();
+    let mut state = test_state_with(vec![mk_endpoint("a", "sk-ant")]);
+    Arc::get_mut(&mut state).unwrap().state_path = tmp.path().to_path_buf();
+    let before = Instant::now();
+    state.load_state().await;
+    let info = state.endpoints[0].rate_info.read().await;
+    info.hard_limited_until.map(|t| (t - before).as_secs())
+}
+
+/// LAB-5682: a corrupt `u64::MAX` epoch must not overflow `Instant` and
+/// panic boot; it is clamped to the 24h ceiling like the Redis sync path.
+#[tokio::test]
+async fn load_state_clamps_u64_max_hard_limit() {
+    let secs = restored_hard_limit_secs(u64::MAX)
+        .await
+        .expect("hard limit applied");
+    assert!(secs <= 86_400, "u64::MAX must clamp to 24h, got {secs}s");
+}
+
+#[tokio::test]
+async fn load_state_clamps_hard_limit_beyond_24h() {
+    let secs = restored_hard_limit_secs(AppState::now_epoch() + 172_800)
+        .await
+        .expect("hard limit applied");
+    assert!(secs <= 86_400, "48h must clamp to 24h, got {secs}s");
+}
+
+#[tokio::test]
+async fn load_state_restores_hard_limit_within_ceiling() {
+    let secs = restored_hard_limit_secs(AppState::now_epoch() + 3600)
+        .await
+        .expect("hard limit applied");
+    assert!(
+        (3590..=3600).contains(&secs),
+        "expected ~3600s, got {secs}s"
+    );
+}
+
+#[tokio::test]
+async fn load_state_ignores_past_hard_limit() {
+    assert_eq!(
+        restored_hard_limit_secs(AppState::now_epoch() - 10).await,
+        None
+    );
+}
+
 /// LAB-5313: only a missing state file means a fresh start, and it keeps
 /// the INFO fresh-start line.
 #[tokio::test]
