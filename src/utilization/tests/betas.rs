@@ -1085,6 +1085,56 @@ async fn strip_is_scoped_to_the_messages_schema() {
     );
 }
 
+/// A client sending `anthropic-beta: _other` must not write the overflow
+/// series directly, and `_other` / `__other` must keep distinct keys.
+#[test]
+fn dropped_beta_flag_literal_other_keeps_off_overflow_key() {
+    let state = test_state_with(vec![]);
+    state.record_dropped_beta_flags("t", &["_other".to_string(), "__other".to_string()]);
+    let map = state.beta_flags_dropped.lock().unwrap();
+    assert_eq!(map.get("_other"), None, "no overflow yet: {map:?}");
+    assert_eq!(map.get("__other"), Some(&1), "{map:?}");
+    assert_eq!(map.get("___other"), Some(&1), "{map:?}");
+}
+
+/// Body fields literally named after a sentinel must not land on it, while a
+/// genuinely invalid name still counts under `_invalid` and over-cap removals
+/// still count under `_other`.
+#[test]
+fn stripped_body_field_literal_sentinels_keep_off_sentinel_keys() {
+    let state = test_state_with(vec![]);
+    let fields: Vec<String> = ["_other", "__other", "_invalid", "__invalid", "bad name"]
+        .iter()
+        .map(|f| f.to_string())
+        .collect();
+    state.record_stripped_body_fields("t", &fields, &[]);
+    {
+        let map = state.beta_body_fields_stripped.lock().unwrap();
+        assert_eq!(map.get("_other"), None, "no overflow yet: {map:?}");
+        for key in ["__other", "___other", "__invalid", "___invalid"] {
+            assert_eq!(map.get(key), Some(&1), "{key}: {map:?}");
+        }
+        assert_eq!(
+            map.get("_invalid"),
+            Some(&1),
+            "the real sanitiser reject: {map:?}"
+        );
+    }
+    let junk: Vec<String> = (0..MAX_STRIPPED_FIELDS_PER_REQUEST + 2)
+        .map(|i| format!("junk_{i}"))
+        .collect();
+    state.record_stripped_body_fields("t", &junk, &[]);
+    assert_eq!(
+        state
+            .beta_body_fields_stripped
+            .lock()
+            .unwrap()
+            .get("_other"),
+        Some(&2),
+        "over-cap removals still count under _other"
+    );
+}
+
 /// The counter is the only alertable signal this mechanism adds, so a caller
 /// must not be able to blind it. One request carrying more junk top-level keys
 /// than the whole map holds used to fill every slot for the process lifetime,

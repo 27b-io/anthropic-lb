@@ -224,6 +224,20 @@ pub(crate) fn truncate_label(s: &str) -> String {
     out
 }
 
+/// Keep a caller-controlled metric label off a bucket sentinel such as
+/// `_other`: a label that is one or more `_` followed by one of `stems` gains
+/// one more leading `_`, so `_other` → `__other` and `__other` → `___other`.
+/// Injective — no two inputs share an output — so the escape never merges two
+/// labels. Call it AFTER truncation: escaping first and clipping second could
+/// cut a long escaped name back onto another raw name.
+pub(crate) fn escape_sentinel(label: &str, stems: &[&str]) -> String {
+    let rest = label.trim_start_matches('_');
+    if rest.len() < label.len() && stems.contains(&rest) {
+        return format!("_{label}");
+    }
+    label.to_owned()
+}
+
 /// Cap on distinct UNRESERVED 7d claim keys per account. Keys are minted from
 /// the upstream `representative-claim` header — never from client input, but
 /// still an unvalidated remote string, and each one becomes a permanent `claim`

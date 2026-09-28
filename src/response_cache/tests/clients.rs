@@ -437,12 +437,14 @@ async fn model_denial_literal_other_model_does_not_alias_overflow_bucket() {
 #[tokio::test]
 async fn model_denial_escape_keeps_other_and_dunder_other_distinct() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
-    for model in ["_other", "__other"] {
+    // Bare `other` guards the leading-`_` requirement: without it, `other`
+    // would be escaped onto `_other` and pre-claim the overflow bucket.
+    for model in ["other", "_other", "__other"] {
         assert!(state.pre_request_gate("-", "limited", model).await.is_err());
     }
 
     let counts = state.model_denied.lock().unwrap();
-    assert_eq!(counts.len(), 2, "two models, two labels: {counts:?}");
+    assert_eq!(counts.len(), 3, "three models, three labels: {counts:?}");
     assert!(
         counts.values().all(|&n| n == 1),
         "each model must mint its own key: {counts:?}"
