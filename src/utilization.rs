@@ -903,7 +903,7 @@ pub(crate) fn drops_deprecated_temperature(model: &str, value: &serde_json::Valu
         return false;
     }
     warn!(
-        model = %truncate_label(model),
+        model = ?truncate_label(model),
         temperature = %value,
         "dropping `temperature`: deprecated and hard-rejected by this model"
     );

@@ -454,6 +454,27 @@ async fn model_denial_escape_keeps_other_and_dunder_other_distinct() {
     );
 }
 
+/// The model is caller-controlled JSON, so it can carry a raw newline. The
+/// denial warn must log it escaped, or a client can forge a log line
+/// (CWE-117, LAB-5442).
+#[test]
+fn model_denial_log_escapes_newline_in_model() {
+    let buf = log_capture_buf();
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    // First denial for this pair, so it takes the warn arm the capture sees.
+    state.note_model_denied("limited", "x\nFORGED-LAB5442 WARN fake");
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        output.contains(r"\nFORGED-LAB5442"),
+        "denial warn must log the model escaped, got:\n{output}"
+    );
+    assert!(
+        !output.contains("\nFORGED-LAB5442"),
+        "a raw newline in the model must not start a new log line"
+    );
+}
+
 // ── Integration: both surfaces, through the real router ──
 
 fn authed_app(upstream_url: &str, clients: Vec<ClientConfig>) -> (Router, Arc<AppState>) {

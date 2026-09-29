@@ -1755,7 +1755,7 @@ pub(crate) async fn proxy_handler(
                     client_id = %client_id,
                     session = %session_id,
                     agent = %agent_id,
-                    model = %model,
+                    model = ?model,
                     fp = %fp,
                     fps = %fps,
                     bps = %bps,
