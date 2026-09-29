@@ -202,7 +202,8 @@ pub(crate) async fn try_fallback_upstream(
         // entitlement 400.
         let model_unsupported =
             serde_json::from_str::<serde_json::Value>(&err_body).is_ok_and(|v| {
-                classify_rejection(status, &v, ep.protocol, model, request_body)
+                // Always the endpoint's own bearer token here, never the caller's.
+                classify_rejection(status, &v, ep.protocol, model, request_body, false)
                     == Some(UpstreamRejection::ModelUnsupported)
             });
         let response = if translate {

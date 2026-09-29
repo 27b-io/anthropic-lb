@@ -122,8 +122,9 @@ const FAST_MODE_NOT_ENABLED_MSG: &str =
 /// this clause (an unrecognized top-level field literally named the phrase),
 /// so a `.contains` match plus an unguarded caller could walk and mark every
 /// reachable account on a single crafted request. The caller additionally
-/// requires a fast request on a non-passthrough endpoint — otherwise the
-/// 400 is not about this account's org, and never grounds to mark it.
+/// requires a fast request, and `classify_rejection` vetoes a passthrough
+/// endpoint — otherwise the 400 is not about this account's org, and never
+/// grounds to mark it.
 fn is_fast_mode_not_enabled_error(status: StatusCode, body: &serde_json::Value) -> bool {
     status == StatusCode::BAD_REQUEST
         && body.pointer("/error/type").and_then(|v| v.as_str()) == Some("invalid_request_error")
@@ -166,22 +167,32 @@ pub(crate) enum UpstreamRejection {
     /// `is_entitlement_exhausted_400`.
     Entitlement,
     /// `is_fast_mode_not_enabled_error`. Reports this account's org only
-    /// when the request asked for fast mode and the endpoint sent its own
-    /// credential; the caller decides.
+    /// when the request asked for fast mode; the caller decides.
     FastModeDisabled,
 }
 
 /// Read account or model state out of an upstream error. Every forward path
-/// classifies through here, so the echo veto covers every classifier, the
-/// ones added later included. `model` is the model the request asked for, and
-/// `sent_body` the request body exactly as it went to this endpoint.
+/// classifies through here, so the echo and caller-credential vetoes cover
+/// every classifier, the ones added later included. `model` is the model the
+/// request asked for, and `sent_body` the request body exactly as it went to
+/// this endpoint.
+///
+/// `caller_credential` is true when the request went out with the caller's
+/// own auth (a passthrough endpoint). The error then describes the caller's
+/// plan, not the endpoint, so it is never endpoint state: marking the
+/// endpoint would take it away from every other caller, and re-sending would
+/// cover the caller's own limits with a pooled account (LAB-6005).
 pub(crate) fn classify_rejection(
     status: StatusCode,
     err_body: &serde_json::Value,
     protocol: Protocol,
     model: &str,
     sent_body: &[u8],
+    caller_credential: bool,
 ) -> Option<UpstreamRejection> {
+    if caller_credential {
+        return None;
+    }
     let verdict = if is_model_unsupported_error(status, err_body, protocol, model) {
         UpstreamRejection::ModelUnsupported
     } else if is_entitlement_exhausted_400(status, err_body) {
@@ -1312,31 +1323,37 @@ pub(crate) async fn forward_anthropic(
             // Forwarding the 4xx as-is wedges affinity-pinned clients into a
             // permanent retry loop against this account.
             // Out of extra usage: re-send once to another account (LAB-4729).
-            // All are account state wearing a 4xx. A streaming request lands
-            // here too: upstream sends the 400 as a JSON body, not an event
-            // stream, so it re-sends before any byte reaches the client.
-            let rotate: Option<fn(Box<Response>) -> ForwardOutcome> =
-                match classify_rejection(status, &parsed, ep.protocol, model, req_body) {
-                    Some(UpstreamRejection::ModelUnsupported) => {
-                        state.note_model_unsupported(endpoint_name, endpoint_idx, model);
-                        Some(ForwardOutcome::RetryRejectedByAccount)
-                    }
-                    Some(UpstreamRejection::FastModeDisabled) if is_fast_mode && !passthrough => {
-                        state.note_fast_mode_disabled(endpoint_name, endpoint_idx);
-                        Some(ForwardOutcome::RetryRejectedByAccount)
-                    }
-                    // Not this account's state: a standard request never asked
-                    // for fast mode, and a passthrough endpoint sent the
-                    // caller's own credential, so the 400 is about the
-                    // caller's org. Marking the endpoint would switch fast
-                    // mode off for every other caller of it.
-                    Some(UpstreamRejection::FastModeDisabled) => None,
-                    Some(UpstreamRejection::Entitlement) => {
-                        state.note_entitlement_400(endpoint_name);
-                        Some(ForwardOutcome::RetryEntitlement)
-                    }
-                    None => None,
-                };
+            // All are account state wearing a 4xx, except on a passthrough
+            // endpoint, where they are the caller's own: `classify_rejection`
+            // returns None and they are forwarded as-is (LAB-6005). A
+            // streaming request lands here too: upstream sends the 400 as a
+            // JSON body, not an event stream, so it re-sends before any byte
+            // reaches the client.
+            let rotate: Option<fn(Box<Response>) -> ForwardOutcome> = match classify_rejection(
+                status,
+                &parsed,
+                ep.protocol,
+                model,
+                req_body,
+                passthrough,
+            ) {
+                Some(UpstreamRejection::ModelUnsupported) => {
+                    state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                    Some(ForwardOutcome::RetryRejectedByAccount)
+                }
+                Some(UpstreamRejection::FastModeDisabled) if is_fast_mode => {
+                    state.note_fast_mode_disabled(endpoint_name, endpoint_idx);
+                    Some(ForwardOutcome::RetryRejectedByAccount)
+                }
+                // A standard request never asked for fast mode, so the 400 is
+                // not about this account's org: forward it as-is.
+                Some(UpstreamRejection::FastModeDisabled) => None,
+                Some(UpstreamRejection::Entitlement) => {
+                    state.note_entitlement_400(endpoint_name);
+                    Some(ForwardOutcome::RetryEntitlement)
+                }
+                None => None,
+            };
             if let Some(retry) = rotate {
                 // This branch returns before `finalize_non_stream` — log the
                 // merged line here too, so a rotated rejection still gets the
