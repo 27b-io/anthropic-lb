@@ -144,3 +144,81 @@ async fn stats_includes_burn_rate_and_headroom() {
     );
     assert!(body["aggregate"]["consumers"].is_object());
 }
+
+/// #202: `client_usage` and `aggregate` are built from per-map snapshots.
+/// Pins their values so the lock-scope refactor cannot change the output.
+#[tokio::test]
+async fn stats_client_usage_and_aggregate_from_snapshots() {
+    let state = Arc::new(AppState {
+        endpoints: vec![make_endpoint("acct-a", Protocol::Anthropic)],
+        operators: vec!["ray".to_string()],
+        ..test_state_base()
+    });
+    let ewma = |value: f64| Ewma {
+        value,
+        tau: 60.0,
+        last_update: Instant::now(),
+    };
+    {
+        let mut rates = state.lock_client_request_rates();
+        rates.insert("alice".to_string(), (10, ewma(2.996)));
+        rates.insert("ray".to_string(), (4, ewma(1.0)));
+    }
+    {
+        let mut usage = state.lock_client_usage();
+        usage.insert("alice".to_string(), [100, 20, 3, 4]);
+        usage.insert("ray".to_string(), [7, 8, 9, 10]);
+        // Tokens but no request rate: still reported, absent from aggregate.
+        usage.insert("bob".to_string(), [1, 2, 0, 0]);
+    }
+    let addr = serve(build_router(state)).await;
+
+    let body: serde_json::Value = Client::new()
+        .get(format!("http://{}/_stats", addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let usage = &body["client_usage"];
+    assert_eq!(
+        usage["alice"],
+        serde_json::json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 3,
+            "cache_read_input_tokens": 4,
+            "requests_total": 10,
+            "requests_per_minute": 3.0,
+        })
+    );
+    assert_eq!(
+        usage["_operator"],
+        serde_json::json!({
+            "input_tokens": 7,
+            "output_tokens": 8,
+            "cache_creation_input_tokens": 9,
+            "cache_read_input_tokens": 10,
+            "requests_total": 4,
+            "requests_per_minute": 1.0,
+        })
+    );
+    assert_eq!(usage["bob"]["input_tokens"], 1);
+    assert_eq!(usage["bob"]["requests_total"], 0);
+    assert!(usage.get("ray").is_none(), "operator id must not leak");
+
+    let consumers = body["aggregate"]["consumers"].as_object().unwrap();
+    assert_eq!(consumers.len(), 2);
+    assert!(consumers.get("ray").is_none(), "operator id must not leak");
+    assert_eq!(consumers["alice"]["requests_per_minute"], 3.0);
+    assert_eq!(consumers["_operator"]["requests_per_minute"], 1.0);
+    let share_sum: f64 = consumers
+        .values()
+        .map(|c| c["share"].as_f64().unwrap())
+        .sum();
+    assert!((share_sum - 1.0).abs() < 0.01, "shares sum to {share_sum}");
+    assert_eq!(consumers["alice"]["share"], 0.75);
+    assert_eq!(consumers["_operator"]["share"], 0.25);
+}
