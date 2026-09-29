@@ -344,6 +344,42 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
     );
 }
 
+/// Claude Code's gateway hint headers, sent when the client sets
+/// `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`. They say what kind of call this is
+/// (main loop, subagent, compaction, ...), so a cache-write spike can be put
+/// down to compaction or subagent fan-out instead of routing scatter. Each is
+/// `"-"` when absent. Logged as plain `&str` fields, so the formatter escapes
+/// these caller-controlled values; never log them with `%`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClientHints {
+    pub(crate) request_class: String,
+    pub(crate) agent_type: String,
+    pub(crate) compaction: String,
+    pub(crate) context_compacted: String,
+    pub(crate) prompt_id: String,
+}
+
+impl ClientHints {
+    pub(crate) fn from_headers(headers: &axum::http::HeaderMap) -> Self {
+        let get = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("-")
+                .to_string()
+        };
+        Self {
+            request_class: get("x-claude-code-request-class"),
+            agent_type: get("x-claude-code-agent-type"),
+            compaction: get("x-claude-code-compaction"),
+            context_compacted: get("x-claude-code-context-compacted"),
+            prompt_id: get("x-claude-code-prompt-id"),
+        }
+    }
+}
+
 /// Routing/utilization snapshot captured when upstream response headers
 /// arrive (the former standalone `proxied` / `proxied (openai-compat)` INFO
 /// lines), carried through to `finalize_stream` / `finalize_non_stream` so it
@@ -363,6 +399,7 @@ pub(crate) enum ProxiedCtx {
         /// line to the DEBUG `fingerprint` line by req_id; `"-"` when the
         /// request body was unparseable.
         fp: String,
+        hints: ClientHints,
     },
     OpenaiCompat {
         client_ver: String,
@@ -404,6 +441,7 @@ pub(crate) fn log_proxied(
             pin,
             total,
             fp,
+            hints,
         } => {
             info!(
                 req_id,
@@ -423,6 +461,11 @@ pub(crate) fn log_proxied(
                 pin = *pin,
                 total,
                 fp = %fp,
+                request_class = hints.request_class.as_str(),
+                agent_type = hints.agent_type.as_str(),
+                compaction = hints.compaction.as_str(),
+                context_compacted = hints.context_compacted.as_str(),
+                prompt_id = hints.prompt_id.as_str(),
                 input = usage.input_tokens,
                 output = usage.output_tokens,
                 cached = usage.cache_read_input_tokens,

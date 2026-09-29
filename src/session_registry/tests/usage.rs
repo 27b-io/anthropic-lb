@@ -287,6 +287,97 @@ async fn single_info_line_per_proxied_request() {
     );
 }
 
+/// The `proxied` line carries Claude Code's gateway hint headers, so cache
+/// analysis can split compaction and subagent calls from main-loop ones. A
+/// request without them logs `-` for each.
+#[tokio::test]
+async fn proxied_line_carries_gateway_hint_headers() {
+    let buf = log_capture_buf();
+
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            mock_listener,
+            Router::new().fallback(any(mock_anthropic_handler)),
+        )
+        .await
+        .unwrap();
+    });
+
+    let (app, _state) = test_app(&format!("http://{mock_addr}"), None);
+    let app_addr = serve(app).await;
+    let client = reqwest::Client::new();
+    let body = r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#;
+
+    let hinted = "gateway-hints-marker-hinted";
+    let resp = client
+        .post(format!("http://{app_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "any")
+        .header("x-client-id", hinted)
+        .header("x-claude-code-request-class", "subagent")
+        .header("x-claude-code-agent-type", "general-purpose")
+        .header("x-claude-code-compaction", "auto")
+        .header("x-claude-code-context-compacted", "1")
+        .header("x-claude-code-prompt-id", "p-123")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let bare = "gateway-hints-marker-bare";
+    let resp = client
+        .post(format!("http://{app_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "any")
+        .header("x-client-id", bare)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let line = |marker: &str| {
+        output
+            .lines()
+            .find(|l| l.contains(marker) && l.contains("proxied"))
+            .unwrap_or_else(|| panic!("no proxied line for {marker}:\n{output}"))
+            .to_string()
+    };
+    let hinted_line = line(hinted);
+    for field in [
+        r#"request_class="subagent""#,
+        r#"agent_type="general-purpose""#,
+        r#"compaction="auto""#,
+        r#"context_compacted="1""#,
+        r#"prompt_id="p-123""#,
+    ] {
+        assert!(
+            hinted_line.contains(field),
+            "missing {field} in: {hinted_line}"
+        );
+    }
+    let bare_line = line(bare);
+    assert!(
+        bare_line.contains(r#"request_class="-""#) && bare_line.contains(r#"prompt_id="-""#),
+        "absent hints should log -, got: {bare_line}"
+    );
+}
+
+#[test]
+fn client_hints_trim_and_default_to_dash() {
+    let mut h = axum::http::HeaderMap::new();
+    h.insert("x-claude-code-request-class", "  main ".parse().unwrap());
+    h.insert("x-claude-code-agent-type", "".parse().unwrap());
+    let hints = ClientHints::from_headers(&h);
+    assert_eq!(hints.request_class, "main");
+    assert_eq!(hints.agent_type, "-");
+    assert_eq!(hints.prompt_id, "-");
+}
+
 /// Regression guard for a gap the LAB-3214 merge introduced and then fixed:
 /// `forward_openai_compat_anthropic` returns early on a non-2xx upstream
 /// status, before ever reaching `finalize_non_stream` — the merged `proxied
