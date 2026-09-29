@@ -1,5 +1,43 @@
 use super::*;
 
+// ── Frozen clock (test-only) ─────────────────────────────────────────
+
+/// Pins `AppState::now_epoch` on this thread for the guard's lifetime and
+/// restores the PREVIOUS value on drop — including on panic, and including a
+/// nested freeze, so an inner guard cannot silently hand the outer test the
+/// wall clock back. Restoring on panic matters under `--test-threads=1`, where
+/// libtest runs tests in place on one shared thread.
+///
+/// The freeze applies to every `now_epoch` read on the thread, not just the
+/// one under test: fixtures that mint timestamps from `SystemTime::now()`
+/// directly (several `reset_epoch` ones here do) will be years out of step
+/// with it.
+#[must_use]
+struct FrozenClock(Option<u64>);
+
+impl FrozenClock {
+    fn at(epoch: u64) -> Self {
+        // The override is thread-local, so on a multi-thread runtime any
+        // `tokio::spawn`ed work reads the wall clock instead — and does it
+        // silently. Fail here rather than let a gate test pass for the wrong
+        // reason.
+        debug_assert!(
+            !matches!(
+                tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+            ),
+            "FrozenClock is thread-local: current-thread runtime only"
+        );
+        Self(FROZEN_NOW.with(|c| c.replace(Some(epoch))))
+    }
+}
+
+impl Drop for FrozenClock {
+    fn drop(&mut self) {
+        FROZEN_NOW.with(|c| c.set(self.0));
+    }
+}
+
 // ── Unit: pre-request-gate rejection counter (LAB-2551) ────────
 
 /// A budget-exhausted request must both 429 and increment the rejection
@@ -854,17 +892,17 @@ async fn gate_denies_model_outside_client_allow_list_with_403_naming_both() {
         StatusCode::FORBIDDEN,
         "policy denial is 403, not 429 — 429 means 'retry later', which this never becomes"
     );
-    let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let text = String::from_utf8_lossy(&body);
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "permission_error");
+    let text = json["error"]["message"].as_str().unwrap();
     assert!(
         text.contains("limited"),
-        "body must name the client: {text}"
+        "message must name the client: {text}"
     );
     assert!(
         text.contains("claude-opus-5"),
-        "body must name the model: {text}"
+        "message must name the model: {text}"
     );
 }
 
@@ -891,6 +929,141 @@ async fn gate_allow_list_bypassed_by_operators() {
             .is_ok(),
         "operators bypass the allow-list like every other gate check"
     );
+}
+
+// ── LAB-4129: proxy-generated denials return Anthropic JSON envelope ──
+
+/// Two instants on 2024-01-01 (12:34:56Z and 14:34:56Z). Neither is a day
+/// boundary, because at `now % 86400 == 0` the true answer and every
+/// `86400 - now % k` mutant (k dividing 86400) are all 86400 — a midnight
+/// instant hides a wrong modulus rather than exposing it.
+///
+/// Two of them, not one, because freezing makes the expected value a constant:
+/// against a single instant the assertion cannot tell a correct computation
+/// from a hardcoded answer. A second instant is what restores that.
+const FROZEN_GATE_CLOCKS: [u64; 2] = [1_704_112_496, 1_704_119_696];
+
+#[tokio::test]
+async fn gate_429_budget_returns_json_envelope_with_retry_after() {
+    for frozen in FROZEN_GATE_CLOCKS {
+        // Frozen only to remove a rollover flake, not to sharpen the assertion:
+        // the day key this test writes and the one `check_budget` reads must
+        // land in the same bucket, and on the live clock a UTC midnight
+        // between those two reads files the usage under yesterday — the gate
+        // then allows the request and `expect_err` fails with no defect.
+        let _clock = FrozenClock::at(frozen);
+        let today = frozen / 86400;
+        let state = Arc::new(AppState {
+            client_budgets: [("budgeted".to_string(), 100)].into_iter().collect(),
+            ..test_state_base()
+        });
+        // Pre-populate usage to exceed the budget
+        state
+            .budget_usage
+            .lock()
+            .unwrap()
+            .insert("budgeted".to_string(), (today, 200));
+        let err = state
+            .pre_request_gate("-", "budgeted", "")
+            .await
+            .expect_err("exceeded budget must be denied");
+        assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = err
+            .headers()
+            .get("retry-after")
+            .expect("budget 429 must carry retry-after")
+            .to_str()
+            .unwrap()
+            .parse()
+            .expect("retry-after must be integer seconds");
+        assert_eq!(
+            retry_after,
+            86400 - frozen % 86400,
+            "budget retry-after must be the seconds left until the next UTC midnight, \
+             the boundary check_budget's day key rolls on"
+        );
+        let json = parse_error_envelope(err).await;
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "rate_limit_error");
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("daily token budget exceeded"));
+    }
+}
+
+#[tokio::test]
+async fn gate_429_utilization_returns_json_envelope() {
+    let now = AppState::now_epoch();
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        state_path: PathBuf::from("/tmp/test.state.json"),
+        client_utilization_limits: [("capped".to_string(), 0.10)].into_iter().collect(),
+        ..test_state_base()
+    });
+    set_account_utilization(&state, 0, 0.95, 0.95, now + 10000, now + 100000).await;
+    let err = state
+        .pre_request_gate("-", "capped", "")
+        .await
+        .expect_err("utilization above limit must be denied");
+    assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        err.headers().get("retry-after").is_some(),
+        "utilization 429 must carry retry-after"
+    );
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "rate_limit_error");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("utilization limit exceeded"));
+}
+
+/// The brake is the same condition as `exhaustion_response`'s rate-limited
+/// branch: recovery is minutes to hours, so a `retry-after` would tight-loop
+/// SDK clients into a still-saturated pool. It must fail fast — no hint.
+#[tokio::test]
+async fn gate_429_emergency_brake_returns_json_envelope_without_retry_after() {
+    let now = AppState::now_epoch();
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        state_path: PathBuf::from("/tmp/test.state.json"),
+        emergency_brake: true,
+        emergency_threshold: 0.88,
+        ..test_state_base()
+    });
+    set_account_utilization(&state, 0, 0.95, 0.95, now + 10000, now + 100000).await;
+    let err = state
+        .pre_request_gate("-", "anyone", "")
+        .await
+        .expect_err("emergency brake must deny");
+    assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        err.headers().get("retry-after").is_none(),
+        "emergency brake 429 must NOT carry retry-after (see exhaustion_response)"
+    );
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "rate_limit_error");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("emergency"));
+}
+
+#[tokio::test]
+async fn authenticate_401_returns_json_envelope() {
+    let state = state_with_clients(vec![mk_client("valid", "k1", &[])]);
+    let headers = hdrs(&[("x-api-key", "wrong-key")]);
+    let err = state
+        .authenticate(&headers, false)
+        .expect_err("bad key must 401");
+    assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "authentication_error");
+    assert_eq!(json["error"]["message"], "unauthorized");
 }
 
 /// Also the ONLY test pinning the `pre_request_gate` backstop call: both

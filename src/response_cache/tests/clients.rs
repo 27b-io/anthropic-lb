@@ -255,13 +255,13 @@ async fn gate_denies_unreadable_model_for_restricted_client() {
         .await
         .expect_err("unknown model must be denied for a restricted client");
     assert_eq!(err.status(), StatusCode::FORBIDDEN);
-    let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let text = String::from_utf8_lossy(&body);
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "permission_error");
+    let text = json["error"]["message"].as_str().unwrap();
     assert!(
         text.contains("no model could be read"),
-        "body should explain the empty-model denial, got: {text}"
+        "message should explain the empty-model denial, got: {text}"
     );
 }
 
@@ -314,12 +314,11 @@ async fn denied_model_response_body_is_truncated() {
         .pre_request_gate("-", "limited", &huge)
         .await
         .expect_err("oversized model must be denied");
-    let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
-        .await
-        .unwrap();
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["error"]["type"], "permission_error");
     assert!(
-        String::from_utf8_lossy(&body).chars().count() < 1_000,
-        "403 body must not echo the untruncated model"
+        json["error"]["message"].as_str().unwrap().chars().count() < 1_000,
+        "403 message must not echo the untruncated model"
     );
 }
 
