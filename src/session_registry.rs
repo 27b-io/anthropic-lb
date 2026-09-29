@@ -365,7 +365,6 @@ impl ClientHints {
             headers
                 .get(name)
                 .and_then(|v| v.to_str().ok())
-                .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("-")
                 .to_string()

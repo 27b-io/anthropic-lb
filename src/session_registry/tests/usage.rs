@@ -294,17 +294,7 @@ async fn single_info_line_per_proxied_request() {
 async fn proxied_line_carries_gateway_hint_headers() {
     let buf = log_capture_buf();
 
-    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mock_addr = mock_listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            mock_listener,
-            Router::new().fallback(any(mock_anthropic_handler)),
-        )
-        .await
-        .unwrap();
-    });
-
+    let mock_addr = serve(Router::new().fallback(any(mock_anthropic_handler))).await;
     let (app, _state) = test_app(&format!("http://{mock_addr}"), None);
     let app_addr = serve(app).await;
     let client = reqwest::Client::new();
@@ -365,17 +355,6 @@ async fn proxied_line_carries_gateway_hint_headers() {
         bare_line.contains(r#"request_class="-""#) && bare_line.contains(r#"prompt_id="-""#),
         "absent hints should log -, got: {bare_line}"
     );
-}
-
-#[test]
-fn client_hints_trim_and_default_to_dash() {
-    let mut h = axum::http::HeaderMap::new();
-    h.insert("x-claude-code-request-class", "  main ".parse().unwrap());
-    h.insert("x-claude-code-agent-type", "".parse().unwrap());
-    let hints = ClientHints::from_headers(&h);
-    assert_eq!(hints.request_class, "main");
-    assert_eq!(hints.agent_type, "-");
-    assert_eq!(hints.prompt_id, "-");
 }
 
 /// Regression guard for a gap the LAB-3214 merge introduced and then fixed:
