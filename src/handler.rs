@@ -1981,7 +1981,7 @@ pub(crate) async fn proxy_handler(
                                     warn!(
                                         req_id,
                                         upstream = ep.name,
-                                        error = %msg,
+                                        error = ?msg,
                                         "fallback: request not representable in OpenAI format"
                                     );
                                     // Terminal, not a retry: the request itself

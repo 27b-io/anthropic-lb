@@ -925,3 +925,122 @@ async fn proxy_handler_translates_once_across_endpoint_rotation() {
         "rotated attempt must reuse the identical serialized body"
     );
 }
+
+async fn spawn_proxy(state: Arc<AppState>) -> SocketAddr {
+    let app = Router::new().fallback(any(proxy_handler)).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    addr
+}
+
+/// Lines of the shared log capture that contain `marker`, plus whether any
+/// captured line STARTS with it — i.e. a raw newline in a logged field let
+/// the marker begin a forged line (CWE-117).
+fn captured_lines_with(marker: &str) -> (Vec<String>, bool) {
+    let output = String::from_utf8(log_capture_buf().lock().unwrap().clone()).unwrap();
+    let forged = output.lines().any(|l| l.starts_with(marker));
+    let mine = output
+        .lines()
+        .filter(|l| l.contains(marker))
+        .map(str::to_owned)
+        .collect();
+    (mine, forged)
+}
+
+/// LAB-5729: the untranslatable-request WARN logs the translator's error, which
+/// quotes the caller's content-block `type` verbatim. It must be Debug-escaped
+/// so a newline in that field cannot start a forged log line.
+#[tokio::test]
+async fn untranslatable_fallback_log_escapes_newline_in_block_type() {
+    let _ = log_capture_buf();
+    let marker = "FORGED-LAB5729-UNTRANSLATABLE";
+    let (url, _rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
+    let mut state = test_state_with(vec![]);
+    let mut ep = make_endpoint("openai-gw", Protocol::OpenAI);
+    ep.base_url = url;
+    Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+    let addr = spawn_proxy(state).await;
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-7",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": format!("x\n{marker}"), "text": "hi"}
+            ]}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let (mine, forged) = captured_lines_with(marker);
+    assert!(
+        !forged,
+        "a raw newline let the marker start a log line:\n{}",
+        mine.join("\n")
+    );
+    assert!(
+        mine.iter()
+            .any(|l| l.contains("not representable in OpenAI format")
+                && l.contains(&format!("x\\n{marker}"))),
+        "expected the escaped block type in the untranslatable WARN, got:\n{}",
+        mine.join("\n")
+    );
+}
+
+/// LAB-5729: the upstream-error WARN logs the gateway's error body, which some
+/// gateways build by echoing request fields, so it must be Debug-escaped too.
+/// A 400 reaches that WARN; a 5xx rotates before it.
+#[tokio::test]
+async fn fallback_upstream_error_log_escapes_newline_in_body() {
+    let _ = log_capture_buf();
+    let marker = "FORGED-LAB5729-UPSTREAM";
+    let (url, _rx) =
+        spawn_capturing_upstream(StatusCode::BAD_REQUEST, b"boom\nFORGED-LAB5729-UPSTREAM").await;
+    let mut state = test_state_with(vec![]);
+    let mut ep = make_endpoint("broken", Protocol::OpenAI);
+    ep.base_url = url;
+    Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+    let body =
+        bytes::Bytes::from_static(br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#);
+    let _ = try_fallback_upstream(
+        &state,
+        &body,
+        "req-lab5729",
+        "client-1",
+        &"127.0.0.1".parse().unwrap(),
+        "-",
+        "-",
+        "claude-opus-4-7",
+        0,
+        Instant::now(),
+        false,
+        false,
+    )
+    .await;
+
+    let (mine, forged) = captured_lines_with(marker);
+    assert!(
+        !forged,
+        "a raw newline let the marker start a log line:\n{}",
+        mine.join("\n")
+    );
+    assert!(
+        mine.iter()
+            .any(|l| l.contains("unified endpoint returned error")
+                && l.contains(&format!("boom\\n{marker}"))),
+        "expected the escaped upstream body in the error WARN, got:\n{}",
+        mine.join("\n")
+    );
+}
