@@ -55,13 +55,14 @@ pub(crate) const ROTATE: ForwardOutcome = ForwardOutcome::Retry {
 ///     the model the request asked for, so a 404 can mark only the model it
 ///     names, even where the proxy and upstream read a different one of two
 ///     duplicate `model` keys.
-///   - LiteLLM-style gateways: 400 `{"error":{"message":"... Invalid model
-///     name passed in model=<id> ..."}}` (observed live from insight-gateway,
-///     2026-07-27). Free text, so matched for `Protocol::OpenAI` endpoints
-///     only: Anthropic echoes client-chosen field names into its 400s
-///     (`<field>: Extra inputs are not permitted`), so on an Anthropic
-///     endpoint the phrase is client-controlled and one request could
-///     negative-cache the model for every client (LAB-5235). See
+///   - LiteLLM-style gateways: 400 `{"error":{"message":"/<route>: Invalid
+///     model name passed in model=<id>. …"}}`, anchored as
+///     `is_gateway_model_rejection` requires (observed live from an
+///     OpenAI-protocol LiteLLM gateway, 2026-07-27). Free text, so matched
+///     for `Protocol::OpenAI` endpoints only: Anthropic echoes client-chosen
+///     field names into its 400s (`<field>: Extra inputs are not permitted`),
+///     so on an Anthropic endpoint the phrase is client-controlled and one
+///     request could negative-cache the model for every client (LAB-5235). See
 ///     `is_gateway_model_rejection` for why it is anchored and bound to
 ///     `model`, the model the request asked for.
 ///   - OpenAI: `{"error":{"code":"model_not_found", ...}}`.

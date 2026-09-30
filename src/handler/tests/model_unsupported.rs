@@ -40,7 +40,7 @@ fn model_unsupported_error_detection() {
         "URL-path 404 lacks the 'model:' prefix and must not match"
     );
 
-    // LiteLLM-style gateway body, observed live from insight-gateway 2026-07-27.
+    // LiteLLM-style gateway body, observed live from an OpenAI-protocol gateway 2026-07-27.
     let litellm_400 = serde_json::json!({
         "error": {
             "message": "/chat/completions: Invalid model name passed in model=claude-opus-5. Call `/v1/models` to view available models for your key.",
