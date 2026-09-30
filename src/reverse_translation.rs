@@ -1246,8 +1246,8 @@ async fn forward_openai_compat_anthropic(
 
             // Process any remaining data in buffer (skip once a terminator is
             // out — nothing may follow it — or the client is gone)
-            if !ctx.terminal.reached() && !client_gone && !splitter.remainder().is_empty() {
-                let remaining = String::from_utf8_lossy(splitter.remainder()).into_owned();
+            if !ctx.terminal.reached() && !client_gone {
+                let remaining = splitter.remainder();
                 if !remaining.trim().is_empty() {
                     if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
                         if translated.ends_with("data: [DONE]\n\n") && !ctx.terminal.errored {

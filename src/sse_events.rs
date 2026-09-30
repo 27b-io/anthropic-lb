@@ -10,7 +10,9 @@ const MAX_DELIM_TAIL: usize = 3;
 /// between events is `\n\n`, `\r\n\r\n` or `\r\r`; accepting only `\n\n`
 /// never splits a CRLF-framed stream. Each search resumes where the last one
 /// stopped, so a large event arriving in many chunks is scanned about once,
-/// where a rescan from byte 0 per chunk is quadratic in its size.
+/// where a rescan from byte 0 per chunk is quadratic in its size. Events come
+/// out with every line ending as `\n`: consumers split field lines with
+/// `str::lines()`, which does not break on a lone `\r`.
 #[derive(Default)]
 pub(crate) struct SseEventSplitter {
     buf: Vec<u8>,
@@ -38,7 +40,7 @@ impl SseEventSplitter {
     pub(crate) fn next_event(&mut self) -> Option<String> {
         for i in self.resume..self.buf.len() {
             if let Some(delim) = self.delimiter_len_at(i) {
-                let event = String::from_utf8_lossy(&self.buf[self.start..i]).into_owned();
+                let event = decode(&self.buf[self.start..i]);
                 self.start = i + delim;
                 self.resume = self.start;
                 return Some(event);
@@ -53,8 +55,8 @@ impl SseEventSplitter {
     }
 
     /// The unterminated tail: whatever follows the last complete event.
-    pub(crate) fn remainder(&self) -> &[u8] {
-        &self.buf[self.start..]
+    pub(crate) fn remainder(&self) -> String {
+        decode(&self.buf[self.start..])
     }
 
     /// Length of the delimiter starting at `i`; `None` if there is none, or
@@ -78,6 +80,15 @@ impl SseEventSplitter {
         }
         self.buf.get(i).copied()
     }
+}
+
+/// `bytes` as text, `\r\n` and lone `\r` line endings turned into `\n`.
+fn decode(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if !text.contains('\r') {
+        return text.into_owned();
+    }
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 #[cfg(test)]

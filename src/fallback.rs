@@ -375,8 +375,8 @@ pub(crate) async fn try_fallback_upstream(
             drop(resp);
 
             // Flush remaining buffer
-            if translate_response && !splitter.remainder().is_empty() && !client_gone {
-                let remaining = String::from_utf8_lossy(splitter.remainder()).into_owned();
+            if translate_response && !client_gone {
+                let remaining = splitter.remainder();
                 for line in remaining.lines() {
                     if let Some(data) = line.strip_prefix("data: ") {
                         let events = translate_openai_sse_to_anthropic(data, &mut ctx);

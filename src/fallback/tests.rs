@@ -1133,3 +1133,28 @@ async fn fallback_translated_crlf_stream_relays_each_event_as_it_arrives() {
     );
     assert!(!body.contains("event: error\n"), "got: {body:?}");
 }
+
+#[tokio::test]
+async fn fallback_translated_cr_only_stream_reads_every_field_line() {
+    // A lone `\r` ends an SSE line too, but `str::lines()` does not split on
+    // it: each `id:`+`data:` event read as one line and lost its `data:`. The
+    // finish_reason sits in the unterminated tail, so the flush is covered.
+    let mock_addr = spawn_sse_upstream(
+        concat!(
+            "id: 1\rdata: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\r\r",
+            "id: 2\rdata: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        ),
+        true,
+    )
+    .await;
+    let state = fallback_only_state(mock_addr, "cr-only-streaming").await;
+    let body = stream_messages(serve(build_router(state)).await).await;
+
+    assert!(body.contains("\"Hi\""), "got: {body:?}");
+    assert_eq!(
+        body.matches("event: message_stop\n").count(),
+        1,
+        "exactly one terminator, got: {body:?}"
+    );
+    assert!(!body.contains("event: error\n"), "got: {body:?}");
+}

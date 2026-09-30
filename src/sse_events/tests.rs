@@ -16,16 +16,19 @@ fn each_delimiter_ends_an_event_and_is_consumed_whole() {
             ["event: a", "data: 1", "data: 2"],
             "delimiter {d:?}"
         );
-        assert_eq!(s.remainder(), b"data: 3", "delimiter {d:?}");
+        assert_eq!(s.remainder(), "data: 3", "delimiter {d:?}");
     }
 }
 
 #[test]
-fn crlf_field_lines_stay_inside_the_event() {
-    let mut s = SseEventSplitter::default();
-    s.push(b"event: x\r\ndata: {}\r\n\r\ndata: y\r\n\r\n");
-    assert_eq!(drain(&mut s), ["event: x\r\ndata: {}", "data: y"]);
-    assert!(s.remainder().is_empty());
+fn field_line_endings_normalize_to_lf() {
+    // Consumers split fields with `str::lines()`, which ignores a lone `\r`.
+    for eol in ["\n", "\r\n", "\r"] {
+        let mut s = SseEventSplitter::default();
+        s.push(format!("event: x{eol}data: {{}}{eol}{eol}event: y{eol}data: 1").as_bytes());
+        assert_eq!(drain(&mut s), ["event: x\ndata: {}"], "line ending {eol:?}");
+        assert_eq!(s.remainder(), "event: y\ndata: 1", "line ending {eol:?}");
+    }
 }
 
 #[test]
@@ -38,7 +41,7 @@ fn delimiter_split_across_pushes_yields_one_boundary() {
             assert_eq!(drain(&mut s), ["data: z"], "{d:?} split at {k}");
             s.push(format!("{}data: b", &d[k..]).as_bytes());
             assert_eq!(drain(&mut s), ["data: a"], "{d:?} split at {k}");
-            assert_eq!(s.remainder(), b"data: b", "{d:?} split at {k}");
+            assert_eq!(s.remainder(), "data: b", "{d:?} split at {k}");
         }
     }
 }

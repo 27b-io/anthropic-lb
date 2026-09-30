@@ -1588,19 +1588,42 @@ async fn chat_stream_deltas(
 }
 
 #[tokio::test]
-async fn openai_chat_streaming_crlf_upstream_matches_lf() {
+async fn openai_chat_streaming_crlf_and_cr_upstreams_match_lf() {
     // LAB-5636: a CRLF-framed upstream never matched the old `\n\n` scan, so
     // the whole stream reached the post-loop flush as one "event" and only
-    // its last `event:`/`data:` pair survived.
+    // its last `event:`/`data:` pair survived. A CR-only one splits, but
+    // `str::lines()` reads each `event:`+`data:` pair as one line.
     let lf = chat_stream_deltas(MOCK_ANTHROPIC_SSE.to_string()).await;
-    let crlf = chat_stream_deltas(MOCK_ANTHROPIC_SSE.replace('\n', "\r\n")).await;
+    for eol in ["\r\n", "\r"] {
+        let framed = chat_stream_deltas(MOCK_ANTHROPIC_SSE.replace('\n', eol)).await;
 
-    let text: String = crlf
-        .0
-        .iter()
-        .filter_map(|(delta, _)| delta["content"].as_str())
-        .collect();
-    assert_eq!(text, "Hello world", "every delta, in order: {crlf:?}");
-    assert_eq!(crlf.1, 1, "exactly one [DONE]: {crlf:?}");
-    assert_eq!(crlf, lf, "CRLF framing must translate like LF framing");
+        let text: String = framed
+            .0
+            .iter()
+            .filter_map(|(delta, _)| delta["content"].as_str())
+            .collect();
+        assert_eq!(
+            text, "Hello world",
+            "{eol:?}: every delta, in order: {framed:?}"
+        );
+        assert_eq!(framed.1, 1, "{eol:?}: exactly one [DONE]: {framed:?}");
+        assert_eq!(framed, lf, "{eol:?} framing must translate like LF framing");
+    }
+}
+
+#[tokio::test]
+async fn openai_chat_streaming_unterminated_tail_matches_lf_for_every_line_ending() {
+    // The stream ends on a `message_delta` with no blank line after it, so
+    // only the post-loop flush translates its finish_reason.
+    let tail = MOCK_ANTHROPIC_SSE[..MOCK_ANTHROPIC_SSE.find("event: message_stop").unwrap()]
+        .trim_end_matches('\n');
+    let lf = chat_stream_deltas(tail.to_string()).await;
+    assert!(
+        lf.0.iter().any(|(_, finish)| finish == "stop"),
+        "the flushed tail carries finish_reason: {lf:?}"
+    );
+    for eol in ["\r\n", "\r"] {
+        let framed = chat_stream_deltas(tail.replace('\n', eol)).await;
+        assert_eq!(framed, lf, "{eol:?} tail must translate like an LF tail");
+    }
 }
