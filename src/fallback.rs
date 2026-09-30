@@ -197,7 +197,8 @@ pub(crate) async fn try_fallback_upstream(
         // negative-cache the pair and rotate instead of handing the client a
         // misleading "your request is invalid" 400 — the model is fine, this
         // endpoint just doesn't serve it (LAB-941, observed 2026-07-27 when a
-        // 529 storm drained the Anthropic pool into insight-gateway).
+        // 529 storm drained the Anthropic accounts into an OpenAI-protocol
+        // LiteLLM gateway).
         // Only the model rejection: this path has never re-sent on an
         // entitlement 400.
         let model_unsupported =
