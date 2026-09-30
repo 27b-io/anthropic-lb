@@ -808,6 +808,19 @@ pub(crate) fn hdrs(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
 /// auto-vivifies only on `Null` and `Object`.
 pub(crate) const NON_OBJECT_JSON_BODIES: [&str; 5] = ["[1,2,3]", "\"x\"", "7", "true", "null"];
 
+/// The whole wire body of both `openai_chat_handler` parse 400s. Compared by
+/// equality, so it also pins the absence of the Anthropic top-level `type`.
+pub(crate) fn openai_invalid_request_body(message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": null,
+            "code": null
+        }
+    })
+}
+
 pub(crate) const TEST_IP: &str = "10.0.0.7";
 
 pub(crate) fn test_ip() -> IpAddr {

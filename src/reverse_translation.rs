@@ -1416,10 +1416,12 @@ async fn forward_openai_compat_anthropic(
     ForwardOutcome::Done(Box::new(response))
 }
 
-/// 400 for a `/v1/chat/completions` body the proxy cannot read. Request
-/// validation, not admission, so it takes the OpenAI envelope this surface
-/// already relays upstream errors in (`code: null`) rather than
-/// `proxy_error_response`'s Anthropic one (LAB-4323).
+/// 400 for a `/v1/chat/completions` body this handler cannot read. It uses
+/// the OpenAI envelope this surface already relays upstream errors in, with
+/// `code: null`, because chat clients got exactly that shape for these inputs
+/// when the upstream said it. The shared admission denials this handler also
+/// returns stay on `proxy_error_response`; the split is by owner, not by
+/// kind — `proxy_handler`'s own non-object 400 is Anthropic-shaped (LAB-4323).
 fn openai_invalid_request_response(message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -1504,7 +1506,13 @@ pub(crate) async fn openai_chat_handler(
     let mut openai_body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            error!("failed to parse request JSON: {e}");
+            warn!(
+                req_id,
+                client = %client_ip,
+                client_id = %client_id,
+                error = %e,
+                "rejected: request body is not valid JSON"
+            );
             return openai_invalid_request_response("invalid JSON");
         }
     };

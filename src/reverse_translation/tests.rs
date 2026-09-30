@@ -1113,19 +1113,6 @@ async fn openai_chat_wrong_apikey_valid_bearer() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
-/// The whole wire body of both `openai_chat_handler` parse 400s. Compared by
-/// equality, so it also pins the absence of the Anthropic top-level `type`.
-fn openai_invalid_request_body(message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "error": {
-            "message": message,
-            "type": "invalid_request_error",
-            "param": null,
-            "code": null
-        }
-    })
-}
-
 /// LAB-4323: a valid-JSON non-object body reads as `model = ""`, which every
 /// endpoint serves, so it used to go upstream for any client without a model
 /// allow-list. It must 400 locally for every client class, and before

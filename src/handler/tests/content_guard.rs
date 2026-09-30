@@ -652,19 +652,10 @@ async fn guard_every_policy_gets_the_non_object_400_on_openai_chat() {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), 400, "{key} {raw}");
-            let err = parse_wire_error_envelope(resp).await;
             assert_eq!(
-                err["error"]["type"], "invalid_request_error",
-                "{key} {raw}: {err}"
-            );
-            assert_eq!(
-                err["error"]["code"],
-                serde_json::Value::Null,
-                "{key} {raw}: {err}"
-            );
-            assert_eq!(
-                err["error"]["message"], "request body must be a JSON object",
-                "{key} {raw}: {err}"
+                parse_wire_error_envelope(resp).await,
+                openai_invalid_request_body("request body must be a JSON object"),
+                "{key} {raw}"
             );
         }
     }
