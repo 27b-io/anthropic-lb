@@ -1113,6 +1113,138 @@ async fn openai_chat_wrong_apikey_valid_bearer() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
+/// LAB-4323: a valid-JSON non-object body reads as `model = ""`, which every
+/// endpoint serves, so it used to go upstream for any client without a model
+/// allow-list. It must 400 locally for every client class, and before
+/// `pre_request_gate`: `limited` would otherwise get the gate's empty-model
+/// 403, and the operator `ops` skips the gate entirely. One endpoint per
+/// protocol arm points at the counting upstream, so a forward on either arm
+/// is a hit.
+#[tokio::test]
+async fn openai_chat_rejects_non_object_json_body_locally() {
+    use std::sync::atomic::Ordering;
+    let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = url.clone();
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api-test-aaa", &url), gw],
+        clients: vec![
+            mk_client("plain", "key-plain", &[]),
+            mk_client("limited", "key-limited", &["claude-haiku-*"]),
+            mk_client("ops", "key-ops", &[]),
+        ],
+        operators: vec!["ops".to_string()],
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+    let client = Client::new();
+    let expected = openai_invalid_request_body("request body must be a JSON object");
+
+    for key in ["key-plain", "key-limited", "key-ops"] {
+        for raw in NON_OBJECT_JSON_BODIES {
+            let resp = client
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {key}"))
+                .body(raw)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{key} {raw}"
+            );
+            let chat = parse_wire_error_envelope(resp).await;
+            assert_eq!(chat, expected, "{key} {raw}");
+
+            // Same message and `error.type` as the native surface's check,
+            // each surface in its own envelope.
+            let resp = client
+                .post(format!("http://{addr}/v1/messages"))
+                .header("content-type", "application/json")
+                .header("x-api-key", key)
+                .body(raw)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{key} {raw}"
+            );
+            let native = parse_wire_error_envelope(resp).await;
+            assert_eq!(
+                native["error"]["message"], chat["error"]["message"],
+                "{key} {raw}"
+            );
+            assert_eq!(
+                native["error"]["type"], chat["error"]["type"],
+                "{key} {raw}"
+            );
+        }
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a rejected body must never reach an upstream"
+    );
+}
+
+/// LAB-4323: the `invalid JSON` 400 was `text/plain`, next to a JSON 400 for
+/// the neighbouring defect. Now the same OpenAI envelope, with status and
+/// message unchanged.
+#[tokio::test]
+async fn openai_chat_invalid_json_returns_openai_envelope() {
+    use std::sync::atomic::Ordering;
+    let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
+    let state = test_state_with(vec![mk_endpoint_at("acct", "sk-ant-api-test-aaa", &url)]);
+    let addr = serve(build_router(state)).await;
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body("this is not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        parse_wire_error_envelope(resp).await,
+        openai_invalid_request_body("invalid JSON")
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+/// LAB-4323: the non-object check leaves object bodies alone. A
+/// `Protocol::OpenAI` endpoint forwards the client's own bytes, so they must
+/// arrive byte-identical; the spacing and key order below would not survive a
+/// re-serialization. Unlike the content-guard byte-identity tests, this one
+/// runs without the `guard` feature.
+#[tokio::test]
+async fn openai_chat_forwards_object_body_byte_identically() {
+    let (url, mut rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = url;
+    let addr = serve(build_router(test_state_with(vec![gw]))).await;
+
+    let raw =
+        r#"{ "messages": [{"role":"user","content":"hi"}],  "model":"gpt-x", "max_tokens":5 }"#;
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    // The mock sends before it replies, so the capture is already queued.
+    let (_, received) = rx
+        .try_recv()
+        .expect("an object body must reach the upstream");
+    assert_eq!(received.as_ref(), raw.as_bytes());
+}
+
 /// Integration test: verify OAuth accounts get the CC system prompt injected
 /// in requests sent through the OpenAI-compat endpoint.
 #[tokio::test]

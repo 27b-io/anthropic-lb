@@ -1416,6 +1416,29 @@ async fn forward_openai_compat_anthropic(
     ForwardOutcome::Done(Box::new(response))
 }
 
+/// 400 for a `/v1/chat/completions` body this handler cannot read. It uses
+/// the OpenAI envelope this surface already relays upstream errors in, with
+/// `code: null`, because chat clients got exactly that shape for these inputs
+/// when the upstream said it. The shared admission denials this handler also
+/// returns stay on `proxy_error_response`; the split is by owner, not by
+/// kind — `proxy_handler`'s own non-object 400 is Anthropic-shaped (LAB-4323).
+fn openai_invalid_request_response(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [("content-type", "application/json")],
+        serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": null,
+                "code": null
+            }
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
 pub(crate) async fn openai_chat_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -1483,10 +1506,32 @@ pub(crate) async fn openai_chat_handler(
     let mut openai_body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            error!("failed to parse request JSON: {e}");
-            return (StatusCode::BAD_REQUEST, "invalid JSON").into_response();
+            warn!(
+                req_id,
+                client = %client_ip,
+                client_id = %client_id,
+                error = %e,
+                "rejected: request body is not valid JSON"
+            );
+            return openai_invalid_request_response("invalid JSON");
         }
     };
+
+    // Valid JSON but not an object (`[1]`, `"x"`, `7`, `true`, `null`) reads
+    // as `model = ""`, which every endpoint serves and only an allow-listed
+    // client is gated on, so it would otherwise pass the gate and spend a
+    // credentialed round-trip only to get upstream's 400. Rejected here,
+    // before the gate, for every client class including operators; same
+    // message and `error.type` as `proxy_handler`'s check (LAB-4323).
+    if !openai_body.is_object() {
+        warn!(
+            req_id,
+            client = %client_ip,
+            client_id = %client_id,
+            "rejected: request body is not a JSON object"
+        );
+        return openai_invalid_request_response("request body must be a JSON object");
+    }
 
     let is_streaming = openai_body
         .get("stream")

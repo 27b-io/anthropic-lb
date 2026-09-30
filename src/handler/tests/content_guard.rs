@@ -622,6 +622,50 @@ async fn guard_non_block_forwards_non_array_openai_messages_byte_identically() {
     }
 }
 
+/// LAB-4323: the chat surface's non-object 400 runs ahead of the guard, so
+/// every policy gets the same 400, and `block` no longer reports it as
+/// `guard_blocked`. That matches `/v1/messages`, whose non-object check
+/// already ran first.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_every_policy_gets_the_non_object_400_on_openai_chat() {
+    use std::sync::atomic::Ordering;
+    let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
+    let mut clients = guard_non_block_clients();
+    clients.push(guard_block_client());
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &url)],
+        clients,
+        guard: crate::guard::Guard::new().expect("guard rules"),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+
+    for key in ["off-key", "annotate-key", "block-key"] {
+        for raw in NON_OBJECT_JSON_BODIES {
+            let resp = Client::new()
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {key}"))
+                .body(raw)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{key} {raw}");
+            assert_eq!(
+                parse_wire_error_envelope(resp).await,
+                openai_invalid_request_body("request body must be a JSON object"),
+                "{key} {raw}"
+            );
+        }
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a rejected body must never reach the upstream"
+    );
+}
+
 /// LAB-4341: on the native surface the forwarded document IS the unscanned
 /// one, so a `messages` the scanner cannot read as an array puts every
 /// character of it on the wire. That the upstream would reject the shape

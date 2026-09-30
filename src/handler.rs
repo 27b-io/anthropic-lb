@@ -663,9 +663,11 @@ pub(crate) fn model_unsupported_response(model: &str, openai_shape: bool) -> Res
 /// a valid-JSON non-object body (LAB-4314) — the router fallback, so any
 /// method on any path — and `exhaustion_response`'s 429/503. This is not the
 /// whole error surface — the admin surfaces' own 403s (the `/_stats` and
-/// `/metrics` IP allowlist, `authorize_admin`'s operator/reader check),
-/// `openai_chat_handler`'s `invalid JSON` 400 and proxy-internal 5xx still
-/// return `text/plain`.
+/// `/metrics` IP allowlist, `authorize_admin`'s operator/reader check) and
+/// proxy-internal 5xx still return `text/plain`, and `openai_chat_handler`'s
+/// own parse 400s (`invalid JSON`, non-object body) are OpenAI-shaped via
+/// `openai_invalid_request_response`, the shape that surface relays upstream
+/// errors in (LAB-4323).
 ///
 /// Every 429 shares `rate_limit_error`: that is the type Anthropic binds
 /// to 429, and a narrower invented one would break SDK matching. What
