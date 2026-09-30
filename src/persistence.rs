@@ -71,12 +71,12 @@ thread_local! {
 
 impl AppState {
     pub(crate) fn now_epoch() -> u64 {
-        // A gate call reads this clock more than once (`check_budget` keys the
-        // day, `pre_request_gate` computes the retry hint). Budget keys roll at
-        // UTC midnight, so a rollover between two live reads buckets usage
-        // under one day and answers for another; tests pin all reads to one
-        // instant. `#[cfg(test)]` — no clock field on AppState, no production
-        // seam, and the release build's `.text` is unchanged.
+        // A request reads this clock more than once (`record_budget_usage` and
+        // `check_budget` each key the day). Budget keys roll at UTC midnight,
+        // so a rollover between two live reads buckets usage under one day and
+        // checks another; tests pin all reads to one instant. `#[cfg(test)]` —
+        // no clock field on AppState, no production seam, and the release
+        // build's `.text` is unchanged.
         #[cfg(test)]
         if let Some(frozen) = FROZEN_NOW.with(|c| c.get()) {
             return frozen;

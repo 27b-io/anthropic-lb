@@ -765,7 +765,9 @@ impl AppState {
         }
     }
 
-    /// Check if a client is within their daily token budget. Returns Ok(()) or Err with remaining.
+    /// Check if a client is within their daily token budget. Returns Ok(()), or Err with the
+    /// seconds until the UTC day rolls over (1..=86400) — the budget's real reset time, derived
+    /// from the same clock read that keys the day, so a denial can never carry the next day's hint.
     /// When Redis is available, a present counter is authoritative; an absent key or a read
     /// error falls through to the local floor — an absent key may be a counter lost to a
     /// failed INCRBY, or a poisoned key record_budget_usage deliberately deleted (LAB-1962).
@@ -776,7 +778,9 @@ impl AppState {
             Some(&limit) => limit,
             None => return Ok(()), // no budget configured = unlimited
         };
-        let today = Self::now_epoch() / 86400;
+        let now = Self::now_epoch();
+        let today = now / 86400;
+        let retry_after = 86400 - (now % 86400);
 
         // Try Redis first for cross-replica budget enforcement. The
         // is_connected gate matters on this request-path call: while fred is
@@ -788,7 +792,7 @@ impl AppState {
             if redis.is_connected() {
                 let key = format!("alb:budget:{client_id}:{today}");
                 match redis.get::<Option<u64>, _>(key.as_str()).await {
-                    Ok(Some(used)) if used >= limit => return Err(0),
+                    Ok(Some(used)) if used >= limit => return Err(retry_after),
                     Ok(Some(_)) => return Ok(()),
                     // Absent key: fall through to the local floor. Treating
                     // absence as an authoritative allow let a single failed
@@ -806,7 +810,7 @@ impl AppState {
         // Local fallback
         if let Some(&(day, used)) = self.lock_budget_usage().get(client_id) {
             if day == today && used >= limit {
-                return Err(limit - (used.min(limit)));
+                return Err(retry_after);
             }
         }
         Ok(())
@@ -1173,9 +1177,13 @@ impl AppState {
         }
 
         // 1. Daily token budget (existing)
-        if client_id != "-" && self.check_budget(client_id).await.is_err() {
+        let budget = if client_id == "-" {
+            Ok(())
+        } else {
+            self.check_budget(client_id).await
+        };
+        if let Err(retry_after) = budget {
             self.note_client_rejection(client_id, "budget");
-            let retry_after = 86400 - (Self::now_epoch() % 86400);
             warn!(client_id = %client_id, retry_after, "rejected: daily token budget exceeded");
             let mut resp = proxy_error_response(
                 StatusCode::TOO_MANY_REQUESTS,

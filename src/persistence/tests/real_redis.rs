@@ -746,7 +746,11 @@ mod redis_integration {
         let Some((mut conn, fred)) = redis_test_conn(Db::BudgetIncrbyAccumulates).await else {
             return;
         };
-        avoid_utc_midnight().await;
+        // Frozen for the whole test: the day key the replicas record under,
+        // the key `check_budget` reads and its seconds-to-midnight payload
+        // must all come from one clock, or a UTC rollover between two live
+        // reads fails the test with no defect.
+        let _clock = FrozenClock::at(FROZEN_GATE_CLOCKS[0]);
         let budgets: HashMap<String, u64> = [("budget-cli".to_string(), 1000u64)].into();
         let replica_a = Arc::new(AppState {
             client_budgets: budgets.clone(),
@@ -786,11 +790,19 @@ mod redis_integration {
             redis: Some(fred.clone()),
             ..test_state_base()
         });
-        assert_eq!(
-            enforcing.check_budget("budget-cli").await,
-            Err(0),
-            "shared counter (350) must gate a 300 limit on a replica that recorded nothing"
-        );
+        // Both instants fall on the same UTC day, so the counter recorded
+        // above gates each; two of them so a hardcoded payload cannot pass.
+        for frozen in FROZEN_GATE_CLOCKS {
+            let _clock = FrozenClock::at(frozen);
+            let secs = enforcing.check_budget("budget-cli").await.expect_err(
+                "shared counter (350) must gate a 300 limit on a replica that recorded nothing",
+            );
+            assert_eq!(
+                secs,
+                86400 - frozen % 86400,
+                "redis-branch payload must be the seconds until the UTC day rolls over"
+            );
+        }
         assert!(
             replica_a.check_budget("budget-cli").await.is_ok(),
             "350 used of 1000 must pass"
@@ -972,10 +984,13 @@ mod redis_integration {
             .lock()
             .unwrap()
             .insert("poison-cli".to_string(), (today, 150));
-        assert_eq!(
-            state.check_budget("poison-cli").await,
-            Err(0),
-            "local fallback must enforce while the redis value is unreadable"
+        let secs = state
+            .check_budget("poison-cli")
+            .await
+            .expect_err("local fallback must enforce while the redis value is unreadable");
+        assert!(
+            (1..=86400).contains(&secs),
+            "budget payload must be the seconds until the UTC day rolls over, got {secs}"
         );
 
         // INCRBY fails with a server-reported value error → the poisoned key
@@ -1003,10 +1018,12 @@ mod redis_integration {
         // → the local floor gates. Under the pre-LAB-1962 contract Ok(None)
         // was an authoritative allow — the enforcement bypass the panel
         // flagged.
-        assert_eq!(
-            state.check_budget("poison-cli").await,
-            Err(0),
-            "absent key with redis reachable must fall through to the local floor and deny"
+        let secs = state.check_budget("poison-cli").await.expect_err(
+            "absent key with redis reachable must fall through to the local floor and deny",
+        );
+        assert!(
+            (1..=86400).contains(&secs),
+            "budget payload must be the seconds until the UTC day rolls over, got {secs}"
         );
 
         // Absent key + no local usage (genuine zero) → still allows.
@@ -1123,10 +1140,13 @@ mod redis_integration {
         // outage) — the shared counter is never created. The local
         // accumulator carries the only record of the spend (150 > 100).
         state.record_budget_usage("lost-cli", 150).await;
-        assert_eq!(
-            state.check_budget("lost-cli").await,
-            Err(0),
-            "local fallback must deny while the backend is dead"
+        let secs = state
+            .check_budget("lost-cli")
+            .await
+            .expect_err("local fallback must deny while the backend is dead");
+        assert!(
+            (1..=86400).contains(&secs),
+            "budget payload must be the seconds until the UTC day rolls over, got {secs}"
         );
 
         // Revive the backend at the SAME address; fred reconnects on its own.
@@ -1152,10 +1172,13 @@ mod redis_integration {
 
         // The money assertion: redis reachable + absent key must fall
         // through to the local floor (150 >= 100) and DENY.
-        assert_eq!(
-            state.check_budget("lost-cli").await,
-            Err(0),
-            "absent key after revival must not bypass the local floor (LAB-1962/F8)"
+        let secs = state
+            .check_budget("lost-cli")
+            .await
+            .expect_err("absent key after revival must not bypass the local floor (LAB-1962/F8)");
+        assert!(
+            (1..=86400).contains(&secs),
+            "budget payload must be the seconds until the UTC day rolls over, got {secs}"
         );
     }
 
@@ -1473,10 +1496,13 @@ mod redis_integration {
         // (50+60=110) and check_budget falls back to it, refusing
         // over-limit spend with redis dead.
         state.record_budget_usage("degrade-cli", 60).await;
-        assert_eq!(
-            state.check_budget("degrade-cli").await,
-            Err(0),
-            "local fallback must enforce the budget with redis dead"
+        let secs = state
+            .check_budget("degrade-cli")
+            .await
+            .expect_err("local fallback must enforce the budget with redis dead");
+        assert!(
+            (1..=86400).contains(&secs),
+            "budget payload must be the seconds until the UTC day rolls over, got {secs}"
         );
 
         // The periodic sync tick and the publish wrappers must return
@@ -1540,10 +1566,13 @@ mod redis_integration {
         // Dead: the INCRBY fails; the local accumulator (50+60=110)
         // enforces the 100 budget.
         state.record_budget_usage("recover-cli", 60).await;
-        assert_eq!(
-            state.check_budget("recover-cli").await,
-            Err(0),
-            "local fallback must enforce the budget while the backend is dead"
+        let secs = state
+            .check_budget("recover-cli")
+            .await
+            .expect_err("local fallback must enforce the budget while the backend is dead");
+        assert!(
+            (1..=86400).contains(&secs),
+            "budget payload must be the seconds until the UTC day rolls over, got {secs}"
         );
 
         // Revive the backend at the SAME address. fred's reconnect policy
@@ -1556,7 +1585,7 @@ mod redis_integration {
 
         // Coordination resumes: the shared counter (still 50 — the
         // dead-window INCRBY failed and was lost) becomes authoritative
-        // again, flipping check_budget from the local Err(0) back to Ok.
+        // again, flipping check_budget from the local denial back to Ok.
         eventually("coordination to resume after backend recovery", || {
             let s = state.clone();
             async move { s.check_budget("recover-cli").await.is_ok() }
@@ -1677,10 +1706,13 @@ mod redis_integration {
 
         // Local budget accounting still enforces (50 + 60 > 100).
         state.record_budget_usage("startup-cli", 60).await;
-        assert_eq!(
-            state.check_budget("startup-cli").await,
-            Err(0),
-            "local fallback must enforce the budget while unconnected"
+        let secs = state
+            .check_budget("startup-cli")
+            .await
+            .expect_err("local fallback must enforce the budget while unconnected");
+        assert!(
+            (1..=86400).contains(&secs),
+            "budget payload must be the seconds until the UTC day rolls over, got {secs}"
         );
 
         // Backend appears (proxy revives at the SAME address): the
