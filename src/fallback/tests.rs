@@ -1044,3 +1044,117 @@ async fn fallback_upstream_error_log_escapes_newline_in_body() {
         mine.join("\n")
     );
 }
+
+// ── LAB-5636: CRLF-framed upstream splits into events while streaming ──
+
+/// Raw-TCP SSE upstream like `spawn_sse_upstream`, but it sends `first`,
+/// then holds the stream open until the returned sender fires, then sends
+/// `rest` and closes cleanly.
+async fn spawn_held_sse_upstream(
+    first: &'static str,
+    rest: &'static str,
+) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let _ = stream.read(&mut buf).await;
+        let head = "HTTP/1.1 200 OK\r\n\
+             content-type: text/event-stream\r\n\
+             transfer-encoding: chunked\r\n\
+             \r\n";
+        let _ = stream.write_all(head.as_bytes()).await;
+        let chunk = format!("{:x}\r\n{first}\r\n", first.len());
+        let _ = stream.write_all(chunk.as_bytes()).await;
+        if released.await.is_err() {
+            return;
+        }
+        let chunk = format!("{:x}\r\n{rest}\r\n0\r\n\r\n", rest.len());
+        let _ = stream.write_all(chunk.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    });
+    (addr, release)
+}
+
+#[tokio::test]
+async fn fallback_translated_crlf_stream_relays_each_event_as_it_arrives() {
+    // `\r\n\r\n` never matched the old `\n\n` scan: the whole stream piled up
+    // in the buffer and the client saw nothing until the upstream ended.
+    let (mock_addr, release) = spawn_held_sse_upstream(
+        "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\r\n\r\n",
+        concat!(
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\" there\"},\"finish_reason\":null}]}\r\n\r\n",
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+        ),
+    )
+    .await;
+    let state = fallback_only_state(mock_addr, "crlf-streaming").await;
+    let addr = serve(build_router(state)).await;
+    let mut resp = Client::new()
+        .post(format!("http://{}/v1/messages", addr))
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 16,
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut body = String::new();
+    let first_delta = tokio::time::timeout(Duration::from_secs(5), async {
+        while !(body.contains("content_block_delta") && body.contains("\"Hi\"")) {
+            let chunk = resp.chunk().await.unwrap().expect("stream ended early");
+            body.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+    })
+    .await;
+    assert!(
+        first_delta.is_ok(),
+        "the first event's content_block_delta must reach the client while the upstream holds the stream open, got: {body:?}"
+    );
+
+    release.send(()).unwrap();
+    while let Some(chunk) = resp.chunk().await.unwrap() {
+        body.push_str(std::str::from_utf8(&chunk).unwrap());
+    }
+    assert!(body.contains("\" there\""), "got: {body:?}");
+    assert_eq!(
+        body.matches("event: message_stop\n").count(),
+        1,
+        "exactly one terminator, got: {body:?}"
+    );
+    assert!(!body.contains("event: error\n"), "got: {body:?}");
+}
+
+#[tokio::test]
+async fn fallback_translated_cr_only_stream_reads_every_field_line() {
+    // A lone `\r` ends an SSE line too, but `str::lines()` does not split on
+    // it: each `id:`+`data:` event read as one line and lost its `data:`. The
+    // finish_reason sits in the unterminated tail, so the flush is covered.
+    let mock_addr = spawn_sse_upstream(
+        concat!(
+            "id: 1\rdata: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\r\r",
+            "id: 2\rdata: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        ),
+        true,
+    )
+    .await;
+    let state = fallback_only_state(mock_addr, "cr-only-streaming").await;
+    let body = stream_messages(serve(build_router(state)).await).await;
+
+    assert!(body.contains("\"Hi\""), "got: {body:?}");
+    assert_eq!(
+        body.matches("event: message_stop\n").count(),
+        1,
+        "exactly one terminator, got: {body:?}"
+    );
+    assert!(!body.contains("event: error\n"), "got: {body:?}");
+}

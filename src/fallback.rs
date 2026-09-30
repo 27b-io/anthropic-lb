@@ -248,7 +248,7 @@ pub(crate) async fn try_fallback_upstream(
         let translate_response = translate;
 
         tokio::spawn(async move {
-            let mut buffer: Vec<u8> = Vec::new();
+            let mut splitter = SseEventSplitter::default();
             // `ctx.terminal` serves both branches. Translate: `completed` by
             // the translator, `errored` by the translator (in-band error) or
             // this loop (transport Err / end-of-stream guard). Passthrough:
@@ -270,11 +270,8 @@ pub(crate) async fn try_fallback_upstream(
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {
                         if translate_response {
-                            buffer.extend_from_slice(&chunk);
-                            while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
-                                let event = String::from_utf8_lossy(&buffer[..pos]).into_owned();
-                                buffer.drain(..pos + 2);
-
+                            splitter.push(&chunk);
+                            while let Some(event) = splitter.next_event() {
                                 for line in event.lines() {
                                     if let Some(data) = line.strip_prefix("data: ") {
                                         let events =
@@ -378,8 +375,8 @@ pub(crate) async fn try_fallback_upstream(
             drop(resp);
 
             // Flush remaining buffer
-            if translate_response && !buffer.is_empty() && !client_gone {
-                let remaining = String::from_utf8_lossy(&buffer).into_owned();
+            if translate_response && !client_gone {
+                let remaining = splitter.remainder();
                 for line in remaining.lines() {
                     if let Some(data) = line.strip_prefix("data: ") {
                         let events = translate_openai_sse_to_anthropic(data, &mut ctx);

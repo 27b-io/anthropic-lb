@@ -1167,7 +1167,7 @@ async fn forward_openai_compat_anthropic(
         let status_code = status.as_u16();
 
         tokio::spawn(async move {
-            let mut buffer: Vec<u8> = Vec::new();
+            let mut splitter = SseEventSplitter::default();
             let mut scanner = SseUsageScanner::default();
             // Terminator state: see `StreamContext::terminal`.
             let mut ctx = StreamContext {
@@ -1181,12 +1181,9 @@ async fn forward_openai_compat_anthropic(
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {
                         scanner.push(&chunk);
-                        buffer.extend_from_slice(&chunk);
+                        splitter.push(&chunk);
 
-                        while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
-                            let event = String::from_utf8_lossy(&buffer[..pos]).into_owned();
-                            buffer.drain(..pos + 2);
-
+                        while let Some(event) = splitter.next_event() {
                             if event.trim().is_empty() {
                                 continue;
                             }
@@ -1249,8 +1246,8 @@ async fn forward_openai_compat_anthropic(
 
             // Process any remaining data in buffer (skip once a terminator is
             // out — nothing may follow it — or the client is gone)
-            if !ctx.terminal.reached() && !client_gone && !buffer.is_empty() {
-                let remaining = String::from_utf8_lossy(&buffer).into_owned();
+            if !ctx.terminal.reached() && !client_gone {
+                let remaining = splitter.remainder();
                 if !remaining.trim().is_empty() {
                     if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
                         if translated.ends_with("data: [DONE]\n\n") && !ctx.terminal.errored {
