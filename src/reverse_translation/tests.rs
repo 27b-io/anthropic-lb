@@ -1191,14 +1191,15 @@ async fn openai_chat_rejects_non_object_json_body_locally() {
     );
 }
 
-/// LAB-5497: a body that repeats a top-level key must 400 locally on both
-/// surfaces, for every client class, before the allow-list, routing or any
-/// upstream call. Both surfaces often forward the client's bytes as sent, so
-/// forwarding would let an upstream that keeps the first key act on a field
-/// the proxy never checked. One endpoint per protocol arm points at the
-/// counting upstream, so a forward on either arm is a hit.
+/// LAB-5497: a body that repeats a top-level key, or spells one outside
+/// lowercase ASCII, must 400 locally on both surfaces, for every client
+/// class, before the allow-list, routing or any upstream call. Both surfaces
+/// often forward the client's bytes as sent, so forwarding would let an
+/// upstream that keeps the first key, or ignores key case, act on a field the
+/// proxy never checked. One endpoint per protocol arm points at the counting
+/// upstream, so a forward on either arm is a hit.
 #[tokio::test]
-async fn duplicate_top_level_key_is_rejected_locally_on_both_surfaces() {
+async fn ambiguous_top_level_key_is_rejected_locally_on_both_surfaces() {
     use std::sync::atomic::Ordering;
     let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
@@ -1215,10 +1216,10 @@ async fn duplicate_top_level_key_is_rejected_locally_on_both_surfaces() {
     });
     let addr = serve(build_router(state)).await;
     let client = Client::new();
-    let message = "request body must not repeat a top-level key";
+    let message = "request body top-level keys must be unique and lowercase ASCII";
 
     for key in ["key-plain", "key-limited", "key-ops"] {
-        for raw in DUPLICATE_KEY_BODIES {
+        for raw in AMBIGUOUS_KEY_BODIES {
             let resp = client
                 .post(format!("http://{addr}/v1/messages"))
                 .header("content-type", "application/json")

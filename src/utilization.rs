@@ -743,34 +743,34 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for TopLevelObject
     }
 }
 
-/// Whether `body` is a JSON object whose top-level keys are all distinct,
-/// compared decoded and case-folded (`"model"`, `"m\u006fdel"` and `"MODEL"`
-/// are one key).
+/// Whether `body` is a JSON object whose top-level keys are all distinct and
+/// all spelled in lowercase ASCII, compared decoded (`"m\u006fdel"` is
+/// `"model"`; `"MODEL"` is refused).
 ///
 /// The handlers read every field from a `serde_json::Value`, which keeps the
-/// last of two duplicate keys, but often forward the client's bytes as sent.
-/// An upstream that keeps the first key, or that matches keys regardless of
-/// case as Go's `encoding/json` does, would then act on a field no policy
-/// check saw. Refusing the ambiguity at ingress makes the outcome independent
-/// of which duplicate the upstream reads.
+/// last of two duplicate keys and matches keys exactly, but often forward the
+/// client's bytes as sent. An upstream that keeps the first key, or that
+/// matches keys regardless of case as Go's `encoding/json` does, would then
+/// act on a field no policy check saw: a repeated `model`, or a lone `"MODEL"`
+/// that the checks read as no model at all. Every Anthropic and OpenAI
+/// top-level field is lowercase ASCII, so that spelling costs a valid body
+/// nothing, and no case fold maps one such key onto another. Refusing the
+/// ambiguity at ingress makes the outcome independent of how the upstream
+/// reads keys.
 ///
-/// A body this parser cannot read as an object counts as not unique. Callers
+/// A body this parser cannot read as an object counts as ambiguous. Callers
 /// have already parsed it as an object, so that arm is unreachable in
 /// practice; it fails closed rather than waving an unchecked body through.
-pub(crate) fn top_level_keys_unique(body: &[u8]) -> bool {
+pub(crate) fn top_level_keys_unambiguous(body: &[u8]) -> bool {
     let Ok(TopLevelObject(entries)) =
         serde_json::from_slice::<TopLevelObject<serde::de::IgnoredAny>>(body)
     else {
         return false;
     };
     let mut seen = std::collections::HashSet::with_capacity(entries.len());
-    // Lowercasing then uppercasing merges every pair a Unicode simple case
-    // fold merges (U+212A KELVIN SIGN with `k`, U+017F with `s`), plus a few
-    // more such as U+00DF with `ss`. Merging more only rejects more, and no
-    // valid body has two top-level keys that differ by case alone.
-    entries
-        .into_iter()
-        .all(|(key, _)| seen.insert(key.to_lowercase().to_uppercase()))
+    entries.into_iter().all(|(key, _)| {
+        key.bytes().all(|b| b.is_ascii() && !b.is_ascii_uppercase()) && seen.insert(key)
+    })
 }
 
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's

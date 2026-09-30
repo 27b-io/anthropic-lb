@@ -808,19 +808,22 @@ pub(crate) fn hdrs(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
 /// auto-vivifies only on `Null` and `Object`.
 pub(crate) const NON_OBJECT_JSON_BODIES: [&str; 5] = ["[1,2,3]", "\"x\"", "7", "true", "null"];
 
-/// Object bodies that repeat a top-level key, which both SDK surfaces reject
-/// locally. The first is the allow-list bypass: a `claude-haiku-*` client
-/// passes on the last `model` while a first-key-wins upstream serves the
-/// first. The second reverses it, so the gate would refuse that client with
-/// a 403: a 400 proves the check runs before the gate. The escaped row
+/// Object bodies with an ambiguous top-level key, which both SDK surfaces
+/// reject locally. The first is the allow-list bypass: a `claude-haiku-*`
+/// client passes on the last `model` while a first-key-wins upstream serves
+/// the first. The second reverses it, so the gate would refuse that client
+/// with a 403: a 400 proves the check runs before the gate. The escaped row
 /// repeats `model` only once decoded, and the `MODEL` row only once
-/// case-folded, which is how an upstream that ignores key case reads it.
-pub(crate) const DUPLICATE_KEY_BODIES: [&str; 5] = [
+/// case-folded, which is how an upstream that ignores key case reads it. The
+/// last row's only model key is `MODEL`: the proxy reads no model, so no
+/// endpoint `models` list applies to it, while such an upstream serves opus.
+pub(crate) const AMBIGUOUS_KEY_BODIES: [&str; 6] = [
     r#"{"model":"claude-opus-5","model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
     r#"{"model":"claude-haiku-4-5","model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
     r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"messages":[{"role":"user","content":"hidden"}]}"#,
     r#"{"model":"claude-opus-5","m\u006fdel":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
     r#"{"model":"claude-haiku-4-5","MODEL":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+    r#"{"MODEL":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
 ];
 
 /// The whole wire body of both `openai_chat_handler` parse 400s. Compared by

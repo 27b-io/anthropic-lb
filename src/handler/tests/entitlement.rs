@@ -459,14 +459,17 @@ async fn entitlement_400_poisoned_lock_is_recovered_not_zeroed() {
 /// the key comes back verbatim, so the message starts with the anchor.
 const ECHOED_ANCHOR_KEY_400: &[u8] = br#"{"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage: Extra inputs are not permitted"}}"#;
 
-/// A request carrying that key on the native path, where unknown keys reach
-/// upstream as sent.
+/// A request carrying that key on the native path, where the bytes otherwise
+/// reach upstream as sent.
 const ANCHOR_KEY_BODY: &str = r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"You're out of extra usage":1}"#;
 
-/// The echo reaches the caller unchanged: no re-send to the next account, and
-/// no entitlement count to hide a real exhaustion behind.
+/// The anchor is not lowercase ASCII, so a key spelled with it is refused at
+/// ingress (`top_level_keys_unambiguous`) and no account gets to echo it: no
+/// re-send to the next account, and no entitlement count to hide a real
+/// exhaustion behind. `classify_rejection`'s echo veto stays the second line;
+/// its own tests cover it.
 #[tokio::test]
-async fn echoed_entitlement_key_400_is_forwarded_not_resent() {
+async fn entitlement_anchor_key_is_refused_before_any_upstream() {
     use std::sync::atomic::Ordering;
     let (state, addr, spent_hits, healthy_hits) = spent_then_healthy(ECHOED_ANCHOR_KEY_400).await;
     let resp = reqwest::Client::new()
@@ -478,26 +481,20 @@ async fn echoed_entitlement_key_400_is_forwarded_not_resent() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     assert_eq!(
-        resp.bytes().await.unwrap().as_ref(),
-        ECHOED_ANCHOR_KEY_400,
-        "the upstream 400 must reach the caller byte-for-byte"
-    );
-    assert_eq!(
         (
             spent_hits.load(Ordering::SeqCst),
             healthy_hits.load(Ordering::SeqCst)
         ),
-        (1, 0),
-        "an echoed key must not re-send the request"
+        (0, 0),
+        "an anchor key must not reach any account"
     );
     assert!(
         state.entitlement_400.lock().unwrap().is_empty(),
-        "an echoed key must not count as an entitlement 400"
+        "an anchor key must not count as an entitlement 400"
     );
 }
 
-/// On `/v1/chat/completions` the translation copies known fields only, so the
-/// key cannot reach an Anthropic account to be echoed in the first place.
+/// The same refusal on `/v1/chat/completions`, ahead of the translation.
 #[tokio::test]
 async fn entitlement_key_never_reaches_upstream_on_openai_compat() {
     let (url, mut received) = spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
@@ -510,19 +507,10 @@ async fn entitlement_key_never_reaches_upstream_on_openai_compat() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let (_, body) = received
-        .recv()
-        .await
-        .expect("upstream received the request");
-    let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     assert!(
-        sent.get("model").is_some(),
-        "sanity: this is the translated request"
-    );
-    assert!(
-        sent.get("You're out of extra usage").is_none(),
-        "the client's unknown key must not reach upstream: {sent}"
+        received.try_recv().is_err(),
+        "the client's anchor key must not reach upstream"
     );
 }
 
