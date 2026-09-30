@@ -637,7 +637,7 @@ async fn guard_every_policy_gets_the_non_object_400_on_openai_chat() {
     let state = Arc::new(AppState {
         endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &url)],
         clients,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let addr = serve(build_router(state)).await;
