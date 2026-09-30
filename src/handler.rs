@@ -653,7 +653,11 @@ pub(crate) fn model_unsupported_response(model: &str, openai_shape: bool) -> Res
 
 /// Anthropic-shaped JSON error envelope for every proxy-generated admission
 /// denial on the SDK surfaces, `/v1/messages` and `/v1/chat/completions`
-/// (LAB-4129, LAB-4153): the IP-allowlist 403, the failed-auth throttle 429
+/// (LAB-4129, LAB-4153), with one exception: `openai_chat_handler`'s two
+/// parse 400s, `invalid JSON` and a valid-JSON non-object body, are request
+/// validation rather than admission, and take the OpenAI envelope that
+/// surface already relays upstream errors in, `code: null` (LAB-4323).
+/// Covered: the IP-allowlist 403, the failed-auth throttle 429
 /// (shared with the admin surfaces through `authorize_admin`),
 /// `authenticate` 401, `pre_request_gate` 403/429,
 /// `deny_admin_reader`'s read-only-principal 403 (LAB-4395),
@@ -663,9 +667,8 @@ pub(crate) fn model_unsupported_response(model: &str, openai_shape: bool) -> Res
 /// a valid-JSON non-object body (LAB-4314) — the router fallback, so any
 /// method on any path — and `exhaustion_response`'s 429/503. This is not the
 /// whole error surface — the admin surfaces' own 403s (the `/_stats` and
-/// `/metrics` IP allowlist, `authorize_admin`'s operator/reader check),
-/// `openai_chat_handler`'s `invalid JSON` 400 and proxy-internal 5xx still
-/// return `text/plain`.
+/// `/metrics` IP allowlist, `authorize_admin`'s operator/reader check) and
+/// proxy-internal 5xx still return `text/plain`.
 ///
 /// Every 429 shares `rate_limit_error`: that is the type Anthropic binds
 /// to 429, and a narrower invented one would break SDK matching. What

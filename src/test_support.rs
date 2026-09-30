@@ -802,6 +802,12 @@ pub(crate) fn hdrs(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
     h
 }
 
+/// Every valid-JSON shape that is not an object — the body both SDK
+/// surfaces reject locally, `/v1/messages` and `/v1/chat/completions`. On the
+/// native surface it was also a panic: `serde_json::Value`'s `IndexMut<&str>`
+/// auto-vivifies only on `Null` and `Object`.
+pub(crate) const NON_OBJECT_JSON_BODIES: [&str; 5] = ["[1,2,3]", "\"x\"", "7", "true", "null"];
+
 pub(crate) const TEST_IP: &str = "10.0.0.7";
 
 pub(crate) fn test_ip() -> IpAddr {

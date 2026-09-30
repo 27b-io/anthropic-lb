@@ -102,11 +102,6 @@ fn oauth_system_prompt_handles_null_system() {
     assert_eq!(system[0]["text"].as_str().unwrap(), OAUTH_SYSTEM_PROMPT);
 }
 
-/// Every valid-JSON shape that is not an object. One list, one defect
-/// class: `serde_json::Value`'s `IndexMut<&str>` auto-vivifies only on
-/// `Null` and `Object` and panics on everything else.
-const NON_OBJECT_JSON_BODIES: [&str; 5] = ["[1,2,3]", "\"x\"", "7", "true", "null"];
-
 /// The shared injector must never index into a non-object: both of its
 /// call sites (`proxy_handler`, `openai_chat_handler`) route through here,
 /// so this is the locus that closes the class for all callers.
