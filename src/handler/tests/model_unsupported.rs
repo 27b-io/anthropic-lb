@@ -972,9 +972,11 @@ async fn bogus_model_spray_cannot_block_a_genuine_learn() {
     );
 }
 
-/// A model 404 marks only the model it names. With two `model` keys the proxy
-/// reads the last one; an upstream that read the first would reject a model
-/// the proxy never asked for, and must not get the requested one cached.
+/// A model 404 marks only the model it names. An upstream that rejects a
+/// model the proxy never asked for must not get the requested one cached.
+/// Two `model` keys were one way to get there; they now 400 at ingress
+/// (`duplicate_top_level_key_is_rejected_locally_on_both_surfaces`), so this
+/// body names one model and the upstream's 404 names another.
 #[tokio::test]
 async fn model_404_naming_another_model_does_not_negative_cache() {
     use std::sync::atomic::Ordering;
@@ -994,7 +996,7 @@ async fn model_404_naming_another_model_does_not_negative_cache() {
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .header("content-type", "application/json")
-        .body(r#"{"model":"claude-nope-1","model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .body(r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
         .unwrap();

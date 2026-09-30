@@ -743,6 +743,28 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for TopLevelObject
     }
 }
 
+/// Whether `body` is a JSON object whose top-level keys are all distinct,
+/// compared decoded (`"model"` and `"m\u006fdel"` are the same key).
+///
+/// The handlers read every field from a `serde_json::Value`, which keeps the
+/// last of two duplicate keys, but often forward the client's bytes as sent.
+/// An upstream that keeps the first key would then act on a field no policy
+/// check saw. Refusing the ambiguity at ingress makes the outcome independent
+/// of which duplicate the upstream reads.
+///
+/// A body this parser cannot read as an object counts as not unique. Callers
+/// have already parsed it as an object, so that arm is unreachable in
+/// practice; it fails closed rather than waving an unchecked body through.
+pub(crate) fn top_level_keys_unique(body: &[u8]) -> bool {
+    let Ok(TopLevelObject(entries)) =
+        serde_json::from_slice::<TopLevelObject<serde::de::IgnoredAny>>(body)
+    else {
+        return false;
+    };
+    let mut seen = std::collections::HashSet::with_capacity(entries.len());
+    entries.into_iter().all(|(key, _)| seen.insert(key))
+}
+
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
 /// `affinity_headroom` is below 50% of the alternative's, stickiness is broken.
 pub(crate) const LEGACY_AFFINITY_OVERRIDE_RATIO: f64 = 0.5;

@@ -1532,6 +1532,18 @@ pub(crate) async fn openai_chat_handler(
         );
         return openai_invalid_request_response("request body must be a JSON object");
     }
+    // `Protocol::OpenAI` endpoints get these bytes verbatim, so a repeated
+    // key would let the upstream read a field the gate never saw. Same
+    // check and message as `proxy_handler`'s.
+    if !top_level_keys_unique(&body_bytes) {
+        warn!(
+            req_id,
+            client = %client_ip,
+            client_id = %client_id,
+            "rejected: request body repeats a top-level key"
+        );
+        return openai_invalid_request_response("request body must not repeat a top-level key");
+    }
 
     let is_streaming = openai_body
         .get("stream")

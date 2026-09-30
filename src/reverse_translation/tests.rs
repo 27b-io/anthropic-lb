@@ -1191,6 +1191,83 @@ async fn openai_chat_rejects_non_object_json_body_locally() {
     );
 }
 
+/// LAB-5497: a body that repeats a top-level key must 400 locally on both
+/// surfaces, for every client class, before the allow-list, routing or any
+/// upstream call. Both surfaces often forward the client's bytes as sent, so
+/// forwarding would let an upstream that keeps the first key act on a field
+/// the proxy never checked. One endpoint per protocol arm points at the
+/// counting upstream, so a forward on either arm is a hit.
+#[tokio::test]
+async fn duplicate_top_level_key_is_rejected_locally_on_both_surfaces() {
+    use std::sync::atomic::Ordering;
+    let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = url.clone();
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api-test-aaa", &url), gw],
+        clients: vec![
+            mk_client("plain", "key-plain", &[]),
+            mk_client("limited", "key-limited", &["claude-haiku-*"]),
+            mk_client("ops", "key-ops", &[]),
+        ],
+        operators: vec!["ops".to_string()],
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+    let client = Client::new();
+    let message = "request body must not repeat a top-level key";
+
+    for key in ["key-plain", "key-limited", "key-ops"] {
+        for raw in DUPLICATE_KEY_BODIES {
+            let resp = client
+                .post(format!("http://{addr}/v1/messages"))
+                .header("content-type", "application/json")
+                .header("x-api-key", key)
+                .body(raw)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{key} {raw}"
+            );
+            assert_eq!(
+                parse_wire_error_envelope(resp).await,
+                serde_json::json!({
+                    "type": "error",
+                    "error": {"type": "invalid_request_error", "message": message}
+                }),
+                "{key} {raw}"
+            );
+
+            let resp = client
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {key}"))
+                .body(raw)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{key} {raw}"
+            );
+            assert_eq!(
+                parse_wire_error_envelope(resp).await,
+                openai_invalid_request_body(message),
+                "{key} {raw}"
+            );
+        }
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a rejected body must never reach an upstream"
+    );
+}
+
 /// LAB-4323: the `invalid JSON` 400 was `text/plain`, next to a JSON 400 for
 /// the neighbouring defect. Now the same OpenAI envelope, with status and
 /// message unchanged.
