@@ -1544,3 +1544,63 @@ async fn streaming_upstream_disconnect_emits_sse_error_to_client() {
         "error frame must use Anthropic's documented api_error type, got: {body_s:?}"
     );
 }
+
+/// Stream `/v1/chat/completions` against an Anthropic upstream serving
+/// `upstream_body`. Returns each chunk's `(choices[0].delta,
+/// choices[0].finish_reason)` in order and the number of `[DONE]` lines.
+async fn chat_stream_deltas(
+    upstream_body: String,
+) -> (Vec<(serde_json::Value, serde_json::Value)>, usize) {
+    let mock_app = Router::new().fallback(any(move || {
+        let body = upstream_body.clone();
+        async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+    }));
+    let (app, _state) = test_openai_app(&format!("http://{}", serve(mock_app).await), None);
+    let body = Client::new()
+        .post(format!("http://{}/v1/chat/completions", serve(app).await))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hello"}],"max_tokens":100,"stream":true}"#)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    let mut deltas = Vec::new();
+    let mut dones = 0;
+    for line in body.lines() {
+        if line == "data: [DONE]" {
+            dones += 1;
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            let v: serde_json::Value = serde_json::from_str(data).unwrap();
+            let choice = &v["choices"][0];
+            deltas.push((choice["delta"].clone(), choice["finish_reason"].clone()));
+        }
+    }
+    (deltas, dones)
+}
+
+#[tokio::test]
+async fn openai_chat_streaming_crlf_upstream_matches_lf() {
+    // LAB-5636: a CRLF-framed upstream never matched the old `\n\n` scan, so
+    // the whole stream reached the post-loop flush as one "event" and only
+    // its last `event:`/`data:` pair survived.
+    let lf = chat_stream_deltas(MOCK_ANTHROPIC_SSE.to_string()).await;
+    let crlf = chat_stream_deltas(MOCK_ANTHROPIC_SSE.replace('\n', "\r\n")).await;
+
+    let text: String = crlf
+        .0
+        .iter()
+        .filter_map(|(delta, _)| delta["content"].as_str())
+        .collect();
+    assert_eq!(text, "Hello world", "every delta, in order: {crlf:?}");
+    assert_eq!(crlf.1, 1, "exactly one [DONE]: {crlf:?}");
+    assert_eq!(crlf, lf, "CRLF framing must translate like LF framing");
+}

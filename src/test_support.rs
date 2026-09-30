@@ -363,6 +363,18 @@ pub(crate) async fn mock_anthropic_handler(req: Request<Body>) -> Response {
     resp
 }
 
+/// The Anthropic SSE stream `mock_anthropic_streaming_handler` serves: two
+/// text deltas ("Hello", " world"), LF-framed.
+pub(crate) const MOCK_ANTHROPIC_SSE: &str = concat!(
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+);
+
 /// Mock that returns Anthropic SSE streaming format
 pub(crate) async fn mock_anthropic_streaming_handler(req: Request<Body>) -> Response {
     let has_auth =
@@ -371,17 +383,7 @@ pub(crate) async fn mock_anthropic_streaming_handler(req: Request<Body>) -> Resp
         return (StatusCode::UNAUTHORIZED, "missing auth").into_response();
     }
 
-    let events = [
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
-            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
-            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-        ];
-
-    let body = events.join("");
+    let body = MOCK_ANTHROPIC_SSE;
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")

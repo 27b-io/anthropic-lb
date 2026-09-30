@@ -51,6 +51,7 @@ mod response_cache;
 mod reverse_translation;
 mod routing;
 mod session_registry;
+mod sse_events;
 mod state;
 mod stats;
 #[cfg(test)]
@@ -70,6 +71,7 @@ use persistence::*;
 use response_cache::*;
 use reverse_translation::*;
 use session_registry::*;
+use sse_events::*;
 use state::*;
 use stats::*;
 #[cfg(test)]
