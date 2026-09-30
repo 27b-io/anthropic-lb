@@ -36,6 +36,44 @@ fn populated_allowlist_blocks_unknown() {
     assert!(!state.is_ip_allowed(&"10.0.0.2".parse().unwrap()));
 }
 
+/// A caller outside `allowed_ips` gets a 403 in the JSON error envelope on
+/// both SDK surfaces (LAB-4153), and the request never reaches an upstream.
+#[tokio::test]
+async fn ip_allowlist_403_is_an_envelope_on_both_sdk_surfaces() {
+    let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
+        // The test client connects from 127.0.0.1.
+        allowed_ips: vec![IpAllowEntry::Addr("10.0.0.1".parse().unwrap())],
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+    let client = Client::new();
+
+    // A body both surfaces would accept, so only the allowlist can refuse it.
+    let body = r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+    for path in ["/v1/messages", "/v1/chat/completions"] {
+        let resp = client
+            .post(format!("http://{addr}{path}"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN, "{path}");
+        assert!(resp.headers().get("retry-after").is_none(), "{path}");
+        let json = parse_wire_error_envelope(resp).await;
+        assert_eq!(json["type"], "error", "{path}: {json}");
+        assert_eq!(json["error"]["type"], "permission_error", "{path}: {json}");
+        assert_eq!(json["error"]["message"], "forbidden", "{path}: {json}");
+    }
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a denied caller must never reach an upstream"
+    );
+}
+
 // ── Client identity resolution tests ──────────────────────────
 
 #[test]
@@ -820,7 +858,8 @@ async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
 
-    // The next invalid credential is throttled with retry-after.
+    // The next invalid credential is throttled with retry-after, in the
+    // JSON error envelope (LAB-4153).
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
         .header("x-api-key", "key-wrong")
@@ -838,6 +877,13 @@ async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
         .parse()
         .expect("retry-after must be whole seconds");
     assert!((1..=60).contains(&retry));
+    let json = parse_wire_error_envelope(resp).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "rate_limit_error");
+    assert_eq!(
+        json["error"]["message"],
+        "too many failed authentication attempts"
+    );
 
     // A valid credential from the same IP must still reach the handler.
     let resp = client

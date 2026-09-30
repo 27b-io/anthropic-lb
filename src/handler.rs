@@ -598,16 +598,22 @@ pub(crate) fn exhaustion_response(
     if last_saw_transient && !last_saw_529 {
         state.pool_exhausted[PoolExhaustion::Transient as usize].fetch_add(1, Ordering::Relaxed);
         warn!("all endpoints transient-failed after backoff; returning retryable 503");
-        return (
+        let mut resp = proxy_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            [("retry-after", "1")],
+            "overloaded_error",
             "upstream temporarily unreachable",
-        )
-            .into_response();
+        );
+        resp.headers_mut()
+            .insert("retry-after", HeaderValue::from_static("1"));
+        return resp;
     }
     state.pool_exhausted[PoolExhaustion::RateLimited as usize].fetch_add(1, Ordering::Relaxed);
     warn!("all endpoints exhausted (rate-limited)");
-    (StatusCode::TOO_MANY_REQUESTS, "exhausted all endpoints").into_response()
+    proxy_error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limit_error",
+        "exhausted all endpoints",
+    )
 }
 
 /// Synthesized model-unsupported 404 for the warm negative-cache path: every
@@ -645,24 +651,31 @@ pub(crate) fn model_unsupported_response(model: &str, openai_shape: bool) -> Res
         .into_response()
 }
 
-/// Anthropic-shaped JSON error envelope for the proxy-generated admission
-/// denials (LAB-4129): `authenticate` 401, `pre_request_gate` 403/429,
+/// Anthropic-shaped JSON error envelope for every proxy-generated admission
+/// denial on the SDK surfaces, `/v1/messages` and `/v1/chat/completions`
+/// (LAB-4129, LAB-4153): the IP-allowlist 403, the failed-auth throttle 429
+/// (shared with the admin surfaces through `authorize_admin`),
+/// `authenticate` 401, `pre_request_gate` 403/429,
 /// `deny_admin_reader`'s read-only-principal 403 (LAB-4395),
-/// `reserve_request_body` 503, `read_body_bounded` 408, the
+/// `reserve_request_body` 503, `read_body_bounded` 408 and bad-body 400, the
 /// untranslatable-request 400, the fast-mode entitlement 400 replayed on
-/// the warm negative-cache path (LAB-2687), and `proxy_handler`'s 400 for
+/// the warm negative-cache path (LAB-2687), `proxy_handler`'s 400 for
 /// a valid-JSON non-object body (LAB-4314) — the router fallback, so any
-/// method on any path. This is not the whole error surface — the
-/// IP-allowlist 403, retry exhaustion, the failed-auth throttle and the
-/// other bad-body 400s still return `text/plain`.
+/// method on any path — and `exhaustion_response`'s 429/503. This is not the
+/// whole error surface — the admin surfaces' own 403s (the `/_stats` and
+/// `/metrics` IP allowlist, `authorize_admin`'s operator/reader check),
+/// `openai_chat_handler`'s `invalid JSON` 400 and proxy-internal 5xx still
+/// return `text/plain`.
 ///
-/// All three 429s share `rate_limit_error`: that is the type Anthropic binds
+/// Every 429 shares `rate_limit_error`: that is the type Anthropic binds
 /// to 429, and a narrower invented one would break SDK matching. What
-/// separates them on the wire is `retry-after` — budget and utilization
-/// carry one, the emergency brake deliberately does not. Two types are ours
-/// rather than Anthropic's, which binds `overloaded_error` to 529 and has no
-/// 408 type at all: `503 overloaded_error` and `408 timeout_error` name load
-/// shed *here*, not an upstream condition relayed.
+/// separates them on the wire is `retry-after` — budget, utilization and the
+/// failed-auth throttle carry one, the emergency brake and rate-limited
+/// exhaustion deliberately do not. Two types are ours rather than
+/// Anthropic's, which binds `overloaded_error` to 529 and has no 408 type at
+/// all: `503 overloaded_error` and `408 timeout_error` name a condition found
+/// *here* (load shed, or every upstream unreachable), not an upstream error
+/// relayed.
 ///
 /// Deliberately NOT surface-shaped, unlike `guard_blocked_response` and
 /// `model_unsupported_response`: those carry a machine-readable cause in
@@ -1565,7 +1578,7 @@ pub(crate) async fn proxy_handler(
     // IP allowlist check
     if !state.is_ip_allowed(&client_ip) {
         warn!(client = %client_ip, "rejected: IP not in allowlist");
-        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+        return proxy_error_response(StatusCode::FORBIDDEN, "permission_error", "forbidden");
     }
 
     // Proxy auth: x-api-key against the [[clients]] table, else legacy proxy_key.
