@@ -190,7 +190,7 @@ pub(crate) async fn try_fallback_upstream(
             req_id,
             upstream = ep.name,
             status = status.as_u16(),
-            body = %err_body,
+            body = ?err_body,
             "fallback: unified endpoint returned error"
         );
         // Gateway rejected the MODEL (e.g. LiteLLM "Invalid model name"):
@@ -202,7 +202,8 @@ pub(crate) async fn try_fallback_upstream(
         // entitlement 400.
         let model_unsupported =
             serde_json::from_str::<serde_json::Value>(&err_body).is_ok_and(|v| {
-                classify_rejection(status, &v, ep.protocol, model, request_body)
+                // Always the endpoint's own bearer token here, never the caller's.
+                classify_rejection(status, &v, ep.protocol, model, request_body, false)
                     == Some(UpstreamRejection::ModelUnsupported)
             });
         let response = if translate {
@@ -241,7 +242,7 @@ pub(crate) async fn try_fallback_upstream(
 
     // Streaming response
     if is_streaming {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+        let (tx, body) = relay_channel();
         let req_id = req_id.to_string();
         let upstream_name = ep.name.clone();
         let translate_response = translate;
@@ -279,10 +280,16 @@ pub(crate) async fn try_fallback_upstream(
                                         let events =
                                             translate_openai_sse_to_anthropic(data, &mut ctx);
                                         for ev in events {
-                                            if tx.send(Ok(bytes::Bytes::from(ev))).await.is_err() {
+                                            if !relay_send(&tx, ev.into(), &req_id).await {
                                                 client_gone = true;
                                                 break;
                                             }
+                                        }
+                                        // An event can carry more `data:`
+                                        // lines; none may be sent once the
+                                        // client is gone.
+                                        if client_gone {
+                                            break;
                                         }
                                     }
                                 }
@@ -320,7 +327,7 @@ pub(crate) async fn try_fallback_upstream(
                                     }
                                 }
                             }
-                            if tx.send(Ok(chunk)).await.is_err() {
+                            if !relay_send(&tx, chunk, &req_id).await {
                                 client_gone = true;
                             }
                         }
@@ -359,13 +366,16 @@ pub(crate) async fn try_fallback_upstream(
                         } else {
                             openai_error_frame(&msg)
                         };
-                        if tx.send(Ok(frame)).await.is_err() {
+                        if !relay_send(&tx, frame, &req_id).await {
                             client_gone = true;
                         }
                         break;
                     }
                 }
             }
+            // Done with the upstream: a stalled client must not keep it
+            // pinned while the tail is flushed.
+            drop(resp);
 
             // Flush remaining buffer
             if translate_response && !buffer.is_empty() && !client_gone {
@@ -374,10 +384,13 @@ pub(crate) async fn try_fallback_upstream(
                     if let Some(data) = line.strip_prefix("data: ") {
                         let events = translate_openai_sse_to_anthropic(data, &mut ctx);
                         for ev in events {
-                            if tx.send(Ok(bytes::Bytes::from(ev))).await.is_err() {
+                            if !relay_send(&tx, ev.into(), &req_id).await {
                                 client_gone = true;
                                 break;
                             }
+                        }
+                        if client_gone {
+                            break;
                         }
                     }
                 }
@@ -398,13 +411,8 @@ pub(crate) async fn try_fallback_upstream(
                     "fallback: upstream stream ended without a terminator — error frame sent"
                 );
                 ctx.terminal.errored = true;
-                if tx
-                    .send(Ok(anthropic_error_frame(
-                        "upstream closed stream before completion",
-                    )))
-                    .await
-                    .is_err()
-                {
+                let frame = anthropic_error_frame("upstream closed stream before completion");
+                if !relay_send(&tx, frame, &req_id).await {
                     client_gone = true;
                 }
             }
@@ -433,9 +441,7 @@ pub(crate) async fn try_fallback_upstream(
                 .header("content-type", "text/event-stream")
                 .header("cache-control", "no-cache")
                 .header("connection", "keep-alive")
-                .body(Body::from_stream(
-                    tokio_stream::wrappers::ReceiverStream::new(rx),
-                ))
+                .body(body)
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "fallback stream error").into_response()
                 }),

@@ -1397,14 +1397,15 @@ impl AppState {
         if dropped.is_empty() {
             return;
         }
-        let truncated: Vec<&str> = dropped
+        let truncated: Vec<String> = dropped
             .iter()
             .map(|f| {
                 let mut end = f.len().min(MAX_DROPPED_BETA_FLAG_LEN);
                 while !f.is_char_boundary(end) {
                     end -= 1;
                 }
-                &f[..end]
+                // A literal `_other` flag must not land on the overflow key.
+                escape_sentinel(&f[..end], &["other"])
             })
             .collect();
         let mut map = lock_recovering(&self.beta_flags_dropped, "beta_flags_dropped");
@@ -1412,9 +1413,9 @@ impl AppState {
         // sends the same unlisted flag at request rate, and the counter
         // already carries the volume. Repeats log at debug for correlation.
         let mut first_seen: Vec<&str> = Vec::new();
-        for flag in &truncated {
-            if map.contains_key(*flag) || map.len() < MAX_DROPPED_BETA_FLAGS {
-                if !map.contains_key(*flag) {
+        for flag in truncated.iter().map(String::as_str) {
+            if map.contains_key(flag) || map.len() < MAX_DROPPED_BETA_FLAGS {
+                if !map.contains_key(flag) {
                     first_seen.push(flag);
                 }
                 *map.entry(flag.to_string()).or_insert(0) += 1;
@@ -1437,8 +1438,8 @@ impl AppState {
         // trace on every request it was dropped from (AC-12).
         let repeats: Vec<&str> = truncated
             .iter()
+            .map(String::as_str)
             .filter(|f| !first_seen.contains(f))
-            .copied()
             .collect();
         if !repeats.is_empty() {
             debug!(

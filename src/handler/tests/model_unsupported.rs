@@ -589,7 +589,14 @@ fn classify_rejection_vetoes_echoed_request_keys_only() {
     ];
     for (why, status, e, protocol, want) in genuine {
         assert_eq!(
-            classify_rejection(status, &e, protocol, "claude-opus-5", plain.as_bytes()),
+            classify_rejection(
+                status,
+                &e,
+                protocol,
+                "claude-opus-5",
+                plain.as_bytes(),
+                false
+            ),
             Some(want),
             "{why} must still classify"
         );
@@ -601,7 +608,8 @@ fn classify_rejection_vetoes_echoed_request_keys_only() {
             &entitlement,
             Protocol::Anthropic,
             "",
-            b""
+            b"",
+            false
         ),
         Some(UpstreamRejection::Entitlement)
     );
@@ -658,7 +666,8 @@ fn classify_rejection_vetoes_echoed_request_keys_only() {
                 &e,
                 protocol,
                 "claude-opus-5",
-                sent.as_bytes()
+                sent.as_bytes(),
+                false
             ),
             None,
             "{why}: the echo is the client's own error"
@@ -671,7 +680,8 @@ fn classify_rejection_vetoes_echoed_request_keys_only() {
             &entitlement,
             Protocol::Anthropic,
             "claude-opus-5",
-            br#"{"model":"claude-opus-5","#
+            br#"{"model":"claude-opus-5","#,
+            false
         ),
         None
     );
@@ -715,7 +725,7 @@ fn classify_rejection_vetoes_duplicate_model_keys() {
             r#"{"model":"gpt-bogus","m\u006fdel":"gpt-real","messages":[]}"#,
         ] {
             assert_eq!(
-                classify_rejection(*status, e, *protocol, "gpt-real", sent.as_bytes()),
+                classify_rejection(*status, e, *protocol, "gpt-real", sent.as_bytes(), false),
                 None,
                 "{why}: {sent}"
             );
@@ -726,7 +736,8 @@ fn classify_rejection_vetoes_duplicate_model_keys() {
                 e,
                 *protocol,
                 "gpt-real",
-                br#"{"model":"gpt-real","messages":[]}"#
+                br#"{"model":"gpt-real","messages":[]}"#,
+                false
             ),
             Some(UpstreamRejection::ModelUnsupported),
             "{why}: with one `model` key the error still classifies"
@@ -819,6 +830,97 @@ async fn gateway_echo_of_client_key_does_not_negative_cache() {
             "{kind}: the model must not be negative-cached"
         );
     }
+}
+
+type Hits = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+/// Passthrough endpoint returning `HEAD_404_MODEL` at priority 0, a healthy
+/// account at priority 1: without the passthrough veto the 404 would mark
+/// `pt` and rotate onto `healthy`.
+async fn passthrough_404_then_healthy() -> (Arc<AppState>, SocketAddr, Hits, Hits) {
+    let (pt_url, pt_hits) = spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
+    let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+    healthy.priority = 1;
+    let state = test_state_with(vec![mk_endpoint_at("pt", "passthrough", &pt_url), healthy]);
+    assert!(state.endpoints[0].passthrough);
+    let addr = serve(build_router(state.clone())).await;
+    (state, addr, pt_hits, ok_hits)
+}
+
+/// LAB-6005: a passthrough endpoint sends the caller's own credential, so its
+/// model 404 says the caller's plan lacks the model, not the endpoint. It must
+/// reach that caller unchanged, with no negative-cache entry and no rotation:
+/// a mark would take the endpoint out of routing for that model for every
+/// other caller for the TTL, and one repeated request would keep it out.
+#[tokio::test]
+async fn model_404_on_passthrough_endpoint_is_not_marked_or_rotated() {
+    use std::sync::atomic::Ordering;
+    let (state, addr, pt_hits, ok_hits) = passthrough_404_then_healthy().await;
+    for _ in 0..2 {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .header("x-api-key", "sk-ant-api-caller")
+            .body(r#"{"model":"claude-nope-1","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.pointer("/error/message").and_then(|v| v.as_str()),
+            Some("model: claude-nope-1"),
+            "the caller must see its own plan's 404, got: {body}"
+        );
+    }
+    assert!(
+        state.unsupported_models.lock().unwrap().is_empty(),
+        "a passthrough endpoint's model 404 must not negative-cache the endpoint"
+    );
+    assert_eq!(
+        (
+            pt_hits.load(Ordering::SeqCst),
+            ok_hits.load(Ordering::SeqCst)
+        ),
+        (2, 0),
+        "must not rotate off a 404 that describes the caller"
+    );
+}
+
+/// LAB-6005, OpenAI-compat path: the same passthrough 404 through
+/// `/v1/chat/completions` (its own `note_model_unsupported` call site).
+#[tokio::test]
+async fn model_404_on_passthrough_endpoint_is_not_marked_on_openai_compat() {
+    use std::sync::atomic::Ordering;
+    let (state, addr, pt_hits, ok_hits) = passthrough_404_then_healthy().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "sk-ant-api-caller")
+        .body(r#"{"model":"claude-nope-1","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body.pointer("/error/message").and_then(|v| v.as_str()),
+        Some("model: claude-nope-1"),
+        "the caller must see its own plan's 404, got: {body}"
+    );
+    assert!(
+        state.unsupported_models.lock().unwrap().is_empty(),
+        "a passthrough endpoint's model 404 must not negative-cache the endpoint"
+    );
+    assert_eq!(
+        (
+            pt_hits.load(Ordering::SeqCst),
+            ok_hits.load(Ordering::SeqCst)
+        ),
+        (1, 0),
+        "must not rotate off a 404 that describes the caller"
+    );
 }
 
 // ── Negative-cache hardening: client model strings ──

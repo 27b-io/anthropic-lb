@@ -255,13 +255,13 @@ async fn gate_denies_unreadable_model_for_restricted_client() {
         .await
         .expect_err("unknown model must be denied for a restricted client");
     assert_eq!(err.status(), StatusCode::FORBIDDEN);
-    let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let text = String::from_utf8_lossy(&body);
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "permission_error");
+    let text = json["error"]["message"].as_str().unwrap();
     assert!(
         text.contains("no model could be read"),
-        "body should explain the empty-model denial, got: {text}"
+        "message should explain the empty-model denial, got: {text}"
     );
 }
 
@@ -314,12 +314,11 @@ async fn denied_model_response_body_is_truncated() {
         .pre_request_gate("-", "limited", &huge)
         .await
         .expect_err("oversized model must be denied");
-    let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
-        .await
-        .unwrap();
+    let json = parse_error_envelope(err).await;
+    assert_eq!(json["error"]["type"], "permission_error");
     assert!(
-        String::from_utf8_lossy(&body).chars().count() < 1_000,
-        "403 body must not echo the untruncated model"
+        json["error"]["message"].as_str().unwrap().chars().count() < 1_000,
+        "403 message must not echo the untruncated model"
     );
 }
 
@@ -437,12 +436,14 @@ async fn model_denial_literal_other_model_does_not_alias_overflow_bucket() {
 #[tokio::test]
 async fn model_denial_escape_keeps_other_and_dunder_other_distinct() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
-    for model in ["_other", "__other"] {
+    // Bare `other` guards the leading-`_` requirement: without it, `other`
+    // would be escaped onto `_other` and pre-claim the overflow bucket.
+    for model in ["other", "_other", "__other"] {
         assert!(state.pre_request_gate("-", "limited", model).await.is_err());
     }
 
     let counts = state.model_denied.lock().unwrap();
-    assert_eq!(counts.len(), 2, "two models, two labels: {counts:?}");
+    assert_eq!(counts.len(), 3, "three models, three labels: {counts:?}");
     assert!(
         counts.values().all(|&n| n == 1),
         "each model must mint its own key: {counts:?}"
@@ -450,6 +451,27 @@ async fn model_denial_escape_keeps_other_and_dunder_other_distinct() {
     assert!(
         !counts.contains_key(&("limited".to_string(), "_other".to_string())),
         "neither model may claim the overflow bucket"
+    );
+}
+
+/// The model is caller-controlled JSON, so it can carry a raw newline. The
+/// denial warn must log it escaped, or a client can forge a log line
+/// (CWE-117, LAB-5442).
+#[test]
+fn model_denial_log_escapes_newline_in_model() {
+    let buf = log_capture_buf();
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    // First denial for this pair, so it takes the warn arm the capture sees.
+    state.note_model_denied("limited", "x\nFORGED-LAB5442 WARN fake");
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        output.contains(r"\nFORGED-LAB5442"),
+        "denial warn must log the model escaped, got:\n{output}"
+    );
+    assert!(
+        !output.contains("\nFORGED-LAB5442"),
+        "a raw newline in the model must not start a new log line"
     );
 }
 

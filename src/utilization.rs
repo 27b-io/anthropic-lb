@@ -328,7 +328,7 @@ pub(crate) const MAX_STRIPPED_FIELDS_PER_REQUEST: usize = 8;
 
 /// Clamp a client-controlled string to something safe to use as a metric
 /// label and a log field: `[A-Za-z0-9_.-]` only, length-bounded on a char
-/// boundary. Anything else becomes `_invalid` rather than being escaped —
+/// boundary (plus one byte when `escape_sentinel` fires). Anything else becomes `_invalid` rather than being escaped —
 /// these are JSON object keys, so a legitimate one is always in that set, and
 /// an illegitimate one has nothing worth preserving.
 ///
@@ -348,7 +348,9 @@ pub(crate) fn sanitize_metric_key(raw: &str, max_len: usize) -> String {
     {
         return "_invalid".to_string();
     }
-    clipped.to_string()
+    // A literal `_invalid` or `_other` key must not land on this sentinel or
+    // the callers' overflow key.
+    escape_sentinel(clipped, &["invalid", "other"])
 }
 
 /// `(route, cred)` — the label set of `anthropic_auth_failures_total`.
@@ -906,7 +908,7 @@ pub(crate) fn drops_deprecated_temperature(model: &str, value: &serde_json::Valu
         return false;
     }
     warn!(
-        model = %truncate_label(model),
+        model = ?truncate_label(model),
         temperature = %value,
         "dropping `temperature`: deprecated and hard-rejected by this model"
     );

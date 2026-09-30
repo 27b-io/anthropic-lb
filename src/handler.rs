@@ -125,8 +125,9 @@ const FAST_MODE_NOT_ENABLED_MSG: &str =
 /// this clause (an unrecognized top-level field literally named the phrase),
 /// so a `.contains` match plus an unguarded caller could walk and mark every
 /// reachable account on a single crafted request. The caller additionally
-/// requires a fast request on a non-passthrough endpoint — otherwise the
-/// 400 is not about this account's org, and never grounds to mark it.
+/// requires a fast request, and `classify_rejection` vetoes a passthrough
+/// endpoint — otherwise the 400 is not about this account's org, and never
+/// grounds to mark it.
 fn is_fast_mode_not_enabled_error(status: StatusCode, body: &serde_json::Value) -> bool {
     status == StatusCode::BAD_REQUEST
         && body.pointer("/error/type").and_then(|v| v.as_str()) == Some("invalid_request_error")
@@ -169,24 +170,33 @@ pub(crate) enum UpstreamRejection {
     /// `is_entitlement_exhausted_400`.
     Entitlement,
     /// `is_fast_mode_not_enabled_error`. Reports this account's org only
-    /// when the request asked for fast mode and the endpoint sent its own
-    /// credential; the caller decides.
+    /// when the request asked for fast mode; the caller decides.
     FastModeDisabled,
 }
 
 /// Read account or model state out of an upstream error. The classifiers it
 /// calls are private to this module, and that is what keeps every forward
-/// path behind the request-body veto: code outside this module cannot reach
-/// them except through here. A classifier added later must stay private too.
-/// `model` is the model the request asked for, and `sent_body` the request
-/// body exactly as it went to this endpoint.
+/// path behind the request-body and caller-credential vetoes: code outside
+/// this module cannot reach them except through here. A classifier added
+/// later must stay private too. `model` is the model the request asked for,
+/// and `sent_body` the request body exactly as it went to this endpoint.
+///
+/// `caller_credential` is true when the request went out with the caller's
+/// own auth (a passthrough endpoint). The error then describes the caller's
+/// plan, not the endpoint, so it is never endpoint state: marking the
+/// endpoint would take it away from every other caller, and re-sending would
+/// cover the caller's own limits with a pooled account (LAB-6005).
 pub(crate) fn classify_rejection(
     status: StatusCode,
     err_body: &serde_json::Value,
     protocol: Protocol,
     model: &str,
     sent_body: &[u8],
+    caller_credential: bool,
 ) -> Option<UpstreamRejection> {
+    if caller_credential {
+        return None;
+    }
     let verdict = if is_model_unsupported_error(status, err_body, protocol, model) {
         UpstreamRejection::ModelUnsupported
     } else if is_entitlement_exhausted_400(status, err_body) {
@@ -635,24 +645,41 @@ pub(crate) fn model_unsupported_response(model: &str, openai_shape: bool) -> Res
         .into_response()
 }
 
-/// 400 in Anthropic's `invalid_request_error` envelope. Used when an
-/// Anthropic request can't be faithfully translated for an OpenAI-compat
-/// fallback endpoint (e.g. an image source type the translator doesn't
-/// support), and to replay the fast-mode entitlement 400 on the warm
-/// negative-cache path (LAB-2687). The caller's request was Anthropic
-/// Messages API shaped, so the error response matches that.
+/// Anthropic-shaped JSON error envelope for the proxy-generated admission
+/// denials (LAB-4129): `authenticate` 401, `pre_request_gate` 403/429,
+/// `deny_admin_reader`'s read-only-principal 403 (LAB-4395),
+/// `reserve_request_body` 503, `read_body_bounded` 408, the
+/// untranslatable-request 400, the fast-mode entitlement 400 replayed on
+/// the warm negative-cache path (LAB-2687), and `proxy_handler`'s 400 for
+/// a valid-JSON non-object body (LAB-4314) — the router fallback, so any
+/// method on any path. This is not the whole error surface — the
+/// IP-allowlist 403, retry exhaustion, the failed-auth throttle and the
+/// other bad-body 400s still return `text/plain`.
 ///
-/// Also `proxy_handler`'s rejection of a valid-JSON non-object body
-/// (LAB-4314). That handler is the router fallback, so the rejected request
-/// may be any method on any path; the envelope is still the right shape,
-/// since it is what the Anthropic upstream returns for the same body.
-fn invalid_request_response(message: &str) -> Response {
+/// All three 429s share `rate_limit_error`: that is the type Anthropic binds
+/// to 429, and a narrower invented one would break SDK matching. What
+/// separates them on the wire is `retry-after` — budget and utilization
+/// carry one, the emergency brake deliberately does not. Two types are ours
+/// rather than Anthropic's, which binds `overloaded_error` to 529 and has no
+/// 408 type at all: `503 overloaded_error` and `408 timeout_error` name load
+/// shed *here*, not an upstream condition relayed.
+///
+/// Deliberately NOT surface-shaped, unlike `guard_blocked_response` and
+/// `model_unsupported_response`: those carry a machine-readable cause in
+/// `error.code` that OpenAI-compat clients match on. For these denials the
+/// status code is the signal — OpenAI SDKs map it to the exception class and
+/// read `error.message`, which both envelope shapes carry.
+pub(crate) fn proxy_error_response(
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+) -> Response {
     (
-        StatusCode::BAD_REQUEST,
+        status,
         [("content-type", "application/json")],
         serde_json::json!({
             "type": "error",
-            "error": { "type": "invalid_request_error", "message": message }
+            "error": { "type": error_type, "message": message }
         })
         .to_string(),
     )
@@ -1136,7 +1163,7 @@ pub(crate) async fn forward_anthropic(
 
     if is_streaming {
         // Streaming: tee the byte stream to accumulate SSE text for usage extraction
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+        let (tx, body) = relay_channel();
         let state_clone = state.clone();
         // The detached task can't carry the `ep` borrow across the spawn
         // boundary; capture the Copy index and re-borrow from the owned `Arc`.
@@ -1157,7 +1184,7 @@ pub(crate) async fn forward_anthropic(
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {
                         scanner.push(&chunk);
-                        if tx.send(Ok(chunk)).await.is_err() {
+                        if !relay_send(&tx, chunk, &req_id_clone).await {
                             client_disconnected = true;
                             break;
                         }
@@ -1180,19 +1207,17 @@ pub(crate) async fn forward_anthropic(
                             break;
                         }
                         scanner.terminal.errored = true;
-                        if tx
-                            .send(Ok(anthropic_error_frame(&format!(
-                                "upstream stream interrupted: {e}"
-                            ))))
-                            .await
-                            .is_err()
-                        {
+                        let frame =
+                            anthropic_error_frame(&format!("upstream stream interrupted: {e}"));
+                        if !relay_send(&tx, frame, &req_id_clone).await {
                             client_disconnected = true;
                         }
                         break;
                     }
                 }
             }
+            // Release the upstream before recording usage.
+            drop(resp);
             // Record scanned usage. The detached task only holds a cloned
             // Arc<AppState>; re-index it to recover &Endpoint.
             let ep = &state_clone.endpoints[endpoint_idx];
@@ -1220,12 +1245,9 @@ pub(crate) async fn forward_anthropic(
             .await;
         });
 
-        let body_stream = ReceiverStream::new(rx);
-        let response = builder
-            .body(Body::from_stream(body_stream))
-            .unwrap_or_else(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-            });
+        let response = builder.body(body).unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+        });
         ForwardOutcome::Done(Box::new(response))
     } else {
         // Non-streaming: buffer, extract usage, forward.
@@ -1318,31 +1340,37 @@ pub(crate) async fn forward_anthropic(
             // Forwarding the 4xx as-is wedges affinity-pinned clients into a
             // permanent retry loop against this account.
             // Out of extra usage: re-send once to another account (LAB-4729).
-            // All are account state wearing a 4xx. A streaming request lands
-            // here too: upstream sends the 400 as a JSON body, not an event
-            // stream, so it re-sends before any byte reaches the client.
-            let rotate: Option<fn(Box<Response>) -> ForwardOutcome> =
-                match classify_rejection(status, &parsed, ep.protocol, model, req_body) {
-                    Some(UpstreamRejection::ModelUnsupported) => {
-                        state.note_model_unsupported(endpoint_name, endpoint_idx, model);
-                        Some(ForwardOutcome::RetryRejectedByAccount)
-                    }
-                    Some(UpstreamRejection::FastModeDisabled) if is_fast_mode && !passthrough => {
-                        state.note_fast_mode_disabled(endpoint_name, endpoint_idx);
-                        Some(ForwardOutcome::RetryRejectedByAccount)
-                    }
-                    // Not this account's state: a standard request never asked
-                    // for fast mode, and a passthrough endpoint sent the
-                    // caller's own credential, so the 400 is about the
-                    // caller's org. Marking the endpoint would switch fast
-                    // mode off for every other caller of it.
-                    Some(UpstreamRejection::FastModeDisabled) => None,
-                    Some(UpstreamRejection::Entitlement) => {
-                        state.note_entitlement_400(endpoint_name);
-                        Some(ForwardOutcome::RetryEntitlement)
-                    }
-                    None => None,
-                };
+            // All are account state wearing a 4xx, except on a passthrough
+            // endpoint, where they are the caller's own: `classify_rejection`
+            // returns None and they are forwarded as-is (LAB-6005). A
+            // streaming request lands here too: upstream sends the 400 as a
+            // JSON body, not an event stream, so it re-sends before any byte
+            // reaches the client.
+            let rotate: Option<fn(Box<Response>) -> ForwardOutcome> = match classify_rejection(
+                status,
+                &parsed,
+                ep.protocol,
+                model,
+                req_body,
+                passthrough,
+            ) {
+                Some(UpstreamRejection::ModelUnsupported) => {
+                    state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                    Some(ForwardOutcome::RetryRejectedByAccount)
+                }
+                Some(UpstreamRejection::FastModeDisabled) if is_fast_mode => {
+                    state.note_fast_mode_disabled(endpoint_name, endpoint_idx);
+                    Some(ForwardOutcome::RetryRejectedByAccount)
+                }
+                // A standard request never asked for fast mode, so the 400 is
+                // not about this account's org: forward it as-is.
+                Some(UpstreamRejection::FastModeDisabled) => None,
+                Some(UpstreamRejection::Entitlement) => {
+                    state.note_entitlement_400(endpoint_name);
+                    Some(ForwardOutcome::RetryEntitlement)
+                }
+                None => None,
+            };
             if let Some(retry) = rotate {
                 // This branch returns before `finalize_non_stream` — log the
                 // merged line here too, so a rotated rejection still gets the
@@ -1632,7 +1660,11 @@ pub(crate) async fn proxy_handler(
                     client_id = %client_id,
                     "rejected: request body is not a JSON object"
                 );
-                return invalid_request_response("request body must be a JSON object");
+                return proxy_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "request body must be a JSON object",
+                );
             }
             let model = parsed
                 .get("model")
@@ -1740,7 +1772,7 @@ pub(crate) async fn proxy_handler(
                     client_id = %client_id,
                     session = %session_id,
                     agent = %agent_id,
-                    model = %model,
+                    model = ?model,
                     fp = %fp,
                     fps = %fps,
                     bps = %bps,
@@ -1966,13 +1998,17 @@ pub(crate) async fn proxy_handler(
                                     warn!(
                                         req_id,
                                         upstream = ep.name,
-                                        error = %msg,
+                                        error = ?msg,
                                         "fallback: request not representable in OpenAI format"
                                     );
                                     // Terminal, not a retry: the request itself
                                     // is the problem, so rotating would fail the
                                     // same way on every endpoint.
-                                    ForwardOutcome::Done(Box::new(invalid_request_response(msg)))
+                                    ForwardOutcome::Done(Box::new(proxy_error_response(
+                                        StatusCode::BAD_REQUEST,
+                                        "invalid_request_error",
+                                        msg,
+                                    )))
                                 }
                             };
                             (out, i)
@@ -2067,7 +2103,11 @@ pub(crate) async fn proxy_handler(
         // stand in the way; otherwise the model itself is unservable.
         if is_fast_mode && !state.pool_cannot_serve(&model, false, refused) {
             warn!(model, "fast mode not enabled on any eligible endpoint");
-            return invalid_request_response(FAST_MODE_NOT_ENABLED_MSG);
+            return proxy_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                FAST_MODE_NOT_ENABLED_MSG,
+            );
         }
         warn!(model, "model unsupported on all eligible endpoints");
         return model_unsupported_response(&model, false);

@@ -223,6 +223,7 @@ token = "sk-ant-api03-..."
 
 > [!TIP]
 > Use `passthrough` when clients have their own Anthropic credentials and you only want load-balancing without token injection.
+> A model rejection (`404 model: …`) or an out-of-extra-usage `400` from a passthrough endpoint describes the caller's own plan, so it reaches the caller unchanged: the proxy neither re-sends it to another account nor marks the endpoint for other callers.
 
 ### Model Routing
 
@@ -443,7 +444,10 @@ can steer are locked down by default:
   allow-list change. Strips are counted in
   `anthropic_beta_body_field_stripped_total{field}` and warned on first
   sighting; a non-zero rate means a paired family is in live traffic and
-  needs both an allow-list entry and a row. Nested pairings
+  needs both an allow-list entry and a row. A flag named `_other`, or a field
+  named `_other` or `_invalid` (and `__other`, … likewise), is labelled with
+  one extra leading `_`, so the `_other` label only ever means overflow and
+  `_invalid` only a name the sanitiser rejected. Nested pairings
   (`extended-cache-ttl-*` → `cache_control.ttl`, and the per-turn family's
   fields inside `messages`) are out of scope — they are on the default
   allow-list and so are never dropped.
@@ -701,7 +705,8 @@ is a reserved client name: config validation rejects a `[[clients]]` entry or
 header is ignored, so real traffic can never pre-claim the global bucket. A
 denied model named `_other`, `__other`, … gets one extra leading `_` in its
 label (`_other` is labelled `model="__other"`), so it cannot pre-claim a
-client's bucket or share a series with another model.
+client's bucket. The escape never merges two models' labels; truncation can:
+models sharing their first 64 characters share one label.
 `anthropic_client_model_token_usage_total` instead uses one global
 `client="_other",model="_other"` bucket, because its client id can be
 header-asserted under legacy auth (bounded at 256 + 1 distinct (client,
