@@ -1,3 +1,4 @@
+use super::enforcement::FrozenClock;
 use super::*;
 
 // ── Unit: per-client budget ────────────────────────────────────
@@ -47,13 +48,17 @@ async fn budget_check_enforces_through_poisoned_lock() {
         client_budgets: budgets,
         ..test_state_base()
     });
+    // 2024-01-01T12:34:56Z: 41104s left in the UTC day. Frozen so the day key
+    // record_budget_usage writes and check_budget reads cannot straddle midnight.
+    let _clock = FrozenClock::at(1_704_112_496);
     state.record_budget_usage("client-a", 1500).await;
     poison(&state.budget_usage);
 
     assert_eq!(
         state.check_budget("client-a").await,
-        Err(0),
-        "an exhausted client must stay denied through a poisoned lock"
+        Err(41_104),
+        "an exhausted client must stay denied through a poisoned lock, \
+         with the seconds left until the budget day rolls over"
     );
     assert!(
         !state.budget_usage.is_poisoned(),

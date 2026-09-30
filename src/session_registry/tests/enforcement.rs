@@ -13,10 +13,10 @@ use super::*;
 /// directly (several `reset_epoch` ones here do) will be years out of step
 /// with it.
 #[must_use]
-struct FrozenClock(Option<u64>);
+pub(super) struct FrozenClock(Option<u64>);
 
 impl FrozenClock {
-    fn at(epoch: u64) -> Self {
+    pub(super) fn at(epoch: u64) -> Self {
         // The override is thread-local, so on a multi-thread runtime any
         // `tokio::spawn`ed work reads the wall clock instead — and does it
         // silently. Fail here rather than let a gate test pass for the wrong
