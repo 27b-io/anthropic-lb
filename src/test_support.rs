@@ -817,8 +817,10 @@ pub(crate) const NON_OBJECT_JSON_BODIES: [&str; 5] = ["[1,2,3]", "\"x\"", "7", "
 /// case-folded, which is how an upstream that ignores key case reads it. The
 /// `MODEL` row's only model key is `MODEL`: the proxy reads no model, so no
 /// endpoint `models` list applies to it, while such an upstream serves opus.
-/// The `mo_del` row does the same to a decoder that also ignores `_`.
-pub(crate) const AMBIGUOUS_KEY_BODIES: [&str; 7] = [
+/// The `mo_del` row does the same to a decoder that also ignores `_`, and
+/// the `fall_backs` row survives the strip a model-restricted endpoint
+/// applies to `fallbacks`.
+pub(crate) const AMBIGUOUS_KEY_BODIES: [&str; 8] = [
     r#"{"model":"claude-opus-5","model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
     r#"{"model":"claude-haiku-4-5","model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
     r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"messages":[{"role":"user","content":"hidden"}]}"#,
@@ -826,6 +828,7 @@ pub(crate) const AMBIGUOUS_KEY_BODIES: [&str; 7] = [
     r#"{"model":"claude-haiku-4-5","MODEL":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
     r#"{"MODEL":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
     r#"{"mo_del":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+    r#"{"model":"claude-haiku-4-5","fall_backs":["claude-opus-5"],"max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
 ];
 
 /// The whole wire body of both `openai_chat_handler` parse 400s. Compared by

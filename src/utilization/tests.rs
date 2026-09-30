@@ -54,3 +54,25 @@ fn top_level_keys_unambiguous_requires_distinct_lowercase_ascii_keys() {
         "not an object fails closed"
     );
 }
+
+/// Every protected field passes as spelt and is refused respelt, including
+/// each body field of `BETA_BODY_FIELDS`, so a row added there is covered
+/// without editing this test.
+#[test]
+fn top_level_keys_unambiguous_refuses_every_respelt_protected_field() {
+    let fields: Vec<&str> = protected_fields().collect();
+    for field in [
+        "fallbacks",
+        "fallback_credit_token",
+        "context_management",
+        "safeguards",
+    ] {
+        assert!(fields.contains(&field), "{field} must be protected");
+    }
+    for field in fields {
+        let exact = format!("{{\"{field}\":1}}");
+        assert!(top_level_keys_unambiguous(exact.as_bytes()), "{exact}");
+        let respelt = format!("{{\"{}-{}\":1}}", &field[..1], &field[1..]);
+        assert!(!top_level_keys_unambiguous(respelt.as_bytes()), "{respelt}");
+    }
+}
