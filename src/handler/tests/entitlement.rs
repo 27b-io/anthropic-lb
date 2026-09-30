@@ -339,11 +339,16 @@ async fn resend_outcome_supersedes_stashed_entitlement_400() {
         ),
     ] {
         let (url, target_hits) = spawn_status_then_ok_upstream(usize::MAX, head, b"{}").await;
-        let (_state, addr, spent_hits) = spent_then(ENTITLEMENT_400_BODY, &url).await;
+        let (state, addr, spent_hits) = spent_then(ENTITLEMENT_400_BODY, &url).await;
+        // Request the model `HEAD_404_MODEL` names, so that its 404 reads as
+        // a model rejection of THIS request rather than as a plain client
+        // error.
         let resp = reqwest::Client::new()
             .post(format!("http://{addr}/v1/messages"))
             .header("content-type", "application/json")
-            .body(MESSAGES_BODY)
+            .body(
+                r#"{"model":"claude-nope-1","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+            )
             .send()
             .await
             .unwrap();
@@ -359,6 +364,14 @@ async fn resend_outcome_supersedes_stashed_entitlement_400() {
                 body.contains("not_found_error") && body.contains("claude-nope-1"),
                 "{kind}: the re-send target's own error must reach the caller: {body}"
             );
+            assert!(
+                state
+                    .unsupported_models
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(1, "claude-nope-1".to_string())),
+                "{kind}: the re-send must end on the model-rejection outcome"
+            );
         }
         assert_eq!(
             (
@@ -369,6 +382,38 @@ async fn resend_outcome_supersedes_stashed_entitlement_400() {
             "{kind}"
         );
     }
+}
+
+/// The 404 case above on the OpenAI-compat path. The refuser is never
+/// negative-cached, so the exhaustion gate must count it out by index
+/// (`pool_cannot_serve`'s `refused`) — otherwise the re-send target's model
+/// rejection turns into a synthetic 429 (LAB-2687 × LAB-4729).
+#[tokio::test]
+async fn resend_404_supersedes_entitlement_400_on_openai_compat_path() {
+    use std::sync::atomic::Ordering;
+    let (url, target_hits) = spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
+    let (_state, addr, spent_hits) = spent_then(ENTITLEMENT_400_BODY, &url).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "body {body}");
+    assert!(
+        !body.contains("out of extra usage"),
+        "the stashed entitlement 400 must not win: {body}"
+    );
+    assert_eq!(
+        (
+            spent_hits.load(Ordering::SeqCst),
+            target_hits.load(Ordering::SeqCst)
+        ),
+        (1, 1)
+    );
 }
 
 /// A poisoned `entitlement_400` lock: `/metrics` publishes the real count and
@@ -406,4 +451,130 @@ async fn entitlement_400_poisoned_lock_is_recovered_not_zeroed() {
     // skipping and the series freezes here for the life of the process.
     state.note_entitlement_400("spent");
     assert_eq!(state.entitlement_400.lock().unwrap().get("spent"), Some(&2));
+}
+
+// ── An echoed request key is the client's own 400, never account state ──
+
+/// Anthropic's 400 for an unknown top-level key named with the anchor text:
+/// the key comes back verbatim, so the message starts with the anchor.
+const ECHOED_ANCHOR_KEY_400: &[u8] = br#"{"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage: Extra inputs are not permitted"}}"#;
+
+/// A request carrying that key on the native path, where unknown keys reach
+/// upstream as sent.
+const ANCHOR_KEY_BODY: &str = r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"You're out of extra usage":1}"#;
+
+/// The echo reaches the caller unchanged: no re-send to the next account, and
+/// no entitlement count to hide a real exhaustion behind.
+#[tokio::test]
+async fn echoed_entitlement_key_400_is_forwarded_not_resent() {
+    use std::sync::atomic::Ordering;
+    let (state, addr, spent_hits, healthy_hits) = spent_then_healthy(ECHOED_ANCHOR_KEY_400).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ANCHOR_KEY_BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.bytes().await.unwrap().as_ref(),
+        ECHOED_ANCHOR_KEY_400,
+        "the upstream 400 must reach the caller byte-for-byte"
+    );
+    assert_eq!(
+        (
+            spent_hits.load(Ordering::SeqCst),
+            healthy_hits.load(Ordering::SeqCst)
+        ),
+        (1, 0),
+        "an echoed key must not re-send the request"
+    );
+    assert!(
+        state.entitlement_400.lock().unwrap().is_empty(),
+        "an echoed key must not count as an entitlement 400"
+    );
+}
+
+/// On `/v1/chat/completions` the translation copies known fields only, so the
+/// key cannot reach an Anthropic account to be echoed in the first place.
+#[tokio::test]
+async fn entitlement_key_never_reaches_upstream_on_openai_compat() {
+    let (url, mut received) = spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
+    let state = test_state_with(vec![mk_endpoint_at("acct", "sk-ant-api-a", &url)]);
+    let addr = serve(build_router(state)).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}],"You're out of extra usage":1}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let (_, body) = received
+        .recv()
+        .await
+        .expect("upstream received the request");
+    let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        sent.get("model").is_some(),
+        "sanity: this is the translated request"
+    );
+    assert!(
+        sent.get("You're out of extra usage").is_none(),
+        "the client's unknown key must not reach upstream: {sent}"
+    );
+}
+
+/// LAB-6005: a passthrough endpoint's entitlement 400 is about the caller's
+/// own credential. Re-sending would move that caller onto a pooled account's
+/// extra usage to cover its own exhausted plan, and the per-account counter
+/// would charge the caller's state to the endpoint. It reaches the caller
+/// unchanged on both Anthropic paths: no re-send, no count.
+#[tokio::test]
+async fn entitlement_400_on_passthrough_endpoint_is_not_resent() {
+    use std::sync::atomic::Ordering;
+    for (path, body) in [
+        ("/v1/messages", MESSAGES_BODY),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+    ] {
+        let (pt_url, pt_hits) = spawn_400_upstream(ENTITLEMENT_400_BODY).await;
+        let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+        let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+        healthy.priority = 1;
+        let state = test_state_with(vec![mk_endpoint_at("pt", "passthrough", &pt_url), healthy]);
+        let addr = serve(build_router(state.clone())).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}{path}"))
+            .header("content-type", "application/json")
+            .header("x-api-key", "sk-ant-api-caller")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "{path}");
+        let got: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            got.pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .is_some_and(|m| m.starts_with(ENTITLEMENT_400_ANCHOR)),
+            "{path}: the caller must see its own 400, got: {got}"
+        );
+        assert_eq!(
+            (
+                pt_hits.load(Ordering::SeqCst),
+                ok_hits.load(Ordering::SeqCst)
+            ),
+            (1, 0),
+            "{path}: must not re-send a 400 that describes the caller"
+        );
+        assert!(
+            state.entitlement_400.lock().unwrap().is_empty(),
+            "{path}: the caller's state must not be counted against the endpoint"
+        );
+    }
 }

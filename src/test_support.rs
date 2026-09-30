@@ -1,5 +1,53 @@
 use crate::*;
 
+// ── Frozen clock (test-only) ─────────────────────────────────────────
+
+/// Pins `AppState::now_epoch` on this thread for the guard's lifetime and
+/// restores the PREVIOUS value on drop — including on panic, and including a
+/// nested freeze, so an inner guard cannot silently hand the outer test the
+/// wall clock back. Restoring on panic matters under `--test-threads=1`, where
+/// libtest runs tests in place on one shared thread.
+///
+/// The freeze applies to every `now_epoch` read on the thread, not just the
+/// one under test: fixtures that mint timestamps from `SystemTime::now()`
+/// directly (several `reset_epoch` ones in the enforcement tests do) will be
+/// years out of step with it.
+#[must_use]
+pub(crate) struct FrozenClock(Option<u64>);
+
+impl FrozenClock {
+    pub(crate) fn at(epoch: u64) -> Self {
+        // The override is thread-local, so on a multi-thread runtime any
+        // `tokio::spawn`ed work reads the wall clock instead — and does it
+        // silently. Fail here rather than let a gate test pass for the wrong
+        // reason.
+        debug_assert!(
+            !matches!(
+                tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+            ),
+            "FrozenClock is thread-local: current-thread runtime only"
+        );
+        Self(FROZEN_NOW.with(|c| c.replace(Some(epoch))))
+    }
+}
+
+impl Drop for FrozenClock {
+    fn drop(&mut self) {
+        FROZEN_NOW.with(|c| c.set(self.0));
+    }
+}
+
+/// Two instants on 2024-01-01 (12:34:56Z and 14:34:56Z). Neither is a day
+/// boundary, because at `now % 86400 == 0` the true answer and every
+/// `86400 - now % k` mutant (k dividing 86400) are all 86400 — a midnight
+/// instant hides a wrong modulus rather than exposing it.
+///
+/// Two of them, not one, because freezing makes the expected value a constant:
+/// against a single instant the assertion cannot tell a correct computation
+/// from a hardcoded answer. A second instant is what restores that.
+pub(crate) const FROZEN_GATE_CLOCKS: [u64; 2] = [1_704_112_496, 1_704_119_696];
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 /// Build an Anthropic-protocol `Endpoint` with the given name and token.
@@ -17,6 +65,7 @@ pub(crate) fn mk_endpoint(name: &str, token: &str) -> Endpoint {
         priority: 0,
         fable_included: true,
         requests: AtomicU64::new(0),
+        fast_mode_disabled_total: AtomicU64::new(0),
         rate_info: RwLock::new(RateLimitInfo::default()),
         burn_rate: Mutex::new(BurnRate::new()),
         input_tokens: AtomicU64::new(0),
@@ -54,6 +103,7 @@ pub(crate) fn make_endpoint(name: &str, protocol: Protocol) -> Endpoint {
         priority: 0,
         fable_included: true,
         requests: AtomicU64::new(0),
+        fast_mode_disabled_total: AtomicU64::new(0),
         rate_info: RwLock::new(RateLimitInfo::default()),
         burn_rate: Mutex::new(BurnRate::new()),
         input_tokens: AtomicU64::new(0),
@@ -157,6 +207,7 @@ pub(crate) fn test_state_base() -> AppState {
         model_denied: Mutex::new(HashMap::new()),
         client_rejections: Mutex::new(HashMap::new()),
         unsupported_models: Mutex::new(HashMap::new()),
+        fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache: None,
     }
 }
@@ -360,6 +411,18 @@ pub(crate) async fn mock_anthropic_handler(req: Request<Body>) -> Response {
     resp
 }
 
+/// The Anthropic SSE stream `mock_anthropic_streaming_handler` serves: two
+/// text deltas ("Hello", " world"), LF-framed.
+pub(crate) const MOCK_ANTHROPIC_SSE: &str = concat!(
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+);
+
 /// Mock that returns Anthropic SSE streaming format
 pub(crate) async fn mock_anthropic_streaming_handler(req: Request<Body>) -> Response {
     let has_auth =
@@ -368,17 +431,7 @@ pub(crate) async fn mock_anthropic_streaming_handler(req: Request<Body>) -> Resp
         return (StatusCode::UNAUTHORIZED, "missing auth").into_response();
     }
 
-    let events = [
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
-            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
-            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-        ];
-
-    let body = events.join("");
+    let body = MOCK_ANTHROPIC_SSE;
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
@@ -753,6 +806,26 @@ pub(crate) const TEST_IP: &str = "10.0.0.7";
 
 pub(crate) fn test_ip() -> IpAddr {
     TEST_IP.parse().unwrap()
+}
+/// Parse a proxy-generated denial into its JSON envelope, pinning AC-1 for
+/// every site that goes through it: `content-type: application/json` and a
+/// body that parses.
+pub(crate) async fn parse_error_envelope(resp: Box<Response>) -> serde_json::Value {
+    assert_eq!(
+        resp.headers().get("content-type").map(|v| v.as_bytes()),
+        Some(&b"application/json"[..]),
+        "denial must be content-type: application/json"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).expect("denial must be valid JSON")
+}
+
+/// `parse_error_envelope` for a denial read off the wire through the router,
+/// so router-level tests pin the same content-type and body contract.
+pub(crate) async fn parse_wire_error_envelope(resp: reqwest::Response) -> serde_json::Value {
+    parse_error_envelope(Box::new(axum::http::Response::from(resp).map(Body::new))).await
 }
 
 /// Build a `Config` from a TOML fragment. Goes through the real deserializer,

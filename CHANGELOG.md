@@ -5,6 +5,7 @@
 
 ### ⚠ BREAKING CHANGES
 
+* **LAB-2332:** `client_names` values `-`, `_operator` and `_other` are rejected at startup (previously accepted silently; an IP mapped to `-` skipped daily budget enforcement). Rename the mapping before upgrading. ([#148](https://github.com/27b-io/anthropic-lb/issues/148))
 * **LAB-3214:** log consumers filtering on `usage` or `fingerprint` at INFO must filter on `proxied` (or `proxied (openai-compat)`) instead. The `usage` line is merged into one `proxied` line per request, emitted at completion with the token fields (names unchanged). Error paths log it with zeroed usage, except an interrupted stream (client disconnect or mid-stream upstream error), which logs the usage captured before the interruption and so can carry nonzero `input`. `usage` survives only for requests routed to a `protocol = "openai"` endpoint, from either `/v1/messages` or `/v1/chat/completions`; those keep a usage-only echo (non-streaming responses with non-empty usage) — keep the `usage` filter if you route to such endpoints. The `fingerprint` line is DEBUG-only; its `fp` rides on the native `/v1/messages` `proxied` line via [#174](https://github.com/27b-io/anthropic-lb/issues/174) (the openai-compat line carries no `fp`). Entry restored by hand: the malformed commit subject (`fix!(scope):`) hid this change from release-please, hence a patch release. ([#172](https://github.com/27b-io/anthropic-lb/issues/172)) ([a0d0269](https://github.com/27b-io/anthropic-lb/commit/a0d0269d391c9d22144fa38ebebd338bd31db534))
 
 

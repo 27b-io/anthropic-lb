@@ -512,6 +512,76 @@ pub(crate) fn openai_error_frame(message: &str) -> bytes::Bytes {
     bytes::Bytes::from(openai_error_sse(message))
 }
 
+/// Longest a stream relay waits for the client to take one frame before it
+/// treats the client as gone. A client that stops reading but keeps its
+/// socket open (a laptop asleep mid-generation) otherwise parks the relay on
+/// its send forever: no upstream timeout fires while the upstream body goes
+/// unpolled, and the unread bytes hold flow-control window on the shared,
+/// pooled upstream connection that sibling streams need. This bounds one
+/// blocked send, never a stream's length: a client that keeps reading
+/// streams as long as the upstream does. 45 s outlasts the retransmit
+/// backoff of a briefly lossy link and keeps a dead client's hold on the
+/// upstream under a minute.
+pub(crate) const DOWNSTREAM_SEND_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(45)
+};
+
+type RelayFrame = Result<bytes::Bytes, std::io::Error>;
+
+/// Sending half of a stream relay's client body (`relay_channel`).
+pub(crate) struct RelaySender {
+    frames: tokio::sync::mpsc::Sender<RelayFrame>,
+    abort: tokio::sync::mpsc::Sender<RelayFrame>,
+}
+
+/// A stream relay's channel and the client body it feeds. The body yields
+/// the relay's frames, then the one error `relay_send` queues on a stall.
+/// hyper polls the body only as the client drains it, so the abort lands
+/// when a stalled client resumes: it sees a failed stream, not a truncated
+/// one ended by a clean terminator. A client that never resumes keeps its
+/// connection and the queued frames until its socket dies; the upstream,
+/// the relay task and accounting are already released by then.
+pub(crate) fn relay_channel() -> (RelaySender, Body) {
+    let (frames, frames_rx) = tokio::sync::mpsc::channel(32);
+    let (abort, abort_rx) = tokio::sync::mpsc::channel(1);
+    let body = Body::from_stream(tokio_stream::StreamExt::chain(
+        ReceiverStream::new(frames_rx),
+        ReceiverStream::new(abort_rx),
+    ));
+    (RelaySender { frames, abort }, body)
+}
+
+/// Hand one frame to a stream relay's client, waiting at most
+/// `DOWNSTREAM_SEND_TIMEOUT`. `false` means the client is gone — it
+/// disconnected, or it stalled past the bound (warned here, once, since the
+/// caller stops sending) — and the relay must take its client-disconnect
+/// exit.
+pub(crate) async fn relay_send(tx: &RelaySender, frame: bytes::Bytes, req_id: &str) -> bool {
+    match tx
+        .frames
+        .send_timeout(Ok(frame), DOWNSTREAM_SEND_TIMEOUT)
+        .await
+    {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::SendTimeoutError::Closed(_)) => false,
+        Err(tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)) => {
+            warn!(
+                req_id,
+                timeout_secs = DOWNSTREAM_SEND_TIMEOUT.as_secs(),
+                "client stopped reading the stream — dropping it"
+            );
+            // Never full: this is its only send.
+            let _ = tx.abort.try_send(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "client stopped reading the stream",
+            )));
+            false
+        }
+    }
+}
+
 /// Translate an OpenAI SSE chunk to Anthropic SSE events.
 /// Returns Vec because one OpenAI chunk may produce multiple Anthropic events.
 /// `raw` is the raw SSE data line (after stripping "data: " prefix).
@@ -833,7 +903,7 @@ async fn forward_openai_compat_anthropic(
     };
     debug!(
         account = endpoint_name,
-        model = %model,
+        model = ?model,
         body_len = req_body.len(),
         "openai-compat: upstream request"
     );
@@ -987,7 +1057,7 @@ async fn forward_openai_compat_anthropic(
             });
         warn!(
             account = endpoint_name,
-            model = %model,
+            model = ?model,
             status = status.as_u16(),
             error_message = ?error_msg,
             "openai-compat: upstream error"
@@ -1011,8 +1081,7 @@ async fn forward_openai_compat_anthropic(
 
         // Translate Anthropic error to OpenAI error format so clients
         // (LiteLLM, etc.) can parse the actual error message.
-        let mut model_unsupported = false;
-        let mut entitlement = false;
+        let mut rejection = None;
         let openai_error =
             if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&error_body) {
                 // Count + trace context-window overflows here too (LAB-916) —
@@ -1024,8 +1093,8 @@ async fn forward_openai_compat_anthropic(
                 }
                 // Same model-rejection detection as the native path (LAB-941),
                 // and the same entitlement 400 (LAB-4729).
-                model_unsupported = is_model_unsupported_error(status, &parsed, ep.protocol);
-                entitlement = is_entitlement_exhausted_400(status, &parsed);
+                rejection =
+                    classify_rejection(status, &parsed, ep.protocol, model, req_body, passthrough);
                 // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
                 let msg = parsed
                     .pointer("/error/message")
@@ -1065,19 +1134,25 @@ async fn forward_openai_compat_anthropic(
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
-        if model_unsupported {
-            state.note_model_unsupported(endpoint_name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
-        }
-        if entitlement {
-            state.note_entitlement_400(endpoint_name);
-            return ForwardOutcome::RetryEntitlement(Box::new(response));
-        }
-        return ForwardOutcome::Done(Box::new(response));
+        return match rejection {
+            Some(UpstreamRejection::ModelUnsupported) => {
+                state.note_model_unsupported(endpoint_name, endpoint_idx, model);
+                ForwardOutcome::RetryRejectedByAccount(Box::new(response))
+            }
+            Some(UpstreamRejection::Entitlement) => {
+                state.note_entitlement_400(endpoint_name);
+                ForwardOutcome::RetryEntitlement(Box::new(response))
+            }
+            // The translated request never carries `speed`, so a fast-mode
+            // 400 here cannot describe this account's fast-mode entitlement.
+            Some(UpstreamRejection::FastModeDisabled) | None => {
+                ForwardOutcome::Done(Box::new(response))
+            }
+        };
     }
 
     if is_streaming {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+        let (tx, body) = relay_channel();
         let state_clone = state.clone();
         // The detached task can't carry the `ep` borrow across the spawn
         // boundary; capture the Copy index and re-borrow from the owned `Arc`.
@@ -1092,7 +1167,7 @@ async fn forward_openai_compat_anthropic(
         let status_code = status.as_u16();
 
         tokio::spawn(async move {
-            let mut buffer: Vec<u8> = Vec::new();
+            let mut splitter = SseEventSplitter::default();
             let mut scanner = SseUsageScanner::default();
             // Terminator state: see `StreamContext::terminal`.
             let mut ctx = StreamContext {
@@ -1106,12 +1181,9 @@ async fn forward_openai_compat_anthropic(
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {
                         scanner.push(&chunk);
-                        buffer.extend_from_slice(&chunk);
+                        splitter.push(&chunk);
 
-                        while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
-                            let event = String::from_utf8_lossy(&buffer[..pos]).into_owned();
-                            buffer.drain(..pos + 2);
-
+                        while let Some(event) = splitter.next_event() {
                             if event.trim().is_empty() {
                                 continue;
                             }
@@ -1128,7 +1200,7 @@ async fn forward_openai_compat_anthropic(
                                 {
                                     ctx.terminal.completed = true;
                                 }
-                                if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
+                                if !relay_send(&tx, translated.into(), &req_id_clone).await {
                                     client_gone = true;
                                     break;
                                 }
@@ -1160,30 +1232,28 @@ async fn forward_openai_compat_anthropic(
                         // here — which already ships [DONE] — cannot race
                         // with a second [DONE] from the post-loop guard.
                         ctx.terminal.errored = true;
-                        if tx
-                            .send(Ok(openai_error_frame(&format!(
-                                "upstream stream interrupted: {e}"
-                            ))))
-                            .await
-                            .is_err()
-                        {
+                        let frame =
+                            openai_error_frame(&format!("upstream stream interrupted: {e}"));
+                        if !relay_send(&tx, frame, &req_id_clone).await {
                             client_gone = true;
                         }
                         break;
                     }
                 }
             }
+            // Release the upstream before the tail sends and recording usage.
+            drop(resp);
 
             // Process any remaining data in buffer (skip once a terminator is
-            // out — nothing may follow it)
-            if !ctx.terminal.reached() && !buffer.is_empty() {
-                let remaining = String::from_utf8_lossy(&buffer).into_owned();
+            // out — nothing may follow it — or the client is gone)
+            if !ctx.terminal.reached() && !client_gone {
+                let remaining = splitter.remainder();
                 if !remaining.trim().is_empty() {
                     if let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
                         if translated.ends_with("data: [DONE]\n\n") && !ctx.terminal.errored {
                             ctx.terminal.completed = true;
                         }
-                        if tx.send(Ok(bytes::Bytes::from(translated))).await.is_err() {
+                        if !relay_send(&tx, translated.into(), &req_id_clone).await {
                             client_gone = true;
                         }
                     }
@@ -1194,10 +1264,7 @@ async fn forward_openai_compat_anthropic(
             // after an error frame it would fake a clean completion)
             if !ctx.terminal.reached()
                 && !client_gone
-                && tx
-                    .send(Ok(bytes::Bytes::from("data: [DONE]\n\n")))
-                    .await
-                    .is_err()
+                && !relay_send(&tx, "data: [DONE]\n\n".into(), &req_id_clone).await
             {
                 client_gone = true;
             }
@@ -1235,7 +1302,7 @@ async fn forward_openai_compat_anthropic(
             .header("cache-control", "no-cache")
             .header("connection", "keep-alive")
             .header("x-budget-status", budget_status)
-            .body(Body::from_stream(ReceiverStream::new(rx)))
+            .body(body)
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
             });
@@ -1361,7 +1428,7 @@ pub(crate) async fn openai_chat_handler(
     // IP allowlist check
     if !state.is_ip_allowed(&client_ip) {
         warn!(client = %client_ip, "rejected: IP not in allowlist");
-        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+        return proxy_error_response(StatusCode::FORBIDDEN, "permission_error", "forbidden");
     }
 
     // Proxy auth: accept the credential from either x-api-key or
@@ -1540,9 +1607,9 @@ pub(crate) async fn openai_chat_handler(
         let n = state.endpoints.len();
         let mut last_saw_529 = false;
         let mut last_saw_transient = false;
-        // Upstream error from the most recent model-unsupported rejection —
+        // Upstream error from the most recent account-level rejection —
         // returned verbatim if the pool exhausts on nothing but rejections.
-        let mut model_unsupported_resp: Option<Response> = None;
+        let mut rejected_resp: Option<Response> = None;
         // One-shot entitlement re-send, as in `proxy_handler` (LAB-4729).
         let mut entitlement_resp: Option<(EndpointIdx, Option<Response>)> = None;
         for retry_round in 0..=MAX_529_RETRIES {
@@ -1565,8 +1632,9 @@ pub(crate) async fn openai_chat_handler(
                 // Pick the next endpoint and dispatch by protocol. Both forwards
                 // return a `ForwardOutcome` so the shared round-gated policy in
                 // `apply_round_outcome` covers both.
+                // OpenAI→Anthropic translation carries no `speed`: never fast.
                 let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                    .pick_endpoint_for_client(affinity, &model, &skip, &client_id)
+                    .pick_endpoint_for_client(affinity, &model, &skip, &client_id, false)
                     .await
                 {
                     Some(i) => {
@@ -1632,7 +1700,7 @@ pub(crate) async fn openai_chat_handler(
                     &mut skip,
                     &mut saw_529,
                     &mut saw_transient,
-                    &mut model_unsupported_resp,
+                    &mut rejected_resp,
                     &mut entitlement_resp,
                 ) {
                     RetryStep::Return(resp) => return resp,
@@ -1647,19 +1715,24 @@ pub(crate) async fn openai_chat_handler(
             }
         }
 
-        // Same model-rejection exhaustion rule as `proxy_handler` (LAB-941),
-        // in the OpenAI error shape this handler's clients parse.
+        // Entitlement 400 first, outside the rejection gate — as in
+        // `proxy_handler` (LAB-4729).
+        let (refused, entitlement_resp) = entitlement_resp.unzip();
         if !last_saw_529 && !last_saw_transient {
-            if let Some(resp) = entitlement_resp
-                .and_then(|(_, r)| r)
-                .or(model_unsupported_resp)
-            {
+            if let Some(resp) = entitlement_resp.flatten() {
                 return resp;
             }
-            if state.model_unsupported_everywhere(&model) {
-                warn!(model, "model unsupported on all eligible endpoints");
-                return model_unsupported_response(&model, true);
+        }
+        // Same rejection-exhaustion rule as `proxy_handler` (LAB-941, as
+        // generalised by LAB-2687), in the OpenAI error shape this handler's
+        // clients parse. Never `fast`: the OpenAI→Anthropic translation
+        // carries no `speed`.
+        if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, false, refused) {
+            if let Some(resp) = rejected_resp {
+                return resp;
             }
+            warn!(model, "model unsupported on all eligible endpoints");
+            return model_unsupported_response(&model, true);
         }
         exhaustion_response(&state, last_saw_transient, last_saw_529)
     }

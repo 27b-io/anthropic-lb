@@ -222,6 +222,12 @@ async fn body_memory_budget_sheds_oversized_with_503() {
         resp.headers().get("retry-after").is_some(),
         "memory-pressure 503 must carry Retry-After"
     );
+    assert_eq!(
+        resp.headers().get("content-type").map(|v| v.as_bytes()),
+        Some(&b"application/json"[..])
+    );
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["error"]["type"], "overloaded_error");
 }
 
 /// Control: with a generous budget the same request is served normally — the
@@ -347,17 +353,28 @@ async fn body_read_timeout_sheds_stalled_body_with_408() {
     .await
     .unwrap();
     // Send nothing further — the handler must time out rather than wait
-    // for the remaining 4080 bytes forever.
-    let mut buf = vec![0u8; 1024];
-    let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+    // for the remaining 4080 bytes forever. Read until the connection
+    // closes so the envelope body is complete, not just the status line.
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw))
         .await
         .expect("server must respond within the timeout, not hang")
         .unwrap();
-    let resp = String::from_utf8_lossy(&buf[..n]);
+    let resp = String::from_utf8_lossy(&raw);
     assert!(
         resp.starts_with("HTTP/1.1 408"),
         "stalled body must be shed with 408, got: {resp}"
     );
+    let (head, body) = resp
+        .split_once("\r\n\r\n")
+        .expect("response must have a header/body boundary");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: application/json"),
+        "408 must be content-type: application/json, got: {head}"
+    );
+    let json: serde_json::Value = serde_json::from_str(body).expect("408 body must be JSON");
+    assert_eq!(json["error"]["type"], "timeout_error");
     assert_eq!(
         state.inflight_body_bytes.load(Ordering::Relaxed),
         0,
@@ -1129,7 +1146,8 @@ async fn ingested_representative_claim_is_truncated_to_match_its_key() {
 }
 
 /// LAB-5313: a request-body read failure logs `req_id` and the error as
-/// structured fields, not interpolated into the message.
+/// structured fields, not interpolated into the message. The client gets a
+/// 400 in the JSON error envelope (LAB-4153).
 #[tokio::test]
 async fn read_body_bounded_logs_read_error_with_req_id() {
     let buf = log_capture_buf();
@@ -1141,6 +1159,11 @@ async fn read_body_bounded_logs_read_error_with_req_id() {
         .await
         .unwrap_err();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(resp.headers().get("retry-after").is_none());
+    let json = parse_error_envelope(resp).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert_eq!(json["error"]["message"], "bad request body");
 
     let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     let mine: Vec<&str> = output

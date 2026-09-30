@@ -1753,7 +1753,8 @@ async fn metrics_omits_claim_reset_already_in_the_past() {
 
 /// AC-3: both `exhaustion_response` arms increment, under their own `kind`, and
 /// both series exist at zero before any exhaustion so a rate() panel has a
-/// baseline instead of "No data".
+/// baseline instead of "No data". Both arms answer in the JSON error envelope
+/// (LAB-4153), and only the transient 503 carries `retry-after`.
 #[tokio::test]
 async fn metrics_counts_client_facing_pool_exhaustion() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
@@ -1780,11 +1781,27 @@ async fn metrics_counts_client_facing_pool_exhaustion() {
     // The incident shape: every endpoint gated, nothing transient → 429.
     let resp = exhaustion_response(&state, false, false);
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        resp.headers().get("retry-after").is_none(),
+        "rate-limited exhaustion must NOT carry retry-after (see exhaustion_response)"
+    );
+    let json = parse_error_envelope(Box::new(resp)).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "rate_limit_error");
+    assert_eq!(json["error"]["message"], "exhausted all endpoints");
     // A 529 round counts as rate-limited too — same 429 to the caller.
     let _ = exhaustion_response(&state, true, true);
     // Transport-only exhaustion is the other arm → retryable 503.
     let resp = exhaustion_response(&state, true, false);
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        resp.headers().get("retry-after").map(|v| v.as_bytes()),
+        Some(&b"1"[..])
+    );
+    let json = parse_error_envelope(Box::new(resp)).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "overloaded_error");
+    assert_eq!(json["error"]["message"], "upstream temporarily unreachable");
 
     let after = scrape(addr).await;
     assert!(

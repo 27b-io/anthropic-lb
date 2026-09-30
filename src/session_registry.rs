@@ -190,12 +190,14 @@ impl AppState {
     ) {
         {
             let mut counts = lock_recovering(&self.prompt_too_long, "prompt_too_long");
-            let label = if counts.len() < MAX_PROMPT_TOO_LONG_MODELS || counts.contains_key(model) {
-                model
-            } else {
-                "_other"
-            };
-            *counts.entry(label.to_owned()).or_insert(0) += 1;
+            let model_label = escape_sentinel(model, &["other"]);
+            let label =
+                if counts.len() < MAX_PROMPT_TOO_LONG_MODELS || counts.contains_key(&model_label) {
+                    model_label
+                } else {
+                    "_other".to_owned()
+                };
+            *counts.entry(label).or_insert(0) += 1;
         }
         let (observed, max) = parse_prompt_too_long(message)
             .map(|(o, m)| (Some(o), Some(m)))
@@ -713,7 +715,7 @@ impl AppState {
                     // overflow bucket — hard bound of MAX_CLIENT_MODEL_LABELS
                     // + 1 entries. A per-client ("<client>", "_other") key
                     // would let x-client-id rotation (legacy auth modes) grow
-                    // the map without bound (expert-panel finding, LAB-2330).
+                    // the map without bound (LAB-2330).
                     ("_other".to_owned(), "_other".to_owned())
                 };
                 let entry = map.entry(key).or_insert([0; 4]);
@@ -763,7 +765,9 @@ impl AppState {
         }
     }
 
-    /// Check if a client is within their daily token budget. Returns Ok(()) or Err with remaining.
+    /// Check if a client is within their daily token budget. Returns Ok(()), or Err with the
+    /// seconds until the UTC day rolls over (1..=86400) — the budget's real reset time, derived
+    /// from the same clock read that keys the day, so a denial can never carry the next day's hint.
     /// When Redis is available, a present counter is authoritative; an absent key or a read
     /// error falls through to the local floor — an absent key may be a counter lost to a
     /// failed INCRBY, or a poisoned key record_budget_usage deliberately deleted (LAB-1962).
@@ -774,7 +778,9 @@ impl AppState {
             Some(&limit) => limit,
             None => return Ok(()), // no budget configured = unlimited
         };
-        let today = Self::now_epoch() / 86400;
+        let now = Self::now_epoch();
+        let today = now / 86400;
+        let retry_after = 86400 - (now % 86400);
 
         // Try Redis first for cross-replica budget enforcement. The
         // is_connected gate matters on this request-path call: while fred is
@@ -786,7 +792,7 @@ impl AppState {
             if redis.is_connected() {
                 let key = format!("alb:budget:{client_id}:{today}");
                 match redis.get::<Option<u64>, _>(key.as_str()).await {
-                    Ok(Some(used)) if used >= limit => return Err(0),
+                    Ok(Some(used)) if used >= limit => return Err(retry_after),
                     Ok(Some(_)) => return Ok(()),
                     // Absent key: fall through to the local floor. Treating
                     // absence as an authoritative allow let a single failed
@@ -804,7 +810,7 @@ impl AppState {
         // Local fallback
         if let Some(&(day, used)) = self.lock_budget_usage().get(client_id) {
             if day == today && used >= limit {
-                return Err(limit - (used.min(limit)));
+                return Err(retry_after);
             }
         }
         Ok(())
@@ -1020,13 +1026,11 @@ impl AppState {
             client_id = %client_id,
             "rejected: read-only principal has no proxy authority"
         );
-        Some(Box::new(
-            (
-                StatusCode::FORBIDDEN,
-                "forbidden: read-only principal — /_stats and /metrics only",
-            )
-                .into_response(),
-        ))
+        Some(Box::new(proxy_error_response(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "forbidden: read-only principal — /_stats and /metrics only",
+        )))
     }
 
     /// Check if all model-compatible endpoints exceed this client's utilization limit.
@@ -1155,7 +1159,7 @@ impl AppState {
             self.note_model_denied(client_id, model);
             // `model` is caller-controlled and echoed back — truncate it here
             // too, so a 25 MB model field cannot become a 25 MB error body.
-            let body = if model.is_empty() {
+            let msg = if model.is_empty() {
                 format!(
                     "client '{client_id}' has a model allow-list, but no model could be read from the request"
                 )
@@ -1165,16 +1169,30 @@ impl AppState {
                     truncate_label(model)
                 )
             };
-            return Err(Box::new((StatusCode::FORBIDDEN, body).into_response()));
+            return Err(Box::new(proxy_error_response(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                &msg,
+            )));
         }
 
         // 1. Daily token budget (existing)
-        if client_id != "-" && self.check_budget(client_id).await.is_err() {
+        let budget = if client_id == "-" {
+            Ok(())
+        } else {
+            self.check_budget(client_id).await
+        };
+        if let Err(retry_after) = budget {
             self.note_client_rejection(client_id, "budget");
-            warn!(client_id = %client_id, "rejected: daily token budget exceeded");
-            return Err(Box::new(
-                (StatusCode::TOO_MANY_REQUESTS, "daily token budget exceeded").into_response(),
-            ));
+            warn!(client_id = %client_id, retry_after, "rejected: daily token budget exceeded");
+            let mut resp = proxy_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "daily token budget exceeded",
+            );
+            resp.headers_mut()
+                .insert("retry-after", HeaderValue::from(retry_after));
+            return Err(Box::new(resp));
         }
 
         // 2. Utilization limit (new)
@@ -1185,15 +1203,13 @@ impl AppState {
                 retry_after = retry_after,
                 "rejected: utilization limit exceeded"
             );
-            let mut resp = (
+            let mut resp = proxy_error_response(
                 StatusCode::TOO_MANY_REQUESTS,
-                format!("utilization limit exceeded for client '{client_id}'"),
-            )
-                .into_response();
-            resp.headers_mut().insert(
-                "retry-after",
-                HeaderValue::from_str(&retry_after.to_string()).unwrap(),
+                "rate_limit_error",
+                &format!("utilization limit exceeded for client '{client_id}'"),
             );
+            resp.headers_mut()
+                .insert("retry-after", HeaderValue::from(retry_after));
             return Err(Box::new(resp));
         }
 
@@ -1204,13 +1220,15 @@ impl AppState {
                 client_id = %client_id,
                 "rejected: emergency brake active"
             );
-            return Err(Box::new(
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "emergency: all accounts near exhaustion",
-                )
-                    .into_response(),
-            ));
+            // No `retry-after`: the brake is the same condition as
+            // `exhaustion_response`'s rate-limited branch — recovery is
+            // minutes to hours, and a short hint would tight-loop clients
+            // into a still-saturated pool. Fail fast instead.
+            return Err(Box::new(proxy_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "emergency: all accounts near exhaustion",
+            )));
         }
 
         Ok(())

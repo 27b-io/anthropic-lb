@@ -58,8 +58,29 @@ struct PersistedEndpoint {
 /// into a torn file before the atomic rename promotes it).
 static STATE_SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
 
+// Test-only clock override for `now_epoch`, set by `FrozenClock`. Thread-local:
+// `#[tokio::test]` defaults to a current-thread runtime on the test's own
+// thread, so parallel tests can't cross-pollute (same rationale as
+// TRANSLATE_A2O_CALLS below). The flip side is that a `multi_thread` test's
+// spawned work would read the wall clock instead — `FrozenClock` asserts
+// against that rather than leaving it to be discovered.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FROZEN_NOW: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 impl AppState {
     pub(crate) fn now_epoch() -> u64 {
+        // A request reads this clock more than once (`record_budget_usage` and
+        // `check_budget` each key the day). Budget keys roll at UTC midnight,
+        // so a rollover between two live reads buckets usage under one day and
+        // checks another; tests pin all reads to one instant. `#[cfg(test)]` —
+        // no clock field on AppState, no production seam, and the release
+        // build's `.text` is unchanged.
+        #[cfg(test)]
+        if let Some(frozen) = FROZEN_NOW.with(|c| c.get()) {
+            return frozen;
+        }
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -570,16 +591,17 @@ impl AppState {
                 info.limit_requests = pa.limit_requests;
                 info.limit_tokens = pa.limit_tokens;
 
-                if let Some(until_epoch) = pa.hard_limited_until_epoch {
-                    if until_epoch > now_epoch {
-                        let remaining_secs = until_epoch - now_epoch;
-                        info.hard_limited_until =
-                            Some(now_instant + Duration::from_secs(remaining_secs));
-                        info!(
-                            account = pa.name,
-                            remaining_secs, "restored hard limit from persisted state"
-                        );
-                    }
+                // Same clamp as the Redis sync path: a corrupt file value
+                // (e.g. u64::MAX) must not overflow Instant and panic boot.
+                if let HardLimitSync::Update(until) =
+                    classify_hard_limit_sync(pa.hard_limited_until_epoch, now_epoch, now_instant)
+                {
+                    info.hard_limited_until = Some(until);
+                    info!(
+                        account = pa.name,
+                        remaining_secs = (until - now_instant).as_secs(),
+                        "restored hard limit from persisted state"
+                    );
                 }
 
                 info.last_updated = Some(now_instant);

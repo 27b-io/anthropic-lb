@@ -414,8 +414,8 @@ async fn build_metrics_snap(
 /// writer's `Mutex` is locked by tracing-subscriber, not by this crate). That
 /// is sound because each guarded value is either a counter/accumulator store,
 /// a map of independent, self-expiring entries (auth throttle windows, the
-/// unsupported-model cache, the session registry, log dedup/rate-limit
-/// stamps), a single replaced value (cluster-info cache), or the burn-rate
+/// unsupported-model and fast-mode-disabled caches, the session registry, log
+/// dedup/rate-limit stamps), a single replaced value (cluster-info cache), or the burn-rate
 /// state: three independent EWMAs updated one after another, so a panic
 /// mid-update leaves at worst a monitoring value torn by one update.
 /// A panicking holder can leave one entry stale by at most one update, never
@@ -878,6 +878,24 @@ pub(crate) async fn metrics_handler(
             "anthropic_account_hard_limited_remaining_seconds",
             &[("account", &s.name)],
             s.hard_limited_secs,
+        );
+    }
+
+    // Org-level fast-mode entitlement marks (LAB-2687): one increment per
+    // "Fast mode is not enabled" 400 an account returned. Non-zero on an
+    // account means its org needs fast mode enabled — an operator action.
+    prom_header(
+        &mut buf,
+        "anthropic_fast_mode_disabled_total",
+        "counter",
+        "Upstream 'Fast mode is not enabled for your organization' 400 responses by account",
+    );
+    for ep in &state.endpoints {
+        prom_counter(
+            &mut buf,
+            "anthropic_fast_mode_disabled_total",
+            &[("account", &ep.name)],
+            ep.fast_mode_disabled_total.load(Ordering::Relaxed),
         );
     }
 
@@ -1471,16 +1489,16 @@ pub(crate) async fn metrics_handler(
         &mut buf,
         "anthropic_upstream_transport_errors_total",
         "counter",
-        "Upstream transport send-failures by kind. Where anthropic_cluster_redis_connected is 1 this is the Redis fleet-wide total, identical on every replica (aggregate with max). Otherwise it is this process's local count (aggregate with sum): without Redis every failure it has seen; with Redis, before the first sync or while unreachable, the failures it has still to flush, which can include some already counted in the fleet total",
+        "Upstream transport send-failures by kind. Where anthropic_cluster_redis_connected is 1 this is the Redis fleet-wide total, identical on every replica (aggregate with max). Otherwise it is this process's local count (aggregate with sum): without Redis every failure it has seen; with Redis, before the first sync or while unreachable, the failures it has still to flush, which overlap the fleet total only after a flush whose reply was lost",
     );
     // Prefer the Redis fleet-wide aggregate (cached every 5s by the sync task)
     // so multi-replica deployments report a cluster-wide count; fall back to the
     // local accumulator when Redis is absent or the aggregate is unavailable
     // (single-instance, pre-first-sync, or a Redis blip). With Redis that
     // accumulator holds the deltas awaiting a flush, including any re-queued by
-    // a failed one (at-least-once), so the fallback is a per-replica count that
-    // can overlap the fleet total: the HELP text names the gauge that tells the
-    // two scopes apart.
+    // a flush whose reply was lost (at-least-once), so the fallback is a
+    // per-replica count that can overlap the fleet total: the HELP text names
+    // the gauge that tells the two scopes apart.
     let transport_errors: Vec<(String, u64)> = cluster_info
         .as_ref()
         .and_then(|ci| ci.get("transport_errors"))

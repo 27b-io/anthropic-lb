@@ -13,13 +13,15 @@ fn model_unsupported_error_detection() {
     assert!(is_model_unsupported_error(
         StatusCode::NOT_FOUND,
         &anthropic_404,
-        Protocol::Anthropic
+        Protocol::Anthropic,
+        "claude-nope-1"
     ));
     assert!(
         !is_model_unsupported_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &anthropic_404,
-            Protocol::Anthropic
+            Protocol::Anthropic,
+            "claude-nope-1"
         ),
         "status gate: a 5xx is never a model rejection"
     );
@@ -29,7 +31,12 @@ fn model_unsupported_error_detection() {
         "error": {"type": "not_found_error", "message": "Not Found"}
     });
     assert!(
-        !is_model_unsupported_error(StatusCode::NOT_FOUND, &path_404, Protocol::Anthropic),
+        !is_model_unsupported_error(
+            StatusCode::NOT_FOUND,
+            &path_404,
+            Protocol::Anthropic,
+            "claude-nope-1"
+        ),
         "URL-path 404 lacks the 'model:' prefix and must not match"
     );
 
@@ -43,7 +50,8 @@ fn model_unsupported_error_detection() {
     assert!(is_model_unsupported_error(
         StatusCode::BAD_REQUEST,
         &litellm_400,
-        Protocol::OpenAI
+        Protocol::OpenAI,
+        "claude-opus-5"
     ));
 
     let openai_code = serde_json::json!({
@@ -52,7 +60,8 @@ fn model_unsupported_error_detection() {
     assert!(is_model_unsupported_error(
         StatusCode::NOT_FOUND,
         &openai_code,
-        Protocol::OpenAI
+        Protocol::OpenAI,
+        "x"
     ));
 
     let too_long = serde_json::json!({
@@ -60,7 +69,12 @@ fn model_unsupported_error_detection() {
         "error": {"type": "invalid_request_error", "message": "prompt is too long: 210000 tokens > 200000 maximum"}
     });
     assert!(
-        !is_model_unsupported_error(StatusCode::BAD_REQUEST, &too_long, Protocol::Anthropic),
+        !is_model_unsupported_error(
+            StatusCode::BAD_REQUEST,
+            &too_long,
+            Protocol::Anthropic,
+            "claude-opus-5"
+        ),
         "prompt-too-long 400 must not be treated as a model rejection"
     );
 
@@ -72,17 +86,31 @@ fn model_unsupported_error_detection() {
         "error": {"type": "invalid_request_error", "message": "invalid model name: Extra inputs are not permitted"}
     });
     assert!(
-        !is_model_unsupported_error(StatusCode::BAD_REQUEST, &echoed_field, Protocol::Anthropic),
+        !is_model_unsupported_error(
+            StatusCode::BAD_REQUEST,
+            &echoed_field,
+            Protocol::Anthropic,
+            "claude-opus-5"
+        ),
         "an echoed client field name must not read as a model rejection on an Anthropic endpoint"
     );
     assert!(
-        !is_model_unsupported_error(StatusCode::BAD_REQUEST, &litellm_400, Protocol::Anthropic),
+        !is_model_unsupported_error(
+            StatusCode::BAD_REQUEST,
+            &litellm_400,
+            Protocol::Anthropic,
+            "claude-opus-5"
+        ),
         "the free-text arm belongs to OpenAI-protocol gateways only"
     );
     for protocol in [Protocol::Anthropic, Protocol::OpenAI] {
         assert!(
-            is_model_unsupported_error(StatusCode::NOT_FOUND, &anthropic_404, protocol)
-                && is_model_unsupported_error(StatusCode::NOT_FOUND, &openai_code, protocol),
+            is_model_unsupported_error(
+                StatusCode::NOT_FOUND,
+                &anthropic_404,
+                protocol,
+                "claude-nope-1"
+            ) && is_model_unsupported_error(StatusCode::NOT_FOUND, &openai_code, protocol, "x"),
             "structured arms match on every protocol ({protocol:?})"
         );
     }
@@ -130,43 +158,91 @@ async fn model_unsupported_filters_routing_until_expiry() {
     assert_eq!(candidates.len(), 2, "expired entry must not filter routing");
 }
 
-/// The learn map is bounded: past UNSUPPORTED_MODEL_MAX distinct pairs, new
-/// learns are dropped — model strings are client-supplied input. An EXISTING
-/// pair must still refresh its TTL at capacity (refresh doesn't grow the map).
+/// The learn map is bounded: past UNSUPPORTED_MODEL_MAX distinct pairs, a new
+/// learn evicts the entry nearest expiry — model strings are client-supplied
+/// input. An EXISTING pair must still refresh its TTL at capacity, and the
+/// refresh evicts nothing (refresh doesn't grow the map).
 #[test]
 fn model_unsupported_map_is_bounded() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a")]);
-    for i in 0..(UNSUPPORTED_MODEL_MAX + 50) {
-        state.note_model_unsupported("a", 0, &format!("model-{i}"));
+    let key = |i: usize| (0usize, format!("model-{i}"));
+    let last = UNSUPPORTED_MODEL_MAX + 49;
+    for i in 0..=last {
+        state.note_model_unsupported("a", 0, &key(i).1);
     }
-    assert_eq!(
-        state.unsupported_models.lock().unwrap().len(),
-        UNSUPPORTED_MODEL_MAX
-    );
+    {
+        let map = state.unsupported_models.lock().unwrap();
+        assert_eq!(map.len(), UNSUPPORTED_MODEL_MAX);
+        assert!(
+            (0..50).all(|i| !map.contains_key(&key(i))) && map.contains_key(&key(50)),
+            "the 50 overflow learns must evict the 50 oldest entries, and only those"
+        );
+    }
 
-    // Shorten one live entry's TTL, then re-note it with the map still full:
-    // the refresh must land (expiry back to ~full TTL), not be dropped.
-    let key = (0usize, "model-0".to_string());
+    // Give `model-50` the nearest expiry, still live, and shorten the TTL of
+    // the pair about to be re-noted. With the map still full, the refresh must
+    // land (expiry back to ~full TTL) without evicting `model-50`.
     {
         let mut map = state.unsupported_models.lock().unwrap();
-        map.insert(key.clone(), Instant::now() + Duration::from_secs(1));
+        map.insert(key(50), Instant::now() + Duration::from_secs(30));
+        map.insert(key(last), Instant::now() + Duration::from_secs(60));
     }
-    state.note_model_unsupported("a", 0, "model-0");
+    state.note_model_unsupported("a", 0, &key(last).1);
     {
         let map = state.unsupported_models.lock().unwrap();
         assert_eq!(
             map.len(),
             UNSUPPORTED_MODEL_MAX,
-            "refresh must not grow the map"
+            "refresh must not shrink or grow the map"
+        );
+        assert!(
+            map.contains_key(&key(50)),
+            "a refresh must not evict the entry nearest expiry"
         );
         let expiry = map
-            .get(&key)
+            .get(&key(last))
             .expect("existing pair must survive a refresh at capacity");
         assert!(
-            *expiry > Instant::now() + Duration::from_secs(60),
+            *expiry > Instant::now() + Duration::from_secs(120),
             "TTL must be refreshed for an existing pair even at capacity"
         );
     }
+}
+
+/// A model name longer than UNSUPPORTED_MODEL_MAX_BYTES is not learned: the
+/// entry count is capped, and this caps each entry's size, since the name is
+/// client input bounded only by the request body cap.
+#[test]
+fn model_unsupported_skips_oversized_model_names() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a")]);
+    let fits = "m".repeat(UNSUPPORTED_MODEL_MAX_BYTES);
+    let oversized = "m".repeat(UNSUPPORTED_MODEL_MAX_BYTES + 1);
+    state.note_model_unsupported("a", 0, &fits);
+    state.note_model_unsupported("a", 0, &oversized);
+    let map = state.unsupported_models.lock().unwrap();
+    assert!(map.contains_key(&(0, fits)));
+    assert!(!map.contains_key(&(0, oversized)));
+}
+
+/// The learn's log line records the model escaped: a newline in a
+/// client-supplied model name must not start a forged log line.
+#[test]
+fn model_unsupported_log_escapes_the_model_name() {
+    let buf = log_capture_buf();
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a")]);
+    state.note_model_unsupported("a", 0, "negcache-log\nFORGED-NEGCACHE fake line");
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|l| l.contains("model unsupported on account")
+                && l.contains(r#"model="negcache-log\nFORGED-NEGCACHE fake line""#)),
+        "the learn must log the model quoted and escaped, got:\n{output}"
+    );
+    assert!(
+        !output.lines().any(|l| l.starts_with("FORGED-NEGCACHE")),
+        "a newline in the model name must not start a new log line"
+    );
 }
 
 /// LAB-941 native path: an account 404-rejecting the model rotates to the
@@ -311,6 +387,10 @@ async fn model_unsupported_everywhere_openai_handler_returns_openai_shaped_404()
     );
 }
 
+/// The gateway's 400 for a model it does not serve, as observed live
+/// 2026-07-27.
+const HEAD_400_LITELLM: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"/chat/completions: Invalid model name passed in model=claude-opus-5. Call `/v1/models` to view available models for your key.\",\"type\":\"None\",\"param\":\"None\",\"code\":\"400\"}}";
+
 /// LAB-941 incident shape (observed live 2026-07-27): an OpenAI-protocol
 /// gateway without the requested model returns 400 "Invalid model name"; the
 /// LB must rotate to an account that serves it and route the NEXT request
@@ -318,7 +398,6 @@ async fn model_unsupported_everywhere_openai_handler_returns_openai_shaped_404()
 #[tokio::test]
 async fn gateway_invalid_model_rotates_to_serving_account() {
     use std::sync::atomic::Ordering;
-    const HEAD_400_LITELLM: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"/chat/completions: Invalid model name passed in model=claude-opus-5. Call `/v1/models` to view available models for your key.\",\"type\":\"None\",\"param\":\"None\",\"code\":\"400\"}}";
     let (gw_url, gw_hits) =
         spawn_status_then_ok_upstream(usize::MAX, HEAD_400_LITELLM, OPENAI_OK_BODY).await;
     let (ok_url, _h) = spawn_mock_upstream().await;
@@ -396,7 +475,11 @@ async fn echoed_field_name_400_does_not_negative_cache_native() {
         reqwest::StatusCode::BAD_REQUEST,
         "the client's own 400 must be forwarded, not rotated away"
     );
-    assert_eq!(echo_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        echo_hits.load(Ordering::SeqCst),
+        1,
+        "the request must reach the echoing account exactly once"
+    );
     assert_eq!(
         other_hits.load(Ordering::SeqCst),
         0,
@@ -410,6 +493,11 @@ async fn echoed_field_name_400_does_not_negative_cache_native() {
 
 /// LAB-5235 OpenAI-compat path: `/v1/chat/completions` forwards to the same
 /// Anthropic accounts, so the same echoed-field 400 must not learn or rotate.
+///
+/// The mock answers with the echo whatever the body, and the request carries
+/// no extra key: the translation copies known fields only, so a client key
+/// cannot reach the account here. This pins the classifier's verdict at this
+/// call site, not the attack's reachability.
 #[tokio::test]
 async fn echoed_field_name_400_does_not_negative_cache_openai_compat() {
     use std::sync::atomic::Ordering;
@@ -426,7 +514,11 @@ async fn echoed_field_name_400_does_not_negative_cache_openai_compat() {
         reqwest::StatusCode::BAD_REQUEST,
         "the client's own 400 must be forwarded, not rotated away"
     );
-    assert_eq!(echo_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        echo_hits.load(Ordering::SeqCst),
+        1,
+        "the request must reach the echoing account exactly once"
+    );
     assert_eq!(
         other_hits.load(Ordering::SeqCst),
         0,
@@ -435,5 +527,492 @@ async fn echoed_field_name_400_does_not_negative_cache_openai_compat() {
     assert!(
         state.unsupported_models.lock().unwrap().is_empty(),
         "an echoed field name must not negative-cache the model"
+    );
+}
+
+// ── The echo veto and the anchored gateway arm ──
+
+/// Every forward path classifies through `classify_rejection`. An error
+/// message that starts with one of the request's own top-level keys is the
+/// client's own error, whatever a classifier would read into it; the genuine
+/// signals, `model: <id>` included, still classify.
+#[test]
+fn classify_rejection_vetoes_echoed_request_keys_only() {
+    let err =
+        |ty: &str, msg: &str| serde_json::json!({"type":"error","error":{"type":ty,"message":msg}});
+    let body = |extra: &str| {
+        format!(
+            r#"{{"model":"claude-opus-5","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]{extra}}}"#
+        )
+    };
+    let plain = body("");
+    let entitlement = err(
+        "invalid_request_error",
+        "You're out of extra usage. Ask your workspace admin to add more so you can keep going.",
+    );
+    let litellm = serde_json::json!({"error":{"message":"/chat/completions: Invalid model name passed in model=claude-opus-5. Call `/v1/models` to view available models for your key.","type":"invalid_request_error","param":null,"code":"400"}});
+    let genuine: [(
+        &str,
+        StatusCode,
+        serde_json::Value,
+        Protocol,
+        UpstreamRejection,
+    ); 4] = [
+        (
+            "the Anthropic model 404, whose prefix is the request's own `model` key",
+            StatusCode::NOT_FOUND,
+            err("not_found_error", "model: claude-opus-5"),
+            Protocol::Anthropic,
+            UpstreamRejection::ModelUnsupported,
+        ),
+        (
+            "the OpenAI model_not_found code",
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error":{"message":"The model `claude-opus-5` does not exist","type":"invalid_request_error","code":"model_not_found"}}),
+            Protocol::OpenAI,
+            UpstreamRejection::ModelUnsupported,
+        ),
+        (
+            "the gateway's own invalid-model 400",
+            StatusCode::BAD_REQUEST,
+            litellm.clone(),
+            Protocol::OpenAI,
+            UpstreamRejection::ModelUnsupported,
+        ),
+        (
+            "the extra-usage 400",
+            StatusCode::BAD_REQUEST,
+            entitlement.clone(),
+            Protocol::Anthropic,
+            UpstreamRejection::Entitlement,
+        ),
+    ];
+    for (why, status, e, protocol, want) in genuine {
+        assert_eq!(
+            classify_rejection(
+                status,
+                &e,
+                protocol,
+                "claude-opus-5",
+                plain.as_bytes(),
+                false
+            ),
+            Some(want),
+            "{why} must still classify"
+        );
+    }
+    // A bodiless request has no key to echo; the verdict stands.
+    assert_eq!(
+        classify_rejection(
+            StatusCode::BAD_REQUEST,
+            &entitlement,
+            Protocol::Anthropic,
+            "",
+            b"",
+            false
+        ),
+        Some(UpstreamRejection::Entitlement)
+    );
+
+    let echoes: [(&str, &str, serde_json::Value, Protocol); 5] = [
+        (
+            "a key named with the entitlement anchor",
+            r#","You're out of extra usage":1"#,
+            err(
+                "invalid_request_error",
+                "You're out of extra usage: Extra inputs are not permitted",
+            ),
+            Protocol::Anthropic,
+        ),
+        (
+            "the same key past a tightened anchor",
+            r#","You're out of extra usage. x":1"#,
+            err(
+                "invalid_request_error",
+                "You're out of extra usage. x: Extra inputs are not permitted",
+            ),
+            Protocol::Anthropic,
+        ),
+        (
+            "a key that spells the gateway's own rejection",
+            r#","/x: Invalid model name passed in model=claude-opus-5.":1"#,
+            serde_json::json!({"error":{"message":"/x: Invalid model name passed in model=claude-opus-5.: Extra inputs are not permitted"}}),
+            Protocol::OpenAI,
+        ),
+        (
+            "a key whose name contains a colon",
+            r#","You're out of extra usage: yes":1"#,
+            err(
+                "invalid_request_error",
+                "You're out of extra usage: yes: Extra inputs are not permitted",
+            ),
+            Protocol::Anthropic,
+        ),
+        (
+            "a duplicated key",
+            r#","You're out of extra usage":1,"You're out of extra usage":2"#,
+            err(
+                "invalid_request_error",
+                "You're out of extra usage: Extra inputs are not permitted",
+            ),
+            Protocol::Anthropic,
+        ),
+    ];
+    for (why, extra, e, protocol) in echoes {
+        let sent = body(extra);
+        assert_eq!(
+            classify_rejection(
+                StatusCode::BAD_REQUEST,
+                &e,
+                protocol,
+                "claude-opus-5",
+                sent.as_bytes(),
+                false
+            ),
+            None,
+            "{why}: the echo is the client's own error"
+        );
+    }
+    // A body that does not parse cannot rule an echo out, so it forwards.
+    assert_eq!(
+        classify_rejection(
+            StatusCode::BAD_REQUEST,
+            &entitlement,
+            Protocol::Anthropic,
+            "claude-opus-5",
+            br#"{"model":"claude-opus-5","#,
+            false
+        ),
+        None
+    );
+}
+
+/// A body with two top-level `model` keys names no single model: the proxy
+/// reads the last, a first-key-wins upstream the first. No model arm may then
+/// classify, since each would pin the rejection on the model the proxy read.
+/// Keys compare decoded, so an escaped duplicate counts too.
+#[test]
+fn classify_rejection_vetoes_duplicate_model_keys() {
+    let arms: [(&str, StatusCode, serde_json::Value, Protocol); 4] = [
+        (
+            "the Anthropic model 404",
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"type":"error","error":{"type":"not_found_error","message":"model: gpt-real"}}),
+            Protocol::Anthropic,
+        ),
+        (
+            "the model_not_found code",
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error":{"message":"The model `gpt-bogus` does not exist","type":"invalid_request_error","code":"model_not_found"}}),
+            Protocol::OpenAI,
+        ),
+        (
+            "the model_not_found code with no message",
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error":{"code":"model_not_found"}}),
+            Protocol::OpenAI,
+        ),
+        (
+            "the gateway's own invalid-model 400",
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error":{"message":"/chat/completions: Invalid model name passed in model=gpt-real. Call `/v1/models` to view available models for your key.","code":"400"}}),
+            Protocol::OpenAI,
+        ),
+    ];
+    for (why, status, e, protocol) in &arms {
+        for sent in [
+            r#"{"model":"gpt-bogus","model":"gpt-real","messages":[]}"#,
+            r#"{"model":"gpt-bogus","m\u006fdel":"gpt-real","messages":[]}"#,
+        ] {
+            assert_eq!(
+                classify_rejection(*status, e, *protocol, "gpt-real", sent.as_bytes(), false),
+                None,
+                "{why}: {sent}"
+            );
+        }
+        assert_eq!(
+            classify_rejection(
+                *status,
+                e,
+                *protocol,
+                "gpt-real",
+                br#"{"model":"gpt-real","messages":[]}"#,
+                false
+            ),
+            Some(UpstreamRejection::ModelUnsupported),
+            "{why}: with one `model` key the error still classifies"
+        );
+    }
+}
+
+/// The gateway arm matches its own framing only, at the start of the message
+/// and naming the model the request asked for. Provider errors the gateway
+/// relays sit later in the same field and can echo client-chosen keys.
+#[test]
+fn gateway_model_arm_is_anchored_and_bound_to_requested_model() {
+    let msg = |m: &str| serde_json::json!({"error":{"message":m,"type":"invalid_request_error","code":"400"}});
+    let hit = |m: &str, model: &str| {
+        is_model_unsupported_error(StatusCode::BAD_REQUEST, &msg(m), Protocol::OpenAI, model)
+    };
+    let own = "/chat/completions: Invalid model name passed in model=claude-opus-5. Call `/v1/models` to view available models for your key.";
+    assert!(hit(own, "claude-opus-5"));
+    assert!(
+        !hit(own, "claude-opus-4"),
+        "a rejection naming another model must not mark the requested one"
+    );
+    assert!(
+        !hit(own, "claude-opus-5-1"),
+        "the bound model must be the whole id, not a prefix of it"
+    );
+    for relayed in [
+        r#"litellm.BadRequestError: AnthropicException - {"type":"error","error":{"type":"invalid_request_error","message":"Invalid model name passed in model=claude-opus-5.: Extra inputs are not permitted"}}"#,
+        "litellm.BadRequestError: OpenAIException - Unrecognized request argument supplied: /chat/completions: Invalid model name passed in model=claude-opus-5.",
+        "Invalid model name passed in model=claude-opus-5. no route prefix",
+    ] {
+        assert!(!hit(relayed, "claude-opus-5"), "must not match: {relayed}");
+    }
+}
+
+/// End to end on an OpenAI-protocol endpoint: a gateway 400 made of the
+/// client's own key neither learns nor rotates, whether the key comes back at
+/// the start of the message (the echo veto) or relayed mid-message (the
+/// anchored arm). The healthy account would serve if the request rotated.
+#[tokio::test]
+async fn gateway_echo_of_client_key_does_not_negative_cache() {
+    use std::sync::atomic::Ordering;
+    const HEAD_START_ECHO: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"/x: Invalid model name passed in model=claude-opus-5.: Extra inputs are not permitted\",\"type\":\"invalid_request_error\",\"code\":\"400\"}}";
+    const HEAD_RELAYED_ECHO: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"litellm.BadRequestError: AnthropicException - {\\\"type\\\":\\\"error\\\",\\\"error\\\":{\\\"type\\\":\\\"invalid_request_error\\\",\\\"message\\\":\\\"Invalid model name passed in model=claude-opus-5.: Extra inputs are not permitted\\\"}}\",\"type\":\"invalid_request_error\",\"code\":\"400\"}}";
+    for (kind, head, key) in [
+        (
+            "echo at the start",
+            HEAD_START_ECHO,
+            "/x: Invalid model name passed in model=claude-opus-5.",
+        ),
+        (
+            "echo relayed mid-message",
+            HEAD_RELAYED_ECHO,
+            "Invalid model name passed in model=claude-opus-5.",
+        ),
+    ] {
+        let (gw_url, gw_hits) =
+            spawn_status_then_ok_upstream(usize::MAX, head, OPENAI_OK_BODY).await;
+        let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+        let mut gw = make_endpoint("gw", Protocol::OpenAI);
+        gw.base_url = gw_url;
+        let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+        healthy.priority = 1;
+        let state = test_state_with(vec![gw, healthy]);
+        let addr = serve(build_router(state.clone())).await;
+        let mut req = serde_json::json!({"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]});
+        req[key] = serde_json::json!(1);
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(req.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{kind}: the client's own 400 must be forwarded"
+        );
+        assert_eq!(
+            (
+                gw_hits.load(Ordering::SeqCst),
+                ok_hits.load(Ordering::SeqCst)
+            ),
+            (1, 0),
+            "{kind}: the request must not rotate"
+        );
+        assert!(
+            state.unsupported_models.lock().unwrap().is_empty(),
+            "{kind}: the model must not be negative-cached"
+        );
+    }
+}
+
+type Hits = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+/// Passthrough endpoint returning `HEAD_404_MODEL` at priority 0, a healthy
+/// account at priority 1: without the passthrough veto the 404 would mark
+/// `pt` and rotate onto `healthy`.
+async fn passthrough_404_then_healthy() -> (Arc<AppState>, SocketAddr, Hits, Hits) {
+    let (pt_url, pt_hits) = spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
+    let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+    healthy.priority = 1;
+    let state = test_state_with(vec![mk_endpoint_at("pt", "passthrough", &pt_url), healthy]);
+    assert!(state.endpoints[0].passthrough);
+    let addr = serve(build_router(state.clone())).await;
+    (state, addr, pt_hits, ok_hits)
+}
+
+/// LAB-6005: a passthrough endpoint sends the caller's own credential, so its
+/// model 404 says the caller's plan lacks the model, not the endpoint. It must
+/// reach that caller unchanged, with no negative-cache entry and no rotation:
+/// a mark would take the endpoint out of routing for that model for every
+/// other caller for the TTL, and one repeated request would keep it out.
+#[tokio::test]
+async fn model_404_on_passthrough_endpoint_is_not_marked_or_rotated() {
+    use std::sync::atomic::Ordering;
+    let (state, addr, pt_hits, ok_hits) = passthrough_404_then_healthy().await;
+    for _ in 0..2 {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .header("x-api-key", "sk-ant-api-caller")
+            .body(r#"{"model":"claude-nope-1","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.pointer("/error/message").and_then(|v| v.as_str()),
+            Some("model: claude-nope-1"),
+            "the caller must see its own plan's 404, got: {body}"
+        );
+    }
+    assert!(
+        state.unsupported_models.lock().unwrap().is_empty(),
+        "a passthrough endpoint's model 404 must not negative-cache the endpoint"
+    );
+    assert_eq!(
+        (
+            pt_hits.load(Ordering::SeqCst),
+            ok_hits.load(Ordering::SeqCst)
+        ),
+        (2, 0),
+        "must not rotate off a 404 that describes the caller"
+    );
+}
+
+/// LAB-6005, OpenAI-compat path: the same passthrough 404 through
+/// `/v1/chat/completions` (its own `note_model_unsupported` call site).
+#[tokio::test]
+async fn model_404_on_passthrough_endpoint_is_not_marked_on_openai_compat() {
+    use std::sync::atomic::Ordering;
+    let (state, addr, pt_hits, ok_hits) = passthrough_404_then_healthy().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "sk-ant-api-caller")
+        .body(r#"{"model":"claude-nope-1","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body.pointer("/error/message").and_then(|v| v.as_str()),
+        Some("model: claude-nope-1"),
+        "the caller must see its own plan's 404, got: {body}"
+    );
+    assert!(
+        state.unsupported_models.lock().unwrap().is_empty(),
+        "a passthrough endpoint's model 404 must not negative-cache the endpoint"
+    );
+    assert_eq!(
+        (
+            pt_hits.load(Ordering::SeqCst),
+            ok_hits.load(Ordering::SeqCst)
+        ),
+        (1, 0),
+        "must not rotate off a 404 that describes the caller"
+    );
+}
+
+// ── Negative-cache hardening: client model strings ──
+
+/// A spray of distinct bogus models fills the map; a genuine rejection that
+/// arrives afterwards is still learned, and the next request for that model
+/// routes away from the endpoint that rejected it.
+#[tokio::test]
+async fn bogus_model_spray_cannot_block_a_genuine_learn() {
+    use std::sync::atomic::Ordering;
+    let (gw_url, gw_hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_400_LITELLM, OPENAI_OK_BODY).await;
+    let (ok_url, _h) = spawn_mock_upstream().await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = gw_url;
+    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+    healthy.priority = 1;
+    let state = test_state_with(vec![gw, healthy]);
+    for i in 0..UNSUPPORTED_MODEL_MAX {
+        state.note_model_unsupported("healthy", 1, &format!("bogus-{i}"));
+    }
+    let addr = serve(build_router(state.clone())).await;
+
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+    assert_eq!(
+        gw_hits.load(Ordering::SeqCst),
+        1,
+        "the genuine learn must land in a full map, so the second request skips the gateway"
+    );
+    // One more bogus learn after the genuine one evicts the oldest bogus
+    // entry. Evicting the newest instead would let every bogus learn that
+    // follows a genuine one push it straight back out.
+    state.note_model_unsupported("healthy", 1, "bogus-late");
+    let map = state.unsupported_models.lock().unwrap();
+    assert_eq!(map.len(), UNSUPPORTED_MODEL_MAX, "the map stays bounded");
+    assert!(
+        map.contains_key(&(0, "claude-opus-5".to_string())),
+        "the genuine learn must survive a later bogus learn"
+    );
+}
+
+/// A model 404 marks only the model it names. With two `model` keys the proxy
+/// reads the last one; an upstream that read the first would reject a model
+/// the proxy never asked for, and must not get the requested one cached.
+#[tokio::test]
+async fn model_404_naming_another_model_does_not_negative_cache() {
+    use std::sync::atomic::Ordering;
+    assert!(!is_model_unsupported_error(
+        StatusCode::NOT_FOUND,
+        &serde_json::json!({"type":"error","error":{"type":"not_found_error","message":"model: claude-nope-1"}}),
+        Protocol::Anthropic,
+        "claude-opus-5"
+    ));
+    let (url, hits) = spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
+    let (other_url, other_hits) = spawn_status_then_ok_upstream(0, "", b"{}").await;
+    let rejecting = mk_endpoint_at("rejecting", "sk-ant-api-r", &url);
+    let mut other = mk_endpoint_at("other", "sk-ant-api-o", &other_url);
+    other.priority = 1;
+    let state = test_state_with(vec![rejecting, other]);
+    let addr = serve(build_router(state.clone())).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-nope-1","model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "the upstream's 404 reaches the caller as-is"
+    );
+    assert_eq!(
+        (
+            hits.load(Ordering::SeqCst),
+            other_hits.load(Ordering::SeqCst)
+        ),
+        (1, 0),
+        "a 404 for another model must not rotate the request"
+    );
+    assert!(
+        state.unsupported_models.lock().unwrap().is_empty(),
+        "the requested model must not be negative-cached"
     );
 }

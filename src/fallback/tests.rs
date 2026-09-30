@@ -414,6 +414,95 @@ async fn fallback_translated_stream_done_only_emits_error_frame() {
     );
 }
 
+// ── LAB-6017: O→O passthrough sees the upstream's in-band error ──
+
+const PASSTHROUGH_INBAND_ERROR: &str = concat!(
+    "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}],\"error\":null}\n\n",
+    "data: {\"error\":{\"message\":\"upstream boom\",\"type\":\"server_error\"}}\n\n",
+);
+
+/// Stream `mock_addr` through `try_fallback_upstream`'s passthrough branch
+/// (translate = false) and return the client-visible body.
+async fn stream_passthrough(mock_addr: SocketAddr, req_id: &str) -> String {
+    let mut ep = make_endpoint("gw", Protocol::OpenAI);
+    ep.base_url = format!("http://{}", mock_addr);
+    let state = Arc::new(AppState {
+        endpoints: vec![ep],
+        ..test_state_base()
+    });
+    let body = bytes::Bytes::from_static(br#"{"model":"gpt-4","messages":[],"stream":true}"#);
+    let ForwardOutcome::Done(resp) = try_fallback_upstream(
+        &state,
+        &body,
+        req_id,
+        "client-1",
+        &"127.0.0.1".parse().unwrap(),
+        "-",
+        "-",
+        "gpt-4",
+        0,
+        Instant::now(),
+        false,
+        true,
+    )
+    .await
+    else {
+        panic!("a 200 SSE stream must be Done");
+    };
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[test]
+fn inband_openai_error_detection() {
+    assert!(is_inband_openai_error(br#"{"error":{"message":"boom"}}"#));
+    // Healthy chunks from some upstreams carry `"error": null`.
+    assert!(!is_inband_openai_error(br#"{"choices":[],"error":null}"#));
+    assert!(!is_inband_openai_error(br#"{"choices":[]}"#));
+    assert!(!is_inband_openai_error(b"[DONE]"));
+}
+
+#[tokio::test]
+async fn fallback_passthrough_inband_error_logs_stream_as_failed() {
+    // The in-band `{"error": …}` line went downstream verbatim, but the
+    // stream was never marked errored, so a failed stream logged as
+    // "stream complete" — operators saw a 100% success rate.
+    let buf = log_capture_buf();
+    let mock_addr = spawn_sse_upstream(PASSTHROUGH_INBAND_ERROR, true).await;
+    let req_id = "lab6017-passthrough-inband-error-clean-eof";
+    let body = stream_passthrough(mock_addr, req_id).await;
+    assert!(body.contains("upstream boom"), "got: {body:?}");
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let mine: Vec<&str> = output.lines().filter(|l| l.contains(req_id)).collect();
+    assert!(
+        mine.iter()
+            .any(|l| l.contains("stream ended with upstream error frame")),
+        "in-band error must log the stream as failed, got: {mine:?}"
+    );
+    assert!(
+        !mine.iter().any(|l| l.contains("stream complete")),
+        "got: {mine:?}"
+    );
+}
+
+#[tokio::test]
+async fn fallback_passthrough_no_second_error_frame_after_inband_error() {
+    // The upstream's own error line is the terminator: when the peer then
+    // drops, no synthesised error frame (with its own [DONE]) may follow it.
+    let mock_addr = spawn_sse_upstream(PASSTHROUGH_INBAND_ERROR, false).await;
+    let body = stream_passthrough(mock_addr, "lab6017-passthrough-inband-error-drop").await;
+
+    assert_eq!(
+        body.matches("\"error\":{").count(),
+        1,
+        "exactly one error frame — the upstream's own, got: {body:?}"
+    );
+    assert!(!body.contains("[DONE]"), "got: {body:?}");
+}
+
 #[tokio::test]
 async fn proxy_handler_no_fallback_returns_429() {
     // With no fallback endpoint, an exhausted pool yields None (→ 429).
@@ -835,4 +924,237 @@ async fn proxy_handler_translates_once_across_endpoint_rotation() {
         bad_body, ok_body,
         "rotated attempt must reuse the identical serialized body"
     );
+}
+
+async fn spawn_proxy(state: Arc<AppState>) -> SocketAddr {
+    let app = Router::new().fallback(any(proxy_handler)).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    addr
+}
+
+/// Lines of the shared log capture that contain `marker`, plus whether any
+/// captured line STARTS with it — i.e. a raw newline in a logged field let
+/// the marker begin a forged line (CWE-117).
+fn captured_lines_with(marker: &str) -> (Vec<String>, bool) {
+    let output = String::from_utf8(log_capture_buf().lock().unwrap().clone()).unwrap();
+    let forged = output.lines().any(|l| l.starts_with(marker));
+    let mine = output
+        .lines()
+        .filter(|l| l.contains(marker))
+        .map(str::to_owned)
+        .collect();
+    (mine, forged)
+}
+
+/// LAB-5729: the untranslatable-request WARN logs the translator's error, which
+/// quotes the caller's content-block `type` verbatim. It must be Debug-escaped
+/// so a newline in that field cannot start a forged log line.
+#[tokio::test]
+async fn untranslatable_fallback_log_escapes_newline_in_block_type() {
+    let _ = log_capture_buf();
+    let marker = "FORGED-LAB5729-UNTRANSLATABLE";
+    let (url, _rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
+    let mut state = test_state_with(vec![]);
+    let mut ep = make_endpoint("openai-gw", Protocol::OpenAI);
+    ep.base_url = url;
+    Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+    let addr = spawn_proxy(state).await;
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-7",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": format!("x\n{marker}"), "text": "hi"}
+            ]}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let (mine, forged) = captured_lines_with(marker);
+    assert!(
+        !forged,
+        "a raw newline let the marker start a log line:\n{}",
+        mine.join("\n")
+    );
+    assert!(
+        mine.iter()
+            .any(|l| l.contains("not representable in OpenAI format")
+                && l.contains(&format!("x\\n{marker}"))),
+        "expected the escaped block type in the untranslatable WARN, got:\n{}",
+        mine.join("\n")
+    );
+}
+
+/// LAB-5729: the upstream-error WARN logs the gateway's error body, which some
+/// gateways build by echoing request fields, so it must be Debug-escaped too.
+/// A 400 reaches that WARN; a 5xx rotates before it.
+#[tokio::test]
+async fn fallback_upstream_error_log_escapes_newline_in_body() {
+    let _ = log_capture_buf();
+    let marker = "FORGED-LAB5729-UPSTREAM";
+    let (url, _rx) =
+        spawn_capturing_upstream(StatusCode::BAD_REQUEST, b"boom\nFORGED-LAB5729-UPSTREAM").await;
+    let mut state = test_state_with(vec![]);
+    let mut ep = make_endpoint("broken", Protocol::OpenAI);
+    ep.base_url = url;
+    Arc::get_mut(&mut state).unwrap().endpoints.push(ep);
+
+    let body =
+        bytes::Bytes::from_static(br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#);
+    let _ = try_fallback_upstream(
+        &state,
+        &body,
+        "req-lab5729",
+        "client-1",
+        &"127.0.0.1".parse().unwrap(),
+        "-",
+        "-",
+        "claude-opus-4-7",
+        0,
+        Instant::now(),
+        false,
+        false,
+    )
+    .await;
+
+    let (mine, forged) = captured_lines_with(marker);
+    assert!(
+        !forged,
+        "a raw newline let the marker start a log line:\n{}",
+        mine.join("\n")
+    );
+    assert!(
+        mine.iter()
+            .any(|l| l.contains("unified endpoint returned error")
+                && l.contains(&format!("boom\\n{marker}"))),
+        "expected the escaped upstream body in the error WARN, got:\n{}",
+        mine.join("\n")
+    );
+}
+
+// ── LAB-5636: CRLF-framed upstream splits into events while streaming ──
+
+/// Raw-TCP SSE upstream like `spawn_sse_upstream`, but it sends `first`,
+/// then holds the stream open until the returned sender fires, then sends
+/// `rest` and closes cleanly.
+async fn spawn_held_sse_upstream(
+    first: &'static str,
+    rest: &'static str,
+) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let _ = stream.read(&mut buf).await;
+        let head = "HTTP/1.1 200 OK\r\n\
+             content-type: text/event-stream\r\n\
+             transfer-encoding: chunked\r\n\
+             \r\n";
+        let _ = stream.write_all(head.as_bytes()).await;
+        let chunk = format!("{:x}\r\n{first}\r\n", first.len());
+        let _ = stream.write_all(chunk.as_bytes()).await;
+        if released.await.is_err() {
+            return;
+        }
+        let chunk = format!("{:x}\r\n{rest}\r\n0\r\n\r\n", rest.len());
+        let _ = stream.write_all(chunk.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    });
+    (addr, release)
+}
+
+#[tokio::test]
+async fn fallback_translated_crlf_stream_relays_each_event_as_it_arrives() {
+    // `\r\n\r\n` never matched the old `\n\n` scan: the whole stream piled up
+    // in the buffer and the client saw nothing until the upstream ended.
+    let (mock_addr, release) = spawn_held_sse_upstream(
+        "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\r\n\r\n",
+        concat!(
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\" there\"},\"finish_reason\":null}]}\r\n\r\n",
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+        ),
+    )
+    .await;
+    let state = fallback_only_state(mock_addr, "crlf-streaming").await;
+    let addr = serve(build_router(state)).await;
+    let mut resp = Client::new()
+        .post(format!("http://{}/v1/messages", addr))
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 16,
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut body = String::new();
+    let first_delta = tokio::time::timeout(Duration::from_secs(5), async {
+        while !(body.contains("content_block_delta") && body.contains("\"Hi\"")) {
+            let chunk = resp.chunk().await.unwrap().expect("stream ended early");
+            body.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+    })
+    .await;
+    assert!(
+        first_delta.is_ok(),
+        "the first event's content_block_delta must reach the client while the upstream holds the stream open, got: {body:?}"
+    );
+
+    release.send(()).unwrap();
+    while let Some(chunk) = resp.chunk().await.unwrap() {
+        body.push_str(std::str::from_utf8(&chunk).unwrap());
+    }
+    assert!(body.contains("\" there\""), "got: {body:?}");
+    assert_eq!(
+        body.matches("event: message_stop\n").count(),
+        1,
+        "exactly one terminator, got: {body:?}"
+    );
+    assert!(!body.contains("event: error\n"), "got: {body:?}");
+}
+
+#[tokio::test]
+async fn fallback_translated_cr_only_stream_reads_every_field_line() {
+    // A lone `\r` ends an SSE line too, but `str::lines()` does not split on
+    // it: each `id:`+`data:` event read as one line and lost its `data:`. The
+    // finish_reason sits in the unterminated tail, so the flush is covered.
+    let mock_addr = spawn_sse_upstream(
+        concat!(
+            "id: 1\rdata: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\r\r",
+            "id: 2\rdata: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        ),
+        true,
+    )
+    .await;
+    let state = fallback_only_state(mock_addr, "cr-only-streaming").await;
+    let body = stream_messages(serve(build_router(state)).await).await;
+
+    assert!(body.contains("\"Hi\""), "got: {body:?}");
+    assert_eq!(
+        body.matches("event: message_stop\n").count(),
+        1,
+        "exactly one terminator, got: {body:?}"
+    );
+    assert!(!body.contains("event: error\n"), "got: {body:?}");
 }

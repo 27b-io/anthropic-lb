@@ -437,8 +437,9 @@ impl AppState {
         }
     }
 
-    /// Test-only convenience: pick with no client identity, so no pinning
-    /// applies. Keeps the pre-LAB-2636 routing tests byte-identical.
+    /// Test-only convenience: pick with no client identity and standard
+    /// speed — no pinning, no fast-mode exclusion. Keeps the pre-LAB-2636
+    /// routing tests byte-identical.
     #[cfg(test)]
     pub(crate) async fn pick_endpoint(
         &self,
@@ -446,7 +447,7 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
     ) -> Option<EndpointIdx> {
-        self.pick_endpoint_for_client(affinity_key, model, skip, "")
+        self.pick_endpoint_for_client(affinity_key, model, skip, "", false)
             .await
     }
 
@@ -467,6 +468,10 @@ impl AppState {
     /// free general-pool capacity — violating the free-before-paid guarantee
     /// below, which the retain would otherwise bypass.
     ///
+    /// `fast` (LAB-2687): a `speed: "fast"` request also drops
+    /// `fast_mode_disabled` accounts BEFORE the pin filter, so a non-entitled
+    /// pin spills rather than serving.
+    ///
     /// Tiers are tried strictly in ascending priority order. Within a tier:
     /// healthy candidates (`gate < soft_limit`) are preferred; if none are healthy
     /// the tier degrades to its soft-limited candidates. Only when a tier has zero
@@ -480,8 +485,37 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
         client_id: &str,
+        fast: bool,
     ) -> Option<EndpointIdx> {
         let mut candidates = self.routing_candidates(model, skip).await;
+        let fast_disabled = if fast {
+            self.fast_mode_disabled_endpoints()
+        } else {
+            Vec::new()
+        };
+        candidates.retain(|c| {
+            if fast_disabled.contains(&c.endpoint) {
+                trace!(
+                    endpoint = self.endpoints[c.endpoint].name,
+                    model,
+                    "pick: skipping, fast mode disabled on endpoint"
+                );
+                return false;
+            }
+            // An OpenAI-protocol endpoint never carries a fast-mode mark (it
+            // has no org entitlement to reject) and its request translation
+            // drops `speed` entirely — routing a fast request there would
+            // silently serve it at standard speed (LAB-2687).
+            if fast && self.endpoints[c.endpoint].protocol == Protocol::OpenAI {
+                trace!(
+                    endpoint = self.endpoints[c.endpoint].name,
+                    model,
+                    "pick: skipping, openai-protocol endpoint can't honor speed:\"fast\""
+                );
+                return false;
+            }
+            true
+        });
         if let Some(preferred) = self.client_preferred_endpoints(client_id) {
             let is_preferred =
                 |c: &RoutingCandidate| self.endpoint_is_preferred(preferred, c.endpoint);
@@ -501,7 +535,11 @@ impl AppState {
                 // account(s) and will consume shared-pool cache/claims.
                 info!(
                     client_id,
-                    model, "pick: no preferred endpoint viable — spilling to general pool"
+                    model,
+                    fast_mode_disabled = fast_disabled
+                        .iter()
+                        .any(|&i| self.endpoint_is_preferred(preferred, i)),
+                    "pick: no preferred endpoint viable — spilling to general pool"
                 );
             }
         }
@@ -1314,6 +1352,12 @@ impl AppState {
         lock_recovering(&self.unsupported_models, "unsupported_models")
     }
 
+    pub(crate) fn lock_fast_mode_disabled(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<usize, Instant>> {
+        lock_recovering(&self.fast_mode_disabled, "fast_mode_disabled")
+    }
+
     pub(crate) fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionEntry>> {
         lock_recovering(&self.sessions, "sessions")
     }
@@ -1337,14 +1381,15 @@ impl AppState {
         if dropped.is_empty() {
             return;
         }
-        let truncated: Vec<&str> = dropped
+        let truncated: Vec<String> = dropped
             .iter()
             .map(|f| {
                 let mut end = f.len().min(MAX_DROPPED_BETA_FLAG_LEN);
                 while !f.is_char_boundary(end) {
                     end -= 1;
                 }
-                &f[..end]
+                // A literal `_other` flag must not land on the overflow key.
+                escape_sentinel(&f[..end], &["other"])
             })
             .collect();
         let mut map = lock_recovering(&self.beta_flags_dropped, "beta_flags_dropped");
@@ -1352,9 +1397,9 @@ impl AppState {
         // sends the same unlisted flag at request rate, and the counter
         // already carries the volume. Repeats log at debug for correlation.
         let mut first_seen: Vec<&str> = Vec::new();
-        for flag in &truncated {
-            if map.contains_key(*flag) || map.len() < MAX_DROPPED_BETA_FLAGS {
-                if !map.contains_key(*flag) {
+        for flag in truncated.iter().map(String::as_str) {
+            if map.contains_key(flag) || map.len() < MAX_DROPPED_BETA_FLAGS {
+                if !map.contains_key(flag) {
                     first_seen.push(flag);
                 }
                 *map.entry(flag.to_string()).or_insert(0) += 1;
@@ -1377,8 +1422,8 @@ impl AppState {
         // trace on every request it was dropped from (AC-12).
         let repeats: Vec<&str> = truncated
             .iter()
+            .map(String::as_str)
             .filter(|f| !first_seen.contains(f))
-            .copied()
             .collect();
         if !repeats.is_empty() {
             debug!(
@@ -1482,11 +1527,15 @@ impl AppState {
     /// Flush this replica's accumulated transport-error deltas into the shared
     /// Redis hash (`TRANSPORT_ERRORS_KEY`) so the fleet-wide count is visible
     /// cluster-wide. `upstream_transport_errors` is a DELTA accumulator: it is
-    /// drained here each tick and its counts folded into Redis via `HINCRBY`,
-    /// so the same delta is never pushed twice (no double-counting across
-    /// ticks). On Redis failure the drained deltas are returned to the local
-    /// map — they retry next tick and stay visible via the local metrics
-    /// fallback rather than being lost. No-op without Redis, so single-instance
+    /// drained here each tick and its counts folded into Redis via `HINCRBY`.
+    /// Results are read per command: a kind whose own `HINCRBY` Redis applied
+    /// is never re-sent, a kind whose `HINCRBY` Redis rejected goes back to the
+    /// local map, and an `EXPIRE` error only warns. The whole drained batch is
+    /// re-queued only when no per-command reply arrived (send failure, timeout,
+    /// dropped connection) — the one case where Redis may have applied counts
+    /// we cannot see, so that path is at-least-once. Re-queued deltas retry
+    /// next tick and stay visible via the local metrics fallback rather than
+    /// being lost. No-op without Redis, so single-instance
     /// deployments keep accumulating locally; on an idle tick the TTL is still
     /// refreshed so the fleet-wide hash never expires under healthy traffic.
     pub(crate) async fn flush_transport_errors(&self) {
@@ -1518,9 +1567,9 @@ impl AppState {
         }
 
         // One round-trip: HINCRBY every kind, then refresh the TTL. fred
-        // pipeline commands resolve immediately when queued; `all()` sends the
-        // batch and surfaces the first error, matching the old atomic
-        // success-or-requeue contract.
+        // pipeline commands resolve immediately when queued; `try_all()` sends
+        // the batch and returns one result per command, so a failure in one
+        // command cannot make us re-send counts another command applied.
         let pipe = redis.pipeline();
         for (kind, n) in &deltas {
             let _: Result<(), fred::error::RedisError> =
@@ -1529,27 +1578,53 @@ impl AppState {
         let _: Result<(), fred::error::RedisError> = pipe
             .expire(TRANSPORT_ERRORS_KEY, TRANSPORT_ERRORS_TTL_SECS as i64)
             .await;
+        let results: Vec<Result<RedisValue, fred::error::RedisError>> = pipe.try_all().await;
 
-        let result: Result<Vec<RedisValue>, fred::error::RedisError> = pipe.all().await;
-        if let Err(e) = result {
-            // Redis is unreachable (or the pipeline reply was lost) — return the
-            // drained deltas to the local accumulator so error signal is not
-            // dropped. This is at-least-once: if the connection died AFTER Redis
-            // applied some HINCRBYs, re-queuing can over-count by a few next
-            // tick. For an error *counter* that bias is correct — a slight
-            // over-report beats a silently missed egress fault. (Contrast
-            // record_budget_usage, which never retries a failed INCRBY:
-            // over-counting a budget would wrongly throttle a client, so the
-            // lost increment is covered by the local floor instead —
-            // LAB-1962.) The deltas also stay
-            // visible via the local metrics fallback until Redis heals.
-            warn!(error = %e, "redis HINCRBY failed for transport errors; re-queuing deltas locally");
-            // Poison-recovering lock: an `if let Ok` here would silently DROP
-            // every drained delta if the mutex got poisoned mid-cycle.
-            let mut m = self.lock_transport_errors();
-            for (kind, n) in deltas {
-                *m.entry(kind).or_insert(0) += n;
+        // When the send fails, times out or the connection drops, fred returns
+        // a single `Err` rather than one entry per command. A flush always
+        // queues at least two commands, so a length mismatch means no reply
+        // arrived and we cannot tell which HINCRBYs Redis applied. Re-queue the
+        // whole batch: at-least-once, so a lost reply can over-count by one
+        // batch. For an error *counter* that bias is correct — a slight
+        // over-report beats a silently missed egress fault. (Contrast
+        // record_budget_usage, which never retries a failed INCRBY:
+        // over-counting a budget would wrongly throttle a client, so the lost
+        // increment is covered by the local floor instead.)
+        if results.len() != deltas.len() + 1 {
+            let error = results.into_iter().find_map(Result::err).map_or_else(
+                || "unexpected pipeline reply length".to_owned(),
+                |e| e.to_string(),
+            );
+            warn!(%error, "redis pipeline failed for transport errors; re-queuing deltas locally");
+            self.requeue_transport_errors(deltas);
+            return;
+        }
+
+        let mut results = results.into_iter();
+        let mut rejected = Vec::new();
+        for ((kind, n), result) in deltas.into_iter().zip(results.by_ref()) {
+            if let Err(e) = result {
+                warn!(kind, error = %e, "redis HINCRBY failed for transport errors; re-queuing delta locally");
+                rejected.push((kind, n));
             }
+        }
+        if let Some(Err(e)) = results.next() {
+            warn!(error = %e, "redis EXPIRE failed for transport-errors TTL refresh");
+        }
+        self.requeue_transport_errors(rejected);
+    }
+
+    /// Return drained deltas Redis did not take to the local accumulator, so
+    /// they retry next tick and stay visible via the local metrics fallback.
+    fn requeue_transport_errors(&self, deltas: Vec<(&'static str, u64)>) {
+        if deltas.is_empty() {
+            return;
+        }
+        // Poison-recovering lock: an `if let Ok` here would silently DROP
+        // every drained delta if the mutex got poisoned mid-cycle.
+        let mut m = self.lock_transport_errors();
+        for (kind, n) in deltas {
+            *m.entry(kind).or_insert(0) += n;
         }
     }
     pub(crate) async fn cluster_info(&self) -> Option<serde_json::Value> {

@@ -15,6 +15,7 @@ async fn build_stats_entry(
     burn_rate: &Mutex<BurnRate>,
     requests: &AtomicU64,
     token_counters: [&AtomicU64; 4],
+    fast_mode_disabled_secs: Option<u64>,
     now_epoch: u64,
     total_headroom: &mut Option<u64>,
 ) -> serde_json::Value {
@@ -108,6 +109,7 @@ async fn build_stats_entry(
         "limit_requests": info.limit_requests,
         "limit_tokens": info.limit_tokens,
         "hard_limited_remaining_secs": hard_limited,
+        "fast_mode_disabled_remaining_secs": fast_mode_disabled_secs,
         "burn_rate": {
             "last_5m": (br_5m * 100.0).round() / 100.0,
             "last_1h": (br_1h * 100.0).round() / 100.0,
@@ -147,7 +149,7 @@ pub(crate) async fn stats_handler(
     let now_epoch = AppState::now_epoch();
     let mut total_headroom: Option<u64> = Some(0);
     let mut endpoint_stats = Vec::new();
-    for ep in &state.endpoints {
+    for (i, ep) in state.endpoints.iter().enumerate() {
         let protocol = match ep.protocol {
             Protocol::Anthropic => "anthropic",
             Protocol::OpenAI => "openai",
@@ -167,6 +169,7 @@ pub(crate) async fn stats_handler(
                     &ep.cache_creation_tokens,
                     &ep.cache_read_tokens,
                 ],
+                state.fast_mode_disabled_remaining_secs(i),
                 now_epoch,
                 &mut total_headroom,
             )
@@ -174,12 +177,20 @@ pub(crate) async fn stats_handler(
         );
     }
 
+    // Snapshot each shared map under its own lock, then drop the guard: these
+    // are std mutexes the proxy hot path also takes, so no guard may nest with
+    // another or outlive the snapshot (#202 — same pattern as metrics_handler).
+    let request_rates: HashMap<String, (u64, f64)> = state
+        .lock_client_request_rates()
+        .iter()
+        .map(|(k, (total, ewma))| (k.clone(), (*total, ewma.value)))
+        .collect();
+    let token_usage = state.lock_client_usage().clone();
+
     // Per-client usage (tokens + request rates)
-    let request_rates = state.lock_client_request_rates();
     let client_usage: serde_json::Value = {
-        let map = state.lock_client_usage();
         // Collect all client IDs from both token usage and request rates
-        let mut all_clients: std::collections::HashSet<&String> = map.keys().collect();
+        let mut all_clients: std::collections::HashSet<&String> = token_usage.keys().collect();
         all_clients.extend(request_rates.keys());
 
         let obj: serde_json::Map<String, serde_json::Value> = all_clients
@@ -191,11 +202,8 @@ pub(crate) async fn stats_handler(
                 } else {
                     k.clone()
                 };
-                let tokens = map.get(k).copied().unwrap_or([0; 4]);
-                let (req_total, req_per_min) = request_rates
-                    .get(k)
-                    .map(|(total, ewma)| (*total, ewma.value))
-                    .unwrap_or((0, 0.0));
+                let tokens = token_usage.get(k).copied().unwrap_or([0; 4]);
+                let (req_total, req_per_min) = request_rates.get(k).copied().unwrap_or((0, 0.0));
                 (
                     display_key,
                     serde_json::json!({
@@ -216,13 +224,13 @@ pub(crate) async fn stats_handler(
     let aggregate = {
         let mut consumers = serde_json::Map::new();
         let mut total_rpm = 0.0_f64;
-        for (client, (_, ewma)) in request_rates.iter() {
+        for (client, &(_, rpm)) in request_rates.iter() {
             let display_key = if state.is_operator(client) {
                 "_operator".to_string()
             } else {
                 client.clone()
             };
-            total_rpm += ewma.value;
+            total_rpm += rpm;
             let entry = consumers
                 .entry(display_key)
                 .or_insert_with(|| serde_json::json!({"requests_per_minute": 0.0, "share": 0.0}));
@@ -233,7 +241,7 @@ pub(crate) async fn stats_handler(
                     .unwrap_or(0.0);
                 obj.insert(
                     "requests_per_minute".to_string(),
-                    serde_json::json!(cur + ewma.value),
+                    serde_json::json!(cur + rpm),
                 );
             }
         }
@@ -293,6 +301,7 @@ pub(crate) async fn stats_handler(
     // Cluster info (when Redis is available)
     // Read from cache (updated by background sync task) to avoid .await in handler
     let cluster: Option<serde_json::Value> = state.lock_cluster_info_cache().clone();
+    let sessions = state.sessions_snapshot(now_epoch);
 
     let mut response = serde_json::json!({
         "endpoints": endpoint_stats,
@@ -303,7 +312,7 @@ pub(crate) async fn stats_handler(
         // Live sessions by context-window occupancy, hottest first (LAB-916).
         // Session labels are hashes of the affinity key; raw IPs/session ids
         // never leave the process.
-        "sessions": state.sessions_snapshot(now_epoch),
+        "sessions": sessions,
     });
     if let Some(cluster_info) = cluster {
         response["cluster"] = cluster_info;

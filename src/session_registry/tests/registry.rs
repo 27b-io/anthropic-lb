@@ -243,6 +243,25 @@ fn prompt_too_long_counter_bounds_model_cardinality() {
     assert_eq!(counts.get("_other"), Some(&5));
 }
 
+/// A model literally named `_other` must not land on the overflow key, and
+/// `_other` / `__other` must keep distinct keys.
+#[test]
+fn prompt_too_long_literal_other_model_keeps_off_overflow_key() {
+    let state = test_state_with(vec![]);
+    for model in ["_other", "__other"] {
+        state.note_prompt_too_long(
+            "req",
+            model,
+            None,
+            "prompt is too long: 5 tokens > 1 maximum",
+        );
+    }
+    let counts = state.prompt_too_long.lock().unwrap();
+    assert_eq!(counts.get("_other"), None, "no overflow yet: {counts:?}");
+    assert_eq!(counts.get("__other"), Some(&1), "{counts:?}");
+    assert_eq!(counts.get("___other"), Some(&1), "{counts:?}");
+}
+
 /// Upstream that answers every request with the canned 400.
 async fn spawn_prompt_too_long_upstream() -> String {
     spawn_400_upstream(PROMPT_TOO_LONG_BODY).await.0

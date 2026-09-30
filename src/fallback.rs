@@ -47,6 +47,14 @@ pub(crate) fn build_openai_fallback_body(body_bytes: &[u8]) -> FallbackBody {
     }
 }
 
+/// An OpenAI SSE `data:` payload carrying a top-level in-band error. Non-null
+/// only, as in the O→A translator: some upstreams send `"error": null` in
+/// healthy chunks.
+fn is_inband_openai_error(payload: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .is_ok_and(|v| v.get("error").is_some_and(|e| !e.is_null()))
+}
+
 /// Forward a request to a `Protocol::OpenAI` endpoint. Callers hand over the
 /// final wire body: `proxy_handler` pre-translates via
 /// `build_openai_fallback_body` and sets `translate = true` so the *response*
@@ -182,7 +190,7 @@ pub(crate) async fn try_fallback_upstream(
             req_id,
             upstream = ep.name,
             status = status.as_u16(),
-            body = %err_body,
+            body = ?err_body,
             "fallback: unified endpoint returned error"
         );
         // Gateway rejected the MODEL (e.g. LiteLLM "Invalid model name"):
@@ -190,9 +198,14 @@ pub(crate) async fn try_fallback_upstream(
         // misleading "your request is invalid" 400 — the model is fine, this
         // endpoint just doesn't serve it (LAB-941, observed 2026-07-27 when a
         // 529 storm drained the Anthropic pool into insight-gateway).
-        let model_unsupported = serde_json::from_str::<serde_json::Value>(&err_body)
-            .map(|v| is_model_unsupported_error(status, &v, ep.protocol))
-            .unwrap_or(false);
+        // Only the model rejection: this path has never re-sent on an
+        // entitlement 400.
+        let model_unsupported =
+            serde_json::from_str::<serde_json::Value>(&err_body).is_ok_and(|v| {
+                // Always the endpoint's own bearer token here, never the caller's.
+                classify_rejection(status, &v, ep.protocol, model, request_body, false)
+                    == Some(UpstreamRejection::ModelUnsupported)
+            });
         let response = if translate {
             // Return error in Anthropic format
             Response::builder()
@@ -222,26 +235,27 @@ pub(crate) async fn try_fallback_upstream(
         };
         if model_unsupported {
             state.note_model_unsupported(&ep.name, endpoint_idx, model);
-            return ForwardOutcome::RetryModelUnsupported(Box::new(response));
+            return ForwardOutcome::RetryRejectedByAccount(Box::new(response));
         }
         return ForwardOutcome::Done(Box::new(response));
     }
 
     // Streaming response
     if is_streaming {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+        let (tx, body) = relay_channel();
         let req_id = req_id.to_string();
         let upstream_name = ep.name.clone();
         let translate_response = translate;
 
         tokio::spawn(async move {
-            let mut buffer: Vec<u8> = Vec::new();
+            let mut splitter = SseEventSplitter::default();
             // `ctx.terminal` serves both branches. Translate: `completed` by
             // the translator, `errored` by the translator (in-band error) or
             // this loop (transport Err / end-of-stream guard). Passthrough:
-            // `completed` is set below when upstream's `[DONE]` has been
-            // forwarded verbatim, so an error frame on the next read doesn't
-            // ship a second `[DONE]` and break strict OpenAI parsers.
+            // `completed` / `errored` are set below when upstream's `[DONE]`
+            // / in-band `{"error": …}` line has been forwarded verbatim, so
+            // an error frame on the next read doesn't ship a second
+            // terminator, and the stream logs as failed after an error.
             let mut ctx = ReverseStreamContext::default();
             let mut client_gone = false;
             // Carries any partial trailing SSE line between chunks so the
@@ -256,20 +270,23 @@ pub(crate) async fn try_fallback_upstream(
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {
                         if translate_response {
-                            buffer.extend_from_slice(&chunk);
-                            while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
-                                let event = String::from_utf8_lossy(&buffer[..pos]).into_owned();
-                                buffer.drain(..pos + 2);
-
+                            splitter.push(&chunk);
+                            while let Some(event) = splitter.next_event() {
                                 for line in event.lines() {
                                     if let Some(data) = line.strip_prefix("data: ") {
                                         let events =
                                             translate_openai_sse_to_anthropic(data, &mut ctx);
                                         for ev in events {
-                                            if tx.send(Ok(bytes::Bytes::from(ev))).await.is_err() {
+                                            if !relay_send(&tx, ev.into(), &req_id).await {
                                                 client_gone = true;
                                                 break;
                                             }
+                                        }
+                                        // An event can carry more `data:`
+                                        // lines; none may be sent once the
+                                        // client is gone.
+                                        if client_gone {
+                                            break;
                                         }
                                     }
                                 }
@@ -281,7 +298,7 @@ pub(crate) async fn try_fallback_upstream(
                                 }
                             }
                         } else {
-                            if !ctx.terminal.completed {
+                            if !ctx.terminal.reached() {
                                 done_scan_tail.extend_from_slice(&chunk);
                                 while let Some(nl) = done_scan_tail.iter().position(|&b| b == b'\n')
                                 {
@@ -290,26 +307,31 @@ pub(crate) async fn try_fallback_upstream(
                                     } else {
                                         nl
                                     };
-                                    let is_done_marker = if let Some(payload) =
-                                        done_scan_tail[..line_end].strip_prefix(b"data:")
-                                    {
-                                        payload.trim_ascii() == b"[DONE]"
-                                    } else {
-                                        false
-                                    };
-                                    done_scan_tail.drain(..=nl);
-                                    if is_done_marker {
+                                    let payload = done_scan_tail[..line_end]
+                                        .strip_prefix(b"data:")
+                                        .map(<[u8]>::trim_ascii);
+                                    if payload == Some(b"[DONE]".as_slice()) {
                                         ctx.terminal.completed = true;
+                                    } else if payload.is_some_and(is_inband_openai_error) {
+                                        // The upstream's own error line is
+                                        // the terminator (LAB-6017).
+                                        ctx.terminal.errored = true;
+                                    }
+                                    done_scan_tail.drain(..=nl);
+                                    if ctx.terminal.reached() {
                                         done_scan_tail.clear();
                                         break;
                                     }
                                 }
                             }
-                            if tx.send(Ok(chunk)).await.is_err() {
+                            if !relay_send(&tx, chunk, &req_id).await {
                                 client_gone = true;
                             }
                         }
-                        if client_gone || ctx.terminal.errored {
+                        // Passthrough keeps forwarding after an in-band
+                        // error, like the native passthrough: it only
+                        // suppresses a second terminator.
+                        if client_gone || (translate_response && ctx.terminal.errored) {
                             break;
                         }
                     }
@@ -341,25 +363,31 @@ pub(crate) async fn try_fallback_upstream(
                         } else {
                             openai_error_frame(&msg)
                         };
-                        if tx.send(Ok(frame)).await.is_err() {
+                        if !relay_send(&tx, frame, &req_id).await {
                             client_gone = true;
                         }
                         break;
                     }
                 }
             }
+            // Done with the upstream: a stalled client must not keep it
+            // pinned while the tail is flushed.
+            drop(resp);
 
             // Flush remaining buffer
-            if translate_response && !buffer.is_empty() && !client_gone {
-                let remaining = String::from_utf8_lossy(&buffer).into_owned();
+            if translate_response && !client_gone {
+                let remaining = splitter.remainder();
                 for line in remaining.lines() {
                     if let Some(data) = line.strip_prefix("data: ") {
                         let events = translate_openai_sse_to_anthropic(data, &mut ctx);
                         for ev in events {
-                            if tx.send(Ok(bytes::Bytes::from(ev))).await.is_err() {
+                            if !relay_send(&tx, ev.into(), &req_id).await {
                                 client_gone = true;
                                 break;
                             }
+                        }
+                        if client_gone {
+                            break;
                         }
                     }
                 }
@@ -380,13 +408,8 @@ pub(crate) async fn try_fallback_upstream(
                     "fallback: upstream stream ended without a terminator — error frame sent"
                 );
                 ctx.terminal.errored = true;
-                if tx
-                    .send(Ok(anthropic_error_frame(
-                        "upstream closed stream before completion",
-                    )))
-                    .await
-                    .is_err()
-                {
+                let frame = anthropic_error_frame("upstream closed stream before completion");
+                if !relay_send(&tx, frame, &req_id).await {
                     client_gone = true;
                 }
             }
@@ -415,9 +438,7 @@ pub(crate) async fn try_fallback_upstream(
                 .header("content-type", "text/event-stream")
                 .header("cache-control", "no-cache")
                 .header("connection", "keep-alive")
-                .body(Body::from_stream(
-                    tokio_stream::wrappers::ReceiverStream::new(rx),
-                ))
+                .body(body)
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "fallback stream error").into_response()
                 }),
