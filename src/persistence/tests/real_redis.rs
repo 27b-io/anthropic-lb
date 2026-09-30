@@ -746,7 +746,11 @@ mod redis_integration {
         let Some((mut conn, fred)) = redis_test_conn(Db::BudgetIncrbyAccumulates).await else {
             return;
         };
-        avoid_utc_midnight().await;
+        // Frozen for the whole test: the day key the replicas record under,
+        // the key `check_budget` reads and its seconds-to-midnight payload
+        // must all come from one clock, or a UTC rollover between two live
+        // reads fails the test with no defect.
+        let _clock = FrozenClock::at(FROZEN_GATE_CLOCKS[0]);
         let budgets: HashMap<String, u64> = [("budget-cli".to_string(), 1000u64)].into();
         let replica_a = Arc::new(AppState {
             client_budgets: budgets.clone(),
@@ -786,19 +790,19 @@ mod redis_integration {
             redis: Some(fred.clone()),
             ..test_state_base()
         });
-        // Live clock: the payload counts down, so it must land between the
-        // seconds-to-midnight read just before the call and just after it.
-        let before = 86400 - AppState::now_epoch() % 86400;
-        let denied = enforcing.check_budget("budget-cli").await;
-        let after = 86400 - AppState::now_epoch() % 86400;
-        let secs = denied.expect_err(
-            "shared counter (350) must gate a 300 limit on a replica that recorded nothing",
-        );
-        assert!(
-            (after..=before).contains(&secs),
-            "redis-branch payload must be the seconds until the UTC day rolls over \
-             ({after}..={before}), got {secs}"
-        );
+        // Both instants fall on the same UTC day, so the counter recorded
+        // above gates each; two of them so a hardcoded payload cannot pass.
+        for frozen in FROZEN_GATE_CLOCKS {
+            let _clock = FrozenClock::at(frozen);
+            let secs = enforcing.check_budget("budget-cli").await.expect_err(
+                "shared counter (350) must gate a 300 limit on a replica that recorded nothing",
+            );
+            assert_eq!(
+                secs,
+                86400 - frozen % 86400,
+                "redis-branch payload must be the seconds until the UTC day rolls over"
+            );
+        }
         assert!(
             replica_a.check_budget("budget-cli").await.is_ok(),
             "350 used of 1000 must pass"

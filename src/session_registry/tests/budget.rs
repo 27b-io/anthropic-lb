@@ -1,4 +1,3 @@
-use super::enforcement::FrozenClock;
 use super::*;
 
 // ── Unit: per-client budget ────────────────────────────────────

@@ -1,5 +1,53 @@
 use crate::*;
 
+// ── Frozen clock (test-only) ─────────────────────────────────────────
+
+/// Pins `AppState::now_epoch` on this thread for the guard's lifetime and
+/// restores the PREVIOUS value on drop — including on panic, and including a
+/// nested freeze, so an inner guard cannot silently hand the outer test the
+/// wall clock back. Restoring on panic matters under `--test-threads=1`, where
+/// libtest runs tests in place on one shared thread.
+///
+/// The freeze applies to every `now_epoch` read on the thread, not just the
+/// one under test: fixtures that mint timestamps from `SystemTime::now()`
+/// directly (several `reset_epoch` ones in the enforcement tests do) will be
+/// years out of step with it.
+#[must_use]
+pub(crate) struct FrozenClock(Option<u64>);
+
+impl FrozenClock {
+    pub(crate) fn at(epoch: u64) -> Self {
+        // The override is thread-local, so on a multi-thread runtime any
+        // `tokio::spawn`ed work reads the wall clock instead — and does it
+        // silently. Fail here rather than let a gate test pass for the wrong
+        // reason.
+        debug_assert!(
+            !matches!(
+                tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+            ),
+            "FrozenClock is thread-local: current-thread runtime only"
+        );
+        Self(FROZEN_NOW.with(|c| c.replace(Some(epoch))))
+    }
+}
+
+impl Drop for FrozenClock {
+    fn drop(&mut self) {
+        FROZEN_NOW.with(|c| c.set(self.0));
+    }
+}
+
+/// Two instants on 2024-01-01 (12:34:56Z and 14:34:56Z). Neither is a day
+/// boundary, because at `now % 86400 == 0` the true answer and every
+/// `86400 - now % k` mutant (k dividing 86400) are all 86400 — a midnight
+/// instant hides a wrong modulus rather than exposing it.
+///
+/// Two of them, not one, because freezing makes the expected value a constant:
+/// against a single instant the assertion cannot tell a correct computation
+/// from a hardcoded answer. A second instant is what restores that.
+pub(crate) const FROZEN_GATE_CLOCKS: [u64; 2] = [1_704_112_496, 1_704_119_696];
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 /// Build an Anthropic-protocol `Endpoint` with the given name and token.
