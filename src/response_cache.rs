@@ -754,11 +754,11 @@ impl AppState {
                         retry_after,
                         "rejected: failed-auth throttle active"
                     );
-                    let mut resp = (
+                    let mut resp = proxy_error_response(
                         StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_error",
                         "too many failed authentication attempts",
-                    )
-                        .into_response();
+                    );
                     resp.headers_mut()
                         .insert("retry-after", HeaderValue::from(retry_after));
                     return Err(Box::new(resp));

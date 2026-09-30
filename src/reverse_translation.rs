@@ -1431,7 +1431,7 @@ pub(crate) async fn openai_chat_handler(
     // IP allowlist check
     if !state.is_ip_allowed(&client_ip) {
         warn!(client = %client_ip, "rejected: IP not in allowlist");
-        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+        return proxy_error_response(StatusCode::FORBIDDEN, "permission_error", "forbidden");
     }
 
     // Proxy auth: accept the credential from either x-api-key or

@@ -1146,7 +1146,8 @@ async fn ingested_representative_claim_is_truncated_to_match_its_key() {
 }
 
 /// LAB-5313: a request-body read failure logs `req_id` and the error as
-/// structured fields, not interpolated into the message.
+/// structured fields, not interpolated into the message. The client gets a
+/// 400 in the JSON error envelope (LAB-4153).
 #[tokio::test]
 async fn read_body_bounded_logs_read_error_with_req_id() {
     let buf = log_capture_buf();
@@ -1158,6 +1159,11 @@ async fn read_body_bounded_logs_read_error_with_req_id() {
         .await
         .unwrap_err();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(resp.headers().get("retry-after").is_none());
+    let json = parse_error_envelope(resp).await;
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert_eq!(json["error"]["message"], "bad request body");
 
     let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     let mine: Vec<&str> = output

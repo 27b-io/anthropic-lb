@@ -772,6 +772,12 @@ pub(crate) async fn parse_error_envelope(resp: Box<Response>) -> serde_json::Val
     serde_json::from_slice(&body).expect("denial must be valid JSON")
 }
 
+/// `parse_error_envelope` for a denial read off the wire through the router,
+/// so router-level tests pin the same content-type and body contract.
+pub(crate) async fn parse_wire_error_envelope(resp: reqwest::Response) -> serde_json::Value {
+    parse_error_envelope(Box::new(axum::http::Response::from(resp).map(Body::new))).await
+}
+
 /// Build a `Config` from a TOML fragment. Goes through the real deserializer,
 /// so these tests also pin the config surface, and it beats hand-writing
 /// ~30-field `Config` / 7-field `ResponseCacheConfig` literals per case.

@@ -919,9 +919,11 @@ pub(crate) async fn read_body_bounded(
         Ok(b) => Ok(b),
         Err(e) => {
             error!(req_id, error = %e, "failed to read request body");
-            Err(Box::new(
-                (StatusCode::BAD_REQUEST, "bad request body").into_response(),
-            ))
+            Err(Box::new(proxy_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "bad request body",
+            )))
         }
     }
 }
