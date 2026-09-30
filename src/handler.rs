@@ -1729,7 +1729,7 @@ pub(crate) async fn proxy_handler(
                 return proxy_error_response(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
-                    "request body top-level keys must be unique and lowercase ASCII",
+                    "request body has an ambiguous top-level key",
                 );
             }
             let model = parsed

@@ -1542,9 +1542,7 @@ pub(crate) async fn openai_chat_handler(
             client_id = %client_id,
             "rejected: request body has an ambiguous top-level key"
         );
-        return openai_invalid_request_response(
-            "request body top-level keys must be unique and lowercase ASCII",
-        );
+        return openai_invalid_request_response("request body has an ambiguous top-level key");
     }
 
     let is_streaming = openai_body

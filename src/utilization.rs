@@ -743,20 +743,36 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for TopLevelObject
     }
 }
 
-/// Whether `body` is a JSON object whose top-level keys are all distinct and
-/// all spelled in lowercase ASCII, compared decoded (`"m\u006fdel"` is
-/// `"model"`; `"MODEL"` is refused).
+/// Top-level fields a policy or routing decision reads: the client
+/// allow-list, endpoint `models` routing, the context window and the negative
+/// cache read `model`, fast-mode routing reads `speed`, and the content guard
+/// reads `messages` and `system`. A field a new decision starts reading
+/// belongs here; until it is added, its respellings pass as they did before
+/// this check existed.
+const DECISION_FIELDS: [&str; 4] = ["model", "speed", "messages", "system"];
+
+/// A key as a decoder that ignores `_` and `-` when matching names sees it.
+fn without_delimiters(key: &str) -> String {
+    key.chars().filter(|c| !matches!(c, '_' | '-')).collect()
+}
+
+/// Whether `body` is a JSON object whose top-level keys are unambiguous:
+/// spelled in lowercase ASCII, distinct once `_` and `-` are removed, and not
+/// a respelling of a field in `DECISION_FIELDS`. Keys compare decoded
+/// (`"m\u006fdel"` is `"model"`).
 ///
 /// The handlers read every field from a `serde_json::Value`, which keeps the
 /// last of two duplicate keys and matches keys exactly, but often forward the
-/// client's bytes as sent. An upstream that keeps the first key, or that
-/// matches keys regardless of case as Go's `encoding/json` does, would then
-/// act on a field no policy check saw: a repeated `model`, or a lone `"MODEL"`
+/// client's bytes as sent. An upstream decoder that keeps the first key,
+/// matches keys regardless of case (Go's `encoding/json`), or also ignores
+/// `_` and `-` (its v2 case-insensitive option) would then act on a field no
+/// policy check saw: a repeated `model`, or a lone `"MODEL"` or `"mo_del"`
 /// that the checks read as no model at all. Every Anthropic and OpenAI
-/// top-level field is lowercase ASCII, so that spelling costs a valid body
-/// nothing, and no case fold maps one such key onto another. Refusing the
-/// ambiguity at ingress makes the outcome independent of how the upstream
-/// reads keys.
+/// top-level field is lowercase ASCII, and no two differ only by delimiters,
+/// so these rules cost a valid body nothing.
+///
+/// A lone respelling of a field outside `DECISION_FIELDS` still passes; the
+/// proxy decides nothing on such a field, so it has no view to disagree with.
 ///
 /// A body this parser cannot read as an object counts as ambiguous. Callers
 /// have already parsed it as an object, so that arm is unreachable in
@@ -769,7 +785,15 @@ pub(crate) fn top_level_keys_unambiguous(body: &[u8]) -> bool {
     };
     let mut seen = std::collections::HashSet::with_capacity(entries.len());
     entries.into_iter().all(|(key, _)| {
-        key.bytes().all(|b| b.is_ascii() && !b.is_ascii_uppercase()) && seen.insert(key)
+        if !key.bytes().all(|b| b.is_ascii() && !b.is_ascii_uppercase()) {
+            return false;
+        }
+        let bare = without_delimiters(&key);
+        let respells_decision_field = !DECISION_FIELDS.contains(&key.as_str())
+            && DECISION_FIELDS
+                .iter()
+                .any(|f| without_delimiters(f) == bare);
+        !respells_decision_field && seen.insert(bare)
     })
 }
 

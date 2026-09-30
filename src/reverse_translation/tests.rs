@@ -1216,7 +1216,7 @@ async fn ambiguous_top_level_key_is_rejected_locally_on_both_surfaces() {
     });
     let addr = serve(build_router(state)).await;
     let client = Client::new();
-    let message = "request body top-level keys must be unique and lowercase ASCII";
+    let message = "request body has an ambiguous top-level key";
 
     for key in ["key-plain", "key-limited", "key-ops"] {
         for raw in AMBIGUOUS_KEY_BODIES {
