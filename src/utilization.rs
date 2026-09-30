@@ -1709,7 +1709,7 @@ impl AppState {
                                 continue;
                             }
                         }
-                        if let Some(until) = info.transport_unhealthy_until {
+                        if let Some(until) = info.transport.open_until {
                             if now < until {
                                 trace!(
                                     endpoint = ep.name,
@@ -1755,7 +1755,7 @@ impl AppState {
                     }
                     // Transport circuit breaker — independent of the 429 path
                     // above (rate limit ≠ transport health).
-                    if let Some(until) = info.transport_unhealthy_until {
+                    if let Some(until) = info.transport.open_until {
                         if now < until {
                             trace!(
                                 endpoint = ep.name,

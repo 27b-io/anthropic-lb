@@ -93,18 +93,17 @@ pub(crate) struct RateLimitInfo {
     /// Counts consecutive burst 429s (no retry-after) for exponential backoff.
     /// Reset to 0 on any successful response.
     pub(crate) consecutive_burst_429s: u32,
-    /// Consecutive upstream transport failures (ETIMEDOUT/reset/closed/DNS).
-    /// Transport health, NOT rate-limit state — independent of
+    /// Upstream transport health (ETIMEDOUT/reset/closed/DNS) as a circuit
+    /// breaker. Transport health, NOT rate-limit state — independent of
     /// hard_limited_until, and deliberately process-scoped (never persisted or
     /// Redis-synced, same as `upstream_transport_errors`): each replica has its
     /// own egress path, so another replica's connectivity says nothing about ours.
-    pub(crate) consecutive_transport_failures: u32,
-    /// Circuit breaker: while set and in the future, the endpoint is excluded
-    /// from `routing_candidates` so a stateless affinity recompute cannot snap
-    /// a session back to a persistently-dead endpoint every request. Opened
-    /// after TRANSPORT_FAILURE_THRESHOLD consecutive transport failures;
-    /// cleared on any successful forward or after the cooldown elapses.
-    pub(crate) transport_unhealthy_until: Option<Instant>,
+    /// While open, the endpoint is excluded from `routing_candidates` so a
+    /// stateless affinity recompute cannot snap a session back to a
+    /// persistently-dead endpoint every request. Opened after
+    /// TRANSPORT_FAILURE_THRESHOLD consecutive transport failures; cleared on
+    /// any successful forward or after the cooldown elapses.
+    pub(crate) transport: crate::breaker::Breaker,
     #[allow(dead_code)]
     pub(crate) last_updated: Option<Instant>,
     /// Wall-clock epoch of last update, for cross-replica age comparison.

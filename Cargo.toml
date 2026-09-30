@@ -62,11 +62,17 @@ subtle = "2.6"
 # the compiled-in ruleset. Optional: compiled only with the `guard` feature.
 secrets_scanner = { version = "0.2.3", default-features = false, optional = true }
 leakguard = { version = "0.9.1", optional = true }
+# LAB-3878: Tier 1 detector client — concurrent batch calls and the verdict
+# memo cache. Both are already in the tree (reqwest/tokio and cachekit-rs pull
+# the same versions), so the marginal weight is nil; optional so a build
+# without `guard` is unchanged.
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+moka = { version = "0.12", default-features = false, features = ["sync"], optional = true }
 
 [features]
 # Off by default: with the feature disabled the guard module and both scanner
 # crates are not compiled, and request handling is unchanged.
-guard = ["dep:secrets_scanner", "dep:leakguard"]
+guard = ["dep:secrets_scanner", "dep:leakguard", "dep:futures-util", "dep:moka"]
 
 [dev-dependencies]
 tempfile = "3.25.0"
