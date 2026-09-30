@@ -744,11 +744,13 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for TopLevelObject
 }
 
 /// Whether `body` is a JSON object whose top-level keys are all distinct,
-/// compared decoded (`"model"` and `"m\u006fdel"` are the same key).
+/// compared decoded and case-folded (`"model"`, `"m\u006fdel"` and `"MODEL"`
+/// are one key).
 ///
 /// The handlers read every field from a `serde_json::Value`, which keeps the
 /// last of two duplicate keys, but often forward the client's bytes as sent.
-/// An upstream that keeps the first key would then act on a field no policy
+/// An upstream that keeps the first key, or that matches keys regardless of
+/// case as Go's `encoding/json` does, would then act on a field no policy
 /// check saw. Refusing the ambiguity at ingress makes the outcome independent
 /// of which duplicate the upstream reads.
 ///
@@ -762,7 +764,13 @@ pub(crate) fn top_level_keys_unique(body: &[u8]) -> bool {
         return false;
     };
     let mut seen = std::collections::HashSet::with_capacity(entries.len());
-    entries.into_iter().all(|(key, _)| seen.insert(key))
+    // Lowercasing then uppercasing merges every pair a Unicode simple case
+    // fold merges (U+212A KELVIN SIGN with `k`, U+017F with `s`), plus a few
+    // more such as U+00DF with `ss`. Merging more only rejects more, and no
+    // valid body has two top-level keys that differ by case alone.
+    entries
+        .into_iter()
+        .all(|(key, _)| seen.insert(key.to_lowercase().to_uppercase()))
 }
 
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
