@@ -301,6 +301,40 @@ async fn guard_block_fails_closed_on_unparseable_body() {
     );
 }
 
+/// Every other unparsed body is refused at ingress whatever the policy, so a
+/// multipart upload is what is left for `block` to fail closed on.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_fails_closed_on_multipart_body() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-multipart.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/files"))
+        .header("content-type", "multipart/form-data; boundary=x")
+        .header("x-api-key", "block-key")
+        .body("--x\r\n\r\nhi\r\n--x--\r\n")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400, "an unscannable upload fails closed");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "guard_blocked");
+    assert!(
+        captured.lock().await.is_empty(),
+        "an unscannable upload must never reach the upstream under block"
+    );
+}
+
 /// Shadow-mode counterpart: `annotate` (the default) must NOT reject an
 /// oversized body — it scans best-effort and forwards byte-identically. Guards
 /// against the fail-closed logic leaking into the shadow-mode default.

@@ -1695,8 +1695,37 @@ pub(crate) async fn proxy_handler(
 
     // Parse body once for model extraction, optional cache injection, and
     // the fast-mode flag that picks the rate bucket and routing pool downstream.
+    let parse = serde_json::from_slice::<serde_json::Value>(&body_bytes);
+
+    // A body this parse refuses would route on no model, yet other JSON
+    // decoders read a model out of some such bodies: a lone surrogate escape,
+    // nesting past the depth limit, an out-of-range number, a non-UTF-8 byte,
+    // trailing bytes, a BOM, UTF-16. The upstream could then act on a model
+    // the proxy never routed or gated on, so refuse it before routing
+    // (LAB-6781). The one non-JSON body this handler carries, a multipart
+    // upload (`/v1/files`), opens with its `--` boundary line, which no JSON
+    // text can start with, so it passes. Keyed on the bytes alone: the client
+    // controls the path and the `Content-Type`.
+    if let Err(e) = &parse {
+        if !body_bytes.is_empty() && !body_bytes.starts_with(b"--") {
+            warn!(
+                req_id,
+                client = %client_ip,
+                client_id = %client_id,
+                path = %parts.uri.path(),
+                error = %e,
+                "rejected: request body could not be parsed as JSON"
+            );
+            return proxy_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "request body could not be parsed as JSON",
+            );
+        }
+    }
+
     let (body_bytes, oauth_body_bytes, model, fp, cache_key, is_fast_mode) =
-        if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+        if let Ok(mut parsed) = parse {
             // Valid JSON but not an object (`[1]`, `"x"`, `7`, `true`,
             // `null`) can only 400 upstream. Reject it here so it costs no
             // account headroom, no budget sample and no credentialed
@@ -1875,9 +1904,11 @@ pub(crate) async fn proxy_handler(
                 is_fast_mode,
             )
         } else {
-            // Non-empty and not JSON: the scanner cannot read it, and a parse
-            // differential against the upstream could smuggle content past the
-            // scan. A bodiless request keeps the `NothingToScan` default.
+            // Bodiless, or a multipart upload (the rejection above refused
+            // every other unparsed body). The scanner cannot read multipart,
+            // and a parse differential against the upstream could smuggle
+            // content past the scan. A bodiless request keeps the
+            // `NothingToScan` default.
             #[cfg(feature = "guard")]
             if !body_bytes.is_empty() {
                 guard_outcome = guard::ScanOutcome::Unscannable(guard::REASON_BODY_UNPARSEABLE);

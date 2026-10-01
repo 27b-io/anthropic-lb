@@ -266,7 +266,8 @@ async fn gate_denies_unreadable_model_for_restricted_client() {
 }
 
 /// End-to-end proof of the same thing: an unparseable body must not smuggle a
-/// restricted client past its allow-list.
+/// restricted client past its allow-list. It is refused before the gate now
+/// (LAB-6781), which is the stronger outcome.
 #[tokio::test]
 async fn native_surface_denies_restricted_client_sending_unparseable_body() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
@@ -280,6 +281,27 @@ async fn native_surface_denies_restricted_client_sending_unparseable_body() {
         .header("content-type", "application/json")
         .header("x-api-key", "key-limited")
         .body("this is not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+/// The one unparsed body that still reaches the gate is a multipart upload.
+/// It carries no model the proxy can read, so the allow-list denies it.
+#[tokio::test]
+async fn native_surface_denies_restricted_client_sending_multipart_body() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = authed_app(
+        &mock_url,
+        vec![mk_client("limited", "key-limited", &["claude-haiku-*"])],
+    );
+    let addr = serve(app).await;
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "multipart/form-data; boundary=x")
+        .header("x-api-key", "key-limited")
+        .body("--x\r\n\r\nhi\r\n--x--\r\n")
         .send()
         .await
         .unwrap();
