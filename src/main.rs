@@ -555,6 +555,24 @@ fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// The whole startup parse-and-validate sequence, in boot order. `main()` calls
+/// only this, so a test that loads a config through it sees every validator a
+/// real boot runs, including ones added later. Each error is the exact message
+/// `main()` panics with.
+fn load_config(raw: &str) -> Result<Config, String> {
+    let raw_value: toml::Value =
+        toml::from_str(raw).map_err(|e| format!("config parse error: {e}"))?;
+    reject_legacy_config_keys(&raw_value)?;
+    let config: Config = raw_value
+        .try_into()
+        .map_err(|e| format!("config parse error: {e}"))?;
+    validate_endpoints(&config.endpoints)?;
+    validate_clients(&config).map_err(|msg| format!("config: {msg}"))?;
+    validate_exposure(&config)?;
+    validate_rate_limit_cooldown(&config)?;
+    Ok(config)
+}
+
 #[tokio::main]
 async fn main() {
     // Parse config first so debug_log path is available for tracing setup
@@ -563,26 +581,7 @@ async fn main() {
         .unwrap_or_else(|| "config.toml".to_string());
     let config_str = std::fs::read_to_string(&config_path)
         .unwrap_or_else(|e| panic!("failed to read {config_path}: {e}"));
-    let raw_value: toml::Value =
-        toml::from_str(&config_str).unwrap_or_else(|e| panic!("config parse error: {e}"));
-    if let Err(msg) = reject_legacy_config_keys(&raw_value) {
-        panic!("{msg}");
-    }
-    let config: Config = raw_value
-        .try_into()
-        .unwrap_or_else(|e| panic!("config parse error: {e}"));
-    if let Err(msg) = validate_endpoints(&config.endpoints) {
-        panic!("{msg}");
-    }
-    if let Err(msg) = validate_clients(&config) {
-        panic!("config: {msg}");
-    }
-    if let Err(msg) = validate_exposure(&config) {
-        panic!("{msg}");
-    }
-    if let Err(msg) = validate_rate_limit_cooldown(&config) {
-        panic!("{msg}");
-    }
+    let config = load_config(&config_str).unwrap_or_else(|msg| panic!("{msg}"));
 
     // Set up tracing: stderr (info+) always, plus optional debug log file
     {

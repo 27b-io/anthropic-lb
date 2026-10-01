@@ -335,6 +335,8 @@ Per-client token usage and budget status appear in `/_stats`.
 
 A request for a model outside the list is rejected with **403** — a policy denial, distinct from the 429s that mean "capacity, try later" — and counted as `anthropic_client_model_denied_total{client,model}`. Operators bypass it, as they do every other gate check. The check sits in `pre_request_gate`, which both `/v1/messages` and `/v1/chat/completions` route through, so it covers both surfaces.
 
+To deny a client every model, set `models = [""]`. The single empty pattern matches no model, so every `/v1` request from that client gets 403 while its credential still authenticates — useful for a principal that should only read the admin surfaces. Do not write `models = []` for this: `[]`, like an omitted `models`, allows all models.
+
 It **fails closed** on a model it cannot read. The proxy takes the model from the top-level `model` key of a JSON body; a body that does not parse, or a route that nests the model elsewhere (`/v1/messages/batches` puts it under `requests[].params.model`), yields no model — and a client that has an allow-list is then denied rather than waved through. Clients with no allow-list are unaffected.
 
 ---

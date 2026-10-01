@@ -247,6 +247,19 @@ fn client_allow_list_denies_an_unreadable_model() {
     );
 }
 
+/// LAB-6939: `models = [""]` denies every model, including the wildcard and
+/// empty strings. It is the documented deny-all form; `[]` means all models.
+#[test]
+fn client_allow_list_of_one_empty_pattern_denies_every_model() {
+    let state = state_with_clients(vec![mk_client("deny-all", "k1", &[""])]);
+    for model in ["claude-sonnet-5", "claude-haiku-4-5", "", "*", "none"] {
+        assert!(
+            !state.client_allows_model("deny-all", model),
+            "models = [\"\"] must deny {model:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn gate_denies_unreadable_model_for_restricted_client() {
     let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
@@ -680,4 +693,37 @@ async fn metrics_exposes_the_model_denial_counter() {
         ),
         "denial counter missing from /metrics:\n{body}"
     );
+}
+
+/// LAB-6939 rollback case: with no `admin_readers`, `models = [""]` is the only
+/// thing between the client's key and the pool. Both surfaces must 403 a
+/// well-formed request for a real model before anything reaches upstream.
+#[tokio::test]
+async fn empty_model_pattern_denies_both_surfaces_without_reaching_upstream() {
+    let (mock_url, hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let (app, _state) = authed_app(&mock_url, vec![mk_client("deny-all", "key-deny", &[""])]);
+    let addr = serve(app).await;
+    let client = Client::new();
+
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "key-deny")
+        .body(r#"{"model":"claude-sonnet-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer key-deny")
+        .body(r#"{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

@@ -668,3 +668,38 @@ fn exposure_rejects_a_zero_window_with_the_throttle_enabled() {
     )))
     .is_ok());
 }
+
+/// LAB-6939: `models = [""]` is the supported deny-all form, and a production
+/// config relies on it as the fail-closed backstop for a read-only principal.
+/// Loaded through `load_config`, so a future boot validator that rejects an
+/// empty pattern, or a normalise pass that drops it (collapsing `[""]` to `[]`,
+/// which allows ALL models), fails here instead of at deploy.
+#[test]
+fn load_config_boots_and_keeps_an_empty_model_pattern() {
+    let toml_str = format!(
+        r#"
+listen = "0.0.0.0:8080"
+admin_readers = ["ops-console"]
+
+[[endpoints]]
+name = "primary"
+token = "sk-ant-test"
+
+[[clients]]
+name = "ops-console"
+key = "{STRONG_KEY}"
+models = [""]
+
+[[clients]]
+name = "geo"
+key = "{STRONG_KEY}-geo"
+"#
+    );
+    let config = load_config(&toml_str).expect("a models = [\"\"] client must boot");
+    let ops = config
+        .clients
+        .iter()
+        .find(|c| c.name == "ops-console")
+        .unwrap();
+    assert_eq!(ops.models, vec![String::new()]);
+}
