@@ -1602,6 +1602,33 @@ pub(crate) fn stamp_guard_findings(mut response: Response, count: Option<usize>)
     response
 }
 
+/// The coding a request body would reach the upstream under without the proxy
+/// having decoded it, as `(header, coding)`: any `Content-Encoding` but
+/// `identity`, or any `Transfer-Encoding` but `chunked`, the one framing hyper
+/// removes. The proxy reads such a body as raw bytes, while the upstream may
+/// read what they decode to. A value that is not visible ASCII cannot be
+/// checked, so it counts as a coding.
+pub(crate) fn undecoded_body_coding(headers: &hyper::HeaderMap) -> Option<(&'static str, String)> {
+    for (name, decoded) in [
+        ("content-encoding", "identity"),
+        ("transfer-encoding", "chunked"),
+    ] {
+        for value in headers.get_all(name) {
+            let Ok(value) = value.to_str() else {
+                return Some((name, "(not visible ASCII)".to_string()));
+            };
+            if let Some(coding) = value
+                .split(',')
+                .map(str::trim)
+                .find(|c| !c.eq_ignore_ascii_case(decoded))
+            {
+                return Some((name, truncate_label(coding)));
+            }
+        }
+    }
+    None
+}
+
 pub(crate) async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -1693,19 +1720,41 @@ pub(crate) async fn proxy_handler(
     #[cfg(feature = "guard")]
     let mut guard_outcome = guard::ScanOutcome::NothingToScan;
 
+    // The proxy decodes no content coding, so it would route a coded body on
+    // bytes it cannot read while the upstream decodes them, possibly to a
+    // model the proxy never saw (LAB-6781). Refused before the parse: a coded
+    // body can pass the `--` test below, or even parse as JSON, as raw bytes.
+    if !body_bytes.is_empty() {
+        if let Some((header, coding)) = undecoded_body_coding(&parts.headers) {
+            warn!(
+                req_id,
+                client = %client_ip,
+                client_id = %client_id,
+                path = %parts.uri.path(),
+                header,
+                coding = %coding,
+                "rejected: request body has a coding the proxy does not decode"
+            );
+            return proxy_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("request body {header} '{coding}' is not supported"),
+            );
+        }
+    }
+
     // Parse body once for model extraction, optional cache injection, and
     // the fast-mode flag that picks the rate bucket and routing pool downstream.
     let parse = serde_json::from_slice::<serde_json::Value>(&body_bytes);
 
     // A body this parse refuses would route on no model, yet other JSON
-    // decoders read a model out of some such bodies: a lone surrogate escape,
-    // nesting past the depth limit, an out-of-range number, a non-UTF-8 byte,
-    // trailing bytes, a BOM, UTF-16. The upstream could then act on a model
-    // the proxy never routed or gated on, so refuse it before routing
-    // (LAB-6781). The one non-JSON body this handler carries, a multipart
-    // upload (`/v1/files`), opens with its `--` boundary line, which no JSON
-    // text can start with, so it passes. Keyed on the bytes alone: the client
-    // controls the path and the `Content-Type`.
+    // decoders read a model out of some such bodies (`unparseable_json_bodies`
+    // in the tests holds them), so the upstream could act on a model the proxy
+    // never routed or gated on. Refuse it before routing (LAB-6781). A
+    // multipart upload (`/v1/files`) passes: it opens with its `--` boundary
+    // line, and no JSON text starts with `--`. With codings refused above,
+    // these bytes are the ones the upstream reads. Keyed on the bytes alone:
+    // the client controls the path and the `Content-Type`.
     if let Err(e) = &parse {
         if !body_bytes.is_empty() && !body_bytes.starts_with(b"--") {
             warn!(
@@ -1904,11 +1953,11 @@ pub(crate) async fn proxy_handler(
                 is_fast_mode,
             )
         } else {
-            // Bodiless, or a multipart upload (the rejection above refused
-            // every other unparsed body). The scanner cannot read multipart,
-            // and a parse differential against the upstream could smuggle
-            // content past the scan. A bodiless request keeps the
-            // `NothingToScan` default.
+            // Bodiless, or a body that starts with `--`, such as a multipart
+            // upload; the rejection above refused every other unparsed body.
+            // The scanner cannot read it, and a parse differential against the
+            // upstream could smuggle content past the scan. A bodiless request
+            // keeps the `NothingToScan` default.
             #[cfg(feature = "guard")]
             if !body_bytes.is_empty() {
                 guard_outcome = guard::ScanOutcome::Unscannable(guard::REASON_BODY_UNPARSEABLE);

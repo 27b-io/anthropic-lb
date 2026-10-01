@@ -782,3 +782,108 @@ async fn proxy_forwards_bodiless_and_multipart_requests_unchanged() {
         "the upload is forwarded byte-identical"
     );
 }
+
+/// The proxy decodes no content coding, so a coded body is refused before the
+/// parse: its raw bytes could pass the `--` test, or even parse as JSON, while
+/// the upstream reads what they decode to. Bodies under no coding, `identity`
+/// or `chunked` framing pass.
+#[tokio::test]
+async fn proxy_rejects_body_under_a_coding_it_does_not_decode() {
+    use std::sync::atomic::Ordering;
+    const JSON: &str =
+        r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
+    let state = test_state_with(vec![mk_endpoint_at("acct", "sk-ant-api-test", &url)]);
+    let addr = serve(build_router(state)).await;
+    let client = Client::new();
+
+    let refused: [(&str, &str, &[u8], &str); 5] = [
+        (
+            "content-encoding",
+            "br",
+            b"--\x8b\x7f",
+            "content-encoding 'br'",
+        ),
+        (
+            "content-encoding",
+            "gzip",
+            JSON.as_bytes(),
+            "content-encoding 'gzip'",
+        ),
+        (
+            "content-encoding",
+            "identity, deflate",
+            JSON.as_bytes(),
+            "content-encoding 'deflate'",
+        ),
+        (
+            "content-encoding",
+            "",
+            JSON.as_bytes(),
+            "content-encoding ''",
+        ),
+        (
+            "transfer-encoding",
+            "gzip, chunked",
+            JSON.as_bytes(),
+            "transfer-encoding 'gzip'",
+        ),
+    ];
+    for (header, value, body, message) in refused {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .header(header, value)
+            .body(body)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{header}: {value}: no HTTP response: {e}"));
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{header}: {value}"
+        );
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            json["error"]["type"], "invalid_request_error",
+            "{header}: {value}: {json}"
+        );
+        assert!(
+            json["error"]["message"].as_str().unwrap().contains(message),
+            "{header}: {value}: {json}"
+        );
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "no coded body may reach the upstream"
+    );
+
+    for (header, value) in [
+        ("content-encoding", "identity"),
+        ("content-encoding", "IDENTITY"),
+        ("transfer-encoding", "chunked"),
+    ] {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .header(header, value)
+            .body(JSON)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{header}: {value}");
+    }
+    let resp = client
+        .get(format!("http://{addr}/v1/models"))
+        .header("content-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a bodiless request has nothing to decode"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+}

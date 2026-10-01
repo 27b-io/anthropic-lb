@@ -266,8 +266,9 @@ async fn gate_denies_unreadable_model_for_restricted_client() {
 }
 
 /// End-to-end proof of the same thing: an unparseable body must not smuggle a
-/// restricted client past its allow-list. It is refused before the gate now
-/// (LAB-6781), which is the stronger outcome.
+/// restricted client past its allow-list. Since LAB-6781 the ingress rule
+/// refuses it before the allow-list runs; the allow-list's own denial is
+/// pinned by `native_surface_denies_restricted_client_sending_multipart_body`.
 #[tokio::test]
 async fn native_surface_denies_restricted_client_sending_unparseable_body() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
@@ -285,6 +286,8 @@ async fn native_surface_denies_restricted_client_sending_unparseable_body() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let json = parse_wire_error_envelope(resp).await;
+    assert_eq!(json["error"]["type"], "invalid_request_error");
 }
 
 /// The one unparsed body that still reaches the gate is a multipart upload.

@@ -393,14 +393,19 @@ can steer are locked down by default:
   `redirect::Policy::none()`; a `3xx` from an upstream surfaces to the caller
   as a `502` with a distinct log line instead of re-sending credentials to
   the `Location` target.
-- **Unreadable bodies are refused.** A non-empty request body that does not
-  parse as JSON gets a `400 invalid_request_error` before routing, on every
-  path and whatever its `Content-Type`, and is logged at `warn` with its
-  client and path. Other JSON decoders read a model out of some bodies this
-  proxy's parser refuses (a lone surrogate escape, a UTF-8 BOM, trailing
-  bytes), so forwarding one would let the upstream act on a model the proxy
-  never routed or gated on. A multipart upload (`/v1/files`) passes: it
-  opens with its `--` boundary line, which no JSON text can start with.
+- **Unreadable bodies are refused.** On the Anthropic surface (every route
+  but `/v1/chat/completions`, which answers invalid JSON with its own `400`),
+  a non-empty request body that does not parse as JSON gets a
+  `400 invalid_request_error` before routing, whatever its path or
+  `Content-Type`, and is logged at `warn` with its client and path. Other JSON
+  decoders read a model out of some bodies this proxy's parser refuses (a lone
+  surrogate escape, a UTF-8 BOM, trailing bytes), so forwarding one would let
+  the upstream act on a model the proxy never routed or gated on. A multipart
+  upload (`/v1/files`) passes: it opens with its `--` boundary line, and no
+  JSON text starts with `--`. The proxy decodes no content coding, so a
+  non-empty body under any `Content-Encoding` but `identity`, or any
+  `Transfer-Encoding` but `chunked`, gets the same `400` first: its raw bytes
+  are not what the upstream would read.
 - **Response headers are allow-listed.** Only `content-type`,
   `content-length`, `cache-control`, `request-id`, `retry-after`, and
   `x-should-retry` are reflected to callers (plus the proxy's own
