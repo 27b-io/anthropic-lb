@@ -1794,6 +1794,23 @@ pub(crate) async fn proxy_handler(
                     "request body must be a JSON object",
                 );
             }
+            // `parsed` keeps the last of two duplicate keys and matches keys
+            // exactly, but the bytes usually go upstream as sent. Checked
+            // before any field is read, so no policy or routing decision
+            // rests on a top-level field the upstream might read differently.
+            if !top_level_keys_unambiguous(&body_bytes) {
+                warn!(
+                    req_id,
+                    client = %client_ip,
+                    client_id = %client_id,
+                    "rejected: request body has an ambiguous top-level key"
+                );
+                return proxy_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "request body has an ambiguous top-level key",
+                );
+            }
             let model = parsed
                 .get("model")
                 .and_then(|m| m.as_str())
