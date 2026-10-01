@@ -1323,6 +1323,141 @@ async fn openai_chat_forwards_object_body_byte_identically() {
     assert_eq!(received.as_ref(), raw.as_bytes());
 }
 
+/// LAB-6794: the body-level fallback lists an OpenAI-compatible gateway can
+/// honour, each naming a model outside every `models` list in these tests.
+/// `router_settings_override` carries the same lists one level down.
+const FALLBACK_FIELD_ROWS: [(&str, &str); 4] = [
+    ("fallbacks", r#"["claude-opus-5"]"#),
+    (
+        "context_window_fallbacks",
+        r#"[{"gpt-x": ["claude-opus-5"]}]"#,
+    ),
+    (
+        "content_policy_fallbacks",
+        r#"[{"gpt-x": ["claude-opus-5"]}]"#,
+    ),
+    (
+        "router_settings_override",
+        r#"{"fallbacks": [{"gpt-x": ["claude-opus-5"]}]}"#,
+    ),
+];
+
+/// A chat body carrying one fallback field. Its spacing and key order would
+/// not survive a re-serialization, so a verbatim forward is observable.
+fn fallback_field_body(field: &str, value: &str) -> String {
+    format!(
+        r#"{{ "model":"gpt-x", "{field}": {value}, "messages": [{{"role": "user", "content": "hi"}}],  "max_tokens":5 }}"#
+    )
+}
+
+/// What a restricted endpoint must receive for every `fallback_field_body`:
+/// the field gone and each kept value as the client wrote it.
+const STRIPPED_FALLBACK_BODY: &str =
+    r#"{"model":"gpt-x","messages":[{"role": "user", "content": "hi"}],"max_tokens":5}"#;
+
+/// LAB-6794: a `Protocol::OpenAI` endpoint gets the client's bytes, so a
+/// fallback list would let a gateway serve a model neither `models` gate saw.
+/// A restricted client, a restricted endpoint, or both, must forward without
+/// it; the same body from an unrestricted client to an unrestricted endpoint
+/// arrives byte-identical.
+#[tokio::test]
+async fn restricted_openai_endpoint_never_receives_fallback_fields() {
+    for endpoint_models in [&[][..], &["gpt-x"][..]] {
+        let (url, mut rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
+        let mut gw = make_endpoint("gw", Protocol::OpenAI);
+        gw.base_url = url;
+        gw.models = endpoint_models.iter().map(|m| m.to_string()).collect();
+        let state = Arc::new(AppState {
+            endpoints: vec![gw],
+            clients: vec![
+                mk_client("plain", "key-plain", &[]),
+                mk_client("limited", "key-limited", &["gpt-x*"]),
+            ],
+            ..test_state_base()
+        });
+        let addr = serve(build_router(state)).await;
+        let client = Client::new();
+
+        for (field, value) in FALLBACK_FIELD_ROWS {
+            let raw = fallback_field_body(field, value);
+            for key in ["key-plain", "key-limited"] {
+                let resp = client
+                    .post(format!("http://{addr}/v1/chat/completions"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(raw.clone())
+                    .send()
+                    .await
+                    .unwrap();
+                let case = format!("{field} {key} endpoint models {endpoint_models:?}");
+                assert_eq!(resp.status(), reqwest::StatusCode::OK, "{case}");
+                // The mock sends before it replies, so the capture is queued.
+                let (_, received) = rx.try_recv().expect("the body must reach the upstream");
+                let received = std::str::from_utf8(&received).unwrap();
+                if key == "key-limited" || !endpoint_models.is_empty() {
+                    assert_eq!(received, STRIPPED_FALLBACK_BODY, "{case}");
+                } else {
+                    assert_eq!(received, raw, "{case}");
+                }
+            }
+        }
+    }
+}
+
+/// LAB-6794: the strip is judged per attempt, on the endpoint the retry loop
+/// actually picked, as in `forward_anthropic`. A 500 on the first endpoint
+/// rotates to the second; whichever of the two is restricted gets the
+/// stripped body, the other the client's bytes.
+#[tokio::test]
+async fn fallback_field_strip_follows_each_attempts_endpoint() {
+    let (field, value) = FALLBACK_FIELD_ROWS[1];
+    let raw = fallback_field_body(field, value);
+    for first_restricted in [true, false] {
+        let (first_url, mut first_rx) =
+            spawn_capturing_upstream(StatusCode::INTERNAL_SERVER_ERROR, OPENAI_OK_BODY).await;
+        let (second_url, mut second_rx) =
+            spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
+        let mut first = make_endpoint("first", Protocol::OpenAI);
+        first.base_url = first_url;
+        let mut second = make_endpoint("second", Protocol::OpenAI);
+        second.base_url = second_url;
+        second.priority = 1;
+        let restricted = if first_restricted {
+            &mut first
+        } else {
+            &mut second
+        };
+        restricted.models = vec!["gpt-x".to_string()];
+        let addr = serve(build_router(test_state_with(vec![first, second]))).await;
+
+        let resp = Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(raw.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let (_, first_body) = first_rx.try_recv().expect("first endpoint must be tried");
+        let (_, second_body) = second_rx.try_recv().expect("the 500 must rotate");
+        let (stripped, verbatim) = if first_restricted {
+            (first_body, second_body)
+        } else {
+            (second_body, first_body)
+        };
+        assert_eq!(
+            std::str::from_utf8(&stripped).unwrap(),
+            STRIPPED_FALLBACK_BODY,
+            "first restricted: {first_restricted}"
+        );
+        assert_eq!(
+            std::str::from_utf8(&verbatim).unwrap(),
+            raw,
+            "first restricted: {first_restricted}"
+        );
+    }
+}
+
 /// Integration test: verify OAuth accounts get the CC system prompt injected
 /// in requests sent through the OpenAI-compat endpoint.
 #[tokio::test]

@@ -1669,6 +1669,9 @@ pub(crate) async fn openai_chat_handler(
         let mut rejected_resp: Option<Response> = None;
         // One-shot entitlement re-send, as in `proxy_handler` (LAB-4729).
         let mut entitlement_resp: Option<(EndpointIdx, Option<Response>)> = None;
+        // `body_bytes` without `OPENAI_FALLBACK_FIELDS`, built on the first
+        // restricted `Protocol::OpenAI` attempt and reused after it.
+        let mut restricted_body: Option<bytes::Bytes> = None;
         for retry_round in 0..=MAX_529_RETRIES {
             if retry_round > 0 {
                 let delay = round_backoff_delay(retry_round, last_saw_529);
@@ -1723,9 +1726,37 @@ pub(crate) async fn openai_chat_handler(
                             Protocol::OpenAI => {
                                 // The endpoint is OpenAI-native — forward the
                                 // original request body without translation.
+                                // LAB-6794: minus its fallback lists when the
+                                // client or THIS endpoint has a `models` list,
+                                // the rule `forward_anthropic` applies to
+                                // `fallbacks` (LAB-5970) — see
+                                // `OPENAI_FALLBACK_FIELDS`.
+                                let restricted = !ep.models.is_empty()
+                                    || state.client_restricts_models(&client_id);
+                                let wire_body = if restricted {
+                                    &*restricted_body.get_or_insert_with(|| {
+                                        match strip_top_level_fields(
+                                            &body_bytes,
+                                            OPENAI_FALLBACK_FIELDS,
+                                        ) {
+                                            Some(stripped) => {
+                                                debug!(
+                                                    req_id,
+                                                    client_id,
+                                                    upstream = ep.name,
+                                                    "models allow-list: stripped top-level fallback fields"
+                                                );
+                                                stripped
+                                            }
+                                            None => body_bytes.clone(),
+                                        }
+                                    })
+                                } else {
+                                    &body_bytes
+                                };
                                 let out = try_fallback_upstream(
                                     &state,
-                                    &body_bytes,
+                                    wire_body,
                                     &req_id,
                                     &client_id,
                                     &client_ip,
