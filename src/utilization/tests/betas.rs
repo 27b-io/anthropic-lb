@@ -911,22 +911,38 @@ fn surviving_server_side_fallback_keeps_fallbacks_and_dropped_one_strips_it() {
     assert_eq!(parsed["fallbacks"], "default");
 }
 
-/// LAB-5970: `strip_fallbacks` removes every top-level `fallbacks` (a
-/// duplicate key must not keep one alive) and nothing else, retained values
-/// byte-identical.
+/// LAB-5970: `strip_top_level_fields` removes every top-level entry of a
+/// listed key (a duplicate key must not keep one alive) and nothing else,
+/// retained values byte-identical.
 #[test]
-fn strip_fallbacks_removes_only_fallbacks() {
+fn strip_top_level_fields_removes_only_listed_fields() {
     let body = bytes::Bytes::from_static(
         br#"{"model":"claude-opus-5","fallbacks":"default","max_tokens":18446744073709551617,"fallbacks":[{"model":"claude-opus-4-8"}],"messages":[]}"#,
     );
-    let out = strip_fallbacks(&body).expect("fallbacks must be stripped");
+    let out = strip_top_level_fields(&body, &["fallbacks"]).expect("fallbacks must be stripped");
     assert_eq!(
         std::str::from_utf8(&out).unwrap(),
         r#"{"model":"claude-opus-5","max_tokens":18446744073709551617,"messages":[]}"#
     );
     // Nothing to strip, or nothing we can read: body untouched.
-    assert!(strip_fallbacks(&bytes::Bytes::from_static(br#"{"model":"m"}"#)).is_none());
-    assert!(strip_fallbacks(&bytes::Bytes::from_static(b"not json")).is_none());
+    let fallbacks = &["fallbacks"];
+    assert!(
+        strip_top_level_fields(&bytes::Bytes::from_static(br#"{"model":"m"}"#), fallbacks)
+            .is_none()
+    );
+    assert!(strip_top_level_fields(&bytes::Bytes::from_static(b"not json"), fallbacks).is_none());
+
+    // LAB-6794: every listed field goes, wherever it sits, and a nested
+    // `fallbacks` is a value of a kept key, not a top-level entry.
+    let body = bytes::Bytes::from_static(
+        br#"{"router_settings_override":{"fallbacks":[{"a":["b"]}]},"model":"m","context_window_fallbacks":[{"m":["big"]}],"metadata":{"fallbacks":["x"]},"content_policy_fallbacks":[],"fallbacks":["x"]}"#,
+    );
+    let out =
+        strip_top_level_fields(&body, OPENAI_FALLBACK_FIELDS).expect("all four must be stripped");
+    assert_eq!(
+        std::str::from_utf8(&out).unwrap(),
+        r#"{"model":"m","metadata":{"fallbacks":["x"]}}"#
+    );
 }
 
 /// What the upstream received for a `fallbacks` request, sent as `client_key`

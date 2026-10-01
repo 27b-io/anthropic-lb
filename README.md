@@ -251,6 +251,11 @@ A server-side refusal fallback (`fallbacks`) could be served by a model this
 list does not name, so when the chosen endpoint or the client (see
 `[[clients]]` below) has a non-empty `models` list, the proxy strips the
 top-level `fallbacks` field and a refusal is returned as a refusal.
+The same rule covers `/v1/chat/completions` requests forwarded to a
+`protocol = "openai"` endpoint: they lose the body-level fallback lists an
+OpenAI-compatible gateway may honour (`fallbacks`, `context_window_fallbacks`,
+`content_policy_fallbacks` and `router_settings_override`), so a failure of the
+requested model comes back as that failure.
 
 ---
 

@@ -61,13 +61,14 @@ fn top_level_keys_unambiguous_requires_distinct_lowercase_ascii_keys() {
 #[test]
 fn top_level_keys_unambiguous_refuses_every_respelt_protected_field() {
     let fields: Vec<&str> = protected_fields().collect();
-    for field in [
-        "fallbacks",
+    // Every field a models-restricted request loses on an OpenAI-protocol
+    // endpoint (LAB-6794), read from the list the strip itself uses.
+    for field in OPENAI_FALLBACK_FIELDS.iter().chain(&[
         "fallback_credit_token",
         "context_management",
         "safeguards",
-    ] {
-        assert!(fields.contains(&field), "{field} must be protected");
+    ]) {
+        assert!(fields.contains(field), "{field} must be protected");
     }
     for field in fields {
         let exact = format!("{{\"{field}\":1}}");

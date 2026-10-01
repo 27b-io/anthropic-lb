@@ -662,7 +662,9 @@ pub(crate) fn strip_orphaned_beta_body_fields(
     Some((render_top_level(kept)?, removed))
 }
 
-/// Remove top-level `fallbacks` from a Messages body (LAB-5970).
+/// Remove every top-level entry named in `fields`: `fallbacks` from a
+/// Messages body (LAB-5970), `OPENAI_FALLBACK_FIELDS` from a chat-completions
+/// body bound for an OpenAI-protocol endpoint (LAB-6794).
 ///
 /// Both `models` gates — the client's (`client_allows_model`) and the
 /// endpoint's (`Endpoint::serves_model`) — read only the top-level `model`,
@@ -677,18 +679,44 @@ pub(crate) fn strip_orphaned_beta_body_fields(
 /// header also grants `fallback_credit_token`, whose redemption is a new
 /// request that passes both gates on its own top-level `model`.
 ///
-/// Every `fallbacks` entry goes, so a duplicate key cannot keep one alive.
-/// Returns `None` — body untouched — when there is none, or when the body is
-/// not a JSON object: a restricted CLIENT never gets here with one
+/// Every entry of a listed key goes, so a duplicate key cannot keep one
+/// alive. Returns `None` — body untouched — when there is none, or when the
+/// body is not a JSON object: a restricted CLIENT never gets here with one
 /// (`client_allows_model` fails closed on an unreadable model), and an
 /// endpoint gate already routes an unreadable body unnarrowed.
-pub(crate) fn strip_fallbacks(body: &bytes::Bytes) -> Option<bytes::Bytes> {
+pub(crate) fn strip_top_level_fields(body: &bytes::Bytes, fields: &[&str]) -> Option<bytes::Bytes> {
     let parsed: TopLevelObject = serde_json::from_slice(body).ok()?;
-    if !parsed.0.iter().any(|(key, _)| key == "fallbacks") {
+    if !parsed
+        .0
+        .iter()
+        .any(|(key, _)| fields.contains(&key.as_str()))
+    {
         return None;
     }
-    render_top_level(parsed.0.iter().filter(|(key, _)| key != "fallbacks"))
+    render_top_level(
+        parsed
+            .0
+            .iter()
+            .filter(|(key, _)| !fields.contains(&key.as_str())),
+    )
 }
+
+/// Top-level fields with which a chat-completions body asks an
+/// OpenAI-compatible gateway to serve ANOTHER model when the named one fails
+/// (LAB-6794). LiteLLM's proxy reads `fallbacks`, `context_window_fallbacks`
+/// and `content_policy_fallbacks` from the request, and also merges all three
+/// from a client-supplied `router_settings_override` object. A client can
+/// provoke the context-window failure at will with an oversized prompt.
+///
+/// Same rule as `fallbacks` on Anthropic endpoints: the `models` gates read
+/// only `model`, so a restricted request loses these fields and a failure of
+/// the named model comes back as that failure.
+pub(crate) const OPENAI_FALLBACK_FIELDS: &[&str] = &[
+    "fallbacks",
+    "context_window_fallbacks",
+    "content_policy_fallbacks",
+    "router_settings_override",
+];
 
 /// Re-emit top-level entries as a JSON object, values spliced through as their
 /// original bytes (see `strip_orphaned_beta_body_fields` for why).
@@ -746,11 +774,21 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for TopLevelObject
 /// Top-level fields a policy or routing decision reads or strips: the client
 /// allow-list, endpoint `models` routing, the context window and the negative
 /// cache read `model`, fast-mode routing reads `speed`, the content guard
-/// reads `messages` and `system`, and a model-restricted endpoint strips
-/// `fallbacks` (`strip_fallbacks`). A field a new decision starts reading or
-/// stripping belongs here; until it is added, its respellings pass as they
-/// did before this check existed.
-const DECISION_FIELDS: [&str; 5] = ["model", "speed", "messages", "system", "fallbacks"];
+/// reads `messages` and `system`, and a model-restricted request loses
+/// `fallbacks` and, on an OpenAI-protocol endpoint, the rest of
+/// `OPENAI_FALLBACK_FIELDS` (`strip_top_level_fields`). A field a new decision
+/// starts reading or stripping belongs here; until it is added, its
+/// respellings pass as they did before this check existed.
+const DECISION_FIELDS: [&str; 8] = [
+    "model",
+    "speed",
+    "messages",
+    "system",
+    "fallbacks",
+    "context_window_fallbacks",
+    "content_policy_fallbacks",
+    "router_settings_override",
+];
 
 /// Every field whose respelling is refused: `DECISION_FIELDS`, plus each body
 /// field the beta allow-list strips along with a dropped flag, read from
