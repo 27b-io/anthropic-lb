@@ -743,6 +743,71 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for TopLevelObject
     }
 }
 
+/// Top-level fields a policy or routing decision reads or strips: the client
+/// allow-list, endpoint `models` routing, the context window and the negative
+/// cache read `model`, fast-mode routing reads `speed`, the content guard
+/// reads `messages` and `system`, and a model-restricted endpoint strips
+/// `fallbacks` (`strip_fallbacks`). A field a new decision starts reading or
+/// stripping belongs here; until it is added, its respellings pass as they
+/// did before this check existed.
+const DECISION_FIELDS: [&str; 5] = ["model", "speed", "messages", "system", "fallbacks"];
+
+/// Every field whose respelling is refused: `DECISION_FIELDS`, plus each body
+/// field the beta allow-list strips along with a dropped flag, read from
+/// `BETA_BODY_FIELDS` so the two lists cannot drift apart.
+fn protected_fields() -> impl Iterator<Item = &'static str> {
+    DECISION_FIELDS.into_iter().chain(
+        BETA_BODY_FIELDS
+            .iter()
+            .flat_map(|(_, fields)| fields.iter().copied()),
+    )
+}
+
+/// A key as a decoder that ignores `_` and `-` when matching names sees it.
+fn without_delimiters(key: &str) -> String {
+    key.chars().filter(|c| !matches!(c, '_' | '-')).collect()
+}
+
+/// Whether `body` is a JSON object whose top-level keys are unambiguous:
+/// spelled in lowercase ASCII, distinct once `_` and `-` are removed, and not
+/// a respelling of a field in `protected_fields`. Keys compare decoded
+/// (`"m\u006fdel"` is `"model"`).
+///
+/// The handlers read every field from a `serde_json::Value`, which keeps the
+/// last of two duplicate keys and matches keys exactly, but often forward the
+/// client's bytes as sent. An upstream decoder that keeps the first key,
+/// matches keys regardless of case (Go's `encoding/json`), or also ignores
+/// `_` and `-` (its v2 case-insensitive option) would then act on a field no
+/// policy check saw: a repeated `model`, a lone `"MODEL"` or `"mo_del"` that
+/// the checks read as no model at all, or a `"fall_backs"` that survives the
+/// strip meant to remove it. Every Anthropic and OpenAI
+/// top-level field is lowercase ASCII, and no two differ only by delimiters,
+/// so these rules cost a valid body nothing.
+///
+/// A lone respelling of any other field still passes: the proxy neither
+/// decides on nor strips such a field, so it has no view to disagree with.
+///
+/// A body this parser cannot read as an object counts as ambiguous. Callers
+/// have already parsed it as an object, so that arm is unreachable in
+/// practice; it fails closed rather than waving an unchecked body through.
+pub(crate) fn top_level_keys_unambiguous(body: &[u8]) -> bool {
+    let Ok(TopLevelObject(entries)) =
+        serde_json::from_slice::<TopLevelObject<serde::de::IgnoredAny>>(body)
+    else {
+        return false;
+    };
+    let mut seen = std::collections::HashSet::with_capacity(entries.len());
+    entries.into_iter().all(|(key, _)| {
+        if !key.bytes().all(|b| b.is_ascii() && !b.is_ascii_uppercase()) {
+            return false;
+        }
+        let bare = without_delimiters(&key);
+        let respells_protected_field = !protected_fields().any(|f| f == key)
+            && protected_fields().any(|f| without_delimiters(f) == bare);
+        !respells_protected_field && seen.insert(bare)
+    })
+}
+
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
 /// `affinity_headroom` is below 50% of the alternative's, stickiness is broken.
 pub(crate) const LEGACY_AFFINITY_OVERRIDE_RATIO: f64 = 0.5;

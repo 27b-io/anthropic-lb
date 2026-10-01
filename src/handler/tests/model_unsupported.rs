@@ -773,10 +773,13 @@ fn gateway_model_arm_is_anchored_and_bound_to_requested_model() {
     }
 }
 
-/// End to end on an OpenAI-protocol endpoint: a gateway 400 made of the
-/// client's own key neither learns nor rotates, whether the key comes back at
-/// the start of the message (the echo veto) or relayed mid-message (the
-/// anchored arm). The healthy account would serve if the request rotated.
+/// End to end on an OpenAI-protocol endpoint: a key spelled as the gateway's
+/// own rejection neither learns nor rotates. Such a key is not lowercase
+/// ASCII, so it is refused at ingress (`top_level_keys_unambiguous`) before
+/// the gateway can echo it, at the start of the message or relayed
+/// mid-message. The echo veto and the anchored arm stay the second line;
+/// their own tests cover them. The healthy account would serve if the
+/// request rotated.
 #[tokio::test]
 async fn gateway_echo_of_client_key_does_not_negative_cache() {
     use std::sync::atomic::Ordering;
@@ -815,15 +818,15 @@ async fn gateway_echo_of_client_key_does_not_negative_cache() {
         assert_eq!(
             resp.status(),
             reqwest::StatusCode::BAD_REQUEST,
-            "{kind}: the client's own 400 must be forwarded"
+            "{kind}: the client's own error must be a 400"
         );
         assert_eq!(
             (
                 gw_hits.load(Ordering::SeqCst),
                 ok_hits.load(Ordering::SeqCst)
             ),
-            (1, 0),
-            "{kind}: the request must not rotate"
+            (0, 0),
+            "{kind}: the request must reach no upstream"
         );
         assert!(
             state.unsupported_models.lock().unwrap().is_empty(),
@@ -972,9 +975,11 @@ async fn bogus_model_spray_cannot_block_a_genuine_learn() {
     );
 }
 
-/// A model 404 marks only the model it names. With two `model` keys the proxy
-/// reads the last one; an upstream that read the first would reject a model
-/// the proxy never asked for, and must not get the requested one cached.
+/// A model 404 marks only the model it names. An upstream that rejects a
+/// model the proxy never asked for must not get the requested one cached.
+/// Two `model` keys were one way to get there; they now 400 at ingress
+/// (`ambiguous_top_level_key_is_rejected_locally_on_both_surfaces`), so this
+/// body names one model and the upstream's 404 names another.
 #[tokio::test]
 async fn model_404_naming_another_model_does_not_negative_cache() {
     use std::sync::atomic::Ordering;
@@ -994,7 +999,7 @@ async fn model_404_naming_another_model_does_not_negative_cache() {
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .header("content-type", "application/json")
-        .body(r#"{"model":"claude-nope-1","model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .body(r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
         .unwrap();
