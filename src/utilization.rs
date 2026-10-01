@@ -662,22 +662,12 @@ pub(crate) fn strip_orphaned_beta_body_fields(
     Some((render_top_level(kept)?, removed))
 }
 
-/// Remove every top-level entry named in `fields`: `fallbacks` from a
-/// Messages body (LAB-5970), `OPENAI_FALLBACK_FIELDS` from a chat-completions
-/// body bound for an OpenAI-protocol endpoint (LAB-6794).
-///
-/// Both `models` gates — the client's (`client_allows_model`) and the
-/// endpoint's (`Endpoint::serves_model`) — read only the top-level `model`,
-/// while `fallbacks` asks Anthropic to serve a refusal from ANOTHER model.
-/// The `"default"` form names no target at all (Anthropic routes it by refusal
-/// category), so the targets cannot be checked here without hard-coding
-/// Anthropic's fallback policy. A restricted principal therefore loses the
-/// field: its request runs, and a refusal comes back as a refusal.
-///
-/// Only the field goes, not the `server-side-fallback-*` header: without the
-/// field no fallback runs (the API does not fall back unless asked), and the
-/// header also grants `fallback_credit_token`, whose redemption is a new
-/// request that passes both gates on its own top-level `model`.
+/// Remove every top-level entry named in `fields` — `ANTHROPIC_FALLBACK_FIELDS`
+/// or `OPENAI_FALLBACK_FIELDS`, the fields with which a body asks the upstream
+/// to serve ANOTHER model. Both `models` gates — the client's
+/// (`client_allows_model`) and the endpoint's (`Endpoint::serves_model`) —
+/// read only the top-level `model`, so a restricted attempt
+/// (`AppState::attempt_restricts_models`) loses these fields.
 ///
 /// Every entry of a listed key goes, so a duplicate key cannot keep one
 /// alive. Returns `None` — body untouched — when there is none, or when the
@@ -701,16 +691,30 @@ pub(crate) fn strip_top_level_fields(body: &bytes::Bytes, fields: &[&str]) -> Op
     )
 }
 
+/// `fallbacks` asks Anthropic to serve a refusal from another model (LAB-5970).
+/// The `"default"` form names no target at all (Anthropic routes it by refusal
+/// category), so the targets cannot be checked here without hard-coding
+/// Anthropic's fallback policy. A restricted principal therefore loses the
+/// field: its request runs, and a refusal comes back as a refusal.
+///
+/// Only the field goes, not the `server-side-fallback-*` header: without the
+/// field no fallback runs (the API does not fall back unless asked), and the
+/// header also grants `fallback_credit_token`, whose redemption is a new
+/// request that passes both gates on its own top-level `model`.
+pub(crate) const ANTHROPIC_FALLBACK_FIELDS: &[&str] = &["fallbacks"];
+
 /// Top-level fields with which a chat-completions body asks an
-/// OpenAI-compatible gateway to serve ANOTHER model when the named one fails
+/// OpenAI-compatible gateway to serve another model when the named one fails
 /// (LAB-6794). LiteLLM's proxy reads `fallbacks`, `context_window_fallbacks`
 /// and `content_policy_fallbacks` from the request, and also merges all three
 /// from a client-supplied `router_settings_override` object. A client can
 /// provoke the context-window failure at will with an oversized prompt.
 ///
-/// Same rule as `fallbacks` on Anthropic endpoints: the `models` gates read
-/// only `model`, so a restricted request loses these fields and a failure of
-/// the named model comes back as that failure.
+/// Only the client's lists go: fallbacks the gateway's operator configured
+/// still apply. `router_settings_override` is dropped whole, on purpose: the
+/// retry, timeout and routing settings it also carries go with it, because
+/// rewriting the nested object to keep them would add parsing surface to a
+/// security strip for settings a restricted client can live without.
 pub(crate) const OPENAI_FALLBACK_FIELDS: &[&str] = &[
     "fallbacks",
     "context_window_fallbacks",
@@ -771,34 +775,29 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for TopLevelObject
     }
 }
 
-/// Top-level fields a policy or routing decision reads or strips: the client
-/// allow-list, endpoint `models` routing, the context window and the negative
-/// cache read `model`, fast-mode routing reads `speed`, the content guard
-/// reads `messages` and `system`, and a model-restricted request loses
-/// `fallbacks` and, on an OpenAI-protocol endpoint, the rest of
-/// `OPENAI_FALLBACK_FIELDS` (`strip_top_level_fields`). A field a new decision
-/// starts reading or stripping belongs here; until it is added, its
-/// respellings pass as they did before this check existed.
-const DECISION_FIELDS: [&str; 8] = [
-    "model",
-    "speed",
-    "messages",
-    "system",
-    "fallbacks",
-    "context_window_fallbacks",
-    "content_policy_fallbacks",
-    "router_settings_override",
-];
+/// Top-level fields a policy or routing decision reads: the client allow-list,
+/// endpoint `models` routing, the context window and the negative cache read
+/// `model`, fast-mode routing reads `speed`, and the content guard reads
+/// `messages` and `system`. A field a new decision starts reading belongs
+/// here; until it is added, its respellings pass as they did before this
+/// check existed.
+const DECISION_FIELDS: [&str; 4] = ["model", "speed", "messages", "system"];
 
-/// Every field whose respelling is refused: `DECISION_FIELDS`, plus each body
-/// field the beta allow-list strips along with a dropped flag, read from
-/// `BETA_BODY_FIELDS` so the two lists cannot drift apart.
+/// Every field whose respelling is refused: `DECISION_FIELDS`, every field a
+/// restricted attempt loses (`ANTHROPIC_FALLBACK_FIELDS`,
+/// `OPENAI_FALLBACK_FIELDS`), and each body field the beta allow-list strips
+/// along with a dropped flag (`BETA_BODY_FIELDS`). The strip lists are read
+/// from their own tables so they cannot drift apart from this one.
 fn protected_fields() -> impl Iterator<Item = &'static str> {
-    DECISION_FIELDS.into_iter().chain(
-        BETA_BODY_FIELDS
-            .iter()
-            .flat_map(|(_, fields)| fields.iter().copied()),
-    )
+    DECISION_FIELDS
+        .into_iter()
+        .chain(ANTHROPIC_FALLBACK_FIELDS.iter().copied())
+        .chain(OPENAI_FALLBACK_FIELDS.iter().copied())
+        .chain(
+            BETA_BODY_FIELDS
+                .iter()
+                .flat_map(|(_, fields)| fields.iter().copied()),
+        )
 }
 
 /// A key as a decoder that ignores `_` and `-` when matching names sees it.

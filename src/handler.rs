@@ -996,16 +996,15 @@ pub(crate) async fn forward_anthropic(
         debug_assert!(coherent_body.is_none());
         body_bytes
     };
-    // LAB-5970: a `models` allow-list on the client or on THIS endpoint (the
-    // retry loop may land on a differently restricted one) would be escaped by
-    // a server-side fallback to a model it does not name — see
-    // `strip_top_level_fields`. Applied to every auth type: API-key and
+    // LAB-5970: a `models` allow-list on the client or on THIS endpoint would
+    // be escaped by a server-side fallback to a model it does not name — see
+    // `ANTHROPIC_FALLBACK_FIELDS`. Applied to every auth type: API-key and
     // passthrough endpoints forward client betas unfiltered, so this cannot
     // ride on the beta allow-list. Batches nest the field and Anthropic
     // rejects it there.
-    let models_restricted = !ep.models.is_empty() || state.client_restricts_models(client_id);
+    let models_restricted = state.attempt_restricts_models(ep, client_id);
     let fallback_free = (messages_schema && models_restricted)
-        .then(|| strip_top_level_fields(req_body, &["fallbacks"]))
+        .then(|| strip_top_level_fields(req_body, ANTHROPIC_FALLBACK_FIELDS))
         .flatten();
     if fallback_free.is_some() {
         debug!(
