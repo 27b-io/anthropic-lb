@@ -886,13 +886,19 @@ impl AppState {
         hit
     }
 
-    /// Whether `client_id` has a non-empty `models` list — i.e. whether a
-    /// server-side fallback could serve it a model that list does not name
-    /// (LAB-5970). Same identity semantics as `client_allows_model`.
-    pub(crate) fn client_restricts_models(&self, client_id: &str) -> bool {
-        self.clients
-            .iter()
-            .any(|c| c.name == client_id && !c.models.is_empty())
+    /// Whether an attempt on `ep` for `client_id` is bound by a `models` list,
+    /// the endpoint's or the client's — i.e. whether a body-level fallback
+    /// could serve it a model that list does not name, so the attempt's body
+    /// loses its fallback fields (`strip_top_level_fields`; LAB-5970,
+    /// LAB-6794). Judged per attempt: the retry loop may land on a
+    /// differently restricted endpoint. Same client identity semantics as
+    /// `client_allows_model`.
+    pub(crate) fn attempt_restricts_models(&self, ep: &Endpoint, client_id: &str) -> bool {
+        !ep.models.is_empty()
+            || self
+                .clients
+                .iter()
+                .any(|c| c.name == client_id && !c.models.is_empty())
     }
 
     /// Whether `client_id` may request `model` (LAB-1083).
