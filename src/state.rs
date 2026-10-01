@@ -397,7 +397,7 @@ pub(crate) const SENSITIVE_HEADER_SUBSTRINGS: &[&str] =
 /// (per-minute RPM / concurrency) limits to the ACCOUNT, not to a request's
 /// rate bucket, so a burst 429 is real evidence about the account even when
 /// the request asked for fast mode — which is why the fast-mode exemption in
-/// `classify_retry_status` defers to it (LAB-2675 panel finding). Shared with
+/// `classify_retry_status` defers to it (LAB-2675). Shared with
 /// `mark_hard_limited_for`, which uses it to pick the backoff ladder over the
 /// capacity cooldown, so the two can never disagree on what "burst" means.
 pub(crate) fn is_burst_429(headers: &reqwest::header::HeaderMap) -> bool {

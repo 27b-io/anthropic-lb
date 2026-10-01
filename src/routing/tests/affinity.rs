@@ -513,7 +513,7 @@ async fn affinity_override_ignores_reset_time_skew_legacy() {
 
 #[tokio::test]
 async fn affinity_override_spent_discounts_near_weekly_reset() {
-    // Panel finding on GH#156: an account at 90% weekly with 3h to reset gets
+    // GH#156: an account at 90% weekly with 3h to reset gets
     // the LARGEST bucket share (waste_risk ≈ 5.6 — burn expiring quota first),
     // so a naive unused-7d comparison would migrate every session the buckets
     // just placed there, on every request. Near the weekly reset, remaining

@@ -409,7 +409,7 @@ pub(crate) async fn classify_retry_status(
         // about the account whatever speed the request asked for. Exempting it
         // would leave the account pinned: standard traffic routed to it would
         // burst-429 and hard-limit it anyway. The caller still gets
-        // `x-should-retry` as its transient hint (LAB-2675 panel finding).
+        // `x-should-retry` as its transient hint (LAB-2675).
         //
         // What this does NOT buy: the ticket assumed the utilization ceilings
         // would still cover a fast request on an exhausted account, because

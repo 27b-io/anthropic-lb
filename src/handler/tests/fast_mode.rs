@@ -143,7 +143,7 @@ async fn standard_speed_429_still_cools_account_and_rotates() {
     }
 }
 
-/// Panel finding (CRIT): the fast-mode exemption must NOT swallow a transient
+/// The fast-mode exemption must NOT swallow a transient
 /// BURST 429 — `x-should-retry` with no `retry-after` and no rate headers.
 /// Burst limits are per-minute RPM/concurrency on the ACCOUNT, not on a rate
 /// bucket, so they are real evidence about the account whatever speed was

@@ -1468,7 +1468,7 @@ impl AppState {
         // Removals past the cap still happened, so they are still counted —
         // under `_other`, not discarded. Dropping them outright let an ordered
         // payload hide the actionable field behind eight junk ones and leave
-        // no trace that anything else went (Helly R finding 3).
+        // no trace that anything else went.
         let over_cap = stripped.len().saturating_sub(keys.len()) as u64;
         let mut map = lock_recovering(&self.beta_body_fields_stripped, "beta_body_fields_stripped");
         if over_cap > 0 {
