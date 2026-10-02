@@ -103,20 +103,30 @@ thread_local! {
     pub(crate) static TRANSLATE_A2O_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Err (with a client-facing message) when a message contains an image this
-/// translator can't represent faithfully — the caller must surface a real
-/// error instead of silently forwarding a request with the image dropped.
+pub(crate) const MODEL_NOT_A_STRING: &str = "model must be a non-empty string";
+
+/// The request's `model`, only when it is a non-empty JSON string.
+fn request_model(body: &serde_json::Value) -> Option<&str> {
+    body.get("model")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+}
+
+/// Err (with a client-facing message) when `model` is not a non-empty string,
+/// or when a message contains an image this translator can't represent
+/// faithfully — the caller must surface a real error instead of silently
+/// forwarding a request with the image dropped.
 pub(crate) fn translate_anthropic_request_to_openai(
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     #[cfg(test)]
     TRANSLATE_A2O_CALLS.with(|c| c.set(c.get() + 1));
 
+    // `model` is the one field forwarded as the client sent it, and the
+    // routing gate read a non-string one as no model at all (LAB-6894).
+    let model = request_model(body).ok_or(MODEL_NOT_A_STRING)?;
     let mut out = serde_json::Map::new();
-
-    if let Some(model) = body.get("model") {
-        out.insert("model".to_string(), model.clone());
-    }
+    out.insert("model".to_string(), model.into());
 
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
@@ -1550,11 +1560,20 @@ pub(crate) async fn openai_chat_handler(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let json_mode = wants_json_object(&openai_body);
-    let model = openai_body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("")
-        .to_string();
+    // An absent, empty or non-string `model` reads as no model, which every
+    // `models` list allows, while a `Protocol::OpenAI` endpoint gets the
+    // client's own `model` value and may read an array as several models
+    // (LAB-6894). Refused before the gate, for every client class.
+    let Some(model) = request_model(&openai_body) else {
+        warn!(
+            req_id,
+            client = %client_ip,
+            client_id = %client_id,
+            "rejected: model is not a non-empty string"
+        );
+        return openai_invalid_request_response(MODEL_NOT_A_STRING);
+    };
+    let model = model.to_string();
 
     // LAB-798: `Protocol::OpenAI` endpoints below forward `body_bytes`
     // verbatim, so a hard-rejected `temperature` must be stripped here,

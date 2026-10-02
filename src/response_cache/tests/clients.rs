@@ -201,6 +201,29 @@ fn endpoint_model_matcher_semantics() {
     assert!(ep.serves_model("claude-opus-5"), "empty list = all models");
 }
 
+/// LAB-6894: an OpenAI-compatible gateway may split a comma `model` and serve
+/// every model it names, so a non-empty list matches none, even through a
+/// `*` pattern that would match the whole string. An empty list still allows
+/// everything, and both gates share the rule.
+#[test]
+fn model_matcher_refuses_a_comma_model_under_a_list() {
+    let haiku = vec!["claude-haiku-*".to_string()];
+    for model in [
+        "claude-haiku-4-5,claude-opus-5",
+        "claude-haiku-4-5,",
+        ",claude-haiku-4-5",
+        ",",
+    ] {
+        assert!(!model_matches(&haiku, model), "{model:?}");
+        assert!(!model_matches(&["*".to_string()], model), "{model:?}");
+        assert!(model_matches(&[], model), "empty list allows {model:?}");
+    }
+    assert!(model_matches(&haiku, "claude-haiku-4-5"));
+
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    assert!(!state.client_allows_model("limited", "claude-haiku-4-5,claude-opus-5"));
+}
+
 #[test]
 fn client_allow_list_hit_miss_wildcard_and_empty() {
     let state = state_with_clients(vec![

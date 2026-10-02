@@ -16,6 +16,42 @@ fn translate_a2o_drops_temperature_for_rejecting_model() {
     assert_eq!(result["top_p"], 0.9);
 }
 
+/// LAB-6894: `model` is the one field the translator forwards as sent, and
+/// the routing gate reads a non-string one as no model. Any model that is not
+/// a non-empty string is an error, which makes the fallback body
+/// `Untranslatable`; a string one is copied as is.
+#[test]
+fn translate_a2o_requires_a_non_empty_string_model() {
+    let messages = serde_json::json!([{"role": "user", "content": "Hello"}]);
+    for model in [
+        serde_json::Value::Null,
+        serde_json::json!(""),
+        serde_json::json!(["claude-opus-5"]),
+        serde_json::json!({"id": "claude-opus-5"}),
+        serde_json::json!(7),
+    ] {
+        let body = serde_json::json!({"model": model, "messages": messages});
+        assert_eq!(
+            translate_anthropic_request_to_openai(&body),
+            Err(MODEL_NOT_A_STRING.to_string()),
+            "{model}"
+        );
+    }
+    let absent = serde_json::json!({"messages": messages});
+    assert_eq!(
+        translate_anthropic_request_to_openai(&absent),
+        Err(MODEL_NOT_A_STRING.to_string())
+    );
+    assert!(matches!(
+        build_openai_fallback_body(br#"{"model":["claude-opus-5"],"messages":[]}"#),
+        FallbackBody::Untranslatable(msg) if msg == MODEL_NOT_A_STRING
+    ));
+
+    let body = serde_json::json!({"model": "claude-haiku-4-5", "messages": messages});
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    assert_eq!(result["model"], "claude-haiku-4-5");
+}
+
 #[test]
 fn translate_a2o_keeps_default_temperature_for_rejecting_model() {
     // Default 1 passes through (upstream accepts it); ≤ 4.6 models are
@@ -1267,6 +1303,150 @@ async fn ambiguous_top_level_key_is_rejected_locally_on_both_surfaces() {
         0,
         "a rejected body must never reach an upstream"
     );
+}
+
+/// LAB-6894: a `Protocol::OpenAI` endpoint gets the client's own `model`
+/// value, on `/v1/chat/completions` as sent and on the `/v1/messages`
+/// fallback through the translator. A non-string model reads as no model,
+/// which every `models` list allows, and a gateway may read an array or a
+/// comma list as several models. None of these may reach the endpoint, for
+/// any client class. A missing, empty or non-string model is a 400 on both
+/// surfaces. A comma model matches no `models` list, so the endpoint is never
+/// eligible. Unlike `/v1/messages`, the chat surface refuses a missing model
+/// before the gate. On `/v1/messages` the restricted client's gate refuses an
+/// unreadable model first, so only the other two classes see the 400.
+#[tokio::test]
+async fn non_string_or_comma_model_never_reaches_a_restricted_openai_endpoint() {
+    use std::sync::atomic::Ordering;
+    let (url, hits) = spawn_status_then_ok_upstream(0, "", OPENAI_OK_BODY).await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = url;
+    gw.models = vec!["claude-haiku-*".to_string()];
+    let state = Arc::new(AppState {
+        endpoints: vec![gw],
+        clients: vec![
+            mk_client("plain", "key-plain", &[]),
+            mk_client("limited", "key-limited", &["claude-haiku-*"]),
+            mk_client("ops", "key-ops", &[]),
+        ],
+        operators: vec!["ops".to_string()],
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+    let client = Client::new();
+    let body = |model: &str| {
+        format!(r#"{{{model}"max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#)
+    };
+    let unreadable = [
+        r#""model":["claude-opus-5"],"#,
+        r#""model":["claude-haiku-4-5","claude-opus-5"],"#,
+        r#""model":"","#,
+        r#""model":null,"#,
+        r#""model":7,"#,
+    ];
+    let comma = r#""model":"claude-haiku-4-5,claude-opus-5","#;
+
+    for key in ["key-plain", "key-limited", "key-ops"] {
+        for model in unreadable.iter().chain(&[""]) {
+            let resp = client
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {key}"))
+                .body(body(model))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{key} {model}"
+            );
+            assert_eq!(
+                parse_wire_error_envelope(resp).await,
+                openai_invalid_request_body(MODEL_NOT_A_STRING),
+                "{key} {model}"
+            );
+        }
+        for model in unreadable {
+            let resp = client
+                .post(format!("http://{addr}/v1/messages"))
+                .header("content-type", "application/json")
+                .header("x-api-key", key)
+                .body(body(model))
+                .send()
+                .await
+                .unwrap();
+            if key == "key-limited" {
+                assert_eq!(
+                    resp.status(),
+                    reqwest::StatusCode::FORBIDDEN,
+                    "{key} {model}"
+                );
+                continue;
+            }
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{key} {model}"
+            );
+            assert_eq!(
+                parse_wire_error_envelope(resp).await["error"]["message"],
+                MODEL_NOT_A_STRING,
+                "{key} {model}"
+            );
+        }
+        for (path, auth, value) in [
+            (
+                "/v1/chat/completions",
+                "authorization",
+                format!("Bearer {key}"),
+            ),
+            ("/v1/messages", "x-api-key", key.to_string()),
+        ] {
+            let resp = client
+                .post(format!("http://{addr}{path}"))
+                .header("content-type", "application/json")
+                .header(auth, value)
+                .body(body(comma))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                resp.status().is_client_error() || resp.status().is_server_error(),
+                "{key} {path}"
+            );
+        }
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "no unreadable or comma model may reach the endpoint"
+    );
+}
+
+/// LAB-6894: the model checks leave a plain allowed `model` alone, so a
+/// restricted `Protocol::OpenAI` endpoint still gets the client's bytes.
+#[tokio::test]
+async fn openai_chat_forwards_allowed_model_byte_identically_to_restricted_endpoint() {
+    let (url, mut rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = url;
+    gw.models = vec!["claude-haiku-*".to_string()];
+    let addr = serve(build_router(test_state_with(vec![gw]))).await;
+
+    let raw = r#"{ "messages": [{"role":"user","content":"hi"}],  "model":"claude-haiku-4-5", "max_tokens":5 }"#;
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let (_, received) = rx
+        .try_recv()
+        .expect("an allowed model must reach the upstream");
+    assert_eq!(received.as_ref(), raw.as_bytes());
 }
 
 /// LAB-4323: the `invalid JSON` 400 was `text/plain`, next to a JSON 400 for

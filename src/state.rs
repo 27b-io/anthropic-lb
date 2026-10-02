@@ -529,7 +529,9 @@ pub(crate) struct Endpoint {
 }
 
 /// Exact match with `*`-suffix wildcards. Empty pattern list, or an empty
-/// model, allows everything.
+/// model, allows everything. A non-empty list never matches a model holding a
+/// `,`: an OpenAI-compatible gateway may split it and serve every listed
+/// model, while a `*` pattern would match the whole string (LAB-6894).
 ///
 /// The SINGLE list-level implementation behind both model allowlists: which
 /// models an *endpoint* may serve (`Endpoint::serves_model`) and which models
@@ -542,7 +544,7 @@ pub(crate) fn model_matches(patterns: &[String], model: &str) -> bool {
     if patterns.is_empty() || model.is_empty() {
         return true;
     }
-    patterns.iter().any(|p| suffix_wildcard_match(p, model))
+    !model.contains(',') && patterns.iter().any(|p| suffix_wildcard_match(p, model))
 }
 
 impl Endpoint {
