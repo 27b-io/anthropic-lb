@@ -5,7 +5,7 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+*"
 
-# Least privilege per job (LAB-1675 panel finding): validate/build execute
+# Least privilege per job (LAB-1675): validate/build execute
 # arbitrary dependency build.rs code via cargo — they must not inherit the
 # ability to mint an OIDC publish token or write to the repo. Each job
 # declares exactly what it needs below.

@@ -323,7 +323,7 @@ pub(crate) const MAX_DROPPED_BETA_FLAG_LEN: usize = 64;
 
 /// Strips counted (and logged) from any ONE request. A request's top-level
 /// key count is client-controlled; without this the per-key cap above is
-/// reachable from a single request (LAB-1261 panel finding).
+/// reachable from a single request (LAB-1261).
 pub(crate) const MAX_STRIPPED_FIELDS_PER_REQUEST: usize = 8;
 
 /// Clamp a client-controlled string to something safe to use as a metric
@@ -468,7 +468,7 @@ const BASE_BODY_FIELDS: &[&str] = &[
 ///
 /// **This table must stay TOTAL over `DEFAULT_CLIENT_BETA_ALLOWLIST`**, and
 /// `beta_body_field_table_covers_the_allowlist` fails the build if it is not.
-/// Totality is the whole mechanism (LAB-1261, Helly R finding 1): a surviving
+/// Totality is the whole mechanism (LAB-1261): a surviving
 /// flag protects its body field only if a row claims it, so a missing row
 /// means the proxy DELETES a field belonging to a feature the caller was
 /// entitled to use. `fallback-credit-*` is the worked example — it is on the
@@ -546,7 +546,7 @@ const BETA_BODY_FIELDS: &[(&str, &[&str])] = &[
 /// **Declines to strip when a surviving flag is not in `BETA_BODY_FIELDS`.**
 /// The keep-side of the rule is only as good as that table is total: an
 /// unrecognised SURVIVING family may own a top-level field, and stripping it
-/// deletes a capability the caller is entitled to (Helly R finding 1 — a
+/// deletes a capability the caller is entitled to (a
 /// custom `allowed_client_betas` carrying `mcp-client-*` kept the header and
 /// lost `mcp_servers`, leaving `tools[].mcp_server_name` dangling). Forgoing
 /// the degrade costs a 400 the caller already gets today; deleting a live
@@ -571,7 +571,7 @@ const BETA_BODY_FIELDS: &[(&str, &[&str])] = &[
 /// bytes, so nothing below the top level is reformatted. That is not cosmetic:
 /// a `serde_json::Value` round-trip rewrites an integer too large for `u64` as
 /// a float (`18446744073709551617` → `1.8446744073709552e+19`), silently
-/// changing a value inside retained tool history (Helly R finding 2). Only the
+/// changing a value inside retained tool history. Only the
 /// top-level separators are re-emitted, so the cacheable prefix can still
 /// shift on a body that arrived pretty-printed — accepted, since the only
 /// requests reaching the rewrite are the ones answering a hard 400 today.

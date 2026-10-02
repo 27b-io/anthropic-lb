@@ -946,7 +946,7 @@ mod redis_integration {
         )));
     }
 
-    /// LAB-1962 (panel F8) — reversal of the LAB-931 pin, which deliberately
+    /// LAB-1962 — reversal of the LAB-931 pin, which deliberately
     /// deferred this: a transport-level INCRBY failure must NOT delete the
     /// shared counter (one replica's failed write must never erase
     /// fleet-wide accounting — see
@@ -1016,8 +1016,7 @@ mod redis_integration {
 
         // Absent key (just self-healed) + reachable redis + local over limit
         // → the local floor gates. Under the pre-LAB-1962 contract Ok(None)
-        // was an authoritative allow — the enforcement bypass the panel
-        // flagged.
+        // was an authoritative allow — an enforcement bypass.
         let secs = state.check_budget("poison-cli").await.expect_err(
             "absent key with redis reachable must fall through to the local floor and deny",
         );

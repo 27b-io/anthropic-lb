@@ -358,7 +358,7 @@ async fn oauth_forwards_per_turn_betas_header_and_system_entry_body_together() {
     .await;
 }
 
-/// Panel follow-up (LAB-1191): a client flag that IS one of the required
+/// LAB-1191: a client flag that IS one of the required
 /// OAUTH_BETA_FLAGS is always forwarded (the merge re-adds it), so it must
 /// never be reported as dropped — even under a custom allow-list that
 /// omits it. A false drop here would make the diagnostics lie.
@@ -382,7 +382,7 @@ fn oauth_beta_filter_never_reports_required_flags_as_dropped() {
     }
 }
 
-/// Panel follow-up (LAB-1191): dropped-flag keys are length-bounded before
+/// LAB-1191: dropped-flag keys are length-bounded before
 /// logging/counting — a multi-kilobyte client "flag" must not be pinned
 /// verbatim into every /metrics scrape.
 #[test]
@@ -825,7 +825,7 @@ fn known_pairings_travel_together() {
     }
 }
 
-/// Helly R finding 1, and the invariant the whole keep-side rests on: a
+/// The invariant the whole keep-side rests on: a
 /// surviving flag protects its body field ONLY if a row claims it, so the
 /// table has to be total over the allow-list. A family with no row is not
 /// neutral — its field gets deleted out from under a caller who was entitled
@@ -844,7 +844,7 @@ fn beta_body_field_table_covers_the_allowlist() {
     }
 }
 
-/// Helly R finding 1, the concrete case. `fallback-credit-*` is allow-listed
+/// The concrete case. `fallback-credit-*` is allow-listed
 /// and Claude Code sends it; `fallback_credit_token` is a billing instrument
 /// redeemable once within five minutes of a refusal. One unrelated unknown
 /// flag alongside it used to delete the token while the credit flag itself
@@ -1033,7 +1033,7 @@ async fn unrestricted_client_and_endpoint_keep_fallbacks() {
     }
 }
 
-/// Helly R finding 1, second half: a custom `allowed_client_betas` can pass a
+/// The invariant's second half: a custom `allowed_client_betas` can pass a
 /// family this proxy has no row for. It may own a top-level field, and the
 /// proxy cannot tell that field from an orphan — so it declines to strip at
 /// all. Losing the degrade costs a 400 the caller already gets today; deleting
@@ -1054,7 +1054,7 @@ fn unrecognised_surviving_flag_disables_the_strip() {
     );
 }
 
-/// Helly R finding 2: a `serde_json::Value` round-trip rewrote an integer too
+/// A `serde_json::Value` round-trip rewrote an integer too
 /// large for `u64` as a float, silently changing a value inside RETAINED tool
 /// history — data corruption on the part of the payload the design promises
 /// to preserve. Retained fields are spliced through as their original bytes.
@@ -1079,7 +1079,7 @@ fn rewrite_preserves_retained_values_exactly() {
     assert!(!text.contains("orphan_field"));
 }
 
-/// Panel finding (CRIT), and the sharpest edge on this change: `proxy_handler`
+/// The sharpest edge on this change: `proxy_handler`
 /// is the router's catch-all, so EVERY route reaches `forward_anthropic` —
 /// while `BASE_BODY_FIELDS` describes `/v1/messages` alone. Ungated, one
 /// unlisted beta flag on a `/v1/messages/batches` POST deleted the entire
@@ -1171,7 +1171,7 @@ fn one_request_cannot_exhaust_the_strip_counter() {
         "one request claimed {used} named slots; the per-request cap is \
          {MAX_STRIPPED_FIELDS_PER_REQUEST} plus the shared _other bucket"
     );
-    // Helly R finding 3: the removals past the cap still happened, so they are
+    // The removals past the cap still happened, so they are
     // still counted. Discarding them let an ordered payload hide the
     // actionable field behind junk and leave no trace anything else went.
     assert_eq!(
@@ -1319,7 +1319,7 @@ fn stripped_field_names_are_sanitized() {
     assert_eq!(sanitize_metric_key("café", 4), "caf");
 }
 
-/// Adversarial-review probe (Helly R, delta pass on `7e2ebb5`), adopted as a
+/// Probe against `7e2ebb5`, adopted as a
 /// permanent regression. `strip_orphaned_beta_body_fields` hand-writes its
 /// output object — keys re-escaped, values spliced as raw bytes — and manual
 /// JSON emission is exactly where a key containing a quote or a newline, or a
@@ -1395,7 +1395,7 @@ fn raw_object_reemission_survives_hostile_keys_and_values() {
     }
 }
 
-/// Adversarial-review probe (Helly R, delta pass), adopted. Positive controls
+/// Positive controls
 /// for the two policy rules, stated as behaviour rather than as the absence of
 /// the old defects: a known surviving family keeps its field while an orphan
 /// in the same body goes, an unrecognised surviving family disables the strip
@@ -1440,7 +1440,7 @@ fn surviving_families_and_strip_counter_positive_controls() {
     );
 }
 
-/// Adversarial-review probe (Helly R, delta pass), adopted. End-to-end through
+/// End-to-end through
 /// the router against a no-rewrite control, which is the part the unit tests
 /// cannot show: that the bytes reaching the upstream are the client's own.
 ///

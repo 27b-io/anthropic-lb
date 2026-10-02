@@ -172,7 +172,7 @@ fn upstream_headers_do_not_synthesize_should_retry() {
     assert!(!response.headers().contains_key("x-should-retry"));
 }
 
-/// Panel follow-up (LAB-1191 AC-5): on the OpenAI-compat surface an upstream
+/// LAB-1191 AC-5: on the OpenAI-compat surface an upstream
 /// 3xx must surface as a 502 in the OPENAI error shape — those clients'
 /// parsers cannot read an Anthropic error envelope.
 #[tokio::test]
