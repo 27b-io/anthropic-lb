@@ -919,13 +919,14 @@ fn strip_top_level_fields_removes_only_listed_fields() {
     let body = bytes::Bytes::from_static(
         br#"{"model":"claude-opus-5","fallbacks":"default","max_tokens":18446744073709551617,"fallbacks":[{"model":"claude-opus-4-8"}],"messages":[]}"#,
     );
-    let out = strip_top_level_fields(&body, &["fallbacks"]).expect("fallbacks must be stripped");
+    let out = strip_top_level_fields(&body, ANTHROPIC_FALLBACK_FIELDS)
+        .expect("fallbacks must be stripped");
     assert_eq!(
         std::str::from_utf8(&out).unwrap(),
         r#"{"model":"claude-opus-5","max_tokens":18446744073709551617,"messages":[]}"#
     );
     // Nothing to strip, or nothing we can read: body untouched.
-    let fallbacks = &["fallbacks"];
+    let fallbacks = ANTHROPIC_FALLBACK_FIELDS;
     assert!(
         strip_top_level_fields(&bytes::Bytes::from_static(br#"{"model":"m"}"#), fallbacks)
             .is_none()
