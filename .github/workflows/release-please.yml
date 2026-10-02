@@ -18,8 +18,7 @@ concurrency:
 jobs:
   release-please:
     runs-on: ubuntu-latest
-    # STEV3_BOT_PEM must exist only as a secret of the main-only `release` environment;
-    # a repository-level copy exposes it to every branch.
+    # STEV3_BOT_PEM must exist only as a secret of the main-only `release` environment.
     environment: release
     steps:
       - name: Generate stev3-bot token
