@@ -266,6 +266,9 @@ async fn guard_block_fails_closed_on_oversized_body() {
 
 /// LAB-3877 (review finding #3): `block` fails closed on an unparseable body — a
 /// parse differential vs the upstream must not smuggle content past the scan.
+/// Since LAB-6781 the ingress rule refuses this body for every client before
+/// the guard runs, so this is the second layer; the guard's own refusal is
+/// pinned by `guard_block_fails_closed_on_multipart_body`.
 #[cfg(feature = "guard")]
 #[tokio::test]
 async fn guard_block_fails_closed_on_unparseable_body() {
@@ -295,9 +298,45 @@ async fn guard_block_fails_closed_on_unparseable_body() {
         400,
         "unparseable body must fail closed under block"
     );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
     assert!(
         captured.lock().await.is_empty(),
         "an unparseable body must never reach the upstream under block"
+    );
+}
+
+/// Every other unparsed body is refused at ingress whatever the policy, so a
+/// multipart upload is what is left for `block` to fail closed on.
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn guard_block_fails_closed_on_multipart_body() {
+    let (upstream, captured) = spawn_guard_body_upstream().await;
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+        clients: vec![guard_block_client()],
+        state_path: PathBuf::from("/tmp/anthropic-lb-guard-multipart.state.json"),
+        auto_cache: false,
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+        ..test_state_base()
+    });
+    let addr = serve(build_router(state)).await;
+
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/files"))
+        .header("content-type", "multipart/form-data; boundary=x")
+        .header("x-api-key", "block-key")
+        .body("--x\r\n\r\nhi\r\n--x--\r\n")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400, "an unscannable upload fails closed");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "guard_blocked");
+    assert!(
+        captured.lock().await.is_empty(),
+        "an unscannable upload must never reach the upstream under block"
     );
 }
 

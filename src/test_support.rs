@@ -808,6 +808,48 @@ pub(crate) fn hdrs(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
 /// auto-vivifies only on `Null` and `Object`.
 pub(crate) const NON_OBJECT_JSON_BODIES: [&str; 5] = ["[1,2,3]", "\"x\"", "7", "true", "null"];
 
+/// Bodies the proxy's `serde_json` parse refuses although another common JSON
+/// decoder reads `"model":"claude-opus-5"` out of them, so the proxy must never
+/// forward one (LAB-6781). Labelled for assertion messages. The last one also
+/// repeats `model`, pinning that an unparsed body cannot step around the
+/// duplicate-key rule either.
+pub(crate) fn unparseable_json_bodies() -> Vec<(&'static str, Vec<u8>)> {
+    const HEAD: &[u8] =
+        br#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":""#;
+    const TAIL: &[u8] = br#""}]}"#;
+    let with_content = |content: &[u8]| [HEAD, content, TAIL].concat();
+    let object = String::from_utf8(with_content(b"hi")).unwrap();
+    let nested = format!(
+        r#"{{"model":"claude-opus-5","max_tokens":1,"metadata":{}{}}}"#,
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    vec![
+        ("lone high surrogate", with_content(br"\ud800")),
+        ("lone low surrogate", with_content(br"\udc00")),
+        ("200-deep nesting", nested.into_bytes()),
+        (
+            "out-of-range number",
+            br#"{"model":"claude-opus-5","max_tokens":1e400}"#.to_vec(),
+        ),
+        ("raw 0xFF byte in a string", with_content(b"\xff")),
+        ("trailing bytes", format!("{object} trailing").into_bytes()),
+        ("UTF-8 BOM", [b"\xEF\xBB\xBF", object.as_bytes()].concat()),
+        (
+            "UTF-16LE",
+            object.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        ),
+        (
+            "duplicate model plus lone surrogate",
+            [
+                br#"{"model":"claude-haiku-4-5","#.as_slice(),
+                &with_content(br"\ud800")[1..],
+            ]
+            .concat(),
+        ),
+    ]
+}
+
 /// Object bodies with an ambiguous top-level key, which both SDK surfaces
 /// reject locally. The first is the allow-list bypass: a `claude-haiku-*`
 /// client passes on the last `model` while a first-key-wins upstream serves

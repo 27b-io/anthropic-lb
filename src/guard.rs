@@ -368,7 +368,7 @@ pub enum ScanOutcome {
     NothingToScan,
     /// The request body could not be read. Fails closed under `block`. Set by
     /// `from_body` for a `messages` it cannot parse, and by the handler for a
-    /// non-empty body that is not JSON at all.
+    /// non-empty body it forwards unparsed.
     Unscannable(&'static str),
 }
 
@@ -397,8 +397,10 @@ pub const REASON_MESSAGE_UNREADABLE: &str =
 /// Content that is present but not in a readable shape.
 pub const REASON_CONTENT_UNREADABLE: &str =
     "request `messages` content is not in a shape the scanner can read";
-/// A non-empty request body that is not JSON at all. Set by the handler, not by
-/// [`ScanInput::from_body`], but it is a guard reason and lives with the rest.
+/// A non-empty request body forwarded unparsed: one that starts with `--`, such
+/// as a multipart upload. The handler refuses every other unparsed body before
+/// the guard runs. Set by the handler, not by [`ScanInput::from_body`], but it
+/// is a guard reason and lives with the rest.
 pub const REASON_BODY_UNPARSEABLE: &str = "request body could not be parsed for content scanning";
 /// Content a scanner or the detector flagged, under `block`.
 pub const REASON_FLAGGED: &str = "request body contains content flagged by the guard layer";

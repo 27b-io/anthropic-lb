@@ -344,7 +344,7 @@ A request for a model outside the list is rejected with **403** — a policy den
 
 To deny a client every model, set `models = [""]`. The single empty pattern matches no model, so every `/v1` request from that client gets 403 while its credential still authenticates — useful for a principal that should only read the admin surfaces. Do not write `models = []` for this: `[]`, like an omitted `models`, allows all models.
 
-It **fails closed** on a model it cannot read. The proxy takes the model from the top-level `model` key of a JSON body; a body that does not parse, or a route that nests the model elsewhere (`/v1/messages/batches` puts it under `requests[].params.model`), yields no model — and a client that has an allow-list is then denied rather than waved through. Clients with no allow-list are unaffected.
+It **fails closed** on a model it cannot read. The proxy takes the model from the top-level `model` key of a JSON body; a multipart upload, or a route that nests the model elsewhere (`/v1/messages/batches` puts it under `requests[].params.model`), yields no model — and a client that has an allow-list is then denied rather than waved through. Clients with no allow-list are unaffected. Any other body that does not parse is refused before this check (see §Credential-path hardening).
 
 ---
 
@@ -402,6 +402,19 @@ can steer are locked down by default:
   `redirect::Policy::none()`; a `3xx` from an upstream surfaces to the caller
   as a `502` with a distinct log line instead of re-sending credentials to
   the `Location` target.
+- **Unreadable bodies are refused.** On the Anthropic surface (every route
+  but `/v1/chat/completions`, which answers invalid JSON with its own `400`),
+  a non-empty request body that does not parse as JSON gets a
+  `400 invalid_request_error` before routing, whatever its path or
+  `Content-Type`, and is logged at `warn` with its client and path. Other JSON
+  decoders read a model out of some bodies this proxy's parser refuses (a lone
+  surrogate escape, a UTF-8 BOM, trailing bytes), so forwarding one would let
+  the upstream act on a model the proxy never routed or gated on. A multipart
+  upload (`/v1/files`) passes: it opens with its `--` boundary line, and no
+  JSON text starts with `--`. The proxy decodes no content coding, so a
+  non-empty body under any `Content-Encoding` but `identity`, or any
+  `Transfer-Encoding` but `chunked`, gets the same `400` first: its raw bytes
+  are not what the upstream would read.
 - **Response headers are allow-listed.** Only `content-type`,
   `content-length`, `cache-control`, `request-id`, `retry-after`, and
   `x-should-retry` are reflected to callers (plus the proxy's own
@@ -598,7 +611,9 @@ Operator clients are always `off` regardless of configuration.
 same 400 rather than forwarded unscanned:
 
 - the body is not JSON — a parse differential must not smuggle content past the
-  scan; this includes multipart uploads such as `/v1/files`;
+  scan. Every other unparseable body is already refused for all clients (see
+  §Credential-path hardening), so in practice this is a multipart upload such
+  as `/v1/files`;
 - `messages` is present but is not an array — a string, an object, a number,
   `null`. The scanner reads that field as an array, so none of it reaches the
   scan while all of it reaches the upstream. This applies on every path. A body
