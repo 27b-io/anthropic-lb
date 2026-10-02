@@ -871,25 +871,8 @@ async fn main() {
     };
 
     let state = Arc::new(AppState {
-        // Liveness knobs are load-bearing against Anthropic's Cloudflare edge:
-        // h2 PING (while_idle) evicts half-closed pooled streams before they're
-        // reused; read_timeout catches mid-stream stalls without waiting out
-        // the full request budget; pool_idle_timeout keeps connections warm
-        // through Claude Code read/think pauses to avoid paying a fresh TLS
-        // handshake on every burst. read_timeout is set at 180s so Opus's
-        // extended-thinking pauses (which can exceed 90s of inter-chunk
-        // silence on deep reasoning) don't trip a false-positive interruption.
-        client: upstream_client_builder()
-            .read_timeout(Duration::from_secs(180))
-            .build()
-            .expect("failed to build HTTP client"),
-        // Same knobs MINUS read_timeout: a non-streaming response has no
-        // inter-chunk cadence to police — the only bytes arrive when
-        // generation finishes, so a read_timeout is a hard cap on generation
-        // time (LAB-718). The 900s total budget still bounds the request.
-        client_nonstreaming: upstream_client_builder()
-            .build()
-            .expect("failed to build non-streaming HTTP client"),
+        client: streaming_client(),
+        client_nonstreaming: nonstreaming_client(),
         endpoints,
         robin: AtomicUsize::new(0),
         routing_strategy,

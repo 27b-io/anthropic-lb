@@ -737,8 +737,55 @@ fn reflect_upstream_headers(
     builder
 }
 
-/// Shared knob chain for both upstream clients — `client` layers the SSE-tuned
-/// `read_timeout` on top; `client_nonstreaming` takes it as-is (LAB-718).
+/// Total budget for a streamed upstream request, in seconds. reqwest's
+/// `timeout` runs until the body is fully read, so on a stream it caps the
+/// generation itself: at 900 s it cut every reply over about 95K output
+/// tokens on a fast model. Stalls are `STREAMING_STALL_SECS`'s job; this is
+/// only a backstop for a stream that trickles forever, about 3x a full
+/// 128K-token reply.
+pub(crate) const STREAMING_TOTAL_SECS: u64 = 3600;
+/// Longest inter-chunk silence a stream may have, in seconds: the stall guard
+/// that catches a dead stream. 180 s so extended-thinking pauses, which can
+/// exceed 90 s between chunks, don't trip it.
+pub(crate) const STREAMING_STALL_SECS: u64 = 180;
+/// Total budget for a non-streaming upstream request, in seconds. It has no
+/// stall guard: its only bytes arrive when generation completes (LAB-718).
+/// Anthropic refuses non-streaming requests it expects to run longer.
+pub(crate) const NONSTREAMING_TOTAL_SECS: u64 = 900;
+
+/// An upstream budget in seconds as a `Duration`; tests run 200x faster so
+/// the budgets can be exercised in seconds.
+pub(crate) const fn upstream_budget(secs: u64) -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(secs * 5)
+    } else {
+        Duration::from_secs(secs)
+    }
+}
+
+/// Upstream client for streamed requests (`AppState::client`).
+pub(crate) fn streaming_client() -> Client {
+    upstream_client_builder()
+        .timeout(upstream_budget(STREAMING_TOTAL_SECS))
+        .read_timeout(upstream_budget(STREAMING_STALL_SECS))
+        .build()
+        .expect("failed to build HTTP client")
+}
+
+/// Upstream client for non-streaming requests (`AppState::client_nonstreaming`).
+pub(crate) fn nonstreaming_client() -> Client {
+    upstream_client_builder()
+        .timeout(upstream_budget(NONSTREAMING_TOTAL_SECS))
+        .build()
+        .expect("failed to build non-streaming HTTP client")
+}
+
+/// Knob chain shared by both upstream clients; each sets its own timeouts.
+///
+/// Liveness knobs are load-bearing against Anthropic's Cloudflare edge: h2
+/// PING (while_idle) evicts half-closed pooled streams before they're reused,
+/// and pool_idle_timeout keeps connections warm through Claude Code
+/// read/think pauses so a burst doesn't pay a fresh TLS handshake.
 pub(crate) fn upstream_client_builder() -> reqwest::ClientBuilder {
     Client::builder()
         // Never follow redirects: every upstream request carries an account
@@ -747,7 +794,6 @@ pub(crate) fn upstream_client_builder() -> reqwest::ClientBuilder {
         // into a deliberate 502 by `classify_retry_status` (LAB-1191 /
         // 2026-06-02 audit finding 2).
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(900))
         // 4s (was 10): a blackholed connect fails fast so the transient
         // backoff-retry recovers in seconds. pool_idle_timeout stays 300s —
         // it keeps conns warm across Claude Code think-pauses.
