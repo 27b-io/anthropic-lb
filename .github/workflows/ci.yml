@@ -26,12 +26,35 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
-      - name: Check README for lab-deployment identifiers
+      - name: Check README for disallowed strings
+        env:
+          README_GUARD_PATTERN: ${{ secrets.README_GUARD_PATTERN }}
+        # The pattern is never echoed. grep's exit status is branched on explicitly
+        # because `if grep` would treat status 2 (bad pattern, missing README) as a pass.
         run: |
-          if grep -inE '\b(gastown|openclaw|portkey|geo-pipeline|radar)\b|"ray"|LAB-[0-9]+|shared-ip outage|2026-08-24|api\.dev\.cachekit\.io|\b10\.128\.0\.0/20\b|\b10\.0\.0\.[56]\b' README.md; then
-            echo "::error file=README.md::Found a lab-deployment identifier in the public README (matching line printed above). Use generic placeholders instead."
+          if [ -z "$README_GUARD_PATTERN" ]; then
+            echo "::error::Repository secret README_GUARD_PATTERN is empty or not set."
             exit 1
           fi
+          case "$README_GUARD_PATTERN" in
+            *$'\r'* | *$'\n'*)
+              echo "::error::Repository secret README_GUARD_PATTERN contains a CR or LF character."
+              exit 1
+              ;;
+          esac
+          rc=0
+          grep -inE -e "$README_GUARD_PATTERN" README.md || rc=$?
+          case "$rc" in
+            0)
+              echo "::error file=README.md::Found a disallowed string in the README (matching line printed above). Use generic placeholders instead."
+              exit 1
+              ;;
+            1) ;;
+            *)
+              echo "::error::README check could not run (grep exit status $rc). Check the README_GUARD_PATTERN secret and that README.md exists."
+              exit 1
+              ;;
+          esac
 
   lint:
     name: Lint
