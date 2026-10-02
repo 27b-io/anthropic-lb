@@ -264,11 +264,11 @@ async fn guard_block_fails_closed_on_oversized_body() {
     );
 }
 
-/// LAB-3877 (review finding #3): `block` fails closed on an unparseable body — a
-/// parse differential vs the upstream must not smuggle content past the scan.
-/// Since LAB-6781 the ingress rule refuses this body for every client before
-/// the guard runs, so this is the second layer; the guard's own refusal is
-/// pinned by `guard_block_fails_closed_on_multipart_body`.
+/// An unparseable body never reaches the upstream for a `block` client, so a
+/// parse differential vs the upstream cannot smuggle content past the scan.
+/// The ingress JSON rule refuses this body for every client before the guard
+/// runs, so this pins the end-to-end outcome, not the guard's own refusal;
+/// that is pinned by `guard_block_fails_closed_on_multipart_body`.
 #[cfg(feature = "guard")]
 #[tokio::test]
 async fn guard_block_fails_closed_on_unparseable_body() {
