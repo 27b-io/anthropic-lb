@@ -18,6 +18,9 @@ concurrency:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    # The stev3-bot key lives in the `release` environment, which only `main` may use: the
+    # token it mints creates the v* release tags, so no other ref may mint it.
+    environment: release
     steps:
       - name: Generate stev3-bot token
         id: app-token
