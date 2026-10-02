@@ -18,6 +18,8 @@ concurrency:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    # STEV3_BOT_PEM must be a secret of the main-only `release` environment, never a repository secret.
+    environment: release
     steps:
       - name: Generate stev3-bot token
         id: app-token
