@@ -11,3 +11,4 @@ mod model_unsupported;
 mod proxy;
 mod retry;
 mod stalled_client;
+mod upstream_budget;

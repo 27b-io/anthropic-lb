@@ -561,7 +561,7 @@ pub(crate) struct AppState {
     /// inter-chunk silence — kills any generation longer than 180s as
     /// "operation timed out" (LAB-718 GEO judge wedge, 2026-07-24: ~20k-token
     /// structured-output calls died 18×/hour across 9 accounts and the SDK
-    /// retried for hours). No read_timeout here; the 900s total budget is the
+    /// retried for hours). No read_timeout here; `NONSTREAMING_TOTAL_SECS` is the
     /// only cap, and the h2 keep-alive PING still evicts dead connections.
     pub(crate) client_nonstreaming: Client,
     /// Unified routing endpoints — the sole endpoint pool.
