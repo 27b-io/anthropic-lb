@@ -4,6 +4,11 @@
 # Uses a stev3-bot App token instead of GITHUB_TOKEN because tags created with
 # the default token do not trigger other workflows — release.yml would
 # silently never run.
+#
+# STEV3_BOT_PEM belongs to the `release` environment, never to the repository:
+# that environment's deployment branch policy admits `main` only, so no other
+# branch can mint the App token. The App is the sole identity allowed to
+# create release tags.
 name: Release Please
 
 on:
@@ -18,6 +23,7 @@ concurrency:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    environment: release
     steps:
       - name: Generate stev3-bot token
         id: app-token
