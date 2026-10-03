@@ -848,6 +848,11 @@ impl AppState {
 /// hold for the request, or a `503 + Retry-After` Response to return when the
 /// budget is exhausted (load-shedding). Shared by `proxy_handler` and
 /// `openai_chat_handler` so the two paths can't drift.
+///
+/// A request carrying Transfer-Encoding reserves the full cap, as one with no
+/// Content-Length does: TE overrides CL (RFC 9112 §6.3), and hyper keeps a CL
+/// sent before the TE line in the header map while it decodes the body as
+/// chunked, so that CL bounds nothing `read_body_bounded` buffers.
 pub(crate) fn reserve_request_body(
     state: &Arc<AppState>,
     parts: &axum::http::request::Parts,
@@ -857,6 +862,11 @@ pub(crate) fn reserve_request_body(
     let reserve_bytes = parts
         .headers
         .get(axum::http::header::CONTENT_LENGTH)
+        .filter(|_| {
+            !parts
+                .headers
+                .contains_key(axum::http::header::TRANSFER_ENCODING)
+        })
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(MAX_REQUEST_BODY_BYTES as u64)

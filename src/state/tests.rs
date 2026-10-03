@@ -280,6 +280,76 @@ async fn openai_handler_body_budget_sheds_with_503() {
     assert!(resp.headers().get("retry-after").is_some());
 }
 
+/// POST `body` chunked on a raw socket with `Content-Length: 1` placed BEFORE
+/// `Transfer-Encoding: chunked` (a header order reqwest cannot produce), and
+/// return the raw response.
+async fn post_cl_before_chunked_te(addr: SocketAddr, path: &str, body: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: 1\r\n\
+         Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+        body.len()
+    );
+    sock.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    // A reset at close (body bytes left unread) still leaves the response in `raw`.
+    let _ = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw))
+        .await
+        .expect("server must respond, not hang");
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// hyper keeps a `Content-Length` that arrives BEFORE `Transfer-Encoding:
+/// chunked` in the handler's header map (it drops CL only when CL follows TE)
+/// yet decodes the body as chunked, so that CL says nothing about the bytes
+/// `read_body_bounded` buffers. The reservation must ignore it and take the
+/// full cap, as for a request with no CL: under a budget between the CL value
+/// and the cap both handlers shed, and under a budget that fits the cap the
+/// request is still served — processed by TE alone, not refused.
+#[tokio::test]
+async fn body_budget_ignores_content_length_before_chunked_transfer_encoding() {
+    let (url, _h) = spawn_mock_upstream().await;
+    let state_with_budget = |max_inflight_body_bytes| {
+        Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)],
+            max_inflight_body_bytes,
+            ..test_state_base()
+        })
+    };
+    let requests = [
+        (
+            "/v1/messages",
+            r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#,
+        ),
+    ];
+    for (path, body) in requests {
+        // Above the declared 1 byte and the real body, below the 25 MiB cap.
+        let tight = state_with_budget(1024 * 1024);
+        let addr = serve(build_router(tight.clone())).await;
+        let resp = post_cl_before_chunked_te(addr, path, body).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503"),
+            "{path}: a chunked body must reserve the full cap whatever its CL says, got: {resp}"
+        );
+        assert_eq!(tight.body_shed_total.load(Ordering::Relaxed), 1, "{path}");
+
+        let roomy = state_with_budget(MAX_REQUEST_BODY_BYTES as u64);
+        let addr = serve(build_router(roomy)).await;
+        let resp = post_cl_before_chunked_te(addr, path, body).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "{path}: CL+TE must be processed by TE alone, not refused, got: {resp}"
+        );
+    }
+}
+
 /// The body-memory backstop must be observable so the budget can be tuned
 /// from measured peak rather than guessed: a gauge for current in-flight body
 /// bytes, a gauge for the configured limit, and a counter that increments on

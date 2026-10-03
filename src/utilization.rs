@@ -217,8 +217,9 @@ pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 25 * 1024 * 1024;
 /// Default wall-clock ceiling for receiving a request body (seconds). Real
 /// clients push even a max-size body in seconds; 60s is generous headroom for
 /// a slow relayed path while guaranteeing a stalled upload cannot pin its
-/// body-memory reservation (up to `MAX_REQUEST_BODY_BYTES` when Content-Length
-/// is absent) against the P1-01 budget indefinitely. Override with the
+/// body-memory reservation (the full `MAX_REQUEST_BODY_BYTES` when
+/// Content-Length is absent or Transfer-Encoding is present) against the P1-01
+/// budget indefinitely. Override with the
 /// `body_read_timeout_secs` config key; 0 disables.
 pub(crate) const DEFAULT_BODY_READ_TIMEOUT_SECS: u64 = 60;
 
