@@ -1197,6 +1197,7 @@ pub(crate) async fn forward_anthropic(
             pin: state.pin_status(client_id, endpoint_idx),
             total: ep.requests.load(Ordering::Relaxed),
             fp: fp.unwrap_or("-").to_string(),
+            hints: ClientHints::from_headers(&parts.headers),
         };
         (compute_pressure_status(eff_util, client_id, state), ctx)
     };
