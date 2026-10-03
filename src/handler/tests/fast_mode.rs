@@ -571,7 +571,7 @@ async fn fast_mode_disabled_filters_fast_routing_until_expiry() {
     for _ in 0..8 {
         assert_eq!(
             state
-                .pick_endpoint_for_client(None, "claude-opus-5", &[], "", true)
+                .pick_endpoint_for_client(None, "claude-opus-5", &[], "", FastRequest::FAST)
                 .await,
             Some(1),
             "a fast request must never route to the non-entitled endpoint"
@@ -580,7 +580,13 @@ async fn fast_mode_disabled_filters_fast_routing_until_expiry() {
     // Session affinity re-buckets too: the sticky hash only sees candidates.
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("client:sess:1"), "claude-opus-5", &[], "", true)
+            .pick_endpoint_for_client(
+                Some("client:sess:1"),
+                "claude-opus-5",
+                &[],
+                "",
+                FastRequest::FAST
+            )
             .await,
         Some(1),
         "an affinity-pinned fast session must migrate off the non-entitled endpoint"
@@ -597,14 +603,14 @@ async fn fast_mode_disabled_filters_fast_routing_until_expiry() {
             .is_some_and(|s| s > FAST_MODE_DISABLED_TTL.as_secs() - 5),
         "/_stats must expose the remaining TTL"
     );
-    assert!(!state.pool_cannot_serve("claude-opus-5", true, None));
+    assert!(!state.pool_cannot_serve("claude-opus-5", FastRequest::FAST, None));
 
     // Mark the other account too: the FAST pool is now unservable, the
     // standard pool is untouched.
     state.note_fast_mode_disabled("b", 1);
-    assert!(state.pool_cannot_serve("claude-opus-5", true, None));
+    assert!(state.pool_cannot_serve("claude-opus-5", FastRequest::FAST, None));
     assert!(
-        !state.pool_cannot_serve("claude-opus-5", false, None),
+        !state.pool_cannot_serve("claude-opus-5", FastRequest::STANDARD, None),
         "fast-mode marks must not count against a standard request"
     );
 
@@ -654,9 +660,9 @@ fn pool_cannot_serve_unions_negative_caches() {
     ]);
     state.note_model_unsupported("a", 0, "claude-opus-5");
     state.note_fast_mode_disabled("b", 1);
-    assert!(state.pool_cannot_serve("claude-opus-5", true, None));
-    assert!(!state.pool_cannot_serve("claude-opus-5", false, None));
-    assert!(!state.pool_cannot_serve("claude-sonnet-5", true, None));
+    assert!(state.pool_cannot_serve("claude-opus-5", FastRequest::FAST, None));
+    assert!(!state.pool_cannot_serve("claude-opus-5", FastRequest::STANDARD, None));
+    assert!(!state.pool_cannot_serve("claude-sonnet-5", FastRequest::FAST, None));
 }
 
 /// An OpenAI-protocol endpoint never accrues a fast-mode
@@ -673,7 +679,7 @@ async fn fast_mode_excludes_openai_protocol_endpoints() {
     for _ in 0..8 {
         assert_eq!(
             state
-                .pick_endpoint_for_client(None, "claude-opus-5", &[], "", true)
+                .pick_endpoint_for_client(None, "claude-opus-5", &[], "", FastRequest::FAST)
                 .await,
             Some(0),
             "a fast request must never route to an OpenAI-protocol endpoint"
@@ -700,11 +706,11 @@ fn pool_cannot_serve_excludes_openai_protocol_for_fast_requests() {
     ]);
     state.note_fast_mode_disabled("anthropic-only", 0);
     assert!(
-        state.pool_cannot_serve("claude-opus-5", true, None),
+        state.pool_cannot_serve("claude-opus-5", FastRequest::FAST, None),
         "an OpenAI fallback must not mask a fully fast-disabled Anthropic pool"
     );
     assert!(
-        !state.pool_cannot_serve("claude-opus-5", false, None),
+        !state.pool_cannot_serve("claude-opus-5", FastRequest::STANDARD, None),
         "the same pool can serve a standard request"
     );
 }
@@ -1070,11 +1076,12 @@ async fn fast_body_without_fast_mode_beta_still_routes_as_fast() {
     );
 }
 
-/// The allow-list drops the request's fast-mode beta only when it passes
-/// none of the `fast-mode-*` flags the request carries, across every
-/// `anthropic-beta` header.
+/// An OAuth endpoint strips `speed` only when the allow-list passes none of
+/// the `fast-mode-*` flags the request carries, across every `anthropic-beta`
+/// header, and only where the strip itself runs: on the Messages routes, with
+/// every surviving flag known to `BETA_BODY_FIELDS`.
 #[test]
-fn allow_list_drops_fast_mode_beta_needs_every_fast_flag_dropped() {
+fn beta_filter_strips_speed_mirrors_the_filter_and_the_strip() {
     let custom = vec![
         "oauth-2025-04-20".to_string(),
         "fast-mode-2026-02-01".to_string(),
@@ -1083,6 +1090,7 @@ fn allow_list_drops_fast_mode_beta_needs_every_fast_flag_dropped() {
         .iter()
         .map(|s| s.to_string())
         .collect();
+    let unknown_family = vec!["oauth-2025-04-20".to_string(), "mcp-client-*".to_string()];
     let headers = |values: &[&str]| {
         let mut h = axum::http::HeaderMap::new();
         for v in values {
@@ -1091,43 +1099,154 @@ fn allow_list_drops_fast_mode_beta_needs_every_fast_flag_dropped() {
         h
     };
     let none: Vec<String> = vec!["oauth-2025-04-20".to_string()];
-    for (why, values, allowed, want) in [
-        ("no beta header", &[][..], &none, false),
+    let messages = "/v1/messages";
+    for (why, path, values, allowed, want) in [
+        ("no beta header", messages, &[][..], &none, false),
         (
             "no fast-mode flag",
+            messages,
             &["context-1m-2025-08-07"][..],
             &none,
             false,
         ),
         (
             "its only fast-mode flag dropped",
+            messages,
             &["fast-mode-2026-02-01"][..],
             &none,
             true,
         ),
         (
             "dropped across a second header",
+            messages,
             &["context-1m-2025-08-07", " fast-mode-2026-02-01 "][..],
             &none,
             true,
         ),
         (
+            "count_tokens is stripped too",
+            "/v1/messages/count_tokens",
+            &["fast-mode-2026-02-01"][..],
+            &none,
+            true,
+        ),
+        (
+            "the strip does not run off the Messages routes",
+            "/v1/messages/batches",
+            &["fast-mode-2026-02-01"][..],
+            &none,
+            false,
+        ),
+        (
             "default allow-list",
+            messages,
             &["fast-mode-2026-02-01"][..],
             &default,
             false,
         ),
         (
             "one of two fast-mode flags survives",
+            messages,
             &["fast-mode-2025-01-01,fast-mode-2026-02-01"][..],
             &custom,
             false,
         ),
+        (
+            "a surviving flag with no BETA_BODY_FIELDS row makes the strip decline",
+            messages,
+            &["mcp-client-2025-04-04,fast-mode-2026-02-01"][..],
+            &unknown_family,
+            false,
+        ),
     ] {
         assert_eq!(
-            allow_list_drops_fast_mode_beta(&headers(values), allowed),
+            beta_filter_strips_speed(path, &headers(values), allowed),
             want,
             "{why}"
         );
     }
+}
+
+/// The narrowing is per endpoint. Under an allow-list without `fast-mode-*`,
+/// an API-key account forwards the caller's betas unfiltered, so a fast
+/// request still runs fast there and its fast-mode mark still counts. Only
+/// the OAuth account serves it at standard speed.
+///
+/// Mixed pool: an OAuth account answering the model 404, an API-key account
+/// marked fast-disabled, and an OpenAI-protocol fallback. The request falls
+/// back to the OpenAI endpoint without touching the marked account. Alone,
+/// the marked API-key account is skipped and the caller gets the fast-mode
+/// 400, not a retryable 429.
+#[tokio::test]
+async fn dropped_fast_mode_beta_keeps_marks_on_unfiltered_endpoints() {
+    use std::sync::atomic::Ordering;
+    let send = |addr: SocketAddr| async move {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .header("anthropic-beta", FAST_MODE_BETA)
+            .body(NOPE_FAST_BODY)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, resp.text().await.unwrap())
+    };
+    let custom_allow_list = |state: &mut Arc<AppState>| {
+        Arc::get_mut(state)
+            .expect("test fixture should be uniquely owned")
+            .allowed_client_betas = vec!["oauth-2025-04-20".to_string()];
+    };
+
+    // Mixed pool.
+    let (oauth_url, oauth_hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
+    let (api_url, api_hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_400_FAST_MODE, b"{}").await;
+    let (fallback_url, fallback_hits) = spawn_flaky_upstream(0, OPENAI_OK_BODY).await;
+    let mut api = mk_endpoint_at("api", "sk-ant-api-k", &api_url);
+    api.priority = 1;
+    let mut fallback = make_endpoint("openai-fallback", Protocol::OpenAI);
+    fallback.base_url = fallback_url;
+    fallback.priority = 2;
+    let mut state = test_state_with(vec![
+        mk_endpoint_at("oauth", "sk-ant-oat01-test", &oauth_url),
+        api,
+        fallback,
+    ]);
+    custom_allow_list(&mut state);
+    state.note_fast_mode_disabled("api", 1);
+    let (status, text) = send(serve(build_router(state)).await).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "mixed pool: body {text}");
+    assert_eq!(
+        (
+            oauth_hits.load(Ordering::SeqCst),
+            api_hits.load(Ordering::SeqCst),
+            fallback_hits.load(Ordering::SeqCst)
+        ),
+        (1, 0, 1),
+        "mixed pool: the marked API-key account must be skipped, the fallback must serve"
+    );
+
+    // The marked API-key account alone.
+    let (api_url, api_hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_400_FAST_MODE, b"{}").await;
+    let mut state = test_state_with(vec![mk_endpoint_at("api", "sk-ant-api-k", &api_url)]);
+    custom_allow_list(&mut state);
+    state.note_fast_mode_disabled("api", 0);
+    let (status, text) = send(serve(build_router(state)).await).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "API-key only: body {text}"
+    );
+    assert!(
+        text.contains(FAST_MODE_NOT_ENABLED_MSG),
+        "API-key only: the fast-mode 400, not a retryable 429: {text}"
+    );
+    assert_eq!(
+        api_hits.load(Ordering::SeqCst),
+        0,
+        "API-key only: the marked account must not be retried"
+    );
 }

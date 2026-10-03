@@ -847,24 +847,6 @@ fn body_wants_fast_mode(body: &serde_json::Value) -> bool {
     body.get("speed").and_then(|s| s.as_str()) == Some("fast")
 }
 
-/// True when the request carries a `fast-mode-*` beta and the allow-list
-/// passes none of the ones it carries. That is the case where
-/// `forward_anthropic`'s beta filter drops the flag and strips `speed` with
-/// it, so the request does not run as fast. A request that sent no
-/// `fast-mode-*` beta is not narrowed here: its fast-mode pair was never
-/// split by the filter.
-fn allow_list_drops_fast_mode_beta(headers: &axum::http::HeaderMap, allowed: &[String]) -> bool {
-    let mut flags = headers
-        .get_all("anthropic-beta")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|s| s.split(','))
-        .map(str::trim)
-        .filter(|flag| flag.starts_with("fast-mode-"))
-        .peekable();
-    flags.peek().is_some() && flags.all(|flag| !beta_flag_allowed(allowed, flag))
-}
-
 /// Caller-identity headers that must not leave this proxy. The IP set is what
 /// fronting hops (cloudflared, the Cloudflare Worker, nginx-ingress) carry the
 /// caller's address in — `resolve_client_ip` reads only `x-forwarded-for`; the
@@ -980,10 +962,7 @@ pub(crate) async fn forward_anthropic(
     // (`requests`), `/v1/complete` (`prompt`) and anything else arrive here
     // too — running a Messages-only field list over those bodies deletes them
     // outright.
-    let messages_schema = matches!(
-        parts.uri.path(),
-        "/v1/messages" | "/v1/messages/count_tokens"
-    );
+    let messages_schema = is_messages_schema_path(parts.uri.path());
     let coherent_body = if messages_schema {
         strip_orphaned_beta_body_fields(
             oauth_body_bytes,
@@ -2029,7 +2008,7 @@ pub(crate) async fn proxy_handler(
             // after the beta filter (LAB-1261) and re-derives the flag there;
             // any new consumer downstream of that filter must read the
             // narrowed value, or it bills a standard request to the fast pool.
-            // Routing and the exhaustion gate read `routes_fast`, below.
+            // Routing and the exhaustion gate read `fast`, below.
             let is_fast_mode = body_wants_fast_mode(&parsed);
 
             (
@@ -2054,15 +2033,22 @@ pub(crate) async fn proxy_handler(
             (body_bytes, clone, String::new(), None, None, false)
         };
 
-    // The fast flag routing and the exhaustion gate read. When the allow-list
-    // drops the request's `fast-mode-*` beta, `forward_anthropic` strips
-    // `speed` and the request runs at standard speed, so it must not be kept
-    // off OpenAI-protocol and fast-disabled endpoints, nor answered with a
-    // fast-mode error. `forward_anthropic` itself still gets `is_fast_mode`
-    // and narrows it per endpoint: an API-key endpoint forwards `speed`
-    // unfiltered.
-    let routes_fast = is_fast_mode
-        && !allow_list_drops_fast_mode_beta(&parts.headers, &state.allowed_client_betas);
+    // What routing and the exhaustion gate read, per endpoint. When the
+    // allow-list drops the request's `fast-mode-*` beta, an OAuth endpoint
+    // strips `speed` and serves the request at standard speed, so its
+    // fast-mode mark must not keep the request off it. An API-key or
+    // passthrough endpoint still sends `speed`, so its mark still counts.
+    // `forward_anthropic` itself still gets `is_fast_mode` and narrows it on
+    // the strip it actually performs.
+    let fast = FastRequest {
+        requested: is_fast_mode,
+        stripped_on_oauth: is_fast_mode
+            && beta_filter_strips_speed(
+                parts.uri.path(),
+                &parts.headers,
+                &state.allowed_client_betas,
+            ),
+    };
 
     // Build the affinity key now that fp is known. fp is the finest routing
     // discriminator: it splits fan-out agents that share one coarse session-id
@@ -2166,7 +2152,7 @@ pub(crate) async fn proxy_handler(
             // (OpenAI). Both return a `ForwardOutcome` so the shared
             // round-gated policy in `apply_round_outcome` covers both.
             let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint_for_client(affinity, &model, &skip, &client_id, routes_fast)
+                .pick_endpoint_for_client(affinity, &model, &skip, &client_id, fast)
                 .await
             {
                 Some(i) => {
@@ -2322,7 +2308,7 @@ pub(crate) async fn proxy_handler(
     // `model_unsupported_rejection_plus_rate_limited_pool_stays_retryable`.
     if !last_saw_529
         && !last_saw_transient
-        && state.pool_cannot_serve(&model, routes_fast, extra_usage_refuser)
+        && state.pool_cannot_serve(&model, fast, extra_usage_refuser)
     {
         if let Some(resp) = rejected_resp {
             return resp;
@@ -2339,7 +2325,7 @@ pub(crate) async fn proxy_handler(
             // Name the cause whose removal would unblock the request: if the
             // pool serves the model at standard speed, only fast-mode marks
             // stand in the way; otherwise the model itself is unservable.
-            if routes_fast && !state.pool_cannot_serve(&model, false, None) {
+            if fast.requested && !state.pool_cannot_serve(&model, FastRequest::STANDARD, None) {
                 warn!(model, "fast mode not enabled on any eligible endpoint");
                 return proxy_error_response(
                     StatusCode::BAD_REQUEST,

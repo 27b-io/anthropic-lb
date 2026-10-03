@@ -663,6 +663,104 @@ pub(crate) fn strip_orphaned_beta_body_fields(
     Some((render_top_level(kept)?, removed))
 }
 
+/// The routes whose bodies `BASE_BODY_FIELDS` describes, and so the only ones
+/// `strip_orphaned_beta_body_fields` runs on. `proxy_handler` is the router's
+/// catch-all, so `/v1/messages/batches`, `/v1/complete` and the rest reach the
+/// same forward path with completely different bodies.
+pub(crate) fn is_messages_schema_path(path: &str) -> bool {
+    matches!(path, "/v1/messages" | "/v1/messages/count_tokens")
+}
+
+/// True when `flag` matches a `BETA_BODY_FIELDS` row. A surviving flag that
+/// does not makes `strip_orphaned_beta_body_fields` forward the body untouched.
+fn beta_family_known(flag: &str) -> bool {
+    BETA_BODY_FIELDS
+        .iter()
+        .any(|(pattern, _)| suffix_wildcard_match(pattern, flag))
+}
+
+/// True when an endpoint that filters client betas strips `speed` from this
+/// request because the allow-list drops its `fast-mode-*` beta. Mirrors the
+/// filter in `inject_account_auth` and the strip in
+/// `strip_orphaned_beta_body_fields`, so all of these must hold:
+/// - the path is one the strip runs on;
+/// - the request carries a `fast-mode-*` beta and `allowed` passes none of
+///   the ones it carries;
+/// - every flag `allowed` passes has a `BETA_BODY_FIELDS` row, or the strip
+///   declines and `speed` goes upstream untouched.
+///
+/// A request that sent no `fast-mode-*` beta is not narrowed here.
+pub(crate) fn beta_filter_strips_speed(
+    path: &str,
+    headers: &axum::http::HeaderMap,
+    allowed: &[String],
+) -> bool {
+    if !is_messages_schema_path(path) {
+        return false;
+    }
+    let mut carries_fast_beta = false;
+    for flag in headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let passes = beta_flag_allowed(allowed, flag);
+        if flag.starts_with("fast-mode-") {
+            if passes {
+                return false;
+            }
+            carries_fast_beta = true;
+        } else if passes && !beta_family_known(flag) {
+            return false;
+        }
+    }
+    carries_fast_beta
+}
+
+/// A request's `speed: "fast"` as each endpoint receives it. The beta
+/// allow-list filters client betas on OAuth endpoints only, so under an
+/// allow-list without `fast-mode-*` one request runs at standard speed on an
+/// OAuth account and fast on an API-key or passthrough account. Routing and
+/// the exhaustion gate read it per endpoint.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FastRequest {
+    /// The body asks for fast mode (`body_wants_fast_mode`).
+    pub(crate) requested: bool,
+    /// Endpoints that filter client betas strip `speed` from this request
+    /// (`beta_filter_strips_speed`).
+    pub(crate) stripped_on_oauth: bool,
+}
+
+impl FastRequest {
+    pub(crate) const STANDARD: Self = Self {
+        requested: false,
+        stripped_on_oauth: false,
+    };
+    #[cfg(test)]
+    pub(crate) const FAST: Self = Self {
+        requested: true,
+        stripped_on_oauth: false,
+    };
+
+    /// True when `ep` receives the request with `speed: "fast"`. An
+    /// OpenAI-protocol endpoint never does: its translation drops `speed`.
+    pub(crate) fn reaches(self, ep: &Endpoint) -> bool {
+        self.requested
+            && ep.protocol == Protocol::Anthropic
+            && !(self.stripped_on_oauth && ep.filters_client_betas())
+    }
+
+    /// True when the request must not be served at standard speed, which
+    /// keeps it off OpenAI-protocol endpoints. A request the allow-list
+    /// already downgrades on OAuth endpoints may be served there.
+    pub(crate) fn excludes_openai(self) -> bool {
+        self.requested && !self.stripped_on_oauth
+    }
+}
+
 /// Remove every top-level entry named in `fields` — `ANTHROPIC_FALLBACK_FIELDS`
 /// or `OPENAI_FALLBACK_FIELDS`, the fields with which a body asks the upstream
 /// to serve ANOTHER model. Both `models` gates — the client's
@@ -1688,9 +1786,9 @@ impl AppState {
 
     /// True when EVERY endpoint whose config allows `model` is out for this
     /// request: it carries a live negative-cache entry (unsupported model or,
-    /// for a `speed: "fast"` request, fast mode disabled on its org), or it is
-    /// `extra_usage_refuser`, the endpoint that refused this request for extra
-    /// usage. Then no rotation can help. Gates the exhaustion reply: only then
+    /// when `fast` reaches it as fast, fast mode disabled on its org), or it
+    /// is `extra_usage_refuser`, the endpoint that refused this request for
+    /// extra usage. Then no rotation can help. Gates the exhaustion reply: only then
     /// is a stashed upstream 4xx returned (or synthesized on the warm path,
     /// where the pool emptied before any forward ran). A rejection on one
     /// account plus rate limits on the rest is a rate-limited pool, and the
@@ -1703,16 +1801,14 @@ impl AppState {
     pub(crate) fn pool_cannot_serve(
         &self,
         model: &str,
-        fast: bool,
+        fast: FastRequest,
         extra_usage_refuser: Option<EndpointIdx>,
     ) -> bool {
         if model.is_empty() {
             return false;
         }
         let mut excluded = self.unsupported_endpoints_for(model);
-        if fast {
-            excluded.extend(self.fast_mode_disabled_endpoints());
-        }
+        excluded.extend(self.fast_mode_disabled_for(fast));
         excluded.extend(extra_usage_refuser);
         let mut eligible = 0usize;
         for (i, ep) in self.endpoints.iter().enumerate() {
@@ -1724,7 +1820,7 @@ impl AppState {
             // mark, so it must not count as "eligible" for a fast request —
             // otherwise a pool with only OpenAI capacity left would look
             // servable and the exhaustion reply would never fire (LAB-2687).
-            if fast && ep.protocol == Protocol::OpenAI {
+            if fast.excludes_openai() && ep.protocol == Protocol::OpenAI {
                 continue;
             }
             eligible += 1;
@@ -1758,6 +1854,19 @@ impl AppState {
             .iter()
             .filter(|(_, expiry)| **expiry > now)
             .map(|(idx, _)| *idx)
+            .collect()
+    }
+
+    /// The live fast-mode-disabled endpoints `fast` reaches with
+    /// `speed: "fast"`: the marks that count against this request. Empty for a
+    /// standard request, without taking the lock.
+    pub(crate) fn fast_mode_disabled_for(&self, fast: FastRequest) -> Vec<usize> {
+        if !fast.requested {
+            return Vec::new();
+        }
+        self.fast_mode_disabled_endpoints()
+            .into_iter()
+            .filter(|&i| fast.reaches(&self.endpoints[i]))
             .collect()
     }
 

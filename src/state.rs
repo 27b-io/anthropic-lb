@@ -556,6 +556,16 @@ impl Endpoint {
     pub(crate) fn serves_model(&self, model: &str) -> bool {
         model_matches(&self.models, model)
     }
+
+    /// True when `inject_account_auth` passes this endpoint's client
+    /// `anthropic-beta` flags through the allow-list: an Anthropic OAuth
+    /// account. API-key and passthrough endpoints forward the caller's betas,
+    /// and so `speed`, unfiltered.
+    pub(crate) fn filters_client_betas(&self) -> bool {
+        self.protocol == Protocol::Anthropic
+            && !self.passthrough
+            && self.token.starts_with(OAUTH_TOKEN_PREFIX)
+    }
 }
 
 pub(crate) struct AppState {

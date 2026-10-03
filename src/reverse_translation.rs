@@ -1711,7 +1711,13 @@ pub(crate) async fn openai_chat_handler(
                 // `apply_round_outcome` covers both.
                 // OpenAI→Anthropic translation carries no `speed`: never fast.
                 let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                    .pick_endpoint_for_client(affinity, &model, &skip, &client_id, false)
+                    .pick_endpoint_for_client(
+                        affinity,
+                        &model,
+                        &skip,
+                        &client_id,
+                        FastRequest::STANDARD,
+                    )
                     .await
                 {
                     Some(i) => {
@@ -1825,7 +1831,7 @@ pub(crate) async fn openai_chat_handler(
         // carries no `speed`.
         if !last_saw_529
             && !last_saw_transient
-            && state.pool_cannot_serve(&model, false, extra_usage_refuser)
+            && state.pool_cannot_serve(&model, FastRequest::STANDARD, extra_usage_refuser)
         {
             if let Some(resp) = rejected_resp {
                 return resp;

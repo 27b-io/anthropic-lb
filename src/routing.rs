@@ -447,7 +447,7 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
     ) -> Option<EndpointIdx> {
-        self.pick_endpoint_for_client(affinity_key, model, skip, "", false)
+        self.pick_endpoint_for_client(affinity_key, model, skip, "", FastRequest::STANDARD)
             .await
     }
 
@@ -468,9 +468,9 @@ impl AppState {
     /// free general-pool capacity — violating the free-before-paid guarantee
     /// below, which the retain would otherwise bypass.
     ///
-    /// `fast` (LAB-2687): a `speed: "fast"` request also drops
-    /// `fast_mode_disabled` accounts BEFORE the pin filter, so a non-entitled
-    /// pin spills rather than serving.
+    /// `fast`: a `speed: "fast"` request also drops the
+    /// `fast_mode_disabled` accounts it reaches as fast BEFORE the pin filter,
+    /// so a non-entitled pin spills rather than serving.
     ///
     /// Tiers are tried strictly in ascending priority order. Within a tier:
     /// healthy candidates (`gate < soft_limit`) are preferred; if none are healthy
@@ -485,14 +485,10 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
         client_id: &str,
-        fast: bool,
+        fast: FastRequest,
     ) -> Option<EndpointIdx> {
         let mut candidates = self.routing_candidates(model, skip).await;
-        let fast_disabled = if fast {
-            self.fast_mode_disabled_endpoints()
-        } else {
-            Vec::new()
-        };
+        let fast_disabled = self.fast_mode_disabled_for(fast);
         candidates.retain(|c| {
             if fast_disabled.contains(&c.endpoint) {
                 trace!(
@@ -506,7 +502,7 @@ impl AppState {
             // has no org entitlement to reject) and its request translation
             // drops `speed` entirely — routing a fast request there would
             // silently serve it at standard speed (LAB-2687).
-            if fast && self.endpoints[c.endpoint].protocol == Protocol::OpenAI {
+            if fast.excludes_openai() && self.endpoints[c.endpoint].protocol == Protocol::OpenAI {
                 trace!(
                     endpoint = self.endpoints[c.endpoint].name,
                     model,
