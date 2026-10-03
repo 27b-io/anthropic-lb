@@ -1813,7 +1813,7 @@ pub(crate) async fn openai_chat_handler(
 
         // Entitlement 400 first, outside the rejection gate — as in
         // `proxy_handler` (LAB-4729).
-        let (refused, entitlement_resp) = entitlement_resp.unzip();
+        let (extra_usage_refuser, entitlement_resp) = entitlement_resp.unzip();
         if !last_saw_529 && !last_saw_transient {
             if let Some(resp) = entitlement_resp.flatten() {
                 return resp;
@@ -1823,12 +1823,19 @@ pub(crate) async fn openai_chat_handler(
         // generalised by LAB-2687), in the OpenAI error shape this handler's
         // clients parse. Never `fast`: the OpenAI→Anthropic translation
         // carries no `speed`.
-        if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, false, refused) {
+        if !last_saw_529
+            && !last_saw_transient
+            && state.pool_cannot_serve(&model, false, extra_usage_refuser)
+        {
             if let Some(resp) = rejected_resp {
                 return resp;
             }
-            warn!(model, "model unsupported on all eligible endpoints");
-            return model_unsupported_response(&model, true);
+            // As in `proxy_handler`: an account that refused this request for
+            // extra usage did not refuse the model, so no 404 is synthesized.
+            if extra_usage_refuser.is_none() {
+                warn!(model, "model unsupported on all eligible endpoints");
+                return model_unsupported_response(&model, true);
+            }
         }
         exhaustion_response(&state, last_saw_transient, last_saw_529)
     }

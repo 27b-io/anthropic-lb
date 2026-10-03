@@ -1686,24 +1686,25 @@ impl AppState {
             .collect()
     }
 
-    /// True when EVERY endpoint whose config allows `model` carries a live
-    /// negative-cache entry — unsupported model (LAB-941) or, for a
-    /// `speed: "fast"` request, fast mode disabled on its org (LAB-2687) — so
-    /// no rotation can help. Gates the exhaustion reply: only then is a
-    /// stashed upstream 4xx returned (or synthesized on the warm path, where
-    /// the pool emptied before any forward ran). A rejection on one account
-    /// plus rate limits on the rest is a rate-limited pool, and the
+    /// True when EVERY endpoint whose config allows `model` is out for this
+    /// request: it carries a live negative-cache entry (unsupported model or,
+    /// for a `speed: "fast"` request, fast mode disabled on its org), or it is
+    /// `extra_usage_refuser`, the endpoint that refused this request for extra
+    /// usage. Then no rotation can help. Gates the exhaustion reply: only then
+    /// is a stashed upstream 4xx returned (or synthesized on the warm path,
+    /// where the pool emptied before any forward ran). A rejection on one
+    /// account plus rate limits on the rest is a rate-limited pool, and the
     /// retryable 429 stays the truth. Endpoints excluded by their config
     /// `models` allowlist never serve the model and don't count; false when
     /// no endpoint could ever serve it (config-only exclusion keeps its
-    /// pre-existing 429 semantics). `refused` is the endpoint that answered
-    /// THIS request with an entitlement 400 (LAB-4729): never negative-cached,
-    /// but skipped for the rest of the request, so it cannot serve it either.
+    /// pre-existing 429 semantics). `extra_usage_refuser` answered THIS
+    /// request with an entitlement 400: never negative-cached, but skipped
+    /// for the rest of the request, so it cannot serve it either.
     pub(crate) fn pool_cannot_serve(
         &self,
         model: &str,
         fast: bool,
-        refused: Option<EndpointIdx>,
+        extra_usage_refuser: Option<EndpointIdx>,
     ) -> bool {
         if model.is_empty() {
             return false;
@@ -1712,7 +1713,7 @@ impl AppState {
         if fast {
             excluded.extend(self.fast_mode_disabled_endpoints());
         }
-        excluded.extend(refused);
+        excluded.extend(extra_usage_refuser);
         let mut eligible = 0usize;
         for (i, ep) in self.endpoints.iter().enumerate() {
             if !ep.serves_model(model) {

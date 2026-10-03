@@ -406,7 +406,7 @@ const STANDARD_BODY: &str =
     r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
 const FAST_BODY: &str = r#"{"model":"claude-opus-5","max_tokens":1,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#;
 
-/// AC-1: only the org-entitlement 400 matches. The proxy-induced
+/// Only the org-level fast-mode 400 matches. The proxy-induced
 /// `speed: Extra inputs are not permitted` 400 (beta header stripped, body
 /// forwarded — LAB-2669's failure shape), model-not-found 404s and 429s must
 /// not: rotating fixes none of those.
@@ -422,7 +422,7 @@ fn fast_mode_not_enabled_error_detection() {
     ));
     assert!(
         !is_fast_mode_not_enabled_error(StatusCode::TOO_MANY_REQUESTS, &not_enabled),
-        "status gate: only a 400 is an entitlement rejection"
+        "status gate: only a 400 is a fast-mode rejection"
     );
 
     let extra_inputs = serde_json::json!({
@@ -431,7 +431,7 @@ fn fast_mode_not_enabled_error_detection() {
     });
     assert!(
         !is_fast_mode_not_enabled_error(StatusCode::BAD_REQUEST, &extra_inputs),
-        "the proxy-induced header/body mismatch 400 is not an entitlement rejection"
+        "the proxy-induced header/body mismatch 400 is not a fast-mode rejection"
     );
 
     let model_404 = serde_json::json!({
@@ -454,7 +454,7 @@ fn fast_mode_not_enabled_error_detection() {
 }
 
 /// The matcher requires an exact match, not a substring — a message
-/// that merely CONTAINS the entitlement clause (trailing wording drift, or a
+/// that merely CONTAINS the fast-mode clause (trailing wording drift, or a
 /// client-echoed field name in an unrelated 400) must not match. Substring
 /// matching plus an unguarded caller let one crafted request walk and mark
 /// every reachable account.
@@ -466,15 +466,15 @@ fn fast_mode_not_enabled_error_requires_exact_match() {
     });
     assert!(
         !is_fast_mode_not_enabled_error(StatusCode::BAD_REQUEST, &superstring),
-        "a superstring of the entitlement message must not match — exact match only"
+        "a superstring of the fast-mode message must not match — exact match only"
     );
 }
 
-/// Integration regression: an entitlement-shaped 400 on a request that
+/// Integration regression: a fast-mode-shaped 400 on a request that
 /// never asked for `speed: "fast"` must not be treated as a fast-mode
 /// rejection — no account mark, no rotation, the 400 forwards verbatim.
 /// Otherwise a client could craft such a 400 (e.g. an unrecognized top-level
-/// field literally named the entitlement message, which upstream may echo
+/// field literally named the fast-mode message, which upstream may echo
 /// back) and walk every reachable account, starving all other tenants' fast
 /// traffic.
 #[tokio::test]
@@ -498,12 +498,12 @@ async fn fast_mode_shaped_400_on_standard_request_is_not_marked_or_rotated() {
     );
     assert!(
         state.fast_mode_disabled_endpoints().is_empty(),
-        "an entitlement-shaped 400 on a non-fast request must not mark the account"
+        "a fast-mode-shaped 400 on a non-fast request must not mark the account"
     );
     assert_eq!(
         hits.load(Ordering::SeqCst),
         1,
-        "must not rotate/retry a non-fast request off an entitlement-shaped 400"
+        "must not rotate/retry a non-fast request off a fast-mode-shaped 400"
     );
 }
 
@@ -709,7 +709,7 @@ fn pool_cannot_serve_excludes_openai_protocol_for_fast_requests() {
     );
 }
 
-/// AC-2 native path: the first entitlement 400 rotates within the request
+/// Native path: the first fast-mode 400 rotates within the request
 /// (client sees the 200 from the entitled account), the NEXT fast request
 /// skips the non-entitled account outright, and a standard request on the
 /// same pool still routes to it.
@@ -781,7 +781,7 @@ async fn fast_mode_disabled_rotates_and_next_fast_request_skips_account() {
         .unwrap();
     assert!(
         metrics.contains("anthropic_fast_mode_disabled_total{account=\"reject\"} 1"),
-        "one increment per entitlement 400, got:\n{metrics}"
+        "one increment per fast-mode 400, got:\n{metrics}"
     );
     assert!(
         metrics.contains("anthropic_fast_mode_disabled_total{account=\"healthy\"} 0"),
@@ -789,7 +789,7 @@ async fn fast_mode_disabled_rotates_and_next_fast_request_skips_account() {
     );
 
     // A standard request is unaffected by the mark: priority sends it to
-    // `reject`, same as before. The entitlement-shaped 400 is
+    // `reject`, same as before. The fast-mode-shaped 400 is
     // gated on `is_fast_mode`, so a standard request that draws it does NOT
     // rotate — it forwards the 400 verbatim (matches
     // `fast_mode_shaped_400_on_standard_request_is_not_marked_or_rotated`).
@@ -808,7 +808,7 @@ async fn fast_mode_disabled_rotates_and_next_fast_request_skips_account() {
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::BAD_REQUEST,
-        "a standard request must see the entitlement-shaped 400 verbatim, not be rotated off it"
+        "a standard request must see the fast-mode-shaped 400 verbatim, not be rotated off it"
     );
 }
 
@@ -963,4 +963,171 @@ async fn warm_path_fast_request_names_model_not_fast_when_fast_mark_is_ineligibl
         body.contains("not_found_error") && body.contains("claude-opus-5"),
         "error body must carry the model rejection, got: {body}"
     );
+}
+
+/// A custom allow-list without `fast-mode-*`, one OAuth account that answers
+/// the model 404, and a healthy OpenAI-protocol fallback behind it. A fresh
+/// pool per call, so every request takes the cold path through the 404.
+/// Returns `(addr, oauth_hits, fallback_hits)`.
+async fn oauth_404_then_openai_fallback_without_fast_beta() -> (
+    SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (oauth_url, oauth_hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
+    let (fallback_url, fallback_hits) = spawn_flaky_upstream(0, OPENAI_OK_BODY).await;
+    let mut fallback = make_endpoint("openai-fallback", Protocol::OpenAI);
+    fallback.base_url = fallback_url;
+    fallback.priority = 1;
+    let mut state = test_state_with(vec![
+        mk_endpoint_at("oauth", "sk-ant-oat01-test", &oauth_url),
+        fallback,
+    ]);
+    Arc::get_mut(&mut state)
+        .expect("test fixture should be uniquely owned")
+        .allowed_client_betas = vec!["oauth-2025-04-20".to_string()];
+    let addr = serve(build_router(state)).await;
+    (addr, oauth_hits, fallback_hits)
+}
+
+/// The model `HEAD_404_MODEL` rejects, at both speeds.
+const NOPE_STANDARD_BODY: &str =
+    r#"{"model":"claude-nope-1","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+const NOPE_FAST_BODY: &str = r#"{"model":"claude-nope-1","max_tokens":1,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#;
+
+const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
+
+/// When the allow-list drops the request's `fast-mode-*` beta, `speed` goes
+/// with it and the request runs at standard speed. Routing and the
+/// exhaustion gate must treat it as standard too: the OpenAI-protocol
+/// fallback serves it exactly as it serves the standard body, where a fast
+/// classification would exclude the fallback and return the OAuth 404.
+#[tokio::test]
+async fn dropped_fast_mode_beta_routes_as_standard() {
+    use std::sync::atomic::Ordering;
+    for (kind, body, beta) in [
+        ("standard body", NOPE_STANDARD_BODY, None),
+        (
+            "fast body, fast-mode beta dropped",
+            NOPE_FAST_BODY,
+            Some(FAST_MODE_BETA),
+        ),
+    ] {
+        let (addr, oauth_hits, fallback_hits) =
+            oauth_404_then_openai_fallback_without_fast_beta().await;
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json");
+        if let Some(beta) = beta {
+            req = req.header("anthropic-beta", beta);
+        }
+        let resp = req.body(body).send().await.unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{kind}: body {text}");
+        assert_eq!(
+            (
+                oauth_hits.load(Ordering::SeqCst),
+                fallback_hits.load(Ordering::SeqCst)
+            ),
+            (1, 1),
+            "{kind}: the OAuth 404 must rotate to the fallback"
+        );
+    }
+}
+
+/// The narrowing's limit: a fast body that sent no `fast-mode-*` beta had
+/// nothing dropped, so it still routes as fast under the same custom
+/// allow-list. It never reaches the OpenAI-protocol fallback and gets the
+/// OAuth account's 404.
+#[tokio::test]
+async fn fast_body_without_fast_mode_beta_still_routes_as_fast() {
+    use std::sync::atomic::Ordering;
+    let (addr, oauth_hits, fallback_hits) =
+        oauth_404_then_openai_fallback_without_fast_beta().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(NOPE_FAST_BODY)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "body {text}");
+    assert!(
+        text.contains("not_found_error") && text.contains("claude-nope-1"),
+        "the OAuth account's own 404 must reach the caller: {text}"
+    );
+    assert_eq!(
+        (
+            oauth_hits.load(Ordering::SeqCst),
+            fallback_hits.load(Ordering::SeqCst)
+        ),
+        (1, 0),
+        "a fast request must never reach the OpenAI-protocol fallback"
+    );
+}
+
+/// The allow-list drops the request's fast-mode beta only when it passes
+/// none of the `fast-mode-*` flags the request carries, across every
+/// `anthropic-beta` header.
+#[test]
+fn allow_list_drops_fast_mode_beta_needs_every_fast_flag_dropped() {
+    let custom = vec![
+        "oauth-2025-04-20".to_string(),
+        "fast-mode-2026-02-01".to_string(),
+    ];
+    let default: Vec<String> = DEFAULT_CLIENT_BETA_ALLOWLIST
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let headers = |values: &[&str]| {
+        let mut h = axum::http::HeaderMap::new();
+        for v in values {
+            h.append("anthropic-beta", HeaderValue::from_str(v).unwrap());
+        }
+        h
+    };
+    let none: Vec<String> = vec!["oauth-2025-04-20".to_string()];
+    for (why, values, allowed, want) in [
+        ("no beta header", &[][..], &none, false),
+        (
+            "no fast-mode flag",
+            &["context-1m-2025-08-07"][..],
+            &none,
+            false,
+        ),
+        (
+            "its only fast-mode flag dropped",
+            &["fast-mode-2026-02-01"][..],
+            &none,
+            true,
+        ),
+        (
+            "dropped across a second header",
+            &["context-1m-2025-08-07", " fast-mode-2026-02-01 "][..],
+            &none,
+            true,
+        ),
+        (
+            "default allow-list",
+            &["fast-mode-2026-02-01"][..],
+            &default,
+            false,
+        ),
+        (
+            "one of two fast-mode flags survives",
+            &["fast-mode-2025-01-01,fast-mode-2026-02-01"][..],
+            &custom,
+            false,
+        ),
+    ] {
+        assert_eq!(
+            allow_list_drops_fast_mode_beta(&headers(values), allowed),
+            want,
+            "{why}"
+        );
+    }
 }

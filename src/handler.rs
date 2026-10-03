@@ -109,7 +109,7 @@ fn is_gateway_model_rejection(msg: &str, model: &str) -> bool {
             .is_some_and(|r| r.starts_with('.'))
 }
 
-/// Exact upstream text of the org-level fast-mode entitlement 400 (observed
+/// Exact upstream text of the org-level fast-mode 400 (observed
 /// 2026-09-02, LAB-2687), replayed on the warm negative-cache path where no
 /// upstream response exists. The matcher requires this exact string, so if
 /// upstream rewords it, rotation stops and the 400 reaches the client as it
@@ -659,7 +659,7 @@ pub(crate) fn model_unsupported_response(model: &str, openai_shape: bool) -> Res
 /// `authenticate` 401, `pre_request_gate` 403/429,
 /// `deny_admin_reader`'s read-only-principal 403 (LAB-4395),
 /// `reserve_request_body` 503, `read_body_bounded` 408 and bad-body 400, the
-/// untranslatable-request 400, the fast-mode entitlement 400 replayed on
+/// untranslatable-request 400, the fast-mode 400 replayed on
 /// the warm negative-cache path (LAB-2687), `proxy_handler`'s 400 for
 /// a valid-JSON non-object body (LAB-4314) — the router fallback, so any
 /// method on any path — and `exhaustion_response`'s 429/503. This is not the
@@ -845,6 +845,24 @@ fn request_wants_fast_mode(body: &[u8]) -> bool {
 /// fast-mode decision in the proxy agrees on what "fast" means.
 fn body_wants_fast_mode(body: &serde_json::Value) -> bool {
     body.get("speed").and_then(|s| s.as_str()) == Some("fast")
+}
+
+/// True when the request carries a `fast-mode-*` beta and the allow-list
+/// passes none of the ones it carries. That is the case where
+/// `forward_anthropic`'s beta filter drops the flag and strips `speed` with
+/// it, so the request does not run as fast. A request that sent no
+/// `fast-mode-*` beta is not narrowed here: its fast-mode pair was never
+/// split by the filter.
+fn allow_list_drops_fast_mode_beta(headers: &axum::http::HeaderMap, allowed: &[String]) -> bool {
+    let mut flags = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|flag| flag.starts_with("fast-mode-"))
+        .peekable();
+    flags.peek().is_some() && flags.all(|flag| !beta_flag_allowed(allowed, flag))
 }
 
 /// Caller-identity headers that must not leave this proxy. The IP set is what
@@ -2011,6 +2029,7 @@ pub(crate) async fn proxy_handler(
             // after the beta filter (LAB-1261) and re-derives the flag there;
             // any new consumer downstream of that filter must read the
             // narrowed value, or it bills a standard request to the fast pool.
+            // Routing and the exhaustion gate read `routes_fast`, below.
             let is_fast_mode = body_wants_fast_mode(&parsed);
 
             (
@@ -2034,6 +2053,16 @@ pub(crate) async fn proxy_handler(
             let clone = body_bytes.clone();
             (body_bytes, clone, String::new(), None, None, false)
         };
+
+    // The fast flag routing and the exhaustion gate read. When the allow-list
+    // drops the request's `fast-mode-*` beta, `forward_anthropic` strips
+    // `speed` and the request runs at standard speed, so it must not be kept
+    // off OpenAI-protocol and fast-disabled endpoints, nor answered with a
+    // fast-mode error. `forward_anthropic` itself still gets `is_fast_mode`
+    // and narrows it per endpoint: an API-key endpoint forwards `speed`
+    // unfiltered.
+    let routes_fast = is_fast_mode
+        && !allow_list_drops_fast_mode_beta(&parts.headers, &state.allowed_client_betas);
 
     // Build the affinity key now that fp is known. fp is the finest routing
     // discriminator: it splits fan-out agents that share one coarse session-id
@@ -2137,7 +2166,7 @@ pub(crate) async fn proxy_handler(
             // (OpenAI). Both return a `ForwardOutcome` so the shared
             // round-gated policy in `apply_round_outcome` covers both.
             let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint_for_client(affinity, &model, &skip, &client_id, is_fast_mode)
+                .pick_endpoint_for_client(affinity, &model, &skip, &client_id, routes_fast)
                 .await
             {
                 Some(i) => {
@@ -2259,12 +2288,13 @@ pub(crate) async fn proxy_handler(
     }
 
     // An entitlement 400 whose one re-send found nothing else to try goes to
-    // the caller as-is (LAB-4729): the caller sees why, not a synthetic 429.
+    // the caller as-is: the caller sees why, not a synthetic 429.
     // Present only if no later attempt answered — see `apply_round_outcome`.
-    // Deliberately OUTSIDE the `pool_cannot_serve` gate below: the refusal is
-    // never negative-cached, so that gate only counts the refuser as out
-    // via `refused`.
-    let (refused, entitlement_resp) = entitlement_resp.unzip();
+    // Deliberately OUTSIDE the `pool_cannot_serve` gate below, because its
+    // rule is about attempts, not negative caches: the refusal is returned
+    // whenever no other account was attempted after it, so a pool whose other
+    // accounts are hard-limited or cooling still gets it.
+    let (extra_usage_refuser, entitlement_resp) = entitlement_resp.unzip();
     if !last_saw_529 && !last_saw_transient {
         if let Some(resp) = entitlement_resp.flatten() {
             return resp;
@@ -2292,26 +2322,34 @@ pub(crate) async fn proxy_handler(
     // `model_unsupported_rejection_plus_rate_limited_pool_stays_retryable`.
     if !last_saw_529
         && !last_saw_transient
-        && state.pool_cannot_serve(&model, is_fast_mode, refused)
+        && state.pool_cannot_serve(&model, routes_fast, extra_usage_refuser)
     {
         if let Some(resp) = rejected_resp {
             return resp;
         }
         // Warm-cache path: the pool emptied BEFORE any forward ran, so
         // nothing was stashed — synthesize the error the first request got.
-        // Name the cause whose removal would unblock the request: if the
-        // pool serves the model at standard speed, only fast-mode marks
-        // stand in the way; otherwise the model itself is unservable.
-        if is_fast_mode && !state.pool_cannot_serve(&model, false, refused) {
-            warn!(model, "fast mode not enabled on any eligible endpoint");
-            return proxy_error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                FAST_MODE_NOT_ENABLED_MSG,
-            );
+        // Never once an account refused this request for extra usage: that
+        // refusal names neither the model nor fast mode, so a synthesized
+        // model or fast-mode error would claim a cause no account gave this
+        // request. The pool only looks unservable because a concurrent
+        // request marked the rest after a later attempt cleared the stash,
+        // and the retryable exhaustion reply below is the truth.
+        if extra_usage_refuser.is_none() {
+            // Name the cause whose removal would unblock the request: if the
+            // pool serves the model at standard speed, only fast-mode marks
+            // stand in the way; otherwise the model itself is unservable.
+            if routes_fast && !state.pool_cannot_serve(&model, false, None) {
+                warn!(model, "fast mode not enabled on any eligible endpoint");
+                return proxy_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    FAST_MODE_NOT_ENABLED_MSG,
+                );
+            }
+            warn!(model, "model unsupported on all eligible endpoints");
+            return model_unsupported_response(&model, false);
         }
-        warn!(model, "model unsupported on all eligible endpoints");
-        return model_unsupported_response(&model, false);
     }
     exhaustion_response(&state, last_saw_transient, last_saw_529)
     }
