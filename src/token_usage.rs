@@ -135,6 +135,11 @@ pub(crate) struct SseUsageScanner {
     pub(crate) bytes_seen: usize,
     /// Terminator state of the bytes forwarded so far.
     pub(crate) terminal: SseTerminal,
+    /// A `message_start` carrying usage was scanned: input and cache tokens
+    /// are known.
+    pub(crate) saw_input_usage: bool,
+    /// A `message_delta` carrying usage was scanned: output tokens are known.
+    pub(crate) saw_output_usage: bool,
 }
 
 impl SseUsageScanner {
@@ -218,6 +223,7 @@ impl SseUsageScanner {
                     self.model = Some(m.to_owned());
                 }
                 if let Some(msg_usage) = event.get("message").and_then(|m| m.get("usage")) {
+                    self.saw_input_usage = true;
                     self.usage.input_tokens = msg_usage
                         .get("input_tokens")
                         .and_then(|v| v.as_u64())
@@ -234,6 +240,7 @@ impl SseUsageScanner {
             }
             "message_delta" => {
                 if let Some(delta_usage) = event.get("usage") {
+                    self.saw_output_usage = true;
                     self.usage.output_tokens = delta_usage
                         .get("output_tokens")
                         .and_then(|v| v.as_u64())
@@ -242,6 +249,67 @@ impl SseUsageScanner {
             }
             _ => {}
         }
+    }
+}
+
+/// `max_tokens` charged when a streamed request's body carries none the proxy
+/// can read: at least the largest output any current model returns, so an
+/// unreadable value never charges less than a readable one could.
+const FALLBACK_CHARGE_MAX_TOKENS: u64 = 128_000;
+
+/// Request-body bytes per token for the input estimate. Text tokenises at
+/// roughly four bytes per token; images, sent base64, cost far fewer tokens
+/// than their bytes, so the estimate errs high for them.
+const BODY_BYTES_PER_TOKEN: usize = 4;
+
+/// What a streamed request is charged against its client's budget for usage
+/// the upstream never reported (LAB-7593).
+///
+/// Output tokens arrive only in the final `message_delta`, input and cache
+/// tokens in the opening `message_start`. A stream that ends before either —
+/// a client disconnect, an upstream error, a truncated stream — would
+/// otherwise be charged only what was scanned, so a client could take a
+/// whole generation and pay for its input alone. Budgets err toward less
+/// spend: the missing output is charged at the request's `max_tokens`, the
+/// missing input at an estimate from the request body.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct StreamFallbackCharge {
+    pub(crate) max_tokens: u64,
+    pub(crate) input_estimate: u64,
+}
+
+impl StreamFallbackCharge {
+    /// Read from the Anthropic-shape body sent upstream — the one whose
+    /// `max_tokens` bounds the generation.
+    pub(crate) fn from_request_body(body: &[u8]) -> Self {
+        #[derive(serde::Deserialize)]
+        struct MaxTokens {
+            max_tokens: Option<u64>,
+        }
+        let max_tokens = serde_json::from_slice::<MaxTokens>(body)
+            .ok()
+            .and_then(|b| b.max_tokens)
+            .unwrap_or(FALLBACK_CHARGE_MAX_TOKENS);
+        Self {
+            max_tokens,
+            input_estimate: body.len().div_ceil(BODY_BYTES_PER_TOKEN) as u64,
+        }
+    }
+
+    /// `(input, output)` tokens to charge on top of the scanned usage: zero
+    /// for each half the upstream reported.
+    pub(crate) fn unreported(&self, scanner: &SseUsageScanner) -> (u64, u64) {
+        let input = if scanner.saw_input_usage {
+            0
+        } else {
+            self.input_estimate
+        };
+        let output = if scanner.saw_output_usage {
+            0
+        } else {
+            self.max_tokens
+        };
+        (input, output)
     }
 }
 

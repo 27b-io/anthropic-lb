@@ -335,3 +335,63 @@ fn affinity_key_fp_alone_provides_identity() {
         "fp alone must provide an affinity key"
     );
 }
+
+// ── LAB-7593: conservative charge for usage a stream never reported ──
+
+/// Each half of the charge is waived by its own usage event: `message_start`
+/// waives the input estimate, `message_delta` the `max_tokens` output.
+#[test]
+fn stream_fallback_charge_covers_only_unreported_halves() {
+    let charge = StreamFallbackCharge {
+        max_tokens: 50,
+        input_estimate: 20,
+    };
+    let start =
+        b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n";
+    let delta = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
+
+    let mut scanner = SseUsageScanner::default();
+    assert_eq!(charge.unreported(&scanner), (20, 50), "nothing reported");
+    scanner.push(start);
+    assert_eq!(charge.unreported(&scanner), (0, 50), "input reported");
+    scanner.push(delta);
+    assert_eq!(charge.unreported(&scanner), (0, 0), "both reported");
+
+    // A reported zero is still a report: it is not replaced by the charge.
+    let mut scanner = SseUsageScanner::default();
+    scanner.push(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":0}}\n");
+    assert_eq!(charge.unreported(&scanner), (20, 0));
+}
+
+/// `max_tokens` comes from the body; a body without a readable one is
+/// charged the fallback ceiling, never less. The input estimate is the body
+/// length at four bytes per token, rounded up.
+#[test]
+fn stream_fallback_charge_reads_max_tokens_and_estimates_input() {
+    let body = br#"{"model":"m","max_tokens":4096,"messages":[]}"#;
+    assert_eq!(
+        StreamFallbackCharge::from_request_body(body),
+        StreamFallbackCharge {
+            max_tokens: 4096,
+            input_estimate: body.len().div_ceil(4) as u64,
+        }
+    );
+    for body in [
+        &br#"{"model":"m","messages":[]}"#[..],
+        br#"{"max_tokens":"4096"}"#,
+        br#"{"max_tokens":-1}"#,
+        br#"{"max_tokens":1.5}"#,
+        b"not json",
+    ] {
+        assert_eq!(
+            StreamFallbackCharge::from_request_body(body).max_tokens,
+            FALLBACK_CHARGE_MAX_TOKENS,
+            "{}",
+            String::from_utf8_lossy(body)
+        );
+    }
+    assert_eq!(
+        StreamFallbackCharge::from_request_body(b"12345").input_estimate,
+        2
+    );
+}

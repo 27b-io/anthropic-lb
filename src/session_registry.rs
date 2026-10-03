@@ -468,6 +468,10 @@ pub(crate) fn log_proxied(
 
 /// Finalize a streaming response: extract usage, log, and shadow log.
 /// Shared by proxy_handler and openai_chat_handler.
+///
+/// Usage the upstream never reported is charged to the client's budget by
+/// `fallback` (LAB-7593). Only the budget: the token counters and log lines
+/// keep what the upstream reported.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize_stream(
     state: &AppState,
@@ -482,6 +486,7 @@ pub(crate) async fn finalize_stream(
     status_code: u16,
     ctx: ProxiedCtx,
     mut scanner: SseUsageScanner,
+    fallback: StreamFallbackCharge,
     request_start: std::time::Instant,
     client_disconnected: bool,
     upstream_error: bool,
@@ -494,6 +499,13 @@ pub(crate) async fn finalize_stream(
     // Response-derived model (message_start) preferred; request model fallback.
     let usage_model = scanner.model.as_deref().unwrap_or(model);
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
+    let reason = if upstream_error {
+        "upstream_error"
+    } else if client_disconnected {
+        "client_disconnect"
+    } else {
+        "no_usage_event"
+    };
     if !usage.is_empty() {
         state.record_usage(ep, client_id, usage_model, usage).await;
         if let Some(key) = session_key {
@@ -510,13 +522,6 @@ pub(crate) async fn finalize_stream(
             );
         }
     } else {
-        let reason = if upstream_error {
-            "upstream_error"
-        } else if client_disconnected {
-            "client_disconnect"
-        } else {
-            "no_usage_event"
-        };
         // Log structural metadata only — SSE payloads contain user content.
         let truncated = scanner.event_count > 5;
         warn!(
@@ -532,6 +537,22 @@ pub(crate) async fn finalize_stream(
             sse_events = ?scanner.event_preview,
             truncated,
             "stream_end_no_usage"
+        );
+    }
+    let (charged_input, charged_output) = fallback.unreported(&scanner);
+    let charged = charged_input.saturating_add(charged_output);
+    if charged > 0 {
+        state.record_budget_usage(client_id, charged).await;
+        warn!(
+            req_id,
+            client_id,
+            model,
+            account = acct_name,
+            status = status_code,
+            reason,
+            charged_input,
+            charged_output,
+            "stream_usage_estimated"
         );
     }
     // Single terminal line for this request (LAB-3214), routing context
