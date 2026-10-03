@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.1](https://github.com/27b-io/anthropic-lb/compare/v0.3.0...v0.3.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* **LAB-5497:** reject duplicate top-level JSON keys at ingress ([#254](https://github.com/27b-io/anthropic-lb/issues/254)) ([11494ac](https://github.com/27b-io/anthropic-lb/commit/11494ac6f9eaee72d5004affded06ad4a2558960))
+* **LAB-6781:** refuse request bodies the proxy cannot parse ([#255](https://github.com/27b-io/anthropic-lb/issues/255)) ([0ace12b](https://github.com/27b-io/anthropic-lb/commit/0ace12b988790421447ee517ec465120d7720296))
+* **LAB-6794:** strip body-level fallback lists on restricted OpenAI-protocol requests ([#258](https://github.com/27b-io/anthropic-lb/issues/258)) ([66d3719](https://github.com/27b-io/anthropic-lb/commit/66d3719ce50b699b1db24925ccd7a04076cfb1ee))
+* **LAB-6837:** refuse a repeated chunked transfer coding on purpose ([#266](https://github.com/27b-io/anthropic-lb/issues/266)) ([ac3fa68](https://github.com/27b-io/anthropic-lb/commit/ac3fa6846cd6c8e2bb78d65f9b9fba6e5b63fc6f))
+* **LAB-7391:** streaming upstream client no longer inherits the 900 s total timeout ([#263](https://github.com/27b-io/anthropic-lb/issues/263)) ([59d9821](https://github.com/27b-io/anthropic-lb/commit/59d9821b99829f430338d3651cd9999f78dcff8a))
+* **LAB-7553:** reserve the full body cap when Transfer-Encoding is present ([#268](https://github.com/27b-io/anthropic-lb/issues/268)) ([4e23aac](https://github.com/27b-io/anthropic-lb/commit/4e23aac6b76a67a6c8d4d70f31210bf7744644af))
+* **LAB-7593:** charge a stream that ends before its usage events conservatively ([#269](https://github.com/27b-io/anthropic-lb/issues/269)) ([ee156fa](https://github.com/27b-io/anthropic-lb/commit/ee156fa1a27ceecc88f12eeed35385746b942c71))
+* **security:** refuse a non-string or comma model at the models gates (LAB-6894) ([#267](https://github.com/27b-io/anthropic-lb/issues/267)) ([a2d81b0](https://github.com/27b-io/anthropic-lb/commit/a2d81b093c69603de8119266716ec87579e116c7))
+
 ## [0.3.0](https://github.com/27b-io/anthropic-lb/compare/v0.2.5...v0.3.0) (2026-09-30)
 
 
