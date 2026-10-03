@@ -470,8 +470,9 @@ pub(crate) fn log_proxied(
 /// Shared by proxy_handler and openai_chat_handler.
 ///
 /// Usage the upstream never reported is charged to the client's budget by
-/// `fallback` (LAB-7593). Only the budget: the token counters and log lines
-/// keep what the upstream reported.
+/// `fallback` (LAB-7593), unless the upstream errored before `message_start`.
+/// Only the budget: the token counters and log lines keep what the upstream
+/// reported.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize_stream(
     state: &AppState,
@@ -506,7 +507,14 @@ pub(crate) async fn finalize_stream(
     } else {
         "no_usage_event"
     };
-    let (charged_input, charged_output) = fallback.unreported(&scanner);
+    // An upstream that errored before `message_start` generated nothing (an
+    // in-band `overloaded_error` answering a 200 looks like this), so there
+    // is nothing to charge for.
+    let (charged_input, charged_output) = if upstream_error && !scanner.saw_input_usage {
+        (0, 0)
+    } else {
+        fallback.unreported(&scanner)
+    };
     let charged = charged_input.saturating_add(charged_output);
     // One budget write for reported usage and estimate together: two writes
     // each key their own UTC day, so a request straddling midnight would

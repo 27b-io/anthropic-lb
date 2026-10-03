@@ -1,9 +1,9 @@
 //! A stream that ends before its upstream reports usage is charged to the
 //! client's budget conservatively (LAB-7593): the request's `max_tokens` when
 //! no `message_delta` arrived, plus a body estimate when no `message_start`
-//! did. One test per ending, each over both routes that relay an Anthropic
-//! stream: native `/v1/messages` and the OpenAI-compatible
-//! `/v1/chat/completions`.
+//! did, and nothing when the upstream errored before `message_start`. One
+//! test per ending, each over both routes that relay an Anthropic stream:
+//! native `/v1/messages` and the OpenAI-compatible `/v1/chat/completions`.
 
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -264,6 +264,23 @@ async fn upstream_error_mid_stream_charges_max_tokens_as_output() {
             settled_budget(&state, expected).await,
             expected,
             "{path}: a stream the upstream errored before message_delta pays max_tokens"
+        );
+    }
+}
+
+#[tokio::test]
+async fn upstream_error_before_message_start_charges_nothing() {
+    for (path, body) in ROUTES {
+        let (url, _) = spawn_scripted_upstream(vec![ERROR], Tail::Close).await;
+        let state = budget_state(&url);
+        let addr = serve(build_router(state.clone())).await;
+        // The response ends only once its relay task, finalization
+        // included, has finished: any charge has landed by then.
+        request_to_end(addr, path, body).await;
+        assert_eq!(
+            settled_budget(&state, 0).await,
+            0,
+            "{path}: an upstream that errored before generating anything charges nothing"
         );
     }
 }

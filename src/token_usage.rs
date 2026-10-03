@@ -135,10 +135,11 @@ pub(crate) struct SseUsageScanner {
     pub(crate) bytes_seen: usize,
     /// Terminator state of the bytes forwarded so far.
     pub(crate) terminal: SseTerminal,
-    /// A `message_start` carrying usage was scanned: input and cache tokens
-    /// are known.
+    /// A `message_start` carrying a readable `input_tokens` was scanned:
+    /// input and cache tokens are known.
     pub(crate) saw_input_usage: bool,
-    /// A `message_delta` carrying usage was scanned: output tokens are known.
+    /// A `message_delta` carrying a readable `output_tokens` was scanned:
+    /// output tokens are known.
     pub(crate) saw_output_usage: bool,
 }
 
@@ -223,11 +224,12 @@ impl SseUsageScanner {
                     self.model = Some(m.to_owned());
                 }
                 if let Some(msg_usage) = event.get("message").and_then(|m| m.get("usage")) {
-                    self.saw_input_usage = true;
-                    self.usage.input_tokens = msg_usage
-                        .get("input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
+                    // Reported only when the count is readable: `"usage": {}`
+                    // reports nothing, so it must not waive the charge.
+                    if let Some(input) = msg_usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                        self.saw_input_usage = true;
+                        self.usage.input_tokens = input;
+                    }
                     self.usage.cache_creation_input_tokens = msg_usage
                         .get("cache_creation_input_tokens")
                         .and_then(|v| v.as_u64())
@@ -239,12 +241,14 @@ impl SseUsageScanner {
                 }
             }
             "message_delta" => {
-                if let Some(delta_usage) = event.get("usage") {
+                // Counts are cumulative: one without a readable count keeps
+                // the last reported one.
+                if let Some(output) = event
+                    .pointer("/usage/output_tokens")
+                    .and_then(|v| v.as_u64())
+                {
                     self.saw_output_usage = true;
-                    self.usage.output_tokens = delta_usage
-                        .get("output_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
+                    self.usage.output_tokens = output;
                 }
             }
             _ => {}

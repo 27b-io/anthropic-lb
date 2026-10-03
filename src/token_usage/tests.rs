@@ -363,6 +363,33 @@ fn stream_fallback_charge_covers_only_unreported_halves() {
     assert_eq!(charge.unreported(&scanner), (20, 0));
 }
 
+/// A usage event reports a half only when its count is readable: `null`,
+/// `{}` or a non-number reports nothing and leaves the charge in place, and
+/// a later unreadable `message_delta` keeps the last cumulative count.
+#[test]
+fn sse_scanner_reports_usage_only_when_its_count_is_readable() {
+    for usage in ["null", "{}", r#"{"input_tokens":"7"}"#] {
+        let mut scanner = SseUsageScanner::default();
+        scanner.push(
+            format!("data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{usage}}}}}\n")
+                .as_bytes(),
+        );
+        assert!(!scanner.saw_input_usage, "message_start usage {usage}");
+    }
+    for usage in ["null", "{}", r#"{"output_tokens":null}"#] {
+        let mut scanner = SseUsageScanner::default();
+        scanner
+            .push(format!("data: {{\"type\":\"message_delta\",\"usage\":{usage}}}\n").as_bytes());
+        assert!(!scanner.saw_output_usage, "message_delta usage {usage}");
+    }
+
+    let mut scanner = SseUsageScanner::default();
+    scanner.push(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n");
+    scanner.push(b"data: {\"type\":\"message_delta\",\"usage\":{}}\n");
+    assert!(scanner.saw_output_usage);
+    assert_eq!(scanner.usage.output_tokens, 5);
+}
+
 /// `max_tokens` comes from the body; a body without a readable one is
 /// charged the fallback ceiling, never less. The input estimate is the body
 /// length at four bytes per token, rounded up.
