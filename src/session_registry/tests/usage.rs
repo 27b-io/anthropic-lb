@@ -350,3 +350,38 @@ async fn proxied_line_still_logged_on_openai_compat_upstream_error() {
         my_lines[0]
     );
 }
+
+// ── LAB-7593: estimated stream usage is budget-only, in one write ──
+
+/// The estimate joins the reported usage in the client's budget, and only
+/// there: the token counters keep what the upstream reported. With nothing
+/// reported, the estimate alone is booked and no counter entry appears.
+#[tokio::test]
+async fn record_usage_charging_books_estimate_to_budget_only() {
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        client_budgets: [("c1".to_string(), 1_000_000), ("c2".to_string(), 1_000_000)]
+            .into_iter()
+            .collect(),
+        ..test_state_base()
+    });
+    let usage = TokenUsage {
+        input_tokens: 7,
+        cache_read_input_tokens: 3,
+        ..TokenUsage::default()
+    };
+    state
+        .record_usage_charging(&state.endpoints[0], "c1", "m", &usage, 50)
+        .await;
+    state
+        .record_usage_charging(&state.endpoints[0], "c2", "m", &TokenUsage::default(), 80)
+        .await;
+
+    let budget = state.budget_usage.lock().unwrap().clone();
+    assert_eq!(budget.get("c1").map(|&(_, used)| used), Some(60));
+    assert_eq!(budget.get("c2").map(|&(_, used)| used), Some(80));
+    let counters = state.client_usage.lock().unwrap();
+    assert_eq!(counters.get("c1"), Some(&[7, 0, 0, 3]));
+    assert!(!counters.contains_key("c2"));
+    assert_eq!(state.endpoints[0].output_tokens.load(Ordering::Relaxed), 0);
+}

@@ -506,8 +506,15 @@ pub(crate) async fn finalize_stream(
     } else {
         "no_usage_event"
     };
+    let (charged_input, charged_output) = fallback.unreported(&scanner);
+    let charged = charged_input.saturating_add(charged_output);
+    // One budget write for reported usage and estimate together: two writes
+    // each key their own UTC day, so a request straddling midnight would
+    // book the estimate against the next day (LAB-7593 review).
+    state
+        .record_usage_charging(ep, client_id, usage_model, usage, charged)
+        .await;
     if !usage.is_empty() {
-        state.record_usage(ep, client_id, usage_model, usage).await;
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -539,10 +546,7 @@ pub(crate) async fn finalize_stream(
             "stream_end_no_usage"
         );
     }
-    let (charged_input, charged_output) = fallback.unreported(&scanner);
-    let charged = charged_input.saturating_add(charged_output);
     if charged > 0 {
-        state.record_budget_usage(client_id, charged).await;
         warn!(
             req_id,
             client_id,
@@ -687,7 +691,25 @@ impl AppState {
     /// model — either way it is truncated and the pair-count is capped here,
     /// so callers cannot inflate the label set.
     async fn record_usage(&self, ep: &Endpoint, client_id: &str, model: &str, usage: &TokenUsage) {
+        self.record_usage_charging(ep, client_id, model, usage, 0)
+            .await;
+    }
+
+    /// `record_usage`, plus `estimated` tokens charged to the client's budget
+    /// only (LAB-7593): usage a stream never reported. Booked in the same
+    /// budget write as the reported usage, so both land on one UTC day.
+    async fn record_usage_charging(
+        &self,
+        ep: &Endpoint,
+        client_id: &str,
+        model: &str,
+        usage: &TokenUsage,
+        estimated: u64,
+    ) {
         if usage.is_empty() {
+            if client_id != "-" {
+                self.record_budget_usage(client_id, estimated).await;
+            }
             return;
         }
         ep.input_tokens
@@ -746,7 +768,8 @@ impl AppState {
                 entry[3] += usage.cache_read_input_tokens;
             }
             // Budget accounting
-            self.record_budget_usage(client_id, total).await;
+            self.record_budget_usage(client_id, total.saturating_add(estimated))
+                .await;
         }
     }
 
