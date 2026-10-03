@@ -338,7 +338,7 @@ Per-client token usage and budget status appear in `/_stats`.
 
 ### Per-client model allow-lists
 
-`clients[].models` restricts which models a client may request, using the same exact-match + `*`-suffix wildcard semantics as `endpoints[].models`. Empty or absent = all models allowed.
+`clients[].models` restricts which models a client may request, using the same exact-match + `*`-suffix wildcard semantics as `endpoints[].models`. Empty or absent = all models allowed. A non-empty list, on a client or an endpoint, never matches a model containing `,`, because an OpenAI-compatible upstream may read it as several models.
 
 A request for a model outside the list is rejected with **403** — a policy denial, distinct from the 429s that mean "capacity, try later" — and counted as `anthropic_client_model_denied_total{client,model}`. Operators bypass it, as they do every other gate check. The check sits in `pre_request_gate`, which both `/v1/messages` and `/v1/chat/completions` route through, so it covers both surfaces.
 
