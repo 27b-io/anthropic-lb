@@ -1,7 +1,7 @@
 //! A stream that ends before its upstream reports usage is charged to the
 //! client's budget conservatively (LAB-7593): the request's `max_tokens` when
 //! no `message_delta` arrived, plus a body estimate when no `message_start`
-//! did, and nothing when the upstream errored before `message_start`. One
+//! did, and nothing when the upstream errored before the stream began. One
 //! test per ending, each over both routes that relay an Anthropic stream:
 //! native `/v1/messages` and the OpenAI-compatible `/v1/chat/completions`.
 
@@ -18,6 +18,8 @@ const ROUTES: [(&str, &str); 2] = [
 ];
 
 const MESSAGE_START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":7,\"cache_read_input_tokens\":3,\"output_tokens\":1}}}\n\n";
+/// A `message_start` whose usage carries no readable count.
+const MESSAGE_START_NO_COUNT: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{}}}\n\n";
 /// `MESSAGE_START`'s input + cache-read tokens.
 const SCANNED_INPUT: u64 = 10;
 const BLOCK_START: &str = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
@@ -281,6 +283,26 @@ async fn upstream_error_before_message_start_charges_nothing() {
             settled_budget(&state, 0).await,
             0,
             "{path}: an upstream that errored before generating anything charges nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn upstream_error_after_content_with_no_input_count_charges_the_estimate() {
+    for (path, body) in ROUTES {
+        let (url, captured) = spawn_scripted_upstream(
+            vec![MESSAGE_START_NO_COUNT, BLOCK_START, DELTA, ERROR],
+            Tail::Close,
+        )
+        .await;
+        let state = budget_state(&url);
+        let addr = serve(build_router(state.clone())).await;
+        request_to_end(addr, path, body).await;
+        let expected = input_estimate(&captured) + MAX_TOKENS;
+        assert_eq!(
+            settled_budget(&state, expected).await,
+            expected,
+            "{path}: content went out before the error, so the stream is charged"
         );
     }
 }

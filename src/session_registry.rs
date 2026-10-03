@@ -470,7 +470,7 @@ pub(crate) fn log_proxied(
 /// Shared by proxy_handler and openai_chat_handler.
 ///
 /// Usage the upstream never reported is charged to the client's budget by
-/// `fallback` (LAB-7593), unless the upstream errored before `message_start`.
+/// `fallback` (LAB-7593), unless the upstream errored before the stream began.
 /// Only the budget: the token counters and log lines keep what the upstream
 /// reported.
 #[allow(clippy::too_many_arguments)]
@@ -507,10 +507,12 @@ pub(crate) async fn finalize_stream(
     } else {
         "no_usage_event"
     };
-    // An upstream that errored before `message_start` generated nothing (an
+    // An upstream that errored before the stream began generated nothing (an
     // in-band `overloaded_error` answering a 200 looks like this), so there
-    // is nothing to charge for.
-    let (charged_input, charged_output) = if upstream_error && !scanner.saw_input_usage {
+    // is nothing to charge for. Keyed on the stream beginning, not on a
+    // readable input count: a `message_start` without one can still be
+    // followed by content.
+    let (charged_input, charged_output) = if upstream_error && !scanner.began {
         (0, 0)
     } else {
         fallback.unreported(&scanner)

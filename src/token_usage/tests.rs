@@ -390,6 +390,22 @@ fn sse_scanner_reports_usage_only_when_its_count_is_readable() {
     assert_eq!(scanner.usage.output_tokens, 5);
 }
 
+/// A stream has begun once the upstream sends any frame but `error` or
+/// `ping`: those two carry nothing generated, every other one may.
+#[test]
+fn sse_scanner_marks_a_stream_begun_on_any_frame_but_error_or_ping() {
+    let mut scanner = SseUsageScanner::default();
+    scanner.push(b"event: ping\ndata: {\"type\":\"ping\"}\n\n");
+    scanner.push(b"event: error\ndata: {\"type\":\"error\"}\n\n");
+    assert!(!scanner.began, "ping and error only");
+
+    for event in ["message_start", "content_block_delta"] {
+        let mut scanner = SseUsageScanner::default();
+        scanner.push(format!("event: {event}\ndata: {{}}\n\n").as_bytes());
+        assert!(scanner.began, "{event}");
+    }
+}
+
 /// `max_tokens` comes from the body; a body without a readable one is
 /// charged the fallback ceiling, never less. The input estimate is the body
 /// length at four bytes per token, rounded up.

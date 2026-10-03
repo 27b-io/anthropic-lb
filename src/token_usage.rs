@@ -141,6 +141,10 @@ pub(crate) struct SseUsageScanner {
     /// A `message_delta` carrying a readable `output_tokens` was scanned:
     /// output tokens are known.
     pub(crate) saw_output_usage: bool,
+    /// The upstream sent a frame other than `error` or `ping`, so content
+    /// may have gone downstream. Keyed on the `event:` name, which is what
+    /// the SDKs and the OpenAI-compatible translator dispatch on.
+    pub(crate) began: bool,
 }
 
 impl SseUsageScanner {
@@ -194,7 +198,9 @@ impl SseUsageScanner {
             if self.event_preview.len() < 5 {
                 self.event_preview.push(ev.trim_start().to_string());
             }
-            match ev.trim() {
+            let ev = ev.trim();
+            self.began |= !matches!(ev, "error" | "ping");
+            match ev {
                 "message_stop" => self.terminal.completed = true,
                 "error" => self.terminal.errored = true,
                 _ => {}
