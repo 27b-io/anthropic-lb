@@ -1650,25 +1650,31 @@ pub(crate) fn stamp_guard_findings(mut response: Response, count: Option<usize>)
 
 /// The coding a request body would reach the upstream under without the proxy
 /// having decoded it, as `(header, coding)`: any `Content-Encoding` but
-/// `identity`, or any `Transfer-Encoding` but `chunked`, the one framing hyper
-/// removes. The proxy reads such a body as raw bytes, while the upstream may
-/// read what they decode to. A value that is not visible ASCII cannot be
-/// checked, so it counts as a coding.
+/// `identity`, or any `Transfer-Encoding` but a single `chunked`, the one layer
+/// of framing hyper removes. The proxy reads such a body as raw bytes, while the
+/// upstream may read what they decode to. A `chunked` repeated anywhere across
+/// the `Transfer-Encoding` values leaves a layer of framing in the body. A value
+/// that is not visible ASCII cannot be checked, so it counts as a coding.
 pub(crate) fn undecoded_body_coding(headers: &hyper::HeaderMap) -> Option<(&'static str, String)> {
-    for (name, decoded) in [
+    for (name, allowed) in [
         ("content-encoding", "identity"),
         ("transfer-encoding", "chunked"),
     ] {
+        let mut chunked = 0;
         for value in headers.get_all(name) {
             let Ok(value) = value.to_str() else {
                 return Some((name, "(not visible ASCII)".to_string()));
             };
-            if let Some(coding) = value
-                .split(',')
-                .map(str::trim)
-                .find(|c| !c.eq_ignore_ascii_case(decoded))
-            {
-                return Some((name, truncate_label(coding)));
+            for coding in value.split(',').map(str::trim) {
+                if !coding.eq_ignore_ascii_case(allowed) {
+                    return Some((name, truncate_label(coding)));
+                }
+                if name == "transfer-encoding" {
+                    chunked += 1;
+                    if chunked > 1 {
+                        return Some((name, "chunked, chunked".to_string()));
+                    }
+                }
             }
         }
     }
@@ -1766,10 +1772,8 @@ pub(crate) async fn proxy_handler(
     #[cfg(feature = "guard")]
     let mut guard_outcome = guard::ScanOutcome::NothingToScan;
 
-    // The proxy decodes no content coding, so it would route a coded body on
-    // bytes it cannot read while the upstream decodes them, possibly to a
-    // model the proxy never saw (LAB-6781). Refused before the parse: a coded
-    // body can pass the `--` test below, or even parse as JSON, as raw bytes.
+    // Refused before the parse: a coded body can pass the `--` test below, or
+    // even parse as JSON, as raw bytes.
     if !body_bytes.is_empty() {
         if let Some((header, coding)) = undecoded_body_coding(&parts.headers) {
             warn!(

@@ -771,7 +771,7 @@ async fn proxy_forwards_bodiless_and_multipart_requests_unchanged() {
 /// The proxy decodes no content coding, so a coded body is refused before the
 /// parse: its raw bytes could pass the `--` test, or even parse as JSON, while
 /// the upstream reads what they decode to. Bodies under no coding, `identity`
-/// or `chunked` framing pass.
+/// or a single `chunked` framing pass.
 #[tokio::test]
 async fn proxy_rejects_body_under_a_coding_it_does_not_decode() {
     use std::sync::atomic::Ordering;
@@ -782,60 +782,73 @@ async fn proxy_rejects_body_under_a_coding_it_does_not_decode() {
     let addr = serve(build_router(state)).await;
     let client = Client::new();
 
-    let refused: [(&str, &str, &[u8], &str); 5] = [
+    let refused: [(&str, &[u8], &[u8], &str); 7] = [
         (
             "content-encoding",
-            "br",
+            b"br",
             b"--\x8b\x7f",
             "content-encoding 'br'",
         ),
         (
             "content-encoding",
-            "gzip",
+            b"gzip",
             JSON.as_bytes(),
             "content-encoding 'gzip'",
         ),
         (
             "content-encoding",
-            "identity, deflate",
+            b"identity, deflate",
             JSON.as_bytes(),
             "content-encoding 'deflate'",
         ),
         (
             "content-encoding",
-            "",
+            b"",
             JSON.as_bytes(),
             "content-encoding ''",
         ),
         (
             "transfer-encoding",
-            "gzip, chunked",
+            b"gzip, chunked",
             JSON.as_bytes(),
             "transfer-encoding 'gzip'",
         ),
+        (
+            "transfer-encoding",
+            b"chunked, chunked",
+            JSON.as_bytes(),
+            "transfer-encoding 'chunked, chunked'",
+        ),
+        (
+            "content-encoding",
+            b"\xffgzip",
+            JSON.as_bytes(),
+            "content-encoding '(not visible ASCII)'",
+        ),
     ];
     for (header, value, body, message) in refused {
+        let value = HeaderValue::from_bytes(value).unwrap();
         let resp = client
             .post(format!("http://{addr}/v1/messages"))
             .header("content-type", "application/json")
-            .header(header, value)
+            .header(header, value.clone())
             .body(body)
             .send()
             .await
-            .unwrap_or_else(|e| panic!("{header}: {value}: no HTTP response: {e}"));
+            .unwrap_or_else(|e| panic!("{header}: {value:?}: no HTTP response: {e}"));
         assert_eq!(
             resp.status(),
             reqwest::StatusCode::BAD_REQUEST,
-            "{header}: {value}"
+            "{header}: {value:?}"
         );
         let json: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(
             json["error"]["type"], "invalid_request_error",
-            "{header}: {value}: {json}"
+            "{header}: {value:?}: {json}"
         );
         assert!(
             json["error"]["message"].as_str().unwrap().contains(message),
-            "{header}: {value}: {json}"
+            "{header}: {value:?}: {json}"
         );
     }
     assert_eq!(
@@ -870,5 +883,15 @@ async fn proxy_rejects_body_under_a_coding_it_does_not_decode() {
         reqwest::StatusCode::OK,
         "a bodiless request has nothing to decode"
     );
+    // Only the three passing rows and the bodiless request reach the upstream.
     assert_eq!(hits.load(Ordering::SeqCst), 4);
+
+    // A `chunked` repeated on a second header line counts the same.
+    let mut headers = hyper::HeaderMap::new();
+    headers.append("transfer-encoding", HeaderValue::from_static("chunked"));
+    headers.append("transfer-encoding", HeaderValue::from_static("chunked"));
+    assert_eq!(
+        undecoded_body_coding(&headers),
+        Some(("transfer-encoding", "chunked, chunked".to_string()))
+    );
 }
