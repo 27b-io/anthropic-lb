@@ -122,8 +122,8 @@ pub(crate) fn translate_anthropic_request_to_openai(
     #[cfg(test)]
     TRANSLATE_A2O_CALLS.with(|c| c.set(c.get() + 1));
 
-    // `model` is the one field forwarded as the client sent it, and the
-    // routing gate read a non-string one as no model at all (LAB-6894).
+    // `model` is the one forwarded field the routing gate reads, and the gate
+    // read a non-string one as no model at all (LAB-6894).
     let model = request_model(body).ok_or(MODEL_NOT_A_STRING)?;
     let mut out = serde_json::Map::new();
     out.insert("model".to_string(), model.into());
@@ -300,10 +300,9 @@ pub(crate) fn translate_anthropic_request_to_openai(
     // translator: an OpenAI-protocol endpoint can front Claude ≥ 4.7 (empty
     // `models` list serves everything), and the deprecated param 400s there
     // too. Policy in `drops_deprecated_temperature`.
-    let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
     for key in &["temperature", "top_p", "stream"] {
         if let Some(v) = body.get(*key) {
-            if *key == "temperature" && drops_deprecated_temperature(model_name, v) {
+            if *key == "temperature" && drops_deprecated_temperature(model, v) {
                 continue;
             }
             out.insert(key.to_string(), v.clone());
@@ -1561,7 +1560,7 @@ pub(crate) async fn openai_chat_handler(
         .unwrap_or(false);
     let json_mode = wants_json_object(&openai_body);
     // An absent, empty or non-string `model` reads as no model, which every
-    // `models` list allows, while a `Protocol::OpenAI` endpoint gets the
+    // endpoint `models` list allows, while a `Protocol::OpenAI` endpoint gets the
     // client's own `model` value and may read an array as several models
     // (LAB-6894). Refused before the gate, for every client class.
     let Some(model) = request_model(&openai_body) else {

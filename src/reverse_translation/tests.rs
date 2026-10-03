@@ -16,8 +16,8 @@ fn translate_a2o_drops_temperature_for_rejecting_model() {
     assert_eq!(result["top_p"], 0.9);
 }
 
-/// LAB-6894: `model` is the one field the translator forwards as sent, and
-/// the routing gate reads a non-string one as no model. Any model that is not
+/// LAB-6894: `model` is the one forwarded field the routing gate reads, and
+/// the gate reads a non-string one as no model. Any model that is not
 /// a non-empty string is an error, which makes the fallback body
 /// `Untranslatable`; a string one is copied as is.
 #[test]
@@ -1308,13 +1308,12 @@ async fn ambiguous_top_level_key_is_rejected_locally_on_both_surfaces() {
 /// LAB-6894: a `Protocol::OpenAI` endpoint gets the client's own `model`
 /// value, on `/v1/chat/completions` as sent and on the `/v1/messages`
 /// fallback through the translator. A non-string model reads as no model,
-/// which every `models` list allows, and a gateway may read an array or a
-/// comma list as several models. None of these may reach the endpoint, for
-/// any client class. A missing, empty or non-string model is a 400 on both
-/// surfaces. A comma model matches no `models` list, so the endpoint is never
-/// eligible. Unlike `/v1/messages`, the chat surface refuses a missing model
-/// before the gate. On `/v1/messages` the restricted client's gate refuses an
-/// unreadable model first, so only the other two classes see the 400.
+/// which every endpoint `models` list allows, and a gateway may read an array
+/// or a comma list as several models. None of these may reach the endpoint,
+/// for any client class. A missing, empty or non-string model is a 400 on
+/// both surfaces, except that on `/v1/messages` the restricted client's gate
+/// refuses an unreadable model first, with a 403. A comma model matches no
+/// `models` list, so the endpoint is never eligible.
 #[tokio::test]
 async fn non_string_or_comma_model_never_reaches_a_restricted_openai_endpoint() {
     use std::sync::atomic::Ordering;
@@ -1411,10 +1410,15 @@ async fn non_string_or_comma_model_never_reaches_a_restricted_openai_endpoint() 
                 .send()
                 .await
                 .unwrap();
-            assert!(
-                resp.status().is_client_error() || resp.status().is_server_error(),
-                "{key} {path}"
-            );
+            // The restricted client's gate refuses it; for the others no
+            // endpoint is eligible, which is the model-filtered exhaustion
+            // status.
+            let expected = if key == "key-limited" {
+                reqwest::StatusCode::FORBIDDEN
+            } else {
+                reqwest::StatusCode::TOO_MANY_REQUESTS
+            };
+            assert_eq!(resp.status(), expected, "{key} {path}");
         }
     }
     assert_eq!(
@@ -1422,31 +1426,6 @@ async fn non_string_or_comma_model_never_reaches_a_restricted_openai_endpoint() 
         0,
         "no unreadable or comma model may reach the endpoint"
     );
-}
-
-/// LAB-6894: the model checks leave a plain allowed `model` alone, so a
-/// restricted `Protocol::OpenAI` endpoint still gets the client's bytes.
-#[tokio::test]
-async fn openai_chat_forwards_allowed_model_byte_identically_to_restricted_endpoint() {
-    let (url, mut rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
-    let mut gw = make_endpoint("gw", Protocol::OpenAI);
-    gw.base_url = url;
-    gw.models = vec!["claude-haiku-*".to_string()];
-    let addr = serve(build_router(test_state_with(vec![gw]))).await;
-
-    let raw = r#"{ "messages": [{"role":"user","content":"hi"}],  "model":"claude-haiku-4-5", "max_tokens":5 }"#;
-    let resp = Client::new()
-        .post(format!("http://{addr}/v1/chat/completions"))
-        .header("content-type", "application/json")
-        .body(raw)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let (_, received) = rx
-        .try_recv()
-        .expect("an allowed model must reach the upstream");
-    assert_eq!(received.as_ref(), raw.as_bytes());
 }
 
 /// LAB-4323: the `invalid JSON` 400 was `text/plain`, next to a JSON 400 for
@@ -1478,16 +1457,17 @@ async fn openai_chat_invalid_json_returns_openai_envelope() {
 /// `Protocol::OpenAI` endpoint forwards the client's own bytes, so they must
 /// arrive byte-identical; the spacing and key order below would not survive a
 /// re-serialization. Unlike the content-guard byte-identity tests, this one
-/// runs without the `guard` feature.
+/// runs without the `guard` feature. The endpoint's `models` list shows the
+/// LAB-6894 model checks leave an allowed model alone too.
 #[tokio::test]
 async fn openai_chat_forwards_object_body_byte_identically() {
     let (url, mut rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
     gw.base_url = url;
+    gw.models = vec!["claude-haiku-*".to_string()];
     let addr = serve(build_router(test_state_with(vec![gw]))).await;
 
-    let raw =
-        r#"{ "messages": [{"role":"user","content":"hi"}],  "model":"gpt-x", "max_tokens":5 }"#;
+    let raw = r#"{ "messages": [{"role":"user","content":"hi"}],  "model":"claude-haiku-4-5", "max_tokens":5 }"#;
     let resp = Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .header("content-type", "application/json")

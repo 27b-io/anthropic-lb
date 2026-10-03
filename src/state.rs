@@ -532,6 +532,9 @@ pub(crate) struct Endpoint {
 /// model, allows everything. A non-empty list never matches a model holding a
 /// `,`: an OpenAI-compatible gateway may split it and serve every listed
 /// model, while a `*` pattern would match the whole string (LAB-6894).
+/// The empty-model allowance is safe for `Protocol::OpenAI` endpoints only
+/// because both surfaces refuse an empty or non-string model before routing
+/// to one (`request_model`).
 ///
 /// The SINGLE list-level implementation behind both model allowlists: which
 /// models an *endpoint* may serve (`Endpoint::serves_model`) and which models
