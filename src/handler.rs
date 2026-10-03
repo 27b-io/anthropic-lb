@@ -1238,6 +1238,7 @@ pub(crate) async fn forward_anthropic(
         let req_id_clone = req_id.to_owned();
         let session_key_clone = session_key.map(str::to_owned);
         let status_code = status.as_u16();
+        let fallback_charge = StreamFallbackCharge::from_request_body(req_body);
 
         tokio::spawn(async move {
             let mut scanner = SseUsageScanner::default();
@@ -1297,6 +1298,7 @@ pub(crate) async fn forward_anthropic(
                 status_code,
                 ctx,
                 scanner,
+                fallback_charge,
                 request_start,
                 client_disconnected,
                 upstream_error,

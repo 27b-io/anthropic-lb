@@ -778,11 +778,12 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for TopLevelObject
 
 /// Top-level fields a policy or routing decision reads: the client allow-list,
 /// endpoint `models` routing, the context window and the negative cache read
-/// `model`, fast-mode routing reads `speed`, and the content guard reads
-/// `messages` and `system`. A field a new decision starts reading belongs
-/// here; until it is added, its respellings pass as they did before this
-/// check existed.
-const DECISION_FIELDS: [&str; 4] = ["model", "speed", "messages", "system"];
+/// `model`, fast-mode routing reads `speed`, the content guard reads
+/// `messages` and `system`, and the budget charge for a stream that ends
+/// before its usage reads `max_tokens`. A field a new decision starts reading
+/// belongs here; until it is added, its respellings pass as they did before
+/// this check existed.
+const DECISION_FIELDS: [&str; 5] = ["model", "speed", "messages", "system", "max_tokens"];
 
 /// Every field whose respelling is refused: `DECISION_FIELDS`, every field a
 /// restricted attempt loses (`ANTHROPIC_FALLBACK_FIELDS`,

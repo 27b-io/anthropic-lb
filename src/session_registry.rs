@@ -468,6 +468,11 @@ pub(crate) fn log_proxied(
 
 /// Finalize a streaming response: extract usage, log, and shadow log.
 /// Shared by proxy_handler and openai_chat_handler.
+///
+/// Usage the upstream never reported is charged to the client's budget by
+/// `fallback` (LAB-7593), unless the upstream errored before the stream began.
+/// Only the budget: the token counters and log lines keep what the upstream
+/// reported.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize_stream(
     state: &AppState,
@@ -482,6 +487,7 @@ pub(crate) async fn finalize_stream(
     status_code: u16,
     ctx: ProxiedCtx,
     mut scanner: SseUsageScanner,
+    fallback: StreamFallbackCharge,
     request_start: std::time::Instant,
     client_disconnected: bool,
     upstream_error: bool,
@@ -494,8 +500,31 @@ pub(crate) async fn finalize_stream(
     // Response-derived model (message_start) preferred; request model fallback.
     let usage_model = scanner.model.as_deref().unwrap_or(model);
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
+    let reason = if upstream_error {
+        "upstream_error"
+    } else if client_disconnected {
+        "client_disconnect"
+    } else {
+        "no_usage_event"
+    };
+    // An upstream that errored before the stream began generated nothing (an
+    // in-band `overloaded_error` answering a 200 looks like this), so there
+    // is nothing to charge for. Keyed on the stream beginning, not on a
+    // readable input count: a `message_start` without one can still be
+    // followed by content.
+    let (charged_input, charged_output) = if upstream_error && !scanner.began {
+        (0, 0)
+    } else {
+        fallback.unreported(&scanner)
+    };
+    let charged = charged_input.saturating_add(charged_output);
+    // One budget write for reported usage and estimate together: two writes
+    // each key their own UTC day, so a request straddling midnight would
+    // book the estimate against the next day (LAB-7593 review).
+    state
+        .record_usage_charging(ep, client_id, usage_model, usage, charged)
+        .await;
     if !usage.is_empty() {
-        state.record_usage(ep, client_id, usage_model, usage).await;
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -510,13 +539,6 @@ pub(crate) async fn finalize_stream(
             );
         }
     } else {
-        let reason = if upstream_error {
-            "upstream_error"
-        } else if client_disconnected {
-            "client_disconnect"
-        } else {
-            "no_usage_event"
-        };
         // Log structural metadata only — SSE payloads contain user content.
         let truncated = scanner.event_count > 5;
         warn!(
@@ -532,6 +554,19 @@ pub(crate) async fn finalize_stream(
             sse_events = ?scanner.event_preview,
             truncated,
             "stream_end_no_usage"
+        );
+    }
+    if charged > 0 {
+        warn!(
+            req_id,
+            client_id,
+            model,
+            account = acct_name,
+            status = status_code,
+            reason,
+            charged_input,
+            charged_output,
+            "stream_usage_estimated"
         );
     }
     // Single terminal line for this request (LAB-3214), routing context
@@ -666,7 +701,25 @@ impl AppState {
     /// model — either way it is truncated and the pair-count is capped here,
     /// so callers cannot inflate the label set.
     async fn record_usage(&self, ep: &Endpoint, client_id: &str, model: &str, usage: &TokenUsage) {
+        self.record_usage_charging(ep, client_id, model, usage, 0)
+            .await;
+    }
+
+    /// `record_usage`, plus `estimated` tokens charged to the client's budget
+    /// only (LAB-7593): usage a stream never reported. Booked in the same
+    /// budget write as the reported usage, so both land on one UTC day.
+    async fn record_usage_charging(
+        &self,
+        ep: &Endpoint,
+        client_id: &str,
+        model: &str,
+        usage: &TokenUsage,
+        estimated: u64,
+    ) {
         if usage.is_empty() {
+            if client_id != "-" {
+                self.record_budget_usage(client_id, estimated).await;
+            }
             return;
         }
         ep.input_tokens
@@ -725,7 +778,8 @@ impl AppState {
                 entry[3] += usage.cache_read_input_tokens;
             }
             // Budget accounting
-            self.record_budget_usage(client_id, total).await;
+            self.record_budget_usage(client_id, total.saturating_add(estimated))
+                .await;
         }
     }
 

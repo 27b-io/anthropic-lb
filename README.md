@@ -1146,7 +1146,7 @@ The Anthropic↔OpenAI translation layer is not lossless. When an Anthropic-form
 13. If 5xx/529 → add to skip list, retry with different account
 14. Parse rate-limit headers (utilization per claim, reset times, status)
 15. Extract token usage from response (streaming SSE or JSON body; streams from `openai` endpoints have no usage extraction)
-16. Record extracted usage per-account + per-client, update budget (local + Redis)
+16. Record extracted usage per-account + per-client, update budget (local + Redis). A stream from an `anthropic` endpoint that ends before its final `message_delta` (client disconnect, upstream error) is charged to the budget at the request's `max_tokens` for output, plus a request-body estimate (bytes / 4) for input when no `message_start` arrived either. An upstream error before the stream begins (no frame but `error` or `ping`) is charged nothing, since no generation began. The token counters keep only what the upstream reported
 17. Write shadow log entry (async, non-blocking)
 18. State persisted to disk (+ Redis if configured), restored on restart
 ```
