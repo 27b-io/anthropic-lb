@@ -482,9 +482,12 @@ can steer are locked down by default:
   `fast_mode_disabled_remaining_secs` on `/_stats`). Later fast requests skip
   it — a client pinned to it via `preferred_endpoints` spills to the general
   pool — while requests without `speed: "fast"` keep using it. The proxy
-  never strips `speed` to get around a non-entitled org: if no eligible
-  account is entitled, the client gets a `400` with the upstream's error type
-  and message rather than a silent downgrade or a synthetic `429`. The first
+  never strips `speed` to get around a non-entitled org: once every eligible
+  account has answered with that `400`, the client gets a `400` with the
+  upstream's error type and message rather than a silent downgrade or a
+  synthetic `429`. A fast-mode `400` beside accounts that are merely
+  rate-limited stays a retryable `429`, since those accounts may serve the
+  request once they recover. The first
   such request gets the upstream response itself; while the marks last, the
   proxy answers with the same type and message and no upstream headers. A
   `passthrough` endpoint is never marked: it sends the caller's own
