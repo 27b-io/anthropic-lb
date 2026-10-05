@@ -153,7 +153,6 @@ async fn standard_speed_429_still_cools_account_and_rotates() {
 #[tokio::test]
 async fn fast_mode_burst_429_still_backs_off_and_rotates() {
     use std::sync::atomic::Ordering;
-    const HEAD_429_BURST: &str = "HTTP/1.1 429 Too Many Requests\r\nx-should-retry: true\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n";
     let (limited_url, _) =
         spawn_status_then_ok_upstream(usize::MAX, HEAD_429_BURST, ANTHROPIC_OK_BODY).await;
     let (healthy_url, healthy_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;

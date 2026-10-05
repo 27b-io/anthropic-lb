@@ -63,8 +63,6 @@ fn entitlement_400_predicate_is_anchored_exact_type_and_400_only() {
     }
 }
 
-type Hits = std::sync::Arc<std::sync::atomic::AtomicUsize>;
-
 /// `spent` (priority 0) always answers `body` as a 400; `healthy` at
 /// priority 1 is `healthy_url`. Priority, not affinity hashing, forces the
 /// first attempt onto `spent`, so hit counts are a clean "did we re-send?"

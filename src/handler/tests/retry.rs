@@ -399,3 +399,130 @@ async fn proxy_retries_on_server_error() {
     // Two calls to upstream (500 + 200)
     assert_eq!(call_count.load(Ordering::Relaxed), 2);
 }
+
+// ── Passthrough 429: the caller's own limit, never endpoint state ──
+
+/// Sends `body` to `path` through a passthrough endpoint that answers `head`,
+/// with a healthy pooled account behind it. A passthrough request carries the
+/// caller's credential, so its 429 reports the caller's plan. It must reach
+/// the caller unchanged, with no cooldown (which would take the endpoint from
+/// every other caller), no rotation (which would cover the caller's limit
+/// with pooled capacity) and no headroom ingest.
+async fn assert_passthrough_429_untouched(path: &str, body: &'static str) {
+    use std::sync::atomic::Ordering;
+    for (kind, head, retry_hints) in [
+        (
+            "capacity 429",
+            HEAD_429_CAPACITY,
+            (Some("7".to_string()), None),
+        ),
+        (
+            "burst 429",
+            HEAD_429_BURST,
+            (None, Some("true".to_string())),
+        ),
+    ] {
+        let (endpoints, pt_hits, ok_hits) = first_then_healthy(PASSTHROUGH, head).await;
+        let state = test_state_with(endpoints);
+        let addr = serve(build_router(state.clone())).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}{path}"))
+            .header("content-type", "application/json")
+            .header("x-api-key", "sk-ant-api-caller")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "{path} {kind}: the caller must get its own 429"
+        );
+        let hint = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        };
+        assert_eq!(
+            (hint("retry-after"), hint("x-should-retry")),
+            retry_hints,
+            "{path} {kind}: the caller's SDK needs upstream's back-off hints"
+        );
+        assert_eq!(
+            (
+                pt_hits.load(Ordering::SeqCst),
+                ok_hits.load(Ordering::SeqCst)
+            ),
+            (1, 0),
+            "{path} {kind}: must not rotate onto a pooled account"
+        );
+        let info = state.endpoints[0].rate_info.read().await;
+        assert!(
+            info.hard_limited_until.is_none(),
+            "{path} {kind}: must not cool the endpoint"
+        );
+        assert_eq!(
+            info.consecutive_burst_429s, 0,
+            "{path} {kind}: must not climb the burst ladder"
+        );
+        assert_eq!(
+            (info.remaining_requests, info.remaining_tokens),
+            (None, None),
+            "{path} {kind}: must not poison remaining_*"
+        );
+        assert_eq!(
+            (
+                info.utilization_5h,
+                info.status_5h.as_deref(),
+                info.representative_claim.as_deref()
+            ),
+            (None, None, None),
+            "{path} {kind}: must not ingest the caller's rate-limit headers"
+        );
+        assert!(
+            info.last_updated.is_none(),
+            "{path} {kind}: rate_info must be untouched"
+        );
+    }
+}
+
+#[tokio::test]
+async fn passthrough_429_is_returned_untouched_on_messages_path() {
+    assert_passthrough_429_untouched(
+        "/v1/messages",
+        r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn passthrough_429_is_returned_untouched_on_chat_completions_path() {
+    assert_passthrough_429_untouched(
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+}
+
+/// The same response from a pooled endpoint still cools it and rotates, so
+/// the passthrough tests above cannot pass on a 429 the proxy ignores anyway.
+#[tokio::test]
+async fn pooled_capacity_429_still_cools_and_rotates() {
+    use std::sync::atomic::Ordering;
+    let (endpoints, _, ok_hits) = first_then_healthy(POOLED, HEAD_429_CAPACITY).await;
+    let state = test_state_with(endpoints);
+    let addr = serve(build_router(state.clone())).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(ok_hits.load(Ordering::SeqCst), 1);
+    let info = state.endpoints[0].rate_info.read().await;
+    assert!(info.hard_limited_until.is_some());
+    assert_eq!(info.utilization_5h, Some(1.0));
+}

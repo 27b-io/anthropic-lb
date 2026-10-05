@@ -312,7 +312,12 @@ pub(crate) fn describe_reqwest_error(e: &reqwest::Error) -> String {
 /// success or 4xx client error) it returns `Ok(resp)` — handing the
 /// response back so the caller can continue.
 ///
-/// One exception: a non-burst 429 on a `speed: "fast"` request returns
+/// Any 429 with `caller_credential` set returns `Ok(resp)`, burst included.
+/// The request went out with the caller's own auth (a passthrough endpoint),
+/// so the 429 reports the caller's plan, not the endpoint, and is never
+/// endpoint state, for the reason `classify_rejection` gives.
+///
+/// Fast-mode exception: a non-burst 429 on a `speed: "fast"` request returns
 /// `Ok(resp)` too, uncooled and unrotated — fast mode has its own rate
 /// bucket, so that 429 is not evidence about the account (LAB-2675).
 ///
@@ -321,6 +326,7 @@ pub(crate) fn describe_reqwest_error(e: &reqwest::Error) -> String {
 /// passthrough) get `{"error":{...}}`, Anthropic-surface callers get
 /// `{"type":"error",...}` — matching how every other error arm on those
 /// paths translates per surface.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn classify_retry_status(
     state: &AppState,
     status: StatusCode,
@@ -334,6 +340,7 @@ pub(crate) async fn classify_retry_status(
     // that needs it, and so no caller can hand this function a `false` that
     // is only true for non-429 statuses.
     fast_mode_body: Option<&bytes::Bytes>,
+    caller_credential: bool,
 ) -> Result<reqwest::Response, ForwardOutcome> {
     // 3xx → deliberate 502. The upstream client follows no redirects
     // (`Policy::none()`), because following one would re-send the account
@@ -387,6 +394,19 @@ pub(crate) async fn classify_retry_status(
 
     // 429 → mark hard-limited and try next account
     if status == StatusCode::TOO_MANY_REQUESTS {
+        // …unless it answered the caller's own credential. Every such 429 goes
+        // back to the caller, burst included: a burst limit on the caller's
+        // credential still says nothing about the endpoint. Marking would cool
+        // the endpoint for every caller on every replica, and rotating would
+        // cover the caller's own limit with a pooled account. Checked before
+        // the fast-mode test so its bookkeeping stays out of it too.
+        if caller_credential {
+            info!(
+                account = endpoint_name,
+                "got 429 on the caller's own credential, returning it unchanged"
+            );
+            return Ok(resp);
+        }
         // …unless the request asked for fast mode. Fast mode has its own rate
         // bucket, separate from the account's standard 5h/7d windows, so a
         // fast-mode 429 is not evidence the account is exhausted. Cooling the
@@ -1122,6 +1142,7 @@ pub(crate) async fn forward_anthropic(
             // when the LAB-1261 strip removed `speed` — use that value, not
             // the parameter.
             is_fast_mode,
+            passthrough,
         )
         .await;
 
@@ -1139,6 +1160,7 @@ pub(crate) async fn forward_anthropic(
         // The bytes actually sent upstream (the OAuth variant on OAuth
         // tokens) — that body is what picks the rate bucket.
         Some(req_body),
+        passthrough,
     )
     .await
     {

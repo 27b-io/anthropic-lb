@@ -973,6 +973,7 @@ async fn forward_openai_compat_anthropic(
             // here always answers a standard-speed request (LAB-2693).
             /* is_fast_mode */
             false,
+            passthrough,
         )
         .await;
 
@@ -989,6 +990,7 @@ async fn forward_openai_compat_anthropic(
         /* openai_error_shape */ true,
         // The OpenAI request shape cannot express `speed` — never fast.
         None,
+        passthrough,
     )
     .await
     {
@@ -1053,6 +1055,13 @@ async fn forward_openai_compat_anthropic(
 
     // Non-2xx: log error detail, translate to OpenAI error format, return
     if !status.is_success() {
+        // The error is rebuilt below without the upstream headers, so carry
+        // over the two the caller's SDK backs off on.
+        let retry_hints: Vec<(&str, reqwest::header::HeaderValue)> =
+            ["retry-after", "x-should-retry"]
+                .into_iter()
+                .filter_map(|name| Some((name, resp.headers().get(name)?.clone())))
+                .collect();
         let error_body = resp.bytes().await.unwrap_or_else(|e| {
             warn!(req_id, account = endpoint_name, error = %e, "openai-compat: failed to read upstream error body");
             bytes::Bytes::new()
@@ -1133,10 +1142,14 @@ async fn forward_openai_compat_anthropic(
                 })
             };
 
-        let response = Response::builder()
+        let mut builder = Response::builder()
             .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
             .header("content-type", "application/json")
-            .header("x-budget-status", budget_status)
+            .header("x-budget-status", budget_status);
+        for (name, value) in retry_hints {
+            builder = builder.header(name, value);
+        }
+        let response = builder
             .body(Body::from(
                 serde_json::to_vec(&openai_error).unwrap_or_default(),
             ))

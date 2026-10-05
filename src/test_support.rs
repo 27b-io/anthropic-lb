@@ -608,6 +608,32 @@ pub(crate) const HEAD_429_RETRY_AFTER_7: &str = "HTTP/1.1 429 Too Many Requests\
 /// Raw 404 with Anthropic's model-not-found envelope (`connection: close`, so
 /// the body is EOF-delimited — no content-length needed).
 pub(crate) const HEAD_404_MODEL: &str = "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"model: claude-nope-1\"}}";
+/// A capacity 429: `retry-after` plus unified headers reporting an exhausted
+/// 5h window, so ingesting or marking it visibly changes `rate_info`.
+pub(crate) const HEAD_429_CAPACITY: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\nanthropic-ratelimit-unified-5h-utilization: 1.0\r\nanthropic-ratelimit-unified-5h-status: rejected\r\nanthropic-ratelimit-unified-representative-claim: five_hour\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"rate limited\"}}";
+/// A burst 429 (`is_burst_429`): `x-should-retry`, no `retry-after`, no rate
+/// headers. The body is EOF-delimited (`connection: close`).
+pub(crate) const HEAD_429_BURST: &str = "HTTP/1.1 429 Too Many Requests\r\nx-should-retry: true\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"rate limited\"}}";
+
+pub(crate) type Hits = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+/// Endpoint `name` (with `token`) at priority 0 that always answers `head`,
+/// and a healthy pooled account at priority 1. Any rotation off the first
+/// lands on `healthy`, so its hit count is the "did we rotate?" probe.
+/// `PASSTHROUGH` makes the first a passthrough endpoint, `pt`.
+pub(crate) async fn first_then_healthy(
+    (name, token): (&str, &str),
+    head: &'static str,
+) -> (Vec<Endpoint>, Hits, Hits) {
+    let (first_url, first_hits) = spawn_status_then_ok_upstream(usize::MAX, head, b"{}").await;
+    let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+    healthy.priority = 1;
+    let first = mk_endpoint_at(name, token, &first_url);
+    (vec![first, healthy], first_hits, ok_hits)
+}
+pub(crate) const PASSTHROUGH: (&str, &str) = ("pt", "passthrough");
+pub(crate) const POOLED: (&str, &str) = ("pooled", "sk-ant-api-pooled");
 
 /// Poll endpoint token counters until streamed usage lands (the finalize
 /// task is detached, so recording races the client seeing end-of-stream).

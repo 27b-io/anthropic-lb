@@ -174,6 +174,9 @@ pub(crate) async fn try_fallback_upstream(
         /* openai_error_shape */ !translate,
         // The OpenAI request shape cannot express `speed` — never fast.
         None,
+        // Always the endpoint's own token, never the caller's.
+        /* caller_credential */
+        false,
     )
     .await
     {
