@@ -573,6 +573,10 @@ impl Endpoint {
     /// responses describe whichever caller sent them, so its `rate_info` is
     /// never ingested; restored or synced data could then never be
     /// refreshed, and would pin its routing weight indefinitely.
+    ///
+    /// Persistence drops the whole entry, not just `rate_info`, so a
+    /// passthrough endpoint's `requests_total` restarts at 0 after a restart.
+    /// That is deliberate: do not loosen this predicate to keep the counter.
     pub(crate) fn has_own_rate_state(&self) -> bool {
         self.protocol == Protocol::Anthropic && !self.passthrough
     }

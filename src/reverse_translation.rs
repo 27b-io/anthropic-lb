@@ -1057,11 +1057,10 @@ async fn forward_openai_compat_anthropic(
     if !status.is_success() {
         // The error is rebuilt below without the upstream headers, so carry
         // over the two the caller's SDK backs off on.
-        let retry_hints: Vec<(&str, reqwest::header::HeaderValue)> =
-            ["retry-after", "x-should-retry"]
-                .into_iter()
-                .filter_map(|name| Some((name, resp.headers().get(name)?.clone())))
-                .collect();
+        let retry_hints: Vec<(&str, reqwest::header::HeaderValue)> = RETRY_HINT_HEADERS
+            .into_iter()
+            .filter_map(|name| Some((name, resp.headers().get(name)?.clone())))
+            .collect();
         let error_body = resp.bytes().await.unwrap_or_else(|e| {
             warn!(req_id, account = endpoint_name, error = %e, "openai-compat: failed to read upstream error body");
             bytes::Bytes::new()

@@ -1821,11 +1821,13 @@ mod redis_integration {
         let Some((mut conn, fred)) = redis_test_conn(Db::PassthroughNotSynced).await else {
             return;
         };
-        let (mut endpoints, _, _) = first_then_healthy(PASSTHROUGH, HEAD_429_CAPACITY).await;
-        let (mut pooled, _, _) = first_then_healthy(POOLED, HEAD_429_CAPACITY).await;
-        endpoints.truncate(1);
-        endpoints.push(pooled.remove(0));
-        let state = state_with_redis(endpoints, fred);
+        let state = state_with_redis(
+            vec![
+                mk_endpoint_at(PASSTHROUGH.0, PASSTHROUGH.1, "http://127.0.0.1:9"),
+                mk_endpoint_at(POOLED.0, POOLED.1, "http://127.0.0.1:9"),
+            ],
+            fred,
+        );
         let now_epoch = AppState::now_epoch();
         let rate = serde_json::to_string(&remote_rate_info(now_epoch, 1.0)).unwrap();
         for name in ["pt", "pooled"] {

@@ -520,7 +520,7 @@ async fn passthrough_endpoint_rate_state_is_never_restored_or_saved() {
     let until = AppState::now_epoch() + 3600;
     let exhausted = |name: &str| {
         format!(
-            r#"{{"name":"{name}","requests_total":0,"remaining_tokens":0,"utilization":1.0,"hard_limited_until_epoch":{until}}}"#
+            r#"{{"name":"{name}","requests_total":0,"remaining_tokens":0,"hard_limited_until_epoch":{until}}}"#
         )
     };
     std::fs::write(
@@ -547,7 +547,7 @@ async fn passthrough_endpoint_rate_state_is_never_restored_or_saved() {
     drop(pooled_info);
     let info = state.endpoints[0].rate_info.read().await;
     assert!(info.hard_limited_until.is_none());
-    assert_eq!((info.remaining_tokens, info.utilization), (None, None));
+    assert_eq!(info.remaining_tokens, None);
     assert!(info.last_updated.is_none());
     drop(info);
 

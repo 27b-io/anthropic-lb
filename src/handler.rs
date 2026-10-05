@@ -722,34 +722,40 @@ pub(crate) fn proxy_error_response(
         .into_response()
 }
 
+/// Upstream's back-off hints: `retry-after` on a forwarded 4xx, and the
+/// transient `x-should-retry`. Every site that forwards an upstream error
+/// keeps these.
+pub(crate) const RETRY_HINT_HEADERS: [&str; 2] = ["retry-after", "x-should-retry"];
+
 /// Copy the allow-listed upstream response headers onto `builder`. Everything
 /// not listed here stays behind the proxy (LAB-1191 / 2026-06-02 audit
 /// finding 3: the old copy-everything loop leaked `anthropic-ratelimit-*` —
 /// the pooled capacity of every account — plus `set-cookie` and
 /// org-identifying headers). `expose_ratelimit` (config
 /// `expose_upstream_ratelimit_headers`, trusted networks only) restores the
-/// `anthropic-ratelimit-*` passthrough for tooling that reads it. One other
-/// site reflects upstream headers: `forward_anthropic`'s body-read-failure
-/// 502 arm copies `anthropic-ratelimit-*` behind the same flag.
+/// `anthropic-ratelimit-*` passthrough for tooling that reads it. Two other
+/// sites reflect upstream headers: `forward_anthropic`'s body-read-failure
+/// 502 arm copies `anthropic-ratelimit-*` behind the same flag, and
+/// `forward_openai_compat_anthropic`'s error rebuild copies `RETRY_HINT_HEADERS`.
 fn reflect_upstream_headers(
     mut builder: axum::http::response::Builder,
     headers: &reqwest::header::HeaderMap,
     expose_ratelimit: bool,
 ) -> axum::http::response::Builder {
     // What SDKs need to function: body framing (content-type/length),
-    // SSE cache hint, the Anthropic request id for error reports, retry-after
-    // on forwarded 4xx, and the upstream's transient retry hint.
+    // SSE cache hint and the Anthropic request id for error reports, plus
+    // `RETRY_HINT_HEADERS`.
     const ALLOWED: &[&str] = &[
         "content-type",
         "content-length",
         "cache-control",
         "request-id",
-        "retry-after",
-        "x-should-retry",
     ];
     for (k, v) in headers.iter() {
         let name = k.as_str();
-        if ALLOWED.contains(&name) || (expose_ratelimit && name.starts_with("anthropic-ratelimit-"))
+        if ALLOWED.contains(&name)
+            || RETRY_HINT_HEADERS.contains(&name)
+            || (expose_ratelimit && name.starts_with("anthropic-ratelimit-"))
         {
             builder = builder.header(k, v);
         }
