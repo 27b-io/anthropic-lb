@@ -92,7 +92,8 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            # Pinned: the release binary's glibc floor follows the build image.
+            runner: ubuntu-24.04
             cross: false
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
