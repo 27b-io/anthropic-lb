@@ -566,6 +566,16 @@ impl Endpoint {
             && !self.passthrough
             && self.token.starts_with(OAUTH_TOKEN_PREFIX)
     }
+
+    /// True when `rate_info` describes this endpoint, so it is worth
+    /// persisting, restoring and syncing across replicas. An OpenAI endpoint
+    /// carries no Anthropic rate-limit data. A passthrough endpoint's
+    /// responses describe whichever caller sent them, so its `rate_info` is
+    /// never ingested; restored or synced data could then never be
+    /// refreshed, and would pin its routing weight indefinitely.
+    pub(crate) fn has_own_rate_state(&self) -> bool {
+        self.protocol == Protocol::Anthropic && !self.passthrough
+    }
 }
 
 pub(crate) struct AppState {

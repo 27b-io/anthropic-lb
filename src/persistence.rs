@@ -199,10 +199,8 @@ impl AppState {
             }
         }
 
-        // Skip OpenAI endpoints — their rate_info is a permanent stub with no
-        // state worth persisting.
         for ep in &self.endpoints {
-            if ep.protocol == Protocol::OpenAI {
+            if !ep.has_own_rate_state() {
                 continue;
             }
             endpoints.push(persist_one(&ep.name, &ep.requests, &ep.rate_info, now).await);
@@ -522,7 +520,7 @@ impl AppState {
             let restore_target: Option<(&AtomicU64, &RwLock<RateLimitInfo>)> = self
                 .endpoints
                 .iter()
-                .find(|e| e.name == pa.name)
+                .find(|e| e.name == pa.name && e.has_own_rate_state())
                 .map(|e| (&e.requests, &e.rate_info));
             if let Some((requests, rate_info)) = restore_target {
                 requests.store(pa.requests_total, Ordering::Relaxed);

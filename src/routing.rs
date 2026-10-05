@@ -1157,8 +1157,7 @@ impl AppState {
         let now_epoch = Self::now_epoch();
         let now_instant = Instant::now();
 
-        // Sync target list over the endpoint pool. OpenAI endpoints are
-        // skipped: they carry no Anthropic rate-limit data.
+        // Sync target list over the endpoints whose rate state is their own.
         struct SyncTarget<'a> {
             name: &'a str,
             rate_info: &'a RwLock<RateLimitInfo>,
@@ -1168,7 +1167,7 @@ impl AppState {
         }
         let mut targets: Vec<SyncTarget<'_>> = Vec::new();
         for e in &self.endpoints {
-            if e.protocol == Protocol::OpenAI {
+            if !e.has_own_rate_state() {
                 continue;
             }
             targets.push(SyncTarget {

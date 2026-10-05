@@ -839,7 +839,7 @@ async fn gateway_echo_of_client_key_does_not_negative_cache() {
 /// account at priority 1: without the passthrough veto the 404 would mark
 /// `pt` and rotate onto `healthy`.
 async fn passthrough_404_then_healthy() -> (Arc<AppState>, SocketAddr, Hits, Hits) {
-    let (endpoints, pt_hits, ok_hits) = passthrough_then_healthy(HEAD_404_MODEL).await;
+    let (endpoints, pt_hits, ok_hits) = first_then_healthy(PASSTHROUGH, HEAD_404_MODEL).await;
     let state = test_state_with(endpoints);
     let addr = serve(build_router(state.clone())).await;
     (state, addr, pt_hits, ok_hits)

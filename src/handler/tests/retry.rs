@@ -410,11 +410,19 @@ async fn proxy_retries_on_server_error() {
 /// with pooled capacity) and no headroom ingest.
 async fn assert_passthrough_429_untouched(path: &str, body: &'static str) {
     use std::sync::atomic::Ordering;
-    for (kind, head) in [
-        ("capacity 429", HEAD_429_CAPACITY),
-        ("burst 429", HEAD_429_BURST),
+    for (kind, head, retry_hints) in [
+        (
+            "capacity 429",
+            HEAD_429_CAPACITY,
+            (Some("7".to_string()), None),
+        ),
+        (
+            "burst 429",
+            HEAD_429_BURST,
+            (None, Some("true".to_string())),
+        ),
     ] {
-        let (endpoints, pt_hits, ok_hits) = passthrough_then_healthy(head).await;
+        let (endpoints, pt_hits, ok_hits) = first_then_healthy(PASSTHROUGH, head).await;
         let state = test_state_with(endpoints);
         let addr = serve(build_router(state.clone())).await;
         let resp = reqwest::Client::new()
@@ -429,6 +437,17 @@ async fn assert_passthrough_429_untouched(path: &str, body: &'static str) {
             resp.status(),
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             "{path} {kind}: the caller must get its own 429"
+        );
+        let hint = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        };
+        assert_eq!(
+            (hint("retry-after"), hint("x-should-retry")),
+            retry_hints,
+            "{path} {kind}: the caller's SDK needs upstream's back-off hints"
         );
         assert_eq!(
             (
@@ -491,10 +510,7 @@ async fn passthrough_429_is_returned_untouched_on_chat_completions_path() {
 #[tokio::test]
 async fn pooled_capacity_429_still_cools_and_rotates() {
     use std::sync::atomic::Ordering;
-    let (endpoints, _pt_hits, ok_hits) = passthrough_then_healthy(HEAD_429_CAPACITY).await;
-    let mut endpoints = endpoints;
-    endpoints[0].token = "sk-ant-api-pooled".to_string();
-    endpoints[0].passthrough = false;
+    let (endpoints, _, ok_hits) = first_then_healthy(POOLED, HEAD_429_CAPACITY).await;
     let state = test_state_with(endpoints);
     let addr = serve(build_router(state.clone())).await;
     let resp = reqwest::Client::new()
