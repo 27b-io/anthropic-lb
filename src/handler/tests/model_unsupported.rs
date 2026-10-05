@@ -835,18 +835,12 @@ async fn gateway_echo_of_client_key_does_not_negative_cache() {
     }
 }
 
-type Hits = std::sync::Arc<std::sync::atomic::AtomicUsize>;
-
 /// Passthrough endpoint returning `HEAD_404_MODEL` at priority 0, a healthy
 /// account at priority 1: without the passthrough veto the 404 would mark
 /// `pt` and rotate onto `healthy`.
 async fn passthrough_404_then_healthy() -> (Arc<AppState>, SocketAddr, Hits, Hits) {
-    let (pt_url, pt_hits) = spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
-    let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
-    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
-    healthy.priority = 1;
-    let state = test_state_with(vec![mk_endpoint_at("pt", "passthrough", &pt_url), healthy]);
-    assert!(state.endpoints[0].passthrough);
+    let (endpoints, pt_hits, ok_hits) = passthrough_then_healthy(HEAD_404_MODEL).await;
+    let state = test_state_with(endpoints);
     let addr = serve(build_router(state.clone())).await;
     (state, addr, pt_hits, ok_hits)
 }

@@ -400,6 +400,9 @@ impl AppState {
                     // Probes never request fast mode (PROBE_MODELS, fixed body).
                     /* is_fast_mode */
                     false,
+                    // Passthrough endpoints are never probed (skipped above).
+                    /* caller_credential */
+                    false,
                 )
                 .await;
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {

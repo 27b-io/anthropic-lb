@@ -973,6 +973,7 @@ async fn forward_openai_compat_anthropic(
             // here always answers a standard-speed request (LAB-2693).
             /* is_fast_mode */
             false,
+            passthrough,
         )
         .await;
 
@@ -989,6 +990,7 @@ async fn forward_openai_compat_anthropic(
         /* openai_error_shape */ true,
         // The OpenAI request shape cannot express `speed` — never fast.
         None,
+        passthrough,
     )
     .await
     {

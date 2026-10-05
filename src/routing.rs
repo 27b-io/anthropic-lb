@@ -597,18 +597,26 @@ impl AppState {
             &ep.name,
             headers,
             /* is_fast_mode */ false,
+            /* caller_credential */ false,
         )
         .await;
     }
 
     /// Parse rate-limit headers from a response into the supplied
     /// `RateLimitInfo` lock.
+    ///
+    /// `caller_credential` is true when the request went out with the
+    /// caller's own auth (a passthrough endpoint). The headers then describe
+    /// the caller's plan, not the endpoint, so they are skipped like a
+    /// fast-mode response's: ingesting them would let one caller's plan set
+    /// the endpoint's routing weight for every other caller.
     pub(crate) async fn update_rate_info_for(
         &self,
         rate_info: &RwLock<RateLimitInfo>,
         endpoint_name: &str,
         headers: &reqwest::header::HeaderMap,
         is_fast_mode: bool,
+        caller_credential: bool,
     ) {
         // A fast-mode response's `anthropic-ratelimit-unified-*` headers
         // describe the FAST/paid POOL, not the account's 5h/7d subscription
@@ -637,7 +645,7 @@ impl AppState {
         // fast response could still freeze this account's standard view; the
         // ≤`probe_interval_secs` background probe refreshes the real 5h/7d view
         // regardless of traffic, bounding that staleness.
-        if is_fast_mode {
+        if is_fast_mode || caller_credential {
             return;
         }
 

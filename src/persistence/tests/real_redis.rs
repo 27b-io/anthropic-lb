@@ -59,6 +59,7 @@ mod redis_integration {
         SeedBudgetMirror = 16,
         TransportErrorsExpireDenied = 17,
         TransportErrorsHincrbyRejected = 18,
+        PassthroughNoHardMark = 19,
     }
 
     impl Db {
@@ -1749,6 +1750,67 @@ mod redis_integration {
         assert_eq!(
             info["redis_connected"], true,
             "cluster_info must reflect the attached backend"
+        );
+    }
+
+    /// A passthrough 429 answers the caller's own credential, so it must
+    /// write no `alb:hard:` key, which would cool the endpoint for every
+    /// caller on every replica. Covers a capacity and a burst 429 on both
+    /// Anthropic paths. The pooled control proves this harness sees the key
+    /// when a 429 does mark the endpoint.
+    #[tokio::test]
+    async fn passthrough_429_never_writes_shared_hard_limit() {
+        let Some((conn, fred)) = redis_test_conn(Db::PassthroughNoHardMark).await else {
+            return;
+        };
+        let send = |addr: SocketAddr, path: &'static str, body: &'static str| async move {
+            reqwest::Client::new()
+                .post(format!("http://{addr}{path}"))
+                .header("content-type", "application/json")
+                .header("x-api-key", "sk-ant-api-caller")
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        };
+        const MESSAGES: (&str, &str) = (
+            "/v1/messages",
+            r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        const CHAT: (&str, &str) = (
+            "/v1/chat/completions",
+            r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        for head in [HEAD_429_CAPACITY, HEAD_429_BURST] {
+            for (path, body) in [MESSAGES, CHAT] {
+                let (endpoints, _, _) = passthrough_then_healthy(head).await;
+                let addr = serve(build_router(state_with_redis(endpoints, fred.clone()))).await;
+                assert_eq!(
+                    send(addr, path, body).await,
+                    reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    "{path}: the caller must get its own 429"
+                );
+            }
+        }
+
+        let (mut endpoints, _, _) = passthrough_then_healthy(HEAD_429_CAPACITY).await;
+        endpoints[0].name = "pooled".to_string();
+        endpoints[0].token = "sk-ant-api-pooled".to_string();
+        endpoints[0].passthrough = false;
+        let addr = serve(build_router(state_with_redis(endpoints, fred.clone()))).await;
+        let (path, body) = MESSAGES;
+        assert_eq!(send(addr, path, body).await, reqwest::StatusCode::OK);
+        eventually("the pooled 429 to write alb:hard:pooled", || {
+            let mut c = conn.clone();
+            async move { c.exists::<_, bool>("alb:hard:pooled").await.unwrap() }
+        })
+        .await;
+
+        let mut c = conn.clone();
+        assert!(
+            !c.exists::<_, bool>("alb:hard:pt").await.unwrap(),
+            "a passthrough 429 must not mark the endpoint for other replicas"
         );
     }
 }
