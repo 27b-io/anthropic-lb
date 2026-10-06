@@ -645,7 +645,8 @@ same 400 rather than forwarded unscanned:
   `source`, `title`, `context`, `refusal` or `thinking` field
   (`{"type": "x", "text": "..."}`). A newest-turn `refusal` or `thinking` part
   or block that carries its text is therefore rejected, on `/v1/messages` and
-  `/v1/chat/completions` alike.
+  `/v1/chat/completions` alike. On `/v1/chat/completions` so is one in any
+  `tool` message, older turns included (below).
   Audio, file, `tool_reference` and `browser_state` blocks carry none of those
   and still pass; images are skipped as a known binary type. Each of these is content the guard never saw and the upstream would
   have;
