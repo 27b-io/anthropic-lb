@@ -1374,7 +1374,7 @@ async fn guard_block_scans_document_and_search_result_blocks() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-document-blocks.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let native_addr = serve(build_router(state)).await;
@@ -1386,7 +1386,7 @@ async fn guard_block_scans_document_and_search_result_blocks() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-document-blocks-openai.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let openai_addr = serve(build_router(openai_state)).await;
@@ -1460,7 +1460,7 @@ async fn guard_block_fails_closed_on_oversized_document_text() {
         clients: vec![guard_block_client()],
         state_path: PathBuf::from("/tmp/anthropic-lb-guard-oversized-document.state.json"),
         auto_cache: false,
-        guard: crate::guard::Guard::new().expect("guard rules"),
+        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
     });
     let addr = serve(build_router(state)).await;
