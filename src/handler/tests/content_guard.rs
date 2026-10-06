@@ -938,8 +938,8 @@ fn in_newest_turn(shape: &str, blocks: serde_json::Value) -> [(String, serde_jso
 /// LAB-5542: content blocks the scanner cannot read, each carrying the secret
 /// where that unreadability would hide it. Two kinds.
 ///
-/// A block type the scanner does not know that carries a text-bearing field
-/// (`text`, `content`, `source`). Skipping those forwarded whatever they held:
+/// A block type the scanner does not know that carries one of
+/// `TEXT_BEARING_FIELDS` in `src/guard.rs`. Skipping those forwarded whatever they held:
 /// `{"type":"x","text":"<secret>"}` scanned as nothing.
 ///
 /// A `document` or `search_result` — types the scanner now reads — in a shape
@@ -1223,6 +1223,13 @@ fn guard_openai_translation_loss_shapes(secret: &str) -> Vec<(&'static str, serd
                 {"type": "search_result", "title": leak}
             ]}]),
         ),
+        (
+            "tool-part-text-with-source",
+            serde_json::json!([{"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "text", "text": "hello",
+                 "source": {"type": "text", "media_type": "text/plain", "data": leak}}
+            ]}]),
+        ),
         // LAB-5627: the same join drops a `refusal` or `thinking` part's own
         // field, which an OpenAI-compatible upstream renders as text.
         (
@@ -1235,13 +1242,6 @@ fn guard_openai_translation_loss_shapes(secret: &str) -> Vec<(&'static str, serd
             "tool-part-thinking",
             serde_json::json!([{"role": "tool", "tool_call_id": "t1", "content": [
                 {"type": "thinking", "thinking": leak}
-            ]}]),
-        ),
-        (
-            "tool-part-text-with-source",
-            serde_json::json!([{"role": "tool", "tool_call_id": "t1", "content": [
-                {"type": "text", "text": "hello",
-                 "source": {"type": "text", "media_type": "text/plain", "data": leak}}
             ]}]),
         ),
     ]

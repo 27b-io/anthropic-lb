@@ -365,8 +365,10 @@ fn carries(block: &Value, key: &str) -> bool {
 ///
 /// LAB-5627: also an OpenAI `refusal` part's `refusal` and a `thinking` part's
 /// `thinking`. The scanner reads neither, but an OpenAI-compatible upstream
-/// such as vLLM renders both as text in any role, so a newest-turn part
-/// carrying one fails closed instead of forwarding unread.
+/// such as vLLM renders both as text in any role, so a part carrying one fails
+/// closed instead of forwarding unread: through the unknown-type arm of
+/// [`collect_block`] in the newest user turn, and through the `tool`-part check
+/// in [`openai_message_readable`] in any `tool` message.
 const TEXT_BEARING_FIELDS: [&str; 7] = [
     "text", "content", "source", "title", "context", "refusal", "thinking",
 ];
