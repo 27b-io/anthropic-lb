@@ -969,6 +969,16 @@ fn guard_unreadable_block_shapes(secret: &str) -> Vec<(&'static str, serde_json:
             "unknown-type-content",
             serde_json::json!([{"type": "x", "content": leak}]),
         ),
+        // LAB-5627: an OpenAI-compatible upstream renders both as text, in any
+        // role, so their own fields are text-bearing too.
+        (
+            "unknown-type-refusal",
+            serde_json::json!([{"type": "refusal", "refusal": leak}]),
+        ),
+        (
+            "unknown-type-thinking",
+            serde_json::json!([{"type": "thinking", "thinking": leak}]),
+        ),
         (
             "tool-result-nested",
             serde_json::json!([{"type": "tool_result", "tool_use_id": "t2", "content": [
@@ -1211,6 +1221,20 @@ fn guard_openai_translation_loss_shapes(secret: &str) -> Vec<(&'static str, serd
             "tool-part-search-result-title-only",
             serde_json::json!([{"role": "tool", "tool_call_id": "t1", "content": [
                 {"type": "search_result", "title": leak}
+            ]}]),
+        ),
+        // LAB-5627: the same join drops a `refusal` or `thinking` part's own
+        // field, which an OpenAI-compatible upstream renders as text.
+        (
+            "tool-part-refusal",
+            serde_json::json!([{"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "refusal", "refusal": leak}
+            ]}]),
+        ),
+        (
+            "tool-part-thinking",
+            serde_json::json!([{"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "thinking", "thinking": leak}
             ]}]),
         ),
         (

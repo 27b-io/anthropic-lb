@@ -362,7 +362,14 @@ fn carries(block: &Value, key: &str) -> bool {
 /// The content-block fields that carry model-visible text: a `text` block's
 /// `text`, a `document`'s `source` / `title` / `context`, a `search_result`'s
 /// `content` / `source` / `title`.
-const TEXT_BEARING_FIELDS: [&str; 5] = ["text", "content", "source", "title", "context"];
+///
+/// LAB-5627: also an OpenAI `refusal` part's `refusal` and a `thinking` part's
+/// `thinking`. The scanner reads neither, but an OpenAI-compatible upstream
+/// such as vLLM renders both as text in any role, so a newest-turn part
+/// carrying one fails closed instead of forwarding unread.
+const TEXT_BEARING_FIELDS: [&str; 7] = [
+    "text", "content", "source", "title", "context", "refusal", "thinking",
+];
 
 /// Pull every model-visible string out of one newest-turn content block, at
 /// top level or inside `tool_result.content` (a newest-turn `tool_result` is
