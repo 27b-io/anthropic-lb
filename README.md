@@ -885,7 +885,8 @@ each request whose own upstream response carried
 `anthropic-ratelimit-unified-overage-in-use: true`, i.e. usage billed as paid
 extra usage. It reads the serving response's headers, not the account's last
 known state, so concurrent responses on one account cannot mislabel each
-other. It shares the per-model family's labels and bound, and also counts
+other; the `proxied` log line carries the same flag as `served_overage`, beside
+the account-level `overage`. It shares the per-model family's labels and bound, and also counts
 anonymous (`client="-"`) traffic. Join it to a `(model, type)` price series to
 estimate extra-usage spend.
 

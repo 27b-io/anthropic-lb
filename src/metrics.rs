@@ -63,6 +63,9 @@ fn prom_counter(buf: &mut String, name: &str, labels: &[(&str, &str)], value: u6
     buf.push('\n');
 }
 
+/// The `type` label of each slot in a `[u64; 4]` token-usage array.
+const TOKEN_TYPES: [&str; 4] = ["input", "output", "cache_creation", "cache_read"];
+
 /// Emit a `{client, model, type}` token counter family from a per-(client,
 /// model) usage map. Operators aggregate into `_operator` per model, matching
 /// the house pattern. Cardinality is bounded at record time
@@ -74,7 +77,6 @@ fn prom_client_model_family(
     help: &str,
     usage: &[((String, String), [u64; 4])],
 ) {
-    const TYPES: [&str; 4] = ["input", "output", "cache_creation", "cache_read"];
     prom_header(buf, name, "counter", help);
     let mut op_model_tokens: HashMap<&str, [u64; 4]> = HashMap::new();
     for ((client, mdl), tokens) in usage {
@@ -84,7 +86,7 @@ fn prom_client_model_family(
                 e[i] += tokens[i];
             }
         } else {
-            for (i, t) in TYPES.iter().enumerate() {
+            for (i, t) in TOKEN_TYPES.iter().enumerate() {
                 prom_counter(
                     buf,
                     name,
@@ -95,7 +97,7 @@ fn prom_client_model_family(
         }
     }
     for (mdl, tokens) in &op_model_tokens {
-        for (i, t) in TYPES.iter().enumerate() {
+        for (i, t) in TOKEN_TYPES.iter().enumerate() {
             prom_counter(
                 buf,
                 name,
@@ -1262,12 +1264,11 @@ pub(crate) async fn metrics_handler(
         "counter",
         "Per-client token usage by type",
     );
-    let types = ["input", "output", "cache_creation", "cache_read"];
     let mut emitted_operator_token = false;
     for client in &all_clients {
         if state.is_operator(client) {
             if !emitted_operator_token {
-                for (i, t) in types.iter().enumerate() {
+                for (i, t) in TOKEN_TYPES.iter().enumerate() {
                     prom_counter(
                         &mut buf,
                         "anthropic_client_token_usage_total",
@@ -1279,7 +1280,7 @@ pub(crate) async fn metrics_handler(
             }
         } else {
             let tokens = client_usage.get(*client).copied().unwrap_or([0; 4]);
-            for (i, t) in types.iter().enumerate() {
+            for (i, t) in TOKEN_TYPES.iter().enumerate() {
                 prom_counter(
                     &mut buf,
                     "anthropic_client_token_usage_total",

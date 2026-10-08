@@ -391,8 +391,8 @@ pub(crate) enum ProxiedCtx {
         util_5h: String,
         util_7d: String,
         constraint: &'static str,
-        /// The account's shared overage flag, for the log line. Billing
-        /// reads `served_on_overage` instead.
+        /// The account's shared overage flag. Billing reads
+        /// `served_on_overage`, which the log line also carries.
         overage: bool,
         served_on_overage: bool,
         pin: &'static str,
@@ -455,11 +455,11 @@ pub(crate) fn log_proxied(
             util_7d,
             constraint,
             overage,
+            served_on_overage,
             pin,
             total,
             fp,
             hints,
-            ..
         } => {
             info!(
                 req_id,
@@ -476,6 +476,7 @@ pub(crate) fn log_proxied(
                 util_7d = %util_7d,
                 constraint = *constraint,
                 overage,
+                served_overage = *served_on_overage,
                 pin = *pin,
                 total,
                 fp = %fp,
@@ -497,9 +498,9 @@ pub(crate) fn log_proxied(
             util_5h,
             util_7d,
             constraint,
+            served_on_overage,
             pin,
             stream,
-            ..
         } => {
             info!(
                 req_id,
@@ -515,6 +516,7 @@ pub(crate) fn log_proxied(
                 util_5h = %util_5h,
                 util_7d = %util_7d,
                 constraint = *constraint,
+                served_overage = *served_on_overage,
                 pin = *pin,
                 openai_compat = true,
                 stream,

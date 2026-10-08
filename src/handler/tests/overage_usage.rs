@@ -47,7 +47,7 @@ async fn spawn_upstream(stream: bool, overage: bool) -> String {
     format!("http://{addr}")
 }
 
-async fn serve_one(url: &str, path: &str, body: String) -> Arc<AppState> {
+async fn serve_one(url: &str, path: &str, body: String, client: &str) -> Arc<AppState> {
     let mut acct = make_endpoint("acct", Protocol::Anthropic);
     acct.base_url = url.to_owned();
     let state = test_state_with(vec![acct]);
@@ -55,7 +55,7 @@ async fn serve_one(url: &str, path: &str, body: String) -> Arc<AppState> {
     let resp = Client::new()
         .post(format!("http://{addr}{path}"))
         .header("content-type", "application/json")
-        .header("x-client-id", CLIENT)
+        .header("x-client-id", client)
         .body(body)
         .send()
         .await
@@ -65,10 +65,10 @@ async fn serve_one(url: &str, path: &str, body: String) -> Arc<AppState> {
     state
 }
 
-/// `(overage, all)` usage for `(CLIENT, MODEL)` once `all` is booked — a
+/// `(overage, all)` usage for `(client, MODEL)` once `all` is booked — a
 /// stream finalizes in the relay's detached task — or after 5 s.
-async fn settled(state: &AppState) -> (Option<[u64; 4]>, Option<[u64; 4]>) {
-    let key = (CLIENT.to_string(), MODEL.to_string());
+async fn settled(state: &AppState, client: &str) -> (Option<[u64; 4]>, Option<[u64; 4]>) {
+    let key = (client.to_string(), MODEL.to_string());
     for _ in 0..500 {
         if state.lock_client_model_usage().contains_key(&key) {
             break;
@@ -92,8 +92,8 @@ async fn overage_response_books_its_tokens() {
     for path in ROUTES {
         for stream in [false, true] {
             let url = spawn_upstream(stream, true).await;
-            let state = serve_one(&url, path, request_body(stream, None)).await;
-            let (overage, all) = settled(&state).await;
+            let state = serve_one(&url, path, request_body(stream, None), CLIENT).await;
+            let (overage, all) = settled(&state, CLIENT).await;
             assert_eq!(all, Some(TOKENS), "{path} stream={stream}: usage recorded");
             assert_eq!(
                 overage,
@@ -109,8 +109,8 @@ async fn standard_response_books_nothing() {
     for path in ROUTES {
         for stream in [false, true] {
             let url = spawn_upstream(stream, false).await;
-            let state = serve_one(&url, path, request_body(stream, None)).await;
-            let (overage, all) = settled(&state).await;
+            let state = serve_one(&url, path, request_body(stream, None), CLIENT).await;
+            let (overage, all) = settled(&state, CLIENT).await;
             assert_eq!(all, Some(TOKENS), "{path} stream={stream}: usage recorded");
             assert_eq!(
                 overage, None,
@@ -123,14 +123,33 @@ async fn standard_response_books_nothing() {
 /// A fast-mode 200 is kept out of the account's shared `RateLimitInfo`
 /// (LAB-2693), so the shared flag stays `false` while this response says
 /// `true`. The meter follows the response: it is what the request billed.
+/// The `proxied` line carries both flags, so logs reconcile with the meter.
 #[tokio::test]
 async fn meter_reads_the_response_not_the_account() {
+    let buf = log_capture_buf();
+    let client = "overage-fast-mode-marker";
     let url = spawn_upstream(false, true).await;
-    let state = serve_one(&url, "/v1/messages", request_body(false, Some("fast"))).await;
-    let (overage, _) = settled(&state).await;
+    let state = serve_one(
+        &url,
+        "/v1/messages",
+        request_body(false, Some("fast")),
+        client,
+    )
+    .await;
+    let (overage, _) = settled(&state, client).await;
     assert!(
         !state.endpoints[0].rate_info.read().await.overage_in_use,
         "fast-mode headers must not reach the shared account state"
     );
     assert_eq!(overage, Some(TOKENS));
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let line = output
+        .lines()
+        .find(|l| l.contains(client) && l.contains("proxied"))
+        .unwrap_or_else(|| panic!("no proxied line:\n{output}"));
+    assert!(
+        line.contains("overage=false") && line.contains("served_overage=true"),
+        "the proxied line must carry the shared and per-response flags: {line}"
+    );
 }
