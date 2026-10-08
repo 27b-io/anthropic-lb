@@ -481,6 +481,21 @@ async fn metrics_operator_hiding() {
         );
     }
     {
+        let mut usage = state.overage_usage.lock().unwrap();
+        usage.insert(
+            ("op-alice".to_string(), "claude-sonnet-5".to_string()),
+            [40, 0, 0, 0],
+        );
+        usage.insert(
+            ("op-bob".to_string(), "claude-sonnet-5".to_string()),
+            [2, 0, 0, 0],
+        );
+        usage.insert(
+            ("user-charlie".to_string(), "claude-haiku-4-5".to_string()),
+            [0, 9, 0, 0],
+        );
+    }
+    {
         let mut rates = state.client_request_rates.lock().unwrap();
         rates.insert(
             "op-alice".to_string(),
@@ -567,6 +582,20 @@ async fn metrics_operator_hiding() {
             "anthropic_client_model_token_usage_total{client=\"user-charlie\",model=\"claude-haiku-4-5\",type=\"output\"} 20"
         ),
         "regular client per-model tokens should be emitted:\n{body}"
+    );
+
+    // LAB-8496: the overage family shares labels and operator rollup.
+    assert!(
+        body.contains(
+            "anthropic_overage_token_usage_total{client=\"_operator\",model=\"claude-sonnet-5\",type=\"input\"} 42"
+        ),
+        "operator overage tokens should sum to 42:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "anthropic_overage_token_usage_total{client=\"user-charlie\",model=\"claude-haiku-4-5\",type=\"output\"} 9"
+        ),
+        "regular client overage tokens should be emitted:\n{body}"
     );
 
     // Regular client should appear normally

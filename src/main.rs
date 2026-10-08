@@ -901,6 +901,7 @@ async fn main() {
         auto_cache: config.auto_cache.unwrap_or(true),
         client_usage: Mutex::new(HashMap::new()),
         client_model_usage: Mutex::new(HashMap::new()),
+        overage_usage: Mutex::new(HashMap::new()),
         shadow_log_tx,
         shadow_log_dropped: AtomicU64::new(0),
         client_budgets: config.client_budgets.clone(),

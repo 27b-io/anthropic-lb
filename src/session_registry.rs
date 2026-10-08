@@ -391,7 +391,10 @@ pub(crate) enum ProxiedCtx {
         util_5h: String,
         util_7d: String,
         constraint: &'static str,
+        /// The account's shared overage flag. Billing reads
+        /// `served_on_overage`, which the log line also carries.
         overage: bool,
+        served_on_overage: bool,
         pin: &'static str,
         total: u64,
         /// Content fingerprint (12 hex, `content_fingerprints`) joining this
@@ -406,9 +409,24 @@ pub(crate) enum ProxiedCtx {
         util_5h: String,
         util_7d: String,
         constraint: &'static str,
+        served_on_overage: bool,
         pin: &'static str,
         stream: bool,
     },
+}
+
+impl ProxiedCtx {
+    /// Whether THIS response carried `overage-in-use: true` (LAB-8496).
+    fn served_on_overage(&self) -> bool {
+        match self {
+            Self::Anthropic {
+                served_on_overage, ..
+            }
+            | Self::OpenaiCompat {
+                served_on_overage, ..
+            } => *served_on_overage,
+        }
+    }
 }
 
 /// Emit the single per-request INFO line merging routing context with token
@@ -437,6 +455,7 @@ pub(crate) fn log_proxied(
             util_7d,
             constraint,
             overage,
+            served_on_overage,
             pin,
             total,
             fp,
@@ -457,6 +476,7 @@ pub(crate) fn log_proxied(
                 util_7d = %util_7d,
                 constraint = *constraint,
                 overage,
+                served_overage = *served_on_overage,
                 pin = *pin,
                 total,
                 fp = %fp,
@@ -478,6 +498,7 @@ pub(crate) fn log_proxied(
             util_5h,
             util_7d,
             constraint,
+            served_on_overage,
             pin,
             stream,
         } => {
@@ -495,6 +516,7 @@ pub(crate) fn log_proxied(
                 util_5h = %util_5h,
                 util_7d = %util_7d,
                 constraint = *constraint,
+                served_overage = *served_on_overage,
                 pin = *pin,
                 openai_compat = true,
                 stream,
@@ -566,6 +588,9 @@ pub(crate) async fn finalize_stream(
     state
         .record_usage_charging(ep, client_id, usage_model, usage, charged)
         .await;
+    if ctx.served_on_overage() {
+        state.record_overage_usage(client_id, usage_model, usage);
+    }
     if !usage.is_empty() {
         if let Some(key) = session_key {
             state.record_session(
@@ -675,6 +700,9 @@ pub(crate) async fn finalize_non_stream(
     ctx: Option<ProxiedCtx>,
 ) {
     let usage_model = response_model.unwrap_or(model);
+    if ctx.as_ref().is_some_and(ProxiedCtx::served_on_overage) {
+        state.record_overage_usage(client_id, usage_model, usage);
+    }
     if !usage.is_empty() {
         state.record_usage(ep, client_id, usage_model, usage).await;
         if let Some(key) = session_key {
@@ -736,7 +764,49 @@ pub(crate) async fn finalize_non_stream(
     state.shadow_log(log);
 }
 
+/// Add `usage` to a per-(client, model) map, bounding its label set: the
+/// model is truncated (empty → `unknown`), and once the map holds
+/// `MAX_CLIENT_MODEL_LABELS` pairs every new pair lumps into ONE global
+/// ("_other", "_other") bucket — a hard bound of the cap + 1. A per-client
+/// ("<client>", "_other") key would let x-client-id rotation (legacy auth
+/// modes) grow the map without bound (LAB-2330).
+fn add_client_model_usage(
+    map: &mut HashMap<(String, String), [u64; 4]>,
+    client_id: &str,
+    model: &str,
+    usage: &TokenUsage,
+) {
+    let model = if model.is_empty() {
+        "unknown".to_owned()
+    } else {
+        truncate_label(model)
+    };
+    let key = (client_id.to_owned(), model);
+    let key = if map.len() < MAX_CLIENT_MODEL_LABELS || map.contains_key(&key) {
+        key
+    } else {
+        ("_other".to_owned(), "_other".to_owned())
+    };
+    let entry = map.entry(key).or_insert([0; 4]);
+    entry[0] += usage.input_tokens;
+    entry[1] += usage.output_tokens;
+    entry[2] += usage.cache_creation_input_tokens;
+    entry[3] += usage.cache_read_input_tokens;
+}
+
 impl AppState {
+    /// Book usage served on paid extra usage (LAB-8496) into
+    /// `anthropic_overage_token_usage_total`. Callers pass the flag read from
+    /// the serving response's own headers, never the account's shared
+    /// `RateLimitInfo`, which a concurrent response on the same account may
+    /// have overwritten.
+    fn record_overage_usage(&self, client_id: &str, model: &str, usage: &TokenUsage) {
+        if usage.is_empty() {
+            return;
+        }
+        add_client_model_usage(&mut self.lock_overage_usage(), client_id, model, usage);
+    }
+
     /// Record token usage for an endpoint and client. `model` feeds the
     /// per-(client, model) counter (LAB-2330): callers pass the
     /// response-derived model where available, falling back to the request
@@ -795,30 +865,7 @@ impl AppState {
             // exists when the upstream returned usage, so the model string was
             // accepted upstream; truncation + the pair cap bound the label set
             // regardless.
-            let model = if model.is_empty() {
-                "unknown".to_owned()
-            } else {
-                truncate_label(model)
-            };
-            {
-                let mut map = self.lock_client_model_usage();
-                let key = (client_id.to_owned(), model);
-                let key = if map.len() < MAX_CLIENT_MODEL_LABELS || map.contains_key(&key) {
-                    key
-                } else {
-                    // Map full and this pair is new: lump into ONE global
-                    // overflow bucket — hard bound of MAX_CLIENT_MODEL_LABELS
-                    // + 1 entries. A per-client ("<client>", "_other") key
-                    // would let x-client-id rotation (legacy auth modes) grow
-                    // the map without bound (LAB-2330).
-                    ("_other".to_owned(), "_other".to_owned())
-                };
-                let entry = map.entry(key).or_insert([0; 4]);
-                entry[0] += usage.input_tokens;
-                entry[1] += usage.output_tokens;
-                entry[2] += usage.cache_creation_input_tokens;
-                entry[3] += usage.cache_read_input_tokens;
-            }
+            add_client_model_usage(&mut self.lock_client_model_usage(), client_id, model, usage);
             // Budget accounting
             self.record_budget_usage(client_id, total.saturating_add(estimated))
                 .await;

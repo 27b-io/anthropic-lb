@@ -1044,6 +1044,7 @@ async fn forward_openai_compat_anthropic(
                 .map(|v| format!("{v:.2}"))
                 .unwrap_or_else(|| "-".to_string()),
             constraint,
+            served_on_overage: overage_in_use(resp.headers()),
             pin: state.pin_status(client_id, endpoint_idx),
             stream: is_streaming,
         };

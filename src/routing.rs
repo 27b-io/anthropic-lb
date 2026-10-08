@@ -837,11 +837,7 @@ impl AppState {
         // Overage (paid extra usage) — account-level, covers whichever subscription
         // window is exhausted. `overage-in-use` is always overwritten: header absent
         // or "false" → false (so demotion auto-clears when the window refills).
-        info.overage_in_use = headers
-            .get("anthropic-ratelimit-unified-overage-in-use")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        info.overage_in_use = overage_in_use(headers);
         if info.overage_in_use {
             info.overage_status = headers
                 .get("anthropic-ratelimit-unified-overage-status")
@@ -1340,6 +1336,12 @@ impl AppState {
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<(String, String), [u64; 4]>> {
         lock_recovering(&self.client_model_usage, "client_model_usage")
+    }
+
+    pub(crate) fn lock_overage_usage(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(String, String), [u64; 4]>> {
+        lock_recovering(&self.overage_usage, "overage_usage")
     }
 
     pub(crate) fn lock_client_request_rates(

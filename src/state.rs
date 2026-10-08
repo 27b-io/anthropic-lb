@@ -390,6 +390,16 @@ const MAX_429_BODY_LOG_BYTES: usize = 512;
 pub(crate) const SENSITIVE_HEADER_SUBSTRINGS: &[&str] =
     &["auth", "cookie", "token", "key", "secret", "session"];
 
+/// Whether a response was served on paid extra usage: its
+/// `anthropic-ratelimit-unified-overage-in-use` header reads `true` (any
+/// case). Absent or anything else is `false`.
+pub(crate) fn overage_in_use(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get("anthropic-ratelimit-unified-overage-in-use")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.eq_ignore_ascii_case("true"))
+}
+
 /// True when a 429 is a transient BURST limit rather than capacity exhaustion:
 /// `x-should-retry` set, but no `retry-after` and no rate-limit headers.
 ///
@@ -639,6 +649,12 @@ pub(crate) struct AppState {
     /// global ("_other", "_other") bucket), so callers cannot inflate the
     /// label set on either axis.
     pub(crate) client_model_usage: Mutex<HashMap<(String, String), [u64; 4]>>,
+    /// Per-(client, model) usage served on paid extra usage: the serving
+    /// response carried `overage-in-use: true` (LAB-8496). Same key, layout
+    /// and cap as `client_model_usage`, but counted independently: it also
+    /// counts anonymous (`-`) traffic, which is billed all the same, and the
+    /// two maps reach their `_other` overflow at different times.
+    pub(crate) overage_usage: Mutex<HashMap<(String, String), [u64; 4]>>,
     /// Shadow log sender (fire-and-forget JSONL appends). None = disabled.
     pub(crate) shadow_log_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Count of shadow log entries dropped due to channel backpressure.
