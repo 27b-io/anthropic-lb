@@ -1072,6 +1072,7 @@ impl AppState {
             retry_after_raw = ?raw_retry_after,
             burst = is_burst_limit,
             consecutive_burst = info.consecutive_burst_429s,
+            unified = unified_ratelimit_summary(headers),
             "account hard rate-limited (429), cooling down"
         );
 
