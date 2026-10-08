@@ -108,10 +108,9 @@ impl AppState {
                 }
             });
         };
-        // OpenAI endpoints are skipped — sync_from_redis only reads weights
-        // for Anthropic targets.
+        // Mirrors `sync_from_redis`'s targets: nothing reads the others' weights.
         for ep in &self.endpoints {
-            if ep.protocol == Protocol::OpenAI {
+            if !ep.has_own_rate_state() {
                 continue;
             }
             publish(
