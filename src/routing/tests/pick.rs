@@ -402,25 +402,13 @@ async fn mark_hard_limited_logs_unified_headers() {
     );
     let line = mine[0];
     assert!(line.contains(" WARN "), "{line}");
-    // `HeaderMap` iteration order is unspecified, so compare the pairs as a set.
-    let field = line
-        .split_once("unified=\"")
-        .and_then(|(_, rest)| rest.split_once('"'))
-        .map(|(field, _)| field)
-        .unwrap_or_else(|| panic!("no unified field: {line}"));
-    let mut pairs: Vec<&str> = field.split(' ').collect();
-    pairs.sort_unstable();
-    assert_eq!(
-        pairs,
-        [
-            "7d-reset=1790000000",
-            "7d-status=rejected",
-            "overage-disabled-reason=org_level_disabled",
-            "overage-in-use=false",
-            "overage-status=rejected",
-            "representative-claim=seven_day",
-            "status=rejected",
-        ],
+    // Sorted by name, whatever order the headers were inserted in.
+    assert!(
+        line.contains(
+            "unified=\"7d-reset=1790000000 7d-status=rejected \
+             overage-disabled-reason=org_level_disabled overage-in-use=false \
+             overage-status=rejected representative-claim=seven_day status=rejected\""
+        ),
         "{line}"
     );
     assert!(!line.contains("req_not_logged"), "{line}");
