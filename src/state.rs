@@ -412,25 +412,6 @@ pub(crate) fn is_burst_429(headers: &reqwest::header::HeaderMap) -> bool {
     should_retry && !headers.contains_key("retry-after") && !has_rate_headers
 }
 
-/// Every `anthropic-ratelimit-unified-*` header on a response, prefix
-/// stripped, as space-separated `name=value` pairs in wire order. Logged on
-/// each hard 429 so the log shows which window refused and whether an
-/// overage path was open: `retry-after` alone reads the same for a spent
-/// week and for a refusal that clears within a minute (LAB-8497). The
-/// unified headers carry window state only, never a credential. Each value
-/// is clipped to `MAX_LABEL_CHARS`.
-pub(crate) fn unified_ratelimit_summary(headers: &reqwest::header::HeaderMap) -> String {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            let short = name.as_str().strip_prefix("anthropic-ratelimit-unified-")?;
-            let value = truncate_label(value.to_str().unwrap_or("<binary>"));
-            Some(format!("{short}={value}"))
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Format 429 response headers and body for a single debug log line.
 /// Redacts sensitive headers, truncates body to MAX_429_BODY_LOG_BYTES.
 pub(crate) async fn log_429_details(account_name: &str, resp: reqwest::Response) {

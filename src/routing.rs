@@ -1,5 +1,22 @@
 use crate::*;
 
+/// Every `anthropic-ratelimit-unified-*` header on a response, prefix
+/// stripped, as space-separated `name=value` pairs. Logged on each hard 429
+/// so the log shows which window refused and whether an overage path was
+/// open: `retry-after` alone reads the same for a spent week and for a
+/// refusal that clears within a minute (LAB-8497). The unified headers carry
+/// window state only, never a credential.
+fn unified_ratelimit_summary(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let short = name.as_str().strip_prefix("anthropic-ratelimit-unified-")?;
+            Some(format!("{short}={}", value.to_str().unwrap_or("<binary>")))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl AppState {
     pub(crate) fn routing_weight_publish_ttl(probe_interval_secs: u64) -> u64 {
         const FALLBACK_PUBLISH_INTERVAL_SECS: u64 = 60;
