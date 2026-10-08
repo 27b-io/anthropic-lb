@@ -42,7 +42,7 @@ Routes requests across multiple Anthropic accounts using dynamic capacity-based 
 | **Status-based routing** | Parses API status headers — `warning`/`throttled`/`rejected` enforce utilization floors |
 | **429 rotation** | Rate-limited accounts cool down, traffic shifts instantly |
 | **5xx retry** | Automatic retry on 500/502/503/504/529 (picks different account) |
-| **Token tracking** | Per-account and per-client input/output/cache token counters, plus a per-(client, model) breakdown (`anthropic_client_model_token_usage_total{client,model,type}`) for model-mix and API-price attribution |
+| **Token tracking** | Per-account and per-client input/output/cache token counters, plus a per-(client, model) breakdown (`anthropic_client_model_token_usage_total{client,model,type}`) for model-mix and API-price attribution, and the same breakdown for tokens served on paid extra usage (`anthropic_overage_token_usage_total{client,model,type}`) |
 | **Client budgets** | Daily per-client token budgets with automatic reset |
 | **Utilization limits** | Per-client utilization ceiling — 429 when all Anthropic endpoints exceed limit |
 | **Operator bypass** | Designated client bypasses all budget, utilization, and emergency checks |
@@ -879,6 +879,15 @@ models sharing their first 64 characters share one label.
 `client="_other",model="_other"` bucket, because its client id can be
 header-asserted under legacy auth (bounded at 256 + 1 distinct (client,
 model) pairs).
+
+`anthropic_overage_token_usage_total{client,model,type}` counts the tokens of
+each request whose own upstream response carried
+`anthropic-ratelimit-unified-overage-in-use: true`, i.e. usage billed as paid
+extra usage. It reads the serving response's headers, not the account's last
+known state, so concurrent responses on one account cannot mislabel each
+other. It shares the per-model family's labels and bound, and also counts
+anonymous (`client="-"`) traffic. Join it to a `(model, type)` price series to
+estimate extra-usage spend.
 
 ### Per-claim rate-limit visibility
 

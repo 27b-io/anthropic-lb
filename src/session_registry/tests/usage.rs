@@ -455,3 +455,25 @@ async fn record_usage_charging_books_estimate_to_budget_only() {
     assert!(!counters.contains_key("c2"));
     assert_eq!(state.endpoints[0].output_tokens.load(Ordering::Relaxed), 0);
 }
+
+// ── LAB-8496: usage served on paid extra usage ─────────────────
+
+#[tokio::test]
+async fn record_overage_usage_counts_anonymous_and_skips_empty() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 4,
+        output_tokens: 3,
+        cache_creation_input_tokens: 2,
+        cache_read_input_tokens: 1,
+    };
+    // Anonymous traffic is billed too, unlike the per-client families.
+    state.record_overage_usage("-", "claude-sonnet-5", &usage);
+    state.record_overage_usage("c1", "claude-sonnet-5", &TokenUsage::default());
+    let map = state.overage_usage.lock().unwrap();
+    assert_eq!(
+        map.get(&("-".to_string(), "claude-sonnet-5".to_string())),
+        Some(&[4, 3, 2, 1])
+    );
+    assert_eq!(map.len(), 1, "empty usage must not mint a key");
+}

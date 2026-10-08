@@ -1219,6 +1219,7 @@ pub(crate) async fn forward_anthropic(
                 .unwrap_or_else(|| "-".to_string()),
             constraint,
             overage: info.overage_in_use,
+            served_on_overage: overage_in_use(resp.headers()),
             pin: state.pin_status(client_id, endpoint_idx),
             total: ep.requests.load(Ordering::Relaxed),
             fp: fp.unwrap_or("-").to_string(),

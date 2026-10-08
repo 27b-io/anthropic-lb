@@ -63,6 +63,49 @@ fn prom_counter(buf: &mut String, name: &str, labels: &[(&str, &str)], value: u6
     buf.push('\n');
 }
 
+/// Emit a `{client, model, type}` token counter family from a per-(client,
+/// model) usage map. Operators aggregate into `_operator` per model, matching
+/// the house pattern. Cardinality is bounded at record time
+/// (MAX_CLIENT_MODEL_LABELS).
+fn prom_client_model_family(
+    buf: &mut String,
+    state: &AppState,
+    name: &str,
+    help: &str,
+    usage: &[((String, String), [u64; 4])],
+) {
+    const TYPES: [&str; 4] = ["input", "output", "cache_creation", "cache_read"];
+    prom_header(buf, name, "counter", help);
+    let mut op_model_tokens: HashMap<&str, [u64; 4]> = HashMap::new();
+    for ((client, mdl), tokens) in usage {
+        if state.is_operator(client) {
+            let e = op_model_tokens.entry(mdl.as_str()).or_insert([0; 4]);
+            for i in 0..4 {
+                e[i] += tokens[i];
+            }
+        } else {
+            for (i, t) in TYPES.iter().enumerate() {
+                prom_counter(
+                    buf,
+                    name,
+                    &[("client", client), ("model", mdl), ("type", t)],
+                    tokens[i],
+                );
+            }
+        }
+    }
+    for (mdl, tokens) in &op_model_tokens {
+        for (i, t) in TYPES.iter().enumerate() {
+            prom_counter(
+                buf,
+                name,
+                &[("client", "_operator"), ("model", mdl), ("type", t)],
+                tokens[i],
+            );
+        }
+    }
+}
+
 fn prom_header(buf: &mut String, name: &str, metric_type: &str, help: &str) {
     use std::fmt::Write;
     let _ = writeln!(buf, "# HELP {name} {help}");
@@ -526,6 +569,11 @@ pub(crate) async fn metrics_handler(
     let client_usage = state.lock_client_usage().clone();
     let client_model_usage: Vec<((String, String), [u64; 4])> = state
         .lock_client_model_usage()
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    let overage_usage: Vec<((String, String), [u64; 4])> = state
+        .lock_overage_usage()
         .iter()
         .map(|(k, v)| (k.clone(), *v))
         .collect();
@@ -1245,42 +1293,24 @@ pub(crate) async fn metrics_handler(
     // Per-(client, model) usage (LAB-2330). Sibling of the per-client family
     // above — that one stays authoritative for per-client totals; this one
     // adds the model dimension so per-model pricing can be applied downstream.
-    // Operators aggregate into `_operator` per model, matching the house
-    // pattern. Cardinality is bounded at record time (MAX_CLIENT_MODEL_LABELS).
-    prom_header(
+    prom_client_model_family(
         &mut buf,
+        &state,
         "anthropic_client_model_token_usage_total",
-        "counter",
         "Per-client token usage by model and type",
+        &client_model_usage,
     );
-    let mut op_model_tokens: HashMap<&str, [u64; 4]> = HashMap::new();
-    for ((client, mdl), tokens) in &client_model_usage {
-        if state.is_operator(client) {
-            let e = op_model_tokens.entry(mdl.as_str()).or_insert([0; 4]);
-            for i in 0..4 {
-                e[i] += tokens[i];
-            }
-        } else {
-            for (i, t) in types.iter().enumerate() {
-                prom_counter(
-                    &mut buf,
-                    "anthropic_client_model_token_usage_total",
-                    &[("client", client), ("model", mdl), ("type", t)],
-                    tokens[i],
-                );
-            }
-        }
-    }
-    for (mdl, tokens) in &op_model_tokens {
-        for (i, t) in types.iter().enumerate() {
-            prom_counter(
-                &mut buf,
-                "anthropic_client_model_token_usage_total",
-                &[("client", "_operator"), ("model", mdl), ("type", t)],
-                tokens[i],
-            );
-        }
-    }
+
+    // Tokens served on paid extra usage (LAB-8496): the serving response
+    // carried `overage-in-use: true`. Same labels as the family above, so
+    // spend panels price it with the same `(model, type)` join.
+    prom_client_model_family(
+        &mut buf,
+        &state,
+        "anthropic_overage_token_usage_total",
+        "Per-client token usage served on paid extra usage, by model and type",
+        &overage_usage,
+    );
 
     prom_header(
         &mut buf,

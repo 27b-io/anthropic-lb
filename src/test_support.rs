@@ -157,6 +157,7 @@ pub(crate) fn test_state_base() -> AppState {
         auto_cache: true,
         client_usage: Mutex::new(HashMap::new()),
         client_model_usage: Mutex::new(HashMap::new()),
+        overage_usage: Mutex::new(HashMap::new()),
         shadow_log_tx: None,
         shadow_log_dropped: AtomicU64::new(0),
         client_budgets: HashMap::new(),
