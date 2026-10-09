@@ -20,6 +20,23 @@ fn unified_ratelimit_summary(headers: &reqwest::header::HeaderMap) -> String {
     pairs.join(" ")
 }
 
+/// Cap on the cooldown for a spent weekly window with no overage path.
+const WEEKLY_SPENT_COOLDOWN: Duration = Duration::from_secs(900);
+
+/// A 429 from an account whose weekly window is spent and which has no
+/// credit to spend on overage. Its `retry-after` runs to the weekly reset,
+/// days out, so the default cooldown would re-try it every minute for
+/// nothing; it is cooled for up to `WEEKLY_SPENT_COOLDOWN` instead, and the
+/// next request or probe after that re-checks it (LAB-8497). A spent 5h
+/// window carries the same overage headers with `7d-status: allowed`, so it
+/// keeps its own `retry-after`.
+fn is_weekly_spent_no_overage(headers: &reqwest::header::HeaderMap) -> bool {
+    let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    header("anthropic-ratelimit-unified-7d-status") == Some("rejected")
+        && header("anthropic-ratelimit-unified-overage-disabled-reason")
+            == Some("member_zero_credit_limit")
+}
+
 impl AppState {
     pub(crate) fn routing_weight_publish_ttl(probe_interval_secs: u64) -> u64 {
         const FALLBACK_PUBLISH_INTERVAL_SECS: u64 = 60;
@@ -1056,18 +1073,19 @@ impl AppState {
             Duration::from_secs(burst_secs)
         } else {
             info.consecutive_burst_429s = 0;
-            if let Some(ref s) = raw_retry_after {
-                if let Ok(secs) = s.parse::<f64>() {
-                    if secs.is_finite() && secs > 0.0 && secs < 86400.0 {
-                        Duration::from_secs_f64(secs)
-                    } else {
-                        self.cooldown
-                    }
-                } else {
-                    self.cooldown
-                }
+            let retry_after = raw_retry_after
+                .as_deref()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|secs| secs.is_finite() && *secs > 0.0);
+            if is_weekly_spent_no_overage(headers) {
+                // Clamped before conversion: `from_secs_f64` panics on a
+                // value too large for a `Duration`.
+                let cap = WEEKLY_SPENT_COOLDOWN.as_secs_f64();
+                Duration::from_secs_f64(retry_after.map_or(cap, |secs| secs.min(cap)))
             } else {
-                self.cooldown
+                retry_after
+                    .filter(|secs| *secs < 86400.0)
+                    .map_or(self.cooldown, Duration::from_secs_f64)
             }
         };
 
