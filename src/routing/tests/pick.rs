@@ -585,9 +585,10 @@ async fn five_hour_refusal_keeps_its_retry_after() {
 }
 
 /// LAB-8497: a spent Fable band (`7d_oi`) with the general week still open
-/// keeps the default cooldown, and once it lapses an Opus request routes.
+/// keeps the default cooldown. That the band skips Fable only is covered by
+/// `fable_band_rejected_skips_for_fable_only`.
 #[tokio::test]
-async fn fable_band_refusal_keeps_default_and_opus_still_routes() {
+async fn fable_band_refusal_keeps_default_cooldown() {
     let headers = spent_429(
         "258810",
         &[
@@ -598,15 +599,20 @@ async fn fable_band_refusal_keeps_default_and_opus_still_routes() {
         ],
     );
     assert_eq!(cooldown_secs_after(&headers).await, 60);
+}
 
-    let state = test_state_with(vec![mk_endpoint("band-spent", "sk-ant-api-a")]);
-    state.update_rate_info(0, &headers).await;
-    state.mark_hard_limited(0, &headers).await;
-    lapse_hard_limit(&state, 0).await;
-    assert_eq!(
-        state.pick_endpoint(None, "claude-opus-4-6", &[]).await,
-        Some(0)
+/// LAB-8497: a spent per-family weekly claim limits that family only, so it
+/// must not lock the account for every model; it keeps the default.
+#[tokio::test]
+async fn per_family_weekly_refusal_keeps_default_cooldown() {
+    let headers = spent_429(
+        "258810",
+        &[(
+            "anthropic-ratelimit-unified-representative-claim",
+            "seven_day_sonnet",
+        )],
     );
+    assert_eq!(cooldown_secs_after(&headers).await, 60);
 }
 
 /// LAB-8497: the lock lapses on its own, and the account routes again so

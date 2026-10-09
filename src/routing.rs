@@ -29,10 +29,14 @@ const WEEKLY_SPENT_COOLDOWN: Duration = Duration::from_secs(900);
 /// nothing; it is cooled for up to `WEEKLY_SPENT_COOLDOWN` instead, and the
 /// next request or probe after that re-checks it (LAB-8497). A spent 5h
 /// window carries the same overage headers with `7d-status: allowed`, so it
-/// keeps its own `retry-after`.
+/// keeps its own `retry-after`. The `7d-*` headers describe whichever claim
+/// `representative-claim` names, and a per-family claim such as
+/// `seven_day_sonnet` limits only that family, so only the general
+/// `seven_day` claim says the whole account is spent.
 fn is_weekly_spent_no_overage(headers: &reqwest::header::HeaderMap) -> bool {
     let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
-    header("anthropic-ratelimit-unified-7d-status") == Some("rejected")
+    header("anthropic-ratelimit-unified-representative-claim") == Some("seven_day")
+        && header("anthropic-ratelimit-unified-7d-status") == Some("rejected")
         && header("anthropic-ratelimit-unified-overage-disabled-reason")
             == Some("member_zero_credit_limit")
 }
