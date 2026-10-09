@@ -578,7 +578,10 @@ scanner cannot walk (an object, a text block whose `text` is not a string, a
 `tool_result` whose content is neither string nor block array, a `document` or
 `search_result` in a shape the API does not define), or a content block of a
 type the scanner does not know that carries a `text`, `content`, `source`,
-`title` or `context` field. Those are not "nothing to scan" — the guard could not tell what it was looking at, and under
+`title`, `context`, `refusal` or `thinking` field. That last pair covers the
+OpenAI `refusal` and `thinking` content parts: the scanner does not read them
+as text, but an OpenAI-compatible upstream may render them as model-visible
+text in any role. Those are not "nothing to scan" — the guard could not tell what it was looking at, and under
 `block` they fail closed (below). Note an absent field is not the same as a
 present unreadable one: absent content cannot be hiding anything.
 
@@ -639,7 +642,11 @@ same 400 rather than forwarded unscanned:
   included: the compare is exact), or a newest-turn `content` present in a shape
   it cannot walk. That includes a malformed `document` or `search_result`, and
   a block of a type the scanner does not know that carries a `text`, `content`,
-  `source`, `title` or `context` field (`{"type": "x", "text": "..."}`).
+  `source`, `title`, `context`, `refusal` or `thinking` field
+  (`{"type": "x", "text": "..."}`). A newest-turn `refusal` or `thinking` part
+  or block that carries its text is therefore rejected, on `/v1/messages` and
+  `/v1/chat/completions` alike. On `/v1/chat/completions` so is one in any
+  `tool` message, older turns included (below).
   Audio, file, `tool_reference` and `browser_state` blocks carry none of those
   and still pass; images are skipped as a known binary type. Each of these is content the guard never saw and the upstream would
   have;
@@ -649,8 +656,8 @@ same 400 rather than forwarded unscanned:
 - on `/v1/chat/completions` only, `messages` is absent or not an array, or a
   `user`/`tool` message's content is in a shape translation would flatten (a
   non-string `tool` content, a content part with no string `type`, a `text` that
-  is not a string, a `tool` content part carrying `content`, `source`, `title`
-  or `context` — translation keeps only its `text` — or an `image_url` that is not an object
+  is not a string, a `tool` content part carrying `content`, `source`, `title`,
+  `context`, `refusal` or `thinking` — translation keeps only its `text` — or an `image_url` that is not an object
   with a string `url`).
   That endpoint is a single API which requires `messages`, and an
   `openai`-protocol endpoint forwards the client's original bytes, so what
