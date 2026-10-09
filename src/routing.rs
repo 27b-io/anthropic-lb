@@ -1,5 +1,25 @@
 use crate::*;
 
+/// Every `anthropic-ratelimit-unified-*` header on a response, prefix
+/// stripped, as space-separated `name=value` pairs sorted by name. Logged on
+/// each hard 429 so the log shows which window refused and whether an
+/// overage path was open: `retry-after` alone reads the same for a spent
+/// week and for a refusal that clears within a minute (LAB-8497). Sorted
+/// because `HeaderMap` iteration order is unspecified, and identical header
+/// sets must log identically to be grouped. The unified headers carry
+/// window state only, never a credential.
+fn unified_ratelimit_summary(headers: &reqwest::header::HeaderMap) -> String {
+    let mut pairs: Vec<String> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let short = name.as_str().strip_prefix("anthropic-ratelimit-unified-")?;
+            Some(format!("{short}={}", value.to_str().unwrap_or("<binary>")))
+        })
+        .collect();
+    pairs.sort_unstable();
+    pairs.join(" ")
+}
+
 impl AppState {
     pub(crate) fn routing_weight_publish_ttl(probe_interval_secs: u64) -> u64 {
         const FALLBACK_PUBLISH_INTERVAL_SECS: u64 = 60;
@@ -108,10 +128,9 @@ impl AppState {
                 }
             });
         };
-        // OpenAI endpoints are skipped — sync_from_redis only reads weights
-        // for Anthropic targets.
+        // Mirrors `sync_from_redis`'s targets: nothing reads the others' weights.
         for ep in &self.endpoints {
-            if ep.protocol == Protocol::OpenAI {
+            if !ep.has_own_rate_state() {
                 continue;
             }
             publish(
@@ -447,7 +466,7 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
     ) -> Option<EndpointIdx> {
-        self.pick_endpoint_for_client(affinity_key, model, skip, "", false)
+        self.pick_endpoint_for_client(affinity_key, model, skip, "", FastRequest::STANDARD)
             .await
     }
 
@@ -468,9 +487,9 @@ impl AppState {
     /// free general-pool capacity — violating the free-before-paid guarantee
     /// below, which the retain would otherwise bypass.
     ///
-    /// `fast` (LAB-2687): a `speed: "fast"` request also drops
-    /// `fast_mode_disabled` accounts BEFORE the pin filter, so a non-entitled
-    /// pin spills rather than serving.
+    /// `fast`: a `speed: "fast"` request also drops the
+    /// `fast_mode_disabled` accounts it reaches as fast BEFORE the pin filter,
+    /// so a non-entitled pin spills rather than serving.
     ///
     /// Tiers are tried strictly in ascending priority order. Within a tier:
     /// healthy candidates (`gate < soft_limit`) are preferred; if none are healthy
@@ -485,14 +504,10 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
         client_id: &str,
-        fast: bool,
+        fast: FastRequest,
     ) -> Option<EndpointIdx> {
         let mut candidates = self.routing_candidates(model, skip).await;
-        let fast_disabled = if fast {
-            self.fast_mode_disabled_endpoints()
-        } else {
-            Vec::new()
-        };
+        let fast_disabled = self.fast_mode_disabled_for(fast);
         candidates.retain(|c| {
             if fast_disabled.contains(&c.endpoint) {
                 trace!(
@@ -506,7 +521,7 @@ impl AppState {
             // has no org entitlement to reject) and its request translation
             // drops `speed` entirely — routing a fast request there would
             // silently serve it at standard speed (LAB-2687).
-            if fast && self.endpoints[c.endpoint].protocol == Protocol::OpenAI {
+            if fast.excludes_openai() && self.endpoints[c.endpoint].protocol == Protocol::OpenAI {
                 trace!(
                     endpoint = self.endpoints[c.endpoint].name,
                     model,
@@ -601,18 +616,26 @@ impl AppState {
             &ep.name,
             headers,
             /* is_fast_mode */ false,
+            /* caller_credential */ false,
         )
         .await;
     }
 
     /// Parse rate-limit headers from a response into the supplied
     /// `RateLimitInfo` lock.
+    ///
+    /// `caller_credential` is true when the request went out with the
+    /// caller's own auth (a passthrough endpoint). The headers then describe
+    /// the caller's plan, not the endpoint, so they are skipped like a
+    /// fast-mode response's: ingesting them would let one caller's plan set
+    /// the endpoint's routing weight for every other caller.
     pub(crate) async fn update_rate_info_for(
         &self,
         rate_info: &RwLock<RateLimitInfo>,
         endpoint_name: &str,
         headers: &reqwest::header::HeaderMap,
         is_fast_mode: bool,
+        caller_credential: bool,
     ) {
         // A fast-mode response's `anthropic-ratelimit-unified-*` headers
         // describe the FAST/paid POOL, not the account's 5h/7d subscription
@@ -641,7 +664,7 @@ impl AppState {
         // fast response could still freeze this account's standard view; the
         // ≤`probe_interval_secs` background probe refreshes the real 5h/7d view
         // regardless of traffic, bounding that staleness.
-        if is_fast_mode {
+        if is_fast_mode || caller_credential {
             return;
         }
 
@@ -834,11 +857,7 @@ impl AppState {
         // Overage (paid extra usage) — account-level, covers whichever subscription
         // window is exhausted. `overage-in-use` is always overwritten: header absent
         // or "false" → false (so demotion auto-clears when the window refills).
-        info.overage_in_use = headers
-            .get("anthropic-ratelimit-unified-overage-in-use")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        info.overage_in_use = overage_in_use(headers);
         if info.overage_in_use {
             info.overage_status = headers
                 .get("anthropic-ratelimit-unified-overage-status")
@@ -1069,6 +1088,7 @@ impl AppState {
             retry_after_raw = ?raw_retry_after,
             burst = is_burst_limit,
             consecutive_burst = info.consecutive_burst_429s,
+            unified = unified_ratelimit_summary(headers),
             "account hard rate-limited (429), cooling down"
         );
 
@@ -1153,8 +1173,7 @@ impl AppState {
         let now_epoch = Self::now_epoch();
         let now_instant = Instant::now();
 
-        // Sync target list over the endpoint pool. OpenAI endpoints are
-        // skipped: they carry no Anthropic rate-limit data.
+        // Sync target list over the endpoints whose rate state is their own.
         struct SyncTarget<'a> {
             name: &'a str,
             rate_info: &'a RwLock<RateLimitInfo>,
@@ -1164,7 +1183,7 @@ impl AppState {
         }
         let mut targets: Vec<SyncTarget<'_>> = Vec::new();
         for e in &self.endpoints {
-            if e.protocol == Protocol::OpenAI {
+            if !e.has_own_rate_state() {
                 continue;
             }
             targets.push(SyncTarget {
@@ -1340,6 +1359,12 @@ impl AppState {
         lock_recovering(&self.client_model_usage, "client_model_usage")
     }
 
+    pub(crate) fn lock_overage_usage(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(String, String), [u64; 4]>> {
+        lock_recovering(&self.overage_usage, "overage_usage")
+    }
+
     pub(crate) fn lock_client_request_rates(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<String, (u64, Ewma)>> {
@@ -1468,7 +1493,7 @@ impl AppState {
         // Removals past the cap still happened, so they are still counted —
         // under `_other`, not discarded. Dropping them outright let an ordered
         // payload hide the actionable field behind eight junk ones and leave
-        // no trace that anything else went (Helly R finding 3).
+        // no trace that anything else went.
         let over_cap = stripped.len().saturating_sub(keys.len()) as u64;
         let mut map = lock_recovering(&self.beta_body_fields_stripped, "beta_body_fields_stripped");
         if over_cap > 0 {

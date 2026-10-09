@@ -217,8 +217,9 @@ pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 25 * 1024 * 1024;
 /// Default wall-clock ceiling for receiving a request body (seconds). Real
 /// clients push even a max-size body in seconds; 60s is generous headroom for
 /// a slow relayed path while guaranteeing a stalled upload cannot pin its
-/// body-memory reservation (up to `MAX_REQUEST_BODY_BYTES` when Content-Length
-/// is absent) against the P1-01 budget indefinitely. Override with the
+/// body-memory reservation (the full `MAX_REQUEST_BODY_BYTES` when
+/// Content-Length is absent or Transfer-Encoding is present) against the P1-01
+/// budget indefinitely. Override with the
 /// `body_read_timeout_secs` config key; 0 disables.
 pub(crate) const DEFAULT_BODY_READ_TIMEOUT_SECS: u64 = 60;
 
@@ -323,7 +324,7 @@ pub(crate) const MAX_DROPPED_BETA_FLAG_LEN: usize = 64;
 
 /// Strips counted (and logged) from any ONE request. A request's top-level
 /// key count is client-controlled; without this the per-key cap above is
-/// reachable from a single request (LAB-1261 panel finding).
+/// reachable from a single request (LAB-1261).
 pub(crate) const MAX_STRIPPED_FIELDS_PER_REQUEST: usize = 8;
 
 /// Clamp a client-controlled string to something safe to use as a metric
@@ -468,7 +469,7 @@ const BASE_BODY_FIELDS: &[&str] = &[
 ///
 /// **This table must stay TOTAL over `DEFAULT_CLIENT_BETA_ALLOWLIST`**, and
 /// `beta_body_field_table_covers_the_allowlist` fails the build if it is not.
-/// Totality is the whole mechanism (LAB-1261, Helly R finding 1): a surviving
+/// Totality is the whole mechanism (LAB-1261): a surviving
 /// flag protects its body field only if a row claims it, so a missing row
 /// means the proxy DELETES a field belonging to a feature the caller was
 /// entitled to use. `fallback-credit-*` is the worked example — it is on the
@@ -546,7 +547,7 @@ const BETA_BODY_FIELDS: &[(&str, &[&str])] = &[
 /// **Declines to strip when a surviving flag is not in `BETA_BODY_FIELDS`.**
 /// The keep-side of the rule is only as good as that table is total: an
 /// unrecognised SURVIVING family may own a top-level field, and stripping it
-/// deletes a capability the caller is entitled to (Helly R finding 1 — a
+/// deletes a capability the caller is entitled to (a
 /// custom `allowed_client_betas` carrying `mcp-client-*` kept the header and
 /// lost `mcp_servers`, leaving `tools[].mcp_server_name` dangling). Forgoing
 /// the degrade costs a 400 the caller already gets today; deleting a live
@@ -571,7 +572,7 @@ const BETA_BODY_FIELDS: &[(&str, &[&str])] = &[
 /// bytes, so nothing below the top level is reformatted. That is not cosmetic:
 /// a `serde_json::Value` round-trip rewrites an integer too large for `u64` as
 /// a float (`18446744073709551617` → `1.8446744073709552e+19`), silently
-/// changing a value inside retained tool history (Helly R finding 2). Only the
+/// changing a value inside retained tool history. Only the
 /// top-level separators are re-emitted, so the cacheable prefix can still
 /// shift on a body that arrived pretty-printed — accepted, since the only
 /// requests reaching the rewrite are the ones answering a hard 400 today.
@@ -662,22 +663,110 @@ pub(crate) fn strip_orphaned_beta_body_fields(
     Some((render_top_level(kept)?, removed))
 }
 
-/// Remove every top-level entry named in `fields`: `fallbacks` from a
-/// Messages body (LAB-5970), `OPENAI_FALLBACK_FIELDS` from a chat-completions
-/// body bound for an OpenAI-protocol endpoint (LAB-6794).
+/// The routes whose bodies `BASE_BODY_FIELDS` describes, and so the only ones
+/// `strip_orphaned_beta_body_fields` runs on. `proxy_handler` is the router's
+/// catch-all, so `/v1/messages/batches`, `/v1/complete` and the rest reach the
+/// same forward path with completely different bodies.
+pub(crate) fn is_messages_schema_path(path: &str) -> bool {
+    matches!(path, "/v1/messages" | "/v1/messages/count_tokens")
+}
+
+/// True when `flag` matches a `BETA_BODY_FIELDS` row. A surviving flag that
+/// does not makes `strip_orphaned_beta_body_fields` forward the body untouched.
+fn beta_family_known(flag: &str) -> bool {
+    BETA_BODY_FIELDS
+        .iter()
+        .any(|(pattern, _)| suffix_wildcard_match(pattern, flag))
+}
+
+/// True when an endpoint that filters client betas strips `speed` from this
+/// request because the allow-list drops its `fast-mode-*` beta. Mirrors the
+/// filter in `inject_account_auth` and the strip in
+/// `strip_orphaned_beta_body_fields`, so all of these must hold:
+/// - the path is one the strip runs on;
+/// - the request carries a `fast-mode-*` beta and `allowed` passes none of
+///   the ones it carries;
+/// - every flag `allowed` passes has a `BETA_BODY_FIELDS` row, or the strip
+///   declines and `speed` goes upstream untouched.
 ///
-/// Both `models` gates — the client's (`client_allows_model`) and the
-/// endpoint's (`Endpoint::serves_model`) — read only the top-level `model`,
-/// while `fallbacks` asks Anthropic to serve a refusal from ANOTHER model.
-/// The `"default"` form names no target at all (Anthropic routes it by refusal
-/// category), so the targets cannot be checked here without hard-coding
-/// Anthropic's fallback policy. A restricted principal therefore loses the
-/// field: its request runs, and a refusal comes back as a refusal.
-///
-/// Only the field goes, not the `server-side-fallback-*` header: without the
-/// field no fallback runs (the API does not fall back unless asked), and the
-/// header also grants `fallback_credit_token`, whose redemption is a new
-/// request that passes both gates on its own top-level `model`.
+/// A request that sent no `fast-mode-*` beta is not narrowed here.
+pub(crate) fn beta_filter_strips_speed(
+    path: &str,
+    headers: &axum::http::HeaderMap,
+    allowed: &[String],
+) -> bool {
+    if !is_messages_schema_path(path) {
+        return false;
+    }
+    let mut carries_fast_beta = false;
+    for flag in headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let passes = beta_flag_allowed(allowed, flag);
+        if flag.starts_with("fast-mode-") {
+            if passes {
+                return false;
+            }
+            carries_fast_beta = true;
+        } else if passes && !beta_family_known(flag) {
+            return false;
+        }
+    }
+    carries_fast_beta
+}
+
+/// A request's `speed: "fast"` as each endpoint receives it. The beta
+/// allow-list filters client betas on OAuth endpoints only, so under an
+/// allow-list without `fast-mode-*` one request runs at standard speed on an
+/// OAuth account and fast on an API-key or passthrough account. Routing and
+/// the exhaustion gate read it per endpoint.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FastRequest {
+    /// The body asks for fast mode (`body_wants_fast_mode`).
+    pub(crate) requested: bool,
+    /// Endpoints that filter client betas strip `speed` from this request
+    /// (`beta_filter_strips_speed`).
+    pub(crate) stripped_on_oauth: bool,
+}
+
+impl FastRequest {
+    pub(crate) const STANDARD: Self = Self {
+        requested: false,
+        stripped_on_oauth: false,
+    };
+    #[cfg(test)]
+    pub(crate) const FAST: Self = Self {
+        requested: true,
+        stripped_on_oauth: false,
+    };
+
+    /// True when `ep` receives the request with `speed: "fast"`. An
+    /// OpenAI-protocol endpoint never does: its translation drops `speed`.
+    pub(crate) fn reaches(self, ep: &Endpoint) -> bool {
+        self.requested
+            && ep.protocol == Protocol::Anthropic
+            && !(self.stripped_on_oauth && ep.filters_client_betas())
+    }
+
+    /// True when the request must not be served at standard speed, which
+    /// keeps it off OpenAI-protocol endpoints. A request the allow-list
+    /// already downgrades on OAuth endpoints may be served there.
+    pub(crate) fn excludes_openai(self) -> bool {
+        self.requested && !self.stripped_on_oauth
+    }
+}
+
+/// Remove every top-level entry named in `fields` — `ANTHROPIC_FALLBACK_FIELDS`
+/// or `OPENAI_FALLBACK_FIELDS`, the fields with which a body asks the upstream
+/// to serve ANOTHER model. Both `models` gates — the client's
+/// (`client_allows_model`) and the endpoint's (`Endpoint::serves_model`) —
+/// read only the top-level `model`, so a restricted attempt
+/// (`AppState::attempt_restricts_models`) loses these fields.
 ///
 /// Every entry of a listed key goes, so a duplicate key cannot keep one
 /// alive. Returns `None` — body untouched — when there is none, or when the
@@ -701,16 +790,30 @@ pub(crate) fn strip_top_level_fields(body: &bytes::Bytes, fields: &[&str]) -> Op
     )
 }
 
+/// `fallbacks` asks Anthropic to serve a refusal from another model (LAB-5970).
+/// The `"default"` form names no target at all (Anthropic routes it by refusal
+/// category), so the targets cannot be checked here without hard-coding
+/// Anthropic's fallback policy. A restricted principal therefore loses the
+/// field: its request runs, and a refusal comes back as a refusal.
+///
+/// Only the field goes, not the `server-side-fallback-*` header: without the
+/// field no fallback runs (the API does not fall back unless asked), and the
+/// header also grants `fallback_credit_token`, whose redemption is a new
+/// request that passes both gates on its own top-level `model`.
+pub(crate) const ANTHROPIC_FALLBACK_FIELDS: &[&str] = &["fallbacks"];
+
 /// Top-level fields with which a chat-completions body asks an
-/// OpenAI-compatible gateway to serve ANOTHER model when the named one fails
+/// OpenAI-compatible gateway to serve another model when the named one fails
 /// (LAB-6794). LiteLLM's proxy reads `fallbacks`, `context_window_fallbacks`
 /// and `content_policy_fallbacks` from the request, and also merges all three
 /// from a client-supplied `router_settings_override` object. A client can
 /// provoke the context-window failure at will with an oversized prompt.
 ///
-/// Same rule as `fallbacks` on Anthropic endpoints: the `models` gates read
-/// only `model`, so a restricted request loses these fields and a failure of
-/// the named model comes back as that failure.
+/// Only the client's lists go: fallbacks the gateway's operator configured
+/// still apply. `router_settings_override` is dropped whole, on purpose: the
+/// retry, timeout and routing settings it also carries go with it, because
+/// rewriting the nested object to keep them would add parsing surface to a
+/// security strip for settings a restricted client can live without.
 pub(crate) const OPENAI_FALLBACK_FIELDS: &[&str] = &[
     "fallbacks",
     "context_window_fallbacks",
@@ -771,34 +874,30 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for TopLevelObject
     }
 }
 
-/// Top-level fields a policy or routing decision reads or strips: the client
-/// allow-list, endpoint `models` routing, the context window and the negative
-/// cache read `model`, fast-mode routing reads `speed`, the content guard
-/// reads `messages` and `system`, and a model-restricted request loses
-/// `fallbacks` and, on an OpenAI-protocol endpoint, the rest of
-/// `OPENAI_FALLBACK_FIELDS` (`strip_top_level_fields`). A field a new decision
-/// starts reading or stripping belongs here; until it is added, its
-/// respellings pass as they did before this check existed.
-const DECISION_FIELDS: [&str; 8] = [
-    "model",
-    "speed",
-    "messages",
-    "system",
-    "fallbacks",
-    "context_window_fallbacks",
-    "content_policy_fallbacks",
-    "router_settings_override",
-];
+/// Top-level fields a policy or routing decision reads: the client allow-list,
+/// endpoint `models` routing, the context window and the negative cache read
+/// `model`, fast-mode routing reads `speed`, the content guard reads
+/// `messages` and `system`, and the budget charge for a stream that ends
+/// before its usage reads `max_tokens`. A field a new decision starts reading
+/// belongs here; until it is added, its respellings pass as they did before
+/// this check existed.
+const DECISION_FIELDS: [&str; 5] = ["model", "speed", "messages", "system", "max_tokens"];
 
-/// Every field whose respelling is refused: `DECISION_FIELDS`, plus each body
-/// field the beta allow-list strips along with a dropped flag, read from
-/// `BETA_BODY_FIELDS` so the two lists cannot drift apart.
+/// Every field whose respelling is refused: `DECISION_FIELDS`, every field a
+/// restricted attempt loses (`ANTHROPIC_FALLBACK_FIELDS`,
+/// `OPENAI_FALLBACK_FIELDS`), and each body field the beta allow-list strips
+/// along with a dropped flag (`BETA_BODY_FIELDS`). The strip lists are read
+/// from their own tables so they cannot drift apart from this one.
 fn protected_fields() -> impl Iterator<Item = &'static str> {
-    DECISION_FIELDS.into_iter().chain(
-        BETA_BODY_FIELDS
-            .iter()
-            .flat_map(|(_, fields)| fields.iter().copied()),
-    )
+    DECISION_FIELDS
+        .into_iter()
+        .chain(ANTHROPIC_FALLBACK_FIELDS.iter().copied())
+        .chain(OPENAI_FALLBACK_FIELDS.iter().copied())
+        .chain(
+            BETA_BODY_FIELDS
+                .iter()
+                .flat_map(|(_, fields)| fields.iter().copied()),
+        )
 }
 
 /// A key as a decoder that ignores `_` and `-` when matching names sees it.
@@ -1685,33 +1784,32 @@ impl AppState {
             .collect()
     }
 
-    /// True when EVERY endpoint whose config allows `model` carries a live
-    /// negative-cache entry — unsupported model (LAB-941) or, for a
-    /// `speed: "fast"` request, fast mode disabled on its org (LAB-2687) — so
-    /// no rotation can help. Gates the exhaustion reply: only then is a
-    /// stashed upstream 4xx returned (or synthesized on the warm path, where
-    /// the pool emptied before any forward ran). A rejection on one account
-    /// plus rate limits on the rest is a rate-limited pool, and the
+    /// True when EVERY endpoint whose config allows `model` is out for this
+    /// request: it carries a live negative-cache entry (unsupported model or,
+    /// when `fast` reaches it as fast, fast mode disabled on its org), or it
+    /// is `extra_usage_refuser`, the endpoint that refused this request for
+    /// extra usage. Then no rotation can help. Gates the exhaustion reply: only then
+    /// is a stashed upstream 4xx returned (or synthesized on the warm path,
+    /// where the pool emptied before any forward ran). A rejection on one
+    /// account plus rate limits on the rest is a rate-limited pool, and the
     /// retryable 429 stays the truth. Endpoints excluded by their config
     /// `models` allowlist never serve the model and don't count; false when
     /// no endpoint could ever serve it (config-only exclusion keeps its
-    /// pre-existing 429 semantics). `refused` is the endpoint that answered
-    /// THIS request with an entitlement 400 (LAB-4729): never negative-cached,
-    /// but skipped for the rest of the request, so it cannot serve it either.
+    /// pre-existing 429 semantics). `extra_usage_refuser` answered THIS
+    /// request with an entitlement 400: never negative-cached, but skipped
+    /// for the rest of the request, so it cannot serve it either.
     pub(crate) fn pool_cannot_serve(
         &self,
         model: &str,
-        fast: bool,
-        refused: Option<EndpointIdx>,
+        fast: FastRequest,
+        extra_usage_refuser: Option<EndpointIdx>,
     ) -> bool {
         if model.is_empty() {
             return false;
         }
         let mut excluded = self.unsupported_endpoints_for(model);
-        if fast {
-            excluded.extend(self.fast_mode_disabled_endpoints());
-        }
-        excluded.extend(refused);
+        excluded.extend(self.fast_mode_disabled_for(fast));
+        excluded.extend(extra_usage_refuser);
         let mut eligible = 0usize;
         for (i, ep) in self.endpoints.iter().enumerate() {
             if !ep.serves_model(model) {
@@ -1722,7 +1820,7 @@ impl AppState {
             // mark, so it must not count as "eligible" for a fast request —
             // otherwise a pool with only OpenAI capacity left would look
             // servable and the exhaustion reply would never fire (LAB-2687).
-            if fast && ep.protocol == Protocol::OpenAI {
+            if fast.excludes_openai() && ep.protocol == Protocol::OpenAI {
                 continue;
             }
             eligible += 1;
@@ -1756,6 +1854,19 @@ impl AppState {
             .iter()
             .filter(|(_, expiry)| **expiry > now)
             .map(|(idx, _)| *idx)
+            .collect()
+    }
+
+    /// The live fast-mode-disabled endpoints `fast` reaches with
+    /// `speed: "fast"`: the marks that count against this request. Empty for a
+    /// standard request, without taking the lock.
+    pub(crate) fn fast_mode_disabled_for(&self, fast: FastRequest) -> Vec<usize> {
+        if !fast.requested {
+            return Vec::new();
+        }
+        self.fast_mode_disabled_endpoints()
+            .into_iter()
+            .filter(|&i| fast.reaches(&self.endpoints[i]))
             .collect()
     }
 

@@ -109,7 +109,7 @@ fn is_gateway_model_rejection(msg: &str, model: &str) -> bool {
             .is_some_and(|r| r.starts_with('.'))
 }
 
-/// Exact upstream text of the org-level fast-mode entitlement 400 (observed
+/// Exact upstream text of the org-level fast-mode 400 (observed
 /// 2026-09-02, LAB-2687), replayed on the warm negative-cache path where no
 /// upstream response exists. The matcher requires this exact string, so if
 /// upstream rewords it, rotation stops and the 400 reaches the client as it
@@ -312,7 +312,12 @@ pub(crate) fn describe_reqwest_error(e: &reqwest::Error) -> String {
 /// success or 4xx client error) it returns `Ok(resp)` — handing the
 /// response back so the caller can continue.
 ///
-/// One exception: a non-burst 429 on a `speed: "fast"` request returns
+/// Any 429 with `caller_credential` set returns `Ok(resp)`, burst included.
+/// The request went out with the caller's own auth (a passthrough endpoint),
+/// so the 429 reports the caller's plan, not the endpoint, and is never
+/// endpoint state, for the reason `classify_rejection` gives.
+///
+/// Fast-mode exception: a non-burst 429 on a `speed: "fast"` request returns
 /// `Ok(resp)` too, uncooled and unrotated — fast mode has its own rate
 /// bucket, so that 429 is not evidence about the account (LAB-2675).
 ///
@@ -321,6 +326,7 @@ pub(crate) fn describe_reqwest_error(e: &reqwest::Error) -> String {
 /// passthrough) get `{"error":{...}}`, Anthropic-surface callers get
 /// `{"type":"error",...}` — matching how every other error arm on those
 /// paths translates per surface.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn classify_retry_status(
     state: &AppState,
     status: StatusCode,
@@ -334,6 +340,7 @@ pub(crate) async fn classify_retry_status(
     // that needs it, and so no caller can hand this function a `false` that
     // is only true for non-429 statuses.
     fast_mode_body: Option<&bytes::Bytes>,
+    caller_credential: bool,
 ) -> Result<reqwest::Response, ForwardOutcome> {
     // 3xx → deliberate 502. The upstream client follows no redirects
     // (`Policy::none()`), because following one would re-send the account
@@ -387,6 +394,19 @@ pub(crate) async fn classify_retry_status(
 
     // 429 → mark hard-limited and try next account
     if status == StatusCode::TOO_MANY_REQUESTS {
+        // …unless it answered the caller's own credential. Every such 429 goes
+        // back to the caller, burst included: a burst limit on the caller's
+        // credential still says nothing about the endpoint. Marking would cool
+        // the endpoint for every caller on every replica, and rotating would
+        // cover the caller's own limit with a pooled account. Checked before
+        // the fast-mode test so its bookkeeping stays out of it too.
+        if caller_credential {
+            info!(
+                account = endpoint_name,
+                "got 429 on the caller's own credential, returning it unchanged"
+            );
+            return Ok(resp);
+        }
         // …unless the request asked for fast mode. Fast mode has its own rate
         // bucket, separate from the account's standard 5h/7d windows, so a
         // fast-mode 429 is not evidence the account is exhausted. Cooling the
@@ -409,7 +429,7 @@ pub(crate) async fn classify_retry_status(
         // about the account whatever speed the request asked for. Exempting it
         // would leave the account pinned: standard traffic routed to it would
         // burst-429 and hard-limit it anyway. The caller still gets
-        // `x-should-retry` as its transient hint (LAB-2675 panel finding).
+        // `x-should-retry` as its transient hint (LAB-2675).
         //
         // What this does NOT buy: the ticket assumed the utilization ceilings
         // would still cover a fast request on an exhausted account, because
@@ -659,7 +679,7 @@ pub(crate) fn model_unsupported_response(model: &str, openai_shape: bool) -> Res
 /// `authenticate` 401, `pre_request_gate` 403/429,
 /// `deny_admin_reader`'s read-only-principal 403 (LAB-4395),
 /// `reserve_request_body` 503, `read_body_bounded` 408 and bad-body 400, the
-/// untranslatable-request 400, the fast-mode entitlement 400 replayed on
+/// untranslatable-request 400, the fast-mode 400 replayed on
 /// the warm negative-cache path (LAB-2687), `proxy_handler`'s 400 for
 /// a valid-JSON non-object body (LAB-4314) — the router fallback, so any
 /// method on any path — and `exhaustion_response`'s 429/503. This is not the
@@ -702,34 +722,40 @@ pub(crate) fn proxy_error_response(
         .into_response()
 }
 
+/// Upstream's back-off hints: `retry-after` on a forwarded 4xx, and the
+/// transient `x-should-retry`. Every site that forwards an upstream error
+/// keeps these.
+pub(crate) const RETRY_HINT_HEADERS: [&str; 2] = ["retry-after", "x-should-retry"];
+
 /// Copy the allow-listed upstream response headers onto `builder`. Everything
 /// not listed here stays behind the proxy (LAB-1191 / 2026-06-02 audit
 /// finding 3: the old copy-everything loop leaked `anthropic-ratelimit-*` —
 /// the pooled capacity of every account — plus `set-cookie` and
 /// org-identifying headers). `expose_ratelimit` (config
 /// `expose_upstream_ratelimit_headers`, trusted networks only) restores the
-/// `anthropic-ratelimit-*` passthrough for tooling that reads it. One other
-/// site reflects upstream headers: `forward_anthropic`'s body-read-failure
-/// 502 arm copies `anthropic-ratelimit-*` behind the same flag.
+/// `anthropic-ratelimit-*` passthrough for tooling that reads it. Two other
+/// sites reflect upstream headers: `forward_anthropic`'s body-read-failure
+/// 502 arm copies `anthropic-ratelimit-*` behind the same flag, and
+/// `forward_openai_compat_anthropic`'s error rebuild copies `RETRY_HINT_HEADERS`.
 fn reflect_upstream_headers(
     mut builder: axum::http::response::Builder,
     headers: &reqwest::header::HeaderMap,
     expose_ratelimit: bool,
 ) -> axum::http::response::Builder {
     // What SDKs need to function: body framing (content-type/length),
-    // SSE cache hint, the Anthropic request id for error reports, retry-after
-    // on forwarded 4xx, and the upstream's transient retry hint.
+    // SSE cache hint and the Anthropic request id for error reports, plus
+    // `RETRY_HINT_HEADERS`.
     const ALLOWED: &[&str] = &[
         "content-type",
         "content-length",
         "cache-control",
         "request-id",
-        "retry-after",
-        "x-should-retry",
     ];
     for (k, v) in headers.iter() {
         let name = k.as_str();
-        if ALLOWED.contains(&name) || (expose_ratelimit && name.starts_with("anthropic-ratelimit-"))
+        if ALLOWED.contains(&name)
+            || RETRY_HINT_HEADERS.contains(&name)
+            || (expose_ratelimit && name.starts_with("anthropic-ratelimit-"))
         {
             builder = builder.header(k, v);
         }
@@ -737,8 +763,55 @@ fn reflect_upstream_headers(
     builder
 }
 
-/// Shared knob chain for both upstream clients — `client` layers the SSE-tuned
-/// `read_timeout` on top; `client_nonstreaming` takes it as-is (LAB-718).
+/// Total budget for a streamed upstream request, in seconds. reqwest's
+/// `timeout` runs until the body is fully read, so on a stream it caps the
+/// generation itself: at 900 s it cut every reply over about 95K output
+/// tokens on a fast model. Stalls are `STREAMING_STALL_SECS`'s job; this is
+/// only a backstop for a stream that trickles forever, about 3x a full
+/// 128K-token reply.
+pub(crate) const STREAMING_TOTAL_SECS: u64 = 3600;
+/// Longest inter-chunk silence a stream may have, in seconds: the stall guard
+/// that catches a dead stream. 180 s so extended-thinking pauses, which can
+/// exceed 90 s between chunks, don't trip it.
+pub(crate) const STREAMING_STALL_SECS: u64 = 180;
+/// Total budget for a non-streaming upstream request, in seconds. It has no
+/// stall guard: its only bytes arrive when generation completes (LAB-718).
+/// Anthropic refuses non-streaming requests it expects to run longer.
+pub(crate) const NONSTREAMING_TOTAL_SECS: u64 = 900;
+
+/// An upstream budget in seconds as a `Duration`; tests run 200x faster so
+/// the budgets can be exercised in seconds.
+pub(crate) const fn upstream_budget(secs: u64) -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(secs * 5)
+    } else {
+        Duration::from_secs(secs)
+    }
+}
+
+/// Upstream client for streamed requests (`AppState::client`).
+pub(crate) fn streaming_client() -> Client {
+    upstream_client_builder()
+        .timeout(upstream_budget(STREAMING_TOTAL_SECS))
+        .read_timeout(upstream_budget(STREAMING_STALL_SECS))
+        .build()
+        .expect("failed to build HTTP client")
+}
+
+/// Upstream client for non-streaming requests (`AppState::client_nonstreaming`).
+pub(crate) fn nonstreaming_client() -> Client {
+    upstream_client_builder()
+        .timeout(upstream_budget(NONSTREAMING_TOTAL_SECS))
+        .build()
+        .expect("failed to build non-streaming HTTP client")
+}
+
+/// Knob chain shared by both upstream clients; each sets its own timeouts.
+///
+/// Liveness knobs are load-bearing against Anthropic's Cloudflare edge: h2
+/// PING (while_idle) evicts half-closed pooled streams before they're reused,
+/// and pool_idle_timeout keeps connections warm through Claude Code
+/// read/think pauses so a burst doesn't pay a fresh TLS handshake.
 pub(crate) fn upstream_client_builder() -> reqwest::ClientBuilder {
     Client::builder()
         // Never follow redirects: every upstream request carries an account
@@ -747,7 +820,6 @@ pub(crate) fn upstream_client_builder() -> reqwest::ClientBuilder {
         // into a deliberate 502 by `classify_retry_status` (LAB-1191 /
         // 2026-06-02 audit finding 2).
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(900))
         // 4s (was 10): a blackholed connect fails fast so the transient
         // backoff-retry recovers in seconds. pool_idle_timeout stays 300s —
         // it keeps conns warm across Claude Code think-pauses.
@@ -916,10 +988,7 @@ pub(crate) async fn forward_anthropic(
     // (`requests`), `/v1/complete` (`prompt`) and anything else arrive here
     // too — running a Messages-only field list over those bodies deletes them
     // outright.
-    let messages_schema = matches!(
-        parts.uri.path(),
-        "/v1/messages" | "/v1/messages/count_tokens"
-    );
+    let messages_schema = is_messages_schema_path(parts.uri.path());
     let coherent_body = if messages_schema {
         strip_orphaned_beta_body_fields(
             oauth_body_bytes,
@@ -996,16 +1065,15 @@ pub(crate) async fn forward_anthropic(
         debug_assert!(coherent_body.is_none());
         body_bytes
     };
-    // LAB-5970: a `models` allow-list on the client or on THIS endpoint (the
-    // retry loop may land on a differently restricted one) would be escaped by
-    // a server-side fallback to a model it does not name — see
-    // `strip_top_level_fields`. Applied to every auth type: API-key and
+    // LAB-5970: a `models` allow-list on the client or on THIS endpoint would
+    // be escaped by a server-side fallback to a model it does not name — see
+    // `ANTHROPIC_FALLBACK_FIELDS`. Applied to every auth type: API-key and
     // passthrough endpoints forward client betas unfiltered, so this cannot
     // ride on the beta allow-list. Batches nest the field and Anthropic
     // rejects it there.
-    let models_restricted = !ep.models.is_empty() || state.client_restricts_models(client_id);
+    let models_restricted = state.attempt_restricts_models(ep, client_id);
     let fallback_free = (messages_schema && models_restricted)
-        .then(|| strip_top_level_fields(req_body, &["fallbacks"]))
+        .then(|| strip_top_level_fields(req_body, ANTHROPIC_FALLBACK_FIELDS))
         .flatten();
     if fallback_free.is_some() {
         debug!(
@@ -1080,6 +1148,7 @@ pub(crate) async fn forward_anthropic(
             // when the LAB-1261 strip removed `speed` — use that value, not
             // the parameter.
             is_fast_mode,
+            passthrough,
         )
         .await;
 
@@ -1097,6 +1166,7 @@ pub(crate) async fn forward_anthropic(
         // The bytes actually sent upstream (the OAuth variant on OAuth
         // tokens) — that body is what picks the rate bucket.
         Some(req_body),
+        passthrough,
     )
     .await
     {
@@ -1149,9 +1219,11 @@ pub(crate) async fn forward_anthropic(
                 .unwrap_or_else(|| "-".to_string()),
             constraint,
             overage: info.overage_in_use,
+            served_on_overage: overage_in_use(resp.headers()),
             pin: state.pin_status(client_id, endpoint_idx),
             total: ep.requests.load(Ordering::Relaxed),
             fp: fp.unwrap_or("-").to_string(),
+            hints: ClientHints::from_headers(&parts.headers),
         };
         (compute_pressure_status(eff_util, client_id, state), ctx)
     };
@@ -1193,6 +1265,7 @@ pub(crate) async fn forward_anthropic(
         let req_id_clone = req_id.to_owned();
         let session_key_clone = session_key.map(str::to_owned);
         let status_code = status.as_u16();
+        let fallback_charge = StreamFallbackCharge::from_request_body(req_body);
 
         tokio::spawn(async move {
             let mut scanner = SseUsageScanner::default();
@@ -1252,6 +1325,7 @@ pub(crate) async fn forward_anthropic(
                 status_code,
                 ctx,
                 scanner,
+                fallback_charge,
                 request_start,
                 client_disconnected,
                 upstream_error,
@@ -1603,6 +1677,39 @@ pub(crate) fn stamp_guard_findings(mut response: Response, count: Option<usize>)
     response
 }
 
+/// The coding a request body would reach the upstream under without the proxy
+/// having decoded it, as `(header, coding)`: any `Content-Encoding` but
+/// `identity`, or any `Transfer-Encoding` but a single `chunked`, the one layer
+/// of framing hyper removes. The proxy reads such a body as raw bytes, while the
+/// upstream may read what they decode to. A `chunked` repeated anywhere across
+/// the `Transfer-Encoding` values leaves a layer of framing in the body. A value
+/// that is not visible ASCII cannot be checked, so it counts as a coding.
+pub(crate) fn undecoded_body_coding(headers: &hyper::HeaderMap) -> Option<(&'static str, String)> {
+    for (name, allowed) in [
+        ("content-encoding", "identity"),
+        ("transfer-encoding", "chunked"),
+    ] {
+        let mut chunked = 0;
+        for value in headers.get_all(name) {
+            let Ok(value) = value.to_str() else {
+                return Some((name, "(not visible ASCII)".to_string()));
+            };
+            for coding in value.split(',').map(str::trim) {
+                if !coding.eq_ignore_ascii_case(allowed) {
+                    return Some((name, truncate_label(coding)));
+                }
+                if name == "transfer-encoding" {
+                    chunked += 1;
+                    if chunked > 1 {
+                        return Some((name, "chunked, chunked".to_string()));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub(crate) async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(client_addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -1694,10 +1801,59 @@ pub(crate) async fn proxy_handler(
     #[cfg(feature = "guard")]
     let mut guard_outcome = guard::ScanOutcome::NothingToScan;
 
+    // Refused before the parse: a coded body can pass the `--` test below, or
+    // even parse as JSON, as raw bytes.
+    if !body_bytes.is_empty() {
+        if let Some((header, coding)) = undecoded_body_coding(&parts.headers) {
+            warn!(
+                req_id,
+                client = %client_ip,
+                client_id = %client_id,
+                path = %parts.uri.path(),
+                header,
+                coding = %coding,
+                "rejected: request body has a coding the proxy does not decode"
+            );
+            return proxy_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("request body {header} '{coding}' is not supported"),
+            );
+        }
+    }
+
     // Parse body once for model extraction, optional cache injection, and
     // the fast-mode flag that picks the rate bucket and routing pool downstream.
+    let parse = serde_json::from_slice::<serde_json::Value>(&body_bytes);
+
+    // A body this parse refuses would route on no model, yet other JSON
+    // decoders read a model out of some such bodies (`unparseable_json_bodies`
+    // in the tests holds them), so the upstream could act on a model the proxy
+    // never routed or gated on. Refuse it before routing (LAB-6781). A
+    // multipart upload (`/v1/files`) passes: it opens with its `--` boundary
+    // line, and no JSON text starts with `--`. With codings refused above,
+    // these bytes are the ones the upstream reads. Keyed on the bytes alone:
+    // the client controls the path and the `Content-Type`.
+    if let Err(e) = &parse {
+        if !body_bytes.is_empty() && !body_bytes.starts_with(b"--") {
+            warn!(
+                req_id,
+                client = %client_ip,
+                client_id = %client_id,
+                path = %parts.uri.path(),
+                error = %e,
+                "rejected: request body could not be parsed as JSON"
+            );
+            return proxy_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "request body could not be parsed as JSON",
+            );
+        }
+    }
+
     let (body_bytes, oauth_body_bytes, model, fp, cache_key, is_fast_mode) =
-        if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+        if let Ok(mut parsed) = parse {
             // Valid JSON but not an object (`[1]`, `"x"`, `7`, `true`,
             // `null`) can only 400 upstream. Reject it here so it costs no
             // account headroom, no budget sample and no credentialed
@@ -1882,6 +2038,7 @@ pub(crate) async fn proxy_handler(
             // after the beta filter (LAB-1261) and re-derives the flag there;
             // any new consumer downstream of that filter must read the
             // narrowed value, or it bills a standard request to the fast pool.
+            // Routing and the exhaustion gate read `fast`, below.
             let is_fast_mode = body_wants_fast_mode(&parsed);
 
             (
@@ -1893,9 +2050,11 @@ pub(crate) async fn proxy_handler(
                 is_fast_mode,
             )
         } else {
-            // Non-empty and not JSON: the scanner cannot read it, and a parse
-            // differential against the upstream could smuggle content past the
-            // scan. A bodiless request keeps the `NothingToScan` default.
+            // Bodiless, or a body that starts with `--`, such as a multipart
+            // upload; the rejection above refused every other unparsed body.
+            // The scanner cannot read it, and a parse differential against the
+            // upstream could smuggle content past the scan. A bodiless request
+            // keeps the `NothingToScan` default.
             #[cfg(feature = "guard")]
             if !body_bytes.is_empty() {
                 guard_outcome = guard::ScanOutcome::Unscannable(guard::REASON_BODY_UNPARSEABLE);
@@ -1903,6 +2062,23 @@ pub(crate) async fn proxy_handler(
             let clone = body_bytes.clone();
             (body_bytes, clone, String::new(), None, None, false)
         };
+
+    // What routing and the exhaustion gate read, per endpoint. When the
+    // allow-list drops the request's `fast-mode-*` beta, an OAuth endpoint
+    // strips `speed` and serves the request at standard speed, so its
+    // fast-mode mark must not keep the request off it. An API-key or
+    // passthrough endpoint still sends `speed`, so its mark still counts.
+    // `forward_anthropic` itself still gets `is_fast_mode` and narrows it on
+    // the strip it actually performs.
+    let fast = FastRequest {
+        requested: is_fast_mode,
+        stripped_on_oauth: is_fast_mode
+            && beta_filter_strips_speed(
+                parts.uri.path(),
+                &parts.headers,
+                &state.allowed_client_betas,
+            ),
+    };
 
     // Build the affinity key now that fp is known. fp is the finest routing
     // discriminator: it splits fan-out agents that share one coarse session-id
@@ -2006,7 +2182,7 @@ pub(crate) async fn proxy_handler(
             // (OpenAI). Both return a `ForwardOutcome` so the shared
             // round-gated policy in `apply_round_outcome` covers both.
             let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint_for_client(affinity, &model, &skip, &client_id, is_fast_mode)
+                .pick_endpoint_for_client(affinity, &model, &skip, &client_id, fast)
                 .await
             {
                 Some(i) => {
@@ -2128,12 +2304,13 @@ pub(crate) async fn proxy_handler(
     }
 
     // An entitlement 400 whose one re-send found nothing else to try goes to
-    // the caller as-is (LAB-4729): the caller sees why, not a synthetic 429.
+    // the caller as-is: the caller sees why, not a synthetic 429.
     // Present only if no later attempt answered — see `apply_round_outcome`.
-    // Deliberately OUTSIDE the `pool_cannot_serve` gate below: the refusal is
-    // never negative-cached, so that gate only counts the refuser as out
-    // via `refused`.
-    let (refused, entitlement_resp) = entitlement_resp.unzip();
+    // Deliberately OUTSIDE the `pool_cannot_serve` gate below, because its
+    // rule is about attempts, not negative caches: the refusal is returned
+    // whenever no other account was attempted after it, so a pool whose other
+    // accounts are hard-limited or cooling still gets it.
+    let (extra_usage_refuser, entitlement_resp) = entitlement_resp.unzip();
     if !last_saw_529 && !last_saw_transient {
         if let Some(resp) = entitlement_resp.flatten() {
             return resp;
@@ -2161,26 +2338,34 @@ pub(crate) async fn proxy_handler(
     // `model_unsupported_rejection_plus_rate_limited_pool_stays_retryable`.
     if !last_saw_529
         && !last_saw_transient
-        && state.pool_cannot_serve(&model, is_fast_mode, refused)
+        && state.pool_cannot_serve(&model, fast, extra_usage_refuser)
     {
         if let Some(resp) = rejected_resp {
             return resp;
         }
         // Warm-cache path: the pool emptied BEFORE any forward ran, so
         // nothing was stashed — synthesize the error the first request got.
-        // Name the cause whose removal would unblock the request: if the
-        // pool serves the model at standard speed, only fast-mode marks
-        // stand in the way; otherwise the model itself is unservable.
-        if is_fast_mode && !state.pool_cannot_serve(&model, false, refused) {
-            warn!(model, "fast mode not enabled on any eligible endpoint");
-            return proxy_error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                FAST_MODE_NOT_ENABLED_MSG,
-            );
+        // Never once an account refused this request for extra usage: that
+        // refusal names neither the model nor fast mode, so a synthesized
+        // model or fast-mode error would claim a cause no account gave this
+        // request. The pool only looks unservable because a concurrent
+        // request marked the rest after a later attempt cleared the stash,
+        // and the retryable exhaustion reply below is the truth.
+        if extra_usage_refuser.is_none() {
+            // Name the cause whose removal would unblock the request: if the
+            // pool serves the model at standard speed, only fast-mode marks
+            // stand in the way; otherwise the model itself is unservable.
+            if fast.requested && !state.pool_cannot_serve(&model, FastRequest::STANDARD, None) {
+                warn!(model, "fast mode not enabled on any eligible endpoint");
+                return proxy_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    FAST_MODE_NOT_ENABLED_MSG,
+                );
+            }
+            warn!(model, "model unsupported on all eligible endpoints");
+            return model_unsupported_response(&model, false);
         }
-        warn!(model, "model unsupported on all eligible endpoints");
-        return model_unsupported_response(&model, false);
     }
     exhaustion_response(&state, last_saw_transient, last_saw_529)
     }

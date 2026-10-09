@@ -344,6 +344,41 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
     );
 }
 
+/// Claude Code's gateway hint headers, sent when the client sets
+/// `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`. They say what kind of call this is
+/// (main loop, subagent, compaction, ...), so a cache-write spike can be put
+/// down to compaction or subagent fan-out instead of routing scatter. Each is
+/// `"-"` when absent. Logged as plain `&str` fields, so the formatter escapes
+/// these caller-controlled values; never log them with `%`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClientHints {
+    pub(crate) request_class: String,
+    pub(crate) agent_type: String,
+    pub(crate) compaction: String,
+    pub(crate) context_compacted: String,
+    pub(crate) prompt_id: String,
+}
+
+impl ClientHints {
+    pub(crate) fn from_headers(headers: &axum::http::HeaderMap) -> Self {
+        let get = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("-")
+                .to_string()
+        };
+        Self {
+            request_class: get("x-claude-code-request-class"),
+            agent_type: get("x-claude-code-agent-type"),
+            compaction: get("x-claude-code-compaction"),
+            context_compacted: get("x-claude-code-context-compacted"),
+            prompt_id: get("x-claude-code-prompt-id"),
+        }
+    }
+}
+
 /// Routing/utilization snapshot captured when upstream response headers
 /// arrive (the former standalone `proxied` / `proxied (openai-compat)` INFO
 /// lines), carried through to `finalize_stream` / `finalize_non_stream` so it
@@ -356,13 +391,17 @@ pub(crate) enum ProxiedCtx {
         util_5h: String,
         util_7d: String,
         constraint: &'static str,
+        /// The account's shared overage flag. Billing reads
+        /// `served_on_overage`, which the log line also carries.
         overage: bool,
+        served_on_overage: bool,
         pin: &'static str,
         total: u64,
         /// Content fingerprint (12 hex, `content_fingerprints`) joining this
         /// line to the DEBUG `fingerprint` line by req_id; `"-"` when the
         /// request body was unparseable.
         fp: String,
+        hints: ClientHints,
     },
     OpenaiCompat {
         client_ver: String,
@@ -370,9 +409,24 @@ pub(crate) enum ProxiedCtx {
         util_5h: String,
         util_7d: String,
         constraint: &'static str,
+        served_on_overage: bool,
         pin: &'static str,
         stream: bool,
     },
+}
+
+impl ProxiedCtx {
+    /// Whether THIS response carried `overage-in-use: true` (LAB-8496).
+    fn served_on_overage(&self) -> bool {
+        match self {
+            Self::Anthropic {
+                served_on_overage, ..
+            }
+            | Self::OpenaiCompat {
+                served_on_overage, ..
+            } => *served_on_overage,
+        }
+    }
 }
 
 /// Emit the single per-request INFO line merging routing context with token
@@ -401,9 +455,11 @@ pub(crate) fn log_proxied(
             util_7d,
             constraint,
             overage,
+            served_on_overage,
             pin,
             total,
             fp,
+            hints,
         } => {
             info!(
                 req_id,
@@ -420,9 +476,15 @@ pub(crate) fn log_proxied(
                 util_7d = %util_7d,
                 constraint = *constraint,
                 overage,
+                served_overage = *served_on_overage,
                 pin = *pin,
                 total,
                 fp = %fp,
+                request_class = hints.request_class.as_str(),
+                agent_type = hints.agent_type.as_str(),
+                compaction = hints.compaction.as_str(),
+                context_compacted = hints.context_compacted.as_str(),
+                prompt_id = hints.prompt_id.as_str(),
                 input = usage.input_tokens,
                 output = usage.output_tokens,
                 cached = usage.cache_read_input_tokens,
@@ -436,6 +498,7 @@ pub(crate) fn log_proxied(
             util_5h,
             util_7d,
             constraint,
+            served_on_overage,
             pin,
             stream,
         } => {
@@ -453,6 +516,7 @@ pub(crate) fn log_proxied(
                 util_5h = %util_5h,
                 util_7d = %util_7d,
                 constraint = *constraint,
+                served_overage = *served_on_overage,
                 pin = *pin,
                 openai_compat = true,
                 stream,
@@ -468,6 +532,11 @@ pub(crate) fn log_proxied(
 
 /// Finalize a streaming response: extract usage, log, and shadow log.
 /// Shared by proxy_handler and openai_chat_handler.
+///
+/// Usage the upstream never reported is charged to the client's budget by
+/// `fallback` (LAB-7593), unless the upstream errored before the stream began.
+/// Only the budget: the token counters and log lines keep what the upstream
+/// reported.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize_stream(
     state: &AppState,
@@ -482,6 +551,7 @@ pub(crate) async fn finalize_stream(
     status_code: u16,
     ctx: ProxiedCtx,
     mut scanner: SseUsageScanner,
+    fallback: StreamFallbackCharge,
     request_start: std::time::Instant,
     client_disconnected: bool,
     upstream_error: bool,
@@ -494,8 +564,34 @@ pub(crate) async fn finalize_stream(
     // Response-derived model (message_start) preferred; request model fallback.
     let usage_model = scanner.model.as_deref().unwrap_or(model);
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
+    let reason = if upstream_error {
+        "upstream_error"
+    } else if client_disconnected {
+        "client_disconnect"
+    } else {
+        "no_usage_event"
+    };
+    // An upstream that errored before the stream began generated nothing (an
+    // in-band `overloaded_error` answering a 200 looks like this), so there
+    // is nothing to charge for. Keyed on the stream beginning, not on a
+    // readable input count: a `message_start` without one can still be
+    // followed by content.
+    let (charged_input, charged_output) = if upstream_error && !scanner.began {
+        (0, 0)
+    } else {
+        fallback.unreported(&scanner)
+    };
+    let charged = charged_input.saturating_add(charged_output);
+    // One budget write for reported usage and estimate together: two writes
+    // each key their own UTC day, so a request straddling midnight would
+    // book the estimate against the next day (LAB-7593 review).
+    state
+        .record_usage_charging(ep, client_id, usage_model, usage, charged)
+        .await;
+    if ctx.served_on_overage() {
+        state.record_overage_usage(client_id, usage_model, usage);
+    }
     if !usage.is_empty() {
-        state.record_usage(ep, client_id, usage_model, usage).await;
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -510,13 +606,6 @@ pub(crate) async fn finalize_stream(
             );
         }
     } else {
-        let reason = if upstream_error {
-            "upstream_error"
-        } else if client_disconnected {
-            "client_disconnect"
-        } else {
-            "no_usage_event"
-        };
         // Log structural metadata only — SSE payloads contain user content.
         let truncated = scanner.event_count > 5;
         warn!(
@@ -532,6 +621,19 @@ pub(crate) async fn finalize_stream(
             sse_events = ?scanner.event_preview,
             truncated,
             "stream_end_no_usage"
+        );
+    }
+    if charged > 0 {
+        warn!(
+            req_id,
+            client_id,
+            model,
+            account = acct_name,
+            status = status_code,
+            reason,
+            charged_input,
+            charged_output,
+            "stream_usage_estimated"
         );
     }
     // Single terminal line for this request (LAB-3214), routing context
@@ -598,6 +700,9 @@ pub(crate) async fn finalize_non_stream(
     ctx: Option<ProxiedCtx>,
 ) {
     let usage_model = response_model.unwrap_or(model);
+    if ctx.as_ref().is_some_and(ProxiedCtx::served_on_overage) {
+        state.record_overage_usage(client_id, usage_model, usage);
+    }
     if !usage.is_empty() {
         state.record_usage(ep, client_id, usage_model, usage).await;
         if let Some(key) = session_key {
@@ -659,14 +764,74 @@ pub(crate) async fn finalize_non_stream(
     state.shadow_log(log);
 }
 
+/// Add `usage` to a per-(client, model) map, bounding its label set: the
+/// model is truncated (empty → `unknown`), and once the map holds
+/// `MAX_CLIENT_MODEL_LABELS` pairs every new pair lumps into ONE global
+/// ("_other", "_other") bucket — a hard bound of the cap + 1. A per-client
+/// ("<client>", "_other") key would let x-client-id rotation (legacy auth
+/// modes) grow the map without bound (LAB-2330).
+fn add_client_model_usage(
+    map: &mut HashMap<(String, String), [u64; 4]>,
+    client_id: &str,
+    model: &str,
+    usage: &TokenUsage,
+) {
+    let model = if model.is_empty() {
+        "unknown".to_owned()
+    } else {
+        truncate_label(model)
+    };
+    let key = (client_id.to_owned(), model);
+    let key = if map.len() < MAX_CLIENT_MODEL_LABELS || map.contains_key(&key) {
+        key
+    } else {
+        ("_other".to_owned(), "_other".to_owned())
+    };
+    let entry = map.entry(key).or_insert([0; 4]);
+    entry[0] += usage.input_tokens;
+    entry[1] += usage.output_tokens;
+    entry[2] += usage.cache_creation_input_tokens;
+    entry[3] += usage.cache_read_input_tokens;
+}
+
 impl AppState {
+    /// Book usage served on paid extra usage (LAB-8496) into
+    /// `anthropic_overage_token_usage_total`. Callers pass the flag read from
+    /// the serving response's own headers, never the account's shared
+    /// `RateLimitInfo`, which a concurrent response on the same account may
+    /// have overwritten.
+    fn record_overage_usage(&self, client_id: &str, model: &str, usage: &TokenUsage) {
+        if usage.is_empty() {
+            return;
+        }
+        add_client_model_usage(&mut self.lock_overage_usage(), client_id, model, usage);
+    }
+
     /// Record token usage for an endpoint and client. `model` feeds the
     /// per-(client, model) counter (LAB-2330): callers pass the
     /// response-derived model where available, falling back to the request
     /// model — either way it is truncated and the pair-count is capped here,
     /// so callers cannot inflate the label set.
     async fn record_usage(&self, ep: &Endpoint, client_id: &str, model: &str, usage: &TokenUsage) {
+        self.record_usage_charging(ep, client_id, model, usage, 0)
+            .await;
+    }
+
+    /// `record_usage`, plus `estimated` tokens charged to the client's budget
+    /// only (LAB-7593): usage a stream never reported. Booked in the same
+    /// budget write as the reported usage, so both land on one UTC day.
+    async fn record_usage_charging(
+        &self,
+        ep: &Endpoint,
+        client_id: &str,
+        model: &str,
+        usage: &TokenUsage,
+        estimated: u64,
+    ) {
         if usage.is_empty() {
+            if client_id != "-" {
+                self.record_budget_usage(client_id, estimated).await;
+            }
             return;
         }
         ep.input_tokens
@@ -700,32 +865,10 @@ impl AppState {
             // exists when the upstream returned usage, so the model string was
             // accepted upstream; truncation + the pair cap bound the label set
             // regardless.
-            let model = if model.is_empty() {
-                "unknown".to_owned()
-            } else {
-                truncate_label(model)
-            };
-            {
-                let mut map = self.lock_client_model_usage();
-                let key = (client_id.to_owned(), model);
-                let key = if map.len() < MAX_CLIENT_MODEL_LABELS || map.contains_key(&key) {
-                    key
-                } else {
-                    // Map full and this pair is new: lump into ONE global
-                    // overflow bucket — hard bound of MAX_CLIENT_MODEL_LABELS
-                    // + 1 entries. A per-client ("<client>", "_other") key
-                    // would let x-client-id rotation (legacy auth modes) grow
-                    // the map without bound (LAB-2330).
-                    ("_other".to_owned(), "_other".to_owned())
-                };
-                let entry = map.entry(key).or_insert([0; 4]);
-                entry[0] += usage.input_tokens;
-                entry[1] += usage.output_tokens;
-                entry[2] += usage.cache_creation_input_tokens;
-                entry[3] += usage.cache_read_input_tokens;
-            }
+            add_client_model_usage(&mut self.lock_client_model_usage(), client_id, model, usage);
             // Budget accounting
-            self.record_budget_usage(client_id, total).await;
+            self.record_budget_usage(client_id, total.saturating_add(estimated))
+                .await;
         }
     }
 

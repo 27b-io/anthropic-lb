@@ -21,7 +21,7 @@ fn top_level_keys_unambiguous_requires_distinct_lowercase_ascii_keys() {
     assert!(top_level_keys_unambiguous(b"{}"));
     // A respelling of a field the proxy decides nothing on has no proxy view
     // to disagree with.
-    assert!(top_level_keys_unambiguous(br#"{"maxtokens":1}"#));
+    assert!(top_level_keys_unambiguous(br#"{"topk":1}"#));
     for body in AMBIGUOUS_KEY_BODIES {
         assert!(!top_level_keys_unambiguous(body.as_bytes()), "{body}");
     }
@@ -44,6 +44,7 @@ fn top_level_keys_unambiguous_requires_distinct_lowercase_ascii_keys() {
         r#"{"spe_ed":"fast"}"#,
         r#"{"mess_ages":[]}"#,
         r#"{"sys-tem":"x"}"#,
+        r#"{"maxtokens":1}"#,
         r#"{"model":"a","mo_del":"b"}"#,
         r#"{"max_tokens":1,"maxtokens":2}"#,
     ] {

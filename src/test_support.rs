@@ -157,6 +157,7 @@ pub(crate) fn test_state_base() -> AppState {
         auto_cache: true,
         client_usage: Mutex::new(HashMap::new()),
         client_model_usage: Mutex::new(HashMap::new()),
+        overage_usage: Mutex::new(HashMap::new()),
         shadow_log_tx: None,
         shadow_log_dropped: AtomicU64::new(0),
         client_budgets: HashMap::new(),
@@ -608,6 +609,32 @@ pub(crate) const HEAD_429_RETRY_AFTER_7: &str = "HTTP/1.1 429 Too Many Requests\
 /// Raw 404 with Anthropic's model-not-found envelope (`connection: close`, so
 /// the body is EOF-delimited — no content-length needed).
 pub(crate) const HEAD_404_MODEL: &str = "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"model: claude-nope-1\"}}";
+/// A capacity 429: `retry-after` plus unified headers reporting an exhausted
+/// 5h window, so ingesting or marking it visibly changes `rate_info`.
+pub(crate) const HEAD_429_CAPACITY: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\nanthropic-ratelimit-unified-5h-utilization: 1.0\r\nanthropic-ratelimit-unified-5h-status: rejected\r\nanthropic-ratelimit-unified-representative-claim: five_hour\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"rate limited\"}}";
+/// A burst 429 (`is_burst_429`): `x-should-retry`, no `retry-after`, no rate
+/// headers. The body is EOF-delimited (`connection: close`).
+pub(crate) const HEAD_429_BURST: &str = "HTTP/1.1 429 Too Many Requests\r\nx-should-retry: true\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"rate limited\"}}";
+
+pub(crate) type Hits = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+/// Endpoint `name` (with `token`) at priority 0 that always answers `head`,
+/// and a healthy pooled account at priority 1. Any rotation off the first
+/// lands on `healthy`, so its hit count is the "did we rotate?" probe.
+/// `PASSTHROUGH` makes the first a passthrough endpoint, `pt`.
+pub(crate) async fn first_then_healthy(
+    (name, token): (&str, &str),
+    head: &'static str,
+) -> (Vec<Endpoint>, Hits, Hits) {
+    let (first_url, first_hits) = spawn_status_then_ok_upstream(usize::MAX, head, b"{}").await;
+    let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+    healthy.priority = 1;
+    let first = mk_endpoint_at(name, token, &first_url);
+    (vec![first, healthy], first_hits, ok_hits)
+}
+pub(crate) const PASSTHROUGH: (&str, &str) = ("pt", "passthrough");
+pub(crate) const POOLED: (&str, &str) = ("pooled", "sk-ant-api-pooled");
 
 /// Poll endpoint token counters until streamed usage lands (the finalize
 /// task is detached, so recording races the client seeing end-of-stream).
@@ -807,6 +834,48 @@ pub(crate) fn hdrs(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
 /// native surface it was also a panic: `serde_json::Value`'s `IndexMut<&str>`
 /// auto-vivifies only on `Null` and `Object`.
 pub(crate) const NON_OBJECT_JSON_BODIES: [&str; 5] = ["[1,2,3]", "\"x\"", "7", "true", "null"];
+
+/// Bodies the proxy's `serde_json` parse refuses although another common JSON
+/// decoder reads `"model":"claude-opus-5"` out of them, so the proxy must never
+/// forward one (LAB-6781). Labelled for assertion messages. The last one also
+/// repeats `model`, pinning that an unparsed body cannot step around the
+/// duplicate-key rule either.
+pub(crate) fn unparseable_json_bodies() -> Vec<(&'static str, Vec<u8>)> {
+    const HEAD: &[u8] =
+        br#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":""#;
+    const TAIL: &[u8] = br#""}]}"#;
+    let with_content = |content: &[u8]| [HEAD, content, TAIL].concat();
+    let object = String::from_utf8(with_content(b"hi")).unwrap();
+    let nested = format!(
+        r#"{{"model":"claude-opus-5","max_tokens":1,"metadata":{}{}}}"#,
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    vec![
+        ("lone high surrogate", with_content(br"\ud800")),
+        ("lone low surrogate", with_content(br"\udc00")),
+        ("200-deep nesting", nested.into_bytes()),
+        (
+            "out-of-range number",
+            br#"{"model":"claude-opus-5","max_tokens":1e400}"#.to_vec(),
+        ),
+        ("raw 0xFF byte in a string", with_content(b"\xff")),
+        ("trailing bytes", format!("{object} trailing").into_bytes()),
+        ("UTF-8 BOM", [b"\xEF\xBB\xBF", object.as_bytes()].concat()),
+        (
+            "UTF-16LE",
+            object.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        ),
+        (
+            "duplicate model plus lone surrogate",
+            [
+                br#"{"model":"claude-haiku-4-5","#.as_slice(),
+                &with_content(br"\ud800")[1..],
+            ]
+            .concat(),
+        ),
+    ]
+}
 
 /// Object bodies with an ambiguous top-level key, which both SDK surfaces
 /// reject locally. The first is the allow-list bypass: a `claude-haiku-*`

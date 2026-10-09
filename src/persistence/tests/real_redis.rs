@@ -59,6 +59,8 @@ mod redis_integration {
         SeedBudgetMirror = 16,
         TransportErrorsExpireDenied = 17,
         TransportErrorsHincrbyRejected = 18,
+        PassthroughNoHardMark = 19,
+        PassthroughNotSynced = 20,
     }
 
     impl Db {
@@ -946,7 +948,7 @@ mod redis_integration {
         )));
     }
 
-    /// LAB-1962 (panel F8) — reversal of the LAB-931 pin, which deliberately
+    /// LAB-1962 — reversal of the LAB-931 pin, which deliberately
     /// deferred this: a transport-level INCRBY failure must NOT delete the
     /// shared counter (one replica's failed write must never erase
     /// fleet-wide accounting — see
@@ -1016,8 +1018,7 @@ mod redis_integration {
 
         // Absent key (just self-healed) + reachable redis + local over limit
         // → the local floor gates. Under the pre-LAB-1962 contract Ok(None)
-        // was an authoritative allow — the enforcement bypass the panel
-        // flagged.
+        // was an authoritative allow — an enforcement bypass.
         let secs = state.check_budget("poison-cli").await.expect_err(
             "absent key with redis reachable must fall through to the local floor and deny",
         );
@@ -1750,6 +1751,111 @@ mod redis_integration {
         assert_eq!(
             info["redis_connected"], true,
             "cluster_info must reflect the attached backend"
+        );
+    }
+
+    /// A passthrough 429 answers the caller's own credential, so it must
+    /// write no `alb:hard:` key, which would cool the endpoint for every
+    /// caller on every replica. Covers a capacity and a burst 429 on both
+    /// Anthropic paths. The pooled control proves this harness sees the key
+    /// when a 429 does mark the endpoint.
+    #[tokio::test]
+    async fn passthrough_429_never_writes_shared_hard_limit() {
+        let Some((conn, fred)) = redis_test_conn(Db::PassthroughNoHardMark).await else {
+            return;
+        };
+        let send = |addr: SocketAddr, path: &'static str, body: &'static str| async move {
+            reqwest::Client::new()
+                .post(format!("http://{addr}{path}"))
+                .header("content-type", "application/json")
+                .header("x-api-key", "sk-ant-api-caller")
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        };
+        const MESSAGES: (&str, &str) = (
+            "/v1/messages",
+            r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        const CHAT: (&str, &str) = (
+            "/v1/chat/completions",
+            r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        for head in [HEAD_429_CAPACITY, HEAD_429_BURST] {
+            for (path, body) in [MESSAGES, CHAT] {
+                let (endpoints, _, _) = first_then_healthy(PASSTHROUGH, head).await;
+                let addr = serve(build_router(state_with_redis(endpoints, fred.clone()))).await;
+                assert_eq!(
+                    send(addr, path, body).await,
+                    reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    "{path}: the caller must get its own 429"
+                );
+            }
+        }
+
+        let (endpoints, _, _) = first_then_healthy(POOLED, HEAD_429_CAPACITY).await;
+        let addr = serve(build_router(state_with_redis(endpoints, fred.clone()))).await;
+        let (path, body) = MESSAGES;
+        assert_eq!(send(addr, path, body).await, reqwest::StatusCode::OK);
+        eventually("the pooled 429 to write alb:hard:pooled", || {
+            let mut c = conn.clone();
+            async move { c.exists::<_, bool>("alb:hard:pooled").await.unwrap() }
+        })
+        .await;
+
+        let mut c = conn.clone();
+        assert!(
+            !c.exists::<_, bool>("alb:hard:pt").await.unwrap(),
+            "a passthrough 429 must not mark the endpoint for other replicas"
+        );
+    }
+
+    /// A passthrough endpoint's `rate_info` is never refreshed from its own
+    /// traffic, so a hard limit or rate view synced from another replica (for
+    /// example one still on an older build) would pin it for good. The pooled
+    /// control proves the same keys apply to an endpoint that owns its state.
+    #[tokio::test]
+    async fn sync_from_redis_skips_passthrough_endpoints() {
+        let Some((mut conn, fred)) = redis_test_conn(Db::PassthroughNotSynced).await else {
+            return;
+        };
+        let state = state_with_redis(
+            vec![
+                mk_endpoint_at(PASSTHROUGH.0, PASSTHROUGH.1, "http://127.0.0.1:9"),
+                mk_endpoint_at(POOLED.0, POOLED.1, "http://127.0.0.1:9"),
+            ],
+            fred,
+        );
+        let now_epoch = AppState::now_epoch();
+        let rate = serde_json::to_string(&remote_rate_info(now_epoch, 1.0)).unwrap();
+        for name in ["pt", "pooled"] {
+            let _: () = conn
+                .set(format!("alb:hard:{name}"), now_epoch + 600)
+                .await
+                .unwrap();
+            let _: () = conn
+                .set(format!("alb:rate:{name}"), rate.as_str())
+                .await
+                .unwrap();
+        }
+
+        state.sync_from_redis().await;
+
+        let pooled = state.endpoints[1].rate_info.read().await;
+        assert!(pooled.hard_limited_until.is_some());
+        assert_eq!(pooled.utilization, Some(1.0));
+        drop(pooled);
+        let pt = state.endpoints[0].rate_info.read().await;
+        assert!(
+            pt.hard_limited_until.is_none(),
+            "a synced hard limit must not pin a passthrough endpoint"
+        );
+        assert_eq!(
+            (pt.utilization, pt.remaining_requests),
+            (None, None),
+            "a synced rate view must not pin a passthrough endpoint"
         );
     }
 }

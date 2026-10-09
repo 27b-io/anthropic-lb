@@ -103,20 +103,30 @@ thread_local! {
     pub(crate) static TRANSLATE_A2O_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Err (with a client-facing message) when a message contains an image this
-/// translator can't represent faithfully — the caller must surface a real
-/// error instead of silently forwarding a request with the image dropped.
+pub(crate) const MODEL_NOT_A_STRING: &str = "model must be a non-empty string";
+
+/// The request's `model`, only when it is a non-empty JSON string.
+fn request_model(body: &serde_json::Value) -> Option<&str> {
+    body.get("model")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+}
+
+/// Err (with a client-facing message) when `model` is not a non-empty string,
+/// or when a message contains an image this translator can't represent
+/// faithfully — the caller must surface a real error instead of silently
+/// forwarding a request with the image dropped.
 pub(crate) fn translate_anthropic_request_to_openai(
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     #[cfg(test)]
     TRANSLATE_A2O_CALLS.with(|c| c.set(c.get() + 1));
 
+    // `model` is the one forwarded field the routing gate reads, and the gate
+    // read a non-string one as no model at all (LAB-6894).
+    let model = request_model(body).ok_or(MODEL_NOT_A_STRING)?;
     let mut out = serde_json::Map::new();
-
-    if let Some(model) = body.get("model") {
-        out.insert("model".to_string(), model.clone());
-    }
+    out.insert("model".to_string(), model.into());
 
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
@@ -290,10 +300,9 @@ pub(crate) fn translate_anthropic_request_to_openai(
     // translator: an OpenAI-protocol endpoint can front Claude ≥ 4.7 (empty
     // `models` list serves everything), and the deprecated param 400s there
     // too. Policy in `drops_deprecated_temperature`.
-    let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
     for key in &["temperature", "top_p", "stream"] {
         if let Some(v) = body.get(*key) {
-            if *key == "temperature" && drops_deprecated_temperature(model_name, v) {
+            if *key == "temperature" && drops_deprecated_temperature(model, v) {
                 continue;
             }
             out.insert(key.to_string(), v.clone());
@@ -964,6 +973,7 @@ async fn forward_openai_compat_anthropic(
             // here always answers a standard-speed request (LAB-2693).
             /* is_fast_mode */
             false,
+            passthrough,
         )
         .await;
 
@@ -980,6 +990,7 @@ async fn forward_openai_compat_anthropic(
         /* openai_error_shape */ true,
         // The OpenAI request shape cannot express `speed` — never fast.
         None,
+        passthrough,
     )
     .await
     {
@@ -1033,6 +1044,7 @@ async fn forward_openai_compat_anthropic(
                 .map(|v| format!("{v:.2}"))
                 .unwrap_or_else(|| "-".to_string()),
             constraint,
+            served_on_overage: overage_in_use(resp.headers()),
             pin: state.pin_status(client_id, endpoint_idx),
             stream: is_streaming,
         };
@@ -1044,6 +1056,12 @@ async fn forward_openai_compat_anthropic(
 
     // Non-2xx: log error detail, translate to OpenAI error format, return
     if !status.is_success() {
+        // The error is rebuilt below without the upstream headers, so carry
+        // over the two the caller's SDK backs off on.
+        let retry_hints: Vec<(&str, reqwest::header::HeaderValue)> = RETRY_HINT_HEADERS
+            .into_iter()
+            .filter_map(|name| Some((name, resp.headers().get(name)?.clone())))
+            .collect();
         let error_body = resp.bytes().await.unwrap_or_else(|e| {
             warn!(req_id, account = endpoint_name, error = %e, "openai-compat: failed to read upstream error body");
             bytes::Bytes::new()
@@ -1124,10 +1142,14 @@ async fn forward_openai_compat_anthropic(
                 })
             };
 
-        let response = Response::builder()
+        let mut builder = Response::builder()
             .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
             .header("content-type", "application/json")
-            .header("x-budget-status", budget_status)
+            .header("x-budget-status", budget_status);
+        for (name, value) in retry_hints {
+            builder = builder.header(name, value);
+        }
+        let response = builder
             .body(Body::from(
                 serde_json::to_vec(&openai_error).unwrap_or_default(),
             ))
@@ -1165,6 +1187,7 @@ async fn forward_openai_compat_anthropic(
         let req_id_clone = req_id.to_owned();
         let session_key_clone = session_key.map(str::to_owned);
         let status_code = status.as_u16();
+        let fallback_charge = StreamFallbackCharge::from_request_body(req_body);
 
         tokio::spawn(async move {
             let mut splitter = SseEventSplitter::default();
@@ -1286,6 +1309,7 @@ async fn forward_openai_compat_anthropic(
                 status_code,
                 proxied_ctx,
                 scanner,
+                fallback_charge,
                 request_start,
                 client_gone,
                 ctx.terminal.errored,
@@ -1550,11 +1574,20 @@ pub(crate) async fn openai_chat_handler(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let json_mode = wants_json_object(&openai_body);
-    let model = openai_body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("")
-        .to_string();
+    // An absent, empty or non-string `model` reads as no model, which every
+    // endpoint `models` list allows, while a `Protocol::OpenAI` endpoint gets the
+    // client's own `model` value and may read an array as several models
+    // (LAB-6894). Refused before the gate, for every client class.
+    let Some(model) = request_model(&openai_body) else {
+        warn!(
+            req_id,
+            client = %client_ip,
+            client_id = %client_id,
+            "rejected: model is not a non-empty string"
+        );
+        return openai_invalid_request_response(MODEL_NOT_A_STRING);
+    };
+    let model = model.to_string();
 
     // LAB-798: `Protocol::OpenAI` endpoints below forward `body_bytes`
     // verbatim, so a hard-rejected `temperature` must be stripped here,
@@ -1669,9 +1702,6 @@ pub(crate) async fn openai_chat_handler(
         let mut rejected_resp: Option<Response> = None;
         // One-shot entitlement re-send, as in `proxy_handler` (LAB-4729).
         let mut entitlement_resp: Option<(EndpointIdx, Option<Response>)> = None;
-        // `body_bytes` without `OPENAI_FALLBACK_FIELDS`, built on the first
-        // restricted `Protocol::OpenAI` attempt and reused after it.
-        let mut restricted_body: Option<bytes::Bytes> = None;
         for retry_round in 0..=MAX_529_RETRIES {
             if retry_round > 0 {
                 let delay = round_backoff_delay(retry_round, last_saw_529);
@@ -1694,7 +1724,13 @@ pub(crate) async fn openai_chat_handler(
                 // `apply_round_outcome` covers both.
                 // OpenAI→Anthropic translation carries no `speed`: never fast.
                 let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                    .pick_endpoint_for_client(affinity, &model, &skip, &client_id, false)
+                    .pick_endpoint_for_client(
+                        affinity,
+                        &model,
+                        &skip,
+                        &client_id,
+                        FastRequest::STANDARD,
+                    )
                     .await
                 {
                     Some(i) => {
@@ -1726,34 +1762,25 @@ pub(crate) async fn openai_chat_handler(
                             Protocol::OpenAI => {
                                 // The endpoint is OpenAI-native — forward the
                                 // original request body without translation.
-                                // LAB-6794: minus its fallback lists when the
-                                // client or THIS endpoint has a `models` list,
-                                // the rule `forward_anthropic` applies to
-                                // `fallbacks` (LAB-5970) — see
+                                // LAB-6794: minus its fallback lists on a
+                                // restricted attempt, as `forward_anthropic`
+                                // strips `fallbacks` — see
                                 // `OPENAI_FALLBACK_FIELDS`.
-                                let restricted = !ep.models.is_empty()
-                                    || state.client_restricts_models(&client_id);
-                                let wire_body = if restricted {
-                                    &*restricted_body.get_or_insert_with(|| {
-                                        match strip_top_level_fields(
-                                            &body_bytes,
-                                            OPENAI_FALLBACK_FIELDS,
-                                        ) {
-                                            Some(stripped) => {
-                                                debug!(
-                                                    req_id,
-                                                    client_id,
-                                                    upstream = ep.name,
-                                                    "models allow-list: stripped top-level fallback fields"
-                                                );
-                                                stripped
-                                            }
-                                            None => body_bytes.clone(),
-                                        }
+                                let fallback_free = state
+                                    .attempt_restricts_models(ep, &client_id)
+                                    .then(|| {
+                                        strip_top_level_fields(&body_bytes, OPENAI_FALLBACK_FIELDS)
                                     })
-                                } else {
-                                    &body_bytes
-                                };
+                                    .flatten();
+                                if fallback_free.is_some() {
+                                    debug!(
+                                        req_id,
+                                        client_id,
+                                        upstream = ep.name,
+                                        "models allow-list: stripped top-level fallback fields"
+                                    );
+                                }
+                                let wire_body = fallback_free.as_ref().unwrap_or(&body_bytes);
                                 let out = try_fallback_upstream(
                                     &state,
                                     wire_body,
@@ -1805,7 +1832,7 @@ pub(crate) async fn openai_chat_handler(
 
         // Entitlement 400 first, outside the rejection gate — as in
         // `proxy_handler` (LAB-4729).
-        let (refused, entitlement_resp) = entitlement_resp.unzip();
+        let (extra_usage_refuser, entitlement_resp) = entitlement_resp.unzip();
         if !last_saw_529 && !last_saw_transient {
             if let Some(resp) = entitlement_resp.flatten() {
                 return resp;
@@ -1815,12 +1842,19 @@ pub(crate) async fn openai_chat_handler(
         // generalised by LAB-2687), in the OpenAI error shape this handler's
         // clients parse. Never `fast`: the OpenAI→Anthropic translation
         // carries no `speed`.
-        if !last_saw_529 && !last_saw_transient && state.pool_cannot_serve(&model, false, refused) {
+        if !last_saw_529
+            && !last_saw_transient
+            && state.pool_cannot_serve(&model, FastRequest::STANDARD, extra_usage_refuser)
+        {
             if let Some(resp) = rejected_resp {
                 return resp;
             }
-            warn!(model, "model unsupported on all eligible endpoints");
-            return model_unsupported_response(&model, true);
+            // As in `proxy_handler`: an account that refused this request for
+            // extra usage did not refuse the model, so no 404 is synthesized.
+            if extra_usage_refuser.is_none() {
+                warn!(model, "model unsupported on all eligible endpoints");
+                return model_unsupported_response(&model, true);
+            }
         }
         exhaustion_response(&state, last_saw_transient, last_saw_529)
     }

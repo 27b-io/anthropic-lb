@@ -733,7 +733,7 @@ async fn response_cache_count_tokens_metrics_exposed() {
     assert!(text.contains(r#"anthropic_response_cache_misses_total{surface="messages"} 1"#));
     assert!(text.contains(r#"anthropic_response_cache_stores_total{surface="messages"} 1"#));
 
-    // Panel fix: the exposition format requires all samples of one metric
+    // The exposition format requires all samples of one metric
     // grouped together (no other metric's lines interleaved) — assert both
     // surfaces' `hits_total` samples are adjacent, not separated by
     // misses/stores/errors lines from the metric-major/surface-minor loop.
@@ -950,7 +950,7 @@ async fn response_cache_cachekitio_live_round_trip() {
     assert_eq!(got.body, entry.body);
 }
 
-// Panel fix (bug-hunter MAJ): anthropic-version and the URI query string are
+// anthropic-version and the URI query string are
 // key material — an SDK upgrade mid-TTL must miss, not replay the old shape.
 #[test]
 fn response_cache_key_varies_on_version_and_query() {
@@ -981,7 +981,7 @@ fn response_cache_key_varies_on_version_and_query() {
     );
 }
 
-// Panel fix (craftsman MAJ): an upstream answering a stream:false request
+// An upstream answering a stream:false request
 // with text/event-stream must pass through untouched — never collected,
 // never cached as a bogus non-streaming entry.
 #[tokio::test]
@@ -1044,7 +1044,7 @@ async fn response_cache_skips_non_json_content_type() {
     );
 }
 
-// Panel fix (bug-hunter MAJ): bodies over MAX_BODY_BYTES are not stored —
+// Bodies over MAX_BODY_BYTES are not stored —
 // bounds backend value growth and worst-case L1 memory. The response itself
 // is returned intact.
 #[tokio::test]

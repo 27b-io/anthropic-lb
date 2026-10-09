@@ -42,7 +42,7 @@ Routes requests across multiple Anthropic accounts using dynamic capacity-based 
 | **Status-based routing** | Parses API status headers — `warning`/`throttled`/`rejected` enforce utilization floors |
 | **429 rotation** | Rate-limited accounts cool down, traffic shifts instantly |
 | **5xx retry** | Automatic retry on 500/502/503/504/529 (picks different account) |
-| **Token tracking** | Per-account and per-client input/output/cache token counters, plus a per-(client, model) breakdown (`anthropic_client_model_token_usage_total{client,model,type}`) for model-mix and API-price attribution |
+| **Token tracking** | Per-account and per-client input/output/cache token counters, plus a per-(client, model) breakdown (`anthropic_client_model_token_usage_total{client,model,type}`) for model-mix and API-price attribution, and the same breakdown for tokens served on paid extra usage (`anthropic_overage_token_usage_total{client,model,type}`) |
 | **Client budgets** | Daily per-client token budgets with automatic reset |
 | **Utilization limits** | Per-client utilization ceiling — 429 when all Anthropic endpoints exceed limit |
 | **Operator bypass** | Designated client bypasses all budget, utilization, and emergency checks |
@@ -254,8 +254,10 @@ top-level `fallbacks` field and a refusal is returned as a refusal.
 The same rule covers `/v1/chat/completions` requests forwarded to a
 `protocol = "openai"` endpoint: they lose the body-level fallback lists an
 OpenAI-compatible gateway may honour (`fallbacks`, `context_window_fallbacks`,
-`content_policy_fallbacks` and `router_settings_override`), so a failure of the
-requested model comes back as that failure.
+`content_policy_fallbacks` and `router_settings_override`). Only the client's
+lists go, so fallbacks configured on the gateway itself still apply.
+`router_settings_override` is dropped whole, including any retry, timeout or
+routing settings it carries.
 
 ---
 
@@ -336,13 +338,13 @@ Per-client token usage and budget status appear in `/_stats`.
 
 ### Per-client model allow-lists
 
-`clients[].models` restricts which models a client may request, using the same exact-match + `*`-suffix wildcard semantics as `endpoints[].models`. Empty or absent = all models allowed.
+`clients[].models` restricts which models a client may request, using the same exact-match + `*`-suffix wildcard semantics as `endpoints[].models`. Empty or absent = all models allowed. A non-empty list, on a client or an endpoint, never matches a model containing `,`, because an OpenAI-compatible upstream may read it as several models.
 
 A request for a model outside the list is rejected with **403** — a policy denial, distinct from the 429s that mean "capacity, try later" — and counted as `anthropic_client_model_denied_total{client,model}`. Operators bypass it, as they do every other gate check. The check sits in `pre_request_gate`, which both `/v1/messages` and `/v1/chat/completions` route through, so it covers both surfaces.
 
 To deny a client every model, set `models = [""]`. The single empty pattern matches no model, so every `/v1` request from that client gets 403 while its credential still authenticates — useful for a principal that should only read the admin surfaces. Do not write `models = []` for this: `[]`, like an omitted `models`, allows all models.
 
-It **fails closed** on a model it cannot read. The proxy takes the model from the top-level `model` key of a JSON body; a body that does not parse, or a route that nests the model elsewhere (`/v1/messages/batches` puts it under `requests[].params.model`), yields no model — and a client that has an allow-list is then denied rather than waved through. Clients with no allow-list are unaffected.
+It **fails closed** on a model it cannot read. The proxy takes the model from the top-level `model` key of a JSON body; a multipart upload, or a route that nests the model elsewhere (`/v1/messages/batches` puts it under `requests[].params.model`), yields no model — and a client that has an allow-list is then denied rather than waved through. Clients with no allow-list are unaffected. Any other body that does not parse is refused before this check (see §Credential-path hardening).
 
 ---
 
@@ -400,6 +402,19 @@ can steer are locked down by default:
   `redirect::Policy::none()`; a `3xx` from an upstream surfaces to the caller
   as a `502` with a distinct log line instead of re-sending credentials to
   the `Location` target.
+- **Unreadable bodies are refused.** On the Anthropic surface (every route
+  but `/v1/chat/completions`, which answers invalid JSON with its own `400`),
+  a non-empty request body that does not parse as JSON gets a
+  `400 invalid_request_error` before routing, whatever its path or
+  `Content-Type`, and is logged at `warn` with its client and path. Other JSON
+  decoders read a model out of some bodies this proxy's parser refuses (a lone
+  surrogate escape, a UTF-8 BOM, trailing bytes), so forwarding one would let
+  the upstream act on a model the proxy never routed or gated on. A multipart
+  upload (`/v1/files`) passes: it opens with its `--` boundary line, and no
+  JSON text starts with `--`. The proxy decodes no content coding, so a
+  non-empty body under any `Content-Encoding` but `identity`, or any
+  `Transfer-Encoding` but `chunked`, gets the same `400` first: its raw bytes
+  are not what the upstream would read.
 - **Response headers are allow-listed.** Only `content-type`,
   `content-length`, `cache-control`, `request-id`, `retry-after`, and
   `x-should-retry` are reflected to callers (plus the proxy's own
@@ -467,9 +482,12 @@ can steer are locked down by default:
   `fast_mode_disabled_remaining_secs` on `/_stats`). Later fast requests skip
   it — a client pinned to it via `preferred_endpoints` spills to the general
   pool — while requests without `speed: "fast"` keep using it. The proxy
-  never strips `speed` to get around a non-entitled org: if no eligible
-  account is entitled, the client gets a `400` with the upstream's error type
-  and message rather than a silent downgrade or a synthetic `429`. The first
+  never strips `speed` to get around a non-entitled org: once every eligible
+  account has answered with that `400`, the client gets a `400` with the
+  upstream's error type and message rather than a silent downgrade or a
+  synthetic `429`. A fast-mode `400` beside accounts that are merely
+  rate-limited stays a retryable `429`, since those accounts may serve the
+  request once they recover. The first
   such request gets the upstream response itself; while the marks last, the
   proxy answers with the same type and message and no upstream headers. A
   `passthrough` endpoint is never marked: it sends the caller's own
@@ -517,8 +535,13 @@ PII scanner (emails, cards, IPs, JWTs, national ids, provider API-key shapes).
 
 ### What it scans
 
-Only the **newest `user` text and `tool_result` blocks** of the request body —
-the freshest untrusted content. The `system` prompt is never scanned (it is
+Only the **newest `user` turn** of the request body — the freshest untrusted
+content: its `text` blocks, the text of its `document` and `search_result`
+blocks, and the same inside its `tool_result` blocks. For a `document` that is a
+`text` source's `data`, a `content` source's string or `text` blocks, and the
+`title` and `context` of any document; for a `search_result`, its `text` blocks,
+`title` and `source`; and a `text` field on any block. Those are the retrieval and web-fetch paths, where
+indirect prompt injection arrives. The `system` prompt is never scanned (it is
 operator-trusted and a known false-positive surface). Detection is strictly
 read-only: the body forwarded upstream is byte-identical to what the client
 sent, so prompt-cache prefixes and routing are never disturbed. To bound
@@ -534,23 +557,28 @@ body, such as `GET /v1/models`, has nothing to scan and passes through.
 On `/v1/chat/completions` the body is scanned after translation to the Messages
 shape, but judged **readable** on the body the client sent. The translator is
 lossy in three places — a non-array `messages`, a `tool` message's non-string
-`content`, and a malformed `image_url` part all collapse to empty before the
-scanner sees them — so a document that is unreadable on the wire would
-otherwise read as clean, which is worse than reading as unscanned.
+`content` or a `tool` content part's fields other than `text`, and a
+malformed `image_url` part all collapse to empty before the scanner sees them —
+so a document that is unreadable on the wire would otherwise read as clean,
+which is worse than reading as unscanned.
 
 Content the Messages shape does not carry is not scanned: fields translation
-drops outright (`messages[].name`, the top-level `user`), content blocks of a
-type the scanner does not read (`image`, `document`, `thinking`), older turns,
-and a body with no `messages` field at all (`/v1/complete`'s `prompt`, batch
-requests). Those are **coverage** limits — the guard read the document and there
-was nothing in it that it reads.
+drops outright (`messages[].name`, the top-level `user`), content the scanner
+cannot read as text (images, and `document` blocks with a `base64`, `url` or
+`file` source — PDF bytes, or content not in the request at all), blocks with
+no text field (`tool_reference` tool names, `browser_state` tab titles and
+URLs), older turns, and a body with no `messages` field at all
+(`/v1/complete`'s `prompt`, batch requests). Those are **coverage** limits —
+the guard read the document and there was nothing in it that it reads.
 
 A `messages` the scanner cannot **read** is a different thing, and is treated as
 one: an element that is not an object, a `role` that is absent, not a string, or
 not `user`/`assistant`, or a newest-turn `content` that is present in a shape the
 scanner cannot walk (an object, a text block whose `text` is not a string, a
-`tool_result` whose content is neither string nor block array). Those are not
-"nothing to scan" — the guard could not tell what it was looking at, and under
+`tool_result` whose content is neither string nor block array, a `document` or
+`search_result` in a shape the API does not define), or a content block of a
+type the scanner does not know that carries a `text`, `content`, `source`,
+`title` or `context` field. Those are not "nothing to scan" — the guard could not tell what it was looking at, and under
 `block` they fail closed (below). Note an absent field is not the same as a
 present unreadable one: absent content cannot be hiding anything.
 
@@ -596,7 +624,9 @@ Operator clients are always `off` regardless of configuration.
 same 400 rather than forwarded unscanned:
 
 - the body is not JSON — a parse differential must not smuggle content past the
-  scan; this includes multipart uploads such as `/v1/files`;
+  scan. Every other unparseable body is already refused for all clients (see
+  §Credential-path hardening), so in practice this is a multipart upload such
+  as `/v1/files`;
 - `messages` is present but is not an array — a string, an object, a number,
   `null`. The scanner reads that field as an array, so none of it reaches the
   scan while all of it reaches the upstream. This applies on every path. A body
@@ -607,15 +637,21 @@ same 400 rather than forwarded unscanned:
 - `messages` is an array the scanner cannot read — an element that is not an
   object, a `role` absent / not a string / not `user` or `assistant` (`"User"`
   included: the compare is exact), or a newest-turn `content` present in a shape
-  it cannot walk. Each of these is content the guard never saw and the upstream
-  would have;
+  it cannot walk. That includes a malformed `document` or `search_result`, and
+  a block of a type the scanner does not know that carries a `text`, `content`,
+  `source`, `title` or `context` field (`{"type": "x", "text": "..."}`).
+  Audio, file, `tool_reference` and `browser_state` blocks carry none of those
+  and still pass; images are skipped as a known binary type. Each of these is content the guard never saw and the upstream would
+  have;
 - the body parsed as JSON but is not an object — a bare string or array is not a
   request any endpoint here accepts, and reads as "no `messages` field" without
   this rule;
 - on `/v1/chat/completions` only, `messages` is absent or not an array, or a
   `user`/`tool` message's content is in a shape translation would flatten (a
   non-string `tool` content, a content part with no string `type`, a `text` that
-  is not a string, an `image_url` that is not an object with a string `url`).
+  is not a string, a `tool` content part carrying `content`, `source`, `title`
+  or `context` — translation keeps only its `text` — or an `image_url` that is not an object
+  with a string `url`).
   That endpoint is a single API which requires `messages`, and an
   `openai`-protocol endpoint forwards the client's original bytes, so what
   translation drops still ships;
@@ -843,6 +879,16 @@ models sharing their first 64 characters share one label.
 `client="_other",model="_other"` bucket, because its client id can be
 header-asserted under legacy auth (bounded at 256 + 1 distinct (client,
 model) pairs).
+
+`anthropic_overage_token_usage_total{client,model,type}` counts the tokens of
+each request whose own upstream response carried
+`anthropic-ratelimit-unified-overage-in-use: true`, i.e. usage billed as paid
+extra usage. It reads the serving response's headers, not the account's last
+known state, so concurrent responses on one account cannot mislabel each
+other; the `proxied` log line carries the same flag as `served_overage`, beside
+the account-level `overage`. It shares the per-model family's labels and bound, and also counts
+anonymous (`client="-"`) traffic. Join it to a `(model, type)` price series to
+estimate extra-usage spend.
 
 ### Per-claim rate-limit visibility
 
@@ -1129,7 +1175,7 @@ The Anthropic↔OpenAI translation layer is not lossless. When an Anthropic-form
 13. If 5xx/529 → add to skip list, retry with different account
 14. Parse rate-limit headers (utilization per claim, reset times, status)
 15. Extract token usage from response (streaming SSE or JSON body; streams from `openai` endpoints have no usage extraction)
-16. Record extracted usage per-account + per-client, update budget (local + Redis)
+16. Record extracted usage per-account + per-client, update budget (local + Redis). A stream from an `anthropic` endpoint that ends before its final `message_delta` (client disconnect, upstream error) is charged to the budget at the request's `max_tokens` for output, plus a request-body estimate (bytes / 4) for input when no `message_start` arrived either. An upstream error before the stream begins (no frame but `error` or `ping`) is charged nothing, since no generation began. The token counters keep only what the upstream reported
 17. Write shadow log entry (async, non-blocking)
 18. State persisted to disk (+ Redis if configured), restored on restart
 ```

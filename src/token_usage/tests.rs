@@ -335,3 +335,106 @@ fn affinity_key_fp_alone_provides_identity() {
         "fp alone must provide an affinity key"
     );
 }
+
+// ── LAB-7593: conservative charge for usage a stream never reported ──
+
+/// Each half of the charge is waived by its own usage event: `message_start`
+/// waives the input estimate, `message_delta` the `max_tokens` output.
+#[test]
+fn stream_fallback_charge_covers_only_unreported_halves() {
+    let charge = StreamFallbackCharge {
+        max_tokens: 50,
+        input_estimate: 20,
+    };
+    let start =
+        b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n";
+    let delta = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
+
+    let mut scanner = SseUsageScanner::default();
+    assert_eq!(charge.unreported(&scanner), (20, 50), "nothing reported");
+    scanner.push(start);
+    assert_eq!(charge.unreported(&scanner), (0, 50), "input reported");
+    scanner.push(delta);
+    assert_eq!(charge.unreported(&scanner), (0, 0), "both reported");
+
+    // A reported zero is still a report: it is not replaced by the charge.
+    let mut scanner = SseUsageScanner::default();
+    scanner.push(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":0}}\n");
+    assert_eq!(charge.unreported(&scanner), (20, 0));
+}
+
+/// A usage event reports a half only when its count is readable: `null`,
+/// `{}` or a non-number reports nothing and leaves the charge in place, and
+/// a later unreadable `message_delta` keeps the last cumulative count.
+#[test]
+fn sse_scanner_reports_usage_only_when_its_count_is_readable() {
+    for usage in ["null", "{}", r#"{"input_tokens":"7"}"#] {
+        let mut scanner = SseUsageScanner::default();
+        scanner.push(
+            format!("data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{usage}}}}}\n")
+                .as_bytes(),
+        );
+        assert!(!scanner.saw_input_usage, "message_start usage {usage}");
+    }
+    for usage in ["null", "{}", r#"{"output_tokens":null}"#] {
+        let mut scanner = SseUsageScanner::default();
+        scanner
+            .push(format!("data: {{\"type\":\"message_delta\",\"usage\":{usage}}}\n").as_bytes());
+        assert!(!scanner.saw_output_usage, "message_delta usage {usage}");
+    }
+
+    let mut scanner = SseUsageScanner::default();
+    scanner.push(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n");
+    scanner.push(b"data: {\"type\":\"message_delta\",\"usage\":{}}\n");
+    assert!(scanner.saw_output_usage);
+    assert_eq!(scanner.usage.output_tokens, 5);
+}
+
+/// A stream has begun once the upstream sends any frame but `error` or
+/// `ping`: those two carry nothing generated, every other one may.
+#[test]
+fn sse_scanner_marks_a_stream_begun_on_any_frame_but_error_or_ping() {
+    let mut scanner = SseUsageScanner::default();
+    scanner.push(b"event: ping\ndata: {\"type\":\"ping\"}\n\n");
+    scanner.push(b"event: error\ndata: {\"type\":\"error\"}\n\n");
+    assert!(!scanner.began, "ping and error only");
+
+    for event in ["message_start", "content_block_delta"] {
+        let mut scanner = SseUsageScanner::default();
+        scanner.push(format!("event: {event}\ndata: {{}}\n\n").as_bytes());
+        assert!(scanner.began, "{event}");
+    }
+}
+
+/// `max_tokens` comes from the body; a body without a readable one is
+/// charged the fallback ceiling, never less. The input estimate is the body
+/// length at four bytes per token, rounded up.
+#[test]
+fn stream_fallback_charge_reads_max_tokens_and_estimates_input() {
+    let body = br#"{"model":"m","max_tokens":4096,"messages":[]}"#;
+    assert_eq!(
+        StreamFallbackCharge::from_request_body(body),
+        StreamFallbackCharge {
+            max_tokens: 4096,
+            input_estimate: body.len().div_ceil(4) as u64,
+        }
+    );
+    for body in [
+        &br#"{"model":"m","messages":[]}"#[..],
+        br#"{"max_tokens":"4096"}"#,
+        br#"{"max_tokens":-1}"#,
+        br#"{"max_tokens":1.5}"#,
+        b"not json",
+    ] {
+        assert_eq!(
+            StreamFallbackCharge::from_request_body(body).max_tokens,
+            FALLBACK_CHARGE_MAX_TOKENS,
+            "{}",
+            String::from_utf8_lossy(body)
+        );
+    }
+    assert_eq!(
+        StreamFallbackCharge::from_request_body(b"12345").input_estimate,
+        2
+    );
+}

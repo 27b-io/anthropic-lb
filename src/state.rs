@@ -390,6 +390,16 @@ const MAX_429_BODY_LOG_BYTES: usize = 512;
 pub(crate) const SENSITIVE_HEADER_SUBSTRINGS: &[&str] =
     &["auth", "cookie", "token", "key", "secret", "session"];
 
+/// Whether a response was served on paid extra usage: its
+/// `anthropic-ratelimit-unified-overage-in-use` header reads `true` (any
+/// case). Absent or anything else is `false`.
+pub(crate) fn overage_in_use(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get("anthropic-ratelimit-unified-overage-in-use")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.eq_ignore_ascii_case("true"))
+}
+
 /// True when a 429 is a transient BURST limit rather than capacity exhaustion:
 /// `x-should-retry` set, but no `retry-after` and no rate-limit headers.
 ///
@@ -397,7 +407,7 @@ pub(crate) const SENSITIVE_HEADER_SUBSTRINGS: &[&str] =
 /// (per-minute RPM / concurrency) limits to the ACCOUNT, not to a request's
 /// rate bucket, so a burst 429 is real evidence about the account even when
 /// the request asked for fast mode — which is why the fast-mode exemption in
-/// `classify_retry_status` defers to it (LAB-2675 panel finding). Shared with
+/// `classify_retry_status` defers to it (LAB-2675). Shared with
 /// `mark_hard_limited_for`, which uses it to pick the backoff ladder over the
 /// capacity cooldown, so the two can never disagree on what "burst" means.
 pub(crate) fn is_burst_429(headers: &reqwest::header::HeaderMap) -> bool {
@@ -529,7 +539,12 @@ pub(crate) struct Endpoint {
 }
 
 /// Exact match with `*`-suffix wildcards. Empty pattern list, or an empty
-/// model, allows everything.
+/// model, allows everything. A non-empty list never matches a model holding a
+/// `,`: an OpenAI-compatible gateway may split it and serve every listed
+/// model, while a `*` pattern would match the whole string (LAB-6894).
+/// The empty-model allowance is safe for `Protocol::OpenAI` endpoints only
+/// because both surfaces refuse an empty or non-string model before routing
+/// to one (`request_model`).
 ///
 /// The SINGLE list-level implementation behind both model allowlists: which
 /// models an *endpoint* may serve (`Endpoint::serves_model`) and which models
@@ -542,7 +557,7 @@ pub(crate) fn model_matches(patterns: &[String], model: &str) -> bool {
     if patterns.is_empty() || model.is_empty() {
         return true;
     }
-    patterns.iter().any(|p| suffix_wildcard_match(p, model))
+    !model.contains(',') && patterns.iter().any(|p| suffix_wildcard_match(p, model))
 }
 
 impl Endpoint {
@@ -550,6 +565,30 @@ impl Endpoint {
     /// Identical to the historical `Account::serves_model` predicate.
     pub(crate) fn serves_model(&self, model: &str) -> bool {
         model_matches(&self.models, model)
+    }
+
+    /// True when `inject_account_auth` passes this endpoint's client
+    /// `anthropic-beta` flags through the allow-list: an Anthropic OAuth
+    /// account. API-key and passthrough endpoints forward the caller's betas,
+    /// and so `speed`, unfiltered.
+    pub(crate) fn filters_client_betas(&self) -> bool {
+        self.protocol == Protocol::Anthropic
+            && !self.passthrough
+            && self.token.starts_with(OAUTH_TOKEN_PREFIX)
+    }
+
+    /// True when `rate_info` describes this endpoint, so it is worth
+    /// persisting, restoring and syncing across replicas. An OpenAI endpoint
+    /// carries no Anthropic rate-limit data. A passthrough endpoint's
+    /// responses describe whichever caller sent them, so its `rate_info` is
+    /// never ingested; restored or synced data could then never be
+    /// refreshed, and would pin its routing weight indefinitely.
+    ///
+    /// Persistence drops the whole entry, not just `rate_info`, so a
+    /// passthrough endpoint's `requests_total` restarts at 0 after a restart.
+    /// That is deliberate: do not loosen this predicate to keep the counter.
+    pub(crate) fn has_own_rate_state(&self) -> bool {
+        self.protocol == Protocol::Anthropic && !self.passthrough
     }
 }
 
@@ -561,7 +600,7 @@ pub(crate) struct AppState {
     /// inter-chunk silence — kills any generation longer than 180s as
     /// "operation timed out" (LAB-718 GEO judge wedge, 2026-07-24: ~20k-token
     /// structured-output calls died 18×/hour across 9 accounts and the SDK
-    /// retried for hours). No read_timeout here; the 900s total budget is the
+    /// retried for hours). No read_timeout here; `NONSTREAMING_TOTAL_SECS` is the
     /// only cap, and the h2 keep-alive PING still evicts dead connections.
     pub(crate) client_nonstreaming: Client,
     /// Unified routing endpoints — the sole endpoint pool.
@@ -610,6 +649,12 @@ pub(crate) struct AppState {
     /// global ("_other", "_other") bucket), so callers cannot inflate the
     /// label set on either axis.
     pub(crate) client_model_usage: Mutex<HashMap<(String, String), [u64; 4]>>,
+    /// Per-(client, model) usage served on paid extra usage: the serving
+    /// response carried `overage-in-use: true` (LAB-8496). Same key, layout
+    /// and cap as `client_model_usage`, but counted independently: it also
+    /// counts anonymous (`-`) traffic, which is billed all the same, and the
+    /// two maps reach their `_other` overflow at different times.
+    pub(crate) overage_usage: Mutex<HashMap<(String, String), [u64; 4]>>,
     /// Shadow log sender (fire-and-forget JSONL appends). None = disabled.
     pub(crate) shadow_log_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Count of shadow log entries dropped due to channel backpressure.
@@ -843,6 +888,11 @@ impl AppState {
 /// hold for the request, or a `503 + Retry-After` Response to return when the
 /// budget is exhausted (load-shedding). Shared by `proxy_handler` and
 /// `openai_chat_handler` so the two paths can't drift.
+///
+/// A request carrying Transfer-Encoding reserves the full cap, as one with no
+/// Content-Length does: TE overrides CL (RFC 9112 §6.3), and hyper keeps a CL
+/// sent before the TE line in the header map while it decodes the body as
+/// chunked, so that CL bounds nothing `read_body_bounded` buffers.
 pub(crate) fn reserve_request_body(
     state: &Arc<AppState>,
     parts: &axum::http::request::Parts,
@@ -852,6 +902,11 @@ pub(crate) fn reserve_request_body(
     let reserve_bytes = parts
         .headers
         .get(axum::http::header::CONTENT_LENGTH)
+        .filter(|_| {
+            !parts
+                .headers
+                .contains_key(axum::http::header::TRANSFER_ENCODING)
+        })
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(MAX_REQUEST_BODY_BYTES as u64)

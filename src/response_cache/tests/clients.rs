@@ -201,6 +201,29 @@ fn endpoint_model_matcher_semantics() {
     assert!(ep.serves_model("claude-opus-5"), "empty list = all models");
 }
 
+/// LAB-6894: an OpenAI-compatible gateway may split a comma `model` and serve
+/// every model it names, so a non-empty list matches none, even through a
+/// `*` pattern that would match the whole string. An empty list still allows
+/// everything, and both gates share the rule.
+#[test]
+fn model_matcher_refuses_a_comma_model_under_a_list() {
+    let haiku = vec!["claude-haiku-*".to_string()];
+    for model in [
+        "claude-haiku-4-5,claude-opus-5",
+        "claude-haiku-4-5,",
+        ",claude-haiku-4-5",
+        ",",
+    ] {
+        assert!(!model_matches(&haiku, model), "{model:?}");
+        assert!(!model_matches(&["*".to_string()], model), "{model:?}");
+        assert!(model_matches(&[], model), "empty list allows {model:?}");
+    }
+    assert!(model_matches(&haiku, "claude-haiku-4-5"));
+
+    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    assert!(!state.client_allows_model("limited", "claude-haiku-4-5,claude-opus-5"));
+}
+
 #[test]
 fn client_allow_list_hit_miss_wildcard_and_empty() {
     let state = state_with_clients(vec![
@@ -279,7 +302,9 @@ async fn gate_denies_unreadable_model_for_restricted_client() {
 }
 
 /// End-to-end proof of the same thing: an unparseable body must not smuggle a
-/// restricted client past its allow-list.
+/// restricted client past its allow-list. Since LAB-6781 the ingress rule
+/// refuses it before the allow-list runs; the allow-list's own denial is
+/// pinned by `native_surface_denies_restricted_client_sending_multipart_body`.
 #[tokio::test]
 async fn native_surface_denies_restricted_client_sending_unparseable_body() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
@@ -293,6 +318,29 @@ async fn native_surface_denies_restricted_client_sending_unparseable_body() {
         .header("content-type", "application/json")
         .header("x-api-key", "key-limited")
         .body("this is not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let json = parse_wire_error_envelope(resp).await;
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+}
+
+/// The one unparsed body that still reaches the gate is a multipart upload.
+/// It carries no model the proxy can read, so the allow-list denies it.
+#[tokio::test]
+async fn native_surface_denies_restricted_client_sending_multipart_body() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = authed_app(
+        &mock_url,
+        vec![mk_client("limited", "key-limited", &["claude-haiku-*"])],
+    );
+    let addr = serve(app).await;
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "multipart/form-data; boundary=x")
+        .header("x-api-key", "key-limited")
+        .body("--x\r\n\r\nhi\r\n--x--\r\n")
         .send()
         .await
         .unwrap();

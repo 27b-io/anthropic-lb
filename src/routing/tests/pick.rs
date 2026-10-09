@@ -358,6 +358,62 @@ async fn mark_hard_limited_capacity_429_poisons_state() {
     );
 }
 
+/// LAB-8497: the hard-429 WARN carries every unified rate-limit header the
+/// 429 had, prefix stripped, so the log shows why upstream refused. Headers
+/// outside the unified family stay off the line.
+#[tokio::test]
+async fn mark_hard_limited_logs_unified_headers() {
+    let buf = log_capture_buf();
+    let state = test_state_with(vec![mk_endpoint("unified-log-8497", "sk-ant-api-a")]);
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in [
+        ("retry-after", "250000"),
+        ("anthropic-ratelimit-unified-status", "rejected"),
+        (
+            "anthropic-ratelimit-unified-representative-claim",
+            "seven_day",
+        ),
+        ("anthropic-ratelimit-unified-7d-status", "rejected"),
+        ("anthropic-ratelimit-unified-7d-reset", "1790000000"),
+        ("anthropic-ratelimit-unified-overage-status", "rejected"),
+        ("anthropic-ratelimit-unified-overage-in-use", "false"),
+        (
+            "anthropic-ratelimit-unified-overage-disabled-reason",
+            "org_level_disabled",
+        ),
+        ("request-id", "req_not_logged"),
+    ] {
+        headers.insert(name, HeaderValue::from_static(value));
+    }
+
+    state.mark_hard_limited(0, &headers).await;
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let mine: Vec<&str> = output
+        .lines()
+        .filter(|l| l.contains("unified-log-8497") && l.contains("account hard rate-limited"))
+        .collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "expected one 429 line, got:\n{}",
+        mine.join("\n")
+    );
+    let line = mine[0];
+    assert!(line.contains(" WARN "), "{line}");
+    // Sorted by name, whatever order the headers were inserted in.
+    assert!(
+        line.contains(
+            "unified=\"7d-reset=1790000000 7d-status=rejected \
+             overage-disabled-reason=org_level_disabled overage-in-use=false \
+             overage-status=rejected representative-claim=seven_day status=rejected\""
+        ),
+        "{line}"
+    );
+    assert!(!line.contains("req_not_logged"), "{line}");
+}
+
 #[tokio::test]
 async fn mark_hard_limited_burst_exponential_backoff() {
     // Consecutive burst 429s should produce increasing cooldowns.

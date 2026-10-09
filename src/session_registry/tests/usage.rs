@@ -287,6 +287,76 @@ async fn single_info_line_per_proxied_request() {
     );
 }
 
+/// The `proxied` line carries Claude Code's gateway hint headers, so cache
+/// analysis can split compaction and subagent calls from main-loop ones. A
+/// request without them logs `-` for each.
+#[tokio::test]
+async fn proxied_line_carries_gateway_hint_headers() {
+    let buf = log_capture_buf();
+
+    let mock_addr = serve(Router::new().fallback(any(mock_anthropic_handler))).await;
+    let (app, _state) = test_app(&format!("http://{mock_addr}"), None);
+    let app_addr = serve(app).await;
+    let client = reqwest::Client::new();
+    let body = r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#;
+
+    let hinted = "gateway-hints-marker-hinted";
+    let resp = client
+        .post(format!("http://{app_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "any")
+        .header("x-client-id", hinted)
+        .header("x-claude-code-request-class", "subagent")
+        .header("x-claude-code-agent-type", "general-purpose")
+        .header("x-claude-code-compaction", "auto")
+        .header("x-claude-code-context-compacted", "1")
+        .header("x-claude-code-prompt-id", "p-123")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let bare = "gateway-hints-marker-bare";
+    let resp = client
+        .post(format!("http://{app_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "any")
+        .header("x-client-id", bare)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let line = |marker: &str| {
+        output
+            .lines()
+            .find(|l| l.contains(marker) && l.contains("proxied"))
+            .unwrap_or_else(|| panic!("no proxied line for {marker}:\n{output}"))
+            .to_string()
+    };
+    let hinted_line = line(hinted);
+    for field in [
+        r#"request_class="subagent""#,
+        r#"agent_type="general-purpose""#,
+        r#"compaction="auto""#,
+        r#"context_compacted="1""#,
+        r#"prompt_id="p-123""#,
+    ] {
+        assert!(
+            hinted_line.contains(field),
+            "missing {field} in: {hinted_line}"
+        );
+    }
+    let bare_line = line(bare);
+    assert!(
+        bare_line.contains(r#"request_class="-""#) && bare_line.contains(r#"prompt_id="-""#),
+        "absent hints should log -, got: {bare_line}"
+    );
+}
+
 /// Regression guard for a gap the LAB-3214 merge introduced and then fixed:
 /// `forward_openai_compat_anthropic` returns early on a non-2xx upstream
 /// status, before ever reaching `finalize_non_stream` — the merged `proxied
@@ -349,4 +419,61 @@ async fn proxied_line_still_logged_on_openai_compat_upstream_error() {
         "merged line should carry the upstream status, got: {}",
         my_lines[0]
     );
+}
+
+// ── LAB-7593: estimated stream usage is budget-only, in one write ──
+
+/// The estimate joins the reported usage in the client's budget, and only
+/// there: the token counters keep what the upstream reported. With nothing
+/// reported, the estimate alone is booked and no counter entry appears.
+#[tokio::test]
+async fn record_usage_charging_books_estimate_to_budget_only() {
+    let state = Arc::new(AppState {
+        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+        client_budgets: [("c1".to_string(), 1_000_000), ("c2".to_string(), 1_000_000)]
+            .into_iter()
+            .collect(),
+        ..test_state_base()
+    });
+    let usage = TokenUsage {
+        input_tokens: 7,
+        cache_read_input_tokens: 3,
+        ..TokenUsage::default()
+    };
+    state
+        .record_usage_charging(&state.endpoints[0], "c1", "m", &usage, 50)
+        .await;
+    state
+        .record_usage_charging(&state.endpoints[0], "c2", "m", &TokenUsage::default(), 80)
+        .await;
+
+    let budget = state.budget_usage.lock().unwrap().clone();
+    assert_eq!(budget.get("c1").map(|&(_, used)| used), Some(60));
+    assert_eq!(budget.get("c2").map(|&(_, used)| used), Some(80));
+    let counters = state.client_usage.lock().unwrap();
+    assert_eq!(counters.get("c1"), Some(&[7, 0, 0, 3]));
+    assert!(!counters.contains_key("c2"));
+    assert_eq!(state.endpoints[0].output_tokens.load(Ordering::Relaxed), 0);
+}
+
+// ── LAB-8496: usage served on paid extra usage ─────────────────
+
+#[tokio::test]
+async fn record_overage_usage_counts_anonymous_and_skips_empty() {
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
+    let usage = TokenUsage {
+        input_tokens: 4,
+        output_tokens: 3,
+        cache_creation_input_tokens: 2,
+        cache_read_input_tokens: 1,
+    };
+    // Anonymous traffic is billed too, unlike the per-client families.
+    state.record_overage_usage("-", "claude-sonnet-5", &usage);
+    state.record_overage_usage("c1", "claude-sonnet-5", &TokenUsage::default());
+    let map = state.overage_usage.lock().unwrap();
+    assert_eq!(
+        map.get(&("-".to_string(), "claude-sonnet-5".to_string())),
+        Some(&[4, 3, 2, 1])
+    );
+    assert_eq!(map.len(), 1, "empty usage must not mint a key");
 }

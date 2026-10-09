@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.3.1](https://github.com/27b-io/anthropic-lb/compare/v0.3.0...v0.3.1) (2026-10-08)
+
+
+### Features
+
+* **LAB-6418:** log Claude Code gateway hint headers on the proxied line ([#246](https://github.com/27b-io/anthropic-lb/issues/246)) ([1b9c085](https://github.com/27b-io/anthropic-lb/commit/1b9c085a52a9f1500b1f8ecbeb382dc532cb7956))
+* **metrics:** count tokens served on paid extra usage (LAB-8496) ([#279](https://github.com/27b-io/anthropic-lb/issues/279)) ([2af9912](https://github.com/27b-io/anthropic-lb/commit/2af991237ef5ca6cfe26e8777fe7df87f5516d9a))
+* **routing:** log the unified rate-limit headers on each hard 429 (LAB-8497) ([#278](https://github.com/27b-io/anthropic-lb/issues/278)) ([df2d773](https://github.com/27b-io/anthropic-lb/commit/df2d773e87273813bc0f2f0848554dbf2f7d069e))
+
+
+### Bug Fixes
+
+* **LAB-5236:** keep exhaustion replies truthful after an extra-usage refusal ([#271](https://github.com/27b-io/anthropic-lb/issues/271)) ([bee5a43](https://github.com/27b-io/anthropic-lb/commit/bee5a431990b3c1ebd298f2299c17e07b55b8dba))
+* **LAB-5497:** reject duplicate top-level JSON keys at ingress ([#254](https://github.com/27b-io/anthropic-lb/issues/254)) ([11494ac](https://github.com/27b-io/anthropic-lb/commit/11494ac6f9eaee72d5004affded06ad4a2558960))
+* **LAB-5542:** scan document and search_result text in the guard window ([#235](https://github.com/27b-io/anthropic-lb/issues/235)) ([e082213](https://github.com/27b-io/anthropic-lb/commit/e0822133de8645f01aa7bfe732bb03cdfd9102c1))
+* **LAB-6009:** return a passthrough endpoint's 429 to the caller untouched ([#274](https://github.com/27b-io/anthropic-lb/issues/274)) ([0d13d10](https://github.com/27b-io/anthropic-lb/commit/0d13d1019f06313fe6d4945d4a467a116f71d06e))
+* **LAB-6781:** refuse request bodies the proxy cannot parse ([#255](https://github.com/27b-io/anthropic-lb/issues/255)) ([0ace12b](https://github.com/27b-io/anthropic-lb/commit/0ace12b988790421447ee517ec465120d7720296))
+* **LAB-6794:** strip body-level fallback lists on restricted OpenAI-protocol requests ([#258](https://github.com/27b-io/anthropic-lb/issues/258)) ([66d3719](https://github.com/27b-io/anthropic-lb/commit/66d3719ce50b699b1db24925ccd7a04076cfb1ee))
+* **LAB-6837:** refuse a repeated chunked transfer coding on purpose ([#266](https://github.com/27b-io/anthropic-lb/issues/266)) ([ac3fa68](https://github.com/27b-io/anthropic-lb/commit/ac3fa6846cd6c8e2bb78d65f9b9fba6e5b63fc6f))
+* **LAB-7391:** streaming upstream client no longer inherits the 900 s total timeout ([#263](https://github.com/27b-io/anthropic-lb/issues/263)) ([59d9821](https://github.com/27b-io/anthropic-lb/commit/59d9821b99829f430338d3651cd9999f78dcff8a))
+* **LAB-7553:** reserve the full body cap when Transfer-Encoding is present ([#268](https://github.com/27b-io/anthropic-lb/issues/268)) ([4e23aac](https://github.com/27b-io/anthropic-lb/commit/4e23aac6b76a67a6c8d4d70f31210bf7744644af))
+* **LAB-7593:** charge a stream that ends before its usage events conservatively ([#269](https://github.com/27b-io/anthropic-lb/issues/269)) ([ee156fa](https://github.com/27b-io/anthropic-lb/commit/ee156fa1a27ceecc88f12eeed35385746b942c71))
+* **release:** build x86_64-apple-darwin on macos-26-intel (LAB-8134) ([#273](https://github.com/27b-io/anthropic-lb/issues/273)) ([81df4ae](https://github.com/27b-io/anthropic-lb/commit/81df4ae8161aa45dee98f96f9bdc4846a4ef1a3f))
+* **security:** refuse a non-string or comma model at the models gates (LAB-6894) ([#267](https://github.com/27b-io/anthropic-lb/issues/267)) ([a2d81b0](https://github.com/27b-io/anthropic-lb/commit/a2d81b093c69603de8119266716ec87579e116c7))
+* **test:** pass GuardConfig to Guard::new in three content guard tests (LAB-8331) ([#275](https://github.com/27b-io/anthropic-lb/issues/275)) ([89ed3e7](https://github.com/27b-io/anthropic-lb/commit/89ed3e7b1c128329ca866af002f7c2a9ecb7cd1e))
+
 ## [0.3.0](https://github.com/27b-io/anthropic-lb/compare/v0.2.5...v0.3.0) (2026-09-30)
 
 
