@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.2](https://github.com/27b-io/anthropic-lb/compare/v0.3.1...v0.3.2) (2026-10-09)
+
+
+### Bug Fixes
+
+* **LAB-5627:** fail closed on OpenAI refusal and thinking parts under block ([#277](https://github.com/27b-io/anthropic-lb/issues/277)) ([9300974](https://github.com/27b-io/anthropic-lb/commit/93009741cea567ada9b390e9e24a92991f5cd43f))
+* **routing:** cool a spent weekly window with no overage path for 15 minutes (LAB-8497) ([#280](https://github.com/27b-io/anthropic-lb/issues/280)) ([08710e3](https://github.com/27b-io/anthropic-lb/commit/08710e3b182cb0149399146f10f82fb300faadd5))
+
 ## [0.3.1](https://github.com/27b-io/anthropic-lb/compare/v0.3.0...v0.3.1) (2026-10-08)
 
 
