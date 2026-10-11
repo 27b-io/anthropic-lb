@@ -81,7 +81,7 @@ async fn pinned_client_always_routes_to_preferred_endpoint() {
                 Some(&key),
                 "claude-opus-5",
                 &[],
-                "other",
+                &state.caller("other"),
                 FastRequest::STANDARD,
             )
             .await
@@ -95,7 +95,7 @@ async fn pinned_client_always_routes_to_preferred_endpoint() {
                     Some(&key),
                     "claude-opus-5",
                     &[],
-                    "passbolt",
+                    &state.caller("passbolt"),
                     FastRequest::STANDARD
                 )
                 .await,
@@ -123,7 +123,7 @@ async fn pinned_client_spills_on_soft_limit_overage() {
                 Some("s"),
                 "claude-opus-5",
                 &[],
-                "passbolt",
+                &state.caller("passbolt"),
                 FastRequest::STANDARD
             )
             .await,
@@ -149,7 +149,7 @@ async fn pinned_client_spills_on_hard_limit() {
                 Some("s"),
                 "claude-opus-5",
                 &[],
-                "passbolt",
+                &state.caller("passbolt"),
                 FastRequest::STANDARD
             )
             .await,
@@ -175,7 +175,7 @@ async fn pinned_client_spills_on_transport_unhealthy() {
                 Some("s"),
                 "claude-opus-5",
                 &[],
-                "passbolt",
+                &state.caller("passbolt"),
                 FastRequest::STANDARD
             )
             .await,
@@ -208,7 +208,7 @@ async fn pinned_client_spills_on_model_mismatch() {
                 Some("s"),
                 "claude-opus-5",
                 &[],
-                "passbolt",
+                &state.caller("passbolt"),
                 FastRequest::STANDARD
             )
             .await,
@@ -222,7 +222,7 @@ async fn pinned_client_spills_on_model_mismatch() {
                 Some("s"),
                 "claude-haiku-4-5",
                 &[],
-                "passbolt",
+                &state.caller("passbolt"),
                 FastRequest::STANDARD
             )
             .await,
@@ -246,7 +246,7 @@ async fn pinned_client_fast_request_spills_when_pin_is_fast_mode_disabled() {
                 Some("s"),
                 "claude-opus-5",
                 &[],
-                "passbolt",
+                &state.caller("passbolt"),
                 FastRequest::FAST
             )
             .await,
@@ -270,7 +270,7 @@ async fn pinned_client_standard_request_keeps_fast_mode_disabled_pin() {
                 Some("s"),
                 "claude-opus-5",
                 &[],
-                "passbolt",
+                &state.caller("passbolt"),
                 FastRequest::STANDARD
             )
             .await,
@@ -311,7 +311,7 @@ async fn pinned_client_rotation_prefers_remaining_preferred_then_spills() {
                     Some(&key),
                     "claude-opus-5",
                     &[1],
-                    "passbolt",
+                    &state.caller("passbolt"),
                     FastRequest::STANDARD
                 )
                 .await,
@@ -326,7 +326,7 @@ async fn pinned_client_rotation_prefers_remaining_preferred_then_spills() {
                 Some("s"),
                 "claude-opus-5",
                 &[1, 2],
-                "passbolt",
+                &state.caller("passbolt"),
                 FastRequest::STANDARD
             )
             .await,
@@ -460,7 +460,7 @@ async fn pinned_client_spills_when_preferred_endpoint_at_paid_overage() {
                 Some("s"),
                 "claude-opus-5",
                 &[],
-                "passbolt",
+                &state.caller("passbolt"),
                 FastRequest::STANDARD
             )
             .await,

@@ -570,7 +570,13 @@ async fn fast_mode_disabled_filters_fast_routing_until_expiry() {
     for _ in 0..8 {
         assert_eq!(
             state
-                .pick_endpoint_for_client(None, "claude-opus-5", &[], "", FastRequest::FAST)
+                .pick_endpoint_for_client(
+                    None,
+                    "claude-opus-5",
+                    &[],
+                    &state.caller(""),
+                    FastRequest::FAST
+                )
                 .await,
             Some(1),
             "a fast request must never route to the non-entitled endpoint"
@@ -583,7 +589,7 @@ async fn fast_mode_disabled_filters_fast_routing_until_expiry() {
                 Some("client:sess:1"),
                 "claude-opus-5",
                 &[],
-                "",
+                &state.caller(""),
                 FastRequest::FAST
             )
             .await,
@@ -678,7 +684,13 @@ async fn fast_mode_excludes_openai_protocol_endpoints() {
     for _ in 0..8 {
         assert_eq!(
             state
-                .pick_endpoint_for_client(None, "claude-opus-5", &[], "", FastRequest::FAST)
+                .pick_endpoint_for_client(
+                    None,
+                    "claude-opus-5",
+                    &[],
+                    &state.caller(""),
+                    FastRequest::FAST
+                )
                 .await,
             Some(0),
             "a fast request must never route to an OpenAI-protocol endpoint"

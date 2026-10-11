@@ -637,11 +637,12 @@ impl AppState {
         peer
     }
 
-    /// Authenticate a request's credential (LAB-1083).
+    /// Authenticate a request's credential (LAB-1083), against the client
+    /// policy in force, read once here and returned for the request to carry.
     ///
-    /// Returns the authenticated principal under `AuthMode::Clients`, `None`
-    /// under the legacy shared key or an open proxy, and a 401 `Response` when
-    /// a required credential does not match.
+    /// The principal is the authenticated one under `AuthMode::Clients`, and
+    /// `None` under the legacy shared key or an open proxy. A required
+    /// credential that does not match is a 401 `Response`.
     ///
     /// `allow_bearer` additionally accepts `Authorization: Bearer` — set only
     /// on the OpenAI-compat surface, whose SDKs send nothing else. It is NOT
@@ -658,7 +659,7 @@ impl AppState {
         &self,
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
-    ) -> Result<Option<Principal>, Box<Response>> {
+    ) -> Result<Authenticated, Box<Response>> {
         // Boxed Err, matching `reserve_request_body` — an inline `Response` is
         // 128+ bytes on the hot success path (clippy::result_large_err).
         let unauthorized = || -> Box<Response> {
@@ -691,23 +692,25 @@ impl AppState {
             .filter(|p| p.len() >= MIN_KEY_LEN);
 
         // Matched as digests (`key_digest` says why timing cannot leak a key).
-        match &self.auth_mode {
-            AuthMode::Clients => presented
-                .find_map(|p| self.principals.get(&key_digest(p)))
-                .cloned()
-                .map(Some)
-                .ok_or_else(unauthorized),
+        let policy = self.current_client_policy();
+        let principal = match &self.auth_mode {
+            AuthMode::Clients => Some(
+                presented
+                    .find_map(|p| policy.principals.get(&key_digest(p)))
+                    .cloned()
+                    .ok_or_else(unauthorized)?,
+            ),
             // Legacy: one shared secret, no principal. The same accept/reject
             // decision as before LAB-1083, on digests now.
             AuthMode::SharedKey(digest) => {
-                if presented.any(|p| key_digest(p) == *digest) {
-                    Ok(None)
-                } else {
-                    Err(unauthorized())
+                if !presented.any(|p| key_digest(p) == *digest) {
+                    return Err(unauthorized());
                 }
+                None
             }
-            AuthMode::Open => Ok(None),
-        }
+            AuthMode::Open => None,
+        };
+        Ok(Authenticated { policy, principal })
     }
 
     /// Authenticate, then throttle failed credentials (LAB-1193).
@@ -743,9 +746,9 @@ impl AppState {
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
         route: &'static str,
-    ) -> Result<Option<Principal>, Box<Response>> {
+    ) -> Result<Authenticated, Box<Response>> {
         match self.authenticate(headers, allow_bearer) {
-            Ok(principal) => Ok(principal),
+            Ok(auth) => Ok(auth),
             Err(unauthorized) => {
                 let (cred, presented) = presented_credential(headers);
                 let key_fp = credential_fingerprint(presented);
@@ -797,8 +800,9 @@ impl AppState {
     }
 
     /// Gate an admin surface (`/_stats`, `/metrics`) behind an OPERATOR
-    /// or ADMIN-READER principal (LAB-1192 AC-4, LAB-4395). Returns the rejection response, or `None`
-    /// when the caller may proceed.
+    /// or ADMIN-READER principal (LAB-1192 AC-4, LAB-4395). Returns the rejection response, or,
+    /// when the caller may proceed, the policy snapshot it was authorized
+    /// against: the one snapshot the surface renders from.
     ///
     /// Under `[[clients]]`: unauthenticated → 401, an authenticated principal
     /// in neither `operators` nor `admin_readers` → 403 — `/_stats` discloses
@@ -817,17 +821,18 @@ impl AppState {
         peer: SocketAddr,
         headers: &hyper::HeaderMap,
         route: &'static str,
-    ) -> Option<Box<Response>> {
-        match self.authenticate_throttled(client_ip, peer, headers, false, route) {
-            Err(resp) => Some(resp),
-            Ok(Some(p)) if p.role == Role::Client => {
+    ) -> Result<Arc<ClientPolicy>, Box<Response>> {
+        let Authenticated { policy, principal } =
+            self.authenticate_throttled(client_ip, peer, headers, false, route)?;
+        match principal {
+            Some(p) if p.role == Role::Client => {
                 warn!(
                     client = %client_ip,
                     client_id = %p.name,
                     route,
                     "rejected: admin surface requires an operator or read-only principal"
                 );
-                Some(Box::new(
+                Err(Box::new(
                     (
                         StatusCode::FORBIDDEN,
                         "forbidden: operator or read-only principal required",
@@ -835,8 +840,8 @@ impl AppState {
                         .into_response(),
                 ))
             }
-            Ok(Some(_)) => None,
-            Ok(None) => {
+            Some(_) => Ok(policy),
+            None => {
                 // allow_unauthenticated: keep the open posture VISIBLE (AC-5)
                 // but rate-limit the warn per route — in the lab a vmagent
                 // scrapes /metrics every ~15s, and one warn per scrape is
@@ -850,7 +855,7 @@ impl AppState {
                         "unauthenticated admin access (allow_unauthenticated) — trusted-network-only; rate-limited log"
                     );
                 }
-                None
+                Ok(policy)
             }
         }
     }
@@ -867,61 +872,6 @@ impl AppState {
                 true
             }
         }
-    }
-
-    /// Whether an attempt on `ep` for `client_id` is bound by a `models` list,
-    /// the endpoint's or the client's — i.e. whether a body-level fallback
-    /// could serve it a model that list does not name, so the attempt's body
-    /// loses its fallback fields (`strip_top_level_fields`; LAB-5970,
-    /// LAB-6794). Judged per attempt: the retry loop may land on a
-    /// differently restricted endpoint. Same client identity semantics as
-    /// `client_allows_model`.
-    pub(crate) fn attempt_restricts_models(&self, ep: &Endpoint, client_id: &str) -> bool {
-        !ep.models.is_empty()
-            || self
-                .clients
-                .iter()
-                .any(|c| c.name == client_id && !c.models.is_empty())
-    }
-
-    /// Whether `client_id` may request `model` (LAB-1083).
-    ///
-    /// Unknown client, or a client with an empty list, allows everything.
-    /// "Unknown client" is only reachable on the legacy path: with
-    /// `[[clients]]` configured, `client_id` is always a principal name.
-    ///
-    /// FAILS CLOSED on an empty `model`, and this is the one place where the
-    /// shared matcher's semantics are deliberately NOT inherited. An empty
-    /// model means the caller's model is UNKNOWN to us — the body did not
-    /// parse as JSON, or it carries no top-level `model` (the batches API
-    /// nests it under `requests[].params.model`, and `proxy_handler` is the
-    /// catch-all route). For `Endpoint::serves_model` "unknown" rightly means
-    /// "don't narrow the routing pool"; for a policy gate it must mean
-    /// "deny", or a restricted client reaches any model by sending a body we
-    /// cannot read.
-    pub(crate) fn client_allows_model(&self, client_id: &str, model: &str) -> bool {
-        match self.clients.iter().find(|c| c.name == client_id) {
-            Some(c) if c.models.is_empty() => true,
-            Some(c) => !model.is_empty() && model_matches(&c.models, model),
-            None => true,
-        }
-    }
-
-    /// LAB-3877: resolve the Tier 0 guard policy for a client. The operator
-    /// bypass is always `Off` (it forwards operator-trusted content). Otherwise
-    /// the client's configured policy, defaulting to `Annotate` (shadow mode)
-    /// for any caller not in the table — including the legacy unknown-client
-    /// "-" and open-`proxy_key` modes, so shadow mode observes everything.
-    #[cfg(feature = "guard")]
-    fn client_guard_policy(&self, client_id: &str) -> guard::GuardPolicy {
-        if self.is_operator(client_id) {
-            return guard::GuardPolicy::Off;
-        }
-        self.clients
-            .iter()
-            .find(|c| c.name == client_id)
-            .map(|c| c.guard)
-            .unwrap_or_default()
     }
 
     /// LAB-3877: run the Tier 0 content guard for one request — after
@@ -958,11 +908,12 @@ impl AppState {
     pub(crate) async fn guard_hook(
         &self,
         req_id: &str,
-        client_id: &str,
+        caller: &Caller,
         outcome: &guard::ScanOutcome,
         openai_shape: bool,
     ) -> Result<Option<usize>, Box<Response>> {
-        let policy = self.client_guard_policy(client_id);
+        let client_id = caller.name();
+        let policy = caller.guard_policy();
         let input = match outcome {
             guard::ScanOutcome::Scannable(input) => Some(input),
             guard::ScanOutcome::NothingToScan | guard::ScanOutcome::Unscannable(_) => None,
@@ -1097,8 +1048,8 @@ impl AppState {
     /// `MAX_LABEL_CHARS` (64) characters share one label.
     ///
     /// The client axis is config-bounded by reachability, not by the header
-    /// filter: this runs only when `client_allows_model` returned false, which
-    /// needs `client_id` to name a configured client. Under legacy
+    /// filter: this runs only when `Caller::allows_model` returned false, which
+    /// needs the caller to have a `[[clients]]` entry. Under legacy
     /// `proxy_key` / `allow_unauthenticated` there is no `[[clients]]` table,
     /// so this is unreachable and the caller-controlled `x-client-id` never
     /// touches this map. The global bucket is defence-in-depth for a future
@@ -1110,7 +1061,8 @@ impl AppState {
     /// unbounded warn-level log volume. The counter records every denial.
     /// Mirrors the once-per-model pattern used for unsupported-model
     /// warnings.
-    pub(crate) fn note_model_denied(&self, client_id: &str, model: &str) {
+    pub(crate) fn note_model_denied(&self, caller: &Caller, model: &str) {
+        let client_id = caller.name();
         let model = truncate_label(model);
         let first_time = {
             let mut counts = lock_recovering(&self.model_denied, "model_denied");
@@ -1118,7 +1070,7 @@ impl AppState {
             let key = (client_id.to_owned(), escape_sentinel(&model, &["other"]));
             let label = if counts.len() < MAX_MODEL_DENIED_LABELS || counts.contains_key(&key) {
                 key
-            } else if self.clients.iter().any(|c| c.name == client_id) {
+            } else if caller.entry().is_some() {
                 // Map full, pair new, client configured: its own bucket.
                 (client_id.to_owned(), "_other".to_owned())
             } else {

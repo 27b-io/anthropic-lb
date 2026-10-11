@@ -849,7 +849,7 @@ async fn forward_openai_compat_anthropic(
     anthropic_body_bytes: &bytes::Bytes,
     oauth_anthropic_body_bytes: &bytes::Bytes,
     req_id: &str,
-    client_id: &str,
+    caller: &Caller,
     client_ver: &str,
     client_ip: &std::net::IpAddr,
     agent_id: &str,
@@ -860,6 +860,7 @@ async fn forward_openai_compat_anthropic(
     json_mode: bool,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
+    let client_id = caller.name();
     let token = ep.token.as_str();
     let passthrough = ep.passthrough;
     let endpoint_name = ep.name.as_str();
@@ -1045,13 +1046,10 @@ async fn forward_openai_compat_anthropic(
                 .unwrap_or_else(|| "-".to_string()),
             constraint,
             served_on_overage: overage_in_use(resp.headers()),
-            pin: state.pin_status(client_id, endpoint_idx),
+            pin: state.pin_status(caller, endpoint_idx),
             stream: is_streaming,
         };
-        (
-            compute_pressure_status(eff_util, client_id, state),
-            proxied_ctx,
-        )
+        (compute_pressure_status(eff_util, caller), proxied_ctx)
     };
 
     // Non-2xx: log error detail, translate to OpenAI error format, return
@@ -1178,7 +1176,7 @@ async fn forward_openai_compat_anthropic(
         let state_clone = state.clone();
         // The detached task can't carry the `ep` borrow across the spawn
         // boundary; capture the Copy index and re-borrow from the owned `Arc`.
-        let client_id_clone = client_id.to_owned();
+        let caller_clone = caller.clone();
         let acct_name = endpoint_name.to_owned();
         let model_clone = model.to_owned();
         let client_ip_str = client_ip.to_string();
@@ -1300,7 +1298,7 @@ async fn forward_openai_compat_anthropic(
                 &state_clone,
                 ep,
                 &req_id_clone,
-                &client_id_clone,
+                &caller_clone,
                 &model_clone,
                 &acct_name,
                 &client_ip_str,
@@ -1410,7 +1408,7 @@ async fn forward_openai_compat_anthropic(
         state,
         ep,
         req_id,
-        client_id,
+        caller,
         model,
         anthropic_resp.get("model").and_then(|v| v.as_str()),
         endpoint_name,
@@ -1480,14 +1478,14 @@ pub(crate) async fn openai_chat_handler(
 
     // Proxy auth: accept the credential from either x-api-key or
     // Authorization: Bearer — OpenAI SDKs send only the latter.
-    let principal = match state.authenticate_throttled(
+    let auth = match state.authenticate_throttled(
         &client_ip,
         client_addr,
         req.headers(),
         true,
         "openai",
     ) {
-        Ok(p) => p,
+        Ok(auth) => auth,
         Err(resp) => return *resp,
     };
 
@@ -1499,20 +1497,22 @@ pub(crate) async fn openai_chat_handler(
         state.next_req_id.fetch_add(1, Ordering::Relaxed)
     );
 
-    // Extract client identification headers
-    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers, principal.as_ref());
+    // Extract client identification headers. From here on every per-client
+    // decision reads `caller`'s policy snapshot, the one authentication read.
+    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers, auth);
     let affinity_key = rctx.affinity_key(&client_ip, None);
     let affinity = affinity_key.as_deref();
     let RequestContext {
-        client_id,
+        caller,
         client_ver,
         agent_id,
         session_id,
     } = rctx;
+    let client_id = caller.name().to_owned();
 
     // LAB-4395 / GH #199: same identity-only refusal as `proxy_handler`, and
     // for the same reason — ahead of the reservation below.
-    if let Some(resp) = state.deny_admin_reader(&req_id, &client_id) {
+    if let Some(resp) = state.deny_admin_reader(&req_id, &caller) {
         return *resp;
     }
 
@@ -1622,7 +1622,7 @@ pub(crate) async fn openai_chat_handler(
     // Note: budget + emergency don't need `model` and could run before body parsing,
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
-    if let Err(resp) = state.pre_request_gate(&req_id, &client_id, &model).await {
+    if let Err(resp) = state.pre_request_gate(&req_id, &caller, &model).await {
         return *resp;
     }
 
@@ -1646,7 +1646,7 @@ pub(crate) async fn openai_chat_handler(
     #[cfg(feature = "guard")]
     let guard_annotate: Option<usize> = {
         let outcome = guard::ScanInput::from_openai_body(&openai_body, &anthropic_body);
-        match state.guard_hook(&req_id, &client_id, &outcome, true).await {
+        match state.guard_hook(&req_id, &caller, &outcome, true).await {
             Ok(annotate) => annotate,
             Err(resp) => return *resp,
         }
@@ -1728,7 +1728,7 @@ pub(crate) async fn openai_chat_handler(
                         affinity,
                         &model,
                         &skip,
-                        &client_id,
+                        &caller,
                         FastRequest::STANDARD,
                     )
                     .await
@@ -1745,7 +1745,7 @@ pub(crate) async fn openai_chat_handler(
                                     &anthropic_body_bytes,
                                     &oauth_body_bytes,
                                     &req_id,
-                                    &client_id,
+                                    &caller,
                                     &client_ver,
                                     &client_ip,
                                     &agent_id,
@@ -1766,8 +1766,8 @@ pub(crate) async fn openai_chat_handler(
                                 // restricted attempt, as `forward_anthropic`
                                 // strips `fallbacks` — see
                                 // `OPENAI_FALLBACK_FIELDS`.
-                                let fallback_free = state
-                                    .attempt_restricts_models(ep, &client_id)
+                                let fallback_free = caller
+                                    .attempt_restricts_models(ep)
                                     .then(|| {
                                         strip_top_level_fields(&body_bytes, OPENAI_FALLBACK_FIELDS)
                                     })
@@ -1785,7 +1785,7 @@ pub(crate) async fn openai_chat_handler(
                                     &state,
                                     wire_body,
                                     &req_id,
-                                    &client_id,
+                                    &caller,
                                     &client_ip,
                                     &agent_id,
                                     &session_id,

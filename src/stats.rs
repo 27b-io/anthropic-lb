@@ -141,10 +141,12 @@ pub(crate) async fn stats_handler(
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     // AC-4: operator principal required — /_stats discloses other clients'
-    // ids, the endpoint account names and pool utilisation.
-    if let Some(resp) = state.authorize_admin(&client_ip, client_addr, req.headers(), "stats") {
-        return *resp;
-    }
+    // ids, the endpoint account names and pool utilisation. Every per-client
+    // field below reads the policy snapshot this authorized against.
+    let policy = match state.authorize_admin(&client_ip, client_addr, req.headers(), "stats") {
+        Ok(policy) => policy,
+        Err(resp) => return *resp,
+    };
 
     let now_epoch = AppState::now_epoch();
     let mut total_headroom: Option<u64> = Some(0);
@@ -197,7 +199,7 @@ pub(crate) async fn stats_handler(
             .into_iter()
             .map(|k| {
                 // Operator hiding: attribute operator data to a reserved key
-                let display_key = if state.is_operator(k) {
+                let display_key = if policy.is_operator(k) {
                     "_operator".to_string()
                 } else {
                     k.clone()
@@ -225,7 +227,7 @@ pub(crate) async fn stats_handler(
         let mut consumers = serde_json::Map::new();
         let mut total_rpm = 0.0_f64;
         for (client, &(_, rpm)) in request_rates.iter() {
-            let display_key = if state.is_operator(client) {
+            let display_key = if policy.is_operator(client) {
                 "_operator".to_string()
             } else {
                 client.clone()
@@ -271,12 +273,12 @@ pub(crate) async fn stats_handler(
     };
 
     // Per-client budget status
-    let budgets: serde_json::Value = if state.client_budgets.is_empty() {
+    let budgets: serde_json::Value = if policy.client_budgets.is_empty() {
         serde_json::json!(null)
     } else {
         let today = AppState::now_epoch() / 86400;
         let usage_map = state.lock_budget_usage();
-        let obj: serde_json::Map<String, serde_json::Value> = state
+        let obj: serde_json::Map<String, serde_json::Value> = policy
             .client_budgets
             .iter()
             .map(|(client, &limit)| {
@@ -301,7 +303,7 @@ pub(crate) async fn stats_handler(
     // Cluster info (when Redis is available)
     // Read from cache (updated by background sync task) to avoid .await in handler
     let cluster: Option<serde_json::Value> = state.lock_cluster_info_cache().clone();
-    let sessions = state.sessions_snapshot(now_epoch);
+    let sessions = state.sessions_snapshot(&policy, now_epoch);
 
     let mut response = serde_json::json!({
         "endpoints": endpoint_stats,

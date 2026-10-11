@@ -143,8 +143,7 @@ pub(crate) fn test_state_base() -> AppState {
         state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
         // `TestPolicy::open()`'s posture: install a `TestPolicy` for any other.
         auth_mode: AuthMode::Open,
-        principals: HashMap::new(),
-        clients: vec![],
+        client_policy: std::sync::RwLock::new(Arc::new(ClientPolicy::unchecked(&cfg("")).1)),
         #[cfg(feature = "guard")]
         guard: crate::guard::Guard::empty(),
         allowed_ips: vec![],
@@ -162,11 +161,7 @@ pub(crate) fn test_state_base() -> AppState {
         overage_usage: Mutex::new(HashMap::new()),
         shadow_log_tx: None,
         shadow_log_dropped: AtomicU64::new(0),
-        client_budgets: HashMap::new(),
         budget_usage: Mutex::new(HashMap::new()),
-        client_utilization_limits: HashMap::new(),
-        operators: vec![],
-        admin_readers: vec![],
         emergency_brake: true,
         emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
         client_request_rates: Mutex::new(HashMap::new()),
@@ -909,25 +904,22 @@ fn endpoint_config(ep: &Endpoint) -> EndpointConfig {
     }
 }
 
-/// Move a built policy into `state`'s per-client fields, as `main()` does.
+/// Install a built policy as `state`'s snapshot, as `main()` does.
 fn install_policy(state: AppState, auth_mode: AuthMode, policy: ClientPolicy) -> AppState {
-    let ClientPolicy {
-        principals,
-        clients,
-        client_budgets,
-        client_utilization_limits,
-        operators,
-        admin_readers,
-    } = policy;
     AppState {
         auth_mode,
-        principals,
-        clients,
-        client_budgets,
-        client_utilization_limits,
-        operators,
-        admin_readers,
+        client_policy: std::sync::RwLock::new(Arc::new(policy)),
         ..state
+    }
+}
+
+impl AppState {
+    /// The caller `name` resolves to under the current snapshot, as a
+    /// shared-key or open proxy resolves a header-derived name. Under
+    /// `[[clients]]` the role is the one the principal table holds for the
+    /// name. For tests that drive a per-client decision without a request.
+    pub(crate) fn caller(&self, name: &str) -> Caller {
+        Caller::named(self.current_client_policy(), name.to_string())
     }
 }
 

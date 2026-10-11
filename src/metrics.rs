@@ -72,7 +72,7 @@ const TOKEN_TYPES: [&str; 4] = ["input", "output", "cache_creation", "cache_read
 /// (MAX_CLIENT_MODEL_LABELS).
 fn prom_client_model_family(
     buf: &mut String,
-    state: &AppState,
+    policy: &ClientPolicy,
     name: &str,
     help: &str,
     usage: &[((String, String), [u64; 4])],
@@ -80,7 +80,7 @@ fn prom_client_model_family(
     prom_header(buf, name, "counter", help);
     let mut op_model_tokens: HashMap<&str, [u64; 4]> = HashMap::new();
     for ((client, mdl), tokens) in usage {
-        if state.is_operator(client) {
+        if policy.is_operator(client) {
             let e = op_model_tokens.entry(mdl.as_str()).or_insert([0; 4]);
             for i in 0..4 {
                 e[i] += tokens[i];
@@ -522,10 +522,12 @@ pub(crate) async fn metrics_handler(
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     // AC-4: operator principal required, same gate as /_stats — per-account
-    // utilisation and budget gauges are pool reconnaissance.
-    if let Some(resp) = state.authorize_admin(&client_ip, client_addr, req.headers(), "metrics") {
-        return *resp;
-    }
+    // utilisation and budget gauges are pool reconnaissance. Every per-client
+    // series below reads the policy snapshot this authorized against.
+    let policy = match state.authorize_admin(&client_ip, client_addr, req.headers(), "metrics") {
+        Ok(policy) => policy,
+        Err(resp) => return *resp,
+    };
 
     let now_epoch = AppState::now_epoch();
     let today = now_epoch / 86400;
@@ -1216,7 +1218,7 @@ pub(crate) async fn metrics_handler(
     if total_rpm > 0.0 {
         let mut operator_rpm = 0.0f64;
         for (client, (_, rpm)) in &client_rates {
-            if state.is_operator(client) {
+            if policy.is_operator(client) {
                 operator_rpm += rpm;
             } else {
                 prom_gauge(
@@ -1246,7 +1248,7 @@ pub(crate) async fn metrics_handler(
     let mut all_clients: std::collections::HashSet<&String> = client_usage.keys().collect();
     all_clients.extend(client_rates.keys());
     for client in &all_clients {
-        if state.is_operator(client) {
+        if policy.is_operator(client) {
             let t = client_usage.get(*client).copied().unwrap_or([0; 4]);
             for i in 0..4 {
                 op_tokens[i] += t[i];
@@ -1266,7 +1268,7 @@ pub(crate) async fn metrics_handler(
     );
     let mut emitted_operator_token = false;
     for client in &all_clients {
-        if state.is_operator(client) {
+        if policy.is_operator(client) {
             if !emitted_operator_token {
                 for (i, t) in TOKEN_TYPES.iter().enumerate() {
                     prom_counter(
@@ -1296,7 +1298,7 @@ pub(crate) async fn metrics_handler(
     // adds the model dimension so per-model pricing can be applied downstream.
     prom_client_model_family(
         &mut buf,
-        &state,
+        &policy,
         "anthropic_client_model_token_usage_total",
         "Per-client token usage by model and type",
         &client_model_usage,
@@ -1307,7 +1309,7 @@ pub(crate) async fn metrics_handler(
     // spend panels price it with the same `(model, type)` join.
     prom_client_model_family(
         &mut buf,
-        &state,
+        &policy,
         "anthropic_overage_token_usage_total",
         "Per-client token usage served on paid extra usage, by model and type",
         &overage_usage,
@@ -1321,7 +1323,7 @@ pub(crate) async fn metrics_handler(
     );
     let mut emitted_operator_req = false;
     for client in &all_clients {
-        if state.is_operator(client) {
+        if policy.is_operator(client) {
             if !emitted_operator_req {
                 prom_counter(
                     &mut buf,
@@ -1350,7 +1352,7 @@ pub(crate) async fn metrics_handler(
     );
     let mut emitted_operator_rpm = false;
     for client in &all_clients {
-        if state.is_operator(client) {
+        if policy.is_operator(client) {
             if !emitted_operator_rpm {
                 prom_gauge(
                     &mut buf,
@@ -1372,14 +1374,14 @@ pub(crate) async fn metrics_handler(
     }
 
     // Client budgets
-    if !state.client_budgets.is_empty() {
+    if !policy.client_budgets.is_empty() {
         prom_header(
             &mut buf,
             "anthropic_client_budget_limit",
             "gauge",
             "Configured daily token limit",
         );
-        for (client, &limit) in &state.client_budgets {
+        for (client, &limit) in &policy.client_budgets {
             prom_gauge(
                 &mut buf,
                 "anthropic_client_budget_limit",
@@ -1393,7 +1395,7 @@ pub(crate) async fn metrics_handler(
             "gauge",
             "Tokens used today",
         );
-        for client in state.client_budgets.keys() {
+        for client in policy.client_budgets.keys() {
             let used = budget_usage
                 .get(client)
                 .filter(|(day, _)| *day == today)
@@ -1412,7 +1414,7 @@ pub(crate) async fn metrics_handler(
             "gauge",
             "Tokens remaining today",
         );
-        for (client, &limit) in &state.client_budgets {
+        for (client, &limit) in &policy.client_budgets {
             let used = budget_usage
                 .get(client)
                 .filter(|(day, _)| *day == today)
