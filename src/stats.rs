@@ -142,7 +142,9 @@ pub(crate) async fn stats_handler(
     }
     // AC-4: operator principal required — /_stats discloses other clients'
     // ids, the endpoint account names and pool utilisation. Every per-client
-    // field below reads the policy snapshot this authorized against.
+    // field below reads the policy snapshot this authorized against, except
+    // `cluster`, which the sync pass computes from its own snapshot and
+    // caches: it follows a policy change on its next pass.
     let policy = match state.authorize_admin(&client_ip, client_addr, req.headers(), "stats") {
         Ok(policy) => policy,
         Err(resp) => return *resp,

@@ -896,7 +896,9 @@ impl TestPolicy {
             std::mem::discriminant(&state.auth_mode),
             "a swap never changes how callers authenticate"
         );
-        state.swap_client_policy(policy);
+        state
+            .swap_client_policy(policy)
+            .unwrap_or_else(|e| panic!("swap refused: {e}"));
     }
 
     /// Install with no check at all, for the tests that pin how the runtime
@@ -932,10 +934,10 @@ fn install_policy(state: AppState, auth_mode: AuthMode, policy: ClientPolicy) ->
 }
 
 impl AppState {
-    /// The caller `name` resolves to under the current snapshot, as a
-    /// shared-key or open proxy resolves a header-derived name. Under
-    /// `[[clients]]` the role is the one the principal table holds for the
-    /// name. For tests that drive a per-client decision without a request.
+    /// A caller named `name` under the current snapshot, built as a shared-
+    /// key or open proxy builds a header-derived caller: its role is looked up
+    /// by name, by the rule the build gave the principal table. For tests that
+    /// drive a per-client decision without a request.
     pub(crate) fn caller(&self, name: &str) -> Caller {
         Caller::named(self.current_client_policy(), name.to_string())
     }

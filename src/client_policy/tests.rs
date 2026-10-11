@@ -504,10 +504,10 @@ fn build_keeps_an_empty_model_pattern() {
 
 // ── One snapshot per request ──
 
-/// The two halves of `spawn_held_upstream`'s stream: `message_start` with 10
-/// input tokens, then the rest, with 5 output tokens and the terminator.
-const HELD_HEAD: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_held\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n";
-const HELD_TAIL: &str = concat!(
+/// The stream every `spawn_held_upstream` response carries: 10 input and 5
+/// output tokens.
+const HELD_STREAM: &str = concat!(
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_held\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
     "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
     "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
     "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
@@ -519,10 +519,12 @@ const HELD_TOKENS: u64 = 15;
 /// A streaming request body both proxied routes accept.
 const STREAM_BODY: &str = r#"{"model":"claude-sonnet-4-6","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
 
-/// An upstream whose first response stops after `HELD_HEAD` and notifies
-/// `started`, then waits for `release`. Later responses run straight through.
-/// A request that reaches it is already past authentication, the gate and
-/// routing.
+/// An upstream whose first request notifies `started` and then waits for
+/// `release` before the response begins; later requests are answered at
+/// once. Every response reports 75% five-hour utilization, with the reset
+/// hours away so no near-reset discount applies. A request that reaches it is
+/// past authentication, the gate and routing, but its response headers, its
+/// relay and its usage are all still to come.
 async fn spawn_held_upstream(
     started: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
@@ -532,19 +534,22 @@ async fn spawn_held_upstream(
         let (started, release) = (started.clone(), release.clone());
         let hold = first.swap(false, Ordering::SeqCst);
         async move {
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
-            tokio::spawn(async move {
-                let _ = tx.send(Ok(HELD_HEAD.into())).await;
-                if hold {
-                    started.notify_one();
-                    release.notified().await;
-                }
-                let _ = tx.send(Ok(HELD_TAIL.into())).await;
-            });
+            if hold {
+                started.notify_one();
+                release.notified().await;
+            }
+            let reset = (AppState::now_epoch() + 4 * 3600).to_string();
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/event-stream")
-                .body(Body::from_stream(ReceiverStream::new(rx)))
+                .header(
+                    "anthropic-ratelimit-unified-representative-claim",
+                    "five_hour",
+                )
+                .header("anthropic-ratelimit-unified-5h-utilization", "0.75")
+                .header("anthropic-ratelimit-unified-5h-reset", reset)
+                .header("anthropic-ratelimit-unified-5h-status", "allowed")
+                .body(Body::from(HELD_STREAM))
                 .unwrap()
         }
     }));
@@ -554,8 +559,13 @@ async fn spawn_held_upstream(
     format!("http://{addr}")
 }
 
-/// POST `STREAM_BODY` to `route` with `key`, and read the whole response.
-async fn post_stream(addr: SocketAddr, route: &'static str, key: String) -> reqwest::StatusCode {
+/// POST `STREAM_BODY` to `route` with `key` and read the whole response.
+/// Returns its status and its `x-budget-status`.
+async fn post_stream(
+    addr: SocketAddr,
+    route: &'static str,
+    key: String,
+) -> (reqwest::StatusCode, Option<String>) {
     let resp = Client::new()
         .post(format!("http://{addr}{route}"))
         .header("x-api-key", key)
@@ -565,12 +575,16 @@ async fn post_stream(addr: SocketAddr, route: &'static str, key: String) -> reqw
         .await
         .unwrap();
     let status = resp.status();
+    let pressure = resp
+        .headers()
+        .get("x-budget-status")
+        .map(|v| v.to_str().unwrap().to_string());
     resp.bytes().await.unwrap();
-    status
+    (status, pressure)
 }
 
-/// Wait until `name`'s recorded token total reaches `total`: the usage of a
-/// stream is recorded by a task that runs after the response ends.
+/// Wait until `name`'s recorded token total reaches `total`: a stream's usage
+/// is recorded by its relay task as the stream ends.
 async fn wait_for_usage(state: &AppState, name: &str, total: u64) {
     let recorded = || {
         state
@@ -590,11 +604,14 @@ async fn wait_for_usage(state: &AppState, name: &str, total: u64) {
 }
 
 /// A request keeps the policy snapshot it authenticated against, to its end,
-/// across a swap that lands while it is in flight; the requests after the
-/// swap read the new policy. The swap gives the client a new key and takes
-/// its budget away, so the old snapshot's budget is visible in the charge
-/// the held request books when its stream ends. Both proxied routes, since
-/// each relays its stream from its own detached task.
+/// across a swap that lands while it waits for the upstream; the requests
+/// after the swap read the new policy. The swap gives the client a new key
+/// and takes away its budget and its utilization ceiling. The held request
+/// still shows the old snapshot in the two decisions it makes after the
+/// swap: the pressure header (75% utilization is "elevated", raised to
+/// "critical" by a 0.9 ceiling) and the budget its usage is charged to when
+/// the stream ends. Both proxied routes, since each makes those decisions
+/// in its own forward path and relay task.
 #[tokio::test]
 async fn a_request_keeps_its_snapshot_across_a_swap_mid_request() {
     for route in ["/v1/messages", "/v1/chat/completions"] {
@@ -606,6 +623,7 @@ async fn a_request_keeps_its_snapshot_across_a_swap_mid_request() {
         let state = Arc::new(
             TestPolicy::clients(vec![mk_client("team-alpha", &old_key, &[])])
                 .budgets([("team-alpha".to_string(), 1_000_000)].into())
+                .utilization_limits([("team-alpha".to_string(), 0.9)].into())
                 .install(AppState {
                     endpoints: vec![ep],
                     ..test_state_base()
@@ -627,7 +645,14 @@ async fn a_request_keeps_its_snapshot_across_a_swap_mid_request() {
             .expect("the request never reached the upstream");
         TestPolicy::clients(vec![mk_client("team-alpha", &new_key, &[])]).swap_into(&state);
         release.notify_one();
-        assert_eq!(held.await.unwrap(), reqwest::StatusCode::OK, "{route}");
+        let (status, pressure) = held.await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{route}");
+        assert_eq!(
+            pressure.as_deref(),
+            Some("critical"),
+            "{route}: the held request's pressure header applies the ceiling of the \
+             snapshot it authenticated against"
+        );
         wait_for_usage(&state, "team-alpha", HELD_TOKENS).await;
         assert_eq!(
             budget_used(),
@@ -637,14 +662,16 @@ async fn a_request_keeps_its_snapshot_across_a_swap_mid_request() {
         );
 
         assert_eq!(
-            post_stream(addr, route, old_key).await,
+            post_stream(addr, route, old_key).await.0,
             reqwest::StatusCode::UNAUTHORIZED,
             "{route}: a request after the swap is authenticated against the new policy"
         );
+        let (status, pressure) = post_stream(addr, route, new_key).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{route}");
         assert_eq!(
-            post_stream(addr, route, new_key).await,
-            reqwest::StatusCode::OK,
-            "{route}"
+            pressure.as_deref(),
+            Some("elevated"),
+            "{route}: a request after the swap has no ceiling to raise its pressure"
         );
         wait_for_usage(&state, "team-alpha", 2 * HELD_TOKENS).await;
         assert_eq!(
@@ -655,14 +682,45 @@ async fn a_request_keeps_its_snapshot_across_a_swap_mid_request() {
     }
 }
 
-/// Every exported budget figure for a client (the limit and remaining
-/// gauges on `/metrics`, and the `/_stats` budget) agrees with the limit the
-/// gate enforces, across a swap that removes, changes and adds budgets. Both
-/// sides read one snapshot's `client_budgets`; a per-client lookup that went
-/// around the snapshot would show here as a gauge the gate disagrees with,
-/// rather than as a silently stale dashboard.
+/// Only a `[[clients]]` stack takes a new policy. Under a shared key or an
+/// open proxy a caller's name is its own claim, so a client table swapped in
+/// there would hand any header-chosen name that client's models, pins and
+/// guard policy: the swap is refused and the policy left as it was.
+#[test]
+fn a_swap_is_refused_unless_callers_authenticate_with_client_keys() {
+    let table = || {
+        ClientPolicy::unchecked(&cfg(&format!(
+            "[[clients]]\nname = \"team-alpha\"\nkey = \"{K1}\"\nmodels = [\"claude-haiku-*\"]\n"
+        )))
+        .1
+    };
+    for state in [
+        TestPolicy::open().install(test_state_base()),
+        TestPolicy::shared_key(&test_key("shared")).install(test_state_base()),
+    ] {
+        let before = state.current_client_policy();
+        assert!(state.swap_client_policy(table()).is_err());
+        assert!(
+            Arc::ptr_eq(&before, &state.current_client_policy()),
+            "the policy is left as it was"
+        );
+        assert!(
+            state.caller("team-alpha").entry().is_none(),
+            "a header-chosen name gains no client entry"
+        );
+    }
+}
+
+/// After a swap that removes, changes and adds budgets, every exported
+/// budget figure for a client (the limit and remaining gauges on `/metrics`,
+/// and the `/_stats` budget) follows the swap and agrees with the limit the
+/// gate enforces. A per-client lookup that did not follow the swap, on
+/// either side, shows here as a gauge the gate disagrees with, rather than
+/// as a silently stale dashboard. The clock is frozen mid-day, so the usage
+/// set here and the day the handlers read are one day.
 #[tokio::test]
 async fn every_budget_gauge_shows_the_limit_the_gate_enforces_after_a_swap() {
+    let _clock = FrozenClock::at(1_704_110_400);
     let clients = || {
         vec![
             mk_client("ops", &test_key("ops"), &[]),

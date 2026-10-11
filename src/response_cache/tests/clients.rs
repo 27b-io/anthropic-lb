@@ -376,7 +376,9 @@ async fn chat_completions_serves_a_valid_bearer_beside_a_junk_api_key() {
 fn an_empty_principal_table_refuses_rather_than_opens() {
     let state = TestPolicy::clients(vec![mk_client("geo", &test_key("key-geo"), &[])])
         .install(test_state_base());
-    state.swap_client_policy(ClientPolicy::unchecked(&cfg("")).1);
+    state
+        .swap_client_policy(ClientPolicy::unchecked(&cfg("")).1)
+        .unwrap();
     assert!(matches!(state.auth_mode, AuthMode::Clients));
     for headers in [hdrs(&[]), hdrs(&[("x-api-key", &test_key("key-geo"))])] {
         for allow_bearer in [false, true] {

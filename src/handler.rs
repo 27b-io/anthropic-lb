@@ -1763,7 +1763,7 @@ pub(crate) async fn proxy_handler(
     // LAB-4395 / GH #199: a read-only principal is refused here, on identity
     // alone, before it can reserve any of the shared body budget or have a
     // byte of its body read. `pre_request_gate` repeats the check.
-    if let Some(resp) = state.deny_admin_reader(&req_id, &caller) {
+    if let Some(resp) = deny_admin_reader(&req_id, &caller) {
         return *resp;
     }
 

@@ -216,6 +216,12 @@ impl AppState {
 
     /// Replace the client policy. A request already authenticated keeps the
     /// snapshot it holds, to its end; every request after this reads `next`.
+    ///
+    /// Refused unless callers authenticate with `[[clients]]` keys. Under a
+    /// shared key or an open proxy a caller's name is its own claim, so a
+    /// client table swapped in there would hand any header-chosen name that
+    /// client's models, pins and guard policy. Under `[[clients]]` every
+    /// policy is safe to install: a key it does not hold is refused.
     #[cfg_attr(
         not(test),
         expect(
@@ -223,7 +229,10 @@ impl AppState {
             reason = "the swap point for a runtime policy source; only tests swap today"
         )
     )]
-    pub(crate) fn swap_client_policy(&self, next: ClientPolicy) {
+    pub(crate) fn swap_client_policy(&self, next: ClientPolicy) -> Result<(), &'static str> {
+        if !matches!(self.auth_mode, AuthMode::Clients) {
+            return Err("the client policy can be replaced only under [[clients]] authentication");
+        }
         let next = Arc::new(next);
         let previous = std::mem::replace(
             &mut *self
@@ -234,6 +243,7 @@ impl AppState {
         );
         // Freed here, outside the lock, unless a request still holds it.
         drop(previous);
+        Ok(())
     }
 }
 

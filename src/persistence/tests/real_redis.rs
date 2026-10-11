@@ -1265,20 +1265,30 @@ mod redis_integration {
         assert_eq!(info["budget_usage"]["scan-cli"]["limit"], 1000);
     }
 
-    /// The cluster budget gauge, refreshed by the sync pass from its own
-    /// snapshot, agrees with the limit the gate enforces after a swap that
-    /// removes, changes and adds budgets: the cluster-wide twin of
+    /// After a swap that removes, changes and adds budgets, the first sync
+    /// pass brings the cluster budget gauge into line with the limit the gate
+    /// enforces: the cluster-wide twin of
     /// `every_budget_gauge_shows_the_limit_the_gate_enforces_after_a_swap`.
-    /// With a backend, the gate reads the shared counter, so the probes set
-    /// it there.
+    /// Until that pass the gauge shows the old policy, as `metrics_handler`
+    /// notes. With a backend, the gate reads the shared counter, so the
+    /// probes set it there.
     #[tokio::test]
     async fn cluster_budget_gauge_shows_the_limit_the_gate_enforces_after_a_swap() {
         let Some((mut conn, fred)) = redis_test_conn(Db::ClusterBudgetGaugeAfterSwap).await else {
             return;
         };
         avoid_utc_midnight().await;
+        let clients = || {
+            vec![
+                mk_client("ops", &test_key("ops"), &[]),
+                mk_client("team-alpha", &test_key("alpha"), &[]),
+                mk_client("team-bravo", &test_key("bravo"), &[]),
+                mk_client("team-charlie", &test_key("charlie"), &[]),
+            ]
+        };
         let state = Arc::new(
-            TestPolicy::open()
+            TestPolicy::clients(clients())
+                .operators(&["ops"])
                 .budgets(
                     [
                         ("team-alpha".to_string(), 1_000u64),
@@ -1291,7 +1301,8 @@ mod redis_integration {
                     ..test_state_base()
                 }),
         );
-        TestPolicy::open()
+        TestPolicy::clients(clients())
+            .operators(&["ops"])
             .budgets(
                 [
                     ("team-bravo".to_string(), 5_000u64),
@@ -1307,6 +1318,7 @@ mod redis_integration {
         let addr = serve(build_router(state.clone())).await;
         let metrics = Client::new()
             .get(format!("http://{addr}/metrics"))
+            .header("x-api-key", test_key("ops"))
             .send()
             .await
             .unwrap()

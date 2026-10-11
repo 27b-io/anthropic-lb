@@ -1139,42 +1139,6 @@ impl AppState {
         }
     }
 
-    /// Refuse a read-only principal on a proxied surface (LAB-4395): it is
-    /// admitted to `/_stats` and `/metrics` and to nothing else.
-    ///
-    /// Split out of `pre_request_gate` so both proxied handlers can run it
-    /// BEFORE `reserve_request_body` and the body read, and called from the
-    /// gate as well so a handler that reaches the gate without the early call
-    /// still fails closed. One predicate, one response, three call sites — the
-    /// duplication that matters is of the DECISION, not of the call.
-    ///
-    /// The early placement is the point. Every other gate denial refuses a
-    /// request the caller had some reason to send, so it is refused after
-    /// admission like any other. This one is identity-only: it needs
-    /// `client_id` and nothing else, and the principal has no legitimate
-    /// reason to send a proxied body at all. Refusing it after admission let
-    /// six reader connections declaring large `content-length`s — one byte
-    /// sent each — pin the whole shared in-flight body budget and 503 every
-    /// other client, then do it again after each read timeout (GH #199,
-    /// reproduced by adversarial review 2026-09-21). A role whose premise is
-    /// "this credential cannot harm the pool" must not hold pool admission
-    /// capacity while being told it has no authority.
-    pub(crate) fn deny_admin_reader(&self, req_id: &str, caller: &Caller) -> Option<Box<Response>> {
-        if caller.principal.role != Role::Reader {
-            return None;
-        }
-        warn!(
-            req_id,
-            client_id = %caller.name(),
-            "rejected: read-only principal has no proxy authority"
-        );
-        Some(Box::new(proxy_error_response(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            "forbidden: read-only principal — /_stats and /metrics only",
-        )))
-    }
-
     /// Check if all model-compatible endpoints exceed the caller's utilization limit.
     /// Returns Ok(()) if no limit configured or at least one endpoint is below the limit.
     /// Returns Err(retry_after_secs) if all endpoints exceed the limit.
@@ -1285,7 +1249,7 @@ impl AppState {
         // validation, so the order cannot matter today, but if that check is
         // ever weakened this arm makes the wider grant lose to the denial
         // rather than win.
-        if let Some(resp) = self.deny_admin_reader(req_id, caller) {
+        if let Some(resp) = deny_admin_reader(req_id, caller) {
             return Err(resp);
         }
         if caller.principal.role == Role::Operator {
@@ -1375,6 +1339,42 @@ impl AppState {
 
         Ok(())
     }
+}
+
+/// Refuse a read-only principal on a proxied surface (LAB-4395): it is
+/// admitted to `/_stats` and `/metrics` and to nothing else.
+///
+/// Split out of `pre_request_gate` so both proxied handlers can run it
+/// BEFORE `reserve_request_body` and the body read, and called from the
+/// gate as well so a handler that reaches the gate without the early call
+/// still fails closed. One predicate, one response, three call sites — the
+/// duplication that matters is of the DECISION, not of the call.
+///
+/// The early placement is the point. Every other gate denial refuses a
+/// request the caller had some reason to send, so it is refused after
+/// admission like any other. This one is identity-only: it needs the
+/// caller's role and nothing else, and the principal has no legitimate
+/// reason to send a proxied body at all. Refusing it after admission let
+/// six reader connections declaring large `content-length`s — one byte
+/// sent each — pin the whole shared in-flight body budget and 503 every
+/// other client, then do it again after each read timeout (GH #199,
+/// reproduced by adversarial review 2026-09-21). A role whose premise is
+/// "this credential cannot harm the pool" must not hold pool admission
+/// capacity while being told it has no authority.
+pub(crate) fn deny_admin_reader(req_id: &str, caller: &Caller) -> Option<Box<Response>> {
+    if caller.principal.role != Role::Reader {
+        return None;
+    }
+    warn!(
+        req_id,
+        client_id = %caller.name(),
+        "rejected: read-only principal has no proxy authority"
+    );
+    Some(Box::new(proxy_error_response(
+        StatusCode::FORBIDDEN,
+        "permission_error",
+        "forbidden: read-only principal — /_stats and /metrics only",
+    )))
 }
 
 #[cfg(test)]

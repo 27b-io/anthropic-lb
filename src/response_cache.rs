@@ -1135,8 +1135,9 @@ impl AppState {
     /// this client-asserted path is dead.
     ///
     /// The `debug_assert` is the choke point for that invariant. Nothing in the
-    /// type system stops a future handler from calling
-    /// `RequestContext::from_request(.., None)` and silently reinstating
+    /// type system stops a future handler from handing
+    /// `RequestContext::from_request` an `Authenticated` with no principal
+    /// under `[[clients]]` and silently reinstating
     /// header-asserted identity; this makes that mistake fail loudly in tests
     /// and debug builds instead of quietly becoming an identity bypass.
     pub(crate) fn resolve_client_id(&self, ip: &IpAddr, headers: &hyper::HeaderMap) -> String {

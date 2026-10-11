@@ -523,7 +523,9 @@ pub(crate) async fn metrics_handler(
     }
     // AC-4: operator principal required, same gate as /_stats — per-account
     // utilisation and budget gauges are pool reconnaissance. Every per-client
-    // series below reads the policy snapshot this authorized against.
+    // series below reads the policy snapshot this authorized against, except
+    // the cluster figures, which the sync pass computes from its own snapshot
+    // and caches: they follow a policy change on its next pass.
     let policy = match state.authorize_admin(&client_ip, client_addr, req.headers(), "metrics") {
         Ok(policy) => policy,
         Err(resp) => return *resp,

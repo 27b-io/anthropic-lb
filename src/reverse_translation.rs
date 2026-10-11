@@ -1512,7 +1512,7 @@ pub(crate) async fn openai_chat_handler(
 
     // LAB-4395 / GH #199: same identity-only refusal as `proxy_handler`, and
     // for the same reason — ahead of the reservation below.
-    if let Some(resp) = state.deny_admin_reader(&req_id, &caller) {
+    if let Some(resp) = deny_admin_reader(&req_id, &caller) {
         return *resp;
     }
 
