@@ -1,5 +1,6 @@
 use crate::*;
 use std::collections::hash_map::Entry;
+use std::sync::PoisonError;
 
 // ── Client policy ───────────────────────────────────────────────────
 //
@@ -8,6 +9,12 @@ use std::collections::hash_map::Entry;
 // key resolves to, and what each name may do. `load_config` runs it on every
 // boot, so a test that builds its per-client state through it holds none a
 // boot would refuse.
+//
+// The policy is shared as one immutable snapshot. A request reads it once, at
+// authentication, and carries that snapshot as its `Caller` through every
+// per-client decision it makes, so no two of them can disagree about the
+// policy. Replacing the snapshot reaches only the requests that authenticate
+// afterwards.
 
 /// How callers authenticate. Decided once per build, by `AuthMode::of`, and
 /// never re-inferred at runtime. In particular nothing infers it from how many
@@ -56,7 +63,8 @@ pub(crate) struct ClientEntry {
 
 /// Every per-client rule of a config, validated together by `build`. Client
 /// keys are held only as digests: nothing here, or anywhere it is installed,
-/// keeps a plaintext client key.
+/// keeps a plaintext client key. Installed whole and never edited in place:
+/// `AppState::swap_client_policy` replaces it.
 pub(crate) struct ClientPolicy {
     /// `key_digest` of each `[[clients]]` key → the principal it resolves to.
     /// Empty unless the auth mode is `Clients`.
@@ -66,6 +74,177 @@ pub(crate) struct ClientPolicy {
     pub(crate) client_utilization_limits: HashMap<String, f64>,
     pub(crate) operators: Vec<String>,
     pub(crate) admin_readers: Vec<String>,
+}
+
+/// What authenticating a request established: the policy snapshot it read,
+/// and the principal the credential resolved to in that snapshot.
+/// `RequestContext::from_request` turns the two into the request's `Caller`.
+pub(crate) struct Authenticated {
+    pub(crate) policy: Arc<ClientPolicy>,
+    /// `None` under a shared key or an open proxy, where identity is header-
+    /// or IP-derived instead.
+    pub(crate) principal: Option<Principal>,
+}
+
+/// The principal only: the policy is the whole client table.
+impl std::fmt::Debug for Authenticated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Authenticated")
+            .field("principal", &self.principal)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One request's caller: the principal it resolved to, and the policy
+/// snapshot it was resolved against. Built once per request and handed to
+/// every per-client decision the request makes (the gate, the guard, routing
+/// pins, the pressure header, the budget its usage is charged to), so all of
+/// them read one policy however long the request runs.
+#[derive(Clone)]
+pub(crate) struct Caller {
+    pub(crate) policy: Arc<ClientPolicy>,
+    /// Its `name` is the request's `client_id`.
+    pub(crate) principal: Principal,
+}
+
+impl Caller {
+    /// A caller known by name rather than by a client key: the header- or
+    /// IP-derived identity of a shared-key or open proxy. Its role is looked
+    /// up by name, so there an operator is whoever asserts an operator's
+    /// name, as `operators` documents.
+    pub(crate) fn named(policy: Arc<ClientPolicy>, name: String) -> Self {
+        let role = role_in(&policy.operators, &policy.admin_readers, &name);
+        Self {
+            policy,
+            principal: Principal { name, role },
+        }
+    }
+
+    /// The request's `client_id`.
+    pub(crate) fn name(&self) -> &str {
+        &self.principal.name
+    }
+
+    /// The caller's `[[clients]]` entry. Always `None` on a shared-key or
+    /// open proxy, whose policy has no client table, so a header-derived name
+    /// can never take on a configured client's models, pins or guard policy.
+    pub(crate) fn entry(&self) -> Option<&ClientEntry> {
+        self.policy.clients.iter().find(|c| c.name == self.name())
+    }
+
+    /// The caller's daily token budget, if it has one.
+    pub(crate) fn budget(&self) -> Option<u64> {
+        self.policy.client_budgets.get(self.name()).copied()
+    }
+
+    /// The caller's utilization ceiling, if it has one.
+    pub(crate) fn utilization_limit(&self) -> Option<f64> {
+        self.policy
+            .client_utilization_limits
+            .get(self.name())
+            .copied()
+    }
+
+    /// Whether the caller may request `model` (LAB-1083).
+    ///
+    /// A caller with no entry, or an entry with an empty list, may request
+    /// anything. "No entry" is only reachable on the legacy path: with
+    /// `[[clients]]` configured, every caller is a principal from the table.
+    ///
+    /// FAILS CLOSED on an empty `model`, and this is the one place where the
+    /// shared matcher's semantics are deliberately NOT inherited. An empty
+    /// model means the caller's model is UNKNOWN to us — the body did not
+    /// parse as JSON, or it carries no top-level `model` (the batches API
+    /// nests it under `requests[].params.model`, and `proxy_handler` is the
+    /// catch-all route). For `Endpoint::serves_model` "unknown" rightly means
+    /// "don't narrow the routing pool"; for a policy gate it must mean
+    /// "deny", or a restricted client reaches any model by sending a body we
+    /// cannot read.
+    pub(crate) fn allows_model(&self, model: &str) -> bool {
+        match self.entry() {
+            Some(c) if c.models.is_empty() => true,
+            Some(c) => !model.is_empty() && model_matches(&c.models, model),
+            None => true,
+        }
+    }
+
+    /// Whether an attempt on `ep` is bound by a `models` list, the endpoint's
+    /// or the caller's — i.e. whether a body-level fallback could serve it a
+    /// model that list does not name, so the attempt's body loses its
+    /// fallback fields (`strip_top_level_fields`; LAB-5970, LAB-6794). Judged
+    /// per attempt: the retry loop may land on a differently restricted
+    /// endpoint. Same identity semantics as `allows_model`.
+    pub(crate) fn attempt_restricts_models(&self, ep: &Endpoint) -> bool {
+        !ep.models.is_empty() || self.entry().is_some_and(|c| !c.models.is_empty())
+    }
+
+    /// The caller's non-empty `preferred_endpoints` list, if it has one.
+    pub(crate) fn preferred_endpoints(&self) -> Option<&[String]> {
+        self.entry()
+            .map(|c| c.preferred_endpoints.as_slice())
+            .filter(|p| !p.is_empty())
+    }
+
+    /// LAB-3877: the caller's Tier 0 guard policy. An operator's is always
+    /// `Off` (it forwards operator-trusted content). Otherwise the entry's
+    /// configured policy, defaulting to `Annotate` (shadow mode) for a caller
+    /// with no entry — including the legacy unknown-client "-" and open-
+    /// `proxy_key` modes, so shadow mode observes everything.
+    #[cfg(feature = "guard")]
+    pub(crate) fn guard_policy(&self) -> guard::GuardPolicy {
+        if self.principal.role == Role::Operator {
+            return guard::GuardPolicy::Off;
+        }
+        self.entry().map(|c| c.guard).unwrap_or_default()
+    }
+}
+
+impl AppState {
+    /// The client policy in force. Read once per request, by authentication,
+    /// and once per pass by a background reader; a request then reads only
+    /// the snapshot its `Caller` holds.
+    pub(crate) fn current_client_policy(&self) -> Arc<ClientPolicy> {
+        // A poisoned lock still holds a whole snapshot: the one write swaps
+        // the `Arc` in a single move that cannot panic.
+        Arc::clone(
+            &self
+                .client_policy
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// Replace the client policy. A request already authenticated keeps the
+    /// snapshot it holds, to its end; every request after this reads `next`.
+    ///
+    /// Refused unless callers authenticate with `[[clients]]` keys. Under a
+    /// shared key or an open proxy a caller's name is its own claim, so a
+    /// client table swapped in there would hand any header-chosen name that
+    /// client's models, pins and guard policy. Under `[[clients]]` every
+    /// policy is safe to install: a key it does not hold is refused.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the swap point for a runtime policy source; only tests swap today"
+        )
+    )]
+    pub(crate) fn swap_client_policy(&self, next: ClientPolicy) -> Result<(), &'static str> {
+        if !matches!(self.auth_mode, AuthMode::Clients) {
+            return Err("the client policy can be replaced only under [[clients]] authentication");
+        }
+        let next = Arc::new(next);
+        let previous = std::mem::replace(
+            &mut *self
+                .client_policy
+                .write()
+                .unwrap_or_else(PoisonError::into_inner),
+            next,
+        );
+        // Freed here, outside the lock, unless a request still holds it.
+        drop(previous);
+        Ok(())
+    }
 }
 
 /// The digest a client key is held and matched as: BLAKE2s-256 over a purpose
@@ -158,22 +337,33 @@ impl ClientPolicy {
             admin_readers: config.admin_readers.clone(),
         }
     }
+
+    /// Whether `name` is an operator's. Only for folding name-keyed records
+    /// into the `_operator` label on `/_stats` and `/metrics`: a request's own
+    /// role is its `Caller`'s principal.
+    pub(crate) fn is_operator(&self, name: &str) -> bool {
+        self.operators.iter().any(|op| op == name)
+    }
 }
 
-/// The principal a `[[clients]]` name resolves to. Reader before operator: a
-/// name in both lists (which `check_clients` refuses) resolves to the denial,
-/// as `pre_request_gate` does.
+/// The principal a `[[clients]]` name resolves to.
 fn principal(config: &Config, name: &str) -> Principal {
-    let role = if config.admin_readers.iter().any(|r| r == name) {
+    Principal {
+        name: name.to_string(),
+        role: role_in(&config.operators, &config.admin_readers, name),
+    }
+}
+
+/// The role `name` holds under these lists. Reader before operator: a name in
+/// both (which `check_clients` refuses) resolves to the denial, as
+/// `pre_request_gate` does.
+fn role_in(operators: &[String], admin_readers: &[String], name: &str) -> Role {
+    if admin_readers.iter().any(|r| r == name) {
         Role::Reader
-    } else if config.operators.iter().any(|op| op == name) {
+    } else if operators.iter().any(|op| op == name) {
         Role::Operator
     } else {
         Role::Client
-    };
-    Principal {
-        name: name.to_string(),
-        role,
     }
 }
 

@@ -5,7 +5,10 @@ use super::*;
 #[tokio::test]
 async fn budget_check_no_limit_configured() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
-    assert!(state.check_budget("any-client").await.is_ok());
+    assert!(state
+        .check_budget(&state.caller("any-client"))
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
@@ -18,18 +21,22 @@ async fn budget_check_within_limit() {
     }));
 
     // Within budget
-    assert!(state.check_budget("client-a").await.is_ok());
+    assert!(state.check_budget(&state.caller("client-a")).await.is_ok());
 
     // Record some usage
-    state.record_budget_usage("client-a", 500).await;
-    assert!(state.check_budget("client-a").await.is_ok());
+    state
+        .record_budget_usage(&state.caller("client-a"), 500)
+        .await;
+    assert!(state.check_budget(&state.caller("client-a")).await.is_ok());
 
     // Exceed budget
-    state.record_budget_usage("client-a", 600).await;
-    assert!(state.check_budget("client-a").await.is_err());
+    state
+        .record_budget_usage(&state.caller("client-a"), 600)
+        .await;
+    assert!(state.check_budget(&state.caller("client-a")).await.is_err());
 
     // Unknown client has no budget, always ok
-    assert!(state.check_budget("unknown").await.is_ok());
+    assert!(state.check_budget(&state.caller("unknown")).await.is_ok());
 }
 
 /// A poisoned `budget_usage` lock must not disable enforcement: `check_budget`
@@ -48,11 +55,13 @@ async fn budget_check_enforces_through_poisoned_lock() {
     // 2024-01-01T12:34:56Z: 41104s left in the UTC day. Frozen so the day key
     // record_budget_usage writes and check_budget reads cannot straddle midnight.
     let _clock = FrozenClock::at(1_704_112_496);
-    state.record_budget_usage("client-a", 1500).await;
+    state
+        .record_budget_usage(&state.caller("client-a"), 1500)
+        .await;
     poison(&state.budget_usage);
 
     assert_eq!(
-        state.check_budget("client-a").await,
+        state.check_budget(&state.caller("client-a")).await,
         Err(41_104),
         "an exhausted client must stay denied through a poisoned lock, \
          with the seconds left until the budget day rolls over"
@@ -63,8 +72,10 @@ async fn budget_check_enforces_through_poisoned_lock() {
     );
 
     // Accumulation survives too: new usage is counted and enforced.
-    state.record_budget_usage("client-b", 1200).await;
-    assert!(state.check_budget("client-b").await.is_err());
+    state
+        .record_budget_usage(&state.caller("client-b"), 1200)
+        .await;
+    assert!(state.check_budget(&state.caller("client-b")).await.is_err());
 }
 
 /// The accumulator itself going through a poisoned lock: usage recorded
@@ -78,8 +89,10 @@ async fn budget_record_counts_through_poisoned_lock() {
         ..test_state_base()
     }));
     poison(&state.budget_usage);
-    state.record_budget_usage("client-a", 1500).await;
-    assert!(state.check_budget("client-a").await.is_err());
+    state
+        .record_budget_usage(&state.caller("client-a"), 1500)
+        .await;
+    assert!(state.check_budget(&state.caller("client-a")).await.is_err());
 }
 
 /// `anthropic_auth_failures_total` is the brute-force signal: a poisoned
@@ -101,9 +114,9 @@ async fn auth_failure_counter_survives_poisoned_lock() {
 #[tokio::test]
 async fn model_denied_counter_survives_poisoned_lock() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
-    state.note_model_denied("client-a", "claude-opus-4-7");
+    state.note_model_denied(&state.caller("client-a"), "claude-opus-4-7");
     poison(&state.model_denied);
-    state.note_model_denied("client-a", "claude-opus-4-7");
+    state.note_model_denied(&state.caller("client-a"), "claude-opus-4-7");
     assert!(!state.model_denied.is_poisoned());
     let key = ("client-a".to_string(), "claude-opus-4-7".to_string());
     assert_eq!(state.model_denied.lock().unwrap().get(&key), Some(&2));
@@ -119,7 +132,9 @@ async fn budget_readers_report_usage_through_poisoned_lock() {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
         ..test_state_base()
     }));
-    state.record_budget_usage("client-a", 400).await;
+    state
+        .record_budget_usage(&state.caller("client-a"), 400)
+        .await;
     let addr = serve(build_router(state.clone())).await;
     let c = reqwest::Client::new();
 
@@ -171,7 +186,9 @@ async fn budget_day_rollover_resets_counter() {
     }
 
     // Recording usage today should reset the counter (day rollover)
-    state.record_budget_usage("client-a", 50).await;
+    state
+        .record_budget_usage(&state.caller("client-a"), 50)
+        .await;
 
     let map = state.budget_usage.lock().unwrap();
     let (day, used) = map.get("client-a").unwrap();
@@ -198,7 +215,7 @@ async fn budget_check_respects_day_boundary() {
 
     // Budget check for today should pass — yesterday's usage doesn't count
     assert!(
-        state.check_budget("client-a").await.is_ok(),
+        state.check_budget(&state.caller("client-a")).await.is_ok(),
         "yesterday's exhausted budget should not block today"
     );
 }

@@ -14,11 +14,13 @@ async fn gate_rejection_counted_by_client_and_reason() {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
         ..test_state_base()
     }));
-    state.record_budget_usage("client-a", 200).await;
+    state
+        .record_budget_usage(&state.caller("client-a"), 200)
+        .await;
 
     for expected in [1u64, 2] {
         let resp = state
-            .pre_request_gate("-", "client-a", "claude-sonnet-4-6")
+            .pre_request_gate("-", &state.caller("client-a"), "claude-sonnet-4-6")
             .await
             .expect_err("exhausted budget must reject");
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -107,7 +109,9 @@ async fn metrics_expose_client_rejections() {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
         ..test_state_base()
     }));
-    state.record_budget_usage("client-a", 200).await;
+    state
+        .record_budget_usage(&state.caller("client-a"), 200)
+        .await;
     let addr = serve(build_router(state)).await;
     let c = reqwest::Client::new();
 
@@ -170,7 +174,7 @@ async fn limit_all_below() {
     set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
     set_account_utilization(&state, 1, 0.60, 0.50, now + 10000, now + 100000).await;
     assert!(state
-        .check_utilization_limit("testclient", "")
+        .check_utilization_limit(&state.caller("testclient"), "")
         .await
         .is_ok());
 }
@@ -194,7 +198,9 @@ async fn limit_all_above() {
     );
     set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
     set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
-    let result = state.check_utilization_limit("testclient", "").await;
+    let result = state
+        .check_utilization_limit(&state.caller("testclient"), "")
+        .await;
     assert!(result.is_err(), "all above limit should return Err");
     let retry = result.unwrap_err();
     assert!(retry >= 60, "retry-after should be >= 60");
@@ -221,7 +227,7 @@ async fn limit_one_below() {
     set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
     set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
     assert!(state
-        .check_utilization_limit("testclient", "")
+        .check_utilization_limit(&state.caller("testclient"), "")
         .await
         .is_ok());
 }
@@ -229,7 +235,10 @@ async fn limit_one_below() {
 #[tokio::test]
 async fn limit_no_config() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
-    assert!(state.check_utilization_limit("anyone", "").await.is_ok());
+    assert!(state
+        .check_utilization_limit(&state.caller("anyone"), "")
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
@@ -249,10 +258,13 @@ async fn limit_operator_bypass() {
     );
     set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
     // Operator bypasses everything
-    assert!(state.is_operator("ray"));
-    assert!(state.pre_request_gate("-", "ray", "").await.is_ok());
+    assert!(state.current_client_policy().is_operator("ray"));
+    assert!(state
+        .pre_request_gate("-", &state.caller("ray"), "")
+        .await
+        .is_ok());
     // Non-operator does not bypass
-    assert!(!state.is_operator("gastown"));
+    assert!(!state.current_client_policy().is_operator("gastown"));
 }
 
 #[tokio::test]
@@ -275,7 +287,7 @@ async fn limit_no_compatible_accounts_passes() {
     // Request for "claude-opus" — no account serves it → should pass
     assert!(
         state
-            .check_utilization_limit("test-client", "claude-opus")
+            .check_utilization_limit(&state.caller("test-client"), "claude-opus")
             .await
             .is_ok(),
         "should not 429 when no account serves the requested model"
@@ -303,7 +315,7 @@ async fn limit_unknown_accounts_fail_open() {
     // With limit=0.30, unknown 0.5 would appear "above limit" without fail-open
     assert!(
         state
-            .check_utilization_limit("testclient", "")
+            .check_utilization_limit(&state.caller("testclient"), "")
             .await
             .is_ok(),
         "should fail-open when all accounts have unknown utilization"
@@ -336,7 +348,7 @@ async fn limit_mixed_known_unknown_fails_open() {
     // Account "c" has no rate data → unknown
     assert!(
         state
-            .check_utilization_limit("testclient", "")
+            .check_utilization_limit(&state.caller("testclient"), "")
             .await
             .is_ok(),
         "should fail-open when unknown compatible account may have capacity"
@@ -385,9 +397,15 @@ async fn emergency_operator_bypass() {
     set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
     assert!(state.is_emergency_brake_active().await);
     // Operator bypasses pre_request_gate even during emergency
-    assert!(state.pre_request_gate("-", "ray", "").await.is_ok());
+    assert!(state
+        .pre_request_gate("-", &state.caller("ray"), "")
+        .await
+        .is_ok());
     // Non-operator gets blocked
-    assert!(state.pre_request_gate("-", "gastown", "").await.is_err());
+    assert!(state
+        .pre_request_gate("-", &state.caller("gastown"), "")
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -594,9 +612,9 @@ async fn gate_unknown_client_not_operator() {
         ..test_state_base()
     }));
     // "-" is not the operator
-    assert!(!state.is_operator("-"));
-    assert!(!state.is_operator("gastown"));
-    assert!(state.is_operator("ray"));
+    assert!(!state.current_client_policy().is_operator("-"));
+    assert!(!state.current_client_policy().is_operator("gastown"));
+    assert!(state.current_client_policy().is_operator("ray"));
 }
 
 // ── Task 7: Full integration tests ──
@@ -880,7 +898,7 @@ async fn gate_denies_model_outside_client_allow_list_with_403_naming_both() {
         &["claude-haiku-*"],
     )]);
     let err = state
-        .pre_request_gate("-", "limited", "claude-opus-5")
+        .pre_request_gate("-", &state.caller("limited"), "claude-opus-5")
         .await
         .expect_err("opus must be denied");
     assert_eq!(
@@ -910,7 +928,7 @@ async fn gate_allows_model_inside_client_allow_list() {
         &["claude-haiku-*"],
     )]);
     assert!(state
-        .pre_request_gate("-", "limited", "claude-haiku-4-5")
+        .pre_request_gate("-", &state.caller("limited"), "claude-haiku-4-5")
         .await
         .is_ok());
 }
@@ -928,7 +946,7 @@ async fn gate_allow_list_bypassed_by_operators() {
     );
     assert!(
         state
-            .pre_request_gate("-", "limited", "claude-opus-5")
+            .pre_request_gate("-", &state.caller("limited"), "claude-opus-5")
             .await
             .is_ok(),
         "operators bypass the allow-list like every other gate check"
@@ -959,7 +977,7 @@ async fn gate_429_budget_returns_json_envelope_with_retry_after() {
             .unwrap()
             .insert("budgeted".to_string(), (today, 200));
         let err = state
-            .pre_request_gate("-", "budgeted", "")
+            .pre_request_gate("-", &state.caller("budgeted"), "")
             .await
             .expect_err("exceeded budget must be denied");
         assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1001,7 +1019,7 @@ async fn gate_429_utilization_returns_json_envelope() {
     );
     set_account_utilization(&state, 0, 0.95, 0.95, now + 10000, now + 100000).await;
     let err = state
-        .pre_request_gate("-", "capped", "")
+        .pre_request_gate("-", &state.caller("capped"), "")
         .await
         .expect_err("utilization above limit must be denied");
     assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1033,7 +1051,7 @@ async fn gate_429_emergency_brake_returns_json_envelope_without_retry_after() {
     });
     set_account_utilization(&state, 0, 0.95, 0.95, now + 10000, now + 100000).await;
     let err = state
-        .pre_request_gate("-", "anyone", "")
+        .pre_request_gate("-", &state.caller("anyone"), "")
         .await
         .expect_err("emergency brake must deny");
     assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1084,7 +1102,7 @@ async fn gate_denial_beats_the_operator_bypass_when_a_name_holds_both_roles() {
     );
     assert!(
         state
-            .pre_request_gate("-", "both", "claude-opus-5")
+            .pre_request_gate("-", &state.caller("both"), "claude-opus-5")
             .await
             .is_err(),
         "overlap must resolve to the denial, never to the bypass"
@@ -1105,14 +1123,14 @@ async fn gate_leaves_a_plain_client_on_its_existing_policy() {
     );
     assert!(
         state
-            .pre_request_gate("-", "limited", "claude-haiku-4-5")
+            .pre_request_gate("-", &state.caller("limited"), "claude-haiku-4-5")
             .await
             .is_ok(),
         "an allowed model still passes"
     );
     assert!(
         state
-            .pre_request_gate("-", "limited", "claude-opus-5")
+            .pre_request_gate("-", &state.caller("limited"), "claude-opus-5")
             .await
             .is_err(),
         "the allow-list still denies"

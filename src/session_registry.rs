@@ -260,14 +260,18 @@ impl AppState {
     /// context-window % desc, capped to `SESSIONS_STATS_TOP_N`. Raw IPs and
     /// session ids never leave the registry — the label is a hash of the
     /// affinity key and agent/session ids are truncated to 8 chars.
-    pub(crate) fn sessions_snapshot(&self, now: u64) -> Vec<serde_json::Value> {
+    pub(crate) fn sessions_snapshot(
+        &self,
+        policy: &ClientPolicy,
+        now: u64,
+    ) -> Vec<serde_json::Value> {
         let mut rows: Vec<(f64, serde_json::Value)> = {
             let map = self.lock_sessions();
             map.iter()
                 .filter(|(_, e)| now.saturating_sub(e.last_seen) <= self.session_registry_ttl_secs)
                 .map(|(key, e)| {
                     let pct = window_pct(e.last_prompt_tokens, e.context_window);
-                    let client_id = if self.is_operator(&e.client_id) {
+                    let client_id = if policy.is_operator(&e.client_id) {
                         "_operator"
                     } else {
                         &e.client_id
@@ -542,7 +546,7 @@ pub(crate) async fn finalize_stream(
     state: &AppState,
     ep: &Endpoint,
     req_id: &str,
-    client_id: &str,
+    caller: &Caller,
     model: &str,
     acct_name: &str,
     client_ip: &str,
@@ -559,6 +563,7 @@ pub(crate) async fn finalize_stream(
     session_key: Option<&str>,
     context_window: u64,
 ) {
+    let client_id = caller.name();
     scanner.finish();
     let usage = &scanner.usage;
     // Response-derived model (message_start) preferred; request model fallback.
@@ -586,7 +591,7 @@ pub(crate) async fn finalize_stream(
     // each key their own UTC day, so a request straddling midnight would
     // book the estimate against the next day (LAB-7593 review).
     state
-        .record_usage_charging(ep, client_id, usage_model, usage, charged)
+        .record_usage_charging(ep, caller, usage_model, usage, charged)
         .await;
     if ctx.served_on_overage() {
         state.record_overage_usage(client_id, usage_model, usage);
@@ -684,7 +689,7 @@ pub(crate) async fn finalize_non_stream(
     state: &AppState,
     ep: &Endpoint,
     req_id: &str,
-    client_id: &str,
+    caller: &Caller,
     model: &str,
     response_model: Option<&str>,
     acct_name: &str,
@@ -699,12 +704,13 @@ pub(crate) async fn finalize_non_stream(
     context_window: u64,
     ctx: Option<ProxiedCtx>,
 ) {
+    let client_id = caller.name();
     let usage_model = response_model.unwrap_or(model);
     if ctx.as_ref().is_some_and(ProxiedCtx::served_on_overage) {
         state.record_overage_usage(client_id, usage_model, usage);
     }
     if !usage.is_empty() {
-        state.record_usage(ep, client_id, usage_model, usage).await;
+        state.record_usage(ep, caller, usage_model, usage).await;
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -812,8 +818,8 @@ impl AppState {
     /// response-derived model where available, falling back to the request
     /// model — either way it is truncated and the pair-count is capped here,
     /// so callers cannot inflate the label set.
-    async fn record_usage(&self, ep: &Endpoint, client_id: &str, model: &str, usage: &TokenUsage) {
-        self.record_usage_charging(ep, client_id, model, usage, 0)
+    async fn record_usage(&self, ep: &Endpoint, caller: &Caller, model: &str, usage: &TokenUsage) {
+        self.record_usage_charging(ep, caller, model, usage, 0)
             .await;
     }
 
@@ -823,14 +829,15 @@ impl AppState {
     async fn record_usage_charging(
         &self,
         ep: &Endpoint,
-        client_id: &str,
+        caller: &Caller,
         model: &str,
         usage: &TokenUsage,
         estimated: u64,
     ) {
+        let client_id = caller.name();
         if usage.is_empty() {
             if client_id != "-" {
-                self.record_budget_usage(client_id, estimated).await;
+                self.record_budget_usage(caller, estimated).await;
             }
             return;
         }
@@ -867,7 +874,7 @@ impl AppState {
             // regardless.
             add_client_model_usage(&mut self.lock_client_model_usage(), client_id, model, usage);
             // Budget accounting
-            self.record_budget_usage(client_id, total.saturating_add(estimated))
+            self.record_budget_usage(caller, total.saturating_add(estimated))
                 .await;
         }
     }
@@ -908,7 +915,7 @@ impl AppState {
         }
     }
 
-    /// Check if a client is within their daily token budget. Returns Ok(()), or Err with the
+    /// Check if the caller is within its daily token budget. Returns Ok(()), or Err with the
     /// seconds until the UTC day rolls over (1..=86400) — the budget's real reset time, derived
     /// from the same clock read that keys the day, so a denial can never carry the next day's hint.
     /// When Redis is available, a present counter is authoritative; an absent key or a read
@@ -916,11 +923,11 @@ impl AppState {
     /// failed INCRBY, or a poisoned key record_budget_usage deliberately deleted (LAB-1962).
     /// The poison self-heal DEL is only safe because of this floor: relaxing the absent-key
     /// path back to an authoritative allow would reopen the enforcement bypass.
-    pub(crate) async fn check_budget(&self, client_id: &str) -> Result<(), u64> {
-        let limit = match self.client_budgets.get(client_id) {
-            Some(&limit) => limit,
-            None => return Ok(()), // no budget configured = unlimited
+    pub(crate) async fn check_budget(&self, caller: &Caller) -> Result<(), u64> {
+        let Some(limit) = caller.budget() else {
+            return Ok(()); // no budget configured = unlimited
         };
+        let client_id = caller.name();
         let now = Self::now_epoch();
         let today = now / 86400;
         let retry_after = 86400 - (now % 86400);
@@ -1003,7 +1010,8 @@ impl AppState {
         details.starts_with("WRONGTYPE") || details.contains("not an integer")
     }
 
-    /// Record tokens against a client's daily budget.
+    /// Record tokens against the caller's daily budget, if its snapshot gives
+    /// it one.
     /// Updates local state synchronously; awaits Redis INCRBY inline to prevent TOCTOU races.
     /// On a transport-level INCRBY failure the increment is lost from the shared counter —
     /// the key is left untouched so one replica's failed write never erases fleet-wide
@@ -1011,10 +1019,11 @@ impl AppState {
     /// floor (LAB-1962). A server-reported poisoned value (WRONGTYPE / non-integer) is the
     /// one case that still deletes: the key is unreadable garbage for its full TTL and
     /// deleting it lets the shared counter rebuild.
-    pub(crate) async fn record_budget_usage(&self, client_id: &str, tokens: u64) {
-        if tokens == 0 || !self.client_budgets.contains_key(client_id) {
+    pub(crate) async fn record_budget_usage(&self, caller: &Caller, tokens: u64) {
+        if tokens == 0 || caller.budget().is_none() {
             return;
         }
+        let client_id = caller.name();
         let today = Self::now_epoch() / 86400;
 
         // Always update local state (for stats + fallback). Scoped so the
@@ -1130,61 +1139,14 @@ impl AppState {
         }
     }
 
-    /// Check if client_id is an operator.
-    pub(crate) fn is_operator(&self, client_id: &str) -> bool {
-        self.operators.iter().any(|op| op == client_id)
-    }
-
-    /// Check if client_id is a read-only principal (LAB-4395): admitted to
-    /// `/_stats` and `/metrics`, refused on every proxied surface.
-    pub(crate) fn is_admin_reader(&self, client_id: &str) -> bool {
-        self.admin_readers.iter().any(|r| r == client_id)
-    }
-
-    /// Refuse a read-only principal on a proxied surface (LAB-4395).
-    ///
-    /// Split out of `pre_request_gate` so both proxied handlers can run it
-    /// BEFORE `reserve_request_body` and the body read, and called from the
-    /// gate as well so a handler that reaches the gate without the early call
-    /// still fails closed. One predicate, one response, three call sites — the
-    /// duplication that matters is of the DECISION, not of the call.
-    ///
-    /// The early placement is the point. Every other gate denial refuses a
-    /// request the caller had some reason to send, so it is refused after
-    /// admission like any other. This one is identity-only: it needs
-    /// `client_id` and nothing else, and the principal has no legitimate
-    /// reason to send a proxied body at all. Refusing it after admission let
-    /// six reader connections declaring large `content-length`s — one byte
-    /// sent each — pin the whole shared in-flight body budget and 503 every
-    /// other client, then do it again after each read timeout (GH #199,
-    /// reproduced by adversarial review 2026-09-21). A role whose premise is
-    /// "this credential cannot harm the pool" must not hold pool admission
-    /// capacity while being told it has no authority.
-    pub(crate) fn deny_admin_reader(&self, req_id: &str, client_id: &str) -> Option<Box<Response>> {
-        if !self.is_admin_reader(client_id) {
-            return None;
-        }
-        warn!(
-            req_id,
-            client_id = %client_id,
-            "rejected: read-only principal has no proxy authority"
-        );
-        Some(Box::new(proxy_error_response(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            "forbidden: read-only principal — /_stats and /metrics only",
-        )))
-    }
-
-    /// Check if all model-compatible endpoints exceed this client's utilization limit.
+    /// Check if all model-compatible endpoints exceed the caller's utilization limit.
     /// Returns Ok(()) if no limit configured or at least one endpoint is below the limit.
     /// Returns Err(retry_after_secs) if all endpoints exceed the limit.
     /// OpenAI endpoints carry no rate-limit data and are skipped — they neither
     /// gate nor relieve the limit (mirrors `is_emergency_brake_active`).
-    async fn check_utilization_limit(&self, client_id: &str, model: &str) -> Result<(), u64> {
-        let limit = match self.client_utilization_limits.get(client_id) {
-            Some(&limit) => limit,
-            None => return Ok(()), // no limit configured
+    async fn check_utilization_limit(&self, caller: &Caller, model: &str) -> Result<(), u64> {
+        let Some(limit) = caller.utilization_limit() else {
+            return Ok(()); // no limit configured
         };
 
         let now_epoch = Self::now_epoch();
@@ -1276,9 +1238,10 @@ impl AppState {
     pub(crate) async fn pre_request_gate(
         &self,
         req_id: &str,
-        client_id: &str,
+        caller: &Caller,
         model: &str,
     ) -> Result<(), Box<Response>> {
+        let client_id = caller.name();
         // Read-only principal (LAB-4395). Both proxied handlers already ran
         // this before admitting a body; repeating it here is the backstop for
         // any future caller of the gate that does not. Checked BEFORE the
@@ -1286,10 +1249,10 @@ impl AppState {
         // validation, so the order cannot matter today, but if that check is
         // ever weakened this arm makes the wider grant lose to the denial
         // rather than win.
-        if let Some(resp) = self.deny_admin_reader(req_id, client_id) {
+        if let Some(resp) = deny_admin_reader(req_id, caller) {
             return Err(resp);
         }
-        if self.is_operator(client_id) {
+        if caller.principal.role == Role::Operator {
             return Ok(()); // operator bypasses everything
         }
 
@@ -1298,8 +1261,8 @@ impl AppState {
         //    must not be reported as 429 "try again later", which is what the
         //    three checks below all mean. Reached from both proxy_handler and
         //    openai_chat_handler, so one placement covers both surfaces.
-        if !self.client_allows_model(client_id, model) {
-            self.note_model_denied(client_id, model);
+        if !caller.allows_model(model) {
+            self.note_model_denied(caller, model);
             // `model` is caller-controlled and echoed back — truncate it here
             // too, so a 25 MB model field cannot become a 25 MB error body.
             let msg = if model.is_empty() {
@@ -1323,7 +1286,7 @@ impl AppState {
         let budget = if client_id == "-" {
             Ok(())
         } else {
-            self.check_budget(client_id).await
+            self.check_budget(caller).await
         };
         if let Err(retry_after) = budget {
             self.note_client_rejection(client_id, "budget");
@@ -1339,7 +1302,7 @@ impl AppState {
         }
 
         // 2. Utilization limit (new)
-        if let Err(retry_after) = self.check_utilization_limit(client_id, model).await {
+        if let Err(retry_after) = self.check_utilization_limit(caller, model).await {
             self.note_client_rejection(client_id, "utilization");
             warn!(
                 client_id = %client_id,
@@ -1376,6 +1339,42 @@ impl AppState {
 
         Ok(())
     }
+}
+
+/// Refuse a read-only principal on a proxied surface (LAB-4395): it is
+/// admitted to `/_stats` and `/metrics` and to nothing else.
+///
+/// Split out of `pre_request_gate` so both proxied handlers can run it
+/// BEFORE `reserve_request_body` and the body read, and called from the
+/// gate as well so a handler that reaches the gate without the early call
+/// still fails closed. One predicate, one response, three call sites — the
+/// duplication that matters is of the DECISION, not of the call.
+///
+/// The early placement is the point. Every other gate denial refuses a
+/// request the caller had some reason to send, so it is refused after
+/// admission like any other. This one is identity-only: it needs the
+/// caller's role and nothing else, and the principal has no legitimate
+/// reason to send a proxied body at all. Refusing it after admission let
+/// six reader connections declaring large `content-length`s — one byte
+/// sent each — pin the whole shared in-flight body budget and 503 every
+/// other client, then do it again after each read timeout (GH #199,
+/// reproduced by adversarial review 2026-09-21). A role whose premise is
+/// "this credential cannot harm the pool" must not hold pool admission
+/// capacity while being told it has no authority.
+pub(crate) fn deny_admin_reader(req_id: &str, caller: &Caller) -> Option<Box<Response>> {
+    if caller.principal.role != Role::Reader {
+        return None;
+    }
+    warn!(
+        req_id,
+        client_id = %caller.name(),
+        "rejected: read-only principal has no proxy authority"
+    );
+    Some(Box::new(proxy_error_response(
+        StatusCode::FORBIDDEN,
+        "permission_error",
+        "forbidden: read-only principal — /_stats and /metrics only",
+    )))
 }
 
 #[cfg(test)]

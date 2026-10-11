@@ -443,18 +443,6 @@ impl AppState {
         picked.endpoint
     }
 
-    /// The client's non-empty `preferred_endpoints` list, if it has one.
-    /// Resolved through the authenticated `[[clients]]` registry only — on the
-    /// legacy `proxy_key` / open path `clients` is empty, so a spoofable
-    /// header-derived client id can never acquire another client's pin.
-    fn client_preferred_endpoints(&self, client_id: &str) -> Option<&[String]> {
-        self.clients
-            .iter()
-            .find(|c| c.name == client_id)
-            .map(|c| c.preferred_endpoints.as_slice())
-            .filter(|p| !p.is_empty())
-    }
-
     /// Whether `endpoint_idx` is in a `preferred_endpoints` list. The ONE
     /// membership predicate, shared by the pick-time filter and `pin_status`
     /// — if they ever diverged, the `pin=` log field would lie about what the
@@ -466,11 +454,11 @@ impl AppState {
     }
 
     /// `pin` field for the per-request serving log lines: "pinned" when the
-    /// serving endpoint is in the client's preferred set, "spilled" when the
-    /// client has preferences but was served outside them, "-" for clients
+    /// serving endpoint is in the caller's preferred set, "spilled" when the
+    /// caller has preferences but was served outside them, "-" for callers
     /// without preferences.
-    pub(crate) fn pin_status(&self, client_id: &str, endpoint_idx: EndpointIdx) -> &'static str {
-        match self.client_preferred_endpoints(client_id) {
+    pub(crate) fn pin_status(&self, caller: &Caller, endpoint_idx: EndpointIdx) -> &'static str {
+        match caller.preferred_endpoints() {
             Some(p) if self.endpoint_is_preferred(p, endpoint_idx) => "pinned",
             Some(_) => "spilled",
             None => "-",
@@ -487,13 +475,14 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
     ) -> Option<EndpointIdx> {
-        self.pick_endpoint_for_client(affinity_key, model, skip, "", FastRequest::STANDARD)
+        let anonymous = self.caller("");
+        self.pick_endpoint_for_client(affinity_key, model, skip, &anonymous, FastRequest::STANDARD)
             .await
     }
 
     /// Pick the best available endpoint (account or fallback upstream).
     ///
-    /// Per-client pinning (LAB-2636 / #151) runs first: if `client_id` names a
+    /// Per-client pinning (LAB-2636 / #151) runs first: if the caller has a
     /// `[[clients]]` entry with `preferred_endpoints` and at least one of them
     /// is a healthy, undemoted candidate (serves the model, not hard-limited,
     /// not transport-unhealthy, not skipped, `gate < soft_limit`, and not
@@ -524,7 +513,7 @@ impl AppState {
         affinity_key: Option<&str>,
         model: &str,
         skip: &[EndpointIdx],
-        client_id: &str,
+        caller: &Caller,
         fast: FastRequest,
     ) -> Option<EndpointIdx> {
         let mut candidates = self.routing_candidates(model, skip).await;
@@ -552,7 +541,7 @@ impl AppState {
             }
             true
         });
-        if let Some(preferred) = self.client_preferred_endpoints(client_id) {
+        if let Some(preferred) = caller.preferred_endpoints() {
             let is_preferred =
                 |c: &RoutingCandidate| self.endpoint_is_preferred(preferred, c.endpoint);
             // Undemoted = candidate priority equals the configured priority.
@@ -570,7 +559,7 @@ impl AppState {
                 // Greppable spill marker — the request leaves its dedicated
                 // account(s) and will consume shared-pool cache/claims.
                 info!(
-                    client_id,
+                    client_id = caller.name(),
                     model,
                     fast_mode_disabled = fast_disabled
                         .iter()
@@ -1736,9 +1725,10 @@ impl AppState {
         // re-seeds this replica's local `budget_usage` mirror (LAB-3217) —
         // see fold_budget_mirror for why it must receive THIS `today`.
         let mut redis_budgets = serde_json::Map::new();
-        if redis_ok && !self.client_budgets.is_empty() {
+        let policy = self.current_client_policy();
+        if redis_ok && !policy.client_budgets.is_empty() {
             let today = Self::now_epoch() / 86400;
-            let client_ids: Vec<&String> = self.client_budgets.keys().collect();
+            let client_ids: Vec<&String> = policy.client_budgets.keys().collect();
             let budget_keys: Vec<String> = client_ids
                 .iter()
                 .map(|id| format!("alb:budget:{id}:{today}"))
@@ -1751,7 +1741,7 @@ impl AppState {
                         .map(|(i, id)| (id.as_str(), values.get(i).copied().flatten().unwrap_or(0)))
                         .collect();
                     for &(client_id, used) in &used_by_client {
-                        let limit = self.client_budgets[client_id];
+                        let limit = policy.client_budgets[client_id];
                         redis_budgets.insert(
                             client_id.to_owned(),
                             serde_json::json!({ "limit": limit, "used": used }),

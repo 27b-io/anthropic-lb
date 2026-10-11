@@ -596,7 +596,7 @@ async fn forward_with_betas_full(
         &state.endpoints[0],
         0,
         "req-1261",
-        "client-1",
+        &state.caller("client-1"),
         "-",
         &"127.0.0.1".parse().unwrap(),
         "-",

@@ -1958,7 +1958,7 @@ async fn guard_hook_logs_fail_closed_cause_under_every_policy() {
         ] {
             let req_id = format!("lab4358-hook-{label}-{client}");
             let rejected = state
-                .guard_hook(&req_id, client, outcome, false)
+                .guard_hook(&req_id, &state.caller(client), outcome, false)
                 .await
                 .is_err();
             assert_eq!(

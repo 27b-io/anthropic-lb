@@ -713,35 +713,65 @@ fn burn_rate_decay() {
 #[test]
 fn pressure_status_healthy() {
     let state = test_state_with(vec![]);
-    assert_eq!(compute_pressure_status(0.0, "client1", &state), "healthy");
-    assert_eq!(compute_pressure_status(0.50, "client1", &state), "healthy");
-    assert_eq!(compute_pressure_status(0.69, "client1", &state), "healthy");
+    assert_eq!(
+        compute_pressure_status(0.0, &state.caller("client1")),
+        "healthy"
+    );
+    assert_eq!(
+        compute_pressure_status(0.50, &state.caller("client1")),
+        "healthy"
+    );
+    assert_eq!(
+        compute_pressure_status(0.69, &state.caller("client1")),
+        "healthy"
+    );
 }
 
 #[test]
 fn pressure_status_elevated() {
     let state = test_state_with(vec![]);
-    assert_eq!(compute_pressure_status(0.70, "client1", &state), "elevated");
-    assert_eq!(compute_pressure_status(0.80, "client1", &state), "elevated");
-    assert_eq!(compute_pressure_status(0.84, "client1", &state), "elevated");
+    assert_eq!(
+        compute_pressure_status(0.70, &state.caller("client1")),
+        "elevated"
+    );
+    assert_eq!(
+        compute_pressure_status(0.80, &state.caller("client1")),
+        "elevated"
+    );
+    assert_eq!(
+        compute_pressure_status(0.84, &state.caller("client1")),
+        "elevated"
+    );
 }
 
 #[test]
 fn pressure_status_critical() {
     let state = test_state_with(vec![]);
-    assert_eq!(compute_pressure_status(0.85, "client1", &state), "critical");
-    assert_eq!(compute_pressure_status(0.90, "client1", &state), "critical");
-    assert_eq!(compute_pressure_status(0.94, "client1", &state), "critical");
+    assert_eq!(
+        compute_pressure_status(0.85, &state.caller("client1")),
+        "critical"
+    );
+    assert_eq!(
+        compute_pressure_status(0.90, &state.caller("client1")),
+        "critical"
+    );
+    assert_eq!(
+        compute_pressure_status(0.94, &state.caller("client1")),
+        "critical"
+    );
 }
 
 #[test]
 fn pressure_status_emergency() {
     let state = test_state_with(vec![]);
     assert_eq!(
-        compute_pressure_status(0.95, "client1", &state),
+        compute_pressure_status(0.95, &state.caller("client1")),
         "emergency"
     );
-    assert_eq!(compute_pressure_status(1.0, "client1", &state), "emergency");
+    assert_eq!(
+        compute_pressure_status(1.0, &state.caller("client1")),
+        "emergency"
+    );
 }
 
 #[test]
@@ -751,10 +781,19 @@ fn pressure_status_operator_always_healthy() {
         ..test_state_base()
     }));
     // Operator always gets "healthy" regardless of utilization
-    assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
-    assert_eq!(compute_pressure_status(1.0, "ray", &state), "healthy");
+    assert_eq!(
+        compute_pressure_status(0.99, &state.caller("ray")),
+        "healthy"
+    );
+    assert_eq!(
+        compute_pressure_status(1.0, &state.caller("ray")),
+        "healthy"
+    );
     // Non-operator at same utilization gets emergency
-    assert_eq!(compute_pressure_status(0.99, "other", &state), "emergency");
+    assert_eq!(
+        compute_pressure_status(0.99, &state.caller("other")),
+        "emergency"
+    );
 }
 
 #[test]
@@ -771,13 +810,25 @@ fn pressure_status_upgrade_near_client_limit() {
     );
     // gastown has limit 0.85, 80% of that = 0.68
     // At 0.60, below 0.68 → no upgrade → "healthy"
-    assert_eq!(compute_pressure_status(0.60, "gastown", &state), "healthy");
+    assert_eq!(
+        compute_pressure_status(0.60, &state.caller("gastown")),
+        "healthy"
+    );
     // At 0.69, above 0.68 → upgrade healthy→elevated
-    assert_eq!(compute_pressure_status(0.69, "gastown", &state), "elevated");
+    assert_eq!(
+        compute_pressure_status(0.69, &state.caller("gastown")),
+        "elevated"
+    );
     // At 0.70, already elevated, above 0.68 → upgrade elevated→critical
-    assert_eq!(compute_pressure_status(0.70, "gastown", &state), "critical");
+    assert_eq!(
+        compute_pressure_status(0.70, &state.caller("gastown")),
+        "critical"
+    );
     // Client without limits: no upgrade
-    assert_eq!(compute_pressure_status(0.69, "other", &state), "healthy");
+    assert_eq!(
+        compute_pressure_status(0.69, &state.caller("other")),
+        "healthy"
+    );
 }
 
 #[test]
@@ -793,7 +844,7 @@ fn compute_pressure_status_operator_always_healthy() {
             }),
     );
 
-    let status = compute_pressure_status(0.99, "operator-id", &state);
+    let status = compute_pressure_status(0.99, &state.caller("operator-id"));
     assert_eq!(
         status, "healthy",
         "operator should always see healthy status"
@@ -804,10 +855,22 @@ fn compute_pressure_status_operator_always_healthy() {
 fn compute_pressure_status_thresholds() {
     let state = test_state_with(vec![]);
 
-    assert_eq!(compute_pressure_status(0.50, "client", &state), "healthy");
-    assert_eq!(compute_pressure_status(0.75, "client", &state), "elevated");
-    assert_eq!(compute_pressure_status(0.90, "client", &state), "critical");
-    assert_eq!(compute_pressure_status(0.99, "client", &state), "emergency");
+    assert_eq!(
+        compute_pressure_status(0.50, &state.caller("client")),
+        "healthy"
+    );
+    assert_eq!(
+        compute_pressure_status(0.75, &state.caller("client")),
+        "elevated"
+    );
+    assert_eq!(
+        compute_pressure_status(0.90, &state.caller("client")),
+        "critical"
+    );
+    assert_eq!(
+        compute_pressure_status(0.99, &state.caller("client")),
+        "emergency"
+    );
 }
 
 #[test]
@@ -826,7 +889,7 @@ fn compute_pressure_status_limit_proximity_upgrade() {
     );
 
     // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
-    let status = compute_pressure_status(0.65, "client", &state);
+    let status = compute_pressure_status(0.65, &state.caller("client"));
     assert_eq!(
         status, "elevated",
         "proximity to limit should upgrade status"

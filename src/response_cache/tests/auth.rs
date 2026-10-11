@@ -134,12 +134,12 @@ fn resolve_multi_client_per_ip() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("x-client-id", HeaderValue::from_static("gastown"));
     assert_eq!(state.resolve_client_id(&ip, &headers), "gastown");
-    assert!(!state.is_operator("gastown"));
+    assert!(!state.current_client_policy().is_operator("gastown"));
 
     // ray on same IP → identified as ray, IS operator
     headers.insert("x-client-id", HeaderValue::from_static("ray"));
     assert_eq!(state.resolve_client_id(&ip, &headers), "ray");
-    assert!(state.is_operator("ray"));
+    assert!(state.current_client_policy().is_operator("ray"));
 
     // No header → falls back to IP mapping ("ray")
     let empty = hyper::HeaderMap::new();

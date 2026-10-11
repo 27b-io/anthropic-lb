@@ -74,7 +74,9 @@ fn session_registry_evicts_by_ttl() {
         assert!(map.contains_key("new"));
     }
     // The /_stats snapshot ALSO filters expired entries before any prune runs.
-    assert!(state.sessions_snapshot(1_000 + 1801 + 1801).is_empty());
+    assert!(state
+        .sessions_snapshot(&state.current_client_policy(), 1_000 + 1801 + 1801)
+        .is_empty());
 }
 
 #[test]
@@ -141,7 +143,7 @@ fn sessions_snapshot_sorts_by_pct_desc_and_caps_top_n() {
     state.record_session("high", rctx, "m", "a", 190_000, 200_000, 100);
     state.record_session("mid", rctx, "m", "a", 100_000, 200_000, 100);
     let pcts: Vec<f64> = state
-        .sessions_snapshot(100)
+        .sessions_snapshot(&state.current_client_policy(), 100)
         .iter()
         .map(|s| s["context_window_pct"].as_f64().unwrap())
         .collect();
@@ -151,7 +153,12 @@ fn sessions_snapshot_sorts_by_pct_desc_and_caps_top_n() {
     for i in 0..(SESSIONS_STATS_TOP_N + 10) {
         state.record_session(&format!("k{i}"), rctx, "m", "a", i as u64, 200_000, 100);
     }
-    assert_eq!(state.sessions_snapshot(100).len(), SESSIONS_STATS_TOP_N);
+    assert_eq!(
+        state
+            .sessions_snapshot(&state.current_client_policy(), 100)
+            .len(),
+        SESSIONS_STATS_TOP_N
+    );
 }
 
 #[test]

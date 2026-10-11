@@ -409,14 +409,16 @@ fn is_operator_checks_configured_operator() {
             }),
     );
 
-    assert!(state.is_operator("special-operator"));
-    assert!(!state.is_operator("regular-client"));
+    assert!(state
+        .current_client_policy()
+        .is_operator("special-operator"));
+    assert!(!state.current_client_policy().is_operator("regular-client"));
 }
 
 #[test]
 fn is_operator_returns_false_when_no_operator_configured() {
     let state = test_state_with(vec![]);
-    assert!(!state.is_operator("any-client"));
+    assert!(!state.current_client_policy().is_operator("any-client"));
 }
 
 #[test]
@@ -431,9 +433,9 @@ fn is_operator_supports_multiple_operators() {
                 ..test_state_base()
             }),
     );
-    assert!(state.is_operator("ray"));
-    assert!(state.is_operator("openclaw"));
-    assert!(state.is_operator("claude"));
-    assert!(!state.is_operator("gastown"));
-    assert!(!state.is_operator("-"));
+    assert!(state.current_client_policy().is_operator("ray"));
+    assert!(state.current_client_policy().is_operator("openclaw"));
+    assert!(state.current_client_policy().is_operator("claude"));
+    assert!(!state.current_client_policy().is_operator("gastown"));
+    assert!(!state.current_client_policy().is_operator("-"));
 }

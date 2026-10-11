@@ -466,13 +466,9 @@ const STATUS_EMERGENCY_FLOOR: f64 = 0.95;
 
 /// Compute the budget pressure status for a response header.
 /// Returns one of "healthy", "elevated", "critical", "emergency".
-pub(crate) fn compute_pressure_status(
-    effective_util: f64,
-    client_id: &str,
-    state: &AppState,
-) -> &'static str {
+pub(crate) fn compute_pressure_status(effective_util: f64, caller: &Caller) -> &'static str {
     // Operator always sees healthy
-    if state.is_operator(client_id) {
+    if caller.principal.role == Role::Operator {
         return "healthy";
     }
 
@@ -487,7 +483,7 @@ pub(crate) fn compute_pressure_status(
     };
 
     // Upgrade status if client's utilization limit proximity exceeds 80%
-    if let Some(&limit) = state.client_utilization_limits.get(client_id) {
+    if let Some(limit) = caller.utilization_limit() {
         if effective_util >= limit * 0.80 {
             status = match status {
                 "healthy" => "elevated",
@@ -548,7 +544,7 @@ pub(crate) struct Endpoint {
 ///
 /// The SINGLE list-level implementation behind both model allowlists: which
 /// models an *endpoint* may serve (`Endpoint::serves_model`) and which models
-/// a *client* may request (`AppState::client_allows_model`, LAB-1083). The
+/// a *client* may request (`Caller::allows_model`, LAB-1083). The
 /// per-pattern wildcard semantics live in `suffix_wildcard_match`, shared
 /// with the beta-flag allow-list (LAB-1191) — two matchers would be two sets
 /// of wildcard semantics to keep in sync, and the divergence would show up as
@@ -618,12 +614,13 @@ pub(crate) struct AppState {
     /// carries a verified principal, and `client_id` is that principal's name
     /// rather than a client-asserted header (LAB-1083).
     pub(crate) auth_mode: AuthMode,
-    /// `key_digest` of each `[[clients]]` key → its principal. No plaintext
-    /// client key is held anywhere in this state.
-    pub(crate) principals: HashMap<[u8; 32], Principal>,
-    /// The `[[clients]]` entries, keys removed: per-name model allow-lists,
-    /// pins and guard policy. Empty unless `auth_mode` is `Clients`.
-    pub(crate) clients: Vec<ClientEntry>,
+    /// Every per-client rule: the principal each client key resolves to (by
+    /// digest; no plaintext client key is held anywhere in this state), and
+    /// each name's model list, pins, guard policy, budget, utilization ceiling
+    /// and role. Read through `current_client_policy`, replaced whole through
+    /// `swap_client_policy`. `auth_mode` stays outside it, fixed at boot, so
+    /// no replacement can change how callers authenticate.
+    pub(crate) client_policy: std::sync::RwLock<Arc<ClientPolicy>>,
     /// LAB-3877: Tier 0 content guard — the compiled scanners plus their
     /// metrics. Built once at startup; scanned read-only per request. Present
     /// only under the `guard` feature.
@@ -663,19 +660,10 @@ pub(crate) struct AppState {
     pub(crate) shadow_log_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Count of shadow log entries dropped due to channel backpressure.
     pub(crate) shadow_log_dropped: AtomicU64,
-    /// Per-client daily token budgets: client_id → max tokens per day.
-    pub(crate) client_budgets: HashMap<String, u64>,
     /// Budget tracking: client_id → (epoch_day, tokens_used). Resets on new day.
     /// Process-local; with Redis it is re-seeded from the shared counter every
     /// sync tick (`fold_budget_mirror`, LAB-3217) so it survives restarts.
     pub(crate) budget_usage: Mutex<HashMap<String, (u64, u64)>>,
-    /// Per-client utilization limits: client_id → max effective utilization.
-    pub(crate) client_utilization_limits: HashMap<String, f64>,
-    /// Operator client IDs — never throttled by budgets, ceilings, or emergency brake.
-    pub(crate) operators: Vec<String>,
-    /// Read-only client IDs — `/_stats` + `/metrics` only, 403 on every `/v1`
-    /// surface. Disjoint from `operators`; the overlap is a boot error.
-    pub(crate) admin_readers: Vec<String>,
     /// Whether the emergency brake is enabled. Default: true.
     pub(crate) emergency_brake: bool,
     /// Emergency brake threshold. Default: 0.88.

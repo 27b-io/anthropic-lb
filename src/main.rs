@@ -648,14 +648,6 @@ async fn main() {
         Err(msg) => panic!("guard init failed: {msg}"),
     };
 
-    let ClientPolicy {
-        principals,
-        clients,
-        client_budgets,
-        client_utilization_limits,
-        operators,
-        admin_readers,
-    } = client_policy;
     let state = Arc::new(AppState {
         client: streaming_client(),
         client_nonstreaming: nonstreaming_client(),
@@ -666,8 +658,7 @@ async fn main() {
         transport_cooldown: TRANSPORT_UNHEALTHY_COOLDOWN,
         state_path,
         auth_mode,
-        principals,
-        clients,
+        client_policy: std::sync::RwLock::new(Arc::new(client_policy)),
         #[cfg(feature = "guard")]
         guard,
         allowed_ips,
@@ -691,11 +682,7 @@ async fn main() {
         overage_usage: Mutex::new(HashMap::new()),
         shadow_log_tx,
         shadow_log_dropped: AtomicU64::new(0),
-        client_budgets,
         budget_usage: Mutex::new(HashMap::new()),
-        client_utilization_limits,
-        operators,
-        admin_readers,
         emergency_brake: config.emergency_brake.unwrap_or(true),
         emergency_threshold: config
             .emergency_threshold

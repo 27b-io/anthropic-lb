@@ -12,15 +12,18 @@ fn distinct_client_keys_resolve_to_distinct_identities() {
 
     for (key, expected) in [("key-geo", "geo"), ("key-radar", "radar")] {
         let headers = hdrs(&[("x-api-key", &test_key(key))]);
-        let principal = state
+        let auth = state
             .authenticate(&headers, false)
-            .expect("configured key must authenticate")
+            .expect("configured key must authenticate");
+        let principal = auth
+            .principal
+            .as_ref()
             .expect("a [[clients]] match must yield a principal");
         assert_eq!(principal.name, expected);
         // And the identity the rest of the proxy sees follows it — with NO
         // x-client-id header present on either request.
-        let rctx = RequestContext::from_request(&state, &ip, &headers, Some(&principal));
-        assert_eq!(rctx.client_id, expected);
+        let rctx = RequestContext::from_request(&state, &ip, &headers, auth);
+        assert_eq!(rctx.caller.name(), expected);
     }
 }
 
@@ -78,6 +81,7 @@ fn bearer_credential_accepted_only_where_enabled() {
     let principal = state
         .authenticate(&headers, true)
         .expect("bearer must authenticate where enabled")
+        .principal
         .expect("principal");
     assert_eq!(principal.name, "geo");
 
@@ -91,7 +95,12 @@ fn bearer_scheme_match_is_case_insensitive() {
     let state = state_with_clients(vec![mk_client("geo", &test_key("key-geo"), &[])]);
     let headers = hdrs(&[("authorization", &format!("bEaReR {}", test_key("key-geo")))]);
     assert_eq!(
-        state.authenticate(&headers, true).unwrap().unwrap().name,
+        state
+            .authenticate(&headers, true)
+            .unwrap()
+            .principal
+            .unwrap()
+            .name,
         "geo"
     );
 }
@@ -110,12 +119,13 @@ fn spoofed_x_client_id_is_ignored_under_clients_table() {
         ("x-client-id", "bravo"),
     ]);
 
-    let principal = state.authenticate(&headers, false).unwrap().unwrap();
-    assert_eq!(principal.name, "alpha");
+    let auth = state.authenticate(&headers, false).unwrap();
+    assert_eq!(auth.principal.as_ref().unwrap().name, "alpha");
 
-    let rctx = RequestContext::from_request(&state, &ip, &headers, Some(&principal));
+    let rctx = RequestContext::from_request(&state, &ip, &headers, auth);
     assert_eq!(
-        rctx.client_id, "alpha",
+        rctx.caller.name(),
+        "alpha",
         "authenticated principal must win over the x-client-id header"
     );
 }
@@ -136,9 +146,10 @@ fn client_names_ip_map_is_ignored_under_clients_table() {
     );
     let ip = test_ip();
     let headers = hdrs(&[("x-api-key", &test_key("key-alpha"))]);
-    let principal = state.authenticate(&headers, false).unwrap().unwrap();
-    let rctx = RequestContext::from_request(&state, &ip, &headers, Some(&principal));
-    assert_eq!(rctx.client_id, "alpha");
+    let auth = state.authenticate(&headers, false).unwrap();
+    assert!(auth.principal.is_some());
+    let rctx = RequestContext::from_request(&state, &ip, &headers, auth);
+    assert_eq!(rctx.caller.name(), "alpha");
 }
 
 // ── AC-5: legacy proxy_key path unchanged ──
@@ -150,7 +161,8 @@ fn legacy_proxy_key_still_authenticates_and_yields_no_principal() {
 
     let principal = state
         .authenticate(&hdrs(&[("x-api-key", &test_key("shared-secret"))]), false)
-        .expect("correct legacy key must authenticate");
+        .expect("correct legacy key must authenticate")
+        .principal;
     assert!(
         principal.is_none(),
         "legacy path has no principal — identity stays header/IP-derived"
@@ -171,10 +183,11 @@ fn legacy_proxy_key_leaves_x_client_id_resolution_intact() {
         ("x-api-key", &test_key("shared-secret")),
         ("x-client-id", "gastown"),
     ]);
-    let principal = state.authenticate(&headers, false).unwrap();
-    let rctx = RequestContext::from_request(&state, &ip, &headers, principal.as_ref());
+    let auth = state.authenticate(&headers, false).unwrap();
+    let rctx = RequestContext::from_request(&state, &ip, &headers, auth);
     assert_eq!(
-        rctx.client_id, "gastown",
+        rctx.caller.name(),
+        "gastown",
         "without [[clients]], x-client-id remains the identity source"
     );
 }
@@ -185,6 +198,7 @@ fn open_proxy_authenticates_every_request() {
     assert!(state
         .authenticate(&hyper::HeaderMap::new(), false)
         .unwrap()
+        .principal
         .is_none());
 }
 
@@ -205,6 +219,7 @@ fn open_proxy_ignores_whatever_credential_is_presented() {
             assert!(state
                 .authenticate(&headers, allow_bearer)
                 .unwrap()
+                .principal
                 .is_none());
         }
     }
@@ -221,7 +236,11 @@ fn legacy_shared_key_is_held_and_matched_as_a_digest() {
         "the state holds the digest, not the key"
     );
     let bearer = hdrs(&[("authorization", &format!("Bearer {key}"))]);
-    assert!(state.authenticate(&bearer, true).unwrap().is_none());
+    assert!(state
+        .authenticate(&bearer, true)
+        .unwrap()
+        .principal
+        .is_none());
     assert!(
         state.authenticate(&bearer, false).is_err(),
         "the native surface still reads only x-api-key"
@@ -242,7 +261,10 @@ fn a_short_presented_key_never_matches_and_is_counted_and_throttled() {
         }),
     );
     // Guard against a vacuous pass: the table really holds the short key.
-    assert!(state.principals.contains_key(&key_digest(&short)));
+    assert!(state
+        .current_client_policy()
+        .principals
+        .contains_key(&key_digest(&short)));
 
     let ip = test_ip();
     let peer: SocketAddr = "10.0.0.7:40000".parse().unwrap();
@@ -299,7 +321,7 @@ fn the_short_key_floor_is_min_key_len_exactly() {
         .install_unchecked(test_state_base()),
     );
     let auth = |key: &str| state.authenticate(&hdrs(&[("x-api-key", key)]), false);
-    assert_eq!(auth(&at_floor).unwrap().unwrap().name, "floor");
+    assert_eq!(auth(&at_floor).unwrap().principal.unwrap().name, "floor");
     assert!(auth(&under).is_err());
 }
 
@@ -317,6 +339,7 @@ fn a_junk_api_key_beside_a_valid_bearer_still_authenticates() {
         let principal = state
             .authenticate(&headers, true)
             .expect("the valid Bearer must authenticate")
+            .principal
             .expect("principal");
         assert_eq!(principal.name, "geo", "{junk}");
         assert!(
@@ -351,10 +374,11 @@ async fn chat_completions_serves_a_valid_bearer_beside_a_junk_api_key() {
 /// than falling open.
 #[test]
 fn an_empty_principal_table_refuses_rather_than_opens() {
-    let mut state = TestPolicy::clients(vec![mk_client("geo", &test_key("key-geo"), &[])])
+    let state = TestPolicy::clients(vec![mk_client("geo", &test_key("key-geo"), &[])])
         .install(test_state_base());
-    state.principals.clear();
-    state.clients.clear();
+    state
+        .swap_client_policy(ClientPolicy::unchecked(&cfg("")).1)
+        .unwrap();
     assert!(matches!(state.auth_mode, AuthMode::Clients));
     for headers in [hdrs(&[]), hdrs(&[("x-api-key", &test_key("key-geo"))])] {
         for allow_bearer in [false, true] {
@@ -417,7 +441,9 @@ fn model_matcher_refuses_a_comma_model_under_a_list() {
         &test_key("k1"),
         &["claude-haiku-*"],
     )]);
-    assert!(!state.client_allows_model("limited", "claude-haiku-4-5,claude-opus-5"));
+    assert!(!state
+        .caller("limited")
+        .allows_model("claude-haiku-4-5,claude-opus-5"));
 }
 
 #[test]
@@ -432,17 +458,19 @@ fn client_allow_list_hit_miss_wildcard_and_empty() {
     ]);
 
     // exact hit
-    assert!(state.client_allows_model("limited", "claude-sonnet-4-6"));
+    assert!(state.caller("limited").allows_model("claude-sonnet-4-6"));
     // wildcard hit
-    assert!(state.client_allows_model("limited", "claude-haiku-4-5"));
+    assert!(state.caller("limited").allows_model("claude-haiku-4-5"));
     // miss
-    assert!(!state.client_allows_model("limited", "claude-opus-5"));
+    assert!(!state.caller("limited").allows_model("claude-opus-5"));
     // a near-miss on the exact pattern is still a miss
-    assert!(!state.client_allows_model("limited", "claude-sonnet-4-6-extra"));
+    assert!(!state
+        .caller("limited")
+        .allows_model("claude-sonnet-4-6-extra"));
     // empty list = all models
-    assert!(state.client_allows_model("unlimited", "claude-opus-5"));
+    assert!(state.caller("unlimited").allows_model("claude-opus-5"));
     // unknown client (legacy path only) = all models
-    assert!(state.client_allows_model("-", "claude-opus-5"));
+    assert!(state.caller("-").allows_model("claude-opus-5"));
 }
 
 /// The allow-list must FAIL CLOSED on an unreadable model.
@@ -461,11 +489,11 @@ fn client_allow_list_denies_an_unreadable_model() {
         mk_client("unlimited", &test_key("k2"), &[]),
     ]);
     assert!(
-        !state.client_allows_model("limited", ""),
+        !state.caller("limited").allows_model(""),
         "a client WITH an allow-list must be denied when the model is unknown"
     );
     assert!(
-        state.client_allows_model("unlimited", ""),
+        state.caller("unlimited").allows_model(""),
         "a client with no allow-list is unaffected — nothing to enforce"
     );
 }
@@ -477,7 +505,7 @@ fn client_allow_list_of_one_empty_pattern_denies_every_model() {
     let state = state_with_clients(vec![mk_client("deny-all", &test_key("k1"), &[""])]);
     for model in ["claude-sonnet-5", "claude-haiku-4-5", "", "*", "none"] {
         assert!(
-            !state.client_allows_model("deny-all", model),
+            !state.caller("deny-all").allows_model(model),
             "models = [\"\"] must deny {model:?}"
         );
     }
@@ -491,7 +519,7 @@ async fn gate_denies_unreadable_model_for_restricted_client() {
         &["claude-haiku-*"],
     )]);
     let err = state
-        .pre_request_gate("-", "limited", "")
+        .pre_request_gate("-", &state.caller("limited"), "")
         .await
         .expect_err("unknown model must be denied for a restricted client");
     assert_eq!(err.status(), StatusCode::FORBIDDEN);
@@ -570,7 +598,7 @@ fn denied_model_label_is_truncated() {
         &["claude-haiku-*"],
     )]);
     let huge = "z".repeat(100_000);
-    state.note_model_denied("limited", &huge);
+    state.note_model_denied(&state.caller("limited"), &huge);
     let counts = state.model_denied.lock().unwrap();
     let (_, label) = counts.keys().next().unwrap();
     assert!(
@@ -592,7 +620,7 @@ async fn denied_model_response_body_is_truncated() {
     )]);
     let huge = "z".repeat(100_000);
     let err = state
-        .pre_request_gate("-", "limited", &huge)
+        .pre_request_gate("-", &state.caller("limited"), &huge)
         .await
         .expect_err("oversized model must be denied");
     let json = parse_error_envelope(err).await;
@@ -624,12 +652,12 @@ async fn model_denial_increments_counter_per_client_and_model() {
     )]);
     for _ in 0..3 {
         assert!(state
-            .pre_request_gate("-", "limited", "claude-opus-5")
+            .pre_request_gate("-", &state.caller("limited"), "claude-opus-5")
             .await
             .is_err());
     }
     assert!(state
-        .pre_request_gate("-", "limited", "claude-fable-5")
+        .pre_request_gate("-", &state.caller("limited"), "claude-fable-5")
         .await
         .is_err());
 
@@ -655,19 +683,19 @@ fn model_denial_labels_are_bounded_by_other_overflow() {
         &["claude-haiku-*"],
     )]);
     for i in 0..(MAX_MODEL_DENIED_LABELS + 25) {
-        state.note_model_denied("limited", &format!("junk-model-{i}"));
+        state.note_model_denied(&state.caller("limited"), &format!("junk-model-{i}"));
     }
     // Rotating an unconfigured client id past the cap must NOT mint keys.
     for i in 0..50 {
-        state.note_model_denied(&format!("evil-{i}"), "claude-x");
+        state.note_model_denied(&state.caller(&format!("evil-{i}")), "claude-x");
     }
     // An already-tracked pair keeps its own key past the cap. Without the
     // `contains_key` clause it would drain into overflow with the bound still
     // satisfied — attribution lost, tests green.
-    state.note_model_denied("limited", "junk-model-0");
+    state.note_model_denied(&state.caller("limited"), "junk-model-0");
     let counts = state.model_denied.lock().unwrap();
     assert!(
-        counts.len() <= MAX_MODEL_DENIED_LABELS + state.clients.len() + 1,
+        counts.len() <= MAX_MODEL_DENIED_LABELS + state.current_client_policy().clients.len() + 1,
         "label map grew unbounded: {} entries",
         counts.len()
     );
@@ -699,14 +727,14 @@ async fn model_denial_literal_other_model_does_not_alias_overflow_bucket() {
         &["claude-haiku-*"],
     )]);
     assert!(state
-        .pre_request_gate("-", "limited", "_other")
+        .pre_request_gate("-", &state.caller("limited"), "_other")
         .await
         .is_err());
     for i in 0..(MAX_MODEL_DENIED_LABELS + 25) {
-        state.note_model_denied("limited", &format!("junk-model-{i}"));
+        state.note_model_denied(&state.caller("limited"), &format!("junk-model-{i}"));
     }
     assert!(state
-        .pre_request_gate("-", "limited", "_other")
+        .pre_request_gate("-", &state.caller("limited"), "_other")
         .await
         .is_err());
 
@@ -736,7 +764,10 @@ async fn model_denial_escape_keeps_other_and_dunder_other_distinct() {
     // Bare `other` guards the leading-`_` requirement: without it, `other`
     // would be escaped onto `_other` and pre-claim the overflow bucket.
     for model in ["other", "_other", "__other"] {
-        assert!(state.pre_request_gate("-", "limited", model).await.is_err());
+        assert!(state
+            .pre_request_gate("-", &state.caller("limited"), model)
+            .await
+            .is_err());
     }
 
     let counts = state.model_denied.lock().unwrap();
@@ -763,7 +794,7 @@ fn model_denial_log_escapes_newline_in_model() {
         &["claude-haiku-*"],
     )]);
     // First denial for this pair, so it takes the warn arm the capture sees.
-    state.note_model_denied("limited", "x\nFORGED-LAB5442 WARN fake");
+    state.note_model_denied(&state.caller("limited"), "x\nFORGED-LAB5442 WARN fake");
 
     let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert!(
@@ -970,7 +1001,7 @@ async fn metrics_exposes_the_model_denial_counter() {
     );
     let app = build_router(state.clone());
     assert!(state
-        .pre_request_gate("-", "limited", "claude-opus-5")
+        .pre_request_gate("-", &state.caller("limited"), "claude-opus-5")
         .await
         .is_err());
 
