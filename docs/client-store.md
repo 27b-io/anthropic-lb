@@ -113,9 +113,9 @@ A reader sorts each fault by its reach. An **envelope** fault, a schema the read
 
 An envelope fault refuses the document whatever else it holds. When a document breaks more than one rule, the rule reported is an envelope rule if any is broken, and otherwise the first in its table. Faults in two different clients, or two different keys, are not ordered against each other.
 
-One rule sits outside the format, because its input differs per deployment. A store refuses a client that takes the name of one of the deployment's operators or admin readers. A reader that finds such a client in a document anyway applies the envelope rules to the whole document, that client included, then drops the client before any client rule, and alerts: none of its keys enter the reader's lookup, it is never quarantined, and the reader keeps its own principal for the name.
+One rule sits outside the format, because its input differs per deployment. A store refuses a client that takes the name of one of the deployment's operators or admin readers. A reader that finds such a client in a document anyway applies the envelope rules to the whole document, that client included, then drops the client before any client rule, and alerts: none of its keys enter the reader's lookup, no other rule on this page applies to it (the merge with a config-file client of that name included), it is never quarantined, and the reader keeps its own principal, keys and policy for the name.
 
-A name in both the document and a reader's config file is one client on that reader: its keys from both authenticate, and the document's policy governs them. `null` and `[]` are values the document carries. Only a setting that schema 1 does not have, such as a guard policy, keeps its config-file value.
+A name in both the document and a reader's config file is one client on that reader: its keys from both authenticate, and the document's policy governs them. `null` and `[]` are values the document carries. Of the client's other settings, only one that schema 1 does not have, such as a guard policy, keeps its config-file value.
 
 A reader installs a document only when the document passes these checks, its version is above the one the reader holds, and the version is at most 15 minutes ahead of the reader's clock. A version further ahead raises a clock-skew alert.
 
@@ -143,7 +143,7 @@ A restrictions part carries the store's restrictions as a *body*, a JSON text, a
 
 | Member | Meaning |
 |---|---|
-| `full` | `true` only when the store's integrity record, which its own writes keep beside its restrictions, matches every row it read, and the body carries every one of those rows except the enabled records that `enabled_ahead` counts. A write updates the integrity record only when the record matched before the write, and only a deliberate reseed of the table creates or repairs one. An empty table with a matching record is full; a wiped one is partial. |
+| `full` | `true` when, and only when, the store's integrity record (the count of its restriction rows and one hash over all of them, kept beside the rows and never itself a row) equals the count and hash of the rows it read, and the body carries every one of those rows except the enabled records that `enabled_ahead` counts. A write always lands; it updates the integrity record only when the record matched before the write, and only a deliberate reseed of the table creates or repairs one. An empty table with a matching record is full; a wiped one is partial. |
 | `enabled_ahead` | How many enabled records the store left out because they are more than 60 s ahead of its clock. A reader alerts while it is above 0. |
 | `records` | One record per name: the name, its `state` (`disabled` or `enabled`), and the `version` at which the state was set, in Unix microseconds of the store's clock. |
 | `revoked_digests` | Digests of revoked keys. |
@@ -207,7 +207,7 @@ Then:
 5. Every digest in the part joins the digests the reader holds, as do the `revoked_digests` of every document it installs. None ever leaves.
 6. The set becomes complete once it has merged a full part, and stays complete. A partial part never makes a set complete. A full part does even when it skipped a record for being ahead: a skipped record is `enabled`, so missing it can only keep a denial in place.
 
-While the last part the reader merged lacks a disable or a digest that the reader holds, the reader raises a restrictions-behind alert. Every record in that part counts, skipped or not. The part lacks a disable the reader holds when it has neither a `disabled` record for that name at the same version or a higher one, nor an `enabled` record for it at a higher version. It lacks a digest the reader holds when it does not list it. The reader also alerts while the last part it merged is partial.
+While the last part the reader merged lacks a disable or a digest that the reader holds, the reader raises a restrictions-behind alert. Every record in that part counts, skipped or not. The part lacks a disable the reader holds when it has neither a `disabled` record for that name at the same version or a higher one, nor an `enabled` record for it at a higher version. It lacks a digest the reader holds when it does not list it. The reader also raises a partial-restrictions alert while the last part it merged is partial.
 
 Until its set is complete, a reader serves no client but its operators and admin readers, whether the client comes from the store or from its config file. Once it is complete, the reader enforces the set whether or not it holds a document:
 

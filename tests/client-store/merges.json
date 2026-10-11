@@ -83,7 +83,7 @@
     },
     {
       "id": "older-disable-in-part",
-      "why": "An older disable in the part keeps the newer held one, and the store lacks the reader's disable: a store's record for a name never goes back, so an older one means the store lost the newer.",
+      "why": "An older disable in the part keeps the newer held one, and the store lacks the reader's disable.",
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},

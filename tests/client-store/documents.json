@@ -57,7 +57,7 @@
     },
     {
       "id": "operator-like-name",
-      "why": "The format does not know a deployment's operators or admin readers, so a client named `operator` is valid here. A store that reserves the name refuses it, and a reader that does ignores the client, outside the format.",
+      "why": "The format does not know a deployment's operators or admin readers, so a client named `operator` is valid here. A store that reserves the name refuses it, and a reader that does drops the client after the envelope rules, outside the format.",
       "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"operator","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k1234567","label":"2026-10 rotation","digest":"8888888888888888888888888888888888888888888888888888888888888888","created_at":"2026-10-01T09:30:00.000Z"}]}],"revoked_digests":[]},
       "expect": "install"
     },
