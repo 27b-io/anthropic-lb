@@ -23,7 +23,7 @@ A reader replaces its document whole, after checking it. It never replaces its r
 
 Every pattern above matches the whole value: a trailing line feed breaks it. Sizes count UTF-8 bytes. Every bounded value is ASCII, so its length in characters is also its length in bytes.
 
-A model pattern holding `,` could never match, because a non-empty list never matches a model that holds `,`, and no model name needs `"` or `\`. The empty pattern, which a `[[clients]]` entry can use to deny every model, is not allowed: a store client is denied by disabling its name.
+The empty pattern, which a `[[clients]]` entry can use to deny every model, is not allowed: a store client is denied by disabling its name.
 
 A store checks parsed values, and it writes every number as JavaScript's `JSON.stringify` does. Input that only a hand edit could produce therefore never reaches a reader from a store: a number spelled `1.0`, `6e8`, `-0` or `1E400`, a fraction that rounds to an integer, a decimal finer than a double holds, a lone surrogate, nesting deeper than the format uses, or a member name repeated within one object. A reader may refuse such a document whole where a JavaScript check would quarantine one client, and no corpus case depends on any of them.
 
@@ -79,13 +79,13 @@ The store writes the document compactly, with the members in the order shown and
 
 ### Checks
 
-A reader checks a document before it installs it, and a store applies the same checks before it writes one. The store refuses to write a document that fails any of them.
+A reader checks a document before it installs it, and a store applies the same checks before it writes one.
 
 A reader sorts each fault by its reach. An **envelope** fault, a schema the reader does not read among them, refuses the whole document: the reader keeps its last good document, or stays without one, and alerts. A **client** fault quarantines the client that holds it: the reader refuses every key of that name, its config-file keys included, installs the rest of the document, and alerts. Everything a reader needs to map each key digest to exactly one name is envelope, so a quarantine can never leave a key pointing at the wrong client.
 
 | Envelope rule | The document is refused unless |
 |---|---|
-| `document.size` | its text is at most 2 MiB (2,097,152 bytes). A store's limits, among them 64 clients and 4,096 revoked digests, keep a document under about 1 MB. |
+| `document.size` | its text is at most 2 MiB (2,097,152 bytes). |
 | `document.object` | its text parses as JSON, and is an object. |
 | `document.schema` | its `schema` is the integer 1. Checked before any other member, so a reader that meets a newer schema reports the schema, not the members it does not know. |
 | `document.members` | its members are exactly `schema`, `version`, `updated_at`, `clients` and `revoked_digests`. |
@@ -113,15 +113,15 @@ A reader sorts each fault by its reach. An **envelope** fault, a schema the read
 
 An envelope fault refuses the document whatever else it holds. When a document breaks more than one rule, the rule reported is an envelope rule if any is broken, and otherwise the first in its table. Faults in two different clients, or two different keys, are not ordered against each other.
 
-One rule sits outside the format, because its input differs per deployment. A store refuses a client that takes the name of one of the deployment's operators or admin readers, and a reader that finds such a client in a document anyway ignores it, keeps its own principal, and alerts.
+One rule sits outside the format, because its input differs per deployment, and it comes before every other rule on this page. A store refuses a client that takes the name of one of the deployment's operators or admin readers. A reader that finds such a client in a document anyway drops it first, and alerts: none of its keys enter the reader's lookup, no other rule applies to it, and the reader keeps its own principal for the name.
 
-A name in both the document and a reader's config file is one client on that reader: its keys from both authenticate, and the document's policy governs them.
+A name in both the document and a reader's config file is one client on that reader: its keys from both authenticate, and the document's policy governs them. A setting that schema 1 does not carry keeps its config-file value.
 
 A reader installs a document only when the document passes these checks, its version is above the one the reader holds, and the version is at most 15 minutes ahead of the reader's clock. A version further ahead raises a clock-skew alert.
 
 ### Key digests
 
-A key's digest is the SHA-256 of the key's text, its UTF-8 bytes, as a digest. A store mints a key as 32 random bytes and hands it out once as unpadded base64url, 43 characters. It keeps the digest of those 43 characters, not of the raw bytes. A reader therefore digests every presented key the same way, whether the key came from the store or from its own config file, and one lookup serves both. So a proxy that reads a store holds its config-file keys as SHA-256 digests too, in place of the BLAKE2s-256 digests this proxy holds them as today.
+A key's digest is the SHA-256 of the key's text, its UTF-8 bytes, as a digest. A store mints a key as 32 random bytes and hands it out once as unpadded base64url, 43 characters. It keeps the digest of those 43 characters, not of the raw bytes. A reader therefore digests every presented key the same way, whether the key came from the store or from its own config file, and one lookup serves both. So a proxy that reads a store holds its config-file keys as SHA-256 digests too.
 
 When a store key's digest equals that of any key in the reader's config file, the reader quarantines the store client and alerts. A store never holds a config-file key's digest, so only an edit or a hand-written import can cause this. A config-file key is never handed to another principal: under another name it keeps working for its own, and under the same name it falls with the quarantine.
 
@@ -143,7 +143,7 @@ A restrictions part carries the store's restrictions as a *body*, a JSON text, a
 
 | Member | Meaning |
 |---|---|
-| `full` | `true` only when the store can prove that the part holds all its restrictions, from an integrity record its own writes keep beside them, which matches the rows it read. Without that proof, the part is partial and `full` is `false`. That includes an empty or wiped table. |
+| `full` | `true` when the store's integrity record, which its own writes keep beside its restrictions, matches every row it read. Leaving out the enabled records that `enabled_ahead` counts keeps a part full. Leaving out a row that breaks a rule makes it partial (`false`), and so does a table without a matching integrity record, an empty or wiped one included. |
 | `enabled_ahead` | How many enabled records the store left out because they are more than 60 s ahead of its clock. A reader alerts while it is above 0. |
 | `records` | One record per name: the name, its `state` (`disabled` or `enabled`), and the `version` at which the state was set, in Unix microseconds of the store's clock. |
 | `revoked_digests` | Digests of revoked keys. |
@@ -164,7 +164,7 @@ A store stamps every record above the previous record of its name, so a later wr
 | `part.record_version` | every record's `version` is an integer from 1 to 2^53−1. |
 | `part.revoked_digests` | `revoked_digests` is an array of digests, and none appears twice. |
 
-The rules are checked in the order of the table, so the size and the tag are checked before the body is parsed, and a fault is reported as the first rule it breaks. A refused part changes nothing the reader holds, and the reader alerts.
+The rules are checked in the order of the table, so the size and the tag are checked before the body is parsed, and a fault is reported as the first rule it breaks.
 
 A store never sends a body that breaks a rule. It leaves out any row that would break one, which only an edit can leave behind, and marks the part partial, so that one bad row cannot stop every later restriction from reaching readers. A new body format, like a new document schema, reaches every reader before any store writes it.
 
@@ -207,7 +207,7 @@ Then:
 5. Every digest in the part joins the digests the reader holds, as do the `revoked_digests` of every document it installs. None ever leaves.
 6. The set becomes complete once it has merged a full part, and stays complete. A partial part never makes a set complete. A full part does even when it skipped a record for being ahead: a skipped record is `enabled`, so missing it can only keep a denial in place.
 
-After merging, the reader checks whether the store is behind it, counting every record in the part, skipped or not. The store lacks a disable the reader holds when the part has no `disabled` record for that name and no `enabled` record for it with a higher version. It lacks a digest the reader holds when the part does not list it. While the store lacks either, the reader raises a restrictions-behind alert.
+Whenever the set it holds changes, from merging a part or from installing a document, the reader checks whether the store is behind it. It checks against the last part it merged, counting every record in that part, skipped or not. The store lacks a disable the reader holds when that part has neither a `disabled` record for that name at the same version or a higher one, nor an `enabled` record for it at a higher version: a store never moves a name's record back, so an older one means it lost the newer. It lacks a digest the reader holds when that part does not list it. While the store lacks either, the reader raises a restrictions-behind alert.
 
 Until its set is complete, a reader serves no client but its operators and admin readers, whether the client comes from the store or from its config file. Once it is complete, the reader enforces the set whether or not it holds a document:
 
@@ -216,18 +216,23 @@ Until its set is complete, a reader serves no client but its operators and admin
 
 ## The poll
 
-A reader polls `GET <poll URL>` every few seconds, with these query parameters:
+A reader polls `GET <poll URL>` every few seconds. Two query parameters choose what the answer carries:
 
 | Parameter | Value |
 |---|---|
 | `version` | The version of the document the reader holds, or 0. |
-| `digest` | The digest of that document. Left out when the reader holds none. |
 | `tag` | The tag of the last part the reader merged. Left out to ask for the body: before the reader has merged a part, and while it skips a record that is ahead. |
+
+The other four are the reader's report:
+
+| Parameter | Value |
+|---|---|
+| `digest` | The digest of the document the reader holds. Left out when it holds none. |
 | `records_version` | The highest version among the records the reader holds, leaving out any more than 15 minutes ahead of its clock, or 0. |
 | `set_hash` | The hash of the set the reader holds. |
 | `set_complete` | `true` or `false`: the set's completeness mark. |
 
-`version` and `records_version` are integers, `digest`, `tag` and `set_hash` are digests, and `set_complete` is `true` or `false`. A store ignores parameters it does not know. It treats a parameter that appears twice or breaks its form as absent, and an absent `version` or `records_version` as 0, so a malformed poll gets more of the answer, never less.
+`version` and `records_version` are integers, `digest`, `tag` and `set_hash` are digests, and `set_complete` is `true` or `false`. A store ignores parameters it does not know. It treats a parameter that appears twice or breaks its form as absent, an absent `version` or `records_version` as 0, and an absent `set_complete` as `false`, so a malformed poll gets more of the answer, never less.
 
 The poll travels over HTTPS with the store's certificate validated, or over a channel that never leaves the reader's own platform. The digest and the tag catch corruption, not tampering: anyone who can rewrite an answer can recompute both.
 
@@ -246,7 +251,7 @@ The reader sends a `User-Agent` naming its software and version, `anthropic-lb/<
 
 Both texts travel as JSON strings, so each side hashes exactly the bytes the store wrote, however either side re-serialises JSON.
 
-A store records what a reader reports only from a channel that no other caller can use. A report that arrives with a bearer token is never recorded, and never changes what a store serves or what it accepts.
+A store records a reader's report only from a channel that no other caller can use. A report that arrives with a bearer token is never recorded, and never changes what a store serves or what it accepts; its `version` and `tag` still choose what the answer carries.
 
 A reader checks each part on its own, so a fault in one part never refuses the other. Decoding each part separately, for example as a raw JSON value, keeps a bad document text from spoiling the restrictions. A reader ignores members it does not know in the answer and in each part, and refuses a part whose `status` is neither `ok` nor `unavailable`.
 
@@ -261,13 +266,13 @@ A part that fails a check is refused like an unavailable one: the reader keeps w
 
 ## The corpus
 
-[`tests/client-store/`](../tests/client-store/) holds four files. Each is a JSON object that holds its cases in arrays: `cases`, or `set_hashes` and `key_digests` in `hashes.json`. Every case has an `id`, unique in its array, and a `why`, and states its expected outcome. A failing case states the rule it breaks. Where it breaks more than one, it states the one reported first in check order; `envelope-fault-wins`, `schema-missing` and `schema-2-with-new-member` exist to pin that order. A test should check the rule as well as the outcome, so that no case passes for the wrong reason. No case is larger than 2 MiB, so `document.size` and `part.size` have none, and the poll answer has no cases.
+[`tests/client-store/`](../tests/client-store/) holds four files. Each is a JSON object that holds its cases in arrays: `cases`, or `set_hashes` and `key_digests` in `hashes.json`. Every case has an `id`, unique in its array, and a `why`, and states its expected outcome. A failing case states the rule it breaks; where it breaks more than one, the one reported first in check order. A test should check the rule as well as the outcome, so that no case passes for the wrong reason. The size rules and the poll exchange have no cases: each side tests them on its own.
 
 | File | Case | Expected outcome |
 |---|---|---|
-| `documents.json` | `document`: a document, as a JSON value. | `"install"`, `{"refuse": "<rule>"}`, or `{"quarantine": {"<name>": "<rule>"}}`. A store accepts exactly the `install` cases. |
+| `documents.json` | `document`: a document, as a JSON value. | `"install"`, `{"refuse": "<rule>"}`, or `{"quarantine": {"<name>": "<rule>"}}`. `"install"` means the document passes every check: whether a reader installs it also depends on the version the reader holds and on its clock, which the cases leave out. A store accepts exactly the `install` cases. |
 | `parts.json` | `tag`, and `body` as a string. | `"accept"` or `{"refuse": "<rule>"}`. Every accepted body but `unsorted-accepted` is written as a store writes one. |
-| `merges.json` | `now_us`, the reader's clock in Unix microseconds; `held`, the set before: `complete`, `records`, `revoked_digests`; and `part`: `full`, `records`, `revoked_digests`. | `held`, the set after, with its `set_hash`; `skipped_ahead`, the names of the records skipped for being ahead; and `behind`, what the store lacks: `disabled` names and `revoked_digests`. |
+| `merges.json` | `now_us`, the reader's clock in Unix microseconds; `held`, the set before: `complete`, `records`, `revoked_digests`; and `part`: `full`, `records`, `revoked_digests`. | `held`, the set after, with its `set_hash`; `records_version`, as the reader then reports it; `skipped_ahead`, the names of the records skipped for being ahead; and `behind`, what the store lacks: `disabled` names and `revoked_digests`. |
 | `hashes.json` | `set_hashes`: `records` and `revoked_digests` in any order. `key_digests`: `bytes_hex`, a key's raw bytes in hex. | `set_hashes`: the set `text` and its `hash`. `key_digests`: the key's `base64url` text, as a store hands it out, and its `digest`. |
 
 Every list in an expected outcome is in ascending order. Each version of the corpus is tagged `client-store-corpus-v<N>` in this repository. Vendor a copy at a tag, and record the tag and its commit.

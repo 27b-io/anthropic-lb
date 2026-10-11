@@ -7,7 +7,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":false,"records":[],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000001},{"name":"b","state":"enabled","version":1791699000000002}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001},{"name":"b","state":"enabled","version":1791699000000002}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"],"set_hash":"59e88ffff5afc7aef46c0c6d681de1db6c4a69fa13e083f650d4aa4b0fbe8f4a"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001},{"name":"b","state":"enabled","version":1791699000000002}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"],"set_hash":"59e88ffff5afc7aef46c0c6d681de1db6c4a69fa13e083f650d4aa4b0fbe8f4a"},"records_version":1791699000000002,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "fresh-reader-empty-full-part",
@@ -15,7 +15,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":false,"records":[],"revoked_digests":[]},
       "part": {"full":true,"records":[],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[],"revoked_digests":[],"set_hash":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[],"revoked_digests":[],"set_hash":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"records_version":0,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "fresh-reader-partial-part",
@@ -23,7 +23,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":false,"records":[],"revoked_digests":[]},
       "part": {"full":false,"records":[{"name":"a","state":"disabled","version":1791699000000001},{"name":"b","state":"enabled","version":1791699000000002}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
-      "expect": {"held":{"complete":false,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"],"set_hash":"6afc1ccae8a7db2f72d25ae93cd80c388e05c279f82c67460e23ef958083637c"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":false,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"],"set_hash":"6afc1ccae8a7db2f72d25ae93cd80c388e05c279f82c67460e23ef958083637c"},"records_version":1791699000000001,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "partial-part-keeps-complete",
@@ -31,7 +31,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":false,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"records_version":1791699000000001,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "newer-disable-replaces-enable",
@@ -39,7 +39,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"4a2af872996f2f6d0186dc887ad4334d2327d9bebcaf5f391e7cb1349df05b90"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"4a2af872996f2f6d0186dc887ad4334d2327d9bebcaf5f391e7cb1349df05b90"},"records_version":1791699000000002,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "newer-enable-lifts-disable",
@@ -47,7 +47,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"e091909c0cd51438ddd682a29fb2a0d999ba9d30d45330e215feacfe8304fec9"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"e091909c0cd51438ddd682a29fb2a0d999ba9d30d45330e215feacfe8304fec9"},"records_version":1791699000000002,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "older-enable-does-not-lift",
@@ -55,7 +55,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"4a2af872996f2f6d0186dc887ad4334d2327d9bebcaf5f391e7cb1349df05b90"},"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"4a2af872996f2f6d0186dc887ad4334d2327d9bebcaf5f391e7cb1349df05b90"},"records_version":1791699000000002,"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
     },
     {
       "id": "tie-held-disable-wins",
@@ -63,7 +63,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"records_version":1791699000000001,"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
     },
     {
       "id": "tie-part-disable-wins",
@@ -71,7 +71,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"records_version":1791699000000001,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "same-record-again",
@@ -79,15 +79,31 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"records_version":1791699000000001,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "older-disable-in-part",
-      "why": "An older disable in the part keeps the newer held one; the store still holds a disable, so it lacks nothing.",
+      "why": "An older disable in the part keeps the newer held one, and the store lacks the reader's disable: a store's record for a name never goes back, so an older one means the store lost the newer.",
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"4a2af872996f2f6d0186dc887ad4334d2327d9bebcaf5f391e7cb1349df05b90"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"4a2af872996f2f6d0186dc887ad4334d2327d9bebcaf5f391e7cb1349df05b90"},"records_version":1791699000000002,"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
+    },
+    {
+      "id": "reseeded-disable-below-held",
+      "why": "A store whose clock stepped back re-stamps a reseeded disable below the one readers hold. The reader keeps its newer disable and reports the store behind at once, before any enable is sent against the older record.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791700300000000}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791700000000000}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791700300000000}],"revoked_digests":[],"set_hash":"d342351f91eb4534817efd845e06f647cfbb4d4c14b3323697eb42f37d6f56cd"},"records_version":1791700300000000,"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
+    },
+    {
+      "id": "enable-below-held-disable",
+      "why": "An enable the store stamps below a disable the reader holds lifts nothing, and the store stays behind until it writes a record above the reader's.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791700300000000}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791700060000000}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791700300000000}],"revoked_digests":[],"set_hash":"d342351f91eb4534817efd845e06f647cfbb4d4c14b3323697eb42f37d6f56cd"},"records_version":1791700300000000,"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
     },
     {
       "id": "older-disable-keeps-newer-enable",
@@ -95,7 +111,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"e091909c0cd51438ddd682a29fb2a0d999ba9d30d45330e215feacfe8304fec9"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"e091909c0cd51438ddd682a29fb2a0d999ba9d30d45330e215feacfe8304fec9"},"records_version":1791699000000002,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "partial-part-enable-skipped",
@@ -103,7 +119,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":false,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"records_version":1791699000000001,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "missing-disable-kept",
@@ -111,7 +127,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":true,"records":[],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"records_version":1791699000000001,"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
     },
     {
       "id": "enable-forgotten",
@@ -119,7 +135,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001},{"name":"b","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"b","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"b","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"a1828f51ff05439748f23d038dc1e02f7ddf18f4c0c5b3ce155e3f6b2c2a8898"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"b","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"a1828f51ff05439748f23d038dc1e02f7ddf18f4c0c5b3ce155e3f6b2c2a8898"},"records_version":1791699000000001,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "partial-part-forgets-nothing",
@@ -127,7 +143,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":false,"records":[],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"479cf0c65ff1b885bd8c0be96811cda1b51a5d594200c70cabac235b17e43916"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"479cf0c65ff1b885bd8c0be96811cda1b51a5d594200c70cabac235b17e43916"},"records_version":1791699000000001,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "enable-for-a-new-name",
@@ -135,7 +151,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"479cf0c65ff1b885bd8c0be96811cda1b51a5d594200c70cabac235b17e43916"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"479cf0c65ff1b885bd8c0be96811cda1b51a5d594200c70cabac235b17e43916"},"records_version":1791699000000001,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "enable-14-minutes-ahead-merged",
@@ -143,7 +159,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791700840000000}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791700840000000}],"revoked_digests":[],"set_hash":"8f563a22217c5a618c2abceb8256ab65b4a64248e0ae5a31048c59554575efbb"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791700840000000}],"revoked_digests":[],"set_hash":"8f563a22217c5a618c2abceb8256ab65b4a64248e0ae5a31048c59554575efbb"},"records_version":1791700840000000,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "enable-15-minutes-ahead-merged",
@@ -151,7 +167,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791700900000000}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791700900000000}],"revoked_digests":[],"set_hash":"c96374a4b26163cd2e742e10b16fe315b1ff1feb91102c1707943f9c04e784d8"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791700900000000}],"revoked_digests":[],"set_hash":"c96374a4b26163cd2e742e10b16fe315b1ff1feb91102c1707943f9c04e784d8"},"records_version":1791700900000000,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "enable-past-15-minutes-skipped",
@@ -159,7 +175,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791700900000001}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":["a"],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"records_version":1791699000000001,"skipped_ahead":["a"],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "disable-far-ahead-merged",
@@ -167,7 +183,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1823236000000000}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1823236000000000}],"revoked_digests":[],"set_hash":"a9cc47a2479c9161395c019c3f48a1e429376dd34a2979b0abae3aabce9f930c"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1823236000000000}],"revoked_digests":[],"set_hash":"a9cc47a2479c9161395c019c3f48a1e429376dd34a2979b0abae3aabce9f930c"},"records_version":0,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "skipped-enable-blocks-forgetting",
@@ -175,7 +191,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1823236000000000}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"479cf0c65ff1b885bd8c0be96811cda1b51a5d594200c70cabac235b17e43916"},"skipped_ahead":["a"],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"479cf0c65ff1b885bd8c0be96811cda1b51a5d594200c70cabac235b17e43916"},"records_version":1791699000000001,"skipped_ahead":["a"],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "skipped-enable-for-a-new-name",
@@ -183,7 +199,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"b","state":"enabled","version":1823236000000000}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[],"revoked_digests":[],"set_hash":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"skipped_ahead":["b"],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[],"revoked_digests":[],"set_hash":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"records_version":0,"skipped_ahead":["b"],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "partial-ahead-enable-not-skipped-for-skew",
@@ -191,7 +207,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":false,"records":[{"name":"a","state":"enabled","version":1823236000000000}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"records_version":1791699000000001,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "ahead-reader-clock-slow",
@@ -199,7 +215,7 @@
       "now_us": 1791699640000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791700000000000}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791700000000000}],"revoked_digests":[],"set_hash":"5dba5cd4cebdaa66018b54e5b7c892ed4c7edab9da55dc5f56e5bd154a7bebda"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791700000000000}],"revoked_digests":[],"set_hash":"5dba5cd4cebdaa66018b54e5b7c892ed4c7edab9da55dc5f56e5bd154a7bebda"},"records_version":1791700000000000,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "digests-join",
@@ -207,7 +223,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111","2222222222222222222222222222222222222222222222222222222222222222"]},
       "part": {"full":true,"records":[],"revoked_digests":["2222222222222222222222222222222222222222222222222222222222222222","3333333333333333333333333333333333333333333333333333333333333333"]},
-      "expect": {"held":{"complete":true,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111","2222222222222222222222222222222222222222222222222222222222222222","3333333333333333333333333333333333333333333333333333333333333333"],"set_hash":"97bc5805406289a74c53fc37ae7612d0cb4a5fdfae6c0d9167d4a1301a7a993f"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]}}
+      "expect": {"held":{"complete":true,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111","2222222222222222222222222222222222222222222222222222222222222222","3333333333333333333333333333333333333333333333333333333333333333"],"set_hash":"97bc5805406289a74c53fc37ae7612d0cb4a5fdfae6c0d9167d4a1301a7a993f"},"records_version":0,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]}}
     },
     {
       "id": "partial-part-adds-digests",
@@ -215,7 +231,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":false,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
       "part": {"full":false,"records":[],"revoked_digests":["2222222222222222222222222222222222222222222222222222222222222222"]},
-      "expect": {"held":{"complete":false,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111","2222222222222222222222222222222222222222222222222222222222222222"],"set_hash":"337539f9870e9fc85c69b40ca5650e0b923998b6567a922c007377398528d2a8"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]}}
+      "expect": {"held":{"complete":false,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111","2222222222222222222222222222222222222222222222222222222222222222"],"set_hash":"337539f9870e9fc85c69b40ca5650e0b923998b6567a922c007377398528d2a8"},"records_version":0,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]}}
     },
     {
       "id": "digest-listed-again",
@@ -223,7 +239,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
       "part": {"full":true,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
-      "expect": {"held":{"complete":true,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"],"set_hash":"82b3e7bad4af7483ddf73564d2bbb70fa05f108b837008c1fdfaa27114dfa4e7"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"],"set_hash":"82b3e7bad4af7483ddf73564d2bbb70fa05f108b837008c1fdfaa27114dfa4e7"},"records_version":0,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "operator-like-name-merged",
@@ -231,7 +247,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"operator","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"operator","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"b75980481decb04e4590c080fad97bae3be21ccdffb5f46fe1b39d5ab972661d"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"operator","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"b75980481decb04e4590c080fad97bae3be21ccdffb5f46fe1b39d5ab972661d"},"records_version":1791699000000001,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "partial-part-older-disable",
@@ -239,7 +255,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[]},
       "part": {"full":false,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"e091909c0cd51438ddd682a29fb2a0d999ba9d30d45330e215feacfe8304fec9"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"e091909c0cd51438ddd682a29fb2a0d999ba9d30d45330e215feacfe8304fec9"},"records_version":1791699000000002,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "full-part-with-skipped-record-completes",
@@ -247,7 +263,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":false,"records":[],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000001},{"name":"b","state":"enabled","version":1823236000000000}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":["b"],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"records_version":1791699000000001,"skipped_ahead":["b"],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "name-constructor",
@@ -255,15 +271,15 @@
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"constructor","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
       "part": {"full":true,"records":[{"name":"constructor","state":"enabled","version":1791699000000002}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"constructor","state":"enabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"07b8fb112f5fa392d0f379d2775b563927596591ff3efb91364ccfa409e996cd"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"constructor","state":"enabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"07b8fb112f5fa392d0f379d2775b563927596591ff3efb91364ccfa409e996cd"},"records_version":1791699000000002,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
     },
     {
       "id": "mixed-full-part",
-      "why": "Every full-part rule at once: a newer enable and a newer disable win, an enable is forgotten, an older disable keeps the newer held one, a new enabled name is added, and a digest goes missing.",
+      "why": "Every full-part rule at once: a newer enable and a newer disable win, an enable is forgotten, an older disable keeps the newer held one and leaves the store behind on it, a new enabled name is added, and a digest goes missing.",
       "now_us": 1791700000000000,
       "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001},{"name":"b","state":"enabled","version":1791699000000001},{"name":"c","state":"enabled","version":1791699000000001},{"name":"d","state":"disabled","version":1791699000000002}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
       "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791699000000002},{"name":"b","state":"disabled","version":1791699000000002},{"name":"d","state":"disabled","version":1791699000000001},{"name":"e","state":"enabled","version":1791699000000001}],"revoked_digests":["2222222222222222222222222222222222222222222222222222222222222222"]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002},{"name":"b","state":"disabled","version":1791699000000002},{"name":"d","state":"disabled","version":1791699000000002},{"name":"e","state":"enabled","version":1791699000000001}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111","2222222222222222222222222222222222222222222222222222222222222222"],"set_hash":"d3bd081f0b193ee6d86f9b64454d3270641603fd0e3c676c474f2dd6b2870703"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]}}
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002},{"name":"b","state":"disabled","version":1791699000000002},{"name":"d","state":"disabled","version":1791699000000002},{"name":"e","state":"enabled","version":1791699000000001}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111","2222222222222222222222222222222222222222222222222222222222222222"],"set_hash":"d3bd081f0b193ee6d86f9b64454d3270641603fd0e3c676c474f2dd6b2870703"},"records_version":1791699000000002,"skipped_ahead":[],"behind":{"disabled":["d"],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]}}
     },
     {
       "id": "mixed-partial-part",
@@ -271,7 +287,7 @@
       "now_us": 1791700000000000,
       "held": {"complete":false,"records":[{"name":"a","state":"enabled","version":1791699000000001},{"name":"b","state":"disabled","version":1791699000000001},{"name":"c","state":"enabled","version":1791699000000001}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
       "part": {"full":false,"records":[{"name":"a","state":"disabled","version":1791699000000002},{"name":"b","state":"enabled","version":1791699000000002},{"name":"d","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
-      "expect": {"held":{"complete":false,"records":[{"name":"a","state":"disabled","version":1791699000000002},{"name":"b","state":"disabled","version":1791699000000001},{"name":"c","state":"enabled","version":1791699000000001}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"],"set_hash":"3f9c71dfdaff5f90bec0eecc625f686742aff9acbeb853a911d22e1f02207b59"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]}}
+      "expect": {"held":{"complete":false,"records":[{"name":"a","state":"disabled","version":1791699000000002},{"name":"b","state":"disabled","version":1791699000000001},{"name":"c","state":"enabled","version":1791699000000001}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"],"set_hash":"3f9c71dfdaff5f90bec0eecc625f686742aff9acbeb853a911d22e1f02207b59"},"records_version":1791699000000002,"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]}}
     }
   ]
 }
