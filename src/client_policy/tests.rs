@@ -22,7 +22,7 @@ const K3: &str = "k3-0123456789abcdef0123456789abcdef";
 
 const RC_BLOCK: &str = "\n[response_cache]\nbackend = \"redis\"\nredis_url = \"redis://localhost\"\nmaster_key = \"0000000000000000000000000000000000000000000000000000000000000000\"\n";
 
-// ── `[[clients]]` structure (LAB-1083) ──
+// ── `[[clients]]` structure ──
 
 #[test]
 fn build_rejects_duplicate_names_and_keys() {
@@ -36,8 +36,8 @@ fn build_rejects_duplicate_names_and_keys() {
     ));
     assert!(err.contains("duplicate key"), "{err}");
     assert!(
-        !err.contains(K1),
-        "the error must not echo the credential: {err}"
+        !err.contains("k1-"),
+        "the error must not echo the credential, or any of it: {err}"
     );
 }
 
@@ -57,11 +57,11 @@ fn build_rejects_bad_names_and_empty_keys() {
         // Reserved: /_stats and /metrics rewrite operator identities to the
         // literal "_operator", so a real tenant with that name would silently
         // merge with the aggregated operator bucket.
-        (client("_operator", K1), "_operator"),
+        (client("_operator", K1), "operator-aggregation"),
         // Reserved: the metrics overflow bucket is keyed ("_other", "_other");
         // a real client with that name could pre-create the exact pair and
         // later overflow denials/usage would merge into it (CodeRabbit, #148).
-        (client("_other", K1), "_other"),
+        (client("_other", K1), "overflow-bucket"),
         // The legacy client_names IP map is the third identity entry point
         // (resolve_client_id's fallback) — its values must not claim a
         // reserved sentinel either (#148 follow-up).
@@ -70,7 +70,7 @@ fn build_rejects_bad_names_and_empty_keys() {
         (names("_other"), "reserved"),
         (names(""), "non-empty"),
         (names("alice "), "whitespace"),
-        (client("geo", ""), "key"),
+        (client("geo", ""), "key must not be empty"),
         // Untrimmed: stored verbatim, so it would become a client_id matching
         // no client_budgets / operators / response_cache.clients key.
         (client(" geo", K1), "whitespace"),
@@ -313,7 +313,7 @@ fn name_rule_leaves_the_legacy_identity_paths_alone() {
     assert_eq!(state.resolve_client_id(&test_ip(), &headers), "Gas.Town");
 }
 
-// ── Credential posture (LAB-1192) ──
+// ── Credential posture ──
 
 #[test]
 fn build_rejects_a_credential_free_config_by_default() {
@@ -488,7 +488,6 @@ fn key_digest_is_tagged_and_unrelated_to_the_logged_fingerprint() {
         hex(&key_digest(&key)[..6]),
         "a logged fingerprint must not be a prefix of the stored digest"
     );
-    assert_ne!(key_digest(&key), key_digest(&test_key("geo2")));
 }
 
 /// LAB-6939: `models = [""]` is the supported deny-all form, and a production

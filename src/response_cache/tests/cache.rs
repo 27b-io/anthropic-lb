@@ -254,6 +254,21 @@ fn response_cache_master_key_validation() {
     assert!(decode_hex_key("").is_err());
 }
 
+#[test]
+fn response_cache_rejects_unknown_client_sentinel() {
+    let backend: cachekit::SharedBackend = std::sync::Arc::new(RecordingBackend::default());
+    let err = ResponseCache::from_parts(
+        backend,
+        &["-".to_string()],
+        &TEST_MASTER_KEY,
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+    )
+    .err()
+    .expect("\"-\" must be rejected");
+    assert!(err.contains("sentinel"), "got: {err}");
+}
+
 // AC1: with no cache configured, repeat requests hit the upstream every time
 // and no cache artifacts appear on the response.
 #[tokio::test]

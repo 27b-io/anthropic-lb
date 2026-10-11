@@ -1142,22 +1142,25 @@ async fn openai_chat_wrong_apikey_valid_bearer() {
     });
 
     let client = Client::new();
-    let resp = client
-        .post(format!("http://{}/v1/chat/completions", addr))
-        .header("content-type", "application/json")
-        // Too short to be any key: refused on its own, and the Bearer beside
-        // it still authenticates (the check is per credential).
-        .header("x-api-key", "wrong-key")
-        .header(
-            "authorization",
-            format!("Bearer {}", test_key("secret-key")),
-        )
-        .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
-        .send()
-        .await
-        .unwrap();
+    // A wrong key long enough to be compared, and one too short to be any key
+    // at all: either way the Bearer beside it still authenticates, because
+    // each credential is judged on its own.
+    for wrong in [test_key("wrong-key"), "wrong-key".to_string()] {
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", &wrong)
+            .header(
+                "authorization",
+                format!("Bearer {}", test_key("secret-key")),
+            )
+            .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
+            .send()
+            .await
+            .unwrap();
 
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{wrong}");
+    }
 }
 
 /// LAB-4323: a valid-JSON non-object body reads as `model = ""`, which every

@@ -439,9 +439,8 @@ name = "geo"
 key = "{STRONG_KEY}-geo"
 "#
     );
-    let Ok((_, _, policy)) = load_config(&toml_str) else {
-        panic!("a models = [\"\"] client must boot");
-    };
+    let (_, _, policy) = load_config(&toml_str)
+        .unwrap_or_else(|e| panic!("a models = [\"\"] client must boot: {e}"));
     let ops = policy
         .clients
         .iter()

@@ -5,9 +5,9 @@ use std::collections::HashSet;
 //
 // Every per-client rule is checked here, by one fallible builder, and the
 // result is one value: how callers authenticate, which principal each client
-// key resolves to, and what each name may do. A config `ClientPolicy::build`
-// accepts is one a real boot accepts, so a test that builds its state through
-// it holds nothing a boot would refuse.
+// key resolves to, and what each name may do. `load_config` runs it on every
+// boot, so a test that builds its per-client state through it holds none a
+// boot would refuse.
 
 /// How callers authenticate. Decided once, from the config, by
 /// `ClientPolicy::build`, and never re-inferred at runtime. In particular
@@ -75,9 +75,9 @@ pub(crate) struct ClientPolicy {
 /// Matching a presented key is a hash-map lookup on its digest, which is not
 /// constant-time and need not be. Timing can reveal at most something about a
 /// stored digest, and a digest cannot be turned back into a key, which is
-/// what the proxy accepts. That rests on keys being long and random:
-/// `MIN_KEY_LEN` is the floor, and the documented generator is
-/// `openssl rand -hex 32`.
+/// what the proxy accepts. That rests on keys being long and random. Boot
+/// enforces only the length (`MIN_KEY_LEN`); the documented generator,
+/// `openssl rand -hex 32`, supplies the randomness.
 ///
 /// The tag differs from `credential_fingerprint`'s, so the fingerprint a
 /// rejection logs has nothing in common with a stored digest.
@@ -93,8 +93,9 @@ impl ClientPolicy {
     /// Check every per-client rule in `config`, then build the policy and the
     /// auth mode it implies. Each error is the message a boot fails with. The
     /// structural `[[clients]]` rules run first, then the credential posture,
-    /// then the value ranges, so a config breaking several rules reports the
-    /// same first error it always has.
+    /// then the value ranges, so a structural error still wins over a key
+    /// that is too short, as it always has. The rest of `load_config` (legacy
+    /// keys, endpoints, throttle, cooldown) is not repeated here.
     pub(crate) fn build(config: &Config) -> Result<(AuthMode, Self), String> {
         check_clients(config).map_err(|msg| format!("config: {msg}"))?;
         check_credentials(config)?;

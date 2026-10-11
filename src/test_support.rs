@@ -817,7 +817,7 @@ pub(crate) fn state_with_clients(clients: Vec<ClientConfig>) -> Arc<AppState> {
     Arc::new(TestPolicy::clients(clients).install(test_state_base()))
 }
 
-/// A test credential: `tag` plus a fixed 32-character suffix, so it clears
+/// A test credential: `tag` plus a fixed 33-character suffix, so it clears
 /// `MIN_KEY_LEN` whatever the tag. A test configures `test_key(tag)` and
 /// presents `test_key(tag)`. A near miss must be derived from the whole key:
 /// `test_key` of a near-miss tag differs in the tag only.

@@ -253,14 +253,16 @@ impl ResponseCache {
         ttl: Duration,
         op_timeout: Duration,
     ) -> Result<Self, String> {
-        // `ClientPolicy::build` refuses the unknown-client sentinel here: as a
-        // tenant it would opt in every unidentified caller.
-        debug_assert!(
-            !clients.iter().any(|c| c == "-"),
-            "response_cache.clients reached the cache with \"-\""
-        );
         let mut map = HashMap::new();
         for client_id in clients {
+            // `ClientPolicy::build` refuses this at boot. The cache refuses it
+            // too, so no other way of building one can open a shared tenant.
+            if client_id == "-" {
+                return Err(
+                    "response_cache.clients cannot contain \"-\" (the unknown-client sentinel — it would opt in every unidentified caller)"
+                        .into(),
+                );
+            }
             // The builder's default_ttl is the SINGLE source of entry
             // lifetime — writes use plain `set()` so the two can't drift.
             let ck = cachekit::CacheKit::builder()

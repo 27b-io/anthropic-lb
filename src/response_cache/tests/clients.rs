@@ -270,6 +270,21 @@ fn a_short_presented_key_never_matches_and_is_counted_and_throttled() {
     );
 }
 
+/// The legacy shared key gets the same floor: a short shared key, which only
+/// an unchecked state can hold, never matches either.
+#[test]
+fn a_short_presented_shared_key_never_matches() {
+    let short = "s".repeat(MIN_KEY_LEN - 1);
+    let state = TestPolicy::shared_key(&short).install_unchecked(test_state_base());
+    assert!(matches!(state.auth_mode, AuthMode::SharedKey(d) if d == key_digest(&short)));
+    for allow_bearer in [false, true] {
+        let err = state
+            .authenticate(&hdrs(&[("x-api-key", &short)]), allow_bearer)
+            .expect_err("a short shared key must not authenticate");
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
 /// The floor is `MIN_KEY_LEN` itself: a key of exactly that length still
 /// matches, one character less never does.
 #[test]
@@ -332,13 +347,14 @@ async fn chat_completions_serves_a_valid_bearer_beside_a_junk_api_key() {
 }
 
 /// The mode is decided at boot, never re-inferred from the table: a
-/// `[[clients]]` state whose table is empty refuses every credential rather
+/// `[[clients]]` state whose tables are empty refuses every credential rather
 /// than falling open.
 #[test]
 fn an_empty_principal_table_refuses_rather_than_opens() {
     let mut state = TestPolicy::clients(vec![mk_client("geo", &test_key("key-geo"), &[])])
         .install(test_state_base());
     state.principals.clear();
+    state.clients.clear();
     assert!(matches!(state.auth_mode, AuthMode::Clients));
     for headers in [hdrs(&[]), hdrs(&[("x-api-key", &test_key("key-geo"))])] {
         for allow_bearer in [false, true] {
