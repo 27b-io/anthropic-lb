@@ -448,3 +448,47 @@ key = "{STRONG_KEY}-geo"
         .unwrap();
     assert_eq!(ops.models, vec![String::new()]);
 }
+
+/// A planted secret shares no 8-character run with `err`. Version-neutral: it
+/// asserts on what the message must not hold, never on toml's wording.
+fn assert_no_secret_fragment(err: &str, secret: &str) {
+    let chars: Vec<char> = secret.chars().collect();
+    for w in chars.windows(8) {
+        let frag: String = w.iter().collect();
+        assert!(
+            !err.contains(&frag),
+            "error quotes '{frag}' of the secret: {err}"
+        );
+    }
+}
+
+/// A syntax error on a secret line names where it is, not what it holds.
+#[test]
+fn load_config_syntax_error_names_line_and_column_not_the_value() {
+    let raw =
+        format!("listen = \"0.0.0.0:8080\"\n\n[[clients]]\nname = \"geo\"\nkey = \"{STRONG_KEY}\n");
+    let err = match load_config(&raw) {
+        Ok(_) => panic!("an unterminated string must be refused"),
+        Err(e) => e,
+    };
+    assert_no_secret_fragment(&err, STRONG_KEY);
+    assert!(
+        err.contains("line 5, column "),
+        "expected the line and column: {err}"
+    );
+}
+
+/// A value of the wrong type is refused without echoing the value.
+#[test]
+fn load_config_type_error_does_not_echo_the_value() {
+    let raw = format!("listen = \"0.0.0.0:8080\"\nallow_unauthenticated = \"{STRONG_KEY}\"\n");
+    let err = match load_config(&raw) {
+        Ok(_) => panic!("a string where a bool belongs must be refused"),
+        Err(e) => e,
+    };
+    assert_no_secret_fragment(&err, STRONG_KEY);
+    assert!(
+        err.contains("line 2, column "),
+        "expected the line and column: {err}"
+    );
+}
