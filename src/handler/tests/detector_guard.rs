@@ -193,8 +193,9 @@ async fn block_waits_at_most_timeout_ms() {
 }
 
 /// The AC's downtime test end to end: stop the detector mid-traffic. At most
-/// `breaker_threshold` requests pay `timeout_ms`, later ones pay nothing, no
-/// `annotate` request fails, and the breaker closes by itself on recovery.
+/// `breaker_threshold` requests reach it, later ones only as one probe per
+/// cooldown, no `annotate` request fails, and the breaker closes by itself on
+/// recovery.
 #[tokio::test]
 async fn detector_downtime_mid_traffic() {
     let rig = rig(|c| {
@@ -215,14 +216,26 @@ async fn detector_downtime_mid_traffic() {
     }
     assert!(!d.tripped(Lane::Enforce));
 
+    // Whether a block request reached the hung detector is read from the
+    // enforce lane's turned-away counters, not from how long it took: under
+    // parallel load a turned-away request can take `timeout_ms` end to end.
+    // One admitted while the breaker was already tripped is a half-open
+    // probe, which a down phase longer than the cooldown can let through.
+    let turned_away = || {
+        let (open, saturated) = d.turned_away(Lane::Enforce);
+        open + saturated
+    };
     rig.mock.set_mode(MockDetectorMode::Hang);
-    let mut slow = 0;
+    let down = Instant::now();
+    let (mut reached, mut probes) = (0, 0);
     for i in 0..10 {
-        let started = Instant::now();
+        let (before, tripped) = (turned_away(), d.tripped(Lane::Enforce));
         let resp = send(&rig, "block-key", body(&format!("down {i}"))).await;
         assert_eq!(resp.status(), 200, "fail_open forwards");
-        if started.elapsed() >= Duration::from_millis(200) {
-            slow += 1;
+        match (turned_away() > before, tripped) {
+            (true, _) => {}
+            (false, true) => probes += 1,
+            (false, false) => reached += 1,
         }
         let resp = send(&rig, "annotate-key", body(&format!("shadow {i}"))).await;
         assert_eq!(
@@ -232,11 +245,14 @@ async fn detector_downtime_mid_traffic() {
         );
     }
     assert!(
-        slow <= 3,
-        "{slow} block requests paid the timeout; at most 3 may"
+        reached <= 3,
+        "{reached} block requests reached the hung detector; at most 3 may"
+    );
+    assert!(
+        probes <= down.elapsed().as_secs(),
+        "{probes} probes; at most one per cooldown"
     );
     assert!(d.tripped(Lane::Enforce));
-    assert!(d.turned_away(Lane::Enforce).0 > 0);
 
     // Detector back: after the cooldown one request probes and closes it.
     rig.mock.set_mode(MockDetectorMode::Healthy);
