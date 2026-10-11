@@ -754,16 +754,18 @@ mod redis_integration {
         // reads fails the test with no defect.
         let _clock = FrozenClock::at(FROZEN_GATE_CLOCKS[0]);
         let budgets: HashMap<String, u64> = [("budget-cli".to_string(), 1000u64)].into();
-        let replica_a = Arc::new(AppState {
-            client_budgets: budgets.clone(),
+        let replica_a = Arc::new(
+            TestPolicy::open()
+                .budgets(budgets.clone())
+                .install(AppState {
+                    redis: Some(fred.clone()),
+                    ..test_state_base()
+                }),
+        );
+        let replica_b = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
             redis: Some(fred.clone()),
             ..test_state_base()
-        });
-        let replica_b = Arc::new(AppState {
-            client_budgets: budgets,
-            redis: Some(fred.clone()),
-            ..test_state_base()
-        });
+        }));
 
         replica_a.record_budget_usage("budget-cli", 100).await;
         replica_b.record_budget_usage("budget-cli", 250).await;
@@ -787,11 +789,14 @@ mod redis_integration {
 
         // Cross-replica enforcement: a replica with a lower limit and NO
         // local usage of its own sees the shared counter and refuses.
-        let enforcing = Arc::new(AppState {
-            client_budgets: [("budget-cli".to_string(), 300u64)].into(),
-            redis: Some(fred.clone()),
-            ..test_state_base()
-        });
+        let enforcing = Arc::new(
+            TestPolicy::open()
+                .budgets([("budget-cli".to_string(), 300u64)].into())
+                .install(AppState {
+                    redis: Some(fred.clone()),
+                    ..test_state_base()
+                }),
+        );
         // Both instants fall on the same UTC day, so the counter recorded
         // above gates each; two of them so a hardcoded payload cannot pass.
         for frozen in FROZEN_GATE_CLOCKS {
@@ -816,11 +821,14 @@ mod redis_integration {
             .set(format!("alb:budget:roll-cli:{}", today - 1), 999_999u64)
             .await
             .unwrap();
-        let roll = Arc::new(AppState {
-            client_budgets: [("roll-cli".to_string(), 100u64)].into(),
-            redis: Some(fred.clone()),
-            ..test_state_base()
-        });
+        let roll = Arc::new(
+            TestPolicy::open()
+                .budgets([("roll-cli".to_string(), 100u64)].into())
+                .install(AppState {
+                    redis: Some(fred.clone()),
+                    ..test_state_base()
+                }),
+        );
         assert!(
             roll.check_budget("roll-cli").await.is_ok(),
             "yesterday's counter must not gate today"
@@ -845,12 +853,15 @@ mod redis_integration {
         // The fleet spent this much before the replica under test started.
         let _: () = conn.set(&key, 1_516_491u64).await.unwrap();
 
-        let state = Arc::new(AppState {
-            endpoints: vec![make_endpoint("seed-ep", Protocol::Anthropic)],
-            client_budgets: [("seed-cli".to_string(), 2_000_000u64)].into(),
-            redis: Some(fred),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("seed-cli".to_string(), 2_000_000u64)].into())
+                .install(AppState {
+                    endpoints: vec![make_endpoint("seed-ep", Protocol::Anthropic)],
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
         assert!(
             state.budget_usage.lock().unwrap().is_empty(),
             "a fresh replica starts with an empty mirror"
@@ -966,15 +977,20 @@ mod redis_integration {
             return;
         };
         avoid_utc_midnight().await;
-        let state = Arc::new(AppState {
-            client_budgets: [
-                ("poison-cli".to_string(), 100u64),
-                ("fresh-cli".to_string(), 100u64),
-            ]
-            .into(),
-            redis: Some(fred),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets(
+                    [
+                        ("poison-cli".to_string(), 100u64),
+                        ("fresh-cli".to_string(), 100u64),
+                    ]
+                    .into(),
+                )
+                .install(AppState {
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
         let today = AppState::now_epoch() / 86400;
         let key = format!("alb:budget:poison-cli:{today}");
         let _: () = conn.set(&key, "not-a-number").await.unwrap();
@@ -1129,11 +1145,14 @@ mod redis_integration {
         // it can verify the increment really was lost (not buffered/replayed).
         let mut direct = connect(&Db::LostIncrbyRevival.url(&base)).await;
 
-        let state = Arc::new(AppState {
-            client_budgets: [("lost-cli".to_string(), 100u64)].into(),
-            redis: Some(fred),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("lost-cli".to_string(), 100u64)].into())
+                .install(AppState {
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
 
         kill_proxy(kill).await;
 
@@ -1208,11 +1227,14 @@ mod redis_integration {
             .await
             .unwrap();
 
-        let state = Arc::new(AppState {
-            client_budgets: [("scan-cli".to_string(), 1000u64)].into(),
-            redis: Some(fred),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("scan-cli".to_string(), 1000u64)].into())
+                .install(AppState {
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
         let info = state.cluster_info().await.expect("cluster_info with redis");
         assert_eq!(
             info["replicas_seen"], 500,
@@ -1480,12 +1502,15 @@ mod redis_integration {
             return;
         };
         avoid_utc_midnight().await;
-        let state = Arc::new(AppState {
-            endpoints: vec![make_endpoint("degrade-ep", Protocol::Anthropic)],
-            client_budgets: [("degrade-cli".to_string(), 100u64)].into(),
-            redis: Some(fred),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("degrade-cli".to_string(), 100u64)].into())
+                .install(AppState {
+                    endpoints: vec![make_endpoint("degrade-ep", Protocol::Anthropic)],
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
 
         // Healthy first: the shared counter works through the proxy.
         state.record_budget_usage("degrade-cli", 50).await;
@@ -1552,11 +1577,14 @@ mod redis_integration {
         // verify post-recovery writes actually landed.
         let direct = connect(&Db::BackendRecoveryMidRun.url(&base)).await;
 
-        let state = Arc::new(AppState {
-            client_budgets: [("recover-cli".to_string(), 100u64)].into(),
-            redis: Some(fred),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("recover-cli".to_string(), 100u64)].into())
+                .install(AppState {
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
 
         // Healthy first: the shared counter works through the proxy.
         state.record_budget_usage("recover-cli", 50).await;
@@ -1674,14 +1702,17 @@ mod redis_integration {
             "never-yet-connected client must read disconnected"
         );
 
-        let state = Arc::new(AppState {
-            client_budgets: [("startup-cli".to_string(), 100u64)].into(),
-            redis: Some(client.clone()),
-            // Production boots with the gate closed; test_state_base opens
-            // it for the connected-at-creation fixtures.
-            redis_ever_connected: AtomicBool::new(false),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("startup-cli".to_string(), 100u64)].into())
+                .install(AppState {
+                    redis: Some(client.clone()),
+                    // Production boots with the gate closed; test_state_base opens
+                    // it for the connected-at-creation fixtures.
+                    redis_ever_connected: AtomicBool::new(false),
+                    ..test_state_base()
+                }),
+        );
         state.spawn_redis_connect_watcher();
 
         // Never-yet-connected: the coordination gate is closed, so request

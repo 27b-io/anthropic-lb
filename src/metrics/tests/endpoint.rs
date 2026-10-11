@@ -380,7 +380,7 @@ async fn metrics_transport_errors_scope_without_redis_aggregate() {
 #[tokio::test]
 async fn metrics_endpoint_auth() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, _state) = test_app(&mock_url, Some("secret-key".into()));
+    let (app, _state) = test_app(&mock_url, Some(test_key("secret-key")));
 
     let addr = serve(app).await;
     let client = Client::new();
@@ -396,7 +396,7 @@ async fn metrics_endpoint_auth() {
     // Wrong key → 401
     let resp = client
         .get(format!("http://{}/metrics", addr))
-        .header("x-api-key", "wrong-key")
+        .header("x-api-key", test_key("wrong-key"))
         .send()
         .await
         .unwrap();
@@ -405,7 +405,7 @@ async fn metrics_endpoint_auth() {
     // Correct key → 200
     let resp = client
         .get(format!("http://{}/metrics", addr))
-        .header("x-api-key", "secret-key")
+        .header("x-api-key", test_key("secret-key"))
         .send()
         .await
         .unwrap();
@@ -452,11 +452,14 @@ async fn metrics_omits_null_utilization() {
 async fn metrics_operator_hiding() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let accounts = vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &mock_url)];
-    let state = Arc::new(AppState {
-        endpoints: accounts,
-        operators: vec!["op-alice".to_string(), "op-bob".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .operators(&["op-alice", "op-bob"])
+            .install(AppState {
+                endpoints: accounts,
+                ..test_state_base()
+            }),
+    );
 
     // Seed two operator clients and one regular client with token usage
     {
@@ -730,13 +733,16 @@ async fn metrics_client_budgets_and_rpm() {
     ewma.value = 3.5;
     client_rates_map.insert("claude-code".to_string(), (50, ewma));
 
-    let state = Arc::new(AppState {
-        endpoints: accounts,
-        client_budgets,
-        budget_usage: Mutex::new(budget_usage_map),
-        client_request_rates: Mutex::new(client_rates_map),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .budgets(client_budgets)
+            .install(AppState {
+                endpoints: accounts,
+                budget_usage: Mutex::new(budget_usage_map),
+                client_request_rates: Mutex::new(client_rates_map),
+                ..test_state_base()
+            }),
+    );
 
     let app = build_router(state);
     let addr = serve(app).await;

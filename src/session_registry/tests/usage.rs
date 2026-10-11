@@ -428,13 +428,18 @@ async fn proxied_line_still_logged_on_openai_compat_upstream_error() {
 /// reported, the estimate alone is booked and no counter entry appears.
 #[tokio::test]
 async fn record_usage_charging_books_estimate_to_budget_only() {
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: [("c1".to_string(), 1_000_000), ("c2".to_string(), 1_000_000)]
-            .into_iter()
-            .collect(),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .budgets(
+                [("c1".to_string(), 1_000_000), ("c2".to_string(), 1_000_000)]
+                    .into_iter()
+                    .collect(),
+            )
+            .install(AppState {
+                endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+                ..test_state_base()
+            }),
+    );
     let usage = TokenUsage {
         input_tokens: 7,
         cache_read_input_tokens: 3,

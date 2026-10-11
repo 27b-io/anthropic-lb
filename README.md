@@ -174,8 +174,8 @@ token = "sk-ant-api03-..."
 | `listen` | `String` | — | Bind address (e.g. `"127.0.0.1:8082"`) |
 | `rate_limit_cooldown_secs` | `u64` | `5` | Fallback cooldown after a capacity 429 when upstream sends no usable `retry-after` (burst 429s use their own 5→60s backoff). Must be `1..=86400`; a value outside it is rejected at startup |
 | `probe_interval_secs` | `u64` | `300` | Seconds between utilization probes (0 = disabled) |
-| `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id` |
-| `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`) |
+| `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id`. Must match `^[a-z0-9][a-z0-9_-]{0,62}$`; names starting with `_` are reserved |
+| `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`). At least 32 characters; held only as a digest |
 | `clients[].models` | `[String]` | `[]` | Models this client may request (empty = all; `*` suffix wildcards) |
 | `clients[].preferred_endpoints` | `[String]` | `[]` | Pin this client to named endpoint(s); spills to the full pool when none is healthy (incl. at paid overage). Names are startup-validated |
 | `proxy_key` | `String?` | `None` | **Legacy** shared secret. Mutually exclusive with `[[clients]]` |
@@ -301,7 +301,7 @@ Claude Code sends it as `x-api-key`; the proxy validates it and swaps in the rea
 > [!IMPORTANT]
 > With `[[clients]]` configured, **`x-client-id` and the `client_names` IP map are ignored entirely** — `client_id` comes from the verified credential. That is what makes per-client budgets, utilization ceilings, operator status, model allow-lists and response-cache tenancy enforceable rather than advisory: all five key on `client_id`.
 
-Keys are compared in constant time against the whole table. Startup rejects anything that would otherwise fail silently at runtime: duplicate names, duplicate keys, a name with stray whitespace, and any `client_budgets` / `client_utilization_limits` / `operators` / `admin_readers` / `[response_cache].clients` entry naming no configured client. That last class matters — an unknown client passes the budget and utilization checks, so a one-character typo would mean *unlimited* spend with no log line and no metric.
+Once started, the proxy holds client keys only as BLAKE2s-256 digests: a presented key is digested and looked up. A presented key shorter than 32 characters never matches. Names must match `^[a-z0-9][a-z0-9_-]{0,62}$`, and names starting with `_` are reserved for internal labels. Startup rejects anything that would otherwise fail silently at runtime: duplicate names, duplicate keys, a name with stray whitespace, and any `client_budgets` / `client_utilization_limits` / `operators` / `admin_readers` / `[response_cache].clients` entry naming no configured client. That last class matters — an unknown client passes the budget and utilization checks, so a one-character typo would mean *unlimited* spend with no log line and no metric.
 
 `[[clients]]` is also incompatible with `token = "passthrough"` endpoints, and that combination is rejected at startup. Passthrough forwards the caller's auth headers upstream untouched, but under `[[clients]]` those headers carry the caller's *proxy* credential — forwarding them would hand every client key to the upstream.
 
@@ -366,7 +366,7 @@ It **fails closed** on a model it cannot read. The proxy takes the model from th
 | **Caller-identity privacy** | `forward_caller_identity = false` | Caller IP and `x-client-id`/`x-agent-id`/`x-session-id` headers dropped before the upstream request | **stripped** |
 | **Model allow-list** | `clients[].models` | Rejects models outside a client's list (403) | all models |
 
-IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are compared in constant time, and startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`).
+IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are held and matched as digests. Startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`), and a presented credential that short never matches.
 
 **TLS terminates at the ingress.** The proxy speaks plain HTTP and its container port must never be published directly to the internet — put it behind a TLS-terminating load balancer or ingress, list that LB in `trusted_proxies`, and let the ingress carry the certificate. Bearer credentials without TLS are credentials in cleartext.
 

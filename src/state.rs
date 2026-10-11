@@ -613,13 +613,17 @@ pub(crate) struct AppState {
     /// exercise breaker re-entry without a 30s sleep.
     pub(crate) transport_cooldown: Duration,
     pub(crate) state_path: PathBuf,
-    /// Legacy single shared secret. Mutually exclusive with `clients`.
-    pub(crate) proxy_key: Option<String>,
-    /// Authenticated client registry (LAB-1083). Non-empty ⇒ every request
-    /// through an authenticated entry point carries a verified principal, and
-    /// `client_id` is that principal's name rather than a client-asserted
-    /// header. Empty ⇒ legacy `proxy_key` / open behaviour.
-    pub(crate) clients: Vec<ClientConfig>,
+    /// How callers authenticate, decided once at boot by `ClientPolicy::build`.
+    /// Under `Clients` every request through an authenticated entry point
+    /// carries a verified principal, and `client_id` is that principal's name
+    /// rather than a client-asserted header (LAB-1083).
+    pub(crate) auth_mode: AuthMode,
+    /// `key_digest` of each `[[clients]]` key → its principal. No plaintext
+    /// client key is held anywhere in this state.
+    pub(crate) principals: HashMap<[u8; 32], Principal>,
+    /// The `[[clients]]` entries, keys removed: per-name model allow-lists,
+    /// pins and guard policy. Empty unless `auth_mode` is `Clients`.
+    pub(crate) clients: Vec<ClientEntry>,
     /// LAB-3877: Tier 0 content guard — the compiled scanners plus their
     /// metrics. Built once at startup; scanned read-only per request. Present
     /// only under the `guard` feature.

@@ -693,11 +693,10 @@ async fn try_fallback_upstream_records_usage_and_budget() {
     budgets.insert("client-1".to_string(), 100u64);
     let mut ep = make_endpoint("gw", Protocol::OpenAI);
     ep.base_url = format!("http://{}", addr);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![ep],
-        client_budgets: budgets,
         ..test_state_base()
-    });
+    }));
 
     assert!(state.check_budget("client-1").await.is_ok());
 

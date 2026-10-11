@@ -12,11 +12,10 @@ async fn budget_check_no_limit_configured() {
 async fn budget_check_within_limit() {
     let mut budgets = HashMap::new();
     budgets.insert("client-a".to_string(), 1000u64);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: budgets,
         ..test_state_base()
-    });
+    }));
 
     // Within budget
     assert!(state.check_budget("client-a").await.is_ok());
@@ -42,11 +41,10 @@ async fn budget_check_enforces_through_poisoned_lock() {
     let mut budgets = HashMap::new();
     budgets.insert("client-a".to_string(), 1000u64);
     budgets.insert("client-b".to_string(), 1000u64);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: budgets,
         ..test_state_base()
-    });
+    }));
     // 2024-01-01T12:34:56Z: 41104s left in the UTC day. Frozen so the day key
     // record_budget_usage writes and check_budget reads cannot straddle midnight.
     let _clock = FrozenClock::at(1_704_112_496);
@@ -75,11 +73,10 @@ async fn budget_check_enforces_through_poisoned_lock() {
 async fn budget_record_counts_through_poisoned_lock() {
     let mut budgets = HashMap::new();
     budgets.insert("client-a".to_string(), 1000u64);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: budgets,
         ..test_state_base()
-    });
+    }));
     poison(&state.budget_usage);
     state.record_budget_usage("client-a", 1500).await;
     assert!(state.check_budget("client-a").await.is_err());
@@ -118,11 +115,10 @@ async fn model_denied_counter_survives_poisoned_lock() {
 async fn budget_readers_report_usage_through_poisoned_lock() {
     let mut budgets = HashMap::new();
     budgets.insert("client-a".to_string(), 1000u64);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: budgets,
         ..test_state_base()
-    });
+    }));
     state.record_budget_usage("client-a", 400).await;
     let addr = serve(build_router(state.clone())).await;
     let c = reqwest::Client::new();
@@ -162,11 +158,10 @@ async fn budget_readers_report_usage_through_poisoned_lock() {
 async fn budget_day_rollover_resets_counter() {
     let mut budgets = HashMap::new();
     budgets.insert("client-a".to_string(), 10000u64);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: budgets,
         ..test_state_base()
-    });
+    }));
 
     // Pre-populate with yesterday's usage (high usage that would exceed budget)
     let yesterday = AppState::now_epoch() / 86400 - 1;
@@ -189,11 +184,10 @@ async fn budget_day_rollover_resets_counter() {
 async fn budget_check_respects_day_boundary() {
     let mut budgets = HashMap::new();
     budgets.insert("client-a".to_string(), 1000u64);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: budgets,
         ..test_state_base()
-    });
+    }));
 
     // Pre-populate with yesterday's exhausted budget
     let yesterday = AppState::now_epoch() / 86400 - 1;

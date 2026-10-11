@@ -398,13 +398,16 @@ async fn pick_endpoint_openai_is_last_resort() {
 
 #[test]
 fn is_operator_checks_configured_operator() {
-    let state = Arc::new(AppState {
-        client: Client::new(),
-        client_nonstreaming: Client::new(),
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        operators: vec!["special-operator".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .operators(&["special-operator"])
+            .install(AppState {
+                client: Client::new(),
+                client_nonstreaming: Client::new(),
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
 
     assert!(state.is_operator("special-operator"));
     assert!(!state.is_operator("regular-client"));
@@ -418,17 +421,16 @@ fn is_operator_returns_false_when_no_operator_configured() {
 
 #[test]
 fn is_operator_supports_multiple_operators() {
-    let state = Arc::new(AppState {
-        client: Client::new(),
-        client_nonstreaming: Client::new(),
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        operators: vec![
-            "ray".to_string(),
-            "openclaw".to_string(),
-            "claude".to_string(),
-        ],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .operators(&["ray", "openclaw", "claude"])
+            .install(AppState {
+                client: Client::new(),
+                client_nonstreaming: Client::new(),
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
     assert!(state.is_operator("ray"));
     assert!(state.is_operator("openclaw"));
     assert!(state.is_operator("claude"));

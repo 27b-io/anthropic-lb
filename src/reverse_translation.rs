@@ -1500,7 +1500,7 @@ pub(crate) async fn openai_chat_handler(
     );
 
     // Extract client identification headers
-    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers, principal);
+    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers, principal.as_ref());
     let affinity_key = rctx.affinity_key(&client_ip, None);
     let affinity = affinity_key.as_deref();
     let RequestContext {

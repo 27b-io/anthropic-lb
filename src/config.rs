@@ -83,7 +83,7 @@ pub(crate) struct Config {
     /// reading it. This splits the read bit out.
     ///
     /// Only meaningful under `[[clients]]`, where identity is credential-derived:
-    /// `validate_clients` rejects the key on the legacy path rather than let it
+    /// `ClientPolicy::build` rejects the key on the legacy path rather than let it
     /// pretend to scope a shared secret it cannot scope.
     #[serde(default)]
     pub(crate) admin_readers: Vec<String>,
@@ -160,8 +160,9 @@ pub(crate) struct ClientConfig {
     /// `[response_cache].clients` must name.
     pub(crate) name: String,
     /// Shared secret this client presents as `x-api-key` (or, on the
-    /// OpenAI-compat surface, `Authorization: Bearer`). Compared in constant
-    /// time against the whole table.
+    /// OpenAI-compat surface, `Authorization: Bearer`). Read only by
+    /// `ClientPolicy::build`, which keeps its digest (`key_digest`) and nothing
+    /// else.
     pub(crate) key: String,
     /// Models this client may request. Empty = all models, mirroring
     /// `EndpointConfig.models` semantics. Same exact + `*`-suffix matcher.

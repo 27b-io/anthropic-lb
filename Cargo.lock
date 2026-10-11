@@ -120,7 +120,6 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
- "subtle",
  "tempfile",
  "tokio",
  "tokio-stream",

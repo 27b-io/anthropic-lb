@@ -1015,7 +1015,7 @@ async fn openai_chat_rejects_missing_auth() {
     });
 
     let mock_url = format!("http://{}", mock_addr);
-    let (app, _state) = test_openai_app(&mock_url, Some("secret-key".to_string()));
+    let (app, _state) = test_openai_app(&mock_url, Some(test_key("secret-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1050,7 +1050,7 @@ async fn openai_chat_accepts_bearer_capitalized() {
     });
 
     let mock_url = format!("http://{}", mock_addr);
-    let (app, _state) = test_openai_app(&mock_url, Some("secret-key".to_string()));
+    let (app, _state) = test_openai_app(&mock_url, Some(test_key("secret-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1067,7 +1067,10 @@ async fn openai_chat_accepts_bearer_capitalized() {
     let resp = client
         .post(format!("http://{}/v1/chat/completions", addr))
         .header("content-type", "application/json")
-        .header("authorization", "Bearer secret-key")
+        .header(
+            "authorization",
+            format!("Bearer {}", test_key("secret-key")),
+        )
         .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
         .send()
         .await
@@ -1086,7 +1089,7 @@ async fn openai_chat_accepts_bearer_lowercase() {
     });
 
     let mock_url = format!("http://{}", mock_addr);
-    let (app, _state) = test_openai_app(&mock_url, Some("secret-key".to_string()));
+    let (app, _state) = test_openai_app(&mock_url, Some(test_key("secret-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1103,7 +1106,10 @@ async fn openai_chat_accepts_bearer_lowercase() {
     let resp = client
         .post(format!("http://{}/v1/chat/completions", addr))
         .header("content-type", "application/json")
-        .header("authorization", "bearer secret-key")
+        .header(
+            "authorization",
+            format!("bearer {}", test_key("secret-key")),
+        )
         .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
         .send()
         .await
@@ -1122,7 +1128,7 @@ async fn openai_chat_wrong_apikey_valid_bearer() {
     });
 
     let mock_url = format!("http://{}", mock_addr);
-    let (app, _state) = test_openai_app(&mock_url, Some("secret-key".to_string()));
+    let (app, _state) = test_openai_app(&mock_url, Some(test_key("secret-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1136,17 +1142,25 @@ async fn openai_chat_wrong_apikey_valid_bearer() {
     });
 
     let client = Client::new();
-    let resp = client
-        .post(format!("http://{}/v1/chat/completions", addr))
-        .header("content-type", "application/json")
-        .header("x-api-key", "wrong-key")
-        .header("authorization", "Bearer secret-key")
-        .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
-        .send()
-        .await
-        .unwrap();
+    // A wrong key long enough to be compared, and one too short to be any key
+    // at all: either way the Bearer beside it still authenticates, because
+    // each credential is judged on its own.
+    for wrong in [test_key("wrong-key"), "wrong-key".to_string()] {
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", &wrong)
+            .header(
+                "authorization",
+                format!("Bearer {}", test_key("secret-key")),
+            )
+            .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
+            .send()
+            .await
+            .unwrap();
 
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{wrong}");
+    }
 }
 
 /// LAB-4323: a valid-JSON non-object body reads as `model = ""`, which every
@@ -1162,16 +1176,18 @@ async fn openai_chat_rejects_non_object_json_body_locally() {
     let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
     gw.base_url = url.clone();
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api-test-aaa", &url), gw],
-        clients: vec![
-            mk_client("plain", "key-plain", &[]),
-            mk_client("limited", "key-limited", &["claude-haiku-*"]),
-            mk_client("ops", "key-ops", &[]),
-        ],
-        operators: vec!["ops".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![
+            mk_client("plain", &test_key("key-plain"), &[]),
+            mk_client("limited", &test_key("key-limited"), &["claude-haiku-*"]),
+            mk_client("ops", &test_key("key-ops"), &[]),
+        ])
+        .operators(&["ops"])
+        .install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", "sk-ant-api-test-aaa", &url), gw],
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state)).await;
     let client = Client::new();
     let expected = openai_invalid_request_body("request body must be a JSON object");
@@ -1181,7 +1197,7 @@ async fn openai_chat_rejects_non_object_json_body_locally() {
             let resp = client
                 .post(format!("http://{addr}/v1/chat/completions"))
                 .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {key}"))
+                .header("authorization", format!("Bearer {}", test_key(key)))
                 .body(raw)
                 .send()
                 .await
@@ -1199,7 +1215,7 @@ async fn openai_chat_rejects_non_object_json_body_locally() {
             let resp = client
                 .post(format!("http://{addr}/v1/messages"))
                 .header("content-type", "application/json")
-                .header("x-api-key", key)
+                .header("x-api-key", test_key(key))
                 .body(raw)
                 .send()
                 .await
@@ -1240,16 +1256,18 @@ async fn ambiguous_top_level_key_is_rejected_locally_on_both_surfaces() {
     let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
     gw.base_url = url.clone();
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api-test-aaa", &url), gw],
-        clients: vec![
-            mk_client("plain", "key-plain", &[]),
-            mk_client("limited", "key-limited", &["claude-haiku-*"]),
-            mk_client("ops", "key-ops", &[]),
-        ],
-        operators: vec!["ops".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![
+            mk_client("plain", &test_key("key-plain"), &[]),
+            mk_client("limited", &test_key("key-limited"), &["claude-haiku-*"]),
+            mk_client("ops", &test_key("key-ops"), &[]),
+        ])
+        .operators(&["ops"])
+        .install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", "sk-ant-api-test-aaa", &url), gw],
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state)).await;
     let client = Client::new();
     let message = "request body has an ambiguous top-level key";
@@ -1259,7 +1277,7 @@ async fn ambiguous_top_level_key_is_rejected_locally_on_both_surfaces() {
             let resp = client
                 .post(format!("http://{addr}/v1/messages"))
                 .header("content-type", "application/json")
-                .header("x-api-key", key)
+                .header("x-api-key", test_key(key))
                 .body(raw)
                 .send()
                 .await
@@ -1281,7 +1299,7 @@ async fn ambiguous_top_level_key_is_rejected_locally_on_both_surfaces() {
             let resp = client
                 .post(format!("http://{addr}/v1/chat/completions"))
                 .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {key}"))
+                .header("authorization", format!("Bearer {}", test_key(key)))
                 .body(raw)
                 .send()
                 .await
@@ -1321,16 +1339,18 @@ async fn non_string_or_comma_model_never_reaches_a_restricted_openai_endpoint() 
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
     gw.base_url = url;
     gw.models = vec!["claude-haiku-*".to_string()];
-    let state = Arc::new(AppState {
-        endpoints: vec![gw],
-        clients: vec![
-            mk_client("plain", "key-plain", &[]),
-            mk_client("limited", "key-limited", &["claude-haiku-*"]),
-            mk_client("ops", "key-ops", &[]),
-        ],
-        operators: vec!["ops".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![
+            mk_client("plain", &test_key("key-plain"), &[]),
+            mk_client("limited", &test_key("key-limited"), &["claude-haiku-*"]),
+            mk_client("ops", &test_key("key-ops"), &[]),
+        ])
+        .operators(&["ops"])
+        .install(AppState {
+            endpoints: vec![gw],
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state)).await;
     let client = Client::new();
     let body = |model: &str| {
@@ -1350,7 +1370,7 @@ async fn non_string_or_comma_model_never_reaches_a_restricted_openai_endpoint() 
             let resp = client
                 .post(format!("http://{addr}/v1/chat/completions"))
                 .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {key}"))
+                .header("authorization", format!("Bearer {}", test_key(key)))
                 .body(body(model))
                 .send()
                 .await
@@ -1370,7 +1390,7 @@ async fn non_string_or_comma_model_never_reaches_a_restricted_openai_endpoint() 
             let resp = client
                 .post(format!("http://{addr}/v1/messages"))
                 .header("content-type", "application/json")
-                .header("x-api-key", key)
+                .header("x-api-key", test_key(key))
                 .body(body(model))
                 .send()
                 .await
@@ -1398,9 +1418,9 @@ async fn non_string_or_comma_model_never_reaches_a_restricted_openai_endpoint() 
             (
                 "/v1/chat/completions",
                 "authorization",
-                format!("Bearer {key}"),
+                format!("Bearer {}", test_key(key)),
             ),
-            ("/v1/messages", "x-api-key", key.to_string()),
+            ("/v1/messages", "x-api-key", test_key(key)),
         ] {
             let resp = client
                 .post(format!("http://{addr}{path}"))
@@ -1527,14 +1547,16 @@ async fn restricted_openai_endpoint_never_receives_fallback_fields() {
         let mut gw = make_endpoint("gw", Protocol::OpenAI);
         gw.base_url = url;
         gw.models = endpoint_models.iter().map(|m| m.to_string()).collect();
-        let state = Arc::new(AppState {
-            endpoints: vec![gw],
-            clients: vec![
-                mk_client("plain", "key-plain", &[]),
-                mk_client("limited", "key-limited", &["gpt-x*"]),
-            ],
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::clients(vec![
+                mk_client("plain", &test_key("key-plain"), &[]),
+                mk_client("limited", &test_key("key-limited"), &["gpt-x*"]),
+            ])
+            .install(AppState {
+                endpoints: vec![gw],
+                ..test_state_base()
+            }),
+        );
         let addr = serve(build_router(state)).await;
         let client = Client::new();
 
@@ -1544,7 +1566,7 @@ async fn restricted_openai_endpoint_never_receives_fallback_fields() {
                 let resp = client
                     .post(format!("http://{addr}/v1/chat/completions"))
                     .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {key}"))
+                    .header("authorization", format!("Bearer {}", test_key(key)))
                     .body(raw.clone())
                     .send()
                     .await
