@@ -332,18 +332,15 @@ fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// A TOML syntax error as `line:column` plus toml's short message. toml's own
-/// Display quotes the source line, which can hold a key or token.
-fn syntax_error(raw: &str, e: &toml::de::Error) -> String {
-    let Some(before) = e.span().and_then(|s| raw.get(..s.start)) else {
-        return format!("config parse error: {}", e.message());
+/// `config parse error`, plus `at line L, column C` when `span` places it in
+/// `raw`. The column counts characters, as toml's own report does.
+fn parse_error_at(raw: &str, span: Option<std::ops::Range<usize>>) -> String {
+    let Some(before) = span.and_then(|s| raw.get(..s.start)) else {
+        return "config parse error".to_string();
     };
     let line = before.matches('\n').count() + 1;
-    let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
-    format!(
-        "config parse error at line {line}, column {column}: {}",
-        e.message()
-    )
+    let column = before.chars().rev().take_while(|&c| c != '\n').count() + 1;
+    format!("config parse error at line {line}, column {column}")
 }
 
 /// The whole startup parse-and-validate sequence, in boot order. `main()` calls
@@ -352,13 +349,20 @@ fn syntax_error(raw: &str, e: &toml::de::Error) -> String {
 /// `main()` panics with. Returns the client policy alongside the config, built
 /// by the one function that checks every per-client rule.
 fn load_config(raw: &str) -> Result<(Config, AuthMode, ClientPolicy), String> {
-    let raw_value: toml::Value = toml::from_str(raw).map_err(|e| syntax_error(raw, &e))?;
+    // toml's Display quotes the source line, which can hold a key or token, so
+    // a syntax error reports only its position and toml's short message.
+    let raw_value: toml::Value = toml::from_str(raw)
+        .map_err(|e| format!("{}: {}", parse_error_at(raw, e.span()), e.message()))?;
     reject_legacy_config_keys(&raw_value)?;
-    // serde's message carries the offending value, which can be a key or token.
-    let config: Config = raw_value.try_into().map_err(|_| {
-        "config parse error: a field has the wrong type, an unknown value or is missing \
-         (the value is not echoed, as it may be a secret)"
-            .to_string()
+    // Deserialised from `raw`, not `raw_value`, so the error keeps its span.
+    // serde's message carries the offending value, so it is never echoed. A
+    // missing field points at its enclosing table; an empty span points nowhere.
+    let config: Config = toml::from_str(raw).map_err(|e| {
+        let at = parse_error_at(raw, e.span().filter(|s| !s.is_empty()));
+        format!(
+            "{at}: a field has the wrong type, an unknown value or is missing \
+             (the value is not echoed, as it may be a secret)"
+        )
     })?;
     validate_endpoints(&config.endpoints)?;
     let (auth_mode, client_policy) = ClientPolicy::build(&config)?;

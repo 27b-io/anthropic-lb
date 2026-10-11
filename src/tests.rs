@@ -487,4 +487,8 @@ fn load_config_type_error_does_not_echo_the_value() {
         Err(e) => e,
     };
     assert_no_secret_fragment(&err, STRONG_KEY);
+    assert!(
+        err.contains("line 2, column "),
+        "expected the line and column: {err}"
+    );
 }
