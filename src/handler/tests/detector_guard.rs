@@ -14,8 +14,8 @@ struct Rig {
     mock: MockDetector,
 }
 
-/// A proxy with one client per policy (`off-key`, `annotate-key`,
-/// `block-key`) and a detector pointed at a fresh mock.
+/// A proxy with one client per policy (keyed `test_key` of `off-key`,
+/// `annotate-key` and `block-key`) and a detector pointed at a fresh mock.
 async fn rig(tweak: impl FnOnce(&mut guard::detector::DetectorConfig)) -> Rig {
     let (upstream, upstream_body) = spawn_guard_body_upstream().await;
     let mock = spawn_mock_detector().await;
@@ -25,27 +25,29 @@ async fn rig(tweak: impl FnOnce(&mut guard::detector::DetectorConfig)) -> Rig {
     tweak(&mut cfg);
     let client = |name: &str, policy| ClientConfig {
         guard: policy,
-        ..mk_client(name, &format!("{name}-key"), &[])
+        ..mk_client(name, &test_key(&format!("{name}-key")), &[])
     };
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![
+    let state = Arc::new(
+        TestPolicy::clients(vec![
             client("off", GuardPolicy::Off),
             client("annotate", GuardPolicy::Annotate),
             client("block", GuardPolicy::Block),
-            mk_client("ops", "ops-key", &[]),
-        ],
-        operators: vec!["ops".to_string()],
-        state_path: PathBuf::from(format!(
-            "/tmp/anthropic-lb-detector-{}.state.json",
-            mock.url.rsplit(':').next().unwrap()
-        )),
-        auto_cache: false,
-        guard: guard::Guard::with_detector(Some(
-            Detector::new("pg2", &cfg).expect("detector config"),
-        )),
-        ..test_state_base()
-    });
+            mk_client("ops", &test_key("ops-key"), &[]),
+        ])
+        .operators(&["ops"])
+        .install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from(format!(
+                "/tmp/anthropic-lb-detector-{}.state.json",
+                mock.url.rsplit(':').next().unwrap()
+            )),
+            auto_cache: false,
+            guard: guard::Guard::with_detector(Some(
+                Detector::new("pg2", &cfg).expect("detector config"),
+            )),
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state.clone())).await;
     Rig {
         addr,
@@ -67,11 +69,12 @@ fn body(text: &str) -> Vec<u8> {
     .unwrap()
 }
 
+/// Send `bytes` as the client keyed `test_key(key)`.
 async fn send(rig: &Rig, key: &str, bytes: Vec<u8>) -> reqwest::Response {
     Client::new()
         .post(format!("http://{}/v1/messages", rig.addr))
         .header("content-type", "application/json")
-        .header("x-api-key", key)
+        .header("x-api-key", test_key(key))
         .body(bytes)
         .send()
         .await
@@ -254,7 +257,7 @@ async fn detector_metrics_are_exported() {
     send(&rig, "block-key", body("again")).await;
     let text = Client::new()
         .get(format!("http://{}/metrics", rig.addr))
-        .header("x-api-key", "ops-key")
+        .header("x-api-key", test_key("ops-key"))
         .send()
         .await
         .unwrap()

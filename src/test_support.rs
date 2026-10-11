@@ -141,7 +141,9 @@ pub(crate) fn test_state_base() -> AppState {
         cooldown: Duration::from_secs(60),
         transport_cooldown: TRANSPORT_UNHEALTHY_COOLDOWN,
         state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-        proxy_key: None,
+        // `TestPolicy::open()`'s posture: install a `TestPolicy` for any other.
+        auth_mode: AuthMode::Open,
+        principals: HashMap::new(),
         clients: vec![],
         #[cfg(feature = "guard")]
         guard: crate::guard::Guard::empty(),
@@ -315,12 +317,11 @@ fn test_app_with_strategy(
     acct_b.base_url = upstream_url.to_string();
     let endpoints = vec![acct_a, acct_b];
 
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::shared_key_or_open(proxy_key).install(AppState {
         endpoints,
         routing_strategy,
-        proxy_key,
         ..test_state_base()
-    });
+    }));
 
     (build_router(state.clone()), state)
 }
@@ -453,12 +454,11 @@ pub(crate) fn test_openai_app(
     acct_b.base_url = upstream_url.to_string();
     let accounts = vec![acct_a, acct_b];
 
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::shared_key_or_open(proxy_key).install(AppState {
         endpoints: accounts,
         state_path: PathBuf::from("/tmp/anthropic-lb-openai-test.state.json"),
-        proxy_key,
         ..test_state_base()
-    });
+    }));
 
     let app = Router::new()
         .route(
@@ -800,6 +800,8 @@ pub(crate) const PROMPT_TOO_LONG_BODY: &[u8] = br#"{"type":"error","error":{"typ
 // mostly prove one thing from several angles — that `client_id` cannot be
 // asserted by the caller once a client table exists.
 
+/// A `[[clients]]` entry. `key` is stored as given, so pass a `test_key`: the
+/// build refuses anything shorter than `MIN_KEY_LEN`.
 pub(crate) fn mk_client(name: &str, key: &str, models: &[&str]) -> ClientConfig {
     ClientConfig {
         name: name.to_string(),
@@ -812,10 +814,121 @@ pub(crate) fn mk_client(name: &str, key: &str, models: &[&str]) -> ClientConfig 
 }
 
 pub(crate) fn state_with_clients(clients: Vec<ClientConfig>) -> Arc<AppState> {
-    Arc::new(AppState {
+    Arc::new(TestPolicy::clients(clients).install(test_state_base()))
+}
+
+/// A test credential: `tag` plus a fixed 32-character suffix, so it clears
+/// `MIN_KEY_LEN` whatever the tag. A test configures `test_key(tag)` and
+/// presents `test_key(tag)`. A near miss must be derived from the whole key:
+/// `test_key` of a near-miss tag differs in the tag only.
+pub(crate) fn test_key(tag: &str) -> String {
+    format!("{tag}-0123456789abcdef0123456789abcdef")
+}
+
+/// The per-client half of a test state, built by `ClientPolicy::build` — the
+/// checks a real boot runs — so a fixture holds nothing a config could not.
+/// Pick the auth mode, add the name-keyed policy, then `install` it.
+pub(crate) struct TestPolicy(Config);
+
+impl TestPolicy {
+    /// No credential: `allow_unauthenticated = true`, as `test_state_base()`.
+    pub(crate) fn open() -> Self {
+        Self(cfg("allow_unauthenticated = true\n"))
+    }
+
+    /// The legacy shared `proxy_key`.
+    pub(crate) fn shared_key(key: &str) -> Self {
+        let mut config = cfg("");
+        config.proxy_key = Some(key.to_string());
+        Self(config)
+    }
+
+    /// `shared_key` when given one, else `open`: the fixtures that take an
+    /// optional proxy key.
+    pub(crate) fn shared_key_or_open(proxy_key: Option<String>) -> Self {
+        proxy_key.map_or_else(Self::open, |key| Self::shared_key(&key))
+    }
+
+    /// `[[clients]]`.
+    pub(crate) fn clients(clients: Vec<ClientConfig>) -> Self {
+        let mut config = cfg("");
+        config.clients = clients;
+        Self(config)
+    }
+
+    pub(crate) fn operators(mut self, names: &[&str]) -> Self {
+        self.0.operators = names.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub(crate) fn admin_readers(mut self, names: &[&str]) -> Self {
+        self.0.admin_readers = names.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub(crate) fn budgets(mut self, budgets: HashMap<String, u64>) -> Self {
+        self.0.client_budgets = budgets;
+        self
+    }
+
+    pub(crate) fn utilization_limits(mut self, limits: HashMap<String, f64>) -> Self {
+        self.0.client_utilization_limits = limits;
+        self
+    }
+
+    /// Build, then install into `state`. `state.endpoints` stand in for
+    /// `[[endpoints]]`, which the build checks pins and `passthrough` against.
+    /// Panics with the boot error when the build refuses.
+    pub(crate) fn install(mut self, state: AppState) -> AppState {
+        self.0.endpoints = state.endpoints.iter().map(endpoint_config).collect();
+        let (auth_mode, policy) = ClientPolicy::build(&self.0)
+            .unwrap_or_else(|e| panic!("test client policy refused at build: {e}"));
+        install_policy(state, auth_mode, policy)
+    }
+
+    /// Install with no check at all, for the tests that pin how the runtime
+    /// behaves in a state a boot refuses.
+    pub(crate) fn install_unchecked(self, state: AppState) -> AppState {
+        let (auth_mode, policy) = ClientPolicy::unchecked(&self.0);
+        install_policy(state, auth_mode, policy)
+    }
+}
+
+/// The `[[endpoints]]` entry `ep` would have been loaded from, for the build's
+/// endpoint cross-checks.
+fn endpoint_config(ep: &Endpoint) -> EndpointConfig {
+    EndpointConfig {
+        name: ep.name.clone(),
+        protocol: ep.protocol,
+        base_url: Some(ep.base_url.clone()),
+        token: ep.token.clone(),
+        models: ep.models.clone(),
+        priority: ep.priority,
+        fable_included: Some(ep.fable_included),
+        allow_nonstandard_host: None,
+    }
+}
+
+/// Move a built policy into `state`'s per-client fields, as `main()` does.
+fn install_policy(state: AppState, auth_mode: AuthMode, policy: ClientPolicy) -> AppState {
+    let ClientPolicy {
+        principals,
         clients,
-        ..test_state_base()
-    })
+        client_budgets,
+        client_utilization_limits,
+        operators,
+        admin_readers,
+    } = policy;
+    AppState {
+        auth_mode,
+        principals,
+        clients,
+        client_budgets,
+        client_utilization_limits,
+        operators,
+        admin_readers,
+        ..state
+    }
 }
 
 pub(crate) fn hdrs(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
@@ -912,6 +1025,10 @@ pub(crate) fn openai_invalid_request_body(message: &str) -> serde_json::Value {
         }
     })
 }
+
+/// 64-hex — what `openssl rand -hex 32` emits, and the documented floor.
+pub(crate) const STRONG_KEY: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 pub(crate) const TEST_IP: &str = "10.0.0.7";
 

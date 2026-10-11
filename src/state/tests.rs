@@ -746,11 +746,10 @@ fn pressure_status_emergency() {
 
 #[test]
 fn pressure_status_operator_always_healthy() {
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().operators(&["ray"]).install(AppState {
         state_path: PathBuf::from("/tmp/test.state.json"),
-        operators: vec!["ray".to_string()],
         ..test_state_base()
-    });
+    }));
     // Operator always gets "healthy" regardless of utilization
     assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
     assert_eq!(compute_pressure_status(1.0, "ray", &state), "healthy");
@@ -762,11 +761,14 @@ fn pressure_status_operator_always_healthy() {
 fn pressure_status_upgrade_near_client_limit() {
     let mut limits = HashMap::new();
     limits.insert("gastown".to_string(), 0.85);
-    let state = Arc::new(AppState {
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        client_utilization_limits: limits,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .utilization_limits(limits)
+            .install(AppState {
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
     // gastown has limit 0.85, 80% of that = 0.68
     // At 0.60, below 0.68 → no upgrade → "healthy"
     assert_eq!(compute_pressure_status(0.60, "gastown", &state), "healthy");
@@ -780,13 +782,16 @@ fn pressure_status_upgrade_near_client_limit() {
 
 #[test]
 fn compute_pressure_status_operator_always_healthy() {
-    let state = Arc::new(AppState {
-        client: Client::new(),
-        client_nonstreaming: Client::new(),
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        operators: vec!["operator-id".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .operators(&["operator-id"])
+            .install(AppState {
+                client: Client::new(),
+                client_nonstreaming: Client::new(),
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
 
     let status = compute_pressure_status(0.99, "operator-id", &state);
     assert_eq!(
@@ -809,13 +814,16 @@ fn compute_pressure_status_thresholds() {
 fn compute_pressure_status_limit_proximity_upgrade() {
     let mut limits = HashMap::new();
     limits.insert("client".to_string(), 0.80);
-    let state = Arc::new(AppState {
-        client: Client::new(),
-        client_nonstreaming: Client::new(),
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        client_utilization_limits: limits,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .utilization_limits(limits)
+            .install(AppState {
+                client: Client::new(),
+                client_nonstreaming: Client::new(),
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
 
     // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
     let status = compute_pressure_status(0.65, "client", &state);

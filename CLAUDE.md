@@ -99,6 +99,7 @@ Some module names are older than their contents; this is the map.
 | File | Holds |
 |------|-------|
 | `src/config.rs` | TOML config structs (`Config`, `ClientConfig`, `EndpointConfig`, `Protocol`, `RoutingStrategy`) |
+| `src/client_policy.rs` | `ClientPolicy::build`, the one builder of every per-client rule (called from `load_config`): `AuthMode`, `Principal` / `Role`, `key_digest` and the digest → principal table, the client name rule |
 | `src/state.rs` | `AppState`, `Endpoint`, `RateLimitInfo`: shared via `Arc<AppState>`, per-endpoint `RwLock<RateLimitInfo>`, atomic counters, optional fred `RedisClient` (auto-reconnecting). Also EWMA / burn rate, label bounding, request-body admission, affinity hashing and content fingerprints |
 | `src/response_cache.rs` | The encrypted response cache (`ResponseCache`) **and** the admission surface: IP allow-list, failed-auth throttle, `authenticate`, `authorize_admin`, `resolve_client_ip` / `resolve_client_id`, client model allow-lists, the guard hook |
 | `src/persistence.rs` | JSON state file at `<config_path>.state.json`, saved after every request and on shutdown; probes. Its tests hold the Redis coordination suites, including `src/persistence/tests/real_redis.rs` |
@@ -178,8 +179,8 @@ Routing consequences (`constraining_7d_claims`):
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `listen` | string | required | Bind address (e.g. `"0.0.0.0:8080"`) |
-| `clients[].name` | string | required | Identity the credential resolves to — becomes `client_id`, overriding `x-client-id` and `client_names` entirely |
-| `clients[].key` | string | required | Per-client secret (`x-api-key`; also `Authorization: Bearer` on `/v1/chat/completions`). Constant-time compared |
+| `clients[].name` | string | required | Identity the credential resolves to — becomes `client_id`, overriding `x-client-id` and `client_names` entirely. Must match `^[a-z0-9][a-z0-9_-]{0,62}$`; a leading `_` is reserved for internal labels |
+| `clients[].key` | string | required | Per-client secret (`x-api-key`; also `Authorization: Bearer` on `/v1/chat/completions`). Held and matched only as a BLAKE2s-256 digest (`key_digest`); a presented key shorter than `MIN_KEY_LEN` never matches |
 | `clients[].models` | string[]? | [] (all) | Models this client may request; same exact + `*`-suffix matcher as `endpoints[].models`. Violation = 403 |
 | `clients[].preferred_endpoints` | string[]? | [] (no pin) | Endpoint names this client is pinned to (LAB-2636/#151). While ≥1 is healthy (serves the model, not hard-limited/transport-unhealthy, `gate < soft_limit`, not overage/Fable-paid demoted), routing restricts to this set; otherwise the request spills to the full pool. Entries must name configured endpoints (startup-validated). Per-request serving logs (`proxied`, `proxied (openai-compat)`, `fallback: routing to unified OpenAI endpoint`) carry `pin=pinned\|spilled\|-` |
 | `proxy_key` | string? | none | **Legacy** single shared secret for `x-api-key` auth. Mutually exclusive with `[[clients]]` — configuring both is rejected at startup |
@@ -236,3 +237,5 @@ Routing consequences (`constraining_7d_claims`):
 Tests use a `spawn_mock_upstream()` helper that starts a real TCP listener returning canned Anthropic-style responses with rate-limit headers. Integration tests bind to `127.0.0.1:0` (random port) and make real HTTP requests through the full axum router with `ConnectInfo<SocketAddr>`.
 
 `test_state_with()` and `test_app()` are the two test fixture builders — the former for unit tests (no HTTP), the latter for integration tests (full router + mock upstream). `test_openai_app()` builds a minimal router for OpenAI-compat handler tests.
+
+Per-client state (`[[clients]]`, `proxy_key`, `operators`, `admin_readers`, budgets, utilization limits) is never set on `AppState` by hand: build it with `TestPolicy` and `install` it, which runs the real `ClientPolicy::build`, so a fixture holds nothing a boot would refuse. Keys must clear `MIN_KEY_LEN`: configure and present `test_key(tag)`. `install_unchecked` exists only for tests that pin runtime behaviour in a state the build refuses.

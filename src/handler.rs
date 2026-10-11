@@ -1747,7 +1747,7 @@ pub(crate) async fn proxy_handler(
     );
 
     // Extract client identification headers
-    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers, principal);
+    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers, principal.as_ref());
     let RequestContext {
         client_id,
         client_ver,

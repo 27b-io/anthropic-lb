@@ -253,14 +253,14 @@ impl ResponseCache {
         ttl: Duration,
         op_timeout: Duration,
     ) -> Result<Self, String> {
+        // `ClientPolicy::build` refuses the unknown-client sentinel here: as a
+        // tenant it would opt in every unidentified caller.
+        debug_assert!(
+            !clients.iter().any(|c| c == "-"),
+            "response_cache.clients reached the cache with \"-\""
+        );
         let mut map = HashMap::new();
         for client_id in clients {
-            if client_id == "-" {
-                return Err(
-                    "response_cache.clients cannot contain \"-\" (the unknown-client sentinel — it would opt in every unidentified caller)"
-                        .into(),
-                );
-            }
             // The builder's default_ttl is the SINGLE source of entry
             // lifetime — writes use plain `set()` so the two can't drift.
             let ck = cachekit::CacheKit::builder()
@@ -637,9 +637,9 @@ impl AppState {
 
     /// Authenticate a request's credential (LAB-1083).
     ///
-    /// Returns the authenticated principal when `[[clients]]` is configured,
-    /// `None` when it is not (legacy `proxy_key`, or an open proxy), and a 401
-    /// `Response` when a configured credential does not match.
+    /// Returns the authenticated principal under `AuthMode::Clients`, `None`
+    /// under the legacy shared key or an open proxy, and a 401 `Response` when
+    /// a required credential does not match.
     ///
     /// `allow_bearer` additionally accepts `Authorization: Bearer` — set only
     /// on the OpenAI-compat surface, whose SDKs send nothing else. It is NOT
@@ -647,11 +647,16 @@ impl AppState {
     /// carry the caller's own upstream token in `passthrough` mode; widening
     /// acceptance there would be a gratuitous auth surface on a ticket whose
     /// whole purpose is to narrow one.
+    ///
+    /// A presented credential shorter than `MIN_KEY_LEN` never matches, so no
+    /// weak key can authenticate whatever the table holds. The test is per
+    /// credential, not per request: a junk `x-api-key` next to a valid Bearer
+    /// still authenticates on the OpenAI-compat surface.
     pub(crate) fn authenticate(
         &self,
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
-    ) -> Result<Option<&ClientConfig>, Box<Response>> {
+    ) -> Result<Option<Principal>, Box<Response>> {
         // Boxed Err, matching `reserve_request_body` — an inline `Response` is
         // 128+ bytes on the hot success path (clippy::result_large_err).
         let unauthorized = || -> Box<Response> {
@@ -678,28 +683,29 @@ impl AppState {
             None
         };
 
-        if !self.clients.is_empty() {
-            for presented in [from_header, from_bearer].into_iter().flatten() {
-                if let Some(c) = self.match_client(presented) {
-                    return Ok(Some(c));
+        let mut presented = [from_header, from_bearer]
+            .into_iter()
+            .flatten()
+            .filter(|p| p.len() >= MIN_KEY_LEN);
+
+        // Matched as digests (`key_digest` says why timing cannot leak a key).
+        match &self.auth_mode {
+            AuthMode::Clients => presented
+                .find_map(|p| self.principals.get(&key_digest(p)))
+                .cloned()
+                .map(Some)
+                .ok_or_else(unauthorized),
+            // Legacy: one shared secret, no principal. The same accept/reject
+            // decision as before LAB-1083, on digests now.
+            AuthMode::SharedKey(digest) => {
+                if presented.any(|p| key_digest(p) == *digest) {
+                    Ok(None)
+                } else {
+                    Err(unauthorized())
                 }
             }
-            return Err(unauthorized());
+            AuthMode::Open => Ok(None),
         }
-
-        // Legacy: one shared secret, no principal. Byte-for-byte the same
-        // accept/reject decision as before LAB-1083 — only the comparison
-        // primitive changed (audit finding 4).
-        if let Some(ref key) = self.proxy_key {
-            let ok = [from_header, from_bearer]
-                .into_iter()
-                .flatten()
-                .any(|p| bool::from(key.as_bytes().ct_eq(p.as_bytes())));
-            if !ok {
-                return Err(unauthorized());
-            }
-        }
-        Ok(None)
     }
 
     /// Authenticate, then throttle failed credentials (LAB-1193).
@@ -735,7 +741,7 @@ impl AppState {
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
         route: &'static str,
-    ) -> Result<Option<&ClientConfig>, Box<Response>> {
+    ) -> Result<Option<Principal>, Box<Response>> {
         match self.authenticate(headers, allow_bearer) {
             Ok(principal) => Ok(principal),
             Err(unauthorized) => {
@@ -812,10 +818,10 @@ impl AppState {
     ) -> Option<Box<Response>> {
         match self.authenticate_throttled(client_ip, peer, headers, false, route) {
             Err(resp) => Some(resp),
-            Ok(Some(c)) if !self.is_operator(&c.name) && !self.is_admin_reader(&c.name) => {
+            Ok(Some(p)) if p.role == Role::Client => {
                 warn!(
                     client = %client_ip,
-                    client_id = %c.name,
+                    client_id = %p.name,
                     route,
                     "rejected: admin surface requires an operator or read-only principal"
                 );
@@ -835,7 +841,7 @@ impl AppState {
                 // ~11k lines/day/replica that drowns the signal it exists to
                 // give. Once per route per OPEN_ADMIN_WARN_INTERVAL preserves
                 // visibility without the firehose.
-                if self.proxy_key.is_none() && self.should_warn_open_admin(route) {
+                if matches!(self.auth_mode, AuthMode::Open) && self.should_warn_open_admin(route) {
                     warn!(
                         client = %client_ip,
                         route,
@@ -859,31 +865,6 @@ impl AppState {
                 true
             }
         }
-    }
-
-    /// Constant-time lookup of a presented credential in the client table.
-    ///
-    /// What this actually guarantees, precisely — do not read more into it:
-    /// `ct_eq` removes the per-byte prefix oracle that `==` has, which is the
-    /// leak that matters (it is what lets an attacker recover a key byte by
-    /// byte). Audit finding 4, closed.
-    ///
-    /// The full-table scan removes the coarse "how far down the table did we
-    /// get" signal. It does NOT make the whole function constant-time: the
-    /// `hit = Some(c)` store is a data-dependent branch the optimizer may
-    /// emit as one, and `ct_eq` short-circuits on unequal lengths. Both
-    /// residuals are a handful of instructions against milliseconds of network
-    /// and TLS jitter, and key length is not a secret — so neither is
-    /// exploitable remotely. Want the stronger property? Accumulate with
-    /// `subtle::Choice`; don't assume this already does.
-    fn match_client(&self, presented: &str) -> Option<&ClientConfig> {
-        let mut hit: Option<&ClientConfig> = None;
-        for c in &self.clients {
-            if bool::from(c.key.as_bytes().ct_eq(presented.as_bytes())) {
-                hit = Some(c);
-            }
-        }
-        hit
     }
 
     /// Whether an attempt on `ep` for `client_id` is bound by a `models` list,
@@ -1195,9 +1176,9 @@ impl AppState {
     ///
     /// Header takes precedence to support multiple clients per IP.
     ///
-    /// ONLY reached when no `[[clients]]` table is configured. Under
-    /// `[[clients]]`, identity comes from the verified credential
-    /// (`RequestContext::from_request`) and this client-asserted path is dead.
+    /// ONLY reached outside `AuthMode::Clients`. Under `[[clients]]`, identity
+    /// comes from the verified credential (`RequestContext::from_request`) and
+    /// this client-asserted path is dead.
     ///
     /// The `debug_assert` is the choke point for that invariant. Nothing in the
     /// type system stops a future handler from calling
@@ -1206,7 +1187,7 @@ impl AppState {
     /// and debug builds instead of quietly becoming an identity bypass.
     pub(crate) fn resolve_client_id(&self, ip: &IpAddr, headers: &hyper::HeaderMap) -> String {
         debug_assert!(
-            self.clients.is_empty(),
+            !matches!(self.auth_mode, AuthMode::Clients),
             "resolve_client_id reached with [[clients]] configured — a caller \
              skipped the authenticated principal and identity is now spoofable"
         );

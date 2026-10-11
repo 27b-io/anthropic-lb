@@ -28,7 +28,7 @@ async fn describe_reqwest_error_surfaces_cause_and_kind() {
 #[tokio::test]
 async fn proxy_rejects_missing_auth() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, _state) = test_app(&mock_url, Some("secret-key".to_string()));
+    let (app, _state) = test_app(&mock_url, Some(test_key("secret-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -56,7 +56,7 @@ async fn proxy_rejects_missing_auth() {
 #[tokio::test]
 async fn proxy_accepts_valid_auth_and_forwards() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, state) = test_app(&mock_url, Some("secret-key".to_string()));
+    let (app, state) = test_app(&mock_url, Some(test_key("secret-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -73,7 +73,7 @@ async fn proxy_accepts_valid_auth_and_forwards() {
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "secret-key")
+        .header("x-api-key", test_key("secret-key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -122,23 +122,24 @@ async fn proxy_returns_502_when_upstream_body_read_fails() {
 
     // Ratelimit reflection is opt-in since LAB-1191; this test asserts the
     // error-arm parity that the opt-in restores, so flip it on.
-    let mut state = test_state_with(vec![
-        mk_endpoint_at(
-            "acct-a",
-            "sk-ant-api-test-aaa",
-            &format!("http://{}", mock_addr),
-        ),
-        mk_endpoint_at(
-            "acct-b",
-            "sk-ant-api-test-bbb",
-            &format!("http://{}", mock_addr),
-        ),
-    ]);
-    {
-        let s = Arc::get_mut(&mut state).expect("test fixture should be uniquely owned");
-        s.proxy_key = Some("secret-key".to_string());
-        s.expose_upstream_ratelimit_headers = true;
-    }
+    let state = Arc::new(
+        TestPolicy::shared_key(&test_key("secret-key")).install(AppState {
+            endpoints: vec![
+                mk_endpoint_at(
+                    "acct-a",
+                    "sk-ant-api-test-aaa",
+                    &format!("http://{}", mock_addr),
+                ),
+                mk_endpoint_at(
+                    "acct-b",
+                    "sk-ant-api-test-bbb",
+                    &format!("http://{}", mock_addr),
+                ),
+            ],
+            expose_upstream_ratelimit_headers: true,
+            ..test_state_base()
+        }),
+    );
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -155,7 +156,7 @@ async fn proxy_returns_502_when_upstream_body_read_fails() {
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "secret-key")
+        .header("x-api-key", test_key("secret-key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -238,7 +239,7 @@ async fn proxy_preserves_raw_body_bytes_when_auto_cache_skips() {
 
     let (app, _state) = test_app(
         &format!("http://{}", mock_addr),
-        Some("secret-key".to_string()),
+        Some(test_key("secret-key")),
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -258,7 +259,7 @@ async fn proxy_preserves_raw_body_bytes_when_auto_cache_skips() {
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "secret-key")
+        .header("x-api-key", test_key("secret-key"))
         .body(raw_body)
         .send()
         .await
@@ -328,7 +329,7 @@ async fn proxy_preserves_key_order_when_auto_cache_mutates() {
 
     let (app, _state) = test_app(
         &format!("http://{}", mock_addr),
-        Some("secret-key".to_string()),
+        Some(test_key("secret-key")),
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -350,7 +351,7 @@ async fn proxy_preserves_key_order_when_auto_cache_mutates() {
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "secret-key")
+        .header("x-api-key", test_key("secret-key"))
         .body(input_body)
         .send()
         .await
@@ -538,7 +539,7 @@ async fn anthropic_streaming_records_usage() {
 #[tokio::test]
 async fn response_includes_budget_status_header() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, _state) = test_app(&mock_url, Some("test-key".to_string()));
+    let (app, _state) = test_app(&mock_url, Some(test_key("test-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -555,7 +556,7 @@ async fn response_includes_budget_status_header() {
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "test-key")
+        .header("x-api-key", test_key("test-key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -573,7 +574,7 @@ async fn response_includes_budget_status_header() {
 #[tokio::test]
 async fn openai_response_includes_budget_status_header() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, _state) = test_openai_app(&mock_url, Some("test-key".to_string()));
+    let (app, _state) = test_openai_app(&mock_url, Some(test_key("test-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -590,7 +591,7 @@ async fn openai_response_includes_budget_status_header() {
     let resp = client
         .post(format!("http://{}/v1/chat/completions", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "test-key")
+        .header("x-api-key", test_key("test-key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await

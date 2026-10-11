@@ -423,7 +423,7 @@ pub(crate) fn affinity_routing_key(
 }
 
 impl RequestContext {
-    /// `principal` is the authenticated client from `AppState::authenticate`.
+    /// `principal` is the authenticated caller from `AppState::authenticate`.
     /// When present it IS the identity — `x-client-id` and the `client_names`
     /// IP map are not consulted at all. This one substitution is what makes
     /// budgets, ceilings, operator bypass, the model allow-list and the
@@ -433,11 +433,11 @@ impl RequestContext {
         state: &AppState,
         client_ip: &IpAddr,
         headers: &axum::http::HeaderMap,
-        principal: Option<&ClientConfig>,
+        principal: Option<&Principal>,
     ) -> Self {
         Self {
             client_id: match principal {
-                Some(c) => c.name.clone(),
+                Some(p) => p.name.clone(),
                 None => state.resolve_client_id(client_ip, headers),
             },
             client_ver: headers

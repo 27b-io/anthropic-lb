@@ -101,16 +101,19 @@ async fn spawn_scripted_upstream(
 }
 
 fn budget_state(url: &str) -> Arc<AppState> {
-    Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-a", url)],
-        auto_cache: false,
-        client_budgets: [(CLIENT.to_string(), 10_000_000)].into_iter().collect(),
-        client: upstream_client_builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .unwrap(),
-        ..test_state_base()
-    })
+    Arc::new(
+        TestPolicy::open()
+            .budgets([(CLIENT.to_string(), 10_000_000)].into_iter().collect())
+            .install(AppState {
+                endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-a", url)],
+                auto_cache: false,
+                client: upstream_client_builder()
+                    .timeout(Duration::from_secs(60))
+                    .build()
+                    .unwrap(),
+                ..test_state_base()
+            }),
+    )
 }
 
 /// Send a streaming request on a raw socket, read until the relayed content
