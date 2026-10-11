@@ -1,5 +1,5 @@
 use crate::*;
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 
 // ── Client policy ───────────────────────────────────────────────────
 //
@@ -9,10 +9,10 @@ use std::collections::HashSet;
 // boot, so a test that builds its per-client state through it holds none a
 // boot would refuse.
 
-/// How callers authenticate. Decided once, from the config, by
-/// `ClientPolicy::build`, and never re-inferred at runtime. In particular
-/// nothing infers it from how many clients a table holds: an empty principal
-/// table refuses every credential, it does not open the proxy.
+/// How callers authenticate. Decided once per build, by `AuthMode::of`, and
+/// never re-inferred at runtime. In particular nothing infers it from how many
+/// clients a table holds: an empty principal table refuses every credential,
+/// it does not open the proxy.
 pub(crate) enum AuthMode {
     /// `allow_unauthenticated = true`: no credential is checked.
     Open,
@@ -89,6 +89,24 @@ pub(crate) fn key_digest(key: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
+impl AuthMode {
+    /// The mode `config` describes, inferred exactly as it always was:
+    /// `[[clients]]`, else `proxy_key`, else open (which `check_credentials`
+    /// allows only with `allow_unauthenticated`). `reject_legacy_config_keys`
+    /// refuses both credential forms together, so the order never picks a
+    /// winner. Every check that depends on the mode takes this value rather
+    /// than looking at the config again.
+    fn of(config: &Config) -> Self {
+        if !config.clients.is_empty() {
+            Self::Clients
+        } else if let Some(key) = &config.proxy_key {
+            Self::SharedKey(key_digest(key))
+        } else {
+            Self::Open
+        }
+    }
+}
+
 impl ClientPolicy {
     /// Check every per-client rule in `config`, then build the policy and the
     /// auth mode it implies. Each error is the message a boot fails with. The
@@ -97,55 +115,29 @@ impl ClientPolicy {
     /// that is too short, as it always has. The rest of `load_config` (legacy
     /// keys, endpoints, throttle, cooldown) is not repeated here.
     pub(crate) fn build(config: &Config) -> Result<(AuthMode, Self), String> {
-        check_clients(config).map_err(|msg| format!("config: {msg}"))?;
-        check_credentials(config)?;
+        let auth_mode = AuthMode::of(config);
+        let principals =
+            check_clients(config, &auth_mode).map_err(|msg| format!("config: {msg}"))?;
+        check_credentials(config, &auth_mode)?;
         check_policy_values(config)?;
-        Ok(Self::assemble(config))
+        Ok((auth_mode, Self::assemble(config, principals)))
     }
 
-    /// Build without checking a single rule, for the tests that pin how the
-    /// runtime behaves in a state `build` refuses. Never reachable from a boot.
+    /// Build with no check at all, for the tests that pin how the runtime
+    /// behaves in a state `build` refuses. A duplicate key keeps its last
+    /// entry. Never reachable from a boot.
     #[cfg(test)]
     pub(crate) fn unchecked(config: &Config) -> (AuthMode, Self) {
-        Self::assemble(config)
+        let principals = config
+            .clients
+            .iter()
+            .map(|c| (key_digest(&c.key), principal(config, &c.name)))
+            .collect();
+        (AuthMode::of(config), Self::assemble(config, principals))
     }
 
-    /// The mode and policy `config` describes, assuming `build`'s checks
-    /// passed. The mode is inferred exactly as it always was: `[[clients]]`,
-    /// else `proxy_key`, else open (which the checks allow only with
-    /// `allow_unauthenticated`). `reject_legacy_config_keys` refuses both
-    /// credential forms together, so the order never picks a winner.
-    fn assemble(config: &Config) -> (AuthMode, Self) {
-        let auth_mode = if !config.clients.is_empty() {
-            AuthMode::Clients
-        } else if let Some(key) = &config.proxy_key {
-            AuthMode::SharedKey(key_digest(key))
-        } else {
-            AuthMode::Open
-        };
-        // Reader before operator: a name in both lists (which `check_clients`
-        // refuses) resolves to the denial, as `pre_request_gate` does.
-        let role = |name: &str| {
-            if config.admin_readers.iter().any(|r| r == name) {
-                Role::Reader
-            } else if config.operators.iter().any(|op| op == name) {
-                Role::Operator
-            } else {
-                Role::Client
-            }
-        };
-        let mut principals = HashMap::with_capacity(config.clients.len());
-        for c in &config.clients {
-            let principal = Principal {
-                name: c.name.clone(),
-                role: role(&c.name),
-            };
-            let replaced = principals.insert(key_digest(&c.key), principal);
-            debug_assert!(
-                replaced.is_none(),
-                "check_clients refuses a duplicate key; an insert must never replace one"
-            );
-        }
+    /// The policy `config` describes, around a principal table already built.
+    fn assemble(config: &Config, principals: HashMap<[u8; 32], Principal>) -> Self {
         let clients = config
             .clients
             .iter()
@@ -157,15 +149,31 @@ impl ClientPolicy {
                 guard: c.guard,
             })
             .collect();
-        let policy = Self {
+        Self {
             principals,
             clients,
             client_budgets: config.client_budgets.clone(),
             client_utilization_limits: config.client_utilization_limits.clone(),
             operators: config.operators.clone(),
             admin_readers: config.admin_readers.clone(),
-        };
-        (auth_mode, policy)
+        }
+    }
+}
+
+/// The principal a `[[clients]]` name resolves to. Reader before operator: a
+/// name in both lists (which `check_clients` refuses) resolves to the denial,
+/// as `pre_request_gate` does.
+fn principal(config: &Config, name: &str) -> Principal {
+    let role = if config.admin_readers.iter().any(|r| r == name) {
+        Role::Reader
+    } else if config.operators.iter().any(|op| op == name) {
+        Role::Operator
+    } else {
+        Role::Client
+    };
+    Principal {
+        name: name.to_string(),
+        role,
     }
 }
 
@@ -196,18 +204,22 @@ fn check_client_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The structural `[[clients]]` rules (LAB-1083).
+/// The structural `[[clients]]` rules (LAB-1083), and the principal table
+/// they check: each key's digest → its principal.
 ///
 /// Every rule here exists because its violation fails SILENTLY at runtime
-/// rather than loudly: a duplicate key resolves to whichever entry the
-/// principal table took last, a duplicate or empty name silently merges two
-/// callers' budgets and cache tenancy, and a `[response_cache].clients` typo
-/// makes the cache inert for that client with no signal at all. Cheap to
-/// catch at boot; expensive to notice in production.
-fn check_clients(config: &Config) -> Result<(), String> {
+/// rather than loudly: a duplicate key would resolve to whichever entry the
+/// table took last, a duplicate or empty name silently merges two callers'
+/// budgets and cache tenancy, and a `[response_cache].clients` typo makes the
+/// cache inert for that client with no signal at all. Cheap to catch at boot;
+/// expensive to notice in production.
+fn check_clients(
+    config: &Config,
+    auth_mode: &AuthMode,
+) -> Result<HashMap<[u8; 32], Principal>, String> {
     let clients = &config.clients;
     let mut seen_names: Vec<&str> = Vec::with_capacity(clients.len());
-    let mut seen_keys: HashSet<[u8; 32]> = HashSet::with_capacity(clients.len());
+    let mut principals = HashMap::with_capacity(clients.len());
     for c in clients {
         if c.name.trim().is_empty() {
             return Err("client: name must not be empty".to_string());
@@ -264,12 +276,18 @@ fn check_clients(config: &Config) -> Result<(), String> {
             }
         }
         // Keys are held and matched as digests, so a duplicate is found as
-        // one. Names, not keys, in the error — never log a credential.
-        if !seen_keys.insert(key_digest(&c.key)) {
-            return Err(format!(
-                "client '{}': duplicate key (already used by another client)",
-                c.name
-            ));
+        // one, by the insert itself: no entry can ever replace another. Names,
+        // not keys, in the error — never log a credential.
+        match principals.entry(key_digest(&c.key)) {
+            Entry::Occupied(_) => {
+                return Err(format!(
+                    "client '{}': duplicate key (already used by another client)",
+                    c.name
+                ))
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(principal(config, &c.name));
+            }
         }
         seen_names.push(&c.name);
     }
@@ -312,7 +330,7 @@ fn check_clients(config: &Config) -> Result<(), String> {
     // as scoping while scoping nothing. Reject rather than half-handle,
     // exactly as with `passthrough` below. Unlike `operators`, there are no
     // pre-existing configs carrying this key, so nothing regresses.
-    if !config.admin_readers.is_empty() && clients.is_empty() {
+    if !config.admin_readers.is_empty() && !matches!(auth_mode, AuthMode::Clients) {
         return Err(
             "admin_readers: requires [[clients]] — under legacy proxy_key the key holder is the operator by construction and client ids are caller-asserted, so a read-only role cannot be enforced"
                 .to_string(),
@@ -333,8 +351,8 @@ fn check_clients(config: &Config) -> Result<(), String> {
         ));
     }
 
-    if clients.is_empty() {
-        return Ok(());
+    if !matches!(auth_mode, AuthMode::Clients) {
+        return Ok(principals);
     }
 
     // `token = "passthrough"` forwards the caller's auth headers to the
@@ -344,7 +362,7 @@ fn check_clients(config: &Config) -> Result<(), String> {
     // transmit every client key verbatim to that endpoint's `base_url`. They
     // are contradictory by construction: passthrough means "the caller brings
     // its own upstream credential", [[clients]] means "that header is mine".
-    // Reject rather than half-handle, exactly as with proxy_key above.
+    // Reject rather than half-handle.
     if let Some(ep) = config.endpoints.iter().find(|e| e.token == "passthrough") {
         return Err(format!(
             "endpoint '{}': token = \"passthrough\" is incompatible with [[clients]] — passthrough forwards the caller's auth headers upstream, which would leak client keys to {}",
@@ -377,7 +395,7 @@ fn check_clients(config: &Config) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    Ok(principals)
 }
 
 /// Startup exposure posture (LAB-1192): unauthenticated is a BOOT FAILURE,
@@ -385,8 +403,8 @@ fn check_clients(config: &Config) -> Result<(), String> {
 /// at startup instead of a silent misconfiguration in production, where an
 /// open proxy is indistinguishable from a configured one until someone
 /// finds it.
-fn check_credentials(config: &Config) -> Result<(), String> {
-    let has_credentials = config.proxy_key.is_some() || !config.clients.is_empty();
+fn check_credentials(config: &Config, auth_mode: &AuthMode) -> Result<(), String> {
+    let has_credentials = !matches!(auth_mode, AuthMode::Open);
     let allow_unauthenticated = config.allow_unauthenticated.unwrap_or(false);
     if !has_credentials && !allow_unauthenticated {
         return Err(

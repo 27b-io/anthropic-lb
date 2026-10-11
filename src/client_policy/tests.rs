@@ -248,8 +248,8 @@ fn build_accepts_names_inside_the_rule() {
         "a",
         "0",
         "geo",
-        "ops-console",
-        "insight_daisy",
+        "build-bot",
+        "team_alpha",
         "9lives",
         "a-",
         "a_",
@@ -307,10 +307,10 @@ fn build_reserves_every_name_starting_with_an_underscore() {
 /// `x-client-id` are legacy identity paths with their own, older rules.
 #[test]
 fn name_rule_leaves_the_legacy_identity_paths_alone() {
-    built("allow_unauthenticated = true\n[client_names]\n\"10.0.0.5\" = \"Build.Host\"\n");
+    built("allow_unauthenticated = true\n[client_names]\n\"10.0.0.5\" = \"Build.Box\"\n");
     let state = test_state_with(vec![]);
-    let headers = hdrs(&[("x-client-id", "Gas.Town")]);
-    assert_eq!(state.resolve_client_id(&test_ip(), &headers), "Gas.Town");
+    let headers = hdrs(&[("x-client-id", "Team.Alpha")]);
+    assert_eq!(state.resolve_client_id(&test_ip(), &headers), "Team.Alpha");
 }
 
 // ── Credential posture ──
@@ -496,12 +496,8 @@ fn key_digest_is_tagged_and_unrelated_to_the_logged_fingerprint() {
 #[test]
 fn build_keeps_an_empty_model_pattern() {
     let (_, policy) = built(&format!(
-        "admin_readers = [\"ops-console\"]\n\n[[clients]]\nname = \"ops-console\"\nkey = \"{K1}\"\nmodels = [\"\"]\n"
+        "admin_readers = [\"scraper\"]\n\n[[clients]]\nname = \"scraper\"\nkey = \"{K1}\"\nmodels = [\"\"]\n"
     ));
-    let ops = policy
-        .clients
-        .iter()
-        .find(|c| c.name == "ops-console")
-        .unwrap();
-    assert_eq!(ops.models, vec![String::new()]);
+    let scraper = policy.clients.iter().find(|c| c.name == "scraper").unwrap();
+    assert_eq!(scraper.models, vec![String::new()]);
 }
