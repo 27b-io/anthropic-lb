@@ -61,6 +61,7 @@ mod redis_integration {
         TransportErrorsHincrbyRejected = 18,
         PassthroughNoHardMark = 19,
         PassthroughNotSynced = 20,
+        ClusterBudgetGaugeAfterSwap = 21,
     }
 
     impl Db {
@@ -1262,6 +1263,93 @@ mod redis_integration {
         assert_eq!(info["redis_connected"], true);
         assert_eq!(info["budget_usage"]["scan-cli"]["used"], 42);
         assert_eq!(info["budget_usage"]["scan-cli"]["limit"], 1000);
+    }
+
+    /// The cluster budget gauge, refreshed by the sync pass from its own
+    /// snapshot, agrees with the limit the gate enforces after a swap that
+    /// removes, changes and adds budgets: the cluster-wide twin of
+    /// `every_budget_gauge_shows_the_limit_the_gate_enforces_after_a_swap`.
+    /// With a backend, the gate reads the shared counter, so the probes set
+    /// it there.
+    #[tokio::test]
+    async fn cluster_budget_gauge_shows_the_limit_the_gate_enforces_after_a_swap() {
+        let Some((mut conn, fred)) = redis_test_conn(Db::ClusterBudgetGaugeAfterSwap).await else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets(
+                    [
+                        ("team-alpha".to_string(), 1_000u64),
+                        ("team-bravo".to_string(), 2_000),
+                    ]
+                    .into(),
+                )
+                .install(AppState {
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
+        TestPolicy::open()
+            .budgets(
+                [
+                    ("team-bravo".to_string(), 5_000u64),
+                    ("team-charlie".to_string(), 300),
+                ]
+                .into(),
+            )
+            .swap_into(&state);
+        // One sync pass, as the background task runs every few seconds.
+        let info = state.cluster_info().await;
+        *state.lock_cluster_info_cache() = info;
+
+        let addr = serve(build_router(state.clone())).await;
+        let metrics = Client::new()
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let limits = metric_by_client(&metrics, "anthropic_cluster_budget_limit");
+        assert_eq!(
+            limits,
+            [
+                ("team-bravo".to_string(), 5_000),
+                ("team-charlie".to_string(), 300)
+            ]
+            .into(),
+            "the cluster gauge follows the swap"
+        );
+
+        let today = AppState::now_epoch() / 86400;
+        for name in ["team-alpha", "team-bravo", "team-charlie"] {
+            let caller = state.caller(name);
+            let key = format!("alb:budget:{name}:{today}");
+            match limits.get(name).copied() {
+                Some(limit) => {
+                    let _: () = conn.set(&key, limit - 1).await.unwrap();
+                    assert!(
+                        state.check_budget(&caller).await.is_ok(),
+                        "{name}: the gate admits below the gauge's limit"
+                    );
+                    let _: () = conn.set(&key, limit).await.unwrap();
+                    assert!(
+                        state.check_budget(&caller).await.is_err(),
+                        "{name}: the gate refuses at the gauge's limit"
+                    );
+                }
+                None => {
+                    let _: () = conn.set(&key, u64::MAX / 2).await.unwrap();
+                    assert!(
+                        state.check_budget(&caller).await.is_ok(),
+                        "{name}: no gauge, so the gate sets no limit"
+                    );
+                }
+            }
+        }
     }
 
     /// AC5: pipelined HINCRBY folds deltas from multiple replicas into the

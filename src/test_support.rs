@@ -871,14 +871,32 @@ impl TestPolicy {
         self
     }
 
-    /// Build, then install into `state`. `state.endpoints` stand in for
-    /// `[[endpoints]]`, which the build checks pins and `passthrough` against.
-    /// Panics with the boot error when the build refuses.
-    pub(crate) fn install(mut self, state: AppState) -> AppState {
+    /// Build against `state`. Its `endpoints` stand in for `[[endpoints]]`,
+    /// which the build checks pins and `passthrough` against. Panics with the
+    /// boot error when the build refuses.
+    pub(crate) fn build(mut self, state: &AppState) -> (AuthMode, ClientPolicy) {
         self.0.endpoints = state.endpoints.iter().map(endpoint_config).collect();
-        let (auth_mode, policy) = ClientPolicy::build(&self.0)
-            .unwrap_or_else(|e| panic!("test client policy refused at build: {e}"));
+        ClientPolicy::build(&self.0)
+            .unwrap_or_else(|e| panic!("test client policy refused at build: {e}"))
+    }
+
+    /// Build, then install into `state`.
+    pub(crate) fn install(self, state: AppState) -> AppState {
+        let (auth_mode, policy) = self.build(&state);
         install_policy(state, auth_mode, policy)
+    }
+
+    /// Build, then swap in as `state`'s policy, the way a runtime policy
+    /// source would. The auth mode stays the boot's, so the build must agree
+    /// with it.
+    pub(crate) fn swap_into(self, state: &AppState) {
+        let (auth_mode, policy) = self.build(state);
+        assert_eq!(
+            std::mem::discriminant(&auth_mode),
+            std::mem::discriminant(&state.auth_mode),
+            "a swap never changes how callers authenticate"
+        );
+        state.swap_client_policy(policy);
     }
 
     /// Install with no check at all, for the tests that pin how the runtime
@@ -921,6 +939,21 @@ impl AppState {
     pub(crate) fn caller(&self, name: &str) -> Caller {
         Caller::named(self.current_client_policy(), name.to_string())
     }
+}
+
+/// One `/metrics` family's values by `client` label, for the families
+/// labelled by client alone.
+pub(crate) fn metric_by_client(body: &str, family: &str) -> HashMap<String, u64> {
+    let prefix = format!("{family}{{client=\"");
+    body.lines()
+        .filter_map(|line| line.strip_prefix(prefix.as_str()))
+        .map(|rest| {
+            let (client, value) = rest
+                .split_once("\"} ")
+                .unwrap_or_else(|| panic!("unexpected {family} line: {rest}"));
+            (client.to_string(), value.parse::<f64>().unwrap() as u64)
+        })
+        .collect()
 }
 
 pub(crate) fn hdrs(pairs: &[(&str, &str)]) -> hyper::HeaderMap {

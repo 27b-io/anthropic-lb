@@ -89,7 +89,7 @@ Single Rust binary, no library crate. `src/main.rs` holds startup (`main`, confi
 ### Core Data Flow
 
 ```text
-Request → resolve_client_ip(peer, x-forwarded-for vs trusted_proxies) → IP allowlist check → authenticate([[clients]] key, else legacy proxy_key) → throttle failed credentials (valid principals always pass) → resolve client_id (authenticated principal, else x-client-id/IP map) → pre_request_gate(operator bypass → model allow-list → budget → utilization limit → emergency brake) → pick_endpoint(affinity, model, skip) → forward to endpoint → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
+Request → resolve_client_ip(peer, x-forwarded-for vs trusted_proxies) → IP allowlist check → authenticate([[clients]] key, else legacy proxy_key; reads the client-policy snapshot once) → throttle failed credentials (valid principals always pass) → resolve the Caller (authenticated principal, else x-client-id/IP map, plus that snapshot) → pre_request_gate(operator bypass → model allow-list → budget → utilization limit → emergency brake) → pick_endpoint(affinity, model, skip) → forward to endpoint → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
 ```
 
 ### Where things live
@@ -99,9 +99,9 @@ Some module names are older than their contents; this is the map.
 | File | Holds |
 |------|-------|
 | `src/config.rs` | TOML config structs (`Config`, `ClientConfig`, `EndpointConfig`, `Protocol`, `RoutingStrategy`) |
-| `src/client_policy.rs` | `ClientPolicy::build`, the one builder of every per-client rule (called from `load_config`): `AuthMode`, `Principal` / `Role`, `key_digest` and the digest → principal table, the client name rule |
-| `src/state.rs` | `AppState`, `Endpoint`, `RateLimitInfo`: shared via `Arc<AppState>`, per-endpoint `RwLock<RateLimitInfo>`, atomic counters, optional fred `RedisClient` (auto-reconnecting). Also EWMA / burn rate, label bounding, request-body admission, affinity hashing and content fingerprints |
-| `src/response_cache.rs` | The encrypted response cache (`ResponseCache`) **and** the admission surface: IP allow-list, failed-auth throttle, `authenticate`, `authorize_admin`, `resolve_client_ip` / `resolve_client_id`, client model allow-lists, the guard hook |
+| `src/client_policy.rs` | `ClientPolicy::build`, the one builder of every per-client rule (called from `load_config`): `AuthMode`, `Principal` / `Role`, `key_digest` and the digest → principal table, the client name rule. Also the snapshot each request carries: `Authenticated`, `Caller` (principal + policy snapshot, and every per-client lookup), `AppState::current_client_policy` / `swap_client_policy` |
+| `src/state.rs` | `AppState`, `Endpoint`, `RateLimitInfo`: shared via `Arc<AppState>`, the client-policy snapshot (`client_policy`), per-endpoint `RwLock<RateLimitInfo>`, atomic counters, optional fred `RedisClient` (auto-reconnecting). Also EWMA / burn rate, label bounding, request-body admission, affinity hashing and content fingerprints |
+| `src/response_cache.rs` | The encrypted response cache (`ResponseCache`) **and** the admission surface: IP allow-list, failed-auth throttle, `authenticate`, `authorize_admin`, `resolve_client_ip` / `resolve_client_id`, the model allow-list's denial counter, the guard hook |
 | `src/persistence.rs` | JSON state file at `<config_path>.state.json`, saved after every request and on shutdown; probes. Its tests hold the Redis coordination suites, including `src/persistence/tests/real_redis.rs` |
 | `src/utilization.rs` | Time-adjusted utilization, 7d claims, waste risk, `compute_routing_weight`, `routing_candidates`. Also the retry / transport / Redis / body-limit constants, `start_coordination_redis`, credential fingerprinting, the client `anthropic-beta` allow-list (`DEFAULT_CLIENT_BETA_ALLOWLIST`) and beta body-field stripping |
 | `src/routing.rs` | `pick_endpoint` and the weighted pickers, rate-limit header ingestion (`update_rate_info_for`), hard-limit marking, transport health, Redis sync / publish, `cluster_info` |
@@ -238,4 +238,4 @@ Tests use a `spawn_mock_upstream()` helper that starts a real TCP listener retur
 
 `test_state_with()` and `test_app()` are the two test fixture builders — the former for unit tests (no HTTP), the latter for integration tests (full router + mock upstream). `test_openai_app()` builds a minimal router for OpenAI-compat handler tests.
 
-Per-client state (`[[clients]]`, `proxy_key`, `operators`, `admin_readers`, budgets, utilization limits) is never set on `AppState` by hand: build it with `TestPolicy` and `install` it, which runs the real `ClientPolicy::build`, so a fixture holds nothing a boot would refuse. Keys must clear `MIN_KEY_LEN`: configure and present `test_key(tag)`. `install_unchecked` exists only for tests that pin runtime behaviour in a state the build refuses.
+Per-client state (`[[clients]]`, `proxy_key`, `operators`, `admin_readers`, budgets, utilization limits) is never set on `AppState` by hand: build it with `TestPolicy` and `install` it, which runs the real `ClientPolicy::build`, so a fixture holds nothing a boot would refuse. Keys must clear `MIN_KEY_LEN`: configure and present `test_key(tag)`. `install_unchecked` exists only for tests that pin runtime behaviour in a state the build refuses. A per-client decision takes the request's `Caller`, never a client id: a test that drives one without a request takes `state.caller(name)`, and a test that replaces the policy mid-run calls `swap_into(&state)` on a `TestPolicy`.

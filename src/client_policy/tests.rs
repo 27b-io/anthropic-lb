@@ -501,3 +501,275 @@ fn build_keeps_an_empty_model_pattern() {
     let scraper = policy.clients.iter().find(|c| c.name == "scraper").unwrap();
     assert_eq!(scraper.models, vec![String::new()]);
 }
+
+// ── One snapshot per request ──
+
+/// The two halves of `spawn_held_upstream`'s stream: `message_start` with 10
+/// input tokens, then the rest, with 5 output tokens and the terminator.
+const HELD_HEAD: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_held\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n";
+const HELD_TAIL: &str = concat!(
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+);
+/// The tokens each `spawn_held_upstream` response reports.
+const HELD_TOKENS: u64 = 15;
+/// A streaming request body both proxied routes accept.
+const STREAM_BODY: &str = r#"{"model":"claude-sonnet-4-6","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+
+/// An upstream whose first response stops after `HELD_HEAD` and notifies
+/// `started`, then waits for `release`. Later responses run straight through.
+/// A request that reaches it is already past authentication, the gate and
+/// routing.
+async fn spawn_held_upstream(
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) -> String {
+    let first = Arc::new(AtomicBool::new(true));
+    let app = Router::new().fallback(any(move || {
+        let (started, release) = (started.clone(), release.clone());
+        let hold = first.swap(false, Ordering::SeqCst);
+        async move {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
+            tokio::spawn(async move {
+                let _ = tx.send(Ok(HELD_HEAD.into())).await;
+                if hold {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                let _ = tx.send(Ok(HELD_TAIL.into())).await;
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(ReceiverStream::new(rx)))
+                .unwrap()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// POST `STREAM_BODY` to `route` with `key`, and read the whole response.
+async fn post_stream(addr: SocketAddr, route: &'static str, key: String) -> reqwest::StatusCode {
+    let resp = Client::new()
+        .post(format!("http://{addr}{route}"))
+        .header("x-api-key", key)
+        .header("content-type", "application/json")
+        .body(STREAM_BODY)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    resp.bytes().await.unwrap();
+    status
+}
+
+/// Wait until `name`'s recorded token total reaches `total`: the usage of a
+/// stream is recorded by a task that runs after the response ends.
+async fn wait_for_usage(state: &AppState, name: &str, total: u64) {
+    let recorded = || {
+        state
+            .client_usage
+            .lock()
+            .unwrap()
+            .get(name)
+            .map_or(0, |t| t.iter().sum::<u64>())
+    };
+    for _ in 0..200 {
+        if recorded() >= total {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(recorded(), total, "{name}'s usage was not recorded");
+}
+
+/// A request keeps the policy snapshot it authenticated against, to its end,
+/// across a swap that lands while it is in flight; the requests after the
+/// swap read the new policy. The swap gives the client a new key and takes
+/// its budget away, so the old snapshot's budget is visible in the charge
+/// the held request books when its stream ends. Both proxied routes, since
+/// each relays its stream from its own detached task.
+#[tokio::test]
+async fn a_request_keeps_its_snapshot_across_a_swap_mid_request() {
+    for route in ["/v1/messages", "/v1/chat/completions"] {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut ep = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
+        ep.base_url = spawn_held_upstream(started.clone(), release.clone()).await;
+        let (old_key, new_key) = (test_key("alpha-old"), test_key("alpha-new"));
+        let state = Arc::new(
+            TestPolicy::clients(vec![mk_client("team-alpha", &old_key, &[])])
+                .budgets([("team-alpha".to_string(), 1_000_000)].into())
+                .install(AppState {
+                    endpoints: vec![ep],
+                    ..test_state_base()
+                }),
+        );
+        let addr = serve(build_router(state.clone())).await;
+        let budget_used = || {
+            state
+                .budget_usage
+                .lock()
+                .unwrap()
+                .get("team-alpha")
+                .map(|(_, used)| *used)
+        };
+
+        let held = tokio::spawn(post_stream(addr, route, old_key.clone()));
+        tokio::time::timeout(Duration::from_secs(10), started.notified())
+            .await
+            .expect("the request never reached the upstream");
+        TestPolicy::clients(vec![mk_client("team-alpha", &new_key, &[])]).swap_into(&state);
+        release.notify_one();
+        assert_eq!(held.await.unwrap(), reqwest::StatusCode::OK, "{route}");
+        wait_for_usage(&state, "team-alpha", HELD_TOKENS).await;
+        assert_eq!(
+            budget_used(),
+            Some(HELD_TOKENS),
+            "{route}: the held request is charged under the budget of the snapshot it \
+             authenticated against, which the current policy no longer has"
+        );
+
+        assert_eq!(
+            post_stream(addr, route, old_key).await,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{route}: a request after the swap is authenticated against the new policy"
+        );
+        assert_eq!(
+            post_stream(addr, route, new_key).await,
+            reqwest::StatusCode::OK,
+            "{route}"
+        );
+        wait_for_usage(&state, "team-alpha", 2 * HELD_TOKENS).await;
+        assert_eq!(
+            budget_used(),
+            Some(HELD_TOKENS),
+            "{route}: a request after the swap is charged under the new policy, with no budget"
+        );
+    }
+}
+
+/// Every exported budget figure for a client (the limit and remaining
+/// gauges on `/metrics`, and the `/_stats` budget) agrees with the limit the
+/// gate enforces, across a swap that removes, changes and adds budgets. Both
+/// sides read one snapshot's `client_budgets`; a per-client lookup that went
+/// around the snapshot would show here as a gauge the gate disagrees with,
+/// rather than as a silently stale dashboard.
+#[tokio::test]
+async fn every_budget_gauge_shows_the_limit_the_gate_enforces_after_a_swap() {
+    let clients = || {
+        vec![
+            mk_client("ops", &test_key("ops"), &[]),
+            mk_client("team-alpha", &test_key("alpha"), &[]),
+            mk_client("team-bravo", &test_key("bravo"), &[]),
+            mk_client("team-charlie", &test_key("charlie"), &[]),
+        ]
+    };
+    let state = Arc::new(
+        TestPolicy::clients(clients())
+            .operators(&["ops"])
+            .budgets(
+                [
+                    ("team-alpha".to_string(), 1_000),
+                    ("team-bravo".to_string(), 2_000),
+                ]
+                .into(),
+            )
+            .install(test_state_base()),
+    );
+    let today = AppState::now_epoch() / 86400;
+    let used_before: HashMap<&str, u64> = [
+        ("team-alpha", 700),
+        ("team-bravo", 1_200),
+        ("team-charlie", 300),
+    ]
+    .into();
+    for (name, used) in &used_before {
+        state
+            .budget_usage
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), (today, *used));
+    }
+    // Alpha loses its budget, bravo's grows and charlie gains one.
+    TestPolicy::clients(clients())
+        .operators(&["ops"])
+        .budgets(
+            [
+                ("team-bravo".to_string(), 5_000),
+                ("team-charlie".to_string(), 300),
+            ]
+            .into(),
+        )
+        .swap_into(&state);
+
+    let addr = serve(build_router(state.clone())).await;
+    let get = |path: &str| {
+        Client::new()
+            .get(format!("http://{addr}{path}"))
+            .header("x-api-key", test_key("ops"))
+            .send()
+    };
+    let metrics = get("/metrics").await.unwrap().text().await.unwrap();
+    let stats: serde_json::Value = get("/_stats").await.unwrap().json().await.unwrap();
+    let limits = metric_by_client(&metrics, "anthropic_client_budget_limit");
+    let remaining = metric_by_client(&metrics, "anthropic_client_budget_remaining");
+    assert_eq!(
+        limits,
+        [
+            ("team-bravo".to_string(), 5_000),
+            ("team-charlie".to_string(), 300)
+        ]
+        .into(),
+        "the gauges follow the swap"
+    );
+
+    for name in ["ops", "team-alpha", "team-bravo", "team-charlie"] {
+        let caller = state.caller(name);
+        let set_used = |used: u64| {
+            state
+                .budget_usage
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), (today, used));
+        };
+        match limits.get(name).copied() {
+            Some(limit) => {
+                assert_eq!(
+                    stats["client_budgets"][name]["daily_limit"], limit,
+                    "{name}"
+                );
+                assert_eq!(
+                    remaining.get(name).copied(),
+                    Some(limit.saturating_sub(used_before[name])),
+                    "{name}"
+                );
+                set_used(limit - 1);
+                assert!(
+                    state.check_budget(&caller).await.is_ok(),
+                    "{name}: the gate admits below the gauge's limit"
+                );
+                set_used(limit);
+                assert!(
+                    state.check_budget(&caller).await.is_err(),
+                    "{name}: the gate refuses at the gauge's limit"
+                );
+            }
+            None => {
+                assert!(stats["client_budgets"].get(name).is_none(), "{name}");
+                assert!(!remaining.contains_key(name), "{name}");
+                set_used(u64::MAX - 1);
+                assert!(
+                    state.check_budget(&caller).await.is_ok(),
+                    "{name}: no gauge, so the gate sets no limit"
+                );
+            }
+        }
+    }
+}
