@@ -121,9 +121,9 @@ A reader installs a document only when the document passes these checks, its ver
 
 ### Key digests
 
-A key's digest is the SHA-256 of the key's text, its UTF-8 bytes, as a digest. A store mints a key as 32 random bytes and hands it out once as unpadded base64url, 43 characters. It keeps the digest of those 43 characters, not of the raw bytes. A reader therefore digests every presented key the same way, whether the key came from the store or from its own config file, and one lookup serves both.
+A key's digest is the SHA-256 of the key's text, its UTF-8 bytes, as a digest. A store mints a key as 32 random bytes and hands it out once as unpadded base64url, 43 characters. It keeps the digest of those 43 characters, not of the raw bytes. A reader therefore digests every presented key the same way, whether the key came from the store or from its own config file, and one lookup serves both. So a proxy that reads a store holds its config-file keys as SHA-256 digests too, in place of the BLAKE2s-256 digests this proxy holds them as today.
 
-When a store key's digest equals that of a key in the reader's config file under another name, the reader quarantines the store client and alerts. The config-file key keeps its principal.
+When a store key's digest equals that of any key in the reader's config file, the reader quarantines the store client and alerts. A store never holds a config-file key's digest, so only an edit or a hand-written import can cause this. A config-file key is never handed to another principal: under another name it keeps working for its own, and under the same name it falls with the quarantine.
 
 ## The restrictions part
 
@@ -228,6 +228,8 @@ A reader polls `GET <poll URL>` every few seconds, with these query parameters:
 | `set_complete` | `true` or `false`: the set's completeness mark. |
 
 `version` and `records_version` are integers, `digest`, `tag` and `set_hash` are digests, and `set_complete` is `true` or `false`. A store ignores parameters it does not know. It treats a parameter that appears twice or breaks its form as absent, and an absent `version` or `records_version` as 0, so a malformed poll gets more of the answer, never less.
+
+The poll travels over HTTPS with the store's certificate validated, or over a channel that never leaves the reader's own platform. The digest and the tag catch corruption, not tampering: anyone who can rewrite an answer can recompute both.
 
 The reader sends a `User-Agent` naming its software and version, `anthropic-lb/<version>` for this proxy, and `Authorization: Bearer <token>` when it is configured with a token. A store that requires a token answers 401 to a missing or wrong one before it reads anything else. Otherwise it answers 200 with both parts, whatever state they are in:
 
