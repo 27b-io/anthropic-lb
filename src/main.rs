@@ -332,18 +332,34 @@ fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// A TOML syntax error as `line:column` plus toml's short message. toml's own
+/// Display quotes the source line, which can hold a key or token.
+fn syntax_error(raw: &str, e: &toml::de::Error) -> String {
+    let Some(before) = e.span().and_then(|s| raw.get(..s.start)) else {
+        return format!("config parse error: {}", e.message());
+    };
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+    format!(
+        "config parse error at line {line}, column {column}: {}",
+        e.message()
+    )
+}
+
 /// The whole startup parse-and-validate sequence, in boot order. `main()` calls
 /// only this, so a test that loads a config through it sees every validator a
 /// real boot runs, including ones added later. Each error is the exact message
 /// `main()` panics with. Returns the client policy alongside the config, built
 /// by the one function that checks every per-client rule.
 fn load_config(raw: &str) -> Result<(Config, AuthMode, ClientPolicy), String> {
-    let raw_value: toml::Value =
-        toml::from_str(raw).map_err(|e| format!("config parse error: {e}"))?;
+    let raw_value: toml::Value = toml::from_str(raw).map_err(|e| syntax_error(raw, &e))?;
     reject_legacy_config_keys(&raw_value)?;
-    let config: Config = raw_value
-        .try_into()
-        .map_err(|e| format!("config parse error: {e}"))?;
+    // serde's message carries the offending value, which can be a key or token.
+    let config: Config = raw_value.try_into().map_err(|_| {
+        "config parse error: a field has the wrong type, an unknown value or is missing \
+         (the value is not echoed, as it may be a secret)"
+            .to_string()
+    })?;
     validate_endpoints(&config.endpoints)?;
     let (auth_mode, client_policy) = ClientPolicy::build(&config)?;
     validate_auth_throttle(&config)?;
