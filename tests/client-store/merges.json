@@ -1,0 +1,277 @@
+{
+  "about": "Client store corpus. The format and every rule id are in docs/client-store.md.",
+  "cases": [
+    {
+      "id": "fresh-reader-full-part",
+      "why": "A reader holding nothing takes a full part whole, and its set becomes complete.",
+      "now_us": 1791700000000000,
+      "held": {"complete":false,"records":[],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000001},{"name":"b","state":"enabled","version":1791699000000002}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001},{"name":"b","state":"enabled","version":1791699000000002}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"],"set_hash":"59e88ffff5afc7aef46c0c6d681de1db6c4a69fa13e083f650d4aa4b0fbe8f4a"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "fresh-reader-empty-full-part",
+      "why": "An empty full part completes an empty set: the store proves that it holds no restrictions.",
+      "now_us": 1791700000000000,
+      "held": {"complete":false,"records":[],"revoked_digests":[]},
+      "part": {"full":true,"records":[],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[],"revoked_digests":[],"set_hash":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "fresh-reader-partial-part",
+      "why": "A partial part adds its disables and digests but no enabled record, and leaves the set incomplete.",
+      "now_us": 1791700000000000,
+      "held": {"complete":false,"records":[],"revoked_digests":[]},
+      "part": {"full":false,"records":[{"name":"a","state":"disabled","version":1791699000000001},{"name":"b","state":"enabled","version":1791699000000002}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
+      "expect": {"held":{"complete":false,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"],"set_hash":"6afc1ccae8a7db2f72d25ae93cd80c388e05c279f82c67460e23ef958083637c"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "partial-part-keeps-complete",
+      "why": "A complete set stays complete after a partial part.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":false,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "newer-disable-replaces-enable",
+      "why": "A newer record replaces the held one.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"4a2af872996f2f6d0186dc887ad4334d2327d9bebcaf5f391e7cb1349df05b90"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "newer-enable-lifts-disable",
+      "why": "Only a newer enabled record lifts a disable.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"e091909c0cd51438ddd682a29fb2a0d999ba9d30d45330e215feacfe8304fec9"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "older-enable-does-not-lift",
+      "why": "An older enabled record changes nothing, and the store lacks the disable.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"4a2af872996f2f6d0186dc887ad4334d2327d9bebcaf5f391e7cb1349df05b90"},"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
+    },
+    {
+      "id": "tie-held-disable-wins",
+      "why": "At equal versions the disabled record wins, so the held disable stays, and the store lacks it.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
+    },
+    {
+      "id": "tie-part-disable-wins",
+      "why": "At equal versions the disabled record wins, so the part's disable replaces the held enable.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "same-record-again",
+      "why": "A part holding the same record changes nothing; the store lacks nothing, so an earlier restrictions-behind alert clears.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "older-disable-in-part",
+      "why": "An older disable in the part keeps the newer held one; the store still holds a disable, so it lacks nothing.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"4a2af872996f2f6d0186dc887ad4334d2327d9bebcaf5f391e7cb1349df05b90"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "older-disable-keeps-newer-enable",
+      "why": "An older disable does not replace a newer held enable.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"e091909c0cd51438ddd682a29fb2a0d999ba9d30d45330e215feacfe8304fec9"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "partial-part-enable-skipped",
+      "why": "A partial part never lifts a disable, even with a newer enabled record; the store has that newer record, so it lacks nothing.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":false,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "missing-disable-kept",
+      "why": "A part missing a disable lifts nothing, and the store lacks the disable.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":true,"records":[],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
+    },
+    {
+      "id": "enable-forgotten",
+      "why": "A full part with no record for a name makes the reader forget that name's enabled record.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001},{"name":"b","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"b","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"b","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"a1828f51ff05439748f23d038dc1e02f7ddf18f4c0c5b3ce155e3f6b2c2a8898"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "partial-part-forgets-nothing",
+      "why": "Only a full part makes a reader forget an enabled record.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":false,"records":[],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"479cf0c65ff1b885bd8c0be96811cda1b51a5d594200c70cabac235b17e43916"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "enable-for-a-new-name",
+      "why": "An enabled record for a name the reader never held is still held, so it outranks an older disable that arrives later.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"479cf0c65ff1b885bd8c0be96811cda1b51a5d594200c70cabac235b17e43916"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "enable-14-minutes-ahead-merged",
+      "why": "An enabled record 14 minutes ahead of the reader's clock merges.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791700840000000}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791700840000000}],"revoked_digests":[],"set_hash":"8f563a22217c5a618c2abceb8256ab65b4a64248e0ae5a31048c59554575efbb"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "enable-15-minutes-ahead-merged",
+      "why": "An enabled record exactly 15 minutes ahead merges: only more than 15 minutes is skipped.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791700900000000}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791700900000000}],"revoked_digests":[],"set_hash":"c96374a4b26163cd2e742e10b16fe315b1ff1feb91102c1707943f9c04e784d8"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "enable-past-15-minutes-skipped",
+      "why": "An enabled record 1 microsecond past 15 minutes ahead is skipped. The store holds that newer record, so it lacks nothing.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791700900000001}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":["a"],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "disable-far-ahead-merged",
+      "why": "A disabled record merges however far ahead it is.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1823236000000000}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1823236000000000}],"revoked_digests":[],"set_hash":"a9cc47a2479c9161395c019c3f48a1e429376dd34a2979b0abae3aabce9f930c"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "skipped-enable-blocks-forgetting",
+      "why": "A skipped record is still a record in the part, so the held enable for its name is not forgotten.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1823236000000000}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"479cf0c65ff1b885bd8c0be96811cda1b51a5d594200c70cabac235b17e43916"},"skipped_ahead":["a"],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "skipped-enable-for-a-new-name",
+      "why": "A skipped enabled record is not held.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"b","state":"enabled","version":1823236000000000}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[],"revoked_digests":[],"set_hash":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"skipped_ahead":["b"],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "partial-ahead-enable-not-skipped-for-skew",
+      "why": "The partial-part rule comes first, so an enabled record ahead in a partial part raises no clock-skew alert.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":false,"records":[{"name":"a","state":"enabled","version":1823236000000000}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "ahead-reader-clock-slow",
+      "why": "The ceiling is measured against the reader's clock: a record the store wrote now is 6 minutes ahead of a reader 6 minutes slow, and merges.",
+      "now_us": 1791699640000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791700000000000}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791700000000000}],"revoked_digests":[],"set_hash":"5dba5cd4cebdaa66018b54e5b7c892ed4c7edab9da55dc5f56e5bd154a7bebda"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "digests-join",
+      "why": "Digests join the held set and none ever leaves; the store lacks the one it no longer lists.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111","2222222222222222222222222222222222222222222222222222222222222222"]},
+      "part": {"full":true,"records":[],"revoked_digests":["2222222222222222222222222222222222222222222222222222222222222222","3333333333333333333333333333333333333333333333333333333333333333"]},
+      "expect": {"held":{"complete":true,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111","2222222222222222222222222222222222222222222222222222222222222222","3333333333333333333333333333333333333333333333333333333333333333"],"set_hash":"97bc5805406289a74c53fc37ae7612d0cb4a5fdfae6c0d9167d4a1301a7a993f"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]}}
+    },
+    {
+      "id": "partial-part-adds-digests",
+      "why": "A partial part adds its digests.",
+      "now_us": 1791700000000000,
+      "held": {"complete":false,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
+      "part": {"full":false,"records":[],"revoked_digests":["2222222222222222222222222222222222222222222222222222222222222222"]},
+      "expect": {"held":{"complete":false,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111","2222222222222222222222222222222222222222222222222222222222222222"],"set_hash":"337539f9870e9fc85c69b40ca5650e0b923998b6567a922c007377398528d2a8"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]}}
+    },
+    {
+      "id": "digest-listed-again",
+      "why": "A part that lists every held digest leaves the store lacking none.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
+      "part": {"full":true,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
+      "expect": {"held":{"complete":true,"records":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"],"set_hash":"82b3e7bad4af7483ddf73564d2bbb70fa05f108b837008c1fdfaa27114dfa4e7"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "operator-like-name-merged",
+      "why": "Merging does not know a deployment's operators: the disable is held, and enforcement never applies it to the reader's own operator.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"operator","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"operator","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"b75980481decb04e4590c080fad97bae3be21ccdffb5f46fe1b39d5ab972661d"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "partial-part-older-disable",
+      "why": "An older disable from a partial part does not replace a newer held enable.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[]},
+      "part": {"full":false,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"e091909c0cd51438ddd682a29fb2a0d999ba9d30d45330e215feacfe8304fec9"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "full-part-with-skipped-record-completes",
+      "why": "A full part completes the set even though it skipped an enabled record for being ahead.",
+      "now_us": 1791700000000000,
+      "held": {"complete":false,"records":[],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"a","state":"disabled","version":1791699000000001},{"name":"b","state":"enabled","version":1823236000000000}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001}],"revoked_digests":[],"set_hash":"426ac2ca060521966d67b28bde119da854c34185d732b9b2460be29d1bde3fcd"},"skipped_ahead":["b"],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "name-constructor",
+      "why": "`constructor` merges like any name: a newer enable lifts its disable.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"constructor","state":"disabled","version":1791699000000001}],"revoked_digests":[]},
+      "part": {"full":true,"records":[{"name":"constructor","state":"enabled","version":1791699000000002}],"revoked_digests":[]},
+      "expect": {"held":{"complete":true,"records":[{"name":"constructor","state":"enabled","version":1791699000000002}],"revoked_digests":[],"set_hash":"07b8fb112f5fa392d0f379d2775b563927596591ff3efb91364ccfa409e996cd"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":[]}}
+    },
+    {
+      "id": "mixed-full-part",
+      "why": "Every full-part rule at once: a newer enable and a newer disable win, an enable is forgotten, an older disable keeps the newer held one, a new enabled name is added, and a digest goes missing.",
+      "now_us": 1791700000000000,
+      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791699000000001},{"name":"b","state":"enabled","version":1791699000000001},{"name":"c","state":"enabled","version":1791699000000001},{"name":"d","state":"disabled","version":1791699000000002}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
+      "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791699000000002},{"name":"b","state":"disabled","version":1791699000000002},{"name":"d","state":"disabled","version":1791699000000001},{"name":"e","state":"enabled","version":1791699000000001}],"revoked_digests":["2222222222222222222222222222222222222222222222222222222222222222"]},
+      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"enabled","version":1791699000000002},{"name":"b","state":"disabled","version":1791699000000002},{"name":"d","state":"disabled","version":1791699000000002},{"name":"e","state":"enabled","version":1791699000000001}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111","2222222222222222222222222222222222222222222222222222222222222222"],"set_hash":"d3bd081f0b193ee6d86f9b64454d3270641603fd0e3c676c474f2dd6b2870703"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]}}
+    },
+    {
+      "id": "mixed-partial-part",
+      "why": "Every partial-part rule at once: a newer disable wins, enabled records are skipped, nothing is forgotten, and the set stays incomplete.",
+      "now_us": 1791700000000000,
+      "held": {"complete":false,"records":[{"name":"a","state":"enabled","version":1791699000000001},{"name":"b","state":"disabled","version":1791699000000001},{"name":"c","state":"enabled","version":1791699000000001}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]},
+      "part": {"full":false,"records":[{"name":"a","state":"disabled","version":1791699000000002},{"name":"b","state":"enabled","version":1791699000000002},{"name":"d","state":"enabled","version":1791699000000001}],"revoked_digests":[]},
+      "expect": {"held":{"complete":false,"records":[{"name":"a","state":"disabled","version":1791699000000002},{"name":"b","state":"disabled","version":1791699000000001},{"name":"c","state":"enabled","version":1791699000000001}],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"],"set_hash":"3f9c71dfdaff5f90bec0eecc625f686742aff9acbeb853a911d22e1f02207b59"},"skipped_ahead":[],"behind":{"disabled":[],"revoked_digests":["1111111111111111111111111111111111111111111111111111111111111111"]}}
+    }
+  ]
+}
