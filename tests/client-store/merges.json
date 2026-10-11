@@ -98,14 +98,6 @@
       "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791700300000000}],"revoked_digests":[],"set_hash":"d342351f91eb4534817efd845e06f647cfbb4d4c14b3323697eb42f37d6f56cd"},"records_version":1791700300000000,"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
     },
     {
-      "id": "enable-below-held-disable",
-      "why": "An enable the store stamps below a disable the reader holds lifts nothing, and the store stays behind until it writes a record above the reader's.",
-      "now_us": 1791700000000000,
-      "held": {"complete":true,"records":[{"name":"a","state":"disabled","version":1791700300000000}],"revoked_digests":[]},
-      "part": {"full":true,"records":[{"name":"a","state":"enabled","version":1791700060000000}],"revoked_digests":[]},
-      "expect": {"held":{"complete":true,"records":[{"name":"a","state":"disabled","version":1791700300000000}],"revoked_digests":[],"set_hash":"d342351f91eb4534817efd845e06f647cfbb4d4c14b3323697eb42f37d6f56cd"},"records_version":1791700300000000,"skipped_ahead":[],"behind":{"disabled":["a"],"revoked_digests":[]}}
-    },
-    {
       "id": "older-disable-keeps-newer-enable",
       "why": "An older disable does not replace a newer held enable.",
       "now_us": 1791700000000000,

@@ -113,9 +113,9 @@ A reader sorts each fault by its reach. An **envelope** fault, a schema the read
 
 An envelope fault refuses the document whatever else it holds. When a document breaks more than one rule, the rule reported is an envelope rule if any is broken, and otherwise the first in its table. Faults in two different clients, or two different keys, are not ordered against each other.
 
-One rule sits outside the format, because its input differs per deployment, and it comes before every other rule on this page. A store refuses a client that takes the name of one of the deployment's operators or admin readers. A reader that finds such a client in a document anyway drops it first, and alerts: none of its keys enter the reader's lookup, no other rule applies to it, and the reader keeps its own principal for the name.
+One rule sits outside the format, because its input differs per deployment. A store refuses a client that takes the name of one of the deployment's operators or admin readers. A reader that finds such a client in a document anyway applies the envelope rules to the whole document, that client included, then drops the client before any client rule, and alerts: none of its keys enter the reader's lookup, it is never quarantined, and the reader keeps its own principal for the name.
 
-A name in both the document and a reader's config file is one client on that reader: its keys from both authenticate, and the document's policy governs them. A setting that schema 1 does not carry keeps its config-file value.
+A name in both the document and a reader's config file is one client on that reader: its keys from both authenticate, and the document's policy governs them. `null` and `[]` are values the document carries. Only a setting that schema 1 does not have, such as a guard policy, keeps its config-file value.
 
 A reader installs a document only when the document passes these checks, its version is above the one the reader holds, and the version is at most 15 minutes ahead of the reader's clock. A version further ahead raises a clock-skew alert.
 
@@ -143,7 +143,7 @@ A restrictions part carries the store's restrictions as a *body*, a JSON text, a
 
 | Member | Meaning |
 |---|---|
-| `full` | `true` when the store's integrity record, which its own writes keep beside its restrictions, matches every row it read. Leaving out the enabled records that `enabled_ahead` counts keeps a part full. Leaving out a row that breaks a rule makes it partial (`false`), and so does a table without a matching integrity record, an empty or wiped one included. |
+| `full` | `true` only when the store's integrity record, which its own writes keep beside its restrictions, matches every row it read, and the body carries every one of those rows except the enabled records that `enabled_ahead` counts. A write updates the integrity record only when the record matched before the write, and only a deliberate reseed of the table creates or repairs one. An empty table with a matching record is full; a wiped one is partial. |
 | `enabled_ahead` | How many enabled records the store left out because they are more than 60 s ahead of its clock. A reader alerts while it is above 0. |
 | `records` | One record per name: the name, its `state` (`disabled` or `enabled`), and the `version` at which the state was set, in Unix microseconds of the store's clock. |
 | `revoked_digests` | Digests of revoked keys. |
@@ -207,7 +207,7 @@ Then:
 5. Every digest in the part joins the digests the reader holds, as do the `revoked_digests` of every document it installs. None ever leaves.
 6. The set becomes complete once it has merged a full part, and stays complete. A partial part never makes a set complete. A full part does even when it skipped a record for being ahead: a skipped record is `enabled`, so missing it can only keep a denial in place.
 
-After it merges any part, whether or not the part changes the set it holds, and whenever installing a document changes that set, the reader checks whether the store is behind it. It checks against the last part it merged, counting every record in that part, skipped or not. The store lacks a disable the reader holds when that part has neither a `disabled` record for that name at the same version or a higher one, nor an `enabled` record for it at a higher version: a store never moves a name's record back, so an older one means it lost the newer. It lacks a digest the reader holds when that part does not list it. While the store lacks either, the reader raises a restrictions-behind alert.
+While the last part the reader merged lacks a disable or a digest that the reader holds, the reader raises a restrictions-behind alert. Every record in that part counts, skipped or not. The part lacks a disable the reader holds when it has neither a `disabled` record for that name at the same version or a higher one, nor an `enabled` record for it at a higher version. It lacks a digest the reader holds when it does not list it. The reader also alerts while the last part it merged is partial.
 
 Until its set is complete, a reader serves no client but its operators and admin readers, whether the client comes from the store or from its config file. Once it is complete, the reader enforces the set whether or not it holds a document:
 
@@ -216,12 +216,12 @@ Until its set is complete, a reader serves no client but its operators and admin
 
 ## The poll
 
-A reader polls `GET <poll URL>` every few seconds. Two query parameters choose what the answer carries:
+A reader polls `GET <poll URL>` every few seconds. Only `version` and `tag` choose what the answer carries:
 
 | Parameter | Value |
 |---|---|
 | `version` | The version of the document the reader holds, or 0. |
-| `tag` | The tag of the last part the reader merged. Left out to ask for the body: before the reader has merged a part, and while it skips a record that is ahead. |
+| `tag` | The tag of the last part the reader merged. Left out to ask for the body: from the moment the reader starts until it has merged a part, and while it skips a record that is ahead. |
 
 The other four are the reader's report:
 
@@ -251,7 +251,7 @@ The reader sends a `User-Agent` naming its software and version, `anthropic-lb/<
 
 Both texts travel as JSON strings, so each side hashes exactly the bytes the store wrote, however either side re-serialises JSON.
 
-A store records a reader's report only from a channel that no other caller can use. A report that arrives with a bearer token is never recorded, and never changes what a store serves or what it accepts; its `version` and `tag` still choose what the answer carries.
+A store records a reader's report only from a channel that no other caller can use. A report that arrives with a bearer token is never recorded, and never changes what a store serves or what it accepts.
 
 A reader checks each part on its own, so a fault in one part never refuses the other. Decoding each part separately, for example as a raw JSON value, keeps a bad document text from spoiling the restrictions. A reader ignores members it does not know in the answer and in each part, and refuses a part whose `status` is neither `ok` nor `unavailable`.
 
