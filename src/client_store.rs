@@ -609,6 +609,11 @@ impl RestrictionSet {
     pub(crate) fn hash(&self) -> [u8; 32] {
         sha256(self.text().as_bytes())
     }
+
+    /// The set hash as a digest: what a poll reports and the metrics export.
+    pub(crate) fn hash_hex(&self) -> String {
+        digest_hex(&self.hash())
+    }
 }
 
 // ── The reader ──────────────────────────────────────────────────────
@@ -731,7 +736,7 @@ impl Reader {
             "records_version",
             self.set.records_version(now_us).to_string(),
         ));
-        q.push(("set_hash", digest_hex(&self.set.hash())));
+        q.push(("set_hash", self.set.hash_hex()));
         q.push(("set_complete", self.set.complete.to_string()));
         q
     }
@@ -1409,7 +1414,7 @@ impl ClientStore {
                 .as_ref()
                 .map(|d| (d.version, digest_hex(&d.digest))),
             records_version: reader.set.records_version(now_us()),
-            set_hash: digest_hex(&reader.set.hash()),
+            set_hash: reader.set.hash_hex(),
             complete: reader.set.complete,
             loaded: reader.loaded(),
             part_full: part.map(|p| p.full),
