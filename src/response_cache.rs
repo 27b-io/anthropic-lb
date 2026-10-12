@@ -458,6 +458,33 @@ pub(crate) fn parse_ip_entries(entries: Option<&[String]>, field: &str) -> Vec<I
         .collect()
 }
 
+/// Why `authenticate` turned a request away.
+#[derive(Debug)]
+pub(crate) enum AuthRejection {
+    /// No credential matched: a failed credential, counted against the
+    /// client IP's failed-auth throttle.
+    Unauthorized,
+    /// A credential that may well be good, which the client store turns away.
+    Refused(StoreRefusal),
+}
+
+impl AuthRejection {
+    /// The response to answer with. Boxed, so `authenticate_throttled`'s
+    /// `Result` stays small on its hot success path, matching
+    /// `reserve_request_body`: an inline `Response` is 128+ bytes
+    /// (clippy::result_large_err).
+    pub(crate) fn into_response(self) -> Box<Response> {
+        Box::new(match self {
+            Self::Unauthorized => proxy_error_response(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "unauthorized",
+            ),
+            Self::Refused(refusal) => refusal.response(),
+        })
+    }
+}
+
 /// Default failed-auth attempts per IP inside the window before 429.
 pub(crate) const DEFAULT_AUTH_FAILURE_LIMIT: u32 = 10;
 /// Default failed-auth throttle window.
@@ -655,20 +682,16 @@ impl AppState {
     /// weak key can authenticate whatever the table holds. The test is per
     /// credential, not per request: a junk `x-api-key` next to a valid Bearer
     /// still authenticates on the OpenAI-compat surface.
+    ///
+    /// On an instance that reads a client store, the store's gate then
+    /// decides (`ClientPolicy::store_refusal`): a principal's name may be
+    /// disabled or quarantined, and until the store has loaded, an ordinary
+    /// key, or a key that matches nothing, is answered 503.
     pub(crate) fn authenticate(
         &self,
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
-    ) -> Result<Authenticated, Box<Response>> {
-        // Boxed Err, matching `reserve_request_body` — an inline `Response` is
-        // 128+ bytes on the hot success path (clippy::result_large_err).
-        let unauthorized = || -> Box<Response> {
-            Box::new(proxy_error_response(
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                "unauthorized",
-            ))
-        };
+    ) -> Result<Authenticated, AuthRejection> {
         let from_header = headers.get("x-api-key").and_then(|v| v.to_str().ok());
         let from_bearer = if allow_bearer {
             headers
@@ -689,22 +712,35 @@ impl AppState {
         let mut presented = [from_header, from_bearer]
             .into_iter()
             .flatten()
-            .filter(|p| p.len() >= MIN_KEY_LEN);
+            .filter(|p| p.len() >= MIN_KEY_LEN)
+            .peekable();
 
         // Matched as digests (`key_digest` says why timing cannot leak a key).
         let policy = self.current_client_policy();
         let principal = match &self.auth_mode {
-            AuthMode::Clients => Some(
-                presented
+            AuthMode::Clients => {
+                let any_presented = presented.peek().is_some();
+                let Some(principal) = presented
                     .find_map(|p| policy.principals.get(&key_digest(p)))
                     .cloned()
-                    .ok_or_else(unauthorized)?,
-            ),
+                else {
+                    // Until the store has loaded, a key that matches nothing
+                    // may be one its document will bring.
+                    if any_presented && policy.store.as_ref().is_some_and(|g| !g.loaded) {
+                        return Err(AuthRejection::Refused(StoreRefusal::Unloaded));
+                    }
+                    return Err(AuthRejection::Unauthorized);
+                };
+                if let Some(refusal) = policy.store_refusal(&principal) {
+                    return Err(AuthRejection::Refused(refusal));
+                }
+                Some(principal)
+            }
             // Legacy: one shared secret, no principal. The same accept/reject
             // decision as before LAB-1083, on digests now.
             AuthMode::SharedKey(digest) => {
                 if !presented.any(|p| key_digest(p) == *digest) {
-                    return Err(unauthorized());
+                    return Err(AuthRejection::Unauthorized);
                 }
                 None
             }
@@ -749,7 +785,21 @@ impl AppState {
     ) -> Result<Authenticated, Box<Response>> {
         match self.authenticate(headers, allow_bearer) {
             Ok(auth) => Ok(auth),
-            Err(unauthorized) => {
+            // Not a failed credential: never counted, never throttled.
+            Err(AuthRejection::Refused(refusal)) => {
+                if let Some(store) = &self.client_store {
+                    store.count_refusal(refusal);
+                }
+                debug!(
+                    client = %client_ip,
+                    route,
+                    reason = refusal.as_str(),
+                    "refused by the client store"
+                );
+                Err(AuthRejection::Refused(refusal).into_response())
+            }
+            Err(unauthorized @ AuthRejection::Unauthorized) => {
+                let unauthorized = unauthorized.into_response();
                 let (cred, presented) = presented_credential(headers);
                 let key_fp = credential_fingerprint(presented);
                 let ua = bounded_user_agent(headers);

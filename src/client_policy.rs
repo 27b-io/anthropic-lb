@@ -1,5 +1,6 @@
 use crate::*;
 use std::collections::hash_map::Entry;
+use std::collections::HashSet;
 use std::sync::PoisonError;
 
 // ── Client policy ───────────────────────────────────────────────────
@@ -51,8 +52,9 @@ pub(crate) struct Principal {
     pub(crate) role: Role,
 }
 
-/// One `[[clients]]` entry without its key: what the proxy enforces for that
-/// name.
+/// One `[[clients]]` entry without its key, or one client of a client store
+/// document: what the proxy enforces for that name.
+#[derive(Clone)]
 pub(crate) struct ClientEntry {
     pub(crate) name: String,
     pub(crate) models: Vec<String>,
@@ -61,10 +63,12 @@ pub(crate) struct ClientEntry {
     pub(crate) guard: guard::GuardPolicy,
 }
 
-/// Every per-client rule of a config, validated together by `build`. Client
-/// keys are held only as digests: nothing here, or anywhere it is installed,
-/// keeps a plaintext client key. Installed whole and never edited in place:
-/// `AppState::swap_client_policy` replaces it.
+/// Every per-client rule of a config, validated together by `build`, and,
+/// on an instance that reads a client store, what its reader holds
+/// (`with_store`). Client keys are held only as digests: nothing here, or
+/// anywhere it is installed, keeps a plaintext client key. Installed whole
+/// and never edited in place: `AppState::swap_client_policy` replaces it.
+#[derive(Clone)]
 pub(crate) struct ClientPolicy {
     /// `key_digest` of each `[[clients]]` key → the principal it resolves to.
     /// Empty unless the auth mode is `Clients`.
@@ -74,6 +78,80 @@ pub(crate) struct ClientPolicy {
     pub(crate) client_utilization_limits: HashMap<String, f64>,
     pub(crate) operators: Vec<String>,
     pub(crate) admin_readers: Vec<String>,
+    /// Present exactly when the instance reads a client store: what the store
+    /// lets it serve. `build` leaves it closed, so an instance serves no
+    /// ordinary client until its reader holds a complete set of restrictions.
+    pub(crate) store: Option<StoreGate>,
+}
+
+/// What a client store lets an instance serve, from what its reader holds
+/// (docs/client-store.md). It never touches an operator or an admin reader.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StoreGate {
+    /// The reader holds a complete set of restrictions. Until it does, no
+    /// ordinary client is served, config-file keys included.
+    pub(crate) complete: bool,
+    /// The reader holds a complete set and a document, so every client it
+    /// will ever know can be served. Until then a key that matches nothing
+    /// may be one the document will bring, and is answered 503.
+    pub(crate) loaded: bool,
+    /// Names with a disabled record. Every key of an ordinary client of that
+    /// name is refused, from the store or the config file.
+    pub(crate) disabled: HashSet<String>,
+    /// Store clients whose policy failed this instance's checks. Every key of
+    /// the name is refused, config-file keys included.
+    pub(crate) quarantined: HashSet<String>,
+}
+
+/// Why the client store turns away a credential that may well be good. Never
+/// counted as a failed credential.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StoreRefusal {
+    /// The name has a disabled record: 403 `client_disabled`.
+    Disabled,
+    /// The store's policy for the name failed this instance's checks: 403
+    /// `client_quarantined`.
+    Quarantined,
+    /// The instance cannot serve the credential yet: 503 with `retry-after`.
+    Unloaded,
+}
+
+impl StoreRefusal {
+    /// Every refusal, in the order the client store exports them. Its
+    /// refusal counters are sized by this list.
+    pub(crate) const ALL: [Self; 3] = [Self::Disabled, Self::Quarantined, Self::Unloaded];
+
+    /// The `reason` label it is counted under.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Quarantined => "quarantined",
+            Self::Unloaded => "unloaded",
+        }
+    }
+
+    pub(crate) fn response(self) -> Response {
+        match self {
+            Self::Disabled => {
+                proxy_error_response(StatusCode::FORBIDDEN, "permission_error", "client_disabled")
+            }
+            Self::Quarantined => proxy_error_response(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "client_quarantined",
+            ),
+            Self::Unloaded => {
+                let mut resp = proxy_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "overloaded_error",
+                    "client table not loaded yet",
+                );
+                resp.headers_mut()
+                    .insert("retry-after", HeaderValue::from_static("1"));
+                resp
+            }
+        }
+    }
 }
 
 /// What authenticating a request established: the policy snapshot it read,
@@ -222,13 +300,6 @@ impl AppState {
     /// client table swapped in there would hand any header-chosen name that
     /// client's models, pins and guard policy. Under `[[clients]]` every
     /// policy is safe to install: a key it does not hold is refused.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the swap point for a runtime policy source; only tests swap today"
-        )
-    )]
     pub(crate) fn swap_client_policy(&self, next: ClientPolicy) -> Result<(), &'static str> {
         if !matches!(self.auth_mode, AuthMode::Clients) {
             return Err("the client policy can be replaced only under [[clients]] authentication");
@@ -247,25 +318,32 @@ impl AppState {
     }
 }
 
-/// The digest a client key is held and matched as: BLAKE2s-256 over a purpose
-/// tag and the key. Every key the proxy stores or compares goes through this
-/// one function.
+/// The digest a client key is held and matched as: the SHA-256 of the key's
+/// text. Every key the proxy stores or compares goes through this one
+/// function. It is the digest a client store keeps for the keys it mints
+/// (docs/client-store.md, "Key digests"), so a config-file key and a store key
+/// are matched by the one lookup.
 ///
 /// Matching a presented key is a hash-map lookup on its digest, which is not
 /// constant-time and need not be. Timing can reveal at most something about a
 /// stored digest, and a digest cannot be turned back into a key, which is
 /// what the proxy accepts. That rests on keys being long and random. Boot
 /// enforces only the length (`MIN_KEY_LEN`); the documented generator,
-/// `openssl rand -hex 32`, supplies the randomness.
+/// `openssl rand -hex 32`, supplies the randomness, and a store mints 32
+/// random bytes.
 ///
-/// The tag differs from `credential_fingerprint`'s, so the fingerprint a
-/// rejection logs has nothing in common with a stored digest.
+/// `credential_fingerprint` hashes a rejected credential with another
+/// function under its own tag, so the fingerprint a rejection logs has
+/// nothing in common with a stored digest.
 pub(crate) fn key_digest(key: &str) -> [u8; 32] {
-    use blake2::{Blake2s256, Digest};
-    let mut h = Blake2s256::new();
-    h.update(b"anthropic-lb/client-key\x1f");
-    h.update(key.as_bytes());
-    h.finalize().into()
+    sha256(key.as_bytes())
+}
+
+/// SHA-256 of `bytes`: the one hash behind key digests, client store document
+/// digests, restrictions tags and restriction set hashes.
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
 }
 
 impl AuthMode {
@@ -299,6 +377,7 @@ impl ClientPolicy {
             check_clients(config, &auth_mode).map_err(|msg| format!("config: {msg}"))?;
         check_credentials(config, &auth_mode)?;
         check_policy_values(config)?;
+        check_client_store(config, &auth_mode).map_err(|msg| format!("config: {msg}"))?;
         Ok((auth_mode, Self::assemble(config, principals)))
     }
 
@@ -335,6 +414,7 @@ impl ClientPolicy {
             client_utilization_limits: config.client_utilization_limits.clone(),
             operators: config.operators.clone(),
             admin_readers: config.admin_readers.clone(),
+            store: config.client_store.as_ref().map(|_| StoreGate::default()),
         }
     }
 
@@ -344,6 +424,176 @@ impl ClientPolicy {
     pub(crate) fn is_operator(&self, name: &str) -> bool {
         self.operators.iter().any(|op| op == name)
     }
+
+    /// Whether `name` is an operator's or an admin reader's: a name a client
+    /// store can neither grant nor restrict.
+    pub(crate) fn is_privileged(&self, name: &str) -> bool {
+        self.is_operator(name) || self.admin_readers.iter().any(|r| r == name)
+    }
+
+    /// Why the client store turns `principal` away, if it does. Only an
+    /// ordinary client is ever refused: a store never touches an operator or
+    /// an admin reader.
+    pub(crate) fn store_refusal(&self, principal: &Principal) -> Option<StoreRefusal> {
+        let gate = self.store.as_ref()?;
+        if principal.role != Role::Client {
+            None
+        } else if gate.disabled.contains(&principal.name) {
+            Some(StoreRefusal::Disabled)
+        } else if !gate.complete {
+            Some(StoreRefusal::Unloaded)
+        } else if gate.quarantined.contains(&principal.name) {
+            Some(StoreRefusal::Quarantined)
+        } else {
+            None
+        }
+    }
+
+    /// This policy, the config file's, with what a client store reader holds
+    /// applied (docs/client-store.md): the document's clients join the
+    /// principal table and govern their names, and the restrictions set the
+    /// gate. `endpoints` are this instance's endpoint names, the only ones a
+    /// store client may be pinned to here. Also returns what the operator
+    /// should be told about the result.
+    pub(crate) fn with_store(&self, reader: &Reader, endpoints: &[String]) -> (Self, StoreReport) {
+        let mut next = self.clone();
+        let mut report = StoreReport::default();
+        let mut quarantined = HashSet::new();
+        // Every config-file key, whatever its role.
+        let file_digests: HashSet<[u8; 32]> = self.principals.keys().copied().collect();
+        let set = &reader.set;
+        for client in reader.document.iter().flat_map(|d| &d.clients) {
+            let name = &client.name;
+            // The config file's operator or admin reader keeps the name, its
+            // keys and its policy; the store's client is dropped whole.
+            if self.is_privileged(name) {
+                report.privileged_clients.push(name.clone());
+                continue;
+            }
+            // A store key that is a config-file key: only an edit or a
+            // hand-written import puts one there. The key keeps working for
+            // its own principal, and the store's client falls.
+            let policy = match &client.policy {
+                Ok(_) if client.digests.iter().any(|d| file_digests.contains(d)) => {
+                    Err("key.digest_in_config")
+                }
+                policy => policy.as_ref().map_err(|rule| *rule),
+            };
+            for d in &client.digests {
+                // A revoked digest refuses its store key for good.
+                if !set.revoked_digests.contains(d) && !file_digests.contains(d) {
+                    next.principals.insert(
+                        *d,
+                        Principal {
+                            name: name.clone(),
+                            role: Role::Client,
+                        },
+                    );
+                }
+            }
+            // The store's policy governs the name, config-file keys included.
+            next.client_budgets.remove(name);
+            next.client_utilization_limits.remove(name);
+            let file_entry = next.clients.iter().position(|c| c.name == *name);
+            #[cfg(feature = "guard")]
+            let guard = file_entry
+                .map(|i| next.clients[i].guard)
+                .unwrap_or_default();
+            if let Some(i) = file_entry {
+                next.clients.remove(i);
+            }
+            let policy = match policy {
+                Ok(policy) => policy,
+                Err(rule) => {
+                    quarantined.insert(name.clone());
+                    report.quarantined.push((name.clone(), rule));
+                    continue;
+                }
+            };
+            let (pins, dropped): (Vec<String>, Vec<String>) = policy
+                .preferred_endpoints
+                .iter()
+                .cloned()
+                .partition(|pin| endpoints.contains(pin));
+            report
+                .dropped_pins
+                .extend(dropped.into_iter().map(|pin| (name.clone(), pin)));
+            next.clients.push(ClientEntry {
+                name: name.clone(),
+                models: policy.models.clone(),
+                preferred_endpoints: pins,
+                // Schema 1 has no guard policy, so the config file's stays.
+                #[cfg(feature = "guard")]
+                guard,
+            });
+            if let Some(budget) = policy.daily_budget {
+                next.client_budgets.insert(name.clone(), budget);
+            }
+            if let Some(limit) = policy.utilization_limit {
+                next.client_utilization_limits.insert(name.clone(), limit);
+            }
+        }
+
+        let disabled: HashSet<String> = set
+            .records
+            .iter()
+            .filter(|(_, r)| r.state == RecordState::Disabled)
+            .map(|(name, _)| name.clone())
+            .collect();
+        let known = |name: &str| {
+            self.clients.iter().any(|c| c.name == name)
+                || reader
+                    .document
+                    .iter()
+                    .flat_map(|d| &d.clients)
+                    .any(|c| c.name == name)
+        };
+        for name in &disabled {
+            if self.is_privileged(name) {
+                report.privileged_disabled.push(name.clone());
+            } else if !known(name) {
+                report.unmatched_disabled.push(name.clone());
+            }
+        }
+        report.revoked_outside_store = set
+            .revoked_digests
+            .iter()
+            .filter(|d| file_digests.contains(*d))
+            .count();
+        report.privileged_disabled.sort();
+        report.unmatched_disabled.sort();
+
+        next.store = Some(StoreGate {
+            complete: set.complete,
+            loaded: reader.loaded(),
+            disabled,
+            quarantined,
+        });
+        (next, report)
+    }
+}
+
+/// What an operator should hear about a policy `with_store` built: every
+/// place the store and this instance's config file disagree.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct StoreReport {
+    /// Store clients quarantined here, with the rule each broke.
+    pub(crate) quarantined: Vec<(String, &'static str)>,
+    /// Store clients dropped because their name is an operator's or an admin
+    /// reader's here.
+    pub(crate) privileged_clients: Vec<String>,
+    /// Disabled records naming an operator or an admin reader here, which
+    /// refuse nothing.
+    pub(crate) privileged_disabled: Vec<String>,
+    /// Disabled names that match no client this instance knows: a mistyped
+    /// `disable`, or a client not yet created.
+    pub(crate) unmatched_disabled: Vec<String>,
+    /// Revoked digests matching a config-file key. A store revokes only its
+    /// own keys, so these are ignored here.
+    pub(crate) revoked_outside_store: usize,
+    /// Pins dropped for naming an endpoint this instance lacks:
+    /// `(client, endpoint)`.
+    pub(crate) dropped_pins: Vec<(String, String)>,
 }
 
 /// The principal a `[[clients]]` name resolves to.
@@ -378,13 +628,7 @@ fn check_client_name(name: &str) -> Result<(), String> {
             "client {name:?}: names starting with '_' are reserved for internal labels"
         ));
     }
-    let mut chars = name.chars();
-    let first_ok = chars
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-    let rest_ok =
-        chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
-    if !first_ok || !rest_ok || name.len() > 63 {
+    if !is_name(name) {
         // Debug-quoted: an out-of-alphabet character may be invisible.
         return Err(format!(
             "client {name:?}: name must match ^[a-z0-9][a-z0-9_-]{{0,62}}$ \
@@ -562,6 +806,10 @@ fn check_clients(
     }
 
     let known = |name: &str| seen_names.contains(&name);
+    // Under a client store a response-cache tenant may name a client the
+    // store will bring. It stays inert until that client is loaded, so only
+    // the name rule applies to it.
+    let tenants_from_file = config.client_store.is_none();
     for (surface, name) in std::iter::empty()
         .chain(config.client_budgets.keys().map(|k| ("client_budgets", k)))
         .chain(
@@ -576,6 +824,7 @@ fn check_clients(
             config
                 .response_cache
                 .iter()
+                .filter(|_| tenants_from_file)
                 .flat_map(|rc| rc.clients.iter().map(|k| ("response_cache.clients", k))),
         )
     {
@@ -585,7 +834,59 @@ fn check_clients(
             ));
         }
     }
+    if let Some(name) = config
+        .response_cache
+        .iter()
+        .flat_map(|rc| &rc.clients)
+        .find(|name| !is_name(name))
+    {
+        return Err(format!(
+            "response_cache.clients: \"{name}\" is not a client name (^[a-z0-9][a-z0-9_-]{{0,62}}$)"
+        ));
+    }
     Ok(principals)
+}
+
+/// `[client_store]`: only under `[[clients]]`, where the operators and admin
+/// readers stay in this file and every other caller is a principal from a
+/// key. Under a shared key or an open proxy a caller's name is its own claim,
+/// so a store's clients and restrictions could protect nothing. A token is
+/// sent only over https.
+fn check_client_store(config: &Config, auth_mode: &AuthMode) -> Result<(), String> {
+    let Some(store) = &config.client_store else {
+        return Ok(());
+    };
+    if !matches!(auth_mode, AuthMode::Clients) {
+        return Err(
+            "client_store: requires [[clients]] authentication — the store's clients are \
+             principals of a client key, and under proxy_key or allow_unauthenticated a \
+             caller's name is its own claim"
+                .to_string(),
+        );
+    }
+    let url = reqwest::Url::parse(&store.poll_url)
+        .map_err(|_| "client_store.poll_url: not a URL".to_string())?;
+    if !matches!(url.scheme(), "https" | "http") || !url.has_host() {
+        return Err("client_store.poll_url: must be an http:// or https:// URL".to_string());
+    }
+    // A user or password in the URL would be sent as basic auth, over plain
+    // http too, and the URL is logged at boot.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "client_store.poll_url: must not carry credentials — use client_store.token"
+                .to_string(),
+        );
+    }
+    match &store.token {
+        Some(token) if token.is_empty() => {
+            Err("client_store.token: must not be empty (remove it to poll without one)".to_string())
+        }
+        Some(_) if url.scheme() != "https" => Err(
+            "client_store.token: a token is sent only over https:// — the poll_url is plain http"
+                .to_string(),
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// Startup exposure posture (LAB-1192): unauthenticated is a BOOT FAILURE,

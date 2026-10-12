@@ -207,6 +207,7 @@ pub(crate) fn test_state_base() -> AppState {
         unsupported_models: Mutex::new(HashMap::new()),
         fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache: None,
+        client_store: None,
     }
 }
 
@@ -719,6 +720,58 @@ pub(crate) fn log_capture_buf() -> Arc<Mutex<Vec<u8>>> {
     })
     .clone()
 }
+// The test binary's allocator: the system's, counting what each thread
+// allocates, so a test can bound what one call allocates whatever other tests
+// do on their own threads meanwhile. The counter is const-initialised and
+// holds no destructor, so reading it never allocates.
+thread_local! {
+    static THREAD_ALLOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct CountingAlloc;
+
+fn count_allocation(bytes: usize) {
+    let _ = THREAD_ALLOCATED.try_with(|c| c.set(c.get().saturating_add(bytes)));
+}
+
+// SAFETY: every method forwards to `System` unchanged; counting touches only
+// a thread-local `Cell<usize>`.
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_allocation(layout.size());
+        // SAFETY: the caller's contract is `System`'s.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_allocation(layout.size());
+        // SAFETY: as `alloc`.
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        count_allocation(new_size);
+        // SAFETY: as `alloc`.
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: as `alloc`.
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static COUNTING_ALLOC: CountingAlloc = CountingAlloc;
+
+/// Run `f`, and return what it returned with the bytes this thread allocated
+/// while it ran (frees not subtracted).
+pub(crate) fn allocated_by<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let before = THREAD_ALLOCATED.with(std::cell::Cell::get);
+    let out = f();
+    (out, THREAD_ALLOCATED.with(std::cell::Cell::get) - before)
+}
+
 /// Helper: set up account utilization for enforcement tests.
 pub(crate) async fn set_account_utilization(
     state: &AppState,
@@ -863,6 +916,15 @@ impl TestPolicy {
 
     pub(crate) fn budgets(mut self, budgets: HashMap<String, u64>) -> Self {
         self.0.client_budgets = budgets;
+        self
+    }
+
+    /// `[client_store]`, polled at `poll_url`, with a token when given one.
+    pub(crate) fn client_store(mut self, poll_url: &str, token: Option<&str>) -> Self {
+        self.0.client_store = Some(ClientStoreConfig {
+            poll_url: poll_url.to_string(),
+            token: token.map(str::to_string),
+        });
         self
     }
 

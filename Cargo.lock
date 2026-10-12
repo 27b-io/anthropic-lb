@@ -104,6 +104,7 @@ version = "0.3.1"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "blake2",
  "bytes",
  "cachekit-rs",
@@ -120,6 +121,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-stream",

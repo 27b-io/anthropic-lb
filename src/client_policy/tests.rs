@@ -470,22 +470,21 @@ fn build_maps_each_key_digest_to_its_principal_and_role() {
     assert_eq!(policy.admin_readers, vec!["viewer".to_string()]);
 }
 
-/// The digest is BLAKE2s-256 over its own purpose tag, so it shares nothing
-/// with the fingerprint a rejected credential is logged under.
+/// The digest is the SHA-256 of the key's text, the digest a client store
+/// keeps for the keys it mints (the corpus's `key_digests` cases check that
+/// side), and it shares nothing with the fingerprint a rejected credential is
+/// logged under.
 #[test]
-fn key_digest_is_tagged_and_unrelated_to_the_logged_fingerprint() {
-    use blake2::{Blake2s256, Digest};
+fn key_digest_is_the_sha256_of_the_key_and_unrelated_to_the_logged_fingerprint() {
+    // FIPS 180-2, appendix B.1.
+    assert_eq!(
+        digest_hex(&key_digest("abc")),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
     let key = test_key("geo");
-    let mut h = Blake2s256::new();
-    h.update(b"anthropic-lb/client-key\x1f");
-    h.update(key.as_bytes());
-    let expected: [u8; 32] = h.finalize().into();
-    assert_eq!(key_digest(&key), expected);
-
-    let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
     assert_ne!(
         credential_fingerprint(Some(key.as_bytes())),
-        hex(&key_digest(&key)[..6]),
+        digest_hex(&key_digest(&key))[..12],
         "a logged fingerprint must not be a prefix of the stored digest"
     );
 }
@@ -830,4 +829,110 @@ async fn every_budget_gauge_shows_the_limit_the_gate_enforces_after_a_swap() {
             }
         }
     }
+}
+
+// ── [client_store] ───────────────────────────────────────────────────
+
+/// One `[[clients]]` entry, so a fragment breaks only the rule its test names.
+fn one_client() -> String {
+    format!("\n[[clients]]\nname = \"geo\"\nkey = \"{K1}\"\n")
+}
+
+/// A client store's clients are principals of a client key; under a shared
+/// key or an open proxy a caller's name is its own claim.
+#[test]
+fn build_rejects_a_client_store_without_a_client_table() {
+    let store = "\n[client_store]\npoll_url = \"https://store.example/_clients/poll\"\n";
+    for credentials in [
+        format!("proxy_key = \"{K1}\"\n"),
+        "allow_unauthenticated = true\n".to_string(),
+    ] {
+        let err = refused(&format!("{credentials}{store}"));
+        assert!(
+            err.contains("client_store") && err.contains("[[clients]]"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn build_rejects_a_poll_url_or_token_it_cannot_use_safely() {
+    for (store, expect) in [
+        ("poll_url = \"store.example/_clients/poll\"", "not a URL"),
+        (
+            "poll_url = \"ftp://store.example/poll\"",
+            "http:// or https://",
+        ),
+        (
+            "poll_url = \"http://store.example/poll\"\ntoken = \"reader-token\"",
+            "only over https://",
+        ),
+        (
+            "poll_url = \"https://store.example/poll\"\ntoken = \"\"",
+            "must not be empty",
+        ),
+        (
+            "poll_url = \"http://reader:reader-token@store.example/poll\"",
+            "must not carry credentials",
+        ),
+        (
+            "poll_url = \"https://reader-token@store.example/poll\"",
+            "must not carry credentials",
+        ),
+    ] {
+        let err = refused(&format!("{}\n[client_store]\n{store}\n", one_client()));
+        assert!(err.contains(expect), "expected '{expect}' in: {err}");
+        assert!(!err.contains("reader-token"), "never echo a token: {err}");
+    }
+}
+
+/// The policy a boot installs has the store's gate closed, so nothing waits
+/// on the reader to start before ordinary clients are refused.
+#[test]
+fn build_closes_the_gate_of_a_client_store() {
+    for store in [
+        "poll_url = \"http://store.internal/_clients/poll\"",
+        "poll_url = \"https://store.example/_clients/poll\"\ntoken = \"reader-token\"",
+    ] {
+        let (_, policy) = built(&format!("{}\n[client_store]\n{store}\n", one_client()));
+        let gate = policy.store.as_ref().expect("a client store gate");
+        assert!(!gate.complete && !gate.loaded);
+        let principal = Principal {
+            name: "geo".to_string(),
+            role: Role::Client,
+        };
+        assert_eq!(
+            policy.store_refusal(&principal),
+            Some(StoreRefusal::Unloaded)
+        );
+    }
+    let (_, policy) = built(&one_client());
+    assert!(policy.store.is_none(), "no store, no gate");
+}
+
+/// Under a client store a response-cache tenant may name a client the store
+/// will bring; it must still be a client name.
+#[test]
+fn a_response_cache_tenant_may_name_a_store_client_only_under_a_client_store() {
+    let store = "\n[client_store]\npoll_url = \"https://store.example/_clients/poll\"\n";
+    built(&format!(
+        "{}{store}{RC_BLOCK}clients = [\"geo\", \"store-only\"]\n",
+        one_client()
+    ));
+    let err = refused(&format!(
+        "{}{store}{RC_BLOCK}clients = [\"Not-A-Name\"]\n",
+        one_client()
+    ));
+    assert!(
+        err.contains("response_cache.clients") && err.contains("Not-A-Name"),
+        "{err}"
+    );
+    let err = refused(&format!(
+        "{}{RC_BLOCK}clients = [\"store-only\"]\n",
+        one_client()
+    ));
+    assert!(
+        err.contains("names no configured [[clients]] entry"),
+        "{err}"
+    );
 }

@@ -34,7 +34,8 @@ fn unknown_client_key_is_rejected() {
     let state = state_with_clients(vec![mk_client("geo", &test_key("key-geo"), &[])]);
     let resp = state
         .authenticate(&hdrs(&[("x-api-key", &test_key("key-wrong"))]), false)
-        .expect_err("unknown key must not authenticate");
+        .expect_err("unknown key must not authenticate")
+        .into_response();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -43,7 +44,8 @@ fn missing_credential_is_rejected_when_clients_configured() {
     let state = state_with_clients(vec![mk_client("geo", &test_key("key-geo"), &[])]);
     let resp = state
         .authenticate(&hyper::HeaderMap::new(), false)
-        .expect_err("absent credential must not authenticate");
+        .expect_err("absent credential must not authenticate")
+        .into_response();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -302,7 +304,8 @@ fn a_short_presented_shared_key_never_matches() {
     for allow_bearer in [false, true] {
         let err = state
             .authenticate(&hdrs(&[("x-api-key", &short)]), allow_bearer)
-            .expect_err("a short shared key must not authenticate");
+            .expect_err("a short shared key must not authenticate")
+            .into_response();
         assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
     }
 }
@@ -384,7 +387,8 @@ fn an_empty_principal_table_refuses_rather_than_opens() {
         for allow_bearer in [false, true] {
             let err = state
                 .authenticate(&headers, allow_bearer)
-                .expect_err("an empty table must not open the proxy");
+                .expect_err("an empty table must not open the proxy")
+                .into_response();
             assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
         }
     }
