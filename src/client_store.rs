@@ -1,5 +1,5 @@
 use crate::*;
-use serde_json::{value::RawValue, Map, Value};
+use serde_json::value::RawValue;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 // ── Client store reader ─────────────────────────────────────────────
@@ -107,10 +107,21 @@ fn is_timestamp(s: &str) -> bool {
         })
 }
 
+/// A JSON object's members, each kept as its raw text until a rule reads it.
+/// A member no rule reads is never built, however large, so checking a text
+/// costs a small multiple of its size whatever it holds.
+type Members<'a> = HashMap<String, &'a RawValue>;
+
+/// `raw` as a `T`, or `None` when it is not one. A typed parse fails at the
+/// first token of another kind, without building the value it meets.
+fn parse<'a, T: Deserialize<'a>>(raw: &'a RawValue) -> Option<T> {
+    serde_json::from_str(raw.get()).ok()
+}
+
 /// A JSON integer from 0 to 2^53−1. Only a number written as plain digits
 /// parses to a `u64`, so a sign, a fraction or an exponent fails here.
-fn int(v: &Value) -> Option<u64> {
-    v.as_u64().filter(|&n| n <= MAX_INT)
+fn int(raw: &RawValue) -> Option<u64> {
+    parse::<u64>(raw).filter(|&n| n <= MAX_INT)
 }
 
 /// 1 to 128 printable ASCII characters other than `"`, `,` and `\`, with `*`
@@ -138,25 +149,35 @@ fn is_label(s: &str) -> bool {
 }
 
 /// Whether `obj` holds exactly the members `names`.
-fn has_members(obj: &Map<String, Value>, names: &[&str]) -> bool {
+fn has_members(obj: &Members, names: &[&str]) -> bool {
     obj.len() == names.len() && names.iter().all(|n| obj.contains_key(*n))
 }
 
 /// The string member `name` of `obj`, if it is one.
-fn str_member<'a>(obj: &'a Map<String, Value>, name: &str) -> Option<&'a str> {
-    obj.get(name).and_then(Value::as_str)
+fn str_member(obj: &Members, name: &str) -> Option<String> {
+    obj.get(name).and_then(|raw| parse(raw))
 }
 
-/// `v` as an array of at most `max` strings that each pass `valid`.
-fn strings(v: Option<&Value>, max: usize, valid: fn(&str) -> bool) -> Option<Vec<String>> {
-    let items = v?.as_array()?;
+/// `raw` as the elements of an array, each still raw.
+fn elements<'a>(raw: Option<&&'a RawValue>) -> Option<Vec<&'a RawValue>> {
+    parse(raw?)
+}
+
+/// `raw` as an array of at most `max` strings that each pass `valid`.
+fn strings(raw: Option<&&RawValue>, max: usize, valid: fn(&str) -> bool) -> Option<Vec<String>> {
+    let items = elements(raw)?;
     if items.len() > max {
         return None;
     }
     items
-        .iter()
-        .map(|s| s.as_str().filter(|s| valid(s)).map(str::to_string))
+        .into_iter()
+        .map(|s| parse::<String>(s).filter(|s| valid(s)))
         .collect()
+}
+
+/// `raw` as a digest's 32 bytes, if it is a digest's text.
+fn digest_of(raw: Option<&&RawValue>) -> Option<[u8; 32]> {
+    parse::<String>(raw?).as_deref().and_then(parse_digest)
 }
 
 // ── The document ────────────────────────────────────────────────────
@@ -200,11 +221,9 @@ pub(crate) fn check_document(text: &str) -> Result<Document, &'static str> {
     if text.len() > MAX_TEXT_BYTES {
         return Err("document.size");
     }
-    let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(text) else {
-        return Err("document.object");
-    };
+    let doc: Members = serde_json::from_str(text).map_err(|_| "document.object")?;
     // Before any other member, so a newer schema is reported as one.
-    if doc.get("schema").and_then(int) != Some(1) {
+    if doc.get("schema").and_then(|raw| int(raw)) != Some(1) {
         return Err("document.schema");
     }
     if !has_members(&doc, &DOCUMENT_MEMBERS) {
@@ -212,48 +231,39 @@ pub(crate) fn check_document(text: &str) -> Result<Document, &'static str> {
     }
     let version = doc
         .get("version")
-        .and_then(int)
+        .and_then(|raw| int(raw))
         .filter(|&v| v >= 1)
         .ok_or("document.version")?;
-    if !doc
-        .get("updated_at")
-        .and_then(Value::as_str)
-        .is_some_and(is_timestamp)
-    {
+    if !str_member(&doc, "updated_at").is_some_and(|t| is_timestamp(&t)) {
         return Err("document.updated_at");
     }
-    let clients: Vec<&Map<String, Value>> = match doc.get("clients") {
-        Some(Value::Array(a)) if a.len() <= MAX_CLIENTS => a
-            .iter()
-            .map(Value::as_object)
-            .collect::<Option<_>>()
-            .ok_or("document.clients")?,
-        _ => return Err("document.clients"),
-    };
-    let mut names = HashSet::with_capacity(clients.len());
-    let names_ok = clients.iter().all(|c| {
-        c.get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|n| is_name(n) && names.insert(n))
-    });
-    if !names_ok {
+    let clients: Vec<Members> = elements(doc.get("clients"))
+        .filter(|a| a.len() <= MAX_CLIENTS)
+        .and_then(|a| a.into_iter().map(parse).collect())
+        .ok_or("document.clients")?;
+    let names: Vec<String> = clients
+        .iter()
+        .map(|c| str_member(c, "name"))
+        .collect::<Option<_>>()
+        .ok_or("document.name")?;
+    let mut seen_names = HashSet::with_capacity(names.len());
+    if !names
+        .iter()
+        .all(|n| is_name(n) && seen_names.insert(n.as_str()))
+    {
         return Err("document.name");
     }
-    let keys: Vec<Vec<&Map<String, Value>>> = clients
+    let keys: Vec<Vec<Members>> = clients
         .iter()
         .map(|c| {
-            c.get("keys")
-                .and_then(Value::as_array)?
-                .iter()
-                .map(|k| k.as_object().filter(|k| k.contains_key("digest")))
+            elements(c.get("keys"))?
+                .into_iter()
+                .map(|k| parse::<Members>(k).filter(|k| k.contains_key("digest")))
                 .collect::<Option<Vec<_>>>()
         })
         .collect::<Option<_>>()
         .ok_or("document.keys")?;
-    let Some(Value::Array(revoked)) = doc.get("revoked_digests") else {
-        return Err("document.revoked_digests");
-    };
-    let digest_of = |v: Option<&Value>| v.and_then(Value::as_str).and_then(parse_digest);
+    let revoked = elements(doc.get("revoked_digests")).ok_or("document.revoked_digests")?;
     let digests: Vec<Vec<[u8; 32]>> = keys
         .iter()
         .map(|ks| ks.iter().map(|k| digest_of(k.get("digest"))).collect())
@@ -275,14 +285,11 @@ pub(crate) fn check_document(text: &str) -> Result<Document, &'static str> {
     }
     let clients = clients
         .iter()
+        .zip(names)
         .zip(keys)
         .zip(digests)
-        .map(|((c, keys), digests)| StoreClient {
-            name: c
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+        .map(|(((c, name), keys), digests)| StoreClient {
+            name,
             digests,
             policy: check_client(c, &keys),
         })
@@ -299,28 +306,26 @@ pub(crate) fn check_document(text: &str) -> Result<Document, &'static str> {
 /// The client rules, in the table's order, on one client whose envelope
 /// already passed: `Err` is the first rule it breaks. Rules on keys are
 /// checked across all of the client's keys before the next rule.
-fn check_client(
-    c: &Map<String, Value>,
-    keys: &[&Map<String, Value>],
-) -> Result<StorePolicy, &'static str> {
+fn check_client(c: &Members, keys: &[Members]) -> Result<StorePolicy, &'static str> {
     if !has_members(c, &CLIENT_MEMBERS) {
         return Err("client.members");
     }
-    let daily_budget = match c.get("daily_budget") {
-        Some(Value::Null) => None,
-        v => Some(
-            v.and_then(int)
-                .filter(|&n| n >= 1)
-                .ok_or("client.daily_budget")?,
-        ),
+    // `Some(None)` is `null`: no budget, or no ceiling.
+    let daily_budget = match c
+        .get("daily_budget")
+        .and_then(|raw| parse::<Option<u64>>(raw))
+    {
+        Some(None) => None,
+        Some(Some(n)) if (1..=MAX_INT).contains(&n) => Some(n),
+        _ => return Err("client.daily_budget"),
     };
-    let utilization_limit = match c.get("utilization_limit") {
-        Some(Value::Null) => None,
-        v => Some(
-            v.and_then(Value::as_f64)
-                .filter(|&l| l > 0.0 && l <= 1.0)
-                .ok_or("client.utilization_limit")?,
-        ),
+    let utilization_limit = match c
+        .get("utilization_limit")
+        .and_then(|raw| parse::<Option<f64>>(raw))
+    {
+        Some(None) => None,
+        Some(Some(l)) if l > 0.0 && l <= 1.0 => Some(l),
+        _ => return Err("client.utilization_limit"),
     };
     let models = strings(c.get("models"), MAX_MODELS, is_model_pattern).ok_or("client.models")?;
     let preferred_endpoints = strings(c.get("preferred_endpoints"), MAX_PINS, is_name)
@@ -331,22 +336,23 @@ fn check_client(
     if !keys.iter().all(|k| has_members(k, &KEY_MEMBERS)) {
         return Err("key.members");
     }
-    let mut ids = HashSet::new();
-    if !keys
+    let ids: Vec<String> = keys
         .iter()
-        .all(|k| str_member(k, "id").is_some_and(|id| is_key_id(id) && ids.insert(id)))
-    {
+        .map(|k| str_member(k, "id").filter(|id| is_key_id(id)))
+        .collect::<Option<_>>()
+        .ok_or("key.id")?;
+    if ids.iter().collect::<HashSet<_>>().len() != ids.len() {
         return Err("key.id");
     }
     if !keys
         .iter()
-        .all(|k| str_member(k, "label").is_some_and(is_label))
+        .all(|k| str_member(k, "label").is_some_and(|l| is_label(&l)))
     {
         return Err("key.label");
     }
     if !keys
         .iter()
-        .all(|k| str_member(k, "created_at").is_some_and(is_timestamp))
+        .all(|k| str_member(k, "created_at").is_some_and(|t| is_timestamp(&t)))
     {
         return Err("key.created_at");
     }
@@ -412,58 +418,53 @@ pub(crate) fn check_part(tag: &str, body: &str) -> Result<PartBody, &'static str
     if parse_digest(tag) != Some(sha256(body.as_bytes())) {
         return Err("part.tag");
     }
-    let Ok(Value::Object(part)) = serde_json::from_str::<Value>(body) else {
-        return Err("part.object");
-    };
+    let part: Members = serde_json::from_str(body).map_err(|_| "part.object")?;
     if !has_members(&part, &PART_MEMBERS) {
         return Err("part.members");
     }
     let full = part
         .get("full")
-        .and_then(Value::as_bool)
+        .and_then(|raw| parse::<bool>(raw))
         .ok_or("part.full")?;
     let enabled_ahead = part
         .get("enabled_ahead")
-        .and_then(int)
+        .and_then(|raw| int(raw))
         .ok_or("part.enabled_ahead")?;
-    let records: Vec<&Map<String, Value>> = match part.get("records") {
-        Some(Value::Array(a)) => a
-            .iter()
-            .map(|r| r.as_object().filter(|r| has_members(r, &RECORD_MEMBERS)))
-            .collect::<Option<_>>()
-            .ok_or("part.records")?,
-        _ => return Err("part.records"),
-    };
-    let mut seen = HashSet::with_capacity(records.len());
-    let names: Vec<&str> = records
-        .iter()
-        .map(|r| {
-            r.get("name")
-                .and_then(Value::as_str)
-                .filter(|n| is_name(n) && seen.insert(*n))
+    let records: Vec<Members> = elements(part.get("records"))
+        .and_then(|a| {
+            a.into_iter()
+                .map(|r| parse::<Members>(r).filter(|r| has_members(r, &RECORD_MEMBERS)))
+                .collect()
         })
+        .ok_or("part.records")?;
+    let mut seen = HashSet::with_capacity(records.len());
+    let names: Vec<String> = records
+        .iter()
+        .map(|r| str_member(r, "name").filter(|n| is_name(n) && seen.insert(n.clone())))
         .collect::<Option<_>>()
         .ok_or("part.record_name")?;
     let states: Vec<RecordState> = records
         .iter()
         .map(|r| {
-            r.get("state")
-                .and_then(Value::as_str)
+            str_member(r, "state")
+                .as_deref()
                 .and_then(RecordState::parse)
         })
         .collect::<Option<_>>()
         .ok_or("part.record_state")?;
     let versions: Vec<u64> = records
         .iter()
-        .map(|r| r.get("version").and_then(int).filter(|&v| v >= 1))
+        .map(|r| {
+            r.get("version")
+                .and_then(|raw| int(raw))
+                .filter(|&v| v >= 1)
+        })
         .collect::<Option<_>>()
         .ok_or("part.record_version")?;
-    let Some(Value::Array(digests)) = part.get("revoked_digests") else {
-        return Err("part.revoked_digests");
-    };
+    let digests = elements(part.get("revoked_digests")).ok_or("part.revoked_digests")?;
     let mut revoked_digests = BTreeSet::new();
-    for d in digests {
-        match d.as_str().and_then(parse_digest) {
+    for d in &digests {
+        match digest_of(Some(d)) {
             Some(d) if revoked_digests.insert(d) => {}
             _ => return Err("part.revoked_digests"),
         }
@@ -472,7 +473,7 @@ pub(crate) fn check_part(tag: &str, body: &str) -> Result<PartBody, &'static str
         .into_iter()
         .zip(states)
         .zip(versions)
-        .map(|((name, state), version)| (name.to_string(), Record { state, version }))
+        .map(|((name, state), version)| (name, Record { state, version }))
         .collect();
     Ok(PartBody {
         full,
@@ -669,16 +670,32 @@ struct Answer<'a> {
     restrictions: Option<&'a RawValue>,
 }
 
-/// One answer part as an object, with its `status` checked: `None` when the
-/// part is unavailable.
-fn answer_part(
-    raw: Option<&RawValue>,
+/// One answer part, its members kept raw. Members it does not name are
+/// skipped without being built, so an answer costs what its known members do.
+#[derive(Deserialize)]
+struct RawPart<'a> {
+    #[serde(borrow, default)]
+    status: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    version: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    digest: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    text: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    tag: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    body: Option<&'a RawValue>,
+}
+
+/// One answer part with its `status` checked: `None` when the part is
+/// unavailable.
+fn answer_part<'a>(
+    raw: Option<&'a RawValue>,
     fault: &'static str,
-) -> Result<Option<Map<String, Value>>, &'static str> {
-    let Some(Value::Object(part)) = raw.and_then(|r| serde_json::from_str(r.get()).ok()) else {
-        return Err(fault);
-    };
-    match part.get("status").and_then(Value::as_str) {
+) -> Result<Option<RawPart<'a>>, &'static str> {
+    let part: RawPart = raw.and_then(parse).ok_or(fault)?;
+    match part.status.and_then(parse::<String>).as_deref() {
         Some("unavailable") => Ok(None),
         Some("ok") => Ok(Some(part)),
         _ => Err(fault),
@@ -757,18 +774,10 @@ impl Reader {
         let Some(part) = answer_part(raw, "poll.document")? else {
             return Ok(false);
         };
-        let version = part
-            .get("version")
-            .and_then(int)
-            .ok_or("poll.document.version")?;
+        let version = part.version.and_then(int).ok_or("poll.document.version")?;
         let digest = match version {
             0 => None,
-            _ => Some(
-                part.get("digest")
-                    .and_then(Value::as_str)
-                    .and_then(parse_digest)
-                    .ok_or("poll.document.digest")?,
-            ),
+            _ => Some(digest_of(part.digest.as_ref()).ok_or("poll.document.digest")?),
         };
         let held = self.document.as_ref().map_or(0, |d| d.version);
         if version <= held {
@@ -779,14 +788,11 @@ impl Reader {
                 version == held && held > 0 && digest != self.document.as_ref().map(|d| d.digest);
             return Ok(false);
         }
-        let text = part
-            .get("text")
-            .and_then(Value::as_str)
-            .ok_or("poll.document.text")?;
+        let text: String = part.text.and_then(parse).ok_or("poll.document.text")?;
         if digest != Some(sha256(text.as_bytes())) {
             return Err("poll.document.digest");
         }
-        let doc = check_document(text)?;
+        let doc = check_document(&text)?;
         if doc.version != version {
             return Err("poll.document.version");
         }
@@ -824,14 +830,10 @@ impl Reader {
         let Some(part) = answer_part(raw, "poll.restrictions")? else {
             return Ok(());
         };
-        let tag_text = part
-            .get("tag")
-            .and_then(Value::as_str)
-            .ok_or("poll.restrictions.tag")?;
-        let tag = parse_digest(tag_text).ok_or("poll.restrictions.tag")?;
-        let body = match part.get("body") {
-            Some(Value::String(body)) => body,
-            Some(_) => return Err("poll.restrictions.body"),
+        let tag_text: String = part.tag.and_then(parse).ok_or("poll.restrictions.tag")?;
+        let tag = parse_digest(&tag_text).ok_or("poll.restrictions.tag")?;
+        let body: String = match part.body {
+            Some(raw) => parse(raw).ok_or("poll.restrictions.body")?,
             // No body: the part is the one this reader merged last.
             None if sent_tag == Some(tag) => {
                 self.status.restrictions_ok_ms = now_us / 1000;
@@ -839,7 +841,7 @@ impl Reader {
             }
             None => return Err("poll.restrictions.body"),
         };
-        let body = check_part(tag_text, body)?;
+        let body = check_part(&tag_text, &body)?;
         self.skipped_ahead = self.set.merge(&body, now_us);
         self.last_part = Some((tag, body));
         self.status.restrictions_ok_ms = now_us / 1000;
@@ -914,6 +916,9 @@ pub(crate) struct ClientStore {
     answered: tokio::sync::watch::Sender<bool>,
     /// Polls failed in a row.
     failures: AtomicU64,
+    /// Resume copy saves failed in a row. While above 0 a copy is owed, and
+    /// every poll tries to save one.
+    resume_failures: AtomicU64,
 }
 
 /// What `ClientStore::metrics` reports.
@@ -1051,6 +1056,7 @@ impl ClientStore {
             refusals: Default::default(),
             answered: tokio::sync::watch::channel(false).0,
             failures: AtomicU64::new(0),
+            resume_failures: AtomicU64::new(0),
         })
     }
 
@@ -1204,9 +1210,7 @@ impl ClientStore {
         if let Some(set) = &changed.set {
             log_restrictions(set, "change");
         }
-        if let Some(resume) = &changed.resume {
-            self.write_resume(resume).await;
-        }
+        self.save(changed.resume).await;
         true
     }
 
@@ -1278,35 +1282,71 @@ impl ClientStore {
         }
     }
 
-    /// Save the resume copy: written to a sibling, synced, renamed over the
-    /// last copy, and the directory synced, so a crash leaves the old copy or
-    /// the new one, never a torn or rolled-back one.
-    async fn write_resume(&self, resume: &Resume) {
-        let json = match serde_json::to_vec(resume) {
-            Ok(json) => json,
-            Err(e) => {
-                warn!(path = %self.resume_path.display(), error = %e, "client store: cannot serialise the resume copy");
-                return;
+    /// Save the resume copy when an answer changed what is held, and again
+    /// after a save that failed, until one lands.
+    async fn save(&self, changed: Option<Resume>) {
+        let resume = match changed {
+            Some(resume) => resume,
+            None if self.resume_failures.load(Ordering::Relaxed) > 0 => {
+                resume_copy(&self.lock_reader())
             }
+            None => return,
         };
+        self.write_resume(&resume).await;
+    }
+
+    /// Write the resume copy to a sibling, sync it, rename it over the last
+    /// copy and sync the directory, so a crash leaves the old copy or the new
+    /// one, never a torn one. When the write fails the last copy is removed:
+    /// it is older than what is held, and resuming it after a restart could
+    /// lift a restriction the store has since lost. A restart then waits for
+    /// the store, and the next poll writes again.
+    async fn write_resume(&self, resume: &Resume) {
+        let json = serde_json::to_vec(resume).map_err(std::io::Error::other);
         let path = self.resume_path.clone();
         let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            use std::io::Write;
-            let mut tmp = path.clone().into_os_string();
-            tmp.push(".tmp");
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(&json)?;
-            file.sync_all()?;
-            std::fs::rename(&tmp, &path)?;
-            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                std::fs::File::open(dir)?.sync_all()?;
-            }
-            Ok(())
+            let write = || -> std::io::Result<()> {
+                use std::io::Write;
+                let json = json?;
+                let mut tmp = path.clone().into_os_string();
+                tmp.push(".tmp");
+                let mut file = std::fs::File::create(&tmp)?;
+                file.write_all(&json)?;
+                file.sync_all()?;
+                std::fs::rename(&tmp, &path)?;
+                if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                    std::fs::File::open(dir)?.sync_all()?;
+                }
+                Ok(())
+            };
+            write().map_err(|e| match std::fs::remove_file(&path) {
+                Ok(()) => e,
+                Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => e,
+                Err(rm) => std::io::Error::other(format!(
+                    "{e}; the last copy could not be removed either: {rm}"
+                )),
+            })
         })
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(e)));
-        if let Err(e) = written {
-            warn!(path = %self.resume_path.display(), error = %e, "client store: cannot write the resume copy");
+        match written {
+            Ok(()) => {
+                let failures = self.resume_failures.swap(0, Ordering::Relaxed);
+                if failures > 0 {
+                    info!(failures, "client store: resume copy written again");
+                }
+            }
+            Err(e) => {
+                let failures = self.resume_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if failures == 1 || failures.is_multiple_of(FAILURE_LOG_EVERY) {
+                    warn!(
+                        path = %self.resume_path.display(),
+                        error = %e,
+                        failures,
+                        "client store: cannot write the resume copy; the last copy is removed, and the next poll tries again"
+                    );
+                }
+            }
         }
     }
 
@@ -1366,7 +1406,9 @@ pub(crate) async fn await_first_poll(answered: Option<tokio::sync::watch::Receiv
 }
 
 /// `GET /_ready`: 200 once the instance is loaded, 503 until then. Carries
-/// one bit and needs no credential, so a readiness probe can call it.
+/// one bit, so it needs no credential and skips `allowed_ips`: a readiness
+/// probe comes from wherever the orchestrator runs it, and an allow-list that
+/// left it out would hold every instance unready.
 pub(crate) async fn ready_handler(State(state): State<Arc<AppState>>) -> Response {
     let loaded = state
         .current_client_policy()

@@ -1,5 +1,5 @@
 use super::*;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 
 mod corpus;
 mod reader;
@@ -244,9 +244,7 @@ impl Instance {
             .store
             .apply(&self.state, &answer, now_us())
             .expect("readable answer");
-        if let Some(resume) = &changed.resume {
-            self.store.write_resume(resume).await;
-        }
+        self.store.save(changed.resume).await;
     }
 
     /// How authenticating `key` turns out: the principal's name, or the

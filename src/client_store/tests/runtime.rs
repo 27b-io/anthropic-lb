@@ -331,6 +331,53 @@ async fn a_resume_restores_what_was_held_and_is_loaded_only_with_a_complete_set(
     assert_eq!(again.auth(&test_key("beta-2")), Ok("beta".to_string()));
 }
 
+/// A save that fails removes the last copy, so a restart in between waits
+/// for the store instead of resuming a copy that lacks what was held. The
+/// next poll saves again, change or not.
+#[tokio::test]
+async fn a_failed_save_removes_the_stale_copy_and_is_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.client-store.json");
+    let poll_url = "https://store.invalid/_clients/poll";
+    let clients = || file_clients(&["file-only"]);
+    let inst = Instance::in_dir("http://127.0.0.1:9", clients(), poll_url, None, dir.path());
+    inst.answer_and_save(answer(
+        unavailable(),
+        restrictions_part(&body(true, &[], &[])),
+    ))
+    .await;
+    assert!(path.exists());
+
+    // The next save cannot land: its sibling path is taken.
+    let blocker = dir.path().join("config.client-store.json.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    let disabled = restrictions_part(&body(true, &[("file-only", Disabled, now_us() - 1)], &[]));
+    inst.answer_and_save(answer(unavailable(), disabled.clone()))
+        .await;
+    assert_eq!(
+        inst.auth(&test_key("file-only")),
+        Err(403),
+        "held in memory"
+    );
+    assert!(!path.exists(), "the copy that lacks the disable is gone");
+    // A restart now resumes nothing, and waits for the store.
+    let restarted = Instance::in_dir("http://127.0.0.1:9", clients(), poll_url, None, dir.path());
+    restarted.store.resume(&restarted.state).await;
+    assert_eq!(restarted.auth(&test_key("file-only")), Err(503));
+
+    // The path frees up: the next poll saves, though nothing changed.
+    std::fs::remove_dir(&blocker).unwrap();
+    inst.answer_and_save(answer(unavailable(), disabled)).await;
+    assert!(path.exists());
+    let restarted = Instance::in_dir("http://127.0.0.1:9", clients(), poll_url, None, dir.path());
+    restarted.store.resume(&restarted.state).await;
+    assert_eq!(
+        restarted.auth(&test_key("file-only")),
+        Err(403),
+        "the disable survives the restart"
+    );
+}
+
 #[tokio::test]
 async fn a_resume_copy_that_fails_its_checks_is_ignored() {
     let dir = tempfile::tempdir().unwrap();

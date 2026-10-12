@@ -607,3 +607,68 @@ fn the_poll_carries_the_held_set_hash_and_its_completeness_mark() {
     );
     assert_eq!(param(&q, "set_complete"), Some("true"));
 }
+
+// ── What checking costs ──────────────────────────────────────────────
+
+/// `len` bytes of JSON array, its elements arrays nested 8 deep: the shape
+/// that costs the most to build as a JSON value tree.
+fn nested_padding(len: usize) -> String {
+    const UNIT: &str = "[[[[[[[[0]]]]]]]]";
+    let mut pad = String::with_capacity(len + UNIT.len() + 2);
+    pad.push('[');
+    while pad.len() + UNIT.len() + 2 < len {
+        if pad.len() > 1 {
+            pad.push(',');
+        }
+        pad.push_str(UNIT);
+    }
+    pad.push(']');
+    pad
+}
+
+/// Members no rule reads are never built: a 16 MiB answer whose bulk is an
+/// unknown member costs a fraction of its size, not the gigabytes a value
+/// tree of it would, and an instance cannot be run out of memory by one.
+#[test]
+fn an_answer_costs_what_its_known_members_do() {
+    let answer = format!(
+        r#"{{"document":{{"status":"unavailable","pad":{}}},"restrictions":{{"status":"unavailable"}}}}"#,
+        nested_padding(16 * 1024 * 1024 - 100)
+    );
+    let mut reader = Reader::default();
+    let (applied, bytes) = allocated_by(|| reader.apply(answer.as_bytes(), NOW_US));
+    assert_eq!(applied, Ok(Applied::default()));
+    assert!(
+        bytes < answer.len() / 4,
+        "applying a {} byte answer allocated {bytes} bytes",
+        answer.len()
+    );
+}
+
+/// The same holds for a document text and a restrictions body at their size
+/// limit, refused for the member that should not be there.
+#[test]
+fn checking_a_text_costs_a_small_multiple_of_its_size() {
+    let doc = format!(
+        r#"{{"schema":1,"pad":{}}}"#,
+        nested_padding(MAX_TEXT_BYTES - 100)
+    );
+    let (refused, bytes) = allocated_by(|| check_document(&doc).err());
+    assert_eq!(refused, Some("document.members"));
+    assert!(
+        bytes < doc.len() / 4,
+        "checking a document allocated {bytes} bytes"
+    );
+
+    let body = format!(
+        r#"{{"full":true,"pad":{}}}"#,
+        nested_padding(MAX_TEXT_BYTES - 100)
+    );
+    let tag = digest_hex(&sha256(body.as_bytes()));
+    let (refused, bytes) = allocated_by(|| check_part(&tag, &body).err());
+    assert_eq!(refused, Some("part.members"));
+    assert!(
+        bytes < body.len() / 4,
+        "checking a part allocated {bytes} bytes"
+    );
+}
