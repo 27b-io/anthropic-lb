@@ -830,3 +830,101 @@ async fn every_budget_gauge_shows_the_limit_the_gate_enforces_after_a_swap() {
         }
     }
 }
+
+// ── [client_store] ───────────────────────────────────────────────────
+
+/// One `[[clients]]` entry, so a fragment breaks only the rule its test names.
+fn one_client() -> String {
+    format!("\n[[clients]]\nname = \"geo\"\nkey = \"{K1}\"\n")
+}
+
+/// A client store's clients are principals of a client key; under a shared
+/// key or an open proxy a caller's name is its own claim.
+#[test]
+fn build_rejects_a_client_store_without_a_client_table() {
+    let store = "\n[client_store]\npoll_url = \"https://store.example/_clients/poll\"\n";
+    for credentials in [
+        format!("proxy_key = \"{K1}\"\n"),
+        "allow_unauthenticated = true\n".to_string(),
+    ] {
+        let err = refused(&format!("{credentials}{store}"));
+        assert!(
+            err.contains("client_store") && err.contains("[[clients]]"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn build_rejects_a_poll_url_or_token_it_cannot_use_safely() {
+    for (store, expect) in [
+        ("poll_url = \"store.example/_clients/poll\"", "not a URL"),
+        (
+            "poll_url = \"ftp://store.example/poll\"",
+            "http:// or https://",
+        ),
+        (
+            "poll_url = \"http://store.example/poll\"\ntoken = \"reader-token\"",
+            "only over https://",
+        ),
+        (
+            "poll_url = \"https://store.example/poll\"\ntoken = \"\"",
+            "must not be empty",
+        ),
+    ] {
+        let err = refused(&format!("{}\n[client_store]\n{store}\n", one_client()));
+        assert!(err.contains(expect), "expected '{expect}' in: {err}");
+        assert!(!err.contains("reader-token"), "never echo a token: {err}");
+    }
+}
+
+/// The policy a boot installs has the store's gate closed, so nothing waits
+/// on the reader to start before ordinary clients are refused.
+#[test]
+fn build_closes_the_gate_of_a_client_store() {
+    for store in [
+        "poll_url = \"http://store.internal/_clients/poll\"",
+        "poll_url = \"https://store.example/_clients/poll\"\ntoken = \"reader-token\"",
+    ] {
+        let (_, policy) = built(&format!("{}\n[client_store]\n{store}\n", one_client()));
+        let gate = policy.store.as_ref().expect("a client store gate");
+        assert!(!gate.complete && !gate.loaded);
+        let principal = Principal {
+            name: "geo".to_string(),
+            role: Role::Client,
+        };
+        assert_eq!(
+            policy.store_refusal(&principal),
+            Some(StoreRefusal::Unloaded)
+        );
+    }
+    let (_, policy) = built(&one_client());
+    assert!(policy.store.is_none(), "no store, no gate");
+}
+
+/// Under a client store a response-cache tenant may name a client the store
+/// will bring; it must still be a client name.
+#[test]
+fn a_response_cache_tenant_may_name_a_store_client_only_under_a_client_store() {
+    let store = "\n[client_store]\npoll_url = \"https://store.example/_clients/poll\"\n";
+    built(&format!(
+        "{}{store}{RC_BLOCK}clients = [\"geo\", \"store-only\"]\n",
+        one_client()
+    ));
+    let err = refused(&format!(
+        "{}{store}{RC_BLOCK}clients = [\"Not-A-Name\"]\n",
+        one_client()
+    ));
+    assert!(
+        err.contains("response_cache.clients") && err.contains("Not-A-Name"),
+        "{err}"
+    );
+    let err = refused(&format!(
+        "{}{RC_BLOCK}clients = [\"store-only\"]\n",
+        one_client()
+    ));
+    assert!(
+        err.contains("names no configured [[clients]] entry"),
+        "{err}"
+    );
+}

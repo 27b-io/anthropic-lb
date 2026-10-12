@@ -867,6 +867,15 @@ impl TestPolicy {
         self
     }
 
+    /// `[client_store]`, polled at `poll_url`, with a token when given one.
+    pub(crate) fn client_store(mut self, poll_url: &str, token: Option<&str>) -> Self {
+        self.0.client_store = Some(ClientStoreConfig {
+            poll_url: poll_url.to_string(),
+            token: token.map(str::to_string),
+        });
+        self
+    }
+
     pub(crate) fn utilization_limits(mut self, limits: HashMap<String, f64>) -> Self {
         self.0.client_utilization_limits = limits;
         self

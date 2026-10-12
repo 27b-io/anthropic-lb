@@ -1,6 +1,6 @@
 # Client store: reader protocol and formats
 
-Status: specification. The proxy does not read a client store yet.
+Status: implemented. The proxy reads a client store when `[client_store]` is configured; the README's "Client store" section covers its configuration, refusals and metrics.
 
 A client store keeps a fleet's ordinary clients in one place, so a key, a budget or a model list changes without a redeploy. Each proxy instance is a *reader*: it polls the store and enforces what it receives, and it cannot write. This page fixes what a store and its readers exchange, so that the two sides can be built and tested apart. [`tests/client-store/`](../tests/client-store/) holds the corpus both sides test against.
 

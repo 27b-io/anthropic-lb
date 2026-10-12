@@ -882,6 +882,8 @@ const MAX_ANSWER_BYTES: usize = 16 * 1024 * 1024;
 /// How often the document and restrictions held are logged when nothing
 /// changes, so the newest copy is always in the log store's retention.
 const FULL_LOG_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// A store outage logs its first failed poll, then every this many.
+const FAILURE_LOG_EVERY: u64 = 60;
 /// Bytes of a document or set text per log line, before base64. Its 12 KiB of
 /// base64 and the line's other fields stay under the 16 KiB a container
 /// runtime keeps on one line.
@@ -910,6 +912,8 @@ pub(crate) struct ClientStore {
     refusals: [AtomicU64; 3],
     /// Turns true at the first answered poll.
     answered: tokio::sync::watch::Sender<bool>,
+    /// Polls failed in a row.
+    failures: AtomicU64,
 }
 
 /// What `ClientStore::metrics` reports.
@@ -1040,6 +1044,7 @@ impl ClientStore {
             report: Mutex::new(StoreReport::default()),
             refusals: Default::default(),
             answered: tokio::sync::watch::channel(false).0,
+            failures: AtomicU64::new(0),
         })
     }
 
@@ -1130,17 +1135,7 @@ impl ClientStore {
             if self.poll(state).await {
                 self.answered.send_replace(true);
             }
-            if last_full_log.elapsed() >= FULL_LOG_INTERVAL {
-                last_full_log = Instant::now();
-                let (document, set) = {
-                    let reader = self.lock_reader();
-                    (reader.document.clone(), reader.set.clone())
-                };
-                if let Some(doc) = &document {
-                    log_document(doc, "daily");
-                }
-                log_restrictions(&set, "daily");
-            }
+            self.log_daily(&mut last_full_log, Instant::now());
             let loaded = state
                 .current_client_policy()
                 .store
@@ -1155,20 +1150,48 @@ impl ClientStore {
         }
     }
 
+    /// Log the document and the restrictions held once `FULL_LOG_INTERVAL`
+    /// has passed between `last` and `now`, even when nothing changed, so the
+    /// newest copy of each stays inside the log store's retention.
+    fn log_daily(&self, last: &mut Instant, now: Instant) {
+        if now.saturating_duration_since(*last) < FULL_LOG_INTERVAL {
+            return;
+        }
+        *last = now;
+        let (document, set) = {
+            let reader = self.lock_reader();
+            (reader.document.clone(), reader.set.clone())
+        };
+        if let Some(doc) = &document {
+            log_document(doc, "daily");
+        }
+        log_restrictions(&set, "daily");
+    }
+
     /// One poll: ask, apply the answer, and act on what changed. Returns
     /// whether the store answered.
     pub(crate) async fn poll(&self, state: &AppState) -> bool {
         let query = self.lock_reader().query(now_us());
-        let answer = match self.fetch(&query).await {
-            Ok(answer) => answer,
+        let changed = match self.fetch(&query).await {
+            Ok(answer) => self.apply(state, &answer, now_us()),
+            Err(e) => Err(e),
+        };
+        let changed = match changed {
+            Ok(changed) => changed,
             Err(e) => {
-                warn!(error = %e, "client store: poll failed; keeping what is held");
+                // Once at the start of an outage, then once every
+                // FAILURE_LOG_EVERY polls, not once a poll.
+                let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if failures == 1 || failures.is_multiple_of(FAILURE_LOG_EVERY) {
+                    warn!(error = %e, failures, "client store: poll failed; keeping what is held");
+                }
                 return false;
             }
         };
-        let Some(changed) = self.apply(state, &answer) else {
-            return false;
-        };
+        let failures = self.failures.swap(0, Ordering::Relaxed);
+        if failures > 0 {
+            info!(failures, "client store: polls answered again");
+        }
         if let Some(doc) = &changed.document {
             log_document(doc, "install");
         }
@@ -1181,27 +1204,20 @@ impl ClientStore {
         true
     }
 
-    /// Apply one answer and install what it changed. `None` when the answer
-    /// could not be read at all.
-    fn apply(&self, state: &AppState, answer: &[u8]) -> Option<Changed> {
+    /// Apply one answer at the reader's clock `now_us`, and install what it
+    /// changed. `Err` when the answer could not be read at all.
+    fn apply(&self, state: &AppState, answer: &[u8], now_us: u64) -> Result<Changed, String> {
         let mut reader = self.lock_reader();
         let before = alerts(&reader, &self.lock_report());
-        let applied = match reader.apply(answer, now_us()) {
-            Ok(applied) => applied,
-            Err(fault) => {
-                warn!(
-                    fault,
-                    "client store: unreadable poll answer; keeping what is held"
-                );
-                return None;
-            }
-        };
+        let applied = reader
+            .apply(answer, now_us)
+            .map_err(|fault| format!("unreadable answer ({fault})"))?;
         let changed = applied.document_installed || applied.set_changed;
         if changed {
             self.publish(state, &reader);
         }
         log_alert_changes(&reader, &before, &alerts(&reader, &self.lock_report()));
-        Some(Changed {
+        Ok(Changed {
             document: reader
                 .document
                 .clone()
@@ -1260,7 +1276,8 @@ impl ClientStore {
         let Ok(json) = serde_json::to_vec(resume) else {
             return;
         };
-        let tmp = self.resume_path.with_extension("client-store.json.tmp");
+        let mut tmp = self.resume_path.clone().into_os_string();
+        tmp.push(".tmp");
         let written = match tokio::fs::write(&tmp, &json).await {
             Ok(()) => tokio::fs::rename(&tmp, &self.resume_path).await,
             Err(e) => Err(e),
