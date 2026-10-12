@@ -2069,6 +2069,10 @@ impl AppState {
     ///      the Fable demotion of `fable_included = false` accounts (it
     ///      depends on the request's model), per-client
     ///      `preferred_endpoints` pins, and fast-mode exclusions.
+    ///   5. Accounts `routing_candidates` skips — an open transport breaker,
+    ///      or a hard limit on an OpenAI endpoint — take no share, so their
+    ///      tier cannot claim traffic the picker sends elsewhere. Their weight
+    ///      and gate gauges still report as before.
     pub(crate) async fn refresh_metrics_weights(&self) {
         let now_epoch = Self::now_epoch();
         let now = Instant::now();
@@ -2089,10 +2093,12 @@ impl AppState {
                     // emits OpenAI endpoints with a fixed (gate 0.0,
                     // weight 1.0) — an OpenAI endpoint is a real routing
                     // candidate and belongs on dashboards.
+                    let info = ep.rate_info.read().await;
                     entries[i] = Some(MetricsEntry {
                         gate: 0.0,
                         weight: 1.0,
                         priority: ep.priority,
+                        routable: metrics_routable(&info, now),
                     });
                 }
                 Protocol::Anthropic => {
@@ -2111,6 +2117,7 @@ impl AppState {
                                 gate,
                                 weight,
                                 priority,
+                                routable: metrics_routable(&info, now),
                             }
                         });
                 }
@@ -2152,8 +2159,10 @@ impl AppState {
     /// walked in ascending priority, a tier prefers its healthy members
     /// (`gate < soft_limit`) and degrades to its soft-limited ones when it has
     /// none, and the first tier with non-zero weight takes the whole share.
-    /// All zero when no tier has weight.
+    /// All zero when no tier has weight. Unroutable entries are not candidates.
     fn metrics_tier_shares(&self, entries: &[Option<MetricsEntry>]) -> Vec<f64> {
+        let entries: Vec<Option<MetricsEntry>> =
+            entries.iter().map(|e| e.filter(|e| e.routable)).collect();
         let mut tiers: Vec<u32> = entries.iter().flatten().map(|e| e.priority).collect();
         tiers.sort_unstable();
         tiers.dedup();
@@ -2181,12 +2190,21 @@ impl AppState {
 }
 
 /// One endpoint's representative routing inputs for the metrics gauges.
-/// `priority` is the tier `routing_candidates` would place it in.
+/// `priority` is the tier `routing_candidates` would place it in; `routable`
+/// is false when `routing_candidates` would skip it.
 #[derive(Clone, Copy)]
 struct MetricsEntry {
     gate: f64,
     weight: f64,
     priority: u32,
+    routable: bool,
+}
+
+/// Neither hard-limited nor transport-unhealthy: the two skips
+/// `routing_candidates` applies to every protocol.
+fn metrics_routable(info: &RateLimitInfo, now: Instant) -> bool {
+    !info.hard_limited_until.is_some_and(|until| now < until)
+        && !info.transport.open_until.is_some_and(|until| now < until)
 }
 
 /// Whether `info` serves via overage — the same test `compute_routing_weight`

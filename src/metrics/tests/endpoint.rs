@@ -1624,6 +1624,42 @@ async fn routing_share_openai_endpoint_in_configured_tier() {
     assert_shares(&state, &[0.0, 1.0]);
 }
 
+/// Accounts `routing_candidates` skips take no share: an Anthropic endpoint
+/// with an open transport breaker, and a hard-limited OpenAI endpoint. Their
+/// weight and gate gauges still read as before.
+#[tokio::test]
+async fn routing_share_skips_unroutable_endpoints() {
+    let mut state = test_state_with(vec![]);
+    {
+        let st = Arc::get_mut(&mut state).unwrap();
+        st.endpoints.push(mk_tiered("a", 1));
+        let mut oai = make_endpoint("oai", Protocol::OpenAI);
+        oai.priority = 1;
+        st.endpoints.push(oai);
+        st.endpoints.push(mk_tiered("c", 2));
+    }
+    set_util(&state, 0, 0.20).await;
+    set_util(&state, 2, 0.20).await;
+    state.endpoints[0]
+        .rate_info
+        .write()
+        .await
+        .transport
+        .open_until = Some(Instant::now() + Duration::from_secs(600));
+    set_hard_limited(&state, 1).await;
+
+    state.refresh_metrics_weights().await;
+
+    assert_shares(&state, &[0.0, 0.0, 1.0]);
+    assert_picker_serves(&state, 2).await;
+    let w = weights(&state);
+    assert!(
+        w[0] > 0.0,
+        "transport breaker leaves the weight gauge as it was"
+    );
+    assert_eq!(w[1], 1.0, "OpenAI fixed weight unchanged");
+}
+
 #[tokio::test]
 async fn metrics_routing_weight_and_share_present() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
