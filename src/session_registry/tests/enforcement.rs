@@ -258,13 +258,13 @@ async fn limit_operator_bypass() {
     );
     set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
     // Operator bypasses everything
-    assert!(state.current_client_policy().is_operator("ray"));
+    assert_eq!(state.caller("ray").principal.role, Role::Operator);
     assert!(state
         .pre_request_gate("-", &state.caller("ray"), "")
         .await
         .is_ok());
     // Non-operator does not bypass
-    assert!(!state.current_client_policy().is_operator("gastown"));
+    assert_eq!(state.caller("gastown").principal.role, Role::Client);
 }
 
 #[tokio::test]
@@ -612,9 +612,9 @@ async fn gate_unknown_client_not_operator() {
         ..test_state_base()
     }));
     // "-" is not the operator
-    assert!(!state.current_client_policy().is_operator("-"));
-    assert!(!state.current_client_policy().is_operator("gastown"));
-    assert!(state.current_client_policy().is_operator("ray"));
+    assert_eq!(state.caller("-").principal.role, Role::Client);
+    assert_eq!(state.caller("gastown").principal.role, Role::Client);
+    assert_eq!(state.caller("ray").principal.role, Role::Operator);
 }
 
 // ── Task 7: Full integration tests ──
@@ -1088,8 +1088,7 @@ async fn authenticate_401_returns_json_envelope() {
 /// with the gate's own check removed. If this test is ever retired as
 /// "unreachable state", that call site goes unpinned with it.
 ///
-/// The denial is checked ABOVE the operator bypass, so a name that somehow
-/// reached both lists loses its bypass rather than keeping it.
+/// A name in both lists resolves to the reader's denial (`role_in`).
 /// `ClientPolicy::build` rejects that config at boot — this pins the runtime
 /// behaviour as fail-closed if the boot check is ever weakened.
 #[tokio::test]
@@ -1107,6 +1106,10 @@ async fn gate_denial_beats_the_operator_bypass_when_a_name_holds_both_roles() {
             .await
             .is_err(),
         "overlap must resolve to the denial, never to the bypass"
+    );
+    assert!(
+        !state.current_client_policy().is_operator("both"),
+        "/_stats and /metrics fold the name by the gate's rule, not into _operator"
     );
 }
 

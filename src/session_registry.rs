@@ -1244,11 +1244,7 @@ impl AppState {
         let client_id = caller.name();
         // Read-only principal (LAB-4395). Both proxied handlers already ran
         // this before admitting a body; repeating it here is the backstop for
-        // any future caller of the gate that does not. Checked BEFORE the
-        // operator bypass on purpose — the two roles are disjoint by boot
-        // validation, so the order cannot matter today, but if that check is
-        // ever weakened this arm makes the wider grant lose to the denial
-        // rather than win.
+        // any future caller of the gate that does not.
         if let Some(resp) = deny_admin_reader(req_id, caller) {
             return Err(resp);
         }

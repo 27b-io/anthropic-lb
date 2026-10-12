@@ -277,6 +277,29 @@ impl Caller {
     }
 }
 
+/// A `ClientPolicy` that passed `ClientPolicy::build`, or that `with_store`
+/// derived from one: the only kind `AppState::swap_client_policy` installs.
+/// The field is private to this module, so no other code can wrap a policy
+/// it assembled by hand, whose budgets or pins could name no principal and
+/// so never be enforced. Reads go through `Deref`; there is no way back in.
+#[derive(Clone)]
+pub(crate) struct BuiltPolicy(ClientPolicy);
+
+impl std::ops::Deref for BuiltPolicy {
+    type Target = ClientPolicy;
+
+    fn deref(&self) -> &ClientPolicy {
+        &self.0
+    }
+}
+
+impl BuiltPolicy {
+    /// The policy itself, for the boot's first install.
+    pub(crate) fn into_inner(self) -> ClientPolicy {
+        self.0
+    }
+}
+
 impl AppState {
     /// The client policy in force. Read once per request, by authentication,
     /// and once per pass by a background reader; a request then reads only
@@ -300,11 +323,11 @@ impl AppState {
     /// client table swapped in there would hand any header-chosen name that
     /// client's models, pins and guard policy. Under `[[clients]]` every
     /// policy is safe to install: a key it does not hold is refused.
-    pub(crate) fn swap_client_policy(&self, next: ClientPolicy) -> Result<(), &'static str> {
+    pub(crate) fn swap_client_policy(&self, next: BuiltPolicy) -> Result<(), &'static str> {
         if !matches!(self.auth_mode, AuthMode::Clients) {
             return Err("the client policy can be replaced only under [[clients]] authentication");
         }
-        let next = Arc::new(next);
+        let next = Arc::new(next.0);
         let previous = std::mem::replace(
             &mut *self
                 .client_policy
@@ -371,27 +394,30 @@ impl ClientPolicy {
     /// then the value ranges, so a structural error still wins over a key
     /// that is too short, as it always has. The rest of `load_config` (legacy
     /// keys, endpoints, throttle, cooldown) is not repeated here.
-    pub(crate) fn build(config: &Config) -> Result<(AuthMode, Self), String> {
+    pub(crate) fn build(config: &Config) -> Result<(AuthMode, BuiltPolicy), String> {
         let auth_mode = AuthMode::of(config);
         let principals =
             check_clients(config, &auth_mode).map_err(|msg| format!("config: {msg}"))?;
         check_credentials(config, &auth_mode)?;
         check_policy_values(config)?;
         check_client_store(config, &auth_mode).map_err(|msg| format!("config: {msg}"))?;
-        Ok((auth_mode, Self::assemble(config, principals)))
+        Ok((auth_mode, BuiltPolicy(Self::assemble(config, principals))))
     }
 
     /// Build with no check at all, for the tests that pin how the runtime
     /// behaves in a state `build` refuses. A duplicate key keeps its last
     /// entry. Never reachable from a boot.
     #[cfg(test)]
-    pub(crate) fn unchecked(config: &Config) -> (AuthMode, Self) {
+    pub(crate) fn unchecked(config: &Config) -> (AuthMode, BuiltPolicy) {
         let principals = config
             .clients
             .iter()
             .map(|c| (key_digest(&c.key), principal(config, &c.name)))
             .collect();
-        (AuthMode::of(config), Self::assemble(config, principals))
+        (
+            AuthMode::of(config),
+            BuiltPolicy(Self::assemble(config, principals)),
+        )
     }
 
     /// The policy `config` describes, around a principal table already built.
@@ -418,11 +444,12 @@ impl ClientPolicy {
         }
     }
 
-    /// Whether `name` is an operator's. Only for folding name-keyed records
-    /// into the `_operator` label on `/_stats` and `/metrics`: a request's own
-    /// role is its `Caller`'s principal.
+    /// Whether `name` is an operator's, by the rule a principal's role is
+    /// given. Only for folding name-keyed records into the `_operator` label
+    /// on `/_stats` and `/metrics`: a request's own role is its `Caller`'s
+    /// principal.
     pub(crate) fn is_operator(&self, name: &str) -> bool {
-        self.operators.iter().any(|op| op == name)
+        role_in(&self.operators, &self.admin_readers, name) == Role::Operator
     }
 
     /// Whether `name` is an operator's or an admin reader's: a name a client
@@ -448,7 +475,9 @@ impl ClientPolicy {
             None
         }
     }
+}
 
+impl BuiltPolicy {
     /// This policy, the config file's, with what a client store reader holds
     /// applied (docs/client-store.md): the document's clients join the
     /// principal table and govern their names, and the restrictions set the
@@ -456,7 +485,7 @@ impl ClientPolicy {
     /// store client may be pinned to here. Also returns what the operator
     /// should be told about the result.
     pub(crate) fn with_store(&self, reader: &Reader, endpoints: &[String]) -> (Self, StoreReport) {
-        let mut next = self.clone();
+        let mut next = self.0.clone();
         let mut report = StoreReport::default();
         let mut quarantined = HashSet::new();
         // Every config-file key, whatever its role.
@@ -569,7 +598,7 @@ impl ClientPolicy {
             disabled,
             quarantined,
         });
-        (next, report)
+        (Self(next), report)
     }
 }
 

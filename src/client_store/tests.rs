@@ -189,11 +189,11 @@ impl Instance {
     ) -> Self {
         let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
         acct.base_url = upstream.to_string();
-        let state = TestPolicy::clients(clients)
+        let (state, base) = TestPolicy::clients(clients)
             .operators(&["ops"])
             .admin_readers(&["viewer"])
             .client_store(poll_url, token)
-            .install(AppState {
+            .install_keeping(AppState {
                 endpoints: vec![acct],
                 ..test_state_base()
             });
@@ -204,7 +204,7 @@ impl Instance {
         let store = Arc::new(
             ClientStore::new(
                 &config,
-                &state.current_client_policy(),
+                &base,
                 vec!["acct-a".to_string()],
                 dir.join("config.client-store.json"),
             )

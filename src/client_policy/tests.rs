@@ -9,7 +9,7 @@ fn refused(fragment: &str) -> String {
 }
 
 /// The policy `build` makes of a fragment it must accept.
-fn built(fragment: &str) -> (AuthMode, ClientPolicy) {
+fn built(fragment: &str) -> (AuthMode, BuiltPolicy) {
     ClientPolicy::build(&cfg(fragment))
         .unwrap_or_else(|e| panic!("the build must accept: {e}\n{fragment}"))
 }
@@ -235,7 +235,7 @@ fn build_allows_passthrough_without_a_client_table() {
 
 /// `build` on one `[[clients]]` entry named `name`, built in Rust so no TOML
 /// escaping stands between the test and the name.
-fn build_one_named(name: &str) -> Result<(AuthMode, ClientPolicy), String> {
+fn build_one_named(name: &str) -> Result<(AuthMode, BuiltPolicy), String> {
     let mut config = cfg("");
     config.clients = vec![mk_client(name, K1, &[])];
     ClientPolicy::build(&config)
@@ -720,26 +720,8 @@ fn a_swap_is_refused_unless_callers_authenticate_with_client_keys() {
 #[tokio::test]
 async fn every_budget_gauge_shows_the_limit_the_gate_enforces_after_a_swap() {
     let _clock = FrozenClock::at(1_704_110_400);
-    let clients = || {
-        vec![
-            mk_client("ops", &test_key("ops"), &[]),
-            mk_client("team-alpha", &test_key("alpha"), &[]),
-            mk_client("team-bravo", &test_key("bravo"), &[]),
-            mk_client("team-charlie", &test_key("charlie"), &[]),
-        ]
-    };
-    let state = Arc::new(
-        TestPolicy::clients(clients())
-            .operators(&["ops"])
-            .budgets(
-                [
-                    ("team-alpha".to_string(), 1_000),
-                    ("team-bravo".to_string(), 2_000),
-                ]
-                .into(),
-            )
-            .install(test_state_base()),
-    );
+    let (before, after) = budget_swap_policies();
+    let state = Arc::new(before.install(test_state_base()));
     let today = AppState::now_epoch() / 86400;
     let used_before: HashMap<&str, u64> = [
         ("team-alpha", 700),
@@ -754,17 +736,7 @@ async fn every_budget_gauge_shows_the_limit_the_gate_enforces_after_a_swap() {
             .unwrap()
             .insert(name.to_string(), (today, *used));
     }
-    // Alpha loses its budget, bravo's grows and charlie gains one.
-    TestPolicy::clients(clients())
-        .operators(&["ops"])
-        .budgets(
-            [
-                ("team-bravo".to_string(), 5_000),
-                ("team-charlie".to_string(), 300),
-            ]
-            .into(),
-        )
-        .swap_into(&state);
+    after.swap_into(&state);
 
     let addr = serve(build_router(state.clone())).await;
     let get = |path: &str| {
