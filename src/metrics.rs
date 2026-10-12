@@ -309,6 +309,10 @@ struct EndpointMetricsSnap {
     effective_gate: f64,
 }
 
+/// HELP for `anthropic_account_routing_share`; `metrics_handler` and the
+/// test-only `append_routing_weight_metrics` both emit it.
+const ROUTING_SHARE_HELP: &str = "Per-account share of routing weight within the priority tier the picker serves from (configured priority, demoted by overage_penalty while in overage); accounts in other tiers read 0 (0.0-1.0). Model-agnostic: does not reflect the per-model Fable demotion, per-client preferred_endpoints pins or fast-mode exclusions";
+
 #[cfg(test)]
 fn append_routing_weight_metrics(
     buf: &mut String,
@@ -325,7 +329,7 @@ fn append_routing_weight_metrics(
         buf,
         "anthropic_account_routing_share",
         "gauge",
-        "Per-account share of total routing weight (0.0-1.0)",
+        ROUTING_SHARE_HELP,
     );
     prom_header(
         buf,
@@ -1192,7 +1196,7 @@ pub(crate) async fn metrics_handler(
         &mut buf,
         "anthropic_account_routing_share",
         "gauge",
-        "Per-account share of total routing weight (0.0-1.0)",
+        ROUTING_SHARE_HELP,
     );
     prom_header(
         &mut buf,
