@@ -231,9 +231,10 @@ impl Instance {
         )
     }
 
-    /// Apply `answer` at the system clock, as a poll does: what it changes
-    /// is saved to the resume copy, then installed.
+    /// Apply `answer` at the system clock, as a poll does: under the writer
+    /// lock, what it changes is saved to the resume copy, then installed.
     async fn answer(&self, answer: Vec<u8>) {
+        let _writer = self.store.writer.lock().await;
         self.store
             .apply(&self.state, &answer, now_us())
             .await

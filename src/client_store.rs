@@ -913,10 +913,13 @@ pub(crate) struct ClientStore {
     /// The config file's ordinary clients, exported one series each so the
     /// operator can see which clients are still to move into the store.
     file_clients: Vec<String>,
-    /// What is held. Only `resume`, before polling starts, and the one poll
-    /// loop write it, so `apply` can build the next reader on a copy without
-    /// losing a write.
+    /// What is held. Only `resume` and `poll` write it, each under `writer`.
     reader: Mutex<Reader>,
+    /// Held by `resume`, and by each poll from its query to its last save. A
+    /// poll builds the next reader on a copy and saves it before installing
+    /// it, so a second writer meanwhile would build on what was about to be
+    /// replaced, and one of the two merges would be lost.
+    writer: tokio::sync::Mutex<()>,
     /// What the last policy built had to say (`ClientPolicy::with_store`).
     report: Mutex<StoreReport>,
     /// Credentials refused by the store's gate, indexed by `StoreRefusal`.
@@ -1068,6 +1071,7 @@ impl ClientStore {
             endpoints,
             file_clients,
             reader: Mutex::new(Reader::default()),
+            writer: tokio::sync::Mutex::new(()),
             report: Mutex::new(StoreReport::default()),
             refusals: Default::default(),
             answered: tokio::sync::watch::channel(false).0,
@@ -1094,6 +1098,7 @@ impl ClientStore {
     /// instance counts as loaded only when the saved set is complete. A copy
     /// that fails its checks is ignored, and the instance waits for the store.
     pub(crate) async fn resume(&self, state: &AppState) {
+        let _writer = self.writer.lock().await;
         let bytes = match tokio::fs::read(&self.resume_path).await {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
@@ -1197,8 +1202,9 @@ impl ClientStore {
     }
 
     /// One poll: ask, apply the answer, and act on what changed. Returns
-    /// whether the store answered.
+    /// whether the store answered. Polls run one at a time, under `writer`.
     pub(crate) async fn poll(&self, state: &AppState) -> bool {
+        let _writer = self.writer.lock().await;
         let query = self.lock_reader().query(now_us());
         let changed = match self.fetch(&query).await {
             Ok(answer) => self.apply(state, &answer, now_us()).await,
@@ -1239,8 +1245,8 @@ impl ClientStore {
     /// as an error. A save that
     /// hangs holds this answer back, and the polls after it, until the disk
     /// answers; what is held stays enforced meanwhile, and each part's last
-    /// good arrival stops advancing. `Err` when the answer could not be read
-    /// at all.
+    /// good arrival stops advancing. Called by `poll`, under `writer`. `Err`
+    /// when the answer could not be read at all.
     async fn apply(&self, state: &AppState, answer: &[u8], now_us: u64) -> Result<Changed, String> {
         let (mut next, before) = {
             let reader = self.lock_reader();

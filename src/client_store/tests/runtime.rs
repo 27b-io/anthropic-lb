@@ -350,36 +350,68 @@ async fn a_resume_restores_what_was_held_and_is_loaded_only_with_a_complete_set(
     assert_eq!(again.auth(&test_key("beta-2")), Ok("beta".to_string()));
 }
 
+/// Holds up every save of the resume copy in a directory: the copy's sibling
+/// becomes a FIFO, and opening a FIFO to write blocks until a reader opens
+/// it. Linux only, where syncing a FIFO fails, so a save that `release` lets
+/// through fails and removes the copy.
+///
+/// Dropping it releases any save still waiting, so a failed assertion fails
+/// the test instead of hanging it (the runtime waits for every blocking
+/// thread when it shuts down): opening a FIFO to read and write never blocks
+/// on Linux. It then unlinks the FIFO, so a later save writes a plain file.
+#[cfg(target_os = "linux")]
+struct HeldSaves(std::path::PathBuf);
+
+#[cfg(target_os = "linux")]
+impl HeldSaves {
+    fn new(dir: &std::path::Path) -> Self {
+        let fifo = dir.join("config.client-store.json.tmp");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed");
+        Self(fifo)
+    }
+
+    /// Let the saves waiting now through, and return what they wrote.
+    fn release(&self) -> Vec<u8> {
+        use std::io::Read;
+        let mut written = Vec::new();
+        std::fs::File::open(&self.0)
+            .unwrap()
+            .read_to_end(&mut written)
+            .unwrap();
+        written
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for HeldSaves {
+    fn drop(&mut self) {
+        let _open = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.0);
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// One poll of `inst`'s store, run as a task.
+#[cfg(target_os = "linux")]
+fn spawn_poll(inst: &Instance) -> tokio::task::JoinHandle<bool> {
+    let (state, store) = (inst.state.clone(), inst.store.clone());
+    tokio::spawn(async move { store.poll(&state).await })
+}
+
 /// A restriction is enforced only once it is saved. While a poll's save of a
 /// new disable is held up, the instance keeps enforcing exactly what its copy
 /// on disk holds, so a crash at that moment loses nothing it enforced.
 /// Enforcing first would leave a window in which a restart resumes the older
 /// copy and serves the disabled name again.
-///
-/// The save is held up by making its sibling a FIFO: opening a FIFO to write
-/// blocks until a reader opens it. Linux only, where syncing a FIFO fails, so
-/// the released save fails and removes the copy.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_restriction_is_enforced_only_once_it_is_saved() {
-    /// Releases the save the FIFO holds up when dropped, so it always
-    /// finishes: the runtime waits for every blocking thread when it shuts
-    /// down, and a failed assertion would otherwise hang the test instead of
-    /// failing it. Opening the FIFO to read and write, which never blocks on
-    /// Linux, releases a save already waiting on it; unlinking it means a
-    /// save that comes later writes a plain file.
-    struct Release(std::path::PathBuf);
-    impl Drop for Release {
-        fn drop(&mut self) {
-            let _open = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&self.0);
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
-    use std::io::Read;
     let store = MockStore::default();
     store.hold(None, Some(body(true, &[], &[])));
     let url = store.serve().await;
@@ -389,8 +421,12 @@ async fn a_restriction_is_enforced_only_once_it_is_saved() {
         &url,
         None,
     );
-    let dir = inst._dir.as_ref().unwrap().path().to_path_buf();
-    let path = dir.join("config.client-store.json");
+    let path = inst
+        ._dir
+        .as_ref()
+        .unwrap()
+        .path()
+        .join("config.client-store.json");
     assert!(inst.store.poll(&inst.state).await, "the store answered");
     assert_eq!(
         inst.auth(&test_key("file-only")),
@@ -398,19 +434,12 @@ async fn a_restriction_is_enforced_only_once_it_is_saved() {
     );
     let saved = std::fs::read(&path).unwrap();
 
-    let fifo = dir.join("config.client-store.json.tmp");
-    let made = std::process::Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .unwrap();
-    assert!(made.success(), "mkfifo failed");
-    let _release = Release(fifo.clone());
+    let held = HeldSaves::new(inst._dir.as_ref().unwrap().path());
     store.hold(
         None,
         Some(body(true, &[("file-only", Disabled, now_us() - 1)], &[])),
     );
-    let (state, reader) = (inst.state.clone(), inst.store.clone());
-    let polling = tokio::spawn(async move { reader.poll(&state).await });
+    let polling = spawn_poll(&inst);
 
     // The save is held: the disable is neither enforced nor reported held,
     // and the copy on disk is exactly what is enforced.
@@ -431,17 +460,70 @@ async fn a_restriction_is_enforced_only_once_it_is_saved() {
     // FIFO cannot be synced) and removes the old copy. Only then is the
     // disable enforced, so a restart now waits for the store instead of
     // resuming a copy without it.
-    let mut drained = Vec::new();
-    std::fs::File::open(&fifo)
-        .unwrap()
-        .read_to_end(&mut drained)
-        .unwrap();
-    let copy: Value = serde_json::from_slice(&drained).expect("the save wrote a copy");
+    let copy: Value = serde_json::from_slice(&held.release()).expect("the save wrote a copy");
     assert_eq!(copy["records"][0]["name"], "file-only");
     assert_eq!(copy["records"][0]["state"], "disabled");
     assert!(polling.await.unwrap(), "the store answered");
     assert_eq!(inst.auth(&test_key("file-only")), Err(403));
     assert!(!path.exists(), "the copy that lacks the disable is gone");
+}
+
+/// Polls run one at a time. A poll builds the next reader on a copy and
+/// saves it before installing it, so a second poll that ran meanwhile would
+/// build on what the first was about to replace, and whichever installed
+/// last would drop the other's merge.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn polls_run_one_at_a_time_so_no_merge_is_lost() {
+    let store = MockStore::default();
+    store.hold(None, Some(body(true, &[], &[])));
+    let url = store.serve().await;
+    let inst = Instance::new("http://127.0.0.1:9", file_clients(&["a", "b"]), &url, None);
+    let dir = inst._dir.as_ref().unwrap().path().to_path_buf();
+    assert!(inst.store.poll(&inst.state).await, "the store answered");
+
+    // The first poll merges a disable of `a`, and its save is held up while
+    // a second poll starts on a part that disables `b` alone.
+    let held = HeldSaves::new(&dir);
+    store.hold(
+        None,
+        Some(body(true, &[("a", Disabled, now_us() - 1)], &[])),
+    );
+    let first = spawn_poll(&inst);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    store.hold(
+        None,
+        Some(body(true, &[("b", Disabled, now_us() - 1)], &[])),
+    );
+    let second = spawn_poll(&inst);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!first.is_finished() && !second.is_finished());
+
+    held.release();
+    drop(held);
+    assert!(first.await.unwrap(), "the store answered");
+    assert!(second.await.unwrap(), "the store answered");
+    assert_eq!(
+        inst.auth(&test_key("a")),
+        Err(403),
+        "the first merge was lost"
+    );
+    assert_eq!(
+        inst.auth(&test_key("b")),
+        Err(403),
+        "the second merge was lost"
+    );
+    // The second poll's save landed, and a restart holds both disables.
+    let restarted = Instance::in_dir(
+        "http://127.0.0.1:9",
+        file_clients(&["a", "b"]),
+        &url,
+        None,
+        &dir,
+    );
+    restarted.store.resume(&restarted.state).await;
+    assert_eq!(restarted.auth(&test_key("a")), Err(403));
+    assert_eq!(restarted.auth(&test_key("b")), Err(403));
 }
 
 /// A save that failed is owed until one lands, and is retried even while
