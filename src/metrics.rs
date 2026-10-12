@@ -244,6 +244,33 @@ struct ClaimMetricsSnap {
     status: Option<String>,
 }
 
+/// Account-level waste risk: the most urgent 7d claim, counting only quota the
+/// account can still spend. The Fable band is a carve-out of the general weekly
+/// pool, so it is bounded by the pool's waste risk, as `compute_routing_weight`
+/// bounds it. A live pool that is spent or rejected reads 0, since no claim can
+/// draw on it. A missing pool, or one with no reset data, bounds nothing: a 0.0
+/// from missing data must not erase the band's urgency.
+fn account_waste_risk(claims: &[ClaimMetricsSnap], now_epoch: u64) -> f64 {
+    let pool = claims
+        .iter()
+        .find(|c| c.key == "seven_day")
+        .filter(|c| c.reset.is_none_or(|r| r > now_epoch));
+    let spent = |p: &ClaimMetricsSnap| {
+        p.utilization.is_some_and(|u| u >= 1.0) || p.status.as_deref() == Some("rejected")
+    };
+    if pool.is_some_and(spent) {
+        return 0.0;
+    }
+    let pool_wr = pool.map_or(0.0, |p| p.waste_risk);
+    claims
+        .iter()
+        .map(|c| match c.key.as_str() {
+            FABLE_BAND_CLAIM if pool_wr > 0.0 => c.waste_risk.min(pool_wr),
+            _ => c.waste_risk,
+        })
+        .fold(0.0, f64::max)
+}
+
 #[allow(dead_code)]
 #[derive(Default, Clone)]
 struct EndpointMetricsSnap {
@@ -1022,22 +1049,24 @@ pub(crate) async fn metrics_handler(
         );
     }
 
-    // Account-level waste risk (max across 7d claims).
+    // Account-level waste risk (max across 7d claims, each bounded by the
+    // weekly pool it draws from; see `account_waste_risk`).
     // Note: refresh_metrics_weights uses a 3-tier claim selection
     // (representative → seven_day → max) for routing_weight/share.
     // This metric intentionally shows the max to surface the worst-case
     // claim regardless of which one the router currently selects.
+    // `anthropic_claim_waste_risk` keeps each claim's raw, unbounded score.
     prom_header(
         &mut buf,
         "anthropic_account_waste_risk",
         "gauge",
-        "Max waste risk across 7d claims (worst-case urgency signal)",
+        "Max waste risk across 7d claims, each bounded by the weekly pool it draws from; 0 when that pool is spent or rejected",
     );
     for s in &snaps {
         if s.passthrough || s.claims.is_empty() {
             continue;
         }
-        let wr = s.claims.iter().map(|c| c.waste_risk).fold(0.0f64, f64::max);
+        let wr = account_waste_risk(&s.claims, now_epoch);
         prom_gauge(
             &mut buf,
             "anthropic_account_waste_risk",

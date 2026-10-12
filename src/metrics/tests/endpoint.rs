@@ -1848,3 +1848,145 @@ async fn metrics_counts_client_facing_pool_exhaustion() {
         "transient exhaustion should count 1:\n{after}"
     );
 }
+
+// ── Account waste risk bounded by the weekly pool ────────────────────
+//
+// The Fable band is a carve-out of the general `seven_day` pool, so band quota
+// the pool cannot fund is not urgency the account can act on. The account-level
+// roll-up applies the router's bound; the per-claim gauge stays raw.
+
+fn claim_snap(key: &str, util: f64, reset: u64, status: &str, now: u64) -> ClaimMetricsSnap {
+    ClaimMetricsSnap {
+        key: key.to_string(),
+        utilization: Some(util),
+        waste_risk: waste_risk(Some(util), Some(reset), now),
+        reset: Some(reset),
+        status: Some(status.to_string()),
+    }
+}
+
+/// A spent pool zeroes the account, and the band's raw score is still
+/// published per claim.
+#[tokio::test]
+async fn metrics_account_waste_risk_zero_when_pool_spent() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = test_app(&mock_url, None);
+
+    let now_epoch = AppState::now_epoch();
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: Some(1.0),
+                reset: Some(now_epoch + 5400),
+                status: Some("rejected".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+        // Raw band score: 0.23 / (5400 / 604800) ≈ 25.8, capped at 10.
+        info.claims_7d.insert(
+            FABLE_BAND_CLAIM.to_string(),
+            ClaimWindowData {
+                utilization: Some(0.77),
+                reset: Some(now_epoch + 5400),
+                status: Some("allowed".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+    }
+
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{}/metrics", addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.contains("anthropic_account_waste_risk{account=\"acct-a\"} 0\n"),
+        "spent pool should zero the account waste risk:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "anthropic_claim_waste_risk{account=\"acct-a\",claim=\"seven_day_fable\"} 10\n"
+        ),
+        "per-claim band waste risk should stay raw:\n{body}"
+    );
+}
+
+#[test]
+fn account_waste_risk_zero_when_pool_spent_without_status() {
+    let now = 1_000_000;
+    let claims = [
+        claim_snap("seven_day", 1.0, now + 5400, "allowed", now),
+        claim_snap(FABLE_BAND_CLAIM, 0.77, now + 5400, "allowed", now),
+    ];
+    assert_eq!(account_waste_risk(&claims, now), 0.0);
+}
+
+/// Status is not derivable from utilization: a pool rejected below 1.0 is spent.
+#[test]
+fn account_waste_risk_zero_when_pool_rejected_below_full() {
+    let now = 1_000_000;
+    let claims = [
+        claim_snap("seven_day", 0.97, now + 5400, "rejected", now),
+        claim_snap(FABLE_BAND_CLAIM, 0.77, now + 5400, "allowed", now),
+    ];
+    assert_eq!(account_waste_risk(&claims, now), 0.0);
+}
+
+/// The band never reads more urgent than the pool it draws from.
+#[test]
+fn account_waste_risk_band_bounded_by_unspent_pool() {
+    let now = 1_000_000;
+    let claims = [
+        claim_snap("seven_day", 0.90, now + 86_400, "allowed", now),
+        claim_snap(FABLE_BAND_CLAIM, 0.50, now + 86_400, "allowed", now),
+    ];
+    // Pool: 0.10 / (86400 / 604800) = 0.7. Band alone would be 3.5.
+    let wr = account_waste_risk(&claims, now);
+    assert!((wr - 0.7).abs() < 1e-9, "expected pool's 0.7, got {wr}");
+}
+
+/// With no pool claim there is nothing to bound by: the band reads raw.
+#[test]
+fn account_waste_risk_band_uncapped_without_pool() {
+    let now = 1_000_000;
+    let band = claim_snap(FABLE_BAND_CLAIM, 0.50, now + 86_400, "allowed", now);
+    let raw = band.waste_risk;
+    assert!((raw - 3.5).abs() < 1e-9);
+    assert_eq!(account_waste_risk(&[band], now), raw);
+}
+
+/// A pool whose reset has passed is stale: it neither zeroes nor bounds the
+/// band, even when its last reading was spent and rejected.
+#[test]
+fn account_waste_risk_band_uncapped_with_stale_pool() {
+    let now = 1_000_000;
+    let band = claim_snap(FABLE_BAND_CLAIM, 0.50, now + 86_400, "allowed", now);
+    let raw = band.waste_risk;
+    let claims = [
+        claim_snap("seven_day", 1.0, now - 60, "rejected", now),
+        band,
+    ];
+    assert_eq!(account_waste_risk(&claims, now), raw);
+}
+
+/// Claims other than the band are not bounded by an unspent pool.
+#[test]
+fn account_waste_risk_other_claims_uncapped_by_unspent_pool() {
+    let now = 1_000_000;
+    let claims = [
+        claim_snap("seven_day", 0.90, now + 86_400, "allowed", now),
+        claim_snap("seven_day_sonnet", 0.50, now + 86_400, "allowed", now),
+    ];
+    let wr = account_waste_risk(&claims, now);
+    assert!(
+        (wr - 3.5).abs() < 1e-9,
+        "sonnet sub-budget reads raw, got {wr}"
+    );
+}
