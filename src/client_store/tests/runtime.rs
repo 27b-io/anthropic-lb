@@ -560,7 +560,7 @@ async fn a_failed_save_is_retried_while_the_store_is_away() {
 /// A save that fails syncs the directory after it removes the last copy, as
 /// a save that lands does after its rename: a removal survives a power cut
 /// only once its directory is synced. Here the directory cannot be opened to
-/// sync, so the removal is reported failed, and the save logged as an error.
+/// sync, so the removal is reported failed.
 #[cfg(unix)]
 #[test]
 fn a_failed_save_syncs_the_removal_of_the_last_copy() {
@@ -633,6 +633,59 @@ async fn a_failed_save_removes_the_stale_copy_and_is_retried() {
         Err(403),
         "the disable survives the restart"
     );
+}
+
+/// A save whose removal cannot be synced is logged as an error, even when
+/// an earlier, benign failure means the warning for this run of failures is
+/// already out: the log is rate-limited only for failures that removed the
+/// last copy durably.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unsynced_removal_is_logged_after_a_benign_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    /// Gives the directory its permissions back, so it can be cleaned up.
+    struct Restore<'a>(&'a std::path::Path);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    log_capture_buf();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.client-store.json");
+    let marker = path.display().to_string();
+    let poll_url = "https://store.invalid/_clients/poll";
+    let inst = Instance::in_dir(
+        "http://127.0.0.1:9",
+        file_clients(&["file-only"]),
+        poll_url,
+        None,
+        dir.path(),
+    );
+    let disabled = restrictions_part(&body(true, &[("file-only", Disabled, now_us() - 1)], &[]));
+
+    // Failure 1 is benign: the save cannot land, and the removal is synced.
+    std::fs::create_dir(dir.path().join("config.client-store.json.tmp")).unwrap();
+    inst.answer(answer(unavailable(), disabled.clone())).await;
+    assert!(inst.store.resume_unsaved());
+    let unsafe_lines = || {
+        log_lines(&marker)
+            .into_iter()
+            .filter(|l| l.contains("ERROR") && l.contains("durably remove"))
+            .count()
+    };
+    assert_eq!(unsafe_lines(), 0);
+
+    // Failure 2 cannot sync its removal: the directory cannot be opened.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+    let _restore = Restore(dir.path());
+    if std::fs::File::open(dir.path()).is_ok() {
+        eprintln!("skipped: this user can open any directory");
+        return;
+    }
+    inst.answer(answer(unavailable(), disabled)).await;
+    assert_eq!(unsafe_lines(), 1, "the unsafe second failure is logged");
 }
 
 #[tokio::test]
