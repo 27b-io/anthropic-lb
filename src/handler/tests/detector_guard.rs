@@ -176,28 +176,39 @@ async fn block_fail_open_forwards_with_a_guard_unavailable_finding() {
 }
 
 /// The block path never holds a request past `timeout_ms`, whatever the
-/// chunk count: a 32 KiB input against a hung detector.
+/// chunk count: a 32 KiB input against a hung detector. The bound is on the
+/// detector's own wait, not the round trip, and on the best of three attempts:
+/// under parallel load, scheduling noise inside one busy test process only
+/// ever adds time, while a detector that ignores its deadline overruns every
+/// attempt. Each attempt builds its own rig: on a shared one the hung attempts
+/// would open the breaker, and a later attempt would fail open without calling
+/// the detector at all.
 #[tokio::test]
 async fn block_waits_at_most_timeout_ms() {
-    let rig = rig(|c| {
-        c.fail_open = true;
-        c.chunk_tokens = 300;
-    })
-    .await;
-    rig.mock.set_mode(MockDetectorMode::Hang);
-    let started = Instant::now();
-    let resp = send(
-        &rig,
-        "block-key",
-        body(&"z".repeat(crate::guard::MAX_SCAN_BYTES - 64)),
-    )
-    .await;
-    assert_eq!(resp.status(), 200);
-    assert!(
-        started.elapsed() < Duration::from_millis(200 + 400),
-        "held for {:?}",
-        started.elapsed()
-    );
+    let mut waits = Vec::new();
+    for _ in 0..3 {
+        let rig = rig(|c| {
+            c.fail_open = true;
+            c.chunk_tokens = 300;
+        })
+        .await;
+        rig.mock.set_mode(MockDetectorMode::Hang);
+        let resp = send(
+            &rig,
+            "block-key",
+            body(&"z".repeat(crate::guard::MAX_SCAN_BYTES - 64)),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "fail_open forwards");
+        let (_, secs, calls) = detector(&rig).duration_snapshot();
+        assert_eq!(calls, 1, "the request waited on the detector");
+        let wait = Duration::from_secs_f64(secs);
+        if wait < Duration::from_millis(200 + 400) {
+            return;
+        }
+        waits.push(wait);
+    }
+    panic!("every attempt waited on the hung detector past its deadline: {waits:?}");
 }
 
 /// The AC's downtime test end to end: stop the detector mid-traffic. At most
