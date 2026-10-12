@@ -220,9 +220,12 @@ async fn detector_downtime_mid_traffic() {
     // enforce lane's turned-away counters, not from how long it took: under
     // parallel load a turned-away request can take `timeout_ms` end to end.
     // One admitted while the breaker was already tripped is a half-open
-    // probe, which a down phase longer than the cooldown can let through: it
-    // needs a full cooldown since the breaker last opened, which was no
-    // earlier than the down phase began or the previous probe was sent.
+    // probe, which a down phase longer than the cooldown can let through.
+    // The breaker last opened no earlier than the down phase began or the
+    // previous probe was sent, plus that probe's full `timeout_ms`; a probe
+    // is admitted a cooldown after that and itself waits `timeout_ms` before
+    // it returns. Neither timeout fires early, so a probe returns at least a
+    // cooldown plus two timeouts after `opened_after`, however loaded the host.
     let turned_away = || {
         let (open, saturated) = d.turned_away(Lane::Enforce);
         open + saturated
@@ -239,8 +242,8 @@ async fn detector_downtime_mid_traffic() {
             (true, _) => {}
             (false, true) => {
                 assert!(
-                    opened_after.elapsed() >= Duration::from_secs(1),
-                    "probe {i} came within one cooldown of the breaker opening"
+                    opened_after.elapsed() >= Duration::from_millis(1000 + 2 * 200),
+                    "probe {i} returned within a cooldown and two timeouts of the breaker opening"
                 );
                 opened_after = sent;
             }
