@@ -220,21 +220,30 @@ async fn detector_downtime_mid_traffic() {
     // enforce lane's turned-away counters, not from how long it took: under
     // parallel load a turned-away request can take `timeout_ms` end to end.
     // One admitted while the breaker was already tripped is a half-open
-    // probe, which a down phase longer than the cooldown can let through.
+    // probe, which a down phase longer than the cooldown can let through: it
+    // needs a full cooldown since the breaker last opened, which was no
+    // earlier than the down phase began or the previous probe was sent.
     let turned_away = || {
         let (open, saturated) = d.turned_away(Lane::Enforce);
         open + saturated
     };
     rig.mock.set_mode(MockDetectorMode::Hang);
-    let down = Instant::now();
-    let (mut reached, mut probes) = (0, 0);
+    let mut opened_after = Instant::now();
+    let mut reached = 0;
     for i in 0..10 {
         let (before, tripped) = (turned_away(), d.tripped(Lane::Enforce));
+        let sent = Instant::now();
         let resp = send(&rig, "block-key", body(&format!("down {i}"))).await;
         assert_eq!(resp.status(), 200, "fail_open forwards");
         match (turned_away() > before, tripped) {
             (true, _) => {}
-            (false, true) => probes += 1,
+            (false, true) => {
+                assert!(
+                    opened_after.elapsed() >= Duration::from_secs(1),
+                    "probe {i} came within one cooldown of the breaker opening"
+                );
+                opened_after = sent;
+            }
             (false, false) => reached += 1,
         }
         let resp = send(&rig, "annotate-key", body(&format!("shadow {i}"))).await;
@@ -247,10 +256,6 @@ async fn detector_downtime_mid_traffic() {
     assert!(
         reached <= 3,
         "{reached} block requests reached the hung detector; at most 3 may"
-    );
-    assert!(
-        probes <= down.elapsed().as_secs(),
-        "{probes} probes; at most one per cooldown"
     );
     assert!(d.tripped(Lane::Enforce));
 
