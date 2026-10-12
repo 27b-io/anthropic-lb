@@ -896,12 +896,20 @@ async fn the_metrics_export_what_is_held_and_every_alert() {
         series(&metrics, "anthropic_client_store_document", &doc_labels).as_deref(),
         Some("1")
     );
-    let records_version = inst.store.lock_reader().set.records_version(now_us());
+    // The set hash beside it is the one a poll reports: a store compares it with the set hash of
+    // what it serves to tell whether a write has reached this instance.
+    let (records_version, set_hash) = {
+        let reader = inst.store.lock_reader();
+        (
+            reader.set.records_version(now_us()),
+            digest_hex(&reader.set.hash()),
+        )
+    };
     assert_eq!(
         series(
             &metrics,
             "anthropic_client_store_restrictions",
-            &format!("records_version=\"{records_version}\"")
+            &format!("records_version=\"{records_version}\",set_hash=\"{set_hash}\"")
         )
         .as_deref(),
         Some("1")

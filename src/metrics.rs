@@ -2105,13 +2105,16 @@ fn append_client_store_metrics(buf: &mut String, m: &ClientStoreMetrics) {
         buf,
         "anthropic_client_store_restrictions",
         "gauge",
-        "The restrictions held, always 1: records_version is the highest record version held, as a poll reports it",
+        "The restrictions held, always 1: records_version is the highest record version held and set_hash the hash of the set held, as a poll reports them",
     );
     let records_version = m.records_version.to_string();
     prom_gauge(
         buf,
         "anthropic_client_store_restrictions",
-        &[("records_version", &records_version)],
+        &[
+            ("records_version", &records_version),
+            ("set_hash", &m.set_hash),
+        ],
         1.0,
     );
     gauge(

@@ -941,6 +941,8 @@ pub(crate) struct ClientStoreMetrics {
     pub(crate) document: Option<(u64, String)>,
     /// The highest record version held, as a poll reports it.
     pub(crate) records_version: u64,
+    /// The hash of the set held, as a poll reports it.
+    pub(crate) set_hash: String,
     pub(crate) complete: bool,
     pub(crate) loaded: bool,
     /// Whether the last part merged was full; `None` before the first.
@@ -1407,6 +1409,7 @@ impl ClientStore {
                 .as_ref()
                 .map(|d| (d.version, digest_hex(&d.digest))),
             records_version: reader.set.records_version(now_us()),
+            set_hash: digest_hex(&reader.set.hash()),
             complete: reader.set.complete,
             loaded: reader.loaded(),
             part_full: part.map(|p| p.full),
