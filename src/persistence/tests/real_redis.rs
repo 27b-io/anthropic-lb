@@ -1278,39 +1278,12 @@ mod redis_integration {
             return;
         };
         avoid_utc_midnight().await;
-        let clients = || {
-            vec![
-                mk_client("ops", &test_key("ops"), &[]),
-                mk_client("team-alpha", &test_key("alpha"), &[]),
-                mk_client("team-bravo", &test_key("bravo"), &[]),
-                mk_client("team-charlie", &test_key("charlie"), &[]),
-            ]
-        };
-        let state = Arc::new(
-            TestPolicy::clients(clients())
-                .operators(&["ops"])
-                .budgets(
-                    [
-                        ("team-alpha".to_string(), 1_000u64),
-                        ("team-bravo".to_string(), 2_000),
-                    ]
-                    .into(),
-                )
-                .install(AppState {
-                    redis: Some(fred),
-                    ..test_state_base()
-                }),
-        );
-        TestPolicy::clients(clients())
-            .operators(&["ops"])
-            .budgets(
-                [
-                    ("team-bravo".to_string(), 5_000u64),
-                    ("team-charlie".to_string(), 300),
-                ]
-                .into(),
-            )
-            .swap_into(&state);
+        let (before, after) = budget_swap_policies();
+        let state = Arc::new(before.install(AppState {
+            redis: Some(fred),
+            ..test_state_base()
+        }));
+        after.swap_into(&state);
         // One sync pass, as the background task runs every few seconds.
         let info = state.cluster_info().await;
         *state.lock_cluster_info_cache() = info;

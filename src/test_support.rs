@@ -143,7 +143,9 @@ pub(crate) fn test_state_base() -> AppState {
         state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
         // `TestPolicy::open()`'s posture: install a `TestPolicy` for any other.
         auth_mode: AuthMode::Open,
-        client_policy: std::sync::RwLock::new(Arc::new(ClientPolicy::unchecked(&cfg("")).1)),
+        client_policy: std::sync::RwLock::new(Arc::new(
+            ClientPolicy::unchecked(&cfg("")).1.into_inner(),
+        )),
         #[cfg(feature = "guard")]
         guard: crate::guard::Guard::empty(),
         allowed_ips: vec![],
@@ -936,7 +938,7 @@ impl TestPolicy {
     /// Build against `state`. Its `endpoints` stand in for `[[endpoints]]`,
     /// which the build checks pins and `passthrough` against. Panics with the
     /// boot error when the build refuses.
-    pub(crate) fn build(mut self, state: &AppState) -> (AuthMode, ClientPolicy) {
+    fn build(mut self, state: &AppState) -> (AuthMode, BuiltPolicy) {
         self.0.endpoints = state.endpoints.iter().map(endpoint_config).collect();
         ClientPolicy::build(&self.0)
             .unwrap_or_else(|e| panic!("test client policy refused at build: {e}"))
@@ -944,8 +946,14 @@ impl TestPolicy {
 
     /// Build, then install into `state`.
     pub(crate) fn install(self, state: AppState) -> AppState {
+        self.install_keeping(state).0
+    }
+
+    /// `install`, also returning the built policy, for a fixture that builds
+    /// a client store reader on it, as `main()` does.
+    pub(crate) fn install_keeping(self, state: AppState) -> (AppState, BuiltPolicy) {
         let (auth_mode, policy) = self.build(&state);
-        install_policy(state, auth_mode, policy)
+        (install_policy(state, auth_mode, policy.clone()), policy)
     }
 
     /// Build, then swap in as `state`'s policy, the way a runtime policy
@@ -971,6 +979,31 @@ impl TestPolicy {
     }
 }
 
+/// The before and after policies of the budget-gauge swap tests, in-process
+/// and cluster-wide, so the two cannot drift apart. An operator `ops` reads
+/// the gauges; across the swap `team-alpha` loses its budget, `team-bravo`'s
+/// grows and `team-charlie` gains one.
+pub(crate) fn budget_swap_policies() -> (TestPolicy, TestPolicy) {
+    let policy = |budgets: [(&str, u64); 2]| {
+        TestPolicy::clients(vec![
+            mk_client("ops", &test_key("ops"), &[]),
+            mk_client("team-alpha", &test_key("alpha"), &[]),
+            mk_client("team-bravo", &test_key("bravo"), &[]),
+            mk_client("team-charlie", &test_key("charlie"), &[]),
+        ])
+        .operators(&["ops"])
+        .budgets(
+            budgets
+                .map(|(name, budget)| (name.to_string(), budget))
+                .into(),
+        )
+    };
+    (
+        policy([("team-alpha", 1_000), ("team-bravo", 2_000)]),
+        policy([("team-bravo", 5_000), ("team-charlie", 300)]),
+    )
+}
+
 /// The `[[endpoints]]` entry `ep` would have been loaded from, for the build's
 /// endpoint cross-checks.
 fn endpoint_config(ep: &Endpoint) -> EndpointConfig {
@@ -987,10 +1020,10 @@ fn endpoint_config(ep: &Endpoint) -> EndpointConfig {
 }
 
 /// Install a built policy as `state`'s snapshot, as `main()` does.
-fn install_policy(state: AppState, auth_mode: AuthMode, policy: ClientPolicy) -> AppState {
+fn install_policy(state: AppState, auth_mode: AuthMode, policy: BuiltPolicy) -> AppState {
     AppState {
         auth_mode,
-        client_policy: std::sync::RwLock::new(Arc::new(policy)),
+        client_policy: std::sync::RwLock::new(Arc::new(policy.into_inner())),
         ..state
     }
 }

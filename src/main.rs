@@ -351,7 +351,7 @@ fn parse_error_at(raw: &str, span: Option<std::ops::Range<usize>>) -> String {
 /// real boot runs, including ones added later. Each error is the exact message
 /// `main()` panics with. Returns the client policy alongside the config, built
 /// by the one function that checks every per-client rule.
-fn load_config(raw: &str) -> Result<(Config, AuthMode, ClientPolicy), String> {
+fn load_config(raw: &str) -> Result<(Config, AuthMode, BuiltPolicy), String> {
     // toml's Display quotes the source line, which can hold a key or token, so
     // a syntax error reports only its position and toml's short message.
     let raw_value: toml::Value = toml::from_str(raw)
@@ -700,7 +700,7 @@ async fn main() {
         transport_cooldown: TRANSPORT_UNHEALTHY_COOLDOWN,
         state_path,
         auth_mode,
-        client_policy: std::sync::RwLock::new(Arc::new(client_policy)),
+        client_policy: std::sync::RwLock::new(Arc::new(client_policy.into_inner())),
         #[cfg(feature = "guard")]
         guard,
         allowed_ips,

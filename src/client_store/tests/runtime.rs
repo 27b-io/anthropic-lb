@@ -101,7 +101,7 @@ async fn the_poll_sends_a_user_agent_its_token_and_its_report() {
     };
     let reader = ClientStore::new(
         &config,
-        &inst.state.current_client_policy(),
+        &inst.store.base,
         vec!["acct-a".to_string()],
         inst._dir.as_ref().unwrap().path().join("other.json"),
     )

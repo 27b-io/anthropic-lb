@@ -16,7 +16,7 @@ use std::path::Path;
 // pure functions of their input and the reader's clock: the document and part
 // checks, the merge, the set hash, and `Reader`, which turns one poll answer
 // into what the instance holds. The second half runs it: the poll loop, the
-// resume file, the logs and `/_ready`. `ClientPolicy::with_store` turns what a
+// resume file, the logs and `/_ready`. `BuiltPolicy::with_store` turns what a
 // reader holds into the policy requests authenticate against.
 
 /// The largest document text or restrictions body a reader accepts: 2 MiB.
@@ -908,7 +908,7 @@ pub(crate) struct ClientStore {
     http: reqwest::Client,
     resume_path: PathBuf,
     /// The config file's policy: every policy the store yields is built on it.
-    base: ClientPolicy,
+    base: BuiltPolicy,
     /// This instance's endpoint names, the only pins a store client keeps.
     endpoints: Vec<String>,
     /// The config file's ordinary clients, exported one series each so the
@@ -921,7 +921,7 @@ pub(crate) struct ClientStore {
     /// it, so a second writer meanwhile would build on what was about to be
     /// replaced, and one of the two merges would be lost.
     writer: tokio::sync::Mutex<()>,
-    /// What the last policy built had to say (`ClientPolicy::with_store`).
+    /// What the last policy built had to say (`BuiltPolicy::with_store`).
     report: Mutex<StoreReport>,
     /// Credentials refused by the store's gate, one counter per
     /// `StoreRefusal` (`refusal_counter`).
@@ -1029,7 +1029,7 @@ impl ClientStore {
     /// where the copy a restart resumes from is kept.
     pub(crate) fn new(
         config: &ClientStoreConfig,
-        base: &ClientPolicy,
+        base: &BuiltPolicy,
         endpoints: Vec<String>,
         resume_path: PathBuf,
     ) -> Result<Self, String> {
