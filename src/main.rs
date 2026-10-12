@@ -28,7 +28,6 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, trace, warn};
@@ -41,6 +40,8 @@ mod guard;
 
 mod auto_cache;
 mod breaker;
+mod client_policy;
+mod client_store;
 mod config;
 mod fallback;
 mod handler;
@@ -61,6 +62,8 @@ mod token_usage;
 mod utilization;
 
 use auto_cache::*;
+use client_policy::*;
+use client_store::*;
 use config::*;
 use fallback::*;
 use handler::*;
@@ -162,189 +165,6 @@ fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
     Ok(())
 }
 
-/// Startup validation for the `[[clients]]` registry (LAB-1083).
-///
-/// Every rule here exists because its violation fails SILENTLY at runtime
-/// rather than loudly: a duplicate key resolves to whichever entry the scan
-/// saw last, a duplicate or empty name silently merges two callers' budgets and
-/// cache tenancy, and a `[response_cache].clients` typo makes the cache inert
-/// for that client with no signal at all. Cheap to catch at boot; expensive to
-/// notice in production.
-fn validate_clients(config: &Config) -> Result<(), String> {
-    let clients = &config.clients;
-    let mut seen_names: Vec<&str> = Vec::with_capacity(clients.len());
-    let mut seen_keys: Vec<&str> = Vec::with_capacity(clients.len());
-    for c in clients {
-        if c.name.trim().is_empty() {
-            return Err("client: name must not be empty".to_string());
-        }
-        // Stored untrimmed, so " geo" would become a client_id that matches no
-        // `client_budgets` / `operators` / `[response_cache].clients` key —
-        // silently unenforced budget and cache tenancy. `resolve_client_id`
-        // trims its header input; this path has nothing to trim it later.
-        if c.name != c.name.trim() {
-            return Err(format!(
-                "client '{}': name must not have leading or trailing whitespace",
-                c.name
-            ));
-        }
-        if c.name == "-" {
-            return Err(
-                "client: name must not be \"-\" (the unknown-client sentinel — budget enforcement skips it)"
-                    .to_string(),
-            );
-        }
-        if c.name == "_operator" {
-            return Err(
-                "client: name must not be \"_operator\" (the reserved operator-aggregation label on /_stats and /metrics)"
-                    .to_string(),
-            );
-        }
-        if c.name == "_other" {
-            return Err(
-                "client: name must not be \"_other\" (the reserved metrics overflow-bucket label — a real client with this name would merge into the (\"_other\", \"_other\") overflow key)"
-                    .to_string(),
-            );
-        }
-        if c.key.is_empty() {
-            return Err(format!("client '{}': key must not be empty", c.name));
-        }
-        // NOTE: the MIN_KEY_LEN strength floor (AC-13) is enforced in
-        // validate_exposure, not here — this function's structural rules
-        // (empty / duplicate / whitespace) are exercised by tests with
-        // deliberately short keys, and the deployment-posture floor belongs
-        // with the other posture checks. Both reference the shared const.
-        if seen_names.contains(&c.name.as_str()) {
-            return Err(format!("client '{}': duplicate name", c.name));
-        }
-        // preferred_endpoints must name configured endpoints — same posture as
-        // the registry cross-checks below: a typo would silently leave the
-        // client un-pinned, defeating the whole point of a dedicated account.
-        for pe in &c.preferred_endpoints {
-            if !config.endpoints.iter().any(|ep| ep.name == *pe) {
-                return Err(format!(
-                    "client '{}': preferred_endpoints entry '{}' does not match any configured endpoint",
-                    c.name, pe
-                ));
-            }
-        }
-        // Names, not keys, in the error — never log a credential.
-        if seen_keys.contains(&c.key.as_str()) {
-            return Err(format!(
-                "client '{}': duplicate key (already used by another client)",
-                c.name
-            ));
-        }
-        seen_names.push(&c.name);
-        seen_keys.push(&c.key);
-    }
-
-    // The legacy `client_names` IP map is the third identity entry point
-    // (`resolve_client_id`'s fallback) — an IP mapped to a reserved sentinel
-    // would resolve real traffic to it, bypassing the header filter above.
-    for (ip, name) in &config.client_names {
-        // Same failure as an untrimmed `[[clients]]` name above: resolved
-        // verbatim by `resolve_client_id`, matches no budget key.
-        if name.is_empty() || name != name.trim() {
-            return Err(format!(
-                "client_names: \"{ip}\" maps to \"{name}\" — value must be non-empty with no leading or trailing whitespace"
-            ));
-        }
-        if name == "-" || name == "_operator" || name == "_other" {
-            return Err(format!(
-                "client_names: \"{ip}\" maps to reserved name \"{name}\" (\"-\" = unknown-client sentinel, \"_operator\" = operator-aggregation label, \"_other\" = metrics overflow bucket)"
-            ));
-        }
-    }
-
-    // One client registry, not five. Every one of these config surfaces keys on
-    // a client name, and every one of them fails SILENTLY on a typo — in the
-    // dangerous direction: `check_budget` and `check_utilization_limit` both
-    // return Ok(()) for an unknown client, so a mistyped budget means UNLIMITED
-    // spend against the operator's accounts with no log line and no metric; a
-    // mistyped `operators` entry silently gates the caller it was meant to
-    // exempt; a mistyped `response_cache.clients` entry silently makes the
-    // cache inert. Only enforceable when [[clients]] is configured — on the
-    // legacy path client ids are header-derived and there is no registry to
-    // check against.
-
-    // `admin_readers` (LAB-4395) is the one cross-check surface that must fire on
-    // the legacy path too, because there it cannot work at all: with a single
-    // shared `proxy_key` the key holder IS the operator (`authenticate`
-    // returns no principal, so `authorize_admin` serves), and `client_id` on
-    // the proxy path is caller-asserted via `x-client-id`. An `admin_readers` entry
-    // would therefore restrict nobody and grant nobody — a control that reads
-    // as scoping while scoping nothing. Reject rather than half-handle,
-    // exactly as with `passthrough` below. Unlike `operators`, there are no
-    // pre-existing configs carrying this key, so nothing regresses.
-    if !config.admin_readers.is_empty() && clients.is_empty() {
-        return Err(
-            "admin_readers: requires [[clients]] — under legacy proxy_key the key holder is the operator by construction and client ids are caller-asserted, so a read-only role cannot be enforced"
-                .to_string(),
-        );
-    }
-    // One name, one role. `operators` bypasses every request policy and
-    // `admin_readers` is refused every proxied request; a name in both is a config
-    // whose author meant one of two opposite things. `pre_request_gate`
-    // resolves the overlap to the denial, but silently resolving it is how a
-    // typo becomes an outage or an unmetered key — so name it at boot.
-    if let Some(dup) = config
-        .admin_readers
-        .iter()
-        .find(|r| config.operators.contains(r))
-    {
-        return Err(format!(
-            "admin_readers: \"{dup}\" is also in operators — a client is either a read-only principal or an operator, never both"
-        ));
-    }
-
-    if clients.is_empty() {
-        return Ok(());
-    }
-
-    // `token = "passthrough"` forwards the caller's auth headers to the
-    // upstream UNTOUCHED (`inject_account_auth` returns before the
-    // header-strip). Under [[clients]] the caller's `x-api-key` is its PROXY
-    // credential, not an upstream one — so the two modes together would
-    // transmit every client key verbatim to that endpoint's `base_url`. They
-    // are contradictory by construction: passthrough means "the caller brings
-    // its own upstream credential", [[clients]] means "that header is mine".
-    // Reject rather than half-handle, exactly as with proxy_key above.
-    if let Some(ep) = config.endpoints.iter().find(|e| e.token == "passthrough") {
-        return Err(format!(
-            "endpoint '{}': token = \"passthrough\" is incompatible with [[clients]] — passthrough forwards the caller's auth headers upstream, which would leak client keys to {}",
-            ep.name,
-            ep.base_url.as_deref().unwrap_or("https://api.anthropic.com")
-        ));
-    }
-
-    let known = |name: &str| seen_names.contains(&name);
-    for (surface, name) in std::iter::empty()
-        .chain(config.client_budgets.keys().map(|k| ("client_budgets", k)))
-        .chain(
-            config
-                .client_utilization_limits
-                .keys()
-                .map(|k| ("client_utilization_limits", k)),
-        )
-        .chain(config.operators.iter().map(|k| ("operators", k)))
-        .chain(config.admin_readers.iter().map(|k| ("admin_readers", k)))
-        .chain(
-            config
-                .response_cache
-                .iter()
-                .flat_map(|rc| rc.clients.iter().map(|k| ("response_cache.clients", k))),
-        )
-    {
-        if !known(name) {
-            return Err(format!(
-                "{surface}: \"{name}\" names no configured [[clients]] entry"
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// A day, the ceiling the proxy already puts on an upstream `retry-after`. A
 /// capacity 429 without one cools the account down for `now + cooldown`, and a
 /// value past what `Instant` can hold would panic that request instead.
@@ -363,50 +183,9 @@ fn validate_rate_limit_cooldown(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Startup exposure posture (LAB-1192): unauthenticated is a BOOT FAILURE,
-/// not a default. Same shape as `reject_legacy_config_keys` — a named error
-/// at startup instead of a silent misconfiguration in production, where an
-/// open proxy is indistinguishable from a configured one until someone
-/// finds it.
-fn validate_exposure(config: &Config) -> Result<(), String> {
-    let has_credentials = config.proxy_key.is_some() || !config.clients.is_empty();
-    let allow_unauthenticated = config.allow_unauthenticated.unwrap_or(false);
-    if !has_credentials && !allow_unauthenticated {
-        return Err(
-            "config: no credentials configured — add [[clients]] entries (or legacy proxy_key), \
-             or explicitly set allow_unauthenticated = true for a trusted-network-only deployment \
-             (see README §Client Setup)"
-                .to_string(),
-        );
-    }
-    // One escape hatch, one meaning. Credentials + allow_unauthenticated
-    // together would make the flag silently dead (or worse, ambiguous) —
-    // exactly the half-applied-migration state the mutual-exclusion rules
-    // exist to reject.
-    if has_credentials && allow_unauthenticated {
-        return Err(
-            "config: allow_unauthenticated = true is incompatible with configured credentials — \
-             remove it, or remove [[clients]]/proxy_key (see README §Client Setup)"
-                .to_string(),
-        );
-    }
-    // AC-13: a static bearer credential on a public ingress gets scanned;
-    // below 32 characters the keyspace is the vulnerability.
-    if let Some(ref key) = config.proxy_key {
-        if key.len() < MIN_KEY_LEN {
-            return Err(format!(
-                "config: proxy_key is shorter than {MIN_KEY_LEN} characters — generate one with `openssl rand -hex 32`"
-            ));
-        }
-    }
-    for c in &config.clients {
-        if c.key.len() < MIN_KEY_LEN {
-            return Err(format!(
-                "client '{}': key is shorter than {MIN_KEY_LEN} characters — generate one with `openssl rand -hex 32`",
-                c.name
-            ));
-        }
-    }
+/// The failed-auth throttle needs a window to count in. The credential rules
+/// themselves are `ClientPolicy::build`'s.
+fn validate_auth_throttle(config: &Config) -> Result<(), String> {
     if config
         .auth_failure_limit
         .unwrap_or(DEFAULT_AUTH_FAILURE_LIMIT)
@@ -433,8 +212,8 @@ fn validate_exposure(config: &Config) -> Result<(), String> {
 /// The `admin_readers` arm also rejects a MISPLACED spelling, not just a
 /// removed one, because that drop fails OPEN: an empty `admin_readers` does
 /// not disable the read-only principal, it promotes it to an ordinary client
-/// with full proxy authority, and `validate_clients`' overlap and membership
-/// cross-checks never run for want of a name to check.
+/// with full proxy authority, and `ClientPolicy::build`'s overlap and
+/// membership cross-checks never run for want of a name to check.
 fn reject_legacy_config_keys(value: &toml::Value) -> Result<(), String> {
     let table = match value.as_table() {
         Some(t) => t,
@@ -541,6 +320,7 @@ fn nested_reader_key(value: &toml::Value, path: &str) -> Option<String> {
 /// production route table and middleware stack rather than a copy of it.
 fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/_ready", axum::routing::get(ready_handler))
         .route("/_stats", axum::routing::get(stats_handler))
         .route("/metrics", axum::routing::get(metrics_handler))
         .route(
@@ -555,22 +335,43 @@ fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// `config parse error`, plus `at line L, column C` when `span` places it in
+/// `raw`. The column counts characters, as toml's own report does.
+fn parse_error_at(raw: &str, span: Option<std::ops::Range<usize>>) -> String {
+    let Some(before) = span.and_then(|s| raw.get(..s.start)) else {
+        return "config parse error".to_string();
+    };
+    let line = before.matches('\n').count() + 1;
+    let column = before.chars().rev().take_while(|&c| c != '\n').count() + 1;
+    format!("config parse error at line {line}, column {column}")
+}
+
 /// The whole startup parse-and-validate sequence, in boot order. `main()` calls
 /// only this, so a test that loads a config through it sees every validator a
 /// real boot runs, including ones added later. Each error is the exact message
-/// `main()` panics with.
-fn load_config(raw: &str) -> Result<Config, String> {
-    let raw_value: toml::Value =
-        toml::from_str(raw).map_err(|e| format!("config parse error: {e}"))?;
+/// `main()` panics with. Returns the client policy alongside the config, built
+/// by the one function that checks every per-client rule.
+fn load_config(raw: &str) -> Result<(Config, AuthMode, ClientPolicy), String> {
+    // toml's Display quotes the source line, which can hold a key or token, so
+    // a syntax error reports only its position and toml's short message.
+    let raw_value: toml::Value = toml::from_str(raw)
+        .map_err(|e| format!("{}: {}", parse_error_at(raw, e.span()), e.message()))?;
     reject_legacy_config_keys(&raw_value)?;
-    let config: Config = raw_value
-        .try_into()
-        .map_err(|e| format!("config parse error: {e}"))?;
+    // Deserialised from `raw`, not `raw_value`, so the error keeps its span.
+    // serde's message carries the offending value, so it is never echoed. A
+    // missing field points at its enclosing table; an empty span points nowhere.
+    let config: Config = toml::from_str(raw).map_err(|e| {
+        let at = parse_error_at(raw, e.span().filter(|s| !s.is_empty()));
+        format!(
+            "{at}: a field has the wrong type, an unknown value or is missing \
+             (the value is not echoed, as it may be a secret)"
+        )
+    })?;
     validate_endpoints(&config.endpoints)?;
-    validate_clients(&config).map_err(|msg| format!("config: {msg}"))?;
-    validate_exposure(&config)?;
+    let (auth_mode, client_policy) = ClientPolicy::build(&config)?;
+    validate_auth_throttle(&config)?;
     validate_rate_limit_cooldown(&config)?;
-    Ok(config)
+    Ok((config, auth_mode, client_policy))
 }
 
 #[tokio::main]
@@ -581,7 +382,15 @@ async fn main() {
         .unwrap_or_else(|| "config.toml".to_string());
     let config_str = std::fs::read_to_string(&config_path)
         .unwrap_or_else(|e| panic!("failed to read {config_path}: {e}"));
-    let config = load_config(&config_str).unwrap_or_else(|msg| panic!("{msg}"));
+    let (mut config, auth_mode, client_policy) =
+        load_config(&config_str).unwrap_or_else(|msg| panic!("{msg}"));
+    // The policy holds every client key as a digest. Drop the plaintext keys,
+    // and the text they were read from, now rather than keep them until
+    // shutdown.
+    drop(config_str);
+    config.clients = Vec::new();
+    config.proxy_key = None;
+    let client_store_config = config.client_store.take();
 
     // Set up tracing: stderr (info+) always, plus optional debug log file
     {
@@ -618,19 +427,6 @@ async fn main() {
         "at least one [[endpoints]] entry required"
     );
 
-    // Validate new config fields
-    for (client, limit) in &config.client_utilization_limits {
-        assert!(
-            (0.0..=1.0).contains(limit),
-            "client_utilization_limits.{client}: must be 0.0-1.0, got {limit}"
-        );
-    }
-    for op in &config.operators {
-        assert!(
-            op != "-",
-            "operators cannot contain '-' (the unknown-client sentinel)"
-        );
-    }
     if let Some(thresh) = config.emergency_threshold {
         assert!(
             (0.0..=1.0).contains(&thresh),
@@ -653,7 +449,7 @@ async fn main() {
             count = trusted_proxies.len(),
             "trusted proxies configured — x-forwarded-for honoured from these peers"
         );
-    } else if !config.clients.is_empty() || config.proxy_key.is_some() {
+    } else if !matches!(auth_mode, AuthMode::Open) {
         // Credentials but no trusted_proxies: behind a load balancer every
         // client collapses to the LB's peer IP, leaving one shared allowlist
         // decision and one shared invalid-credential throttle bucket. Valid
@@ -673,7 +469,9 @@ async fn main() {
     // (LAB-1192 AC-4, LAB-4395). Both lists empty there means NO principal can
     // read them — a silent way to blind a monitoring scrape. Warn so the
     // omission is visible.
-    if !config.clients.is_empty() && config.operators.is_empty() && config.admin_readers.is_empty()
+    if matches!(auth_mode, AuthMode::Clients)
+        && client_policy.operators.is_empty()
+        && client_policy.admin_readers.is_empty()
     {
         warn!(
             "[[clients]] configured with empty operators AND admin_readers lists — /_stats and \
@@ -731,26 +529,30 @@ async fn main() {
         })
         .collect();
 
-    if !config.clients.is_empty() {
-        let with_allowlist = config
-            .clients
-            .iter()
-            .filter(|c| !c.models.is_empty())
-            .count();
-        info!(
-            clients = config.clients.len(),
-            with_model_allowlist = with_allowlist,
-            "per-client authentication enabled — x-client-id is ignored, identity comes from the credential"
-        );
-    } else if config.proxy_key.is_some() {
-        warn!("legacy shared proxy_key in use — every caller shares one identity; migrate to [[clients]] (see README §Client Setup)");
-    } else {
-        // validate_exposure guarantees this state is only reachable with the
-        // flag explicitly set (AC-2).
-        warn!(
-            "allow_unauthenticated = true — proxy, /_stats and /metrics accept unauthenticated \
-             traffic; safe ONLY on a trusted network (NetworkPolicy/tailnet), never on a public ingress"
-        );
+    match auth_mode {
+        AuthMode::Clients => {
+            let with_allowlist = client_policy
+                .clients
+                .iter()
+                .filter(|c| !c.models.is_empty())
+                .count();
+            info!(
+                clients = client_policy.clients.len(),
+                with_model_allowlist = with_allowlist,
+                "per-client authentication enabled — x-client-id is ignored, identity comes from the credential"
+            );
+        }
+        AuthMode::SharedKey(_) => {
+            warn!("legacy shared proxy_key in use — every caller shares one identity; migrate to [[clients]] (see README §Client Setup)");
+        }
+        AuthMode::Open => {
+            // ClientPolicy::build allows this mode only with the flag
+            // explicitly set (AC-2).
+            warn!(
+                "allow_unauthenticated = true — proxy, /_stats and /metrics accept unauthenticated \
+                 traffic; safe ONLY on a trusted network (NetworkPolicy/tailnet), never on a public ingress"
+            );
+        }
     }
 
     info!(
@@ -760,6 +562,24 @@ async fn main() {
     );
 
     let state_path = PathBuf::from(&config_path).with_extension("state.json");
+
+    // The client store reader, built on the config file's policy. Its resume
+    // copy sits beside the state file, so a restart that keeps one keeps both.
+    let client_store = client_store_config.map(|cfg| {
+        let store = ClientStore::new(
+            &cfg,
+            &client_policy,
+            endpoints.iter().map(|ep| ep.name.clone()).collect(),
+            PathBuf::from(&config_path).with_extension("client-store.json"),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        info!(
+            poll_url = %cfg.poll_url,
+            token = cfg.token.is_some(),
+            "client store enabled — no ordinary client is served until a complete set of restrictions is held"
+        );
+        Arc::new(store)
+    });
 
     // Set up shadow log writer if configured
     let shadow_log_tx = if let Some(ref path) = config.shadow_log {
@@ -879,8 +699,8 @@ async fn main() {
         cooldown,
         transport_cooldown: TRANSPORT_UNHEALTHY_COOLDOWN,
         state_path,
-        proxy_key: config.proxy_key.clone(),
-        clients: config.clients.clone(),
+        auth_mode,
+        client_policy: std::sync::RwLock::new(Arc::new(client_policy)),
         #[cfg(feature = "guard")]
         guard,
         allowed_ips,
@@ -904,11 +724,7 @@ async fn main() {
         overage_usage: Mutex::new(HashMap::new()),
         shadow_log_tx,
         shadow_log_dropped: AtomicU64::new(0),
-        client_budgets: config.client_budgets.clone(),
         budget_usage: Mutex::new(HashMap::new()),
-        client_utilization_limits: config.client_utilization_limits.clone(),
-        operators: config.operators.clone(),
-        admin_readers: config.admin_readers.clone(),
         emergency_brake: config.emergency_brake.unwrap_or(true),
         emergency_threshold: config
             .emergency_threshold
@@ -970,6 +786,7 @@ async fn main() {
         unsupported_models: Mutex::new(HashMap::new()),
         fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache,
+        client_store,
     });
 
     if state.auto_cache {
@@ -1001,7 +818,9 @@ async fn main() {
         "anthropic-lb starting"
     );
 
-    let listener = tokio::net::TcpListener::bind(addr)
+    // With a client store, the listener opens after the first answered poll,
+    // or after FIRST_POLL_WAIT without one.
+    let listener = bind_after_first_poll(&state, addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
 

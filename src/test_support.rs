@@ -141,8 +141,9 @@ pub(crate) fn test_state_base() -> AppState {
         cooldown: Duration::from_secs(60),
         transport_cooldown: TRANSPORT_UNHEALTHY_COOLDOWN,
         state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-        proxy_key: None,
-        clients: vec![],
+        // `TestPolicy::open()`'s posture: install a `TestPolicy` for any other.
+        auth_mode: AuthMode::Open,
+        client_policy: std::sync::RwLock::new(Arc::new(ClientPolicy::unchecked(&cfg("")).1)),
         #[cfg(feature = "guard")]
         guard: crate::guard::Guard::empty(),
         allowed_ips: vec![],
@@ -160,11 +161,7 @@ pub(crate) fn test_state_base() -> AppState {
         overage_usage: Mutex::new(HashMap::new()),
         shadow_log_tx: None,
         shadow_log_dropped: AtomicU64::new(0),
-        client_budgets: HashMap::new(),
         budget_usage: Mutex::new(HashMap::new()),
-        client_utilization_limits: HashMap::new(),
-        operators: vec![],
-        admin_readers: vec![],
         emergency_brake: true,
         emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
         client_request_rates: Mutex::new(HashMap::new()),
@@ -210,6 +207,7 @@ pub(crate) fn test_state_base() -> AppState {
         unsupported_models: Mutex::new(HashMap::new()),
         fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache: None,
+        client_store: None,
     }
 }
 
@@ -315,12 +313,11 @@ fn test_app_with_strategy(
     acct_b.base_url = upstream_url.to_string();
     let endpoints = vec![acct_a, acct_b];
 
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::shared_key_or_open(proxy_key).install(AppState {
         endpoints,
         routing_strategy,
-        proxy_key,
         ..test_state_base()
-    });
+    }));
 
     (build_router(state.clone()), state)
 }
@@ -453,12 +450,11 @@ pub(crate) fn test_openai_app(
     acct_b.base_url = upstream_url.to_string();
     let accounts = vec![acct_a, acct_b];
 
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::shared_key_or_open(proxy_key).install(AppState {
         endpoints: accounts,
         state_path: PathBuf::from("/tmp/anthropic-lb-openai-test.state.json"),
-        proxy_key,
         ..test_state_base()
-    });
+    }));
 
     let app = Router::new()
         .route(
@@ -724,6 +720,58 @@ pub(crate) fn log_capture_buf() -> Arc<Mutex<Vec<u8>>> {
     })
     .clone()
 }
+// The test binary's allocator: the system's, counting what each thread
+// allocates, so a test can bound what one call allocates whatever other tests
+// do on their own threads meanwhile. The counter is const-initialised and
+// holds no destructor, so reading it never allocates.
+thread_local! {
+    static THREAD_ALLOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct CountingAlloc;
+
+fn count_allocation(bytes: usize) {
+    let _ = THREAD_ALLOCATED.try_with(|c| c.set(c.get().saturating_add(bytes)));
+}
+
+// SAFETY: every method forwards to `System` unchanged; counting touches only
+// a thread-local `Cell<usize>`.
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_allocation(layout.size());
+        // SAFETY: the caller's contract is `System`'s.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_allocation(layout.size());
+        // SAFETY: as `alloc`.
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        count_allocation(new_size);
+        // SAFETY: as `alloc`.
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: as `alloc`.
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static COUNTING_ALLOC: CountingAlloc = CountingAlloc;
+
+/// Run `f`, and return what it returned with the bytes this thread allocated
+/// while it ran (frees not subtracted).
+pub(crate) fn allocated_by<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let before = THREAD_ALLOCATED.with(std::cell::Cell::get);
+    let out = f();
+    (out, THREAD_ALLOCATED.with(std::cell::Cell::get) - before)
+}
+
 /// Helper: set up account utilization for enforcement tests.
 pub(crate) async fn set_account_utilization(
     state: &AppState,
@@ -800,6 +848,8 @@ pub(crate) const PROMPT_TOO_LONG_BODY: &[u8] = br#"{"type":"error","error":{"typ
 // mostly prove one thing from several angles — that `client_id` cannot be
 // asserted by the caller once a client table exists.
 
+/// A `[[clients]]` entry. `key` is stored as given, so pass a `test_key`: the
+/// build refuses anything shorter than `MIN_KEY_LEN`.
 pub(crate) fn mk_client(name: &str, key: &str, models: &[&str]) -> ClientConfig {
     ClientConfig {
         name: name.to_string(),
@@ -812,10 +862,162 @@ pub(crate) fn mk_client(name: &str, key: &str, models: &[&str]) -> ClientConfig 
 }
 
 pub(crate) fn state_with_clients(clients: Vec<ClientConfig>) -> Arc<AppState> {
-    Arc::new(AppState {
-        clients,
-        ..test_state_base()
-    })
+    Arc::new(TestPolicy::clients(clients).install(test_state_base()))
+}
+
+/// A test credential: `tag` plus a fixed 33-character suffix, so it clears
+/// `MIN_KEY_LEN` whatever the tag. A test configures `test_key(tag)` and
+/// presents `test_key(tag)`. A near miss must be derived from the whole key:
+/// `test_key` of a near-miss tag differs in the tag only.
+pub(crate) fn test_key(tag: &str) -> String {
+    format!("{tag}-0123456789abcdef0123456789abcdef")
+}
+
+/// The per-client half of a test state, built by `ClientPolicy::build` — the
+/// checks a real boot runs — so a fixture holds nothing a config could not.
+/// Pick the auth mode, add the name-keyed policy, then `install` it.
+pub(crate) struct TestPolicy(Config);
+
+impl TestPolicy {
+    /// No credential: `allow_unauthenticated = true`, as `test_state_base()`.
+    pub(crate) fn open() -> Self {
+        Self(cfg("allow_unauthenticated = true\n"))
+    }
+
+    /// The legacy shared `proxy_key`.
+    pub(crate) fn shared_key(key: &str) -> Self {
+        let mut config = cfg("");
+        config.proxy_key = Some(key.to_string());
+        Self(config)
+    }
+
+    /// `shared_key` when given one, else `open`: the fixtures that take an
+    /// optional proxy key.
+    pub(crate) fn shared_key_or_open(proxy_key: Option<String>) -> Self {
+        proxy_key.map_or_else(Self::open, |key| Self::shared_key(&key))
+    }
+
+    /// `[[clients]]`.
+    pub(crate) fn clients(clients: Vec<ClientConfig>) -> Self {
+        let mut config = cfg("");
+        config.clients = clients;
+        Self(config)
+    }
+
+    pub(crate) fn operators(mut self, names: &[&str]) -> Self {
+        self.0.operators = names.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub(crate) fn admin_readers(mut self, names: &[&str]) -> Self {
+        self.0.admin_readers = names.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub(crate) fn budgets(mut self, budgets: HashMap<String, u64>) -> Self {
+        self.0.client_budgets = budgets;
+        self
+    }
+
+    /// `[client_store]`, polled at `poll_url`, with a token when given one.
+    pub(crate) fn client_store(mut self, poll_url: &str, token: Option<&str>) -> Self {
+        self.0.client_store = Some(ClientStoreConfig {
+            poll_url: poll_url.to_string(),
+            token: token.map(str::to_string),
+        });
+        self
+    }
+
+    pub(crate) fn utilization_limits(mut self, limits: HashMap<String, f64>) -> Self {
+        self.0.client_utilization_limits = limits;
+        self
+    }
+
+    /// Build against `state`. Its `endpoints` stand in for `[[endpoints]]`,
+    /// which the build checks pins and `passthrough` against. Panics with the
+    /// boot error when the build refuses.
+    pub(crate) fn build(mut self, state: &AppState) -> (AuthMode, ClientPolicy) {
+        self.0.endpoints = state.endpoints.iter().map(endpoint_config).collect();
+        ClientPolicy::build(&self.0)
+            .unwrap_or_else(|e| panic!("test client policy refused at build: {e}"))
+    }
+
+    /// Build, then install into `state`.
+    pub(crate) fn install(self, state: AppState) -> AppState {
+        let (auth_mode, policy) = self.build(&state);
+        install_policy(state, auth_mode, policy)
+    }
+
+    /// Build, then swap in as `state`'s policy, the way a runtime policy
+    /// source would. The auth mode stays the boot's, so the build must agree
+    /// with it.
+    pub(crate) fn swap_into(self, state: &AppState) {
+        let (auth_mode, policy) = self.build(state);
+        assert_eq!(
+            std::mem::discriminant(&auth_mode),
+            std::mem::discriminant(&state.auth_mode),
+            "a swap never changes how callers authenticate"
+        );
+        state
+            .swap_client_policy(policy)
+            .unwrap_or_else(|e| panic!("swap refused: {e}"));
+    }
+
+    /// Install with no check at all, for the tests that pin how the runtime
+    /// behaves in a state a boot refuses.
+    pub(crate) fn install_unchecked(self, state: AppState) -> AppState {
+        let (auth_mode, policy) = ClientPolicy::unchecked(&self.0);
+        install_policy(state, auth_mode, policy)
+    }
+}
+
+/// The `[[endpoints]]` entry `ep` would have been loaded from, for the build's
+/// endpoint cross-checks.
+fn endpoint_config(ep: &Endpoint) -> EndpointConfig {
+    EndpointConfig {
+        name: ep.name.clone(),
+        protocol: ep.protocol,
+        base_url: Some(ep.base_url.clone()),
+        token: ep.token.clone(),
+        models: ep.models.clone(),
+        priority: ep.priority,
+        fable_included: Some(ep.fable_included),
+        allow_nonstandard_host: None,
+    }
+}
+
+/// Install a built policy as `state`'s snapshot, as `main()` does.
+fn install_policy(state: AppState, auth_mode: AuthMode, policy: ClientPolicy) -> AppState {
+    AppState {
+        auth_mode,
+        client_policy: std::sync::RwLock::new(Arc::new(policy)),
+        ..state
+    }
+}
+
+impl AppState {
+    /// A caller named `name` under the current snapshot, built as a shared-
+    /// key or open proxy builds a header-derived caller: its role is looked up
+    /// by name, by the rule the build gave the principal table. For tests that
+    /// drive a per-client decision without a request.
+    pub(crate) fn caller(&self, name: &str) -> Caller {
+        Caller::named(self.current_client_policy(), name.to_string())
+    }
+}
+
+/// One `/metrics` family's values by `client` label, for the families
+/// labelled by client alone.
+pub(crate) fn metric_by_client(body: &str, family: &str) -> HashMap<String, u64> {
+    let prefix = format!("{family}{{client=\"");
+    body.lines()
+        .filter_map(|line| line.strip_prefix(prefix.as_str()))
+        .map(|rest| {
+            let (client, value) = rest
+                .split_once("\"} ")
+                .unwrap_or_else(|| panic!("unexpected {family} line: {rest}"));
+            (client.to_string(), value.parse::<f64>().unwrap() as u64)
+        })
+        .collect()
 }
 
 pub(crate) fn hdrs(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
@@ -912,6 +1114,10 @@ pub(crate) fn openai_invalid_request_body(message: &str) -> serde_json::Value {
         }
     })
 }
+
+/// 64-hex — what `openssl rand -hex 32` emits, and the documented floor.
+pub(crate) const STRONG_KEY: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 pub(crate) const TEST_IP: &str = "10.0.0.7";
 

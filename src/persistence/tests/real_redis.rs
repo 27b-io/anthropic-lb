@@ -61,6 +61,7 @@ mod redis_integration {
         TransportErrorsHincrbyRejected = 18,
         PassthroughNoHardMark = 19,
         PassthroughNotSynced = 20,
+        ClusterBudgetGaugeAfterSwap = 21,
     }
 
     impl Db {
@@ -754,19 +755,25 @@ mod redis_integration {
         // reads fails the test with no defect.
         let _clock = FrozenClock::at(FROZEN_GATE_CLOCKS[0]);
         let budgets: HashMap<String, u64> = [("budget-cli".to_string(), 1000u64)].into();
-        let replica_a = Arc::new(AppState {
-            client_budgets: budgets.clone(),
+        let replica_a = Arc::new(
+            TestPolicy::open()
+                .budgets(budgets.clone())
+                .install(AppState {
+                    redis: Some(fred.clone()),
+                    ..test_state_base()
+                }),
+        );
+        let replica_b = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
             redis: Some(fred.clone()),
             ..test_state_base()
-        });
-        let replica_b = Arc::new(AppState {
-            client_budgets: budgets,
-            redis: Some(fred.clone()),
-            ..test_state_base()
-        });
+        }));
 
-        replica_a.record_budget_usage("budget-cli", 100).await;
-        replica_b.record_budget_usage("budget-cli", 250).await;
+        replica_a
+            .record_budget_usage(&replica_a.caller("budget-cli"), 100)
+            .await;
+        replica_b
+            .record_budget_usage(&replica_b.caller("budget-cli"), 250)
+            .await;
 
         let today = AppState::now_epoch() / 86400;
         let key = format!("alb:budget:budget-cli:{today}");
@@ -787,18 +794,24 @@ mod redis_integration {
 
         // Cross-replica enforcement: a replica with a lower limit and NO
         // local usage of its own sees the shared counter and refuses.
-        let enforcing = Arc::new(AppState {
-            client_budgets: [("budget-cli".to_string(), 300u64)].into(),
-            redis: Some(fred.clone()),
-            ..test_state_base()
-        });
+        let enforcing = Arc::new(
+            TestPolicy::open()
+                .budgets([("budget-cli".to_string(), 300u64)].into())
+                .install(AppState {
+                    redis: Some(fred.clone()),
+                    ..test_state_base()
+                }),
+        );
         // Both instants fall on the same UTC day, so the counter recorded
         // above gates each; two of them so a hardcoded payload cannot pass.
         for frozen in FROZEN_GATE_CLOCKS {
             let _clock = FrozenClock::at(frozen);
-            let secs = enforcing.check_budget("budget-cli").await.expect_err(
-                "shared counter (350) must gate a 300 limit on a replica that recorded nothing",
-            );
+            let secs = enforcing
+                .check_budget(&enforcing.caller("budget-cli"))
+                .await
+                .expect_err(
+                    "shared counter (350) must gate a 300 limit on a replica that recorded nothing",
+                );
             assert_eq!(
                 secs,
                 86400 - frozen % 86400,
@@ -806,7 +819,10 @@ mod redis_integration {
             );
         }
         assert!(
-            replica_a.check_budget("budget-cli").await.is_ok(),
+            replica_a
+                .check_budget(&replica_a.caller("budget-cli"))
+                .await
+                .is_ok(),
             "350 used of 1000 must pass"
         );
 
@@ -816,13 +832,16 @@ mod redis_integration {
             .set(format!("alb:budget:roll-cli:{}", today - 1), 999_999u64)
             .await
             .unwrap();
-        let roll = Arc::new(AppState {
-            client_budgets: [("roll-cli".to_string(), 100u64)].into(),
-            redis: Some(fred.clone()),
-            ..test_state_base()
-        });
+        let roll = Arc::new(
+            TestPolicy::open()
+                .budgets([("roll-cli".to_string(), 100u64)].into())
+                .install(AppState {
+                    redis: Some(fred.clone()),
+                    ..test_state_base()
+                }),
+        );
         assert!(
-            roll.check_budget("roll-cli").await.is_ok(),
+            roll.check_budget(&roll.caller("roll-cli")).await.is_ok(),
             "yesterday's counter must not gate today"
         );
     }
@@ -845,12 +864,15 @@ mod redis_integration {
         // The fleet spent this much before the replica under test started.
         let _: () = conn.set(&key, 1_516_491u64).await.unwrap();
 
-        let state = Arc::new(AppState {
-            endpoints: vec![make_endpoint("seed-ep", Protocol::Anthropic)],
-            client_budgets: [("seed-cli".to_string(), 2_000_000u64)].into(),
-            redis: Some(fred),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("seed-cli".to_string(), 2_000_000u64)].into())
+                .install(AppState {
+                    endpoints: vec![make_endpoint("seed-ep", Protocol::Anthropic)],
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
         assert!(
             state.budget_usage.lock().unwrap().is_empty(),
             "a fresh replica starts with an empty mirror"
@@ -966,15 +988,20 @@ mod redis_integration {
             return;
         };
         avoid_utc_midnight().await;
-        let state = Arc::new(AppState {
-            client_budgets: [
-                ("poison-cli".to_string(), 100u64),
-                ("fresh-cli".to_string(), 100u64),
-            ]
-            .into(),
-            redis: Some(fred),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets(
+                    [
+                        ("poison-cli".to_string(), 100u64),
+                        ("fresh-cli".to_string(), 100u64),
+                    ]
+                    .into(),
+                )
+                .install(AppState {
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
         let today = AppState::now_epoch() / 86400;
         let key = format!("alb:budget:poison-cli:{today}");
         let _: () = conn.set(&key, "not-a-number").await.unwrap();
@@ -987,7 +1014,7 @@ mod redis_integration {
             .unwrap()
             .insert("poison-cli".to_string(), (today, 150));
         let secs = state
-            .check_budget("poison-cli")
+            .check_budget(&state.caller("poison-cli"))
             .await
             .expect_err("local fallback must enforce while the redis value is unreadable");
         assert!(
@@ -998,7 +1025,9 @@ mod redis_integration {
         // INCRBY fails with a server-reported value error → the poisoned key
         // is DELETED so the shared counter can rebuild (Kody amendment on
         // LAB-1962). Only transport failures preserve the key.
-        state.record_budget_usage("poison-cli", 10).await;
+        state
+            .record_budget_usage(&state.caller("poison-cli"), 10)
+            .await;
         assert_eq!(
             conn.get::<_, Option<String>>(&key).await.unwrap(),
             None,
@@ -1019,9 +1048,12 @@ mod redis_integration {
         // Absent key (just self-healed) + reachable redis + local over limit
         // → the local floor gates. Under the pre-LAB-1962 contract Ok(None)
         // was an authoritative allow — an enforcement bypass.
-        let secs = state.check_budget("poison-cli").await.expect_err(
-            "absent key with redis reachable must fall through to the local floor and deny",
-        );
+        let secs = state
+            .check_budget(&state.caller("poison-cli"))
+            .await
+            .expect_err(
+                "absent key with redis reachable must fall through to the local floor and deny",
+            );
         assert!(
             (1..=86400).contains(&secs),
             "budget payload must be the seconds until the UTC day rolls over, got {secs}"
@@ -1029,16 +1061,18 @@ mod redis_integration {
 
         // Absent key + no local usage (genuine zero) → still allows.
         assert!(
-            state.check_budget("fresh-cli").await.is_ok(),
+            state.check_budget(&state.caller("fresh-cli")).await.is_ok(),
             "absent key with no local usage must still allow"
         );
 
         // A rebuilt under-limit shared counter is authoritative over larger
         // local state — the surviving half of the LAB-931 pin.
-        state.record_budget_usage("poison-cli", 5).await;
+        state
+            .record_budget_usage(&state.caller("poison-cli"), 5)
+            .await;
         assert_eq!(conn.get::<_, Option<u64>>(&key).await.unwrap(), Some(5));
         assert!(
-            state.check_budget("poison-cli").await.is_ok(),
+            state.check_budget(&state.caller("poison-cli")).await.is_ok(),
             "deliberate pin: a reachable redis counter (5) is authoritative over larger local state (165)"
         );
 
@@ -1129,20 +1163,25 @@ mod redis_integration {
         // it can verify the increment really was lost (not buffered/replayed).
         let mut direct = connect(&Db::LostIncrbyRevival.url(&base)).await;
 
-        let state = Arc::new(AppState {
-            client_budgets: [("lost-cli".to_string(), 100u64)].into(),
-            redis: Some(fred),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("lost-cli".to_string(), 100u64)].into())
+                .install(AppState {
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
 
         kill_proxy(kill).await;
 
         // The very first INCRBY fails (or is skipped once fred notices the
         // outage) — the shared counter is never created. The local
         // accumulator carries the only record of the spend (150 > 100).
-        state.record_budget_usage("lost-cli", 150).await;
+        state
+            .record_budget_usage(&state.caller("lost-cli"), 150)
+            .await;
         let secs = state
-            .check_budget("lost-cli")
+            .check_budget(&state.caller("lost-cli"))
             .await
             .expect_err("local fallback must deny while the backend is dead");
         assert!(
@@ -1174,7 +1213,7 @@ mod redis_integration {
         // The money assertion: redis reachable + absent key must fall
         // through to the local floor (150 >= 100) and DENY.
         let secs = state
-            .check_budget("lost-cli")
+            .check_budget(&state.caller("lost-cli"))
             .await
             .expect_err("absent key after revival must not bypass the local floor (LAB-1962/F8)");
         assert!(
@@ -1208,11 +1247,14 @@ mod redis_integration {
             .await
             .unwrap();
 
-        let state = Arc::new(AppState {
-            client_budgets: [("scan-cli".to_string(), 1000u64)].into(),
-            redis: Some(fred),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("scan-cli".to_string(), 1000u64)].into())
+                .install(AppState {
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
         let info = state.cluster_info().await.expect("cluster_info with redis");
         assert_eq!(
             info["replicas_seen"], 500,
@@ -1221,6 +1263,105 @@ mod redis_integration {
         assert_eq!(info["redis_connected"], true);
         assert_eq!(info["budget_usage"]["scan-cli"]["used"], 42);
         assert_eq!(info["budget_usage"]["scan-cli"]["limit"], 1000);
+    }
+
+    /// After a swap that removes, changes and adds budgets, the first sync
+    /// pass brings the cluster budget gauge into line with the limit the gate
+    /// enforces: the cluster-wide twin of
+    /// `every_budget_gauge_shows_the_limit_the_gate_enforces_after_a_swap`.
+    /// Until that pass the gauge shows the old policy, as `metrics_handler`
+    /// notes. With a backend, the gate reads the shared counter, so the
+    /// probes set it there.
+    #[tokio::test]
+    async fn cluster_budget_gauge_shows_the_limit_the_gate_enforces_after_a_swap() {
+        let Some((mut conn, fred)) = redis_test_conn(Db::ClusterBudgetGaugeAfterSwap).await else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let clients = || {
+            vec![
+                mk_client("ops", &test_key("ops"), &[]),
+                mk_client("team-alpha", &test_key("alpha"), &[]),
+                mk_client("team-bravo", &test_key("bravo"), &[]),
+                mk_client("team-charlie", &test_key("charlie"), &[]),
+            ]
+        };
+        let state = Arc::new(
+            TestPolicy::clients(clients())
+                .operators(&["ops"])
+                .budgets(
+                    [
+                        ("team-alpha".to_string(), 1_000u64),
+                        ("team-bravo".to_string(), 2_000),
+                    ]
+                    .into(),
+                )
+                .install(AppState {
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
+        TestPolicy::clients(clients())
+            .operators(&["ops"])
+            .budgets(
+                [
+                    ("team-bravo".to_string(), 5_000u64),
+                    ("team-charlie".to_string(), 300),
+                ]
+                .into(),
+            )
+            .swap_into(&state);
+        // One sync pass, as the background task runs every few seconds.
+        let info = state.cluster_info().await;
+        *state.lock_cluster_info_cache() = info;
+
+        let addr = serve(build_router(state.clone())).await;
+        let metrics = Client::new()
+            .get(format!("http://{addr}/metrics"))
+            .header("x-api-key", test_key("ops"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let limits = metric_by_client(&metrics, "anthropic_cluster_budget_limit");
+        assert_eq!(
+            limits,
+            [
+                ("team-bravo".to_string(), 5_000),
+                ("team-charlie".to_string(), 300)
+            ]
+            .into(),
+            "the cluster gauge follows the swap"
+        );
+
+        let today = AppState::now_epoch() / 86400;
+        for name in ["team-alpha", "team-bravo", "team-charlie"] {
+            let caller = state.caller(name);
+            let key = format!("alb:budget:{name}:{today}");
+            match limits.get(name).copied() {
+                Some(limit) => {
+                    let _: () = conn.set(&key, limit - 1).await.unwrap();
+                    assert!(
+                        state.check_budget(&caller).await.is_ok(),
+                        "{name}: the gate admits below the gauge's limit"
+                    );
+                    let _: () = conn.set(&key, limit).await.unwrap();
+                    assert!(
+                        state.check_budget(&caller).await.is_err(),
+                        "{name}: the gate refuses at the gauge's limit"
+                    );
+                }
+                None => {
+                    let _: () = conn.set(&key, u64::MAX / 2).await.unwrap();
+                    assert!(
+                        state.check_budget(&caller).await.is_ok(),
+                        "{name}: no gauge, so the gate sets no limit"
+                    );
+                }
+            }
+        }
     }
 
     /// AC5: pipelined HINCRBY folds deltas from multiple replicas into the
@@ -1480,25 +1621,35 @@ mod redis_integration {
             return;
         };
         avoid_utc_midnight().await;
-        let state = Arc::new(AppState {
-            endpoints: vec![make_endpoint("degrade-ep", Protocol::Anthropic)],
-            client_budgets: [("degrade-cli".to_string(), 100u64)].into(),
-            redis: Some(fred),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("degrade-cli".to_string(), 100u64)].into())
+                .install(AppState {
+                    endpoints: vec![make_endpoint("degrade-ep", Protocol::Anthropic)],
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
 
         // Healthy first: the shared counter works through the proxy.
-        state.record_budget_usage("degrade-cli", 50).await;
-        assert!(state.check_budget("degrade-cli").await.is_ok());
+        state
+            .record_budget_usage(&state.caller("degrade-cli"), 50)
+            .await;
+        assert!(state
+            .check_budget(&state.caller("degrade-cli"))
+            .await
+            .is_ok());
 
         kill_proxy(kill).await;
 
         // Budget: the INCRBY fails; the local accumulator still advances
         // (50+60=110) and check_budget falls back to it, refusing
         // over-limit spend with redis dead.
-        state.record_budget_usage("degrade-cli", 60).await;
+        state
+            .record_budget_usage(&state.caller("degrade-cli"), 60)
+            .await;
         let secs = state
-            .check_budget("degrade-cli")
+            .check_budget(&state.caller("degrade-cli"))
             .await
             .expect_err("local fallback must enforce the budget with redis dead");
         assert!(
@@ -1552,23 +1703,33 @@ mod redis_integration {
         // verify post-recovery writes actually landed.
         let direct = connect(&Db::BackendRecoveryMidRun.url(&base)).await;
 
-        let state = Arc::new(AppState {
-            client_budgets: [("recover-cli".to_string(), 100u64)].into(),
-            redis: Some(fred),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("recover-cli".to_string(), 100u64)].into())
+                .install(AppState {
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
 
         // Healthy first: the shared counter works through the proxy.
-        state.record_budget_usage("recover-cli", 50).await;
-        assert!(state.check_budget("recover-cli").await.is_ok());
+        state
+            .record_budget_usage(&state.caller("recover-cli"), 50)
+            .await;
+        assert!(state
+            .check_budget(&state.caller("recover-cli"))
+            .await
+            .is_ok());
 
         kill_proxy(kill).await;
 
         // Dead: the INCRBY fails; the local accumulator (50+60=110)
         // enforces the 100 budget.
-        state.record_budget_usage("recover-cli", 60).await;
+        state
+            .record_budget_usage(&state.caller("recover-cli"), 60)
+            .await;
         let secs = state
-            .check_budget("recover-cli")
+            .check_budget(&state.caller("recover-cli"))
             .await
             .expect_err("local fallback must enforce the budget while the backend is dead");
         assert!(
@@ -1589,13 +1750,15 @@ mod redis_integration {
         // again, flipping check_budget from the local denial back to Ok.
         eventually("coordination to resume after backend recovery", || {
             let s = state.clone();
-            async move { s.check_budget("recover-cli").await.is_ok() }
+            async move { s.check_budget(&s.caller("recover-cli")).await.is_ok() }
         })
         .await;
 
         // And writes flow again, verified through the independent direct
         // connection: a fresh INCRBY lands in the real backend.
-        state.record_budget_usage("recover-cli", 7).await;
+        state
+            .record_budget_usage(&state.caller("recover-cli"), 7)
+            .await;
         let today = AppState::now_epoch() / 86400;
         let key = format!("alb:budget:recover-cli:{today}");
         eventually("post-recovery INCRBY to land in the backend", || {
@@ -1674,14 +1837,17 @@ mod redis_integration {
             "never-yet-connected client must read disconnected"
         );
 
-        let state = Arc::new(AppState {
-            client_budgets: [("startup-cli".to_string(), 100u64)].into(),
-            redis: Some(client.clone()),
-            // Production boots with the gate closed; test_state_base opens
-            // it for the connected-at-creation fixtures.
-            redis_ever_connected: AtomicBool::new(false),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("startup-cli".to_string(), 100u64)].into())
+                .install(AppState {
+                    redis: Some(client.clone()),
+                    // Production boots with the gate closed; test_state_base opens
+                    // it for the connected-at-creation fixtures.
+                    redis_ever_connected: AtomicBool::new(false),
+                    ..test_state_base()
+                }),
+        );
         state.spawn_redis_connect_watcher();
 
         // Never-yet-connected: the coordination gate is closed, so request
@@ -1692,8 +1858,13 @@ mod redis_integration {
             "coordination gate must be closed before the first connect"
         );
         let ops = std::time::Instant::now();
-        assert!(state.check_budget("startup-cli").await.is_ok());
-        state.record_budget_usage("startup-cli", 50).await;
+        assert!(state
+            .check_budget(&state.caller("startup-cli"))
+            .await
+            .is_ok());
+        state
+            .record_budget_usage(&state.caller("startup-cli"), 50)
+            .await;
         state.sync_from_redis().await;
         state.publish_routing_weights().await;
         assert!(
@@ -1706,9 +1877,11 @@ mod redis_integration {
         );
 
         // Local budget accounting still enforces (50 + 60 > 100).
-        state.record_budget_usage("startup-cli", 60).await;
+        state
+            .record_budget_usage(&state.caller("startup-cli"), 60)
+            .await;
         let secs = state
-            .check_budget("startup-cli")
+            .check_budget(&state.caller("startup-cli"))
             .await
             .expect_err("local fallback must enforce the budget while unconnected");
         assert!(
@@ -1733,7 +1906,9 @@ mod redis_integration {
         // Coordination writes begin: a fresh INCRBY lands in the real
         // backend, verified through the independent direct connection.
         // 7, not 117 — the pre-attach 50 and 60 were local-only by design.
-        state.record_budget_usage("startup-cli", 7).await;
+        state
+            .record_budget_usage(&state.caller("startup-cli"), 7)
+            .await;
         let today = AppState::now_epoch() / 86400;
         let key = format!("alb:budget:startup-cli:{today}");
         eventually("the post-attach INCRBY to land in the backend", || {

@@ -255,6 +255,8 @@ impl ResponseCache {
     ) -> Result<Self, String> {
         let mut map = HashMap::new();
         for client_id in clients {
+            // `ClientPolicy::build` refuses this at boot. The cache refuses it
+            // too, so no other way of building one can open a shared tenant.
             if client_id == "-" {
                 return Err(
                     "response_cache.clients cannot contain \"-\" (the unknown-client sentinel — it would opt in every unidentified caller)"
@@ -456,6 +458,33 @@ pub(crate) fn parse_ip_entries(entries: Option<&[String]>, field: &str) -> Vec<I
         .collect()
 }
 
+/// Why `authenticate` turned a request away.
+#[derive(Debug)]
+pub(crate) enum AuthRejection {
+    /// No credential matched: a failed credential, counted against the
+    /// client IP's failed-auth throttle.
+    Unauthorized,
+    /// A credential that may well be good, which the client store turns away.
+    Refused(StoreRefusal),
+}
+
+impl AuthRejection {
+    /// The response to answer with. Boxed, so `authenticate_throttled`'s
+    /// `Result` stays small on its hot success path, matching
+    /// `reserve_request_body`: an inline `Response` is 128+ bytes
+    /// (clippy::result_large_err).
+    pub(crate) fn into_response(self) -> Box<Response> {
+        Box::new(match self {
+            Self::Unauthorized => proxy_error_response(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "unauthorized",
+            ),
+            Self::Refused(refusal) => refusal.response(),
+        })
+    }
+}
+
 /// Default failed-auth attempts per IP inside the window before 429.
 pub(crate) const DEFAULT_AUTH_FAILURE_LIMIT: u32 = 10;
 /// Default failed-auth throttle window.
@@ -635,11 +664,12 @@ impl AppState {
         peer
     }
 
-    /// Authenticate a request's credential (LAB-1083).
+    /// Authenticate a request's credential (LAB-1083), against the client
+    /// policy in force, read once here and returned for the request to carry.
     ///
-    /// Returns the authenticated principal when `[[clients]]` is configured,
-    /// `None` when it is not (legacy `proxy_key`, or an open proxy), and a 401
-    /// `Response` when a configured credential does not match.
+    /// The principal is the authenticated one under `AuthMode::Clients`, and
+    /// `None` under the legacy shared key or an open proxy. A required
+    /// credential that does not match is a 401 `Response`.
     ///
     /// `allow_bearer` additionally accepts `Authorization: Bearer` — set only
     /// on the OpenAI-compat surface, whose SDKs send nothing else. It is NOT
@@ -647,20 +677,21 @@ impl AppState {
     /// carry the caller's own upstream token in `passthrough` mode; widening
     /// acceptance there would be a gratuitous auth surface on a ticket whose
     /// whole purpose is to narrow one.
+    ///
+    /// A presented credential shorter than `MIN_KEY_LEN` never matches, so no
+    /// weak key can authenticate whatever the table holds. The test is per
+    /// credential, not per request: a junk `x-api-key` next to a valid Bearer
+    /// still authenticates on the OpenAI-compat surface.
+    ///
+    /// On an instance that reads a client store, the store's gate then
+    /// decides (`ClientPolicy::store_refusal`): a principal's name may be
+    /// disabled or quarantined, and until the store has loaded, an ordinary
+    /// key, or a key that matches nothing, is answered 503.
     pub(crate) fn authenticate(
         &self,
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
-    ) -> Result<Option<&ClientConfig>, Box<Response>> {
-        // Boxed Err, matching `reserve_request_body` — an inline `Response` is
-        // 128+ bytes on the hot success path (clippy::result_large_err).
-        let unauthorized = || -> Box<Response> {
-            Box::new(proxy_error_response(
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                "unauthorized",
-            ))
-        };
+    ) -> Result<Authenticated, AuthRejection> {
         let from_header = headers.get("x-api-key").and_then(|v| v.to_str().ok());
         let from_bearer = if allow_bearer {
             headers
@@ -678,28 +709,44 @@ impl AppState {
             None
         };
 
-        if !self.clients.is_empty() {
-            for presented in [from_header, from_bearer].into_iter().flatten() {
-                if let Some(c) = self.match_client(presented) {
-                    return Ok(Some(c));
-                }
-            }
-            return Err(unauthorized());
-        }
+        let mut presented = [from_header, from_bearer]
+            .into_iter()
+            .flatten()
+            .filter(|p| p.len() >= MIN_KEY_LEN)
+            .peekable();
 
-        // Legacy: one shared secret, no principal. Byte-for-byte the same
-        // accept/reject decision as before LAB-1083 — only the comparison
-        // primitive changed (audit finding 4).
-        if let Some(ref key) = self.proxy_key {
-            let ok = [from_header, from_bearer]
-                .into_iter()
-                .flatten()
-                .any(|p| bool::from(key.as_bytes().ct_eq(p.as_bytes())));
-            if !ok {
-                return Err(unauthorized());
+        // Matched as digests (`key_digest` says why timing cannot leak a key).
+        let policy = self.current_client_policy();
+        let principal = match &self.auth_mode {
+            AuthMode::Clients => {
+                let any_presented = presented.peek().is_some();
+                let Some(principal) = presented
+                    .find_map(|p| policy.principals.get(&key_digest(p)))
+                    .cloned()
+                else {
+                    // Until the store has loaded, a key that matches nothing
+                    // may be one its document will bring.
+                    if any_presented && policy.store.as_ref().is_some_and(|g| !g.loaded) {
+                        return Err(AuthRejection::Refused(StoreRefusal::Unloaded));
+                    }
+                    return Err(AuthRejection::Unauthorized);
+                };
+                if let Some(refusal) = policy.store_refusal(&principal) {
+                    return Err(AuthRejection::Refused(refusal));
+                }
+                Some(principal)
             }
-        }
-        Ok(None)
+            // Legacy: one shared secret, no principal. The same accept/reject
+            // decision as before LAB-1083, on digests now.
+            AuthMode::SharedKey(digest) => {
+                if !presented.any(|p| key_digest(p) == *digest) {
+                    return Err(AuthRejection::Unauthorized);
+                }
+                None
+            }
+            AuthMode::Open => None,
+        };
+        Ok(Authenticated { policy, principal })
     }
 
     /// Authenticate, then throttle failed credentials (LAB-1193).
@@ -735,10 +782,24 @@ impl AppState {
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
         route: &'static str,
-    ) -> Result<Option<&ClientConfig>, Box<Response>> {
+    ) -> Result<Authenticated, Box<Response>> {
         match self.authenticate(headers, allow_bearer) {
-            Ok(principal) => Ok(principal),
-            Err(unauthorized) => {
+            Ok(auth) => Ok(auth),
+            // Not a failed credential: never counted, never throttled.
+            Err(AuthRejection::Refused(refusal)) => {
+                if let Some(store) = &self.client_store {
+                    store.count_refusal(refusal);
+                }
+                debug!(
+                    client = %client_ip,
+                    route,
+                    reason = refusal.as_str(),
+                    "refused by the client store"
+                );
+                Err(AuthRejection::Refused(refusal).into_response())
+            }
+            Err(unauthorized @ AuthRejection::Unauthorized) => {
+                let unauthorized = unauthorized.into_response();
                 let (cred, presented) = presented_credential(headers);
                 let key_fp = credential_fingerprint(presented);
                 let ua = bounded_user_agent(headers);
@@ -789,8 +850,9 @@ impl AppState {
     }
 
     /// Gate an admin surface (`/_stats`, `/metrics`) behind an OPERATOR
-    /// or ADMIN-READER principal (LAB-1192 AC-4, LAB-4395). Returns the rejection response, or `None`
-    /// when the caller may proceed.
+    /// or ADMIN-READER principal (LAB-1192 AC-4, LAB-4395). Returns the rejection response, or,
+    /// when the caller may proceed, the policy snapshot it was authorized
+    /// against: the one snapshot the surface renders from.
     ///
     /// Under `[[clients]]`: unauthenticated → 401, an authenticated principal
     /// in neither `operators` nor `admin_readers` → 403 — `/_stats` discloses
@@ -809,17 +871,18 @@ impl AppState {
         peer: SocketAddr,
         headers: &hyper::HeaderMap,
         route: &'static str,
-    ) -> Option<Box<Response>> {
-        match self.authenticate_throttled(client_ip, peer, headers, false, route) {
-            Err(resp) => Some(resp),
-            Ok(Some(c)) if !self.is_operator(&c.name) && !self.is_admin_reader(&c.name) => {
+    ) -> Result<Arc<ClientPolicy>, Box<Response>> {
+        let Authenticated { policy, principal } =
+            self.authenticate_throttled(client_ip, peer, headers, false, route)?;
+        match principal {
+            Some(p) if p.role == Role::Client => {
                 warn!(
                     client = %client_ip,
-                    client_id = %c.name,
+                    client_id = %p.name,
                     route,
                     "rejected: admin surface requires an operator or read-only principal"
                 );
-                Some(Box::new(
+                Err(Box::new(
                     (
                         StatusCode::FORBIDDEN,
                         "forbidden: operator or read-only principal required",
@@ -827,22 +890,22 @@ impl AppState {
                         .into_response(),
                 ))
             }
-            Ok(Some(_)) => None,
-            Ok(None) => {
+            Some(_) => Ok(policy),
+            None => {
                 // allow_unauthenticated: keep the open posture VISIBLE (AC-5)
                 // but rate-limit the warn per route — in the lab a vmagent
                 // scrapes /metrics every ~15s, and one warn per scrape is
                 // ~11k lines/day/replica that drowns the signal it exists to
                 // give. Once per route per OPEN_ADMIN_WARN_INTERVAL preserves
                 // visibility without the firehose.
-                if self.proxy_key.is_none() && self.should_warn_open_admin(route) {
+                if matches!(self.auth_mode, AuthMode::Open) && self.should_warn_open_admin(route) {
                     warn!(
                         client = %client_ip,
                         route,
                         "unauthenticated admin access (allow_unauthenticated) — trusted-network-only; rate-limited log"
                     );
                 }
-                None
+                Ok(policy)
             }
         }
     }
@@ -859,86 +922,6 @@ impl AppState {
                 true
             }
         }
-    }
-
-    /// Constant-time lookup of a presented credential in the client table.
-    ///
-    /// What this actually guarantees, precisely — do not read more into it:
-    /// `ct_eq` removes the per-byte prefix oracle that `==` has, which is the
-    /// leak that matters (it is what lets an attacker recover a key byte by
-    /// byte). Audit finding 4, closed.
-    ///
-    /// The full-table scan removes the coarse "how far down the table did we
-    /// get" signal. It does NOT make the whole function constant-time: the
-    /// `hit = Some(c)` store is a data-dependent branch the optimizer may
-    /// emit as one, and `ct_eq` short-circuits on unequal lengths. Both
-    /// residuals are a handful of instructions against milliseconds of network
-    /// and TLS jitter, and key length is not a secret — so neither is
-    /// exploitable remotely. Want the stronger property? Accumulate with
-    /// `subtle::Choice`; don't assume this already does.
-    fn match_client(&self, presented: &str) -> Option<&ClientConfig> {
-        let mut hit: Option<&ClientConfig> = None;
-        for c in &self.clients {
-            if bool::from(c.key.as_bytes().ct_eq(presented.as_bytes())) {
-                hit = Some(c);
-            }
-        }
-        hit
-    }
-
-    /// Whether an attempt on `ep` for `client_id` is bound by a `models` list,
-    /// the endpoint's or the client's — i.e. whether a body-level fallback
-    /// could serve it a model that list does not name, so the attempt's body
-    /// loses its fallback fields (`strip_top_level_fields`; LAB-5970,
-    /// LAB-6794). Judged per attempt: the retry loop may land on a
-    /// differently restricted endpoint. Same client identity semantics as
-    /// `client_allows_model`.
-    pub(crate) fn attempt_restricts_models(&self, ep: &Endpoint, client_id: &str) -> bool {
-        !ep.models.is_empty()
-            || self
-                .clients
-                .iter()
-                .any(|c| c.name == client_id && !c.models.is_empty())
-    }
-
-    /// Whether `client_id` may request `model` (LAB-1083).
-    ///
-    /// Unknown client, or a client with an empty list, allows everything.
-    /// "Unknown client" is only reachable on the legacy path: with
-    /// `[[clients]]` configured, `client_id` is always a principal name.
-    ///
-    /// FAILS CLOSED on an empty `model`, and this is the one place where the
-    /// shared matcher's semantics are deliberately NOT inherited. An empty
-    /// model means the caller's model is UNKNOWN to us — the body did not
-    /// parse as JSON, or it carries no top-level `model` (the batches API
-    /// nests it under `requests[].params.model`, and `proxy_handler` is the
-    /// catch-all route). For `Endpoint::serves_model` "unknown" rightly means
-    /// "don't narrow the routing pool"; for a policy gate it must mean
-    /// "deny", or a restricted client reaches any model by sending a body we
-    /// cannot read.
-    pub(crate) fn client_allows_model(&self, client_id: &str, model: &str) -> bool {
-        match self.clients.iter().find(|c| c.name == client_id) {
-            Some(c) if c.models.is_empty() => true,
-            Some(c) => !model.is_empty() && model_matches(&c.models, model),
-            None => true,
-        }
-    }
-
-    /// LAB-3877: resolve the Tier 0 guard policy for a client. The operator
-    /// bypass is always `Off` (it forwards operator-trusted content). Otherwise
-    /// the client's configured policy, defaulting to `Annotate` (shadow mode)
-    /// for any caller not in the table — including the legacy unknown-client
-    /// "-" and open-`proxy_key` modes, so shadow mode observes everything.
-    #[cfg(feature = "guard")]
-    fn client_guard_policy(&self, client_id: &str) -> guard::GuardPolicy {
-        if self.is_operator(client_id) {
-            return guard::GuardPolicy::Off;
-        }
-        self.clients
-            .iter()
-            .find(|c| c.name == client_id)
-            .map(|c| c.guard)
-            .unwrap_or_default()
     }
 
     /// LAB-3877: run the Tier 0 content guard for one request — after
@@ -975,11 +958,12 @@ impl AppState {
     pub(crate) async fn guard_hook(
         &self,
         req_id: &str,
-        client_id: &str,
+        caller: &Caller,
         outcome: &guard::ScanOutcome,
         openai_shape: bool,
     ) -> Result<Option<usize>, Box<Response>> {
-        let policy = self.client_guard_policy(client_id);
+        let client_id = caller.name();
+        let policy = caller.guard_policy();
         let input = match outcome {
             guard::ScanOutcome::Scannable(input) => Some(input),
             guard::ScanOutcome::NothingToScan | guard::ScanOutcome::Unscannable(_) => None,
@@ -1114,8 +1098,8 @@ impl AppState {
     /// `MAX_LABEL_CHARS` (64) characters share one label.
     ///
     /// The client axis is config-bounded by reachability, not by the header
-    /// filter: this runs only when `client_allows_model` returned false, which
-    /// needs `client_id` to name a configured client. Under legacy
+    /// filter: this runs only when `Caller::allows_model` returned false, which
+    /// needs the caller to have a `[[clients]]` entry. Under legacy
     /// `proxy_key` / `allow_unauthenticated` there is no `[[clients]]` table,
     /// so this is unreachable and the caller-controlled `x-client-id` never
     /// touches this map. The global bucket is defence-in-depth for a future
@@ -1127,7 +1111,8 @@ impl AppState {
     /// unbounded warn-level log volume. The counter records every denial.
     /// Mirrors the once-per-model pattern used for unsupported-model
     /// warnings.
-    pub(crate) fn note_model_denied(&self, client_id: &str, model: &str) {
+    pub(crate) fn note_model_denied(&self, caller: &Caller, model: &str) {
+        let client_id = caller.name();
         let model = truncate_label(model);
         let first_time = {
             let mut counts = lock_recovering(&self.model_denied, "model_denied");
@@ -1135,7 +1120,7 @@ impl AppState {
             let key = (client_id.to_owned(), escape_sentinel(&model, &["other"]));
             let label = if counts.len() < MAX_MODEL_DENIED_LABELS || counts.contains_key(&key) {
                 key
-            } else if self.clients.iter().any(|c| c.name == client_id) {
+            } else if caller.entry().is_some() {
                 // Map full, pair new, client configured: its own bucket.
                 (client_id.to_owned(), "_other".to_owned())
             } else {
@@ -1195,18 +1180,19 @@ impl AppState {
     ///
     /// Header takes precedence to support multiple clients per IP.
     ///
-    /// ONLY reached when no `[[clients]]` table is configured. Under
-    /// `[[clients]]`, identity comes from the verified credential
-    /// (`RequestContext::from_request`) and this client-asserted path is dead.
+    /// ONLY reached outside `AuthMode::Clients`. Under `[[clients]]`, identity
+    /// comes from the verified credential (`RequestContext::from_request`) and
+    /// this client-asserted path is dead.
     ///
     /// The `debug_assert` is the choke point for that invariant. Nothing in the
-    /// type system stops a future handler from calling
-    /// `RequestContext::from_request(.., None)` and silently reinstating
+    /// type system stops a future handler from handing
+    /// `RequestContext::from_request` an `Authenticated` with no principal
+    /// under `[[clients]]` and silently reinstating
     /// header-asserted identity; this makes that mistake fail loudly in tests
     /// and debug builds instead of quietly becoming an identity bypass.
     pub(crate) fn resolve_client_id(&self, ip: &IpAddr, headers: &hyper::HeaderMap) -> String {
         debug_assert!(
-            self.clients.is_empty(),
+            !matches!(self.auth_mode, AuthMode::Clients),
             "resolve_client_id reached with [[clients]] configured — a caller \
              skipped the authenticated principal and identity is now spoofable"
         );

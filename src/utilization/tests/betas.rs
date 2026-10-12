@@ -596,7 +596,7 @@ async fn forward_with_betas_full(
         &state.endpoints[0],
         0,
         "req-1261",
-        "client-1",
+        &state.caller("client-1"),
         "-",
         &"127.0.0.1".parse().unwrap(),
         "-",
@@ -946,8 +946,8 @@ fn strip_top_level_fields_removes_only_listed_fields() {
     );
 }
 
-/// What the upstream received for a `fallbacks` request, sent as `client_key`
-/// (`None` = no client table) to a single endpoint.
+/// What the upstream received for a `fallbacks` request, sent as
+/// `test_key(client_key)` (`None` = no client table) to a single endpoint.
 async fn fallbacks_body_seen_upstream(
     clients: Vec<ClientConfig>,
     client_key: Option<&str>,
@@ -958,12 +958,16 @@ async fn fallbacks_body_seen_upstream(
         spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
     let mut ep = mk_endpoint_at("acct-a", endpoint_token, &upstream_url);
     ep.models = endpoint_models.iter().map(|m| m.to_string()).collect();
-    let state = Arc::new(AppState {
+    let policy = if clients.is_empty() {
+        TestPolicy::open()
+    } else {
+        TestPolicy::clients(clients)
+    };
+    let state = Arc::new(policy.install(AppState {
         endpoints: vec![ep],
-        clients,
         auto_cache: false,
         ..test_state_base()
-    });
+    }));
     let addr = serve(build_router(state)).await;
     let mut req = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
@@ -973,7 +977,7 @@ async fn fallbacks_body_seen_upstream(
             r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"fallbacks":"default"}"#,
         );
     if let Some(key) = client_key {
-        req = req.header("x-api-key", key);
+        req = req.header("x-api-key", test_key(key));
     }
     let resp = req.send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -994,7 +998,11 @@ async fn fallbacks_body_seen_upstream(
 #[tokio::test]
 async fn restricted_client_loses_fallbacks_on_oauth_endpoint() {
     let body = fallbacks_body_seen_upstream(
-        vec![mk_client("limited", "key-limited", &["claude-opus-5*"])],
+        vec![mk_client(
+            "limited",
+            &test_key("key-limited"),
+            &["claude-opus-5*"],
+        )],
         Some("key-limited"),
         "sk-ant-oat01-test-aaa",
         &[],
@@ -1020,7 +1028,7 @@ async fn restricted_endpoint_loses_fallbacks_on_api_key_endpoint() {
 async fn unrestricted_client_and_endpoint_keep_fallbacks() {
     for token in ["sk-ant-oat01-test-aaa", "sk-ant-api-test-aaa"] {
         let body = fallbacks_body_seen_upstream(
-            vec![mk_client("open", "key-open", &[])],
+            vec![mk_client("open", &test_key("key-open"), &[])],
             Some("key-open"),
             token,
             &[],

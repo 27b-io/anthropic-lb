@@ -121,13 +121,12 @@ fn resolve_multi_client_per_ip() {
     // Operator is identified by client_id, not by IP.
     let mut client_names = HashMap::new();
     client_names.insert("10.0.0.1".to_string(), "ray".to_string());
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().operators(&["ray"]).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
         state_path: PathBuf::from("/tmp/test.state.json"),
         client_names,
-        operators: vec!["ray".to_string()],
         ..test_state_base()
-    });
+    }));
 
     let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
@@ -135,12 +134,12 @@ fn resolve_multi_client_per_ip() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("x-client-id", HeaderValue::from_static("gastown"));
     assert_eq!(state.resolve_client_id(&ip, &headers), "gastown");
-    assert!(!state.is_operator("gastown"));
+    assert!(!state.current_client_policy().is_operator("gastown"));
 
     // ray on same IP → identified as ray, IS operator
     headers.insert("x-client-id", HeaderValue::from_static("ray"));
     assert_eq!(state.resolve_client_id(&ip, &headers), "ray");
-    assert!(state.is_operator("ray"));
+    assert!(state.current_client_policy().is_operator("ray"));
 
     // No header → falls back to IP mapping ("ray")
     let empty = hyper::HeaderMap::new();
@@ -371,17 +370,19 @@ fn xff_multiple_headers_are_one_logical_list_walked_from_the_right() {
 fn admin_matrix_app(upstream_url: &str) -> (Router, Arc<AppState>) {
     let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
     acct.base_url = upstream_url.to_string();
-    let state = Arc::new(AppState {
-        endpoints: vec![acct],
-        clients: vec![
-            mk_client("ops", "key-ops", &[]),
-            mk_client("viewer", "key-view", &[]),
-            mk_client("geo", "key-geo", &[]),
-        ],
-        operators: vec!["ops".to_string()],
-        admin_readers: vec!["viewer".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![
+            mk_client("ops", &test_key("key-ops"), &[]),
+            mk_client("viewer", &test_key("key-view"), &[]),
+            mk_client("geo", &test_key("key-geo"), &[]),
+        ])
+        .operators(&["ops"])
+        .admin_readers(&["viewer"])
+        .install(AppState {
+            endpoints: vec![acct],
+            ..test_state_base()
+        }),
+    );
     (build_router(state.clone()), state)
 }
 
@@ -409,7 +410,7 @@ async fn admin_surfaces_gate_by_operator_principal() {
         // business reading other clients' ids and the account names.
         let resp = client
             .get(format!("http://{addr}{path}"))
-            .header("x-api-key", "key-geo")
+            .header("x-api-key", test_key("key-geo"))
             .send()
             .await
             .unwrap();
@@ -422,7 +423,7 @@ async fn admin_surfaces_gate_by_operator_principal() {
         // Operator → 200.
         let resp = client
             .get(format!("http://{addr}{path}"))
-            .header("x-api-key", "key-ops")
+            .header("x-api-key", test_key("key-ops"))
             .send()
             .await
             .unwrap();
@@ -445,7 +446,7 @@ async fn read_only_principal_reaches_the_admin_surfaces() {
     for path in ["/_stats", "/metrics"] {
         let resp = client
             .get(format!("http://{addr}{path}"))
-            .header("x-api-key", "key-view")
+            .header("x-api-key", test_key("key-view"))
             .send()
             .await
             .unwrap();
@@ -486,18 +487,20 @@ async fn read_only_principal_is_refused_before_it_can_reserve_body_budget() {
 
     for path in ["/v1/messages", "/v1/chat/completions"] {
         let (url, hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
-        let state = Arc::new(AppState {
-            endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
-            clients: vec![
-                mk_client("viewer", "key-view", &[]),
-                mk_client("ops", "key-ops", &[]),
-            ],
-            admin_readers: vec!["viewer".to_string()],
-            operators: vec!["ops".to_string()],
-            max_inflight_body_bytes: 128 * 1024 * 1024,
-            body_read_timeout: Duration::from_secs(2),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::clients(vec![
+                mk_client("viewer", &test_key("key-view"), &[]),
+                mk_client("ops", &test_key("key-ops"), &[]),
+            ])
+            .admin_readers(&["viewer"])
+            .operators(&["ops"])
+            .install(AppState {
+                endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
+                max_inflight_body_bytes: 128 * 1024 * 1024,
+                body_read_timeout: Duration::from_secs(2),
+                ..test_state_base()
+            }),
+        );
         let addr = serve(build_router(state.clone())).await;
         let legit = r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
 
@@ -507,7 +510,8 @@ async fn read_only_principal_is_refused_before_it_can_reserve_body_budget() {
         for mb in [25, 25, 25, 25, 25, 3] {
             let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
             let req = format!(
-                "POST {path} HTTP/1.1\r\nHost: localhost\r\nx-api-key: key-view\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{{",
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nx-api-key: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{{",
+                test_key("key-view"),
                 mb * 1024 * 1024
             );
             socket.write_all(req.as_bytes()).await.unwrap();
@@ -541,19 +545,22 @@ async fn read_only_principal_is_refused_before_it_can_reserve_body_budget() {
         // either ordering. A 1 MiB budget with a declared 4 MiB clamps to
         // 4 MiB, which cannot be admitted: reservation-first answers 503,
         // identity-first answers 403. That difference is the whole property.
-        let tight = Arc::new(AppState {
-            endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
-            clients: vec![mk_client("viewer", "key-view", &[])],
-            admin_readers: vec!["viewer".to_string()],
-            max_inflight_body_bytes: 1024 * 1024,
-            ..test_state_base()
-        });
+        let tight = Arc::new(
+            TestPolicy::clients(vec![mk_client("viewer", &test_key("key-view"), &[])])
+                .admin_readers(&["viewer"])
+                .install(AppState {
+                    endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
+                    max_inflight_body_bytes: 1024 * 1024,
+                    ..test_state_base()
+                }),
+        );
         let tight_addr = serve(build_router(tight)).await;
         let mut socket = tokio::net::TcpStream::connect(tight_addr).await.unwrap();
         socket
             .write_all(
                 format!(
-                    "POST {path} HTTP/1.1\r\nHost: localhost\r\nx-api-key: key-view\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{{",
+                    "POST {path} HTTP/1.1\r\nHost: localhost\r\nx-api-key: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{{",
+                    test_key("key-view"),
                     4 * 1024 * 1024u64
                 )
                 .as_bytes(),
@@ -578,7 +585,7 @@ async fn read_only_principal_is_refused_before_it_can_reserve_body_budget() {
         // surface — proves non-interference ACROSS handlers.
         let resp = Client::new()
             .post(format!("http://{addr}/v1/messages"))
-            .header("x-api-key", "key-ops")
+            .header("x-api-key", test_key("key-ops"))
             .body(legit)
             .send()
             .await
@@ -612,12 +619,14 @@ async fn read_only_principal_is_refused_before_it_can_reserve_body_budget() {
 #[tokio::test]
 async fn read_only_principal_is_refused_on_every_proxy_surface() {
     let (url, hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
-        clients: vec![mk_client("viewer", "key-view", &[])],
-        admin_readers: vec!["viewer".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![mk_client("viewer", &test_key("key-view"), &[])])
+            .admin_readers(&["viewer"])
+            .install(AppState {
+                endpoints: vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &url)],
+                ..test_state_base()
+            }),
+    );
     let addr = serve(build_router(state.clone())).await;
     let client = Client::new();
     let body = r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
@@ -635,7 +644,11 @@ async fn read_only_principal_is_refused_on_every_proxy_surface() {
         } else {
             client.get(format!("http://{addr}{path}"))
         };
-        let resp = req.header("x-api-key", "key-view").send().await.unwrap();
+        let resp = req
+            .header("x-api-key", test_key("key-view"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(
             resp.status(),
             reqwest::StatusCode::FORBIDDEN,
@@ -694,14 +707,14 @@ async fn admin_surfaces_still_serve_without_credentials_configured() {
 #[tokio::test]
 async fn admin_surfaces_accept_the_legacy_shared_key() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, _state) = test_app(&mock_url, Some("legacy-shared-secret-0123456789ab".into()));
+    let (app, _state) = test_app(&mock_url, Some(test_key("legacy-shared-secret")));
     let addr = serve(app).await;
     let client = Client::new();
 
     for path in ["/_stats", "/metrics"] {
         let resp = client
             .get(format!("http://{addr}{path}"))
-            .header("x-api-key", "legacy-shared-secret-0123456789ab")
+            .header("x-api-key", test_key("legacy-shared-secret"))
             .send()
             .await
             .unwrap();
@@ -834,23 +847,25 @@ async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
     acct.base_url = mock_url.to_string();
-    let state = Arc::new(AppState {
-        endpoints: vec![acct],
-        clients: vec![
-            mk_client("ops", "key-ops", &[]),
-            mk_client("geo", "key-geo", &[]),
-        ],
-        operators: vec!["ops".to_string()],
-        auth_throttle: AuthThrottle::new(3, Duration::from_secs(60)),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![
+            mk_client("ops", &test_key("key-ops"), &[]),
+            mk_client("geo", &test_key("key-geo"), &[]),
+        ])
+        .operators(&["ops"])
+        .install(AppState {
+            endpoints: vec![acct],
+            auth_throttle: AuthThrottle::new(3, Duration::from_secs(60)),
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state.clone())).await;
     let client = Client::new();
 
     for _ in 0..3 {
         let resp = client
             .post(format!("http://{addr}/v1/messages"))
-            .header("x-api-key", "key-wrong")
+            .header("x-api-key", test_key("key-wrong"))
             .body("{}")
             .send()
             .await
@@ -862,7 +877,7 @@ async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
     // JSON error envelope (LAB-4153).
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
-        .header("x-api-key", "key-wrong")
+        .header("x-api-key", test_key("key-wrong"))
         .body("{}")
         .send()
         .await
@@ -888,7 +903,7 @@ async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
     // A valid credential from the same IP must still reach the handler.
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
-        .header("x-api-key", "key-geo")
+        .header("x-api-key", test_key("key-geo"))
         .body(r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -899,7 +914,7 @@ async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
     // credential is still throttled, and only failures increment the metric.
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
-        .header("x-api-key", "key-wrong")
+        .header("x-api-key", test_key("key-wrong"))
         .body("{}")
         .send()
         .await
@@ -915,17 +930,18 @@ async fn valid_key_bypasses_a_shared_ip_auth_throttle_without_clearing_it() {
 /// caller sees is what is proven.
 #[tokio::test]
 async fn auth_throttle_keeps_throttling_through_poisoned_lock() {
-    let state = Arc::new(AppState {
-        clients: vec![mk_client("geo", "key-geo", &[])],
-        auth_throttle: AuthThrottle::new(3, Duration::from_secs(60)),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![mk_client("geo", &test_key("key-geo"), &[])]).install(AppState {
+            auth_throttle: AuthThrottle::new(3, Duration::from_secs(60)),
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state.clone())).await;
     let client = Client::new();
     let bad = || {
         client
             .post(format!("http://{addr}/v1/messages"))
-            .header("x-api-key", "key-wrong")
+            .header("x-api-key", test_key("key-wrong"))
             .body("{}")
             .send()
     };
@@ -975,12 +991,13 @@ async fn successful_auth_does_not_clear_shared_ip_failures() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
     acct.base_url = mock_url.to_string();
-    let state = Arc::new(AppState {
-        endpoints: vec![acct],
-        clients: vec![mk_client("geo", "key-geo", &[])],
-        auth_throttle: AuthThrottle::new(3, Duration::from_secs(60)),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![mk_client("geo", &test_key("key-geo"), &[])]).install(AppState {
+            endpoints: vec![acct],
+            auth_throttle: AuthThrottle::new(3, Duration::from_secs(60)),
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state.clone())).await;
     let client = Client::new();
 
@@ -988,7 +1005,7 @@ async fn successful_auth_does_not_clear_shared_ip_failures() {
     for _ in 0..2 {
         let resp = client
             .post(format!("http://{addr}/v1/messages"))
-            .header("x-api-key", "key-wrong")
+            .header("x-api-key", test_key("key-wrong"))
             .body("{}")
             .send()
             .await
@@ -998,7 +1015,7 @@ async fn successful_auth_does_not_clear_shared_ip_failures() {
     // A successful auth is served but does not clear the two failures.
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
-        .header("x-api-key", "key-geo")
+        .header("x-api-key", test_key("key-geo"))
         .body(r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -1008,7 +1025,7 @@ async fn successful_auth_does_not_clear_shared_ip_failures() {
     // a 429. If success had cleared the state, both would be 401.
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
-        .header("x-api-key", "key-wrong")
+        .header("x-api-key", test_key("key-wrong"))
         .body("{}")
         .send()
         .await
@@ -1016,7 +1033,7 @@ async fn successful_auth_does_not_clear_shared_ip_failures() {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
-        .header("x-api-key", "key-wrong")
+        .header("x-api-key", test_key("key-wrong"))
         .body("{}")
         .send()
         .await
@@ -1054,14 +1071,14 @@ async fn metrics_expose_auth_failures_by_route_and_cred() {
     // One failure on the stats route, key in the right header.
     let _ = client
         .get(format!("http://{addr}/_stats"))
-        .header("x-api-key", "key-wrong")
+        .header("x-api-key", test_key("key-wrong"))
         .send()
         .await
         .unwrap();
     // One on the proxy route: a valid key, but in the wrong header.
     let resp = client
         .post(format!("http://{addr}/v1/messages"))
-        .header("authorization", "Bearer key-geo")
+        .header("authorization", format!("Bearer {}", test_key("key-geo")))
         .body("{}")
         .send()
         .await
@@ -1070,7 +1087,7 @@ async fn metrics_expose_auth_failures_by_route_and_cred() {
 
     let body = client
         .get(format!("http://{addr}/metrics"))
-        .header("x-api-key", "key-ops")
+        .header("x-api-key", test_key("key-ops"))
         .send()
         .await
         .unwrap()

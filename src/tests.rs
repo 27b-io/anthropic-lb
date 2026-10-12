@@ -337,216 +337,6 @@ key = "key-radar"
     );
 }
 
-const RC_BLOCK: &str = "\n[response_cache]\nbackend = \"redis\"\nredis_url = \"redis://localhost\"\nmaster_key = \"0000000000000000000000000000000000000000000000000000000000000000\"\n";
-
-#[test]
-fn validate_clients_rejects_duplicate_names_and_keys() {
-    let err = validate_clients(&cfg(
-        "[[clients]]\nname = \"geo\"\nkey = \"k1\"\n\n[[clients]]\nname = \"geo\"\nkey = \"k2\"\n",
-    ))
-    .unwrap_err();
-    assert!(err.contains("duplicate name"), "{err}");
-
-    let err = validate_clients(&cfg(
-        "[[clients]]\nname = \"geo\"\nkey = \"k1\"\n\n[[clients]]\nname = \"radar\"\nkey = \"k1\"\n",
-    ))
-    .unwrap_err();
-    assert!(err.contains("duplicate key"), "{err}");
-    assert!(
-        !err.contains("k1"),
-        "the error must not echo the credential: {err}"
-    );
-}
-
-#[test]
-fn validate_clients_rejects_bad_names_and_empty_keys() {
-    for (fragment, needle) in [
-        ("[[clients]]\nname = \"\"\nkey = \"k1\"\n", "name"),
-        ("[[clients]]\nname = \"   \"\nkey = \"k1\"\n", "name"),
-        ("[[clients]]\nname = \"-\"\nkey = \"k1\"\n", "sentinel"),
-        // Reserved: /_stats and /metrics rewrite operator identities to the
-        // literal "_operator", so a real tenant with that name would silently
-        // merge with the aggregated operator bucket.
-        (
-            "[[clients]]\nname = \"_operator\"\nkey = \"k1\"\n",
-            "_operator",
-        ),
-        // Reserved: the metrics overflow bucket is keyed ("_other", "_other");
-        // a real client with that name could pre-create the exact pair and
-        // later overflow denials/usage would merge into it (CodeRabbit, #148).
-        ("[[clients]]\nname = \"_other\"\nkey = \"k1\"\n", "_other"),
-        // The legacy client_names IP map is the third identity entry point
-        // (resolve_client_id's fallback) — its values must not claim a
-        // reserved sentinel either (#148 follow-up).
-        ("[client_names]\n\"10.0.0.5\" = \"-\"\n", "reserved"),
-        ("[client_names]\n\"10.0.0.5\" = \"_operator\"\n", "reserved"),
-        ("[client_names]\n\"10.0.0.5\" = \"_other\"\n", "reserved"),
-        ("[client_names]\n\"10.0.0.5\" = \"\"\n", "non-empty"),
-        ("[client_names]\n\"10.0.0.5\" = \"alice \"\n", "whitespace"),
-        ("[[clients]]\nname = \"geo\"\nkey = \"\"\n", "key"),
-        // Untrimmed: stored verbatim, so it would become a client_id matching
-        // no client_budgets / operators / response_cache.clients key.
-        ("[[clients]]\nname = \" geo\"\nkey = \"k1\"\n", "whitespace"),
-        ("[[clients]]\nname = \"geo \"\nkey = \"k1\"\n", "whitespace"),
-    ] {
-        let err = validate_clients(&cfg(fragment)).unwrap_err();
-        assert!(err.contains(needle), "expected '{needle}' in: {err}");
-    }
-}
-
-#[test]
-fn validate_clients_accepts_a_well_formed_table() {
-    assert!(validate_clients(&cfg(
-        "[[clients]]\nname = \"geo\"\nkey = \"k1\"\nmodels = [\"claude-haiku-*\"]\n\n[[clients]]\nname = \"radar\"\nkey = \"k2\"\n",
-    ))
-    .is_ok());
-}
-
-/// One client registry, not five. Each of these config surfaces keys on a
-/// client name and each fails SILENTLY on a typo — a mistyped budget means
-/// UNLIMITED spend (`check_budget` returns Ok for an unknown client), a
-/// mistyped operator silently gates the caller it meant to exempt, a mistyped
-/// cache client silently disables the cache.
-#[test]
-fn validate_clients_rejects_any_surface_naming_no_configured_client() {
-    // NOTE: top-level scalars/arrays must precede the first table header —
-    // a bare `operators = [...]` written after `[[clients]]` binds to that
-    // table instead and is silently dropped, making the test pass vacuously.
-    let base = "\n[[clients]]\nname = \"geo\"\nkey = \"k1\"\n";
-    for (fragment, surface) in [
-        (
-            format!("{base}\n[client_budgets]\ngeo-pipeline = 100\n"),
-            "client_budgets",
-        ),
-        (
-            format!("{base}\n[client_utilization_limits]\ngeo-pipeline = 0.5\n"),
-            "client_utilization_limits",
-        ),
-        (
-            format!("operators = [\"geo-pipeline\"]\n{base}"),
-            "operators",
-        ),
-        (
-            format!("{base}{RC_BLOCK}clients = [\"geo-pipeline\"]\n"),
-            "response_cache.clients",
-        ),
-    ] {
-        let err = validate_clients(&cfg(&fragment)).unwrap_err();
-        assert!(err.contains(surface), "expected '{surface}' in: {err}");
-        assert!(err.contains("geo-pipeline"), "must name the typo: {err}");
-    }
-}
-
-#[test]
-fn validate_clients_accepts_every_surface_naming_a_configured_client() {
-    let fragment = format!(
-        "operators = [\"geo\"]\n\n[[clients]]\nname = \"geo\"\nkey = \"k1\"\n\n[client_budgets]\ngeo = 100\n\n[client_utilization_limits]\ngeo = 0.5\n{RC_BLOCK}clients = [\"geo\"]\n"
-    );
-    let parsed = cfg(&fragment);
-    // Guard against the vacuous-pass trap above: assert the fragment really
-    // populated all four surfaces before asserting validation accepts them.
-    assert_eq!(parsed.operators, vec!["geo".to_string()]);
-    assert!(parsed.client_budgets.contains_key("geo"));
-    assert!(parsed.client_utilization_limits.contains_key("geo"));
-    assert_eq!(
-        parsed.response_cache.as_ref().unwrap().clients,
-        vec!["geo".to_string()]
-    );
-    assert!(validate_clients(&parsed).is_ok());
-}
-
-/// On the legacy path there is no registry to check against, so none of the
-/// cross-checks may fire — existing configs must keep booting.
-#[test]
-fn validate_clients_skips_all_crosschecks_without_a_client_table() {
-    let fragment = format!(
-        "operators = [\"anything\"]\n\n[client_budgets]\nanything = 100\n{RC_BLOCK}clients = [\"anything\"]\n"
-    );
-    assert!(validate_clients(&cfg(&fragment)).is_ok());
-}
-
-/// AC-3 (LAB-4395): `admin_readers` is bound by the same registry rule as every
-/// other name-keyed surface — a typo would silently create a role nobody
-/// holds, leaving the credential it was meant to scope on its old one.
-#[test]
-fn validate_clients_rejects_a_reader_naming_no_configured_client() {
-    let err = validate_clients(&cfg(
-        "admin_readers = [\"grafanna\"]\n\n[[clients]]\nname = \"grafana\"\nkey = \"k1\"\n",
-    ))
-    .unwrap_err();
-    assert!(
-        err.contains("admin_readers"),
-        "must name the surface: {err}"
-    );
-    assert!(err.contains("grafanna"), "must name the typo: {err}");
-}
-
-/// AC-3: one name, one role. `operators` bypasses every policy and `admin_readers`
-/// is refused every request — a name in both is a config whose author meant
-/// one of two opposite things, so it fails at boot instead of silently
-/// resolving to either.
-#[test]
-fn validate_clients_rejects_a_name_in_both_operators_and_readers() {
-    let err = validate_clients(&cfg(
-        "operators = [\"ops\"]\nadmin_readers = [\"ops\"]\n\n[[clients]]\nname = \"ops\"\nkey = \"k1\"\n",
-    ))
-    .unwrap_err();
-    assert!(err.contains("admin_readers"), "{err}");
-    assert!(err.contains("operators"), "{err}");
-    assert!(err.contains("ops"), "must name the offending name: {err}");
-}
-
-/// Unlike the other cross-checks, this one fires on the LEGACY path too:
-/// with one shared `proxy_key` the key holder is the operator by construction
-/// and proxy-path client ids are caller-asserted, so a `admin_readers` entry would
-/// restrict nobody while reading as though it scoped something.
-#[test]
-fn validate_clients_rejects_readers_without_a_client_table() {
-    let err = validate_clients(&cfg("admin_readers = [\"grafana\"]\n")).unwrap_err();
-    assert!(err.contains("admin_readers"), "{err}");
-    assert!(
-        err.contains("[[clients]]"),
-        "must say what it requires: {err}"
-    );
-}
-
-/// The happy path: disjoint roles over configured clients boot fine.
-#[test]
-fn validate_clients_accepts_disjoint_operator_and_reader_roles() {
-    let parsed = cfg(
-        "operators = [\"ops\"]\nadmin_readers = [\"grafana\", \"vmagent\"]\n\n[[clients]]\nname = \"ops\"\nkey = \"k1\"\n\n[[clients]]\nname = \"grafana\"\nkey = \"k2\"\n\n[[clients]]\nname = \"vmagent\"\nkey = \"k3\"\n",
-    );
-    // Guard against the vacuous-pass trap: top-level arrays written after a
-    // table header bind to that table and vanish silently.
-    assert_eq!(
-        parsed.admin_readers,
-        vec!["grafana".to_string(), "vmagent".to_string()]
-    );
-    assert!(validate_clients(&parsed).is_ok());
-}
-
-/// `passthrough` forwards the caller's auth headers upstream untouched. Under
-/// `[[clients]]` those headers carry the client's PROXY key, so the two modes
-/// together would transmit every client key to the upstream.
-#[test]
-fn validate_clients_rejects_passthrough_endpoint_alongside_clients() {
-    let err = validate_clients(&cfg(
-        "[[clients]]\nname = \"geo\"\nkey = \"k1\"\n\n[[endpoints]]\nname = \"managed\"\ntoken = \"passthrough\"\n",
-    ))
-    .unwrap_err();
-    assert!(err.contains("passthrough"), "{err}");
-    assert!(err.contains("managed"), "must name the endpoint: {err}");
-}
-
-/// …but passthrough on the legacy path is untouched.
-#[test]
-fn validate_clients_allows_passthrough_without_a_client_table() {
-    assert!(validate_clients(&cfg(
-        "[[endpoints]]\nname = \"managed\"\ntoken = \"passthrough\"\n",
-    ))
-    .is_ok());
-}
-
 // ── LAB-1192: exposure controls ─────────────────────────────────
 //
 // Four mechanisms, one posture: unauthenticated is a boot failure not a
@@ -556,73 +346,6 @@ fn validate_clients_allows_passthrough_without_a_client_table() {
 // guessing is throttled per client IP with bounded state (AC-11..12).
 
 // ── AC-3: startup posture ──
-
-/// 64-hex — what `openssl rand -hex 32` emits, and the documented floor.
-const STRONG_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-#[test]
-fn exposure_rejects_a_credential_free_config_by_default() {
-    let err = validate_exposure(&cfg("")).unwrap_err();
-    assert!(
-        err.contains("allow_unauthenticated"),
-        "error must name the escape hatch: {err}"
-    );
-    assert!(
-        err.contains("[[clients]]"),
-        "error must name the credential fix: {err}"
-    );
-}
-
-#[test]
-fn exposure_accepts_the_explicit_escape_hatch() {
-    assert!(validate_exposure(&cfg("allow_unauthenticated = true\n")).is_ok());
-    // `false` is NOT an escape hatch — omission and explicit false are the
-    // same default-deny.
-    assert!(validate_exposure(&cfg("allow_unauthenticated = false\n")).is_err());
-}
-
-#[test]
-fn exposure_accepts_either_credential_form() {
-    assert!(validate_exposure(&cfg(&format!("proxy_key = \"{STRONG_KEY}\"\n"))).is_ok());
-    assert!(validate_exposure(&cfg(&format!(
-        "[[clients]]\nname = \"geo\"\nkey = \"{STRONG_KEY}\"\n"
-    )))
-    .is_ok());
-}
-
-#[test]
-fn exposure_rejects_the_flag_alongside_credentials() {
-    let err = validate_exposure(&cfg(&format!(
-        "allow_unauthenticated = true\nproxy_key = \"{STRONG_KEY}\"\n"
-    )))
-    .unwrap_err();
-    assert!(err.contains("incompatible"), "{err}");
-    let err = validate_exposure(&cfg(&format!(
-        "allow_unauthenticated = true\n[[clients]]\nname = \"geo\"\nkey = \"{STRONG_KEY}\"\n"
-    )))
-    .unwrap_err();
-    assert!(err.contains("incompatible"), "{err}");
-}
-
-/// AC-13: every configured credential form is held to the 32-char floor, and
-/// the error carries the generation command.
-#[test]
-fn exposure_rejects_short_credentials_with_the_generation_command() {
-    for fragment in [
-        "proxy_key = \"short\"\n".to_string(),
-        "[[clients]]\nname = \"geo\"\nkey = \"short\"\n".to_string(),
-        // 31 chars — one under the floor, so the boundary is pinned.
-        format!("proxy_key = \"{}\"\n", "a".repeat(31)),
-    ] {
-        let err = validate_exposure(&cfg(&fragment)).unwrap_err();
-        assert!(
-            err.contains("openssl rand -hex 32"),
-            "error must carry the generation command: {err}"
-        );
-    }
-    // 32 exactly passes.
-    assert!(validate_exposure(&cfg(&format!("proxy_key = \"{}\"\n", "a".repeat(32)))).is_ok());
-}
 
 #[test]
 fn rate_limit_cooldown_rejects_values_outside_one_day() {
@@ -656,17 +379,38 @@ fn rate_limit_cooldown_accepts_one_second_to_one_day_and_the_default() {
 }
 
 #[test]
-fn exposure_rejects_a_zero_window_with_the_throttle_enabled() {
-    let err = validate_exposure(&cfg(&format!(
+fn auth_throttle_rejects_a_zero_window_while_enabled() {
+    let err = validate_auth_throttle(&cfg(&format!(
         "proxy_key = \"{STRONG_KEY}\"\nauth_failure_window_secs = 0\n"
     )))
     .unwrap_err();
     assert!(err.contains("auth_failure_window_secs"), "{err}");
     // Explicitly disabled throttle: a zero window is fine because it is never read.
-    assert!(validate_exposure(&cfg(&format!(
+    assert!(validate_auth_throttle(&cfg(&format!(
         "proxy_key = \"{STRONG_KEY}\"\nauth_failure_limit = 0\nauth_failure_window_secs = 0\n"
     )))
     .is_ok());
+}
+
+/// Every rule that used to be a `main()` panic is now reachable from
+/// `load_config`, so a test sees what a real boot refuses.
+#[test]
+fn load_config_refuses_what_main_used_to_panic_on() {
+    let base = "listen = \"0.0.0.0:8080\"\nallow_unauthenticated = true\n";
+    for (fragment, needle) in [
+        ("[client_utilization_limits]\ngeo = 2.0\n", "client_utilization_limits.geo"),
+        ("operators = [\"-\"]\n", "operators cannot contain '-'"),
+        (
+            "[response_cache]\nbackend = \"redis\"\nredis_url = \"redis://localhost\"\nmaster_key = \"00\"\nclients = [\"-\"]\n",
+            "response_cache.clients cannot contain",
+        ),
+    ] {
+        let err = match load_config(&format!("{base}{fragment}")) {
+            Ok(_) => panic!("must be refused:\n{fragment}"),
+            Err(e) => e,
+        };
+        assert!(err.contains(needle), "expected '{needle}' in: {err}");
+    }
 }
 
 /// LAB-6939: `models = [""]` is the supported deny-all form, and a production
@@ -695,11 +439,56 @@ name = "geo"
 key = "{STRONG_KEY}-geo"
 "#
     );
-    let config = load_config(&toml_str).expect("a models = [\"\"] client must boot");
-    let ops = config
+    let (_, _, policy) = load_config(&toml_str)
+        .unwrap_or_else(|e| panic!("a models = [\"\"] client must boot: {e}"));
+    let ops = policy
         .clients
         .iter()
         .find(|c| c.name == "ops-console")
         .unwrap();
     assert_eq!(ops.models, vec![String::new()]);
+}
+
+/// A planted secret shares no 8-character run with `err`. Version-neutral: it
+/// asserts on what the message must not hold, never on toml's wording.
+fn assert_no_secret_fragment(err: &str, secret: &str) {
+    let chars: Vec<char> = secret.chars().collect();
+    for w in chars.windows(8) {
+        let frag: String = w.iter().collect();
+        assert!(
+            !err.contains(&frag),
+            "error quotes '{frag}' of the secret: {err}"
+        );
+    }
+}
+
+/// A syntax error on a secret line names where it is, not what it holds.
+#[test]
+fn load_config_syntax_error_names_line_and_column_not_the_value() {
+    let raw =
+        format!("listen = \"0.0.0.0:8080\"\n\n[[clients]]\nname = \"geo\"\nkey = \"{STRONG_KEY}\n");
+    let err = match load_config(&raw) {
+        Ok(_) => panic!("an unterminated string must be refused"),
+        Err(e) => e,
+    };
+    assert_no_secret_fragment(&err, STRONG_KEY);
+    assert!(
+        err.contains("line 5, column "),
+        "expected the line and column: {err}"
+    );
+}
+
+/// A value of the wrong type is refused without echoing the value.
+#[test]
+fn load_config_type_error_does_not_echo_the_value() {
+    let raw = format!("listen = \"0.0.0.0:8080\"\nallow_unauthenticated = \"{STRONG_KEY}\"\n");
+    let err = match load_config(&raw) {
+        Ok(_) => panic!("a string where a bool belongs must be refused"),
+        Err(e) => e,
+    };
+    assert_no_secret_fragment(&err, STRONG_KEY);
+    assert!(
+        err.contains("line 2, column "),
+        "expected the line and column: {err}"
+    );
 }

@@ -1,0 +1,348 @@
+{
+  "about": "Client store corpus. The format and every rule id are in docs/client-store.md.",
+  "cases": [
+    {
+      "id": "empty-full",
+      "why": "A store whose integrity record vouches for an empty table sends an empty full part.",
+      "tag": "06498d89b593874140232729660ed9e8793f7c786f1d1df1f6fb49bfb0d21639",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[],\"revoked_digests\":[]}",
+      "expect": "accept"
+    },
+    {
+      "id": "empty-partial",
+      "why": "A store whose table has no matching integrity record, a wiped one for instance, sends a partial part.",
+      "tag": "7c0f01f43e2a9df1e01198980e1e52752343c0a8b082c9c4f9bf10724830723d",
+      "body": "{\"full\":false,\"enabled_ahead\":0,\"records\":[],\"revoked_digests\":[]}",
+      "expect": "accept"
+    },
+    {
+      "id": "typical",
+      "why": "Disabled and enabled records and revoked digests, as a store writes them.",
+      "tag": "647acccceee8cb96c3dbde54df55d700fd5826854b43e27054775ce0cbb53dc3",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002},{\"name\":\"legacy\",\"state\":\"disabled\",\"version\":1791699000000003}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\",\"2222222222222222222222222222222222222222222222222222222222222222\"]}",
+      "expect": "accept"
+    },
+    {
+      "id": "enabled-ahead",
+      "why": "A store counts the enabled records it left out for being ahead.",
+      "tag": "1e5bcfd4553cedcaf0b57a039e587b3ab8df3f55116861a7c2168d002bd5cc93",
+      "body": "{\"full\":true,\"enabled_ahead\":3,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001}],\"revoked_digests\":[]}",
+      "expect": "accept"
+    },
+    {
+      "id": "record-limits",
+      "why": "A 63-character name, and the lowest and highest record versions.",
+      "tag": "1a19c461cff8e9efbe44d32313cfe4b3ca3ca379832d5fd3bbd382457e0c89e1",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn\",\"state\":\"disabled\",\"version\":1},{\"name\":\"z\",\"state\":\"enabled\",\"version\":9007199254740991}],\"revoked_digests\":[]}",
+      "expect": "accept"
+    },
+    {
+      "id": "operator-like-name",
+      "why": "The format does not know a deployment's operators. A reader accepts the part, and never applies the disable to its own operator.",
+      "tag": "ef23bbedd0287568c83ceb1d43c6fd95f275d5b779aa9f306da4d068287cce6e",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"operator\",\"state\":\"disabled\",\"version\":1791699000000001}],\"revoked_digests\":[]}",
+      "expect": "accept"
+    },
+    {
+      "id": "record-named-constructor",
+      "why": "`constructor` is a valid name, and a trap for a reader or store that keeps records in a plain JavaScript object.",
+      "tag": "b690bf494d9c817ac23d8e0e6f14f146726a15269f098eb8c2cec2220399c826",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"enabled\",\"version\":1791699000000002},{\"name\":\"constructor\",\"state\":\"disabled\",\"version\":1791699000000001}],\"revoked_digests\":[]}",
+      "expect": "accept"
+    },
+    {
+      "id": "names-of-digits",
+      "why": "Names of digits sort by bytes: `007`, `10`, `9`.",
+      "tag": "b0eaff769a6ef1e910dd5cb3af140964a1d61cb26da35801465010b73ccf3d2f",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"007\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"10\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"9\",\"state\":\"disabled\",\"version\":1791699000000001}],\"revoked_digests\":[]}",
+      "expect": "accept"
+    },
+    {
+      "id": "unsorted-accepted",
+      "why": "Readers do not depend on order: these records and digests are out of order, which a store never writes.",
+      "tag": "5e2e84ed0177c898aeac3ff3f168e58c6e9c5938bd96e28f9753191aa640b28e",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002},{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001}],\"revoked_digests\":[\"2222222222222222222222222222222222222222222222222222222222222222\",\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": "accept"
+    },
+    {
+      "id": "tag-of-another-body",
+      "why": "The tag must be the hash of this body.",
+      "tag": "06498d89b593874140232729660ed9e8793f7c786f1d1df1f6fb49bfb0d21639",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002},{\"name\":\"legacy\",\"state\":\"disabled\",\"version\":1791699000000003}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\",\"2222222222222222222222222222222222222222222222222222222222222222\"]}",
+      "expect": {"refuse":"part.tag"}
+    },
+    {
+      "id": "tag-uppercase",
+      "why": "The tag is lowercase hex, so one value has one spelling.",
+      "tag": "647ACCCCEEE8CB96C3DBDE54DF55D700FD5826854B43E27054775CE0CBB53DC3",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002},{\"name\":\"legacy\",\"state\":\"disabled\",\"version\":1791699000000003}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\",\"2222222222222222222222222222222222222222222222222222222222222222\"]}",
+      "expect": {"refuse":"part.tag"}
+    },
+    {
+      "id": "body-not-json",
+      "why": "The body is JSON.",
+      "tag": "264604252894c0f37b6252694faa42e62b134cb31430b6f34c64811928a4d64c",
+      "body": "full=true",
+      "expect": {"refuse":"part.object"}
+    },
+    {
+      "id": "body-truncated",
+      "why": "A cut-off body does not parse.",
+      "tag": "e60a253d4df76f785a1be8f736b8be94c7824b9c226aae5400f1d644201ef475",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002},{\"name\":\"legacy\",\"state\":",
+      "expect": {"refuse":"part.object"}
+    },
+    {
+      "id": "body-an-array",
+      "why": "The body is a JSON object.",
+      "tag": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "body": "[]",
+      "expect": {"refuse":"part.object"}
+    },
+    {
+      "id": "body-null",
+      "why": "`null` is not an object, though JavaScript's `typeof` says it is.",
+      "tag": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+      "body": "null",
+      "expect": {"refuse":"part.object"}
+    },
+    {
+      "id": "member-unknown",
+      "why": "A body member this format does not define.",
+      "tag": "1017e5d5e4b1be27921389e81bc0ddf4a5e97a491780ce3495d108d56170255e",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"],\"schema\":1}",
+      "expect": {"refuse":"part.members"}
+    },
+    {
+      "id": "member-missing",
+      "why": "Every body member is required.",
+      "tag": "f5dda0530c278d37210723be03f889071ef41e55d75cfaf77d1f659e861d5692",
+      "body": "{\"full\":true,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.members"}
+    },
+    {
+      "id": "full-string",
+      "why": "`full` is a boolean, not a string.",
+      "tag": "43f1c77932ea5d55109fd35895a525cabdaf9b779df7492e70fa7c2c4277ac86",
+      "body": "{\"full\":\"true\",\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.full"}
+    },
+    {
+      "id": "full-number",
+      "why": "`full` is a boolean, not a number.",
+      "tag": "718f9d0f2e5652c7ad27311817d33f0e04f84985dc99ea53eeacdaddb35026a4",
+      "body": "{\"full\":1,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.full"}
+    },
+    {
+      "id": "enabled-ahead-negative",
+      "why": "A count is not negative.",
+      "tag": "497747e053388eb95380e40cf08e0492364acc7bcf9d65bb8fa1abfccf4e9fdb",
+      "body": "{\"full\":true,\"enabled_ahead\":-1,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.enabled_ahead"}
+    },
+    {
+      "id": "enabled-ahead-fraction",
+      "why": "A count is an integer.",
+      "tag": "f8b1ea245a7b0a49911292230afbb0f88b39d6e0d0ca40fa07e6ad2db192162b",
+      "body": "{\"full\":true,\"enabled_ahead\":1.5,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.enabled_ahead"}
+    },
+    {
+      "id": "enabled-ahead-null",
+      "why": "A count is a number.",
+      "tag": "23a00ad4ec26ce22340150e9c30d03506079f52cd853d40443654f699c1df868",
+      "body": "{\"full\":true,\"enabled_ahead\":null,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.enabled_ahead"}
+    },
+    {
+      "id": "enabled-ahead-above-max",
+      "why": "2^53 is past the largest integer.",
+      "tag": "790ae931d85bc29d8ec69bc3a370b0685bd8c14c6bf2fe2450642323fbf069f1",
+      "body": "{\"full\":true,\"enabled_ahead\":9007199254740992,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.enabled_ahead"}
+    },
+    {
+      "id": "records-not-an-array",
+      "why": "`records` is an array.",
+      "tag": "fe30f9a1037c2245c4f22275f38c18004bc85490ffeacfdf5982b0a9031ebd32",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":{},\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.records"}
+    },
+    {
+      "id": "record-not-an-object",
+      "why": "Each record is an object.",
+      "tag": "5be807da4c54a6df5edefad3f470d6c118b2dcf711282f6a63ca1f1935bbc258",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002},\"acme\"],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.records"}
+    },
+    {
+      "id": "record-null",
+      "why": "A record is an object, not `null`.",
+      "tag": "1e809feb138c31d2372409fe65df2a691b2e2c36fb2ebe7d334ae0100120faaf",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002},null],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.records"}
+    },
+    {
+      "id": "record-member-unknown",
+      "why": "A poll's record carries no actor or reason.",
+      "tag": "084856dc97b5a161905eb98d72919945edc2cfb793a282753cf96c381f1cd8de",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001,\"actor\":\"ops\"},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.records"}
+    },
+    {
+      "id": "record-member-missing",
+      "why": "Every record member is required.",
+      "tag": "62d4fd701fcd2e0023a745cb77b3521d8f1c4e866758e5c8ce411f917d147cf3",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\"},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.records"}
+    },
+    {
+      "id": "record-name-reserved",
+      "why": "Names starting with `_` are reserved, so no record carries one.",
+      "tag": "35260d131ed8483d113b244e916b70069375f7180df50545db8be1d1d3cf55e3",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"_\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_name"}
+    },
+    {
+      "id": "record-name-in-an-array",
+      "why": "A name is a string, not an array holding one.",
+      "tag": "69eb6a1bcdc89ff3e86d19336e37ed1847a3305fe1257f7468bad9bc358151f0",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":[\"acme\"],\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_name"}
+    },
+    {
+      "id": "record-name-trailing-newline",
+      "why": "A pattern matches the whole value, so a trailing line feed breaks it.",
+      "tag": "fea13268b05967fae53ed1cf910d7dedd82f69d55f5c760d8006d7788de756ba",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\\n\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_name"}
+    },
+    {
+      "id": "record-name-uppercase",
+      "why": "Record names follow the name rule.",
+      "tag": "4d68bb36c7d44eeac7529b9ce4be57cde38140f9300f9b34fdd3f424ba5c2a74",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"Acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_name"}
+    },
+    {
+      "id": "record-name-64-characters",
+      "why": "64 characters is one more than a name holds.",
+      "tag": "e9dc43537edce88ea526e6cf3f8c9cd543268939a5870cc490d3afc14b062cd1",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_name"}
+    },
+    {
+      "id": "record-name-not-a-string",
+      "why": "A name is a string.",
+      "tag": "2b1b5a0233dbc38b8659ecce5a6d9d5725efddeebf074153914c1b7166f022d8",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":7,\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_name"}
+    },
+    {
+      "id": "record-name-twice",
+      "why": "A store holds one record per name.",
+      "tag": "5fe8f0bf7b395bee207913f84811ca2aa46409b448ab60e4a0d82c8a78f8007d",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002},{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000003}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_name"}
+    },
+    {
+      "id": "record-name-twice-in-both-states",
+      "why": "A store holds one record per name, whatever the states.",
+      "tag": "b47635db2b376dff8dff736b0f7883b2c9dde7eb02b4aa22512f0f5f6f870552",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002},{\"name\":\"acme\",\"state\":\"enabled\",\"version\":1791699000000003}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_name"}
+    },
+    {
+      "id": "record-state-unknown",
+      "why": "A state is `disabled` or `enabled`.",
+      "tag": "6083e0a92a8d1cb0e331762a78a0a86df8ab47d639747b59aed710983c5105c1",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"revoked\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_state"}
+    },
+    {
+      "id": "record-state-capitalised",
+      "why": "States are lowercase.",
+      "tag": "120b18abd5ed4e482b751f42269aed475c70d312e1fe6e730897e52acd9330a7",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"Disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_state"}
+    },
+    {
+      "id": "record-state-boolean",
+      "why": "A state is a string.",
+      "tag": "1af3d4dda2d4ee0ae14bdb9bb56ff540bc5f9f10e649717ba99a34d216c50fb5",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":true,\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_state"}
+    },
+    {
+      "id": "record-version-zero",
+      "why": "A record version is at least 1.",
+      "tag": "9105fafb3349209737e1f8f8bcc9d10fb88fabf60bf2c424e95a88682a1aae5b",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":0},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_version"}
+    },
+    {
+      "id": "record-version-negative",
+      "why": "A record version is not negative.",
+      "tag": "b7b63e8f247308a5ad009f536f1faba43d26db37cad903d0a90a92a9c8e28d46",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":-1},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_version"}
+    },
+    {
+      "id": "record-version-above-max",
+      "why": "2^53 is past the largest version.",
+      "tag": "52a19b2846ff2ad777f94048506a65d4e6b2e6e56d1d39b498e215a4c002bde1",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":9007199254740992},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_version"}
+    },
+    {
+      "id": "record-version-fraction",
+      "why": "A record version is an integer.",
+      "tag": "b889ae62e0ef681ad9078d179200678af12fefeb1a35cb876462f177ae9130ac",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001.5},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_version"}
+    },
+    {
+      "id": "record-version-string",
+      "why": "A record version is a number, not a string.",
+      "tag": "6f319ec8f8d500bc2f41d899039736c7bd19b976c0c696846a8f46d68c441e92",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":\"1791699000000001\"},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.record_version"}
+    },
+    {
+      "id": "revoked-digests-not-an-array",
+      "why": "`revoked_digests` is an array.",
+      "tag": "7a84f472447ea01868ce9d4f15dc417d58f2fbc5e014827777a28f7c9e6f2643",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":\"1111111111111111111111111111111111111111111111111111111111111111\"}",
+      "expect": {"refuse":"part.revoked_digests"}
+    },
+    {
+      "id": "revoked-digest-uppercase",
+      "why": "Digests are lowercase hex.",
+      "tag": "af61cdf543e49acaa4ae01c02895f973bb9130aff0debfdcb7a534bae20d1838",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"]}",
+      "expect": {"refuse":"part.revoked_digests"}
+    },
+    {
+      "id": "revoked-digest-not-a-string",
+      "why": "A digest is a string.",
+      "tag": "4c596eb193a9ad8c0a73deaa461b25ccf95e2b4b0f438782fa244086619b1d9f",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[1]}",
+      "expect": {"refuse":"part.revoked_digests"}
+    },
+    {
+      "id": "revoked-digest-twice",
+      "why": "A digest is listed once.",
+      "tag": "ee747a502ea5576057a49869f3f641187063f0894e16e588c4e6f51c6be67a8b",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\",\"1111111111111111111111111111111111111111111111111111111111111111\"]}",
+      "expect": {"refuse":"part.revoked_digests"}
+    },
+    {
+      "id": "revoked-digest-trailing-newline",
+      "why": "A pattern matches the whole value, so a trailing line feed breaks it.",
+      "tag": "100c4a3744d8958b706f71811dbe68eb499b82f01f8d78002ac238ce6e22dc83",
+      "body": "{\"full\":true,\"enabled_ahead\":0,\"records\":[{\"name\":\"acme\",\"state\":\"disabled\",\"version\":1791699000000001},{\"name\":\"batch-7\",\"state\":\"enabled\",\"version\":1791699000000002}],\"revoked_digests\":[\"1111111111111111111111111111111111111111111111111111111111111111\\n\"]}",
+      "expect": {"refuse":"part.revoked_digests"}
+    }
+  ]
+}

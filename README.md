@@ -174,8 +174,8 @@ token = "sk-ant-api03-..."
 | `listen` | `String` | — | Bind address (e.g. `"127.0.0.1:8082"`) |
 | `rate_limit_cooldown_secs` | `u64` | `5` | Fallback cooldown after a capacity 429 when upstream sends no usable `retry-after` (burst 429s use their own 5→60s backoff). Must be `1..=86400`; a value outside it is rejected at startup |
 | `probe_interval_secs` | `u64` | `300` | Seconds between utilization probes (0 = disabled) |
-| `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id` |
-| `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`) |
+| `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id`. Must match `^[a-z0-9][a-z0-9_-]{0,62}$`; names starting with `_` are reserved |
+| `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`). At least 32 characters; held only as a digest |
 | `clients[].models` | `[String]` | `[]` | Models this client may request (empty = all; `*` suffix wildcards) |
 | `clients[].preferred_endpoints` | `[String]` | `[]` | Pin this client to named endpoint(s); spills to the full pool when none is healthy (incl. at paid overage). Names are startup-validated |
 | `proxy_key` | `String?` | `None` | **Legacy** shared secret. Mutually exclusive with `[[clients]]` |
@@ -209,6 +209,8 @@ token = "sk-ant-api03-..."
 | `endpoints[].allow_nonstandard_host` | `bool` | `false` | Allow an `anthropic` endpoint whose `base_url` host isn't `api.anthropic.com` — without it startup fails, because the endpoint token would be sent to that host |
 | `session_registry_max` | `usize` | `1000` | Max live-session entries tracked for `/_stats` `sessions` (0 = disabled) |
 | `session_registry_ttl_secs` | `u64` | `1800` | Seconds after a session's last request before its entry is evicted |
+| `client_store.poll_url` | `String` | — | Read ordinary clients from a client store polled at this URL (see [Client store](#client-store-client_store)). Requires `[[clients]]` |
+| `client_store.token` | `String?` | `None` | Sent as `Authorization: Bearer` on every poll; only over `https://` |
 
 > [!NOTE]
 > **Strategy normalization**: Both `"dynamic-capacity"` and `"dynamic-capacity-v1"` are accepted in config, but the runtime normalizes to `"dynamic-capacity-v1"` in logs and `/_stats` output. Similarly, `"sticky-weighted"` normalizes to `"sticky-weighted-v2"`.
@@ -301,7 +303,7 @@ Claude Code sends it as `x-api-key`; the proxy validates it and swaps in the rea
 > [!IMPORTANT]
 > With `[[clients]]` configured, **`x-client-id` and the `client_names` IP map are ignored entirely** — `client_id` comes from the verified credential. That is what makes per-client budgets, utilization ceilings, operator status, model allow-lists and response-cache tenancy enforceable rather than advisory: all five key on `client_id`.
 
-Keys are compared in constant time against the whole table. Startup rejects anything that would otherwise fail silently at runtime: duplicate names, duplicate keys, a name with stray whitespace, and any `client_budgets` / `client_utilization_limits` / `operators` / `admin_readers` / `[response_cache].clients` entry naming no configured client. That last class matters — an unknown client passes the budget and utilization checks, so a one-character typo would mean *unlimited* spend with no log line and no metric.
+Once started, the proxy holds client keys only as SHA-256 digests: a presented key is digested and looked up. A presented key shorter than 32 characters never matches. Names must match `^[a-z0-9][a-z0-9_-]{0,62}$`, and names starting with `_` are reserved for internal labels. Startup rejects anything that would otherwise fail silently at runtime: duplicate names, duplicate keys, a name with stray whitespace, and any `client_budgets` / `client_utilization_limits` / `operators` / `admin_readers` / `[response_cache].clients` entry naming no configured client. That last class matters — an unknown client passes the budget and utilization checks, so a one-character typo would mean *unlimited* spend with no log line and no metric.
 
 `[[clients]]` is also incompatible with `token = "passthrough"` endpoints, and that combination is rejected at startup. Passthrough forwards the caller's auth headers upstream untouched, but under `[[clients]]` those headers carry the caller's *proxy* credential — forwarding them would hand every client key to the upstream.
 
@@ -346,6 +348,45 @@ To deny a client every model, set `models = [""]`. The single empty pattern matc
 
 It **fails closed** on a model it cannot read. The proxy takes the model from the top-level `model` key of a JSON body; a multipart upload, or a route that nests the model elsewhere (`/v1/messages/batches` puts it under `requests[].params.model`), yields no model — and a client that has an allow-list is then denied rather than waved through. Clients with no allow-list are unaffected. Any other body that does not parse is refused before this check (see §Credential-path hardening).
 
+
+### Client store (`[client_store]`)
+
+A client store keeps the ordinary clients of a fleet in one place, so a key, a budget or a model list changes without a redeploy. The proxy reads it and never writes it: every instance polls the store and enforces what it receives. [`docs/client-store.md`](docs/client-store.md) is the protocol, and `tests/client-store/` the corpus a store and this reader both pass.
+
+```toml
+operators = ["ops"]
+admin_readers = ["scraper"]
+
+[[clients]]          # operators and admin readers stay in this file
+name = "ops"
+key = "<openssl rand -hex 32>"
+
+[[clients]]
+name = "scraper"
+key = "<openssl rand -hex 32>"
+models = [""]
+
+[client_store]
+poll_url = "https://store.example.com/_clients/poll"
+token = "<the store's reader token>"   # optional; sent only over https
+```
+
+The store sends two things. The **document** grants: clients, their keys (as SHA-256 digests) and their policies. The **restrictions** deny: disabled names and revoked key digests. A document replaces the one held once it passes its checks; restrictions are merged into what the instance holds and never replaced, so a store that loses or rewinds a restriction cannot lift it on a running instance. Operators and admin readers live only in this file: a store can neither grant nor restrict them.
+
+**It fails closed.** Until an instance holds a complete set of restrictions, it serves no ordinary client, keys from this file included; operators and admin readers work from the start. It is *loaded* once it also holds a document. Before that, an ordinary key, or a key that matches nothing yet, gets `503` with `retry-after: 1`, which never counts toward the failed-auth throttle. At boot the listener opens after the first answered poll, or after 3 seconds without one, so a store outage cannot hold the port shut. `GET /_ready` answers `200` once loaded and `503` until then. It needs no credential and is exempt from `allowed_ips`, so a readiness probe from the node can call it; it reveals nothing but that one bit. Polls run every 5 seconds, every second while unloaded.
+
+| Refusal | Status | Body `error.message` |
+|---|---|---|
+| A disabled name, for every key of it, store or file | 403 | `client_disabled` |
+| A store client whose policy fails this instance's checks: every key of the name | 403 | `client_quarantined` |
+| An ordinary key before a complete set of restrictions; any unmatched key while unloaded | 503 | `client table not loaded yet` |
+
+A name in both this file and the document is one client: keys from both authenticate, and the document's policy governs them. The file keeps only what the document's schema has no field for, the guard policy. A revoked digest refuses only a store key, and a disabled name refuses every key of an ordinary client of that name. A pin to an endpoint this instance lacks is dropped with a warning. `[response_cache].clients` may name a store client; its tenant stays inert until the client is loaded.
+
+What an instance holds is saved beside the state file, as `<config>.client-store.json`, at every change, and a change is enforced only once it is saved, so a restart resumes no less than was enforced. A save that fails removes the file instead, so a restart waits for the store, and the `resume_unsaved` alert stands until a later save lands. Two cases are exceptions. A file that can be neither written nor removed is logged as an error, and the change is enforced anyway, so a restart in that state may resume less. A disk that hangs holds back new changes on that instance until it answers, and each part's last good arrival stops advancing meanwhile. A process restarted with that file in place resumes from it after the same checks, and counts as loaded only if the saved restrictions are complete.
+
+Every install logs the document's exact bytes as base64, with its version and digest, and every change of restrictions logs the full set held, with its completeness mark and set hash; both are logged again once a day. Each line carries at most 9 KiB of the text, under 16 KiB in all, and the lines of one set reassemble into its set text. The `anthropic_client_store_*` series on `/metrics` export the document and records versions held (as labels), whether the instance is loaded, every alert (`anthropic_client_store_alert{alert}`: `store_behind`, `store_edited`, `clock_skew`, `restrictions_behind`, `restrictions_partial`, `enabled_ahead`, `document_refused`, `restrictions_refused`, `privileged_name`, `quarantined`, `revoked_outside_store`, `resume_unsaved`), the quarantined clients, unmatched disabled names (a count and at most 5 names), each part's last good arrival, refusals by reason, and one `anthropic_client_store_toml_client{client}` series per ordinary client in this file.
+
 ---
 
 ## Security
@@ -366,7 +407,7 @@ It **fails closed** on a model it cannot read. The proxy takes the model from th
 | **Caller-identity privacy** | `forward_caller_identity = false` | Caller IP and `x-client-id`/`x-agent-id`/`x-session-id` headers dropped before the upstream request | **stripped** |
 | **Model allow-list** | `clients[].models` | Rejects models outside a client's list (403) | all models |
 
-IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are compared in constant time, and startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`).
+IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are held and matched as digests. Startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`), and a presented credential that short never matches.
 
 **TLS terminates at the ingress.** The proxy speaks plain HTTP and its container port must never be published directly to the internet — put it behind a TLS-terminating load balancer or ingress, list that LB in `trusted_proxies`, and let the ingress carry the certificate. Bearer credentials without TLS are credentials in cleartext.
 
@@ -578,7 +619,10 @@ scanner cannot walk (an object, a text block whose `text` is not a string, a
 `tool_result` whose content is neither string nor block array, a `document` or
 `search_result` in a shape the API does not define), or a content block of a
 type the scanner does not know that carries a `text`, `content`, `source`,
-`title` or `context` field. Those are not "nothing to scan" — the guard could not tell what it was looking at, and under
+`title`, `context`, `refusal` or `thinking` field. That last pair covers the
+OpenAI `refusal` and `thinking` content parts: the scanner does not read them
+as text, but an OpenAI-compatible upstream may render them as model-visible
+text in any role. Those are not "nothing to scan" — the guard could not tell what it was looking at, and under
 `block` they fail closed (below). Note an absent field is not the same as a
 present unreadable one: absent content cannot be hiding anything.
 
@@ -639,7 +683,11 @@ same 400 rather than forwarded unscanned:
   included: the compare is exact), or a newest-turn `content` present in a shape
   it cannot walk. That includes a malformed `document` or `search_result`, and
   a block of a type the scanner does not know that carries a `text`, `content`,
-  `source`, `title` or `context` field (`{"type": "x", "text": "..."}`).
+  `source`, `title`, `context`, `refusal` or `thinking` field
+  (`{"type": "x", "text": "..."}`). A newest-turn `refusal` or `thinking` part
+  or block that carries its text is therefore rejected, on `/v1/messages` and
+  `/v1/chat/completions` alike. On `/v1/chat/completions` so is one in any
+  `tool` message, older turns included (below).
   Audio, file, `tool_reference` and `browser_state` blocks carry none of those
   and still pass; images are skipped as a known binary type. Each of these is content the guard never saw and the upstream would
   have;
@@ -649,8 +697,8 @@ same 400 rather than forwarded unscanned:
 - on `/v1/chat/completions` only, `messages` is absent or not an array, or a
   `user`/`tool` message's content is in a shape translation would flatten (a
   non-string `tool` content, a content part with no string `type`, a `text` that
-  is not a string, a `tool` content part carrying `content`, `source`, `title`
-  or `context` — translation keeps only its `text` — or an `image_url` that is not an object
+  is not a string, a `tool` content part carrying `content`, `source`, `title`,
+  `context`, `refusal` or `thinking` — translation keeps only its `text` — or an `image_url` that is not an object
   with a string `url`).
   That endpoint is a single API which requires `messages`, and an
   `openai`-protocol endpoint forwards the client's original bytes, so what

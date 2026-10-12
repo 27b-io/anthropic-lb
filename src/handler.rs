@@ -916,7 +916,7 @@ pub(crate) async fn forward_anthropic(
     ep: &Endpoint,
     endpoint_idx: usize,
     req_id: &str,
-    client_id: &str,
+    caller: &Caller,
     client_ver: &str,
     client_ip: &std::net::IpAddr,
     agent_id: &str,
@@ -926,6 +926,7 @@ pub(crate) async fn forward_anthropic(
     session_key: Option<&str>,
     request_start: std::time::Instant,
 ) -> ForwardOutcome {
+    let client_id = caller.name();
     let token = ep.token.as_str();
     let passthrough = ep.passthrough;
     let endpoint_name = ep.name.as_str();
@@ -1071,7 +1072,7 @@ pub(crate) async fn forward_anthropic(
     // passthrough endpoints forward client betas unfiltered, so this cannot
     // ride on the beta allow-list. Batches nest the field and Anthropic
     // rejects it there.
-    let models_restricted = state.attempt_restricts_models(ep, client_id);
+    let models_restricted = caller.attempt_restricts_models(ep);
     let fallback_free = (messages_schema && models_restricted)
         .then(|| strip_top_level_fields(req_body, ANTHROPIC_FALLBACK_FIELDS))
         .flatten();
@@ -1220,12 +1221,12 @@ pub(crate) async fn forward_anthropic(
             constraint,
             overage: info.overage_in_use,
             served_on_overage: overage_in_use(resp.headers()),
-            pin: state.pin_status(client_id, endpoint_idx),
+            pin: state.pin_status(caller, endpoint_idx),
             total: ep.requests.load(Ordering::Relaxed),
             fp: fp.unwrap_or("-").to_string(),
             hints: ClientHints::from_headers(&parts.headers),
         };
-        (compute_pressure_status(eff_util, client_id, state), ctx)
+        (compute_pressure_status(eff_util, caller), ctx)
     };
 
     let latency_ms = request_start.elapsed().as_millis() as u64;
@@ -1256,7 +1257,7 @@ pub(crate) async fn forward_anthropic(
         let state_clone = state.clone();
         // The detached task can't carry the `ep` borrow across the spawn
         // boundary; capture the Copy index and re-borrow from the owned `Arc`.
-        let client_id_clone = client_id.to_owned();
+        let caller_clone = caller.clone();
         let acct_name = endpoint_name.to_owned();
         let model_clone = model.to_owned();
         let client_ip_str = client_ip.to_string();
@@ -1316,7 +1317,7 @@ pub(crate) async fn forward_anthropic(
                 &state_clone,
                 ep,
                 &req_id_clone,
-                &client_id_clone,
+                &caller_clone,
                 &model_clone,
                 &acct_name,
                 &client_ip_str,
@@ -1491,7 +1492,7 @@ pub(crate) async fn forward_anthropic(
             state,
             ep,
             req_id,
-            client_id,
+            caller,
             model,
             response_model.as_deref(),
             endpoint_name,
@@ -1727,14 +1728,14 @@ pub(crate) async fn proxy_handler(
     }
 
     // Proxy auth: x-api-key against the [[clients]] table, else legacy proxy_key.
-    let principal = match state.authenticate_throttled(
+    let auth = match state.authenticate_throttled(
         &client_ip,
         client_addr,
         req.headers(),
         false,
         "proxy",
     ) {
-        Ok(p) => p,
+        Ok(auth) => auth,
         Err(resp) => return *resp,
     };
 
@@ -1746,21 +1747,23 @@ pub(crate) async fn proxy_handler(
         state.next_req_id.fetch_add(1, Ordering::Relaxed)
     );
 
-    // Extract client identification headers
-    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers, principal);
+    // Extract client identification headers. From here on every per-client
+    // decision reads `caller`'s policy snapshot, the one authentication read.
+    let rctx = RequestContext::from_request(&state, &client_ip, &parts.headers, auth);
     let RequestContext {
-        client_id,
+        caller,
         client_ver,
         agent_id,
         session_id,
     } = rctx;
+    let client_id = caller.name().to_owned();
     // affinity_key is built AFTER the body is parsed, so the content fingerprint
     // (fp) can be folded in as the finest routing discriminator.
 
     // LAB-4395 / GH #199: a read-only principal is refused here, on identity
     // alone, before it can reserve any of the shared body budget or have a
     // byte of its body read. `pre_request_gate` repeats the check.
-    if let Some(resp) = state.deny_admin_reader(&req_id, &client_id) {
+    if let Some(resp) = deny_admin_reader(&req_id, &caller) {
         return *resp;
     }
 
@@ -2097,7 +2100,7 @@ pub(crate) async fn proxy_handler(
     // Note: budget + emergency don't need `model` and could run before body parsing,
     // but those rejections are rare and the JSON parse cost is negligible — not worth
     // splitting the gate for a few microseconds on an almost-never code path.
-    if let Err(resp) = state.pre_request_gate(&req_id, &client_id, &model).await {
+    if let Err(resp) = state.pre_request_gate(&req_id, &caller, &model).await {
         return *resp;
     }
 
@@ -2111,7 +2114,7 @@ pub(crate) async fn proxy_handler(
     // what `/v1/complete` and `/v1/models` send through this fallback.
     #[cfg(feature = "guard")]
     let guard_annotate: Option<usize> = match state
-        .guard_hook(&req_id, &client_id, &guard_outcome, false)
+        .guard_hook(&req_id, &caller, &guard_outcome, false)
         .await
     {
         Ok(annotate) => annotate,
@@ -2182,7 +2185,7 @@ pub(crate) async fn proxy_handler(
             // (OpenAI). Both return a `ForwardOutcome` so the shared
             // round-gated policy in `apply_round_outcome` covers both.
             let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint_for_client(affinity, &model, &skip, &client_id, fast)
+                .pick_endpoint_for_client(affinity, &model, &skip, &caller, fast)
                 .await
             {
                 Some(i) => {
@@ -2198,7 +2201,7 @@ pub(crate) async fn proxy_handler(
                                 ep,
                                 i,
                                 &req_id,
-                                &client_id,
+                                &caller,
                                 &client_ver,
                                 &client_ip,
                                 &agent_id,
@@ -2220,7 +2223,7 @@ pub(crate) async fn proxy_handler(
                                         &state,
                                         body,
                                         &req_id,
-                                        &client_id,
+                                        &caller,
                                         &client_ip,
                                         &agent_id,
                                         &session_id,

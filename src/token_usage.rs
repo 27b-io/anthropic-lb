@@ -391,7 +391,9 @@ pub(crate) fn inject_account_auth(
 
 /// Client identity extracted from request headers.
 pub(crate) struct RequestContext {
-    pub(crate) client_id: String,
+    /// Who the request is from, and the client-policy snapshot it carries.
+    /// `caller.name()` is the request's `client_id`.
+    pub(crate) caller: Caller,
     pub(crate) client_ver: String,
     pub(crate) agent_id: String,
     pub(crate) session_id: String,
@@ -423,22 +425,24 @@ pub(crate) fn affinity_routing_key(
 }
 
 impl RequestContext {
-    /// `principal` is the authenticated client from `AppState::authenticate`.
-    /// When present it IS the identity — `x-client-id` and the `client_names`
+    /// `auth` is what `AppState::authenticate` established. Its principal,
+    /// when present, IS the identity — `x-client-id` and the `client_names`
     /// IP map are not consulted at all. This one substitution is what makes
     /// budgets, ceilings, operator bypass, the model allow-list and the
     /// response-cache tenant unspoofable: every one of them keys on
-    /// `client_id`, and this is where `client_id` is born.
+    /// `client_id`, and this is where `client_id` is born. The caller keeps
+    /// the policy snapshot `auth` read, for the whole request.
     pub(crate) fn from_request(
         state: &AppState,
         client_ip: &IpAddr,
         headers: &axum::http::HeaderMap,
-        principal: Option<&ClientConfig>,
+        auth: Authenticated,
     ) -> Self {
+        let Authenticated { policy, principal } = auth;
         Self {
-            client_id: match principal {
-                Some(c) => c.name.clone(),
-                None => state.resolve_client_id(client_ip, headers),
+            caller: match principal {
+                Some(principal) => Caller { policy, principal },
+                None => Caller::named(policy, state.resolve_client_id(client_ip, headers)),
             },
             client_ver: headers
                 .get("user-agent")
@@ -480,7 +484,7 @@ impl RequestContext {
     pub(crate) fn affinity_key(&self, client_ip: &IpAddr, fp: Option<&str>) -> Option<String> {
         affinity_routing_key(
             client_ip,
-            &self.client_id,
+            self.caller.name(),
             &self.agent_id,
             &self.session_id,
             fp,

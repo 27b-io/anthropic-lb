@@ -261,7 +261,11 @@ fn request_context_trims_whitespace_headers() {
     headers.insert("x-agent-id", HeaderValue::from_static("  "));
     headers.insert("x-session-id", HeaderValue::from_static(" \t "));
     let ip: IpAddr = "127.0.0.1".parse().unwrap();
-    let rctx = RequestContext::from_request(&state, &ip, &headers, None);
+    let auth = Authenticated {
+        policy: state.current_client_policy(),
+        principal: None,
+    };
+    let rctx = RequestContext::from_request(&state, &ip, &headers, auth);
     assert_eq!(rctx.agent_id, "-", "whitespace-only agent_id should be -");
     assert_eq!(
         rctx.session_id, "-",
@@ -275,7 +279,7 @@ fn request_context_trims_whitespace_headers() {
 
 fn rctx_for(client_id: &str, agent: &str, session: &str) -> RequestContext {
     RequestContext {
-        client_id: client_id.to_string(),
+        caller: test_state_with(vec![]).caller(client_id),
         client_ver: "-".to_string(),
         agent_id: agent.to_string(),
         session_id: session.to_string(),

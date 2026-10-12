@@ -398,40 +398,44 @@ async fn pick_endpoint_openai_is_last_resort() {
 
 #[test]
 fn is_operator_checks_configured_operator() {
-    let state = Arc::new(AppState {
-        client: Client::new(),
-        client_nonstreaming: Client::new(),
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        operators: vec!["special-operator".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .operators(&["special-operator"])
+            .install(AppState {
+                client: Client::new(),
+                client_nonstreaming: Client::new(),
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
 
-    assert!(state.is_operator("special-operator"));
-    assert!(!state.is_operator("regular-client"));
+    assert!(state
+        .current_client_policy()
+        .is_operator("special-operator"));
+    assert!(!state.current_client_policy().is_operator("regular-client"));
 }
 
 #[test]
 fn is_operator_returns_false_when_no_operator_configured() {
     let state = test_state_with(vec![]);
-    assert!(!state.is_operator("any-client"));
+    assert!(!state.current_client_policy().is_operator("any-client"));
 }
 
 #[test]
 fn is_operator_supports_multiple_operators() {
-    let state = Arc::new(AppState {
-        client: Client::new(),
-        client_nonstreaming: Client::new(),
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        operators: vec![
-            "ray".to_string(),
-            "openclaw".to_string(),
-            "claude".to_string(),
-        ],
-        ..test_state_base()
-    });
-    assert!(state.is_operator("ray"));
-    assert!(state.is_operator("openclaw"));
-    assert!(state.is_operator("claude"));
-    assert!(!state.is_operator("gastown"));
-    assert!(!state.is_operator("-"));
+    let state = Arc::new(
+        TestPolicy::open()
+            .operators(&["ray", "openclaw", "claude"])
+            .install(AppState {
+                client: Client::new(),
+                client_nonstreaming: Client::new(),
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
+    assert!(state.current_client_policy().is_operator("ray"));
+    assert!(state.current_client_policy().is_operator("openclaw"));
+    assert!(state.current_client_policy().is_operator("claude"));
+    assert!(!state.current_client_policy().is_operator("gastown"));
+    assert!(!state.current_client_policy().is_operator("-"));
 }

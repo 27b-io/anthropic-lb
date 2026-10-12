@@ -1125,16 +1125,19 @@ async fn response_cache_skips_oversized_bodies() {
 #[test]
 fn response_cache_tenant_follows_the_authenticated_principal() {
     let state = state_with_clients(vec![
-        mk_client("alpha", "key-alpha", &[]),
-        mk_client("bravo", "key-bravo", &[]),
+        mk_client("alpha", &test_key("key-alpha"), &[]),
+        mk_client("bravo", &test_key("key-bravo"), &[]),
     ]);
     let ip = test_ip();
-    let headers = hdrs(&[("x-api-key", "key-alpha"), ("x-client-id", "bravo")]);
-    let principal = state.authenticate(&headers, false).unwrap().unwrap();
-    let rctx = RequestContext::from_request(&state, &ip, &headers, Some(principal));
+    let headers = hdrs(&[
+        ("x-api-key", &test_key("key-alpha")),
+        ("x-client-id", "bravo"),
+    ]);
+    let auth = state.authenticate(&headers, false).unwrap();
+    let rctx = RequestContext::from_request(&state, &ip, &headers, auth);
 
     // The cache is keyed by this exact string (`rc.clients.get(&client_id)`),
     // and the HKDF tenant is derived from it.
-    assert_eq!(rctx.client_id, "alpha");
-    assert_ne!(rctx.client_id, "bravo");
+    assert_eq!(rctx.caller.name(), "alpha");
+    assert_ne!(rctx.caller.name(), "bravo");
 }

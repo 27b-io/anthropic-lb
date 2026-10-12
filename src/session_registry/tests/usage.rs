@@ -12,7 +12,7 @@ async fn record_usage_updates_account_and_client() {
     state
         .record_usage(
             &state.endpoints[0],
-            "test-client",
+            &state.caller("test-client"),
             "claude-sonnet-5",
             &usage,
         )
@@ -46,7 +46,12 @@ async fn record_usage_ignores_anonymous() {
         cache_read_input_tokens: 0,
     };
     state
-        .record_usage(&state.endpoints[0], "-", "claude-sonnet-5", &usage)
+        .record_usage(
+            &state.endpoints[0],
+            &state.caller("-"),
+            "claude-sonnet-5",
+            &usage,
+        )
         .await;
 
     // Account gets updated
@@ -88,7 +93,7 @@ async fn client_usage_is_bounded() {
         state
             .record_usage(
                 &state.endpoints[0],
-                &format!("c{i}"),
+                &state.caller(&format!("c{i}")),
                 "claude-sonnet-5",
                 &usage,
             )
@@ -114,7 +119,7 @@ async fn record_usage_tracks_per_model() {
     };
     for model in ["claude-sonnet-5", "claude-sonnet-5", "claude-haiku-4-5"] {
         state
-            .record_usage(&state.endpoints[0], "c1", model, &usage)
+            .record_usage(&state.endpoints[0], &state.caller("c1"), model, &usage)
             .await;
     }
 
@@ -144,7 +149,7 @@ async fn record_usage_empty_model_records_unknown() {
         cache_read_input_tokens: 0,
     };
     state
-        .record_usage(&state.endpoints[0], "c1", "", &usage)
+        .record_usage(&state.endpoints[0], &state.caller("c1"), "", &usage)
         .await;
     let map = state.client_model_usage.lock().unwrap();
     assert!(map.contains_key(&("c1".to_string(), "unknown".to_string())));
@@ -161,7 +166,7 @@ async fn record_usage_truncates_model_label() {
     };
     let huge = "m".repeat(500);
     state
-        .record_usage(&state.endpoints[0], "c1", &huge, &usage)
+        .record_usage(&state.endpoints[0], &state.caller("c1"), &huge, &usage)
         .await;
     // The stored key must have gone through truncate_label (whose exact
     // format is covered by its own unit tests).
@@ -184,7 +189,12 @@ async fn client_model_usage_is_bounded() {
     };
     for i in 0..(MAX_CLIENT_MODEL_LABELS + 50) {
         state
-            .record_usage(&state.endpoints[0], "c1", &format!("model-{i}"), &usage)
+            .record_usage(
+                &state.endpoints[0],
+                &state.caller("c1"),
+                &format!("model-{i}"),
+                &usage,
+            )
             .await;
     }
     // LAB-2330: rotating the caller-controlled client
@@ -194,7 +204,7 @@ async fn client_model_usage_is_bounded() {
         state
             .record_usage(
                 &state.endpoints[0],
-                &format!("evil-{i}"),
+                &state.caller(&format!("evil-{i}")),
                 "claude-x",
                 &usage,
             )
@@ -428,23 +438,34 @@ async fn proxied_line_still_logged_on_openai_compat_upstream_error() {
 /// reported, the estimate alone is booked and no counter entry appears.
 #[tokio::test]
 async fn record_usage_charging_books_estimate_to_budget_only() {
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: [("c1".to_string(), 1_000_000), ("c2".to_string(), 1_000_000)]
-            .into_iter()
-            .collect(),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .budgets(
+                [("c1".to_string(), 1_000_000), ("c2".to_string(), 1_000_000)]
+                    .into_iter()
+                    .collect(),
+            )
+            .install(AppState {
+                endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+                ..test_state_base()
+            }),
+    );
     let usage = TokenUsage {
         input_tokens: 7,
         cache_read_input_tokens: 3,
         ..TokenUsage::default()
     };
     state
-        .record_usage_charging(&state.endpoints[0], "c1", "m", &usage, 50)
+        .record_usage_charging(&state.endpoints[0], &state.caller("c1"), "m", &usage, 50)
         .await;
     state
-        .record_usage_charging(&state.endpoints[0], "c2", "m", &TokenUsage::default(), 80)
+        .record_usage_charging(
+            &state.endpoints[0],
+            &state.caller("c2"),
+            "m",
+            &TokenUsage::default(),
+            80,
+        )
         .await;
 
     let budget = state.budget_usage.lock().unwrap().clone();

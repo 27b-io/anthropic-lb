@@ -82,7 +82,7 @@ pub(crate) async fn try_fallback_upstream(
     // caller; each attempt clones the refcounted `Bytes`.
     request_body: &bytes::Bytes,
     req_id: &str,
-    client_id: &str,
+    caller: &Caller,
     client_ip: &std::net::IpAddr,
     agent_id: &str,
     session_id: &str,
@@ -92,6 +92,7 @@ pub(crate) async fn try_fallback_upstream(
     translate: bool, // true = upstream response needs OpenAI→Anthropic translation
     is_streaming: bool,
 ) -> ForwardOutcome {
+    let client_id = caller.name();
     let ep = &state.endpoints[endpoint_idx];
 
     info!(
@@ -100,7 +101,7 @@ pub(crate) async fn try_fallback_upstream(
         model,
         upstream = ep.name,
         translate,
-        pin = state.pin_status(client_id, endpoint_idx),
+        pin = state.pin_status(caller, endpoint_idx),
         "fallback: routing to unified OpenAI endpoint"
     );
 
@@ -484,7 +485,7 @@ pub(crate) async fn try_fallback_upstream(
         state,
         ep,
         req_id,
-        client_id,
+        caller,
         model,
         openai_resp.get("model").and_then(|v| v.as_str()),
         &ep.name,

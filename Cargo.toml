@@ -51,9 +51,6 @@ cachekit-rs = { version = "0.5", features = ["redis"] }
 # Same versions cachekit-rs already pins — zero marginal dependency weight.
 blake2 = "0.10"
 serde_bytes = "0.11"
-# Constant-time credential comparison (LAB-1083). Already in the tree via
-# cachekit-rs' AEAD stack — direct use costs no extra compile.
-subtle = "2.6"
 
 # LAB-3877: Tier 0 request-content guard. Both are pure Rust with no C/C++
 # build dependency (verified via `cargo tree`); `secrets_scanner` is pulled in
@@ -68,6 +65,14 @@ leakguard = { version = "0.9.1", optional = true }
 # without `guard` is unchanged.
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 moka = { version = "0.12", default-features = false, features = ["sync"], optional = true }
+# Client keys, client store documents, restrictions parts and restriction sets
+# are all identified by SHA-256 (docs/client-store.md). cachekit-rs already
+# compiles this version in (through cachekit-core), so the direct dep adds no
+# code.
+sha2 = "0.10.9"
+# The client store install and restrictions logs carry exact bytes as base64.
+# reqwest already compiles this version in, so the direct dep adds no code.
+base64 = "0.22.1"
 
 [features]
 # Off by default: with the feature disabled the guard module and both scanner

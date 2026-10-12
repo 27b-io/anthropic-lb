@@ -13,7 +13,7 @@ use crate::guard::AWS_DOCS_EXAMPLE_SECRET_KEY;
 #[cfg(feature = "guard")]
 pub(super) const TEST_ENDPOINT_TOKEN: &str = "sk-ant-api-guard-test-token";
 
-/// The two non-`block` policies, keyed `annotate-key` and `off-key`. `off` is
+/// The two non-`block` policies, keyed `test_key("annotate-key")` and `test_key("off-key")`. `off` is
 /// not a carbon copy of `annotate`: it returns `Allow` from `Guard::evaluate`'s
 /// own early return without reaching the scanners, while `annotate` reaches
 /// them and finds nothing to scan. Same bytes on the wire by two routes, so
@@ -22,21 +22,21 @@ pub(super) const TEST_ENDPOINT_TOKEN: &str = "sk-ant-api-guard-test-token";
 #[cfg(feature = "guard")]
 fn guard_non_block_clients() -> Vec<ClientConfig> {
     vec![
-        mk_client("annotate", "annotate-key", &[]),
+        mk_client("annotate", &test_key("annotate-key"), &[]),
         ClientConfig {
             guard: crate::guard::GuardPolicy::Off,
-            ..mk_client("off", "off-key", &[])
+            ..mk_client("off", &test_key("off-key"), &[])
         },
     ]
 }
 
 /// A `[[clients]]` entry with the opt-in `block` guard policy, keyed
-/// `block-key`.
+/// `test_key("block-key")`.
 #[cfg(feature = "guard")]
 fn guard_block_client() -> ClientConfig {
     ClientConfig {
         name: "blocked-client".to_string(),
-        key: "block-key".to_string(),
+        key: test_key("block-key"),
         models: vec![],
         preferred_endpoints: vec![],
         guard: crate::guard::GuardPolicy::Block,
@@ -157,14 +157,15 @@ async fn guard_annotate_forwards_byte_identical_and_stamps_header() {
 #[tokio::test]
 async fn guard_block_returns_400_with_offsets_and_skips_upstream() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-block.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-block.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let app = build_router(state);
     let addr = serve(app).await;
 
@@ -179,7 +180,7 @@ async fn guard_block_returns_400_with_offsets_and_skips_upstream() {
     let resp = Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .header("content-type", "application/json")
-        .header("x-api-key", "block-key")
+        .header("x-api-key", test_key("block-key"))
         .json(&request_body)
         .send()
         .await
@@ -219,14 +220,15 @@ async fn guard_block_returns_400_with_offsets_and_skips_upstream() {
 #[tokio::test]
 async fn guard_block_fails_closed_on_oversized_body() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-oversized.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-oversized.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let app = build_router(state);
     let addr = serve(app).await;
 
@@ -245,7 +247,7 @@ async fn guard_block_fails_closed_on_oversized_body() {
     let resp = Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .header("content-type", "application/json")
-        .header("x-api-key", "block-key")
+        .header("x-api-key", test_key("block-key"))
         .json(&request_body)
         .send()
         .await
@@ -273,21 +275,22 @@ async fn guard_block_fails_closed_on_oversized_body() {
 #[tokio::test]
 async fn guard_block_fails_closed_on_unparseable_body() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-unparseable.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-unparseable.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let app = build_router(state);
     let addr = serve(app).await;
 
     let resp = Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .header("content-type", "application/json")
-        .header("x-api-key", "block-key")
+        .header("x-api-key", test_key("block-key"))
         .body("{ this is not valid json ]]")
         .send()
         .await
@@ -312,20 +315,21 @@ async fn guard_block_fails_closed_on_unparseable_body() {
 #[tokio::test]
 async fn guard_block_fails_closed_on_multipart_body() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-multipart.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-multipart.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state)).await;
 
     let resp = Client::new()
         .post(format!("http://{addr}/v1/files"))
         .header("content-type", "multipart/form-data; boundary=x")
-        .header("x-api-key", "block-key")
+        .header("x-api-key", test_key("block-key"))
         .body("--x\r\n\r\nhi\r\n--x--\r\n")
         .send()
         .await
@@ -388,20 +392,21 @@ async fn guard_annotate_forwards_oversized_body() {
 #[tokio::test]
 async fn guard_block_passes_bodiless_get_through() {
     let (upstream, _captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-get.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-get.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let app = build_router(state);
     let addr = serve(app).await;
 
     let resp = Client::new()
         .get(format!("http://{addr}/v1/models"))
-        .header("x-api-key", "block-key")
+        .header("x-api-key", test_key("block-key"))
         .send()
         .await
         .unwrap();
@@ -420,21 +425,22 @@ async fn guard_block_passes_bodiless_get_through() {
 #[tokio::test]
 async fn guard_block_applies_to_openai_chat_completions() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-block.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-block.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let app = build_router(state);
     let addr = serve(app).await;
 
     let resp = Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .header("content-type", "application/json")
-        .header("authorization", "Bearer block-key")
+        .header("authorization", format!("Bearer {}", test_key("block-key")))
         .json(&serde_json::json!({
             "model": "claude-sonnet-4-6",
             "messages": [{"role": "user",
@@ -478,21 +484,22 @@ async fn guard_block_applies_to_openai_chat_completions() {
 #[tokio::test]
 async fn guard_block_fails_closed_on_unmapped_openai_role() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-role.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-role.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let app = build_router(state);
     let addr = serve(app).await;
 
     let resp = Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .header("content-type", "application/json")
-        .header("authorization", "Bearer block-key")
+        .header("authorization", format!("Bearer {}", test_key("block-key")))
         .json(&serde_json::json!({
             "model": "claude-sonnet-4-6",
             "messages": [{"role": "function", "name": "env",
@@ -540,14 +547,15 @@ async fn guard_block_fails_closed_on_non_array_openai_messages() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
     gw.base_url = upstream;
-    let state = Arc::new(AppState {
-        endpoints: vec![gw],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-shape.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![gw],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-shape.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state)).await;
 
     let bodies = [
@@ -576,7 +584,7 @@ async fn guard_block_fails_closed_on_non_array_openai_messages() {
         let resp = Client::new()
             .post(format!("http://{addr}/v1/chat/completions"))
             .header("content-type", "application/json")
-            .header("authorization", "Bearer block-key")
+            .header("authorization", format!("Bearer {}", test_key("block-key")))
             .json(&body)
             .send()
             .await
@@ -619,20 +627,22 @@ async fn guard_non_block_forwards_non_array_openai_messages_byte_identically() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
     gw.base_url = upstream;
-    let state = Arc::new(AppState {
-        endpoints: vec![gw],
-        clients: vec![
-            mk_client("annotate", "annotate-key", &[]),
+    let state = Arc::new(
+        TestPolicy::clients(vec![
+            mk_client("annotate", &test_key("annotate-key"), &[]),
             ClientConfig {
                 guard: crate::guard::GuardPolicy::Off,
-                ..mk_client("off", "off-key", &[])
+                ..mk_client("off", &test_key("off-key"), &[])
             },
-        ],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-shape-shadow.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+        ])
+        .install(AppState {
+            endpoints: vec![gw],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-shape-shadow.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state)).await;
 
     for policy in ["annotate", "off"] {
@@ -642,7 +652,10 @@ async fn guard_non_block_forwards_non_array_openai_messages_byte_identically() {
         let resp = Client::new()
             .post(format!("http://{addr}/v1/chat/completions"))
             .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {policy}-key"))
+            .header(
+                "authorization",
+                format!("Bearer {}", test_key(&format!("{policy}-key"))),
+            )
             .body(raw.clone())
             .send()
             .await
@@ -673,12 +686,11 @@ async fn guard_every_policy_gets_the_non_object_400_on_openai_chat() {
     let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
     let mut clients = guard_non_block_clients();
     clients.push(guard_block_client());
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::clients(clients).install(AppState {
         endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &url)],
-        clients,
         guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
         ..test_state_base()
-    });
+    }));
     let addr = serve(build_router(state)).await;
 
     for key in ["off-key", "annotate-key", "block-key"] {
@@ -686,7 +698,7 @@ async fn guard_every_policy_gets_the_non_object_400_on_openai_chat() {
             let resp = Client::new()
                 .post(format!("http://{addr}/v1/chat/completions"))
                 .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {key}"))
+                .header("authorization", format!("Bearer {}", test_key(key)))
                 .body(raw)
                 .send()
                 .await
@@ -718,14 +730,15 @@ async fn guard_every_policy_gets_the_non_object_400_on_openai_chat() {
 async fn guard_block_fails_closed_on_non_array_native_messages() {
     let secret = AWS_DOCS_EXAMPLE_SECRET_KEY;
     let (upstream, captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-shape.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-shape.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state)).await;
 
     let bodies = [
@@ -750,7 +763,7 @@ async fn guard_block_fails_closed_on_non_array_native_messages() {
         let resp = Client::new()
             .post(format!("http://{addr}/v1/messages"))
             .header("content-type", "application/json")
-            .header("x-api-key", "block-key")
+            .header("x-api-key", test_key("block-key"))
             .json(&body)
             .send()
             .await
@@ -795,14 +808,15 @@ async fn guard_block_fails_closed_on_non_array_native_messages() {
 #[tokio::test]
 async fn guard_block_forwards_fallback_json_body_without_messages() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-no-messages.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-no-messages.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state)).await;
 
     // A non-Messages API shape: valid JSON, no `messages` key, no content.
@@ -810,7 +824,7 @@ async fn guard_block_forwards_fallback_json_body_without_messages() {
     let resp = Client::new()
         .post(format!("http://{addr}/v1/complete"))
         .header("content-type", "application/json")
-        .header("x-api-key", "block-key")
+        .header("x-api-key", test_key("block-key"))
         .body(raw)
         .send()
         .await
@@ -938,8 +952,8 @@ fn in_newest_turn(shape: &str, blocks: serde_json::Value) -> [(String, serde_jso
 /// LAB-5542: content blocks the scanner cannot read, each carrying the secret
 /// where that unreadability would hide it. Two kinds.
 ///
-/// A block type the scanner does not know that carries a text-bearing field
-/// (`text`, `content`, `source`). Skipping those forwarded whatever they held:
+/// A block type the scanner does not know that carries one of
+/// `TEXT_BEARING_FIELDS` in `src/guard.rs`. Skipping those forwarded whatever they held:
 /// `{"type":"x","text":"<secret>"}` scanned as nothing.
 ///
 /// A `document` or `search_result` — types the scanner now reads — in a shape
@@ -968,6 +982,16 @@ fn guard_unreadable_block_shapes(secret: &str) -> Vec<(&'static str, serde_json:
         (
             "unknown-type-content",
             serde_json::json!([{"type": "x", "content": leak}]),
+        ),
+        // LAB-5627: an OpenAI-compatible upstream renders both as text, in any
+        // role, so their own fields are text-bearing too.
+        (
+            "unknown-type-refusal",
+            serde_json::json!([{"type": "refusal", "refusal": leak}]),
+        ),
+        (
+            "unknown-type-thinking",
+            serde_json::json!([{"type": "thinking", "thinking": leak}]),
         ),
         (
             "tool-result-nested",
@@ -1220,6 +1244,20 @@ fn guard_openai_translation_loss_shapes(secret: &str) -> Vec<(&'static str, serd
                  "source": {"type": "text", "media_type": "text/plain", "data": leak}}
             ]}]),
         ),
+        // LAB-5627: the same join drops a `refusal` or `thinking` part's own
+        // field, which an OpenAI-compatible upstream renders as text.
+        (
+            "tool-part-refusal",
+            serde_json::json!([{"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "refusal", "refusal": leak}
+            ]}]),
+        ),
+        (
+            "tool-part-thinking",
+            serde_json::json!([{"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "thinking", "thinking": leak}
+            ]}]),
+        ),
     ]
 }
 
@@ -1235,21 +1273,22 @@ fn guard_openai_translation_loss_shapes(secret: &str) -> Vec<(&'static str, serd
 async fn guard_block_fails_closed_on_unreadable_native_messages() {
     let secret = AWS_DOCS_EXAMPLE_SECRET_KEY;
     let (upstream, captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-unreadable.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-unreadable.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state)).await;
 
     for (shape, messages, reason) in guard_unreadable_message_shapes(secret) {
         let resp = Client::new()
             .post(format!("http://{addr}/v1/messages"))
             .header("content-type", "application/json")
-            .header("x-api-key", "block-key")
+            .header("x-api-key", test_key("block-key"))
             .json(&serde_json::json!({
                 "model": "claude-sonnet-4-6", "max_tokens": 5, "messages": messages
             }))
@@ -1297,14 +1336,15 @@ async fn guard_block_fails_closed_on_unreadable_openai_messages() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
     gw.base_url = upstream;
-    let state = Arc::new(AppState {
-        endpoints: vec![gw],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-unreadable.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![gw],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-unreadable.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state)).await;
 
     let rows = guard_unreadable_message_shapes(secret)
@@ -1326,7 +1366,7 @@ async fn guard_block_fails_closed_on_unreadable_openai_messages() {
         let resp = Client::new()
             .post(format!("http://{addr}/v1/chat/completions"))
             .header("content-type", "application/json")
-            .header("authorization", "Bearer block-key")
+            .header("authorization", format!("Bearer {}", test_key("block-key")))
             .json(&serde_json::json!({
                 "model": "claude-sonnet-4-6", "max_tokens": 5, "messages": messages
             }))
@@ -1369,26 +1409,28 @@ async fn guard_block_fails_closed_on_unreadable_openai_messages() {
 async fn guard_block_scans_document_and_search_result_blocks() {
     let secret = AWS_DOCS_EXAMPLE_SECRET_KEY;
     let (upstream, captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-document-blocks.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-document-blocks.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let native_addr = serve(build_router(state)).await;
 
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
     gw.base_url = upstream;
-    let openai_state = Arc::new(AppState {
-        endpoints: vec![gw],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-document-blocks-openai.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let openai_state = Arc::new(TestPolicy::clients(vec![guard_block_client()]).install(
+        AppState {
+            endpoints: vec![gw],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-document-blocks-openai.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        },
+    ));
     let openai_addr = serve(build_router(openai_state)).await;
 
     let rows = guard_scanned_block_shapes(secret)
@@ -1404,7 +1446,7 @@ async fn guard_block_scans_document_and_search_result_blocks() {
                 native_addr,
                 "/v1/messages",
                 "x-api-key",
-                "block-key",
+                test_key("block-key"),
                 "type",
             ),
             (
@@ -1412,14 +1454,14 @@ async fn guard_block_scans_document_and_search_result_blocks() {
                 openai_addr,
                 "/v1/chat/completions",
                 "authorization",
-                "Bearer block-key",
+                format!("Bearer {}", test_key("block-key")),
                 "code",
             ),
         ] {
             let resp = Client::new()
                 .post(format!("http://{addr}{path}"))
                 .header("content-type", "application/json")
-                .header(header, value)
+                .header(header, &value)
                 .json(&body)
                 .send()
                 .await
@@ -1455,21 +1497,22 @@ async fn guard_block_scans_document_and_search_result_blocks() {
 #[tokio::test]
 async fn guard_block_fails_closed_on_oversized_document_text() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-oversized-document.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-oversized-document.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state)).await;
 
     let data = "x ".repeat(crate::guard::MAX_SCAN_BYTES);
     let resp = Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .header("content-type", "application/json")
-        .header("x-api-key", "block-key")
+        .header("x-api-key", test_key("block-key"))
         .json(&serde_json::json!({
             "model": "claude-sonnet-4-6", "max_tokens": 5,
             "messages": [{"role": "user", "content": [
@@ -1509,24 +1552,30 @@ async fn guard_non_block_forwards_block_rejected_bodies_byte_identically() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
     gw.base_url = upstream.clone();
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: guard_non_block_clients(),
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-native-unreadable-shadow.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(guard_non_block_clients()).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from(
+                "/tmp/anthropic-lb-guard-native-unreadable-shadow.state.json",
+            ),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let native_addr = serve(build_router(state)).await;
 
-    let openai_state = Arc::new(AppState {
-        endpoints: vec![gw],
-        clients: guard_non_block_clients(),
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-openai-unreadable-shadow.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let openai_state = Arc::new(
+        TestPolicy::clients(guard_non_block_clients()).install(AppState {
+            endpoints: vec![gw],
+            state_path: PathBuf::from(
+                "/tmp/anthropic-lb-guard-openai-unreadable-shadow.state.json",
+            ),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let openai_addr = serve(build_router(openai_state)).await;
 
     // LAB-5542 widens what `block` rejects to the OpenAI `tool`-arm losses and
@@ -1558,7 +1607,7 @@ async fn guard_non_block_forwards_block_rejected_bodies_byte_identically() {
                 native_addr,
                 "/v1/messages",
                 "x-api-key",
-                "annotate-key",
+                test_key("annotate-key"),
                 "annotate",
             ),
             (
@@ -1566,7 +1615,7 @@ async fn guard_non_block_forwards_block_rejected_bodies_byte_identically() {
                 native_addr,
                 "/v1/messages",
                 "x-api-key",
-                "off-key",
+                test_key("off-key"),
                 "off",
             ),
             (
@@ -1574,7 +1623,7 @@ async fn guard_non_block_forwards_block_rejected_bodies_byte_identically() {
                 openai_addr,
                 "/v1/chat/completions",
                 "authorization",
-                "Bearer annotate-key",
+                format!("Bearer {}", test_key("annotate-key")),
                 "annotate",
             ),
             (
@@ -1582,7 +1631,7 @@ async fn guard_non_block_forwards_block_rejected_bodies_byte_identically() {
                 openai_addr,
                 "/v1/chat/completions",
                 "authorization",
-                "Bearer off-key",
+                format!("Bearer {}", test_key("off-key")),
                 "off",
             ),
         ] {
@@ -1590,7 +1639,7 @@ async fn guard_non_block_forwards_block_rejected_bodies_byte_identically() {
             let resp = Client::new()
                 .post(format!("http://{addr}{path}"))
                 .header("content-type", "application/json")
-                .header(header, value)
+                .header(header, &value)
                 .body(raw.clone())
                 .send()
                 .await
@@ -1624,26 +1673,28 @@ async fn guard_non_block_forwards_block_rejected_bodies_byte_identically() {
 #[tokio::test]
 async fn guard_block_forwards_coverage_boundary_blocks() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-image-only.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-image-only.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let native_addr = serve(build_router(state)).await;
 
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
     gw.base_url = upstream;
-    let openai_state = Arc::new(AppState {
-        endpoints: vec![gw],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-image-only-openai.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let openai_state = Arc::new(TestPolicy::clients(vec![guard_block_client()]).install(
+        AppState {
+            endpoints: vec![gw],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-image-only-openai.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        },
+    ));
     let openai_addr = serve(build_router(openai_state)).await;
 
     // 1x1 transparent PNG.
@@ -1728,7 +1779,7 @@ async fn guard_block_forwards_coverage_boundary_blocks() {
                 native_addr,
                 "/v1/messages",
                 "x-api-key",
-                "block-key",
+                test_key("block-key"),
                 messages,
             )
         })
@@ -1739,7 +1790,7 @@ async fn guard_block_forwards_coverage_boundary_blocks() {
                 openai_addr,
                 "/v1/chat/completions",
                 "authorization",
-                "Bearer block-key",
+                format!("Bearer {}", test_key("block-key")),
                 messages,
             )
         }));
@@ -1752,7 +1803,7 @@ async fn guard_block_forwards_coverage_boundary_blocks() {
         let resp = Client::new()
             .post(format!("http://{addr}{path}"))
             .header("content-type", "application/json")
-            .header(header, value)
+            .header(header, &value)
             .body(raw.clone())
             .send()
             .await
@@ -1778,26 +1829,28 @@ async fn guard_block_forwards_coverage_boundary_blocks() {
 #[tokio::test]
 async fn guard_block_forwards_conversation_without_user_turn() {
     let (upstream, captured) = spawn_guard_body_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-no-user-turn.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![guard_block_client()]).install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", TEST_ENDPOINT_TOKEN, &upstream)],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-no-user-turn.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        }),
+    );
     let native_addr = serve(build_router(state)).await;
 
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
     gw.base_url = upstream;
-    let openai_state = Arc::new(AppState {
-        endpoints: vec![gw],
-        clients: vec![guard_block_client()],
-        state_path: PathBuf::from("/tmp/anthropic-lb-guard-no-user-turn-openai.state.json"),
-        auto_cache: false,
-        guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
-        ..test_state_base()
-    });
+    let openai_state = Arc::new(TestPolicy::clients(vec![guard_block_client()]).install(
+        AppState {
+            endpoints: vec![gw],
+            state_path: PathBuf::from("/tmp/anthropic-lb-guard-no-user-turn-openai.state.json"),
+            auto_cache: false,
+            guard: crate::guard::Guard::new(&Default::default()).expect("guard rules"),
+            ..test_state_base()
+        },
+    ));
     let openai_addr = serve(build_router(openai_state)).await;
 
     // An assistant prefill, plus (on the OpenAI surface) a `system` message the
@@ -1825,7 +1878,7 @@ async fn guard_block_forwards_conversation_without_user_turn() {
             native_addr,
             "/v1/messages",
             "x-api-key",
-            "block-key",
+            test_key("block-key"),
             &native,
         ),
         (
@@ -1833,7 +1886,7 @@ async fn guard_block_forwards_conversation_without_user_turn() {
             openai_addr,
             "/v1/chat/completions",
             "authorization",
-            "Bearer block-key",
+            format!("Bearer {}", test_key("block-key")),
             &openai,
         ),
     ] {
@@ -1841,7 +1894,7 @@ async fn guard_block_forwards_conversation_without_user_turn() {
         let resp = Client::new()
             .post(format!("http://{addr}{path}"))
             .header("content-type", "application/json")
-            .header(header, value)
+            .header(header, &value)
             .body(raw.clone())
             .send()
             .await
@@ -1876,10 +1929,7 @@ async fn guard_hook_logs_fail_closed_cause_under_every_policy() {
     let buf = log_capture_buf();
     let mut clients = guard_non_block_clients();
     clients.push(guard_block_client());
-    let state = AppState {
-        clients,
-        ..test_state_base()
-    };
+    let state = TestPolicy::clients(clients).install(test_state_base());
     let user_turn = |len: usize| {
         ScanInput::from_body(&serde_json::json!({
             "messages": [{"role": "user", "content": "a".repeat(len)}]
@@ -1908,7 +1958,7 @@ async fn guard_hook_logs_fail_closed_cause_under_every_policy() {
         ] {
             let req_id = format!("lab4358-hook-{label}-{client}");
             let rejected = state
-                .guard_hook(&req_id, client, outcome, false)
+                .guard_hook(&req_id, &state.caller(client), outcome, false)
                 .await
                 .is_err();
             assert_eq!(

@@ -104,18 +104,21 @@ async fn sync_and_publish_handle_endpoint_pool_without_redis() {
 async fn budget_local_fallback_without_redis() {
     let mut budgets = HashMap::new();
     budgets.insert("client-a".to_string(), 100u64);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: budgets,
         ..test_state_base()
-    });
+    }));
 
     // Budget check uses local path when redis is None
-    assert!(state.check_budget("client-a").await.is_ok());
-    state.record_budget_usage("client-a", 80).await;
-    assert!(state.check_budget("client-a").await.is_ok());
-    state.record_budget_usage("client-a", 30).await;
-    assert!(state.check_budget("client-a").await.is_err());
+    assert!(state.check_budget(&state.caller("client-a")).await.is_ok());
+    state
+        .record_budget_usage(&state.caller("client-a"), 80)
+        .await;
+    assert!(state.check_budget(&state.caller("client-a")).await.is_ok());
+    state
+        .record_budget_usage(&state.caller("client-a"), 30)
+        .await;
+    assert!(state.check_budget(&state.caller("client-a")).await.is_err());
 }
 
 #[test]
@@ -218,14 +221,15 @@ async fn hard_limit_unchanged_by_sync_without_redis() {
 async fn record_budget_usage_skips_zero_tokens() {
     let mut budgets = HashMap::new();
     budgets.insert("client-a".to_string(), 100u64);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: budgets,
         ..test_state_base()
-    });
+    }));
 
     // Recording 0 tokens should be a no-op
-    state.record_budget_usage("client-a", 0).await;
+    state
+        .record_budget_usage(&state.caller("client-a"), 0)
+        .await;
     let map = state.budget_usage.lock().unwrap();
     assert!(map.get("client-a").is_none());
 }
@@ -234,7 +238,9 @@ async fn record_budget_usage_skips_zero_tokens() {
 async fn record_budget_usage_skips_unknown_client() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
     // No budgets configured — recording should be a no-op
-    state.record_budget_usage("unknown-client", 500).await;
+    state
+        .record_budget_usage(&state.caller("unknown-client"), 500)
+        .await;
     let map = state.budget_usage.lock().unwrap();
     assert!(map.is_empty());
 }

@@ -435,7 +435,7 @@ async fn stream_passthrough(mock_addr: SocketAddr, req_id: &str) -> String {
         &state,
         &body,
         req_id,
-        "client-1",
+        &state.caller("client-1"),
         &"127.0.0.1".parse().unwrap(),
         "-",
         "-",
@@ -546,7 +546,7 @@ async fn try_fallback_upstream_rotates_on_429() {
         &state,
         &body,
         "req-1",
-        "client-1",
+        &state.caller("client-1"),
         &"127.0.0.1".parse().unwrap(),
         "-",
         "-",
@@ -592,7 +592,7 @@ async fn try_fallback_upstream_rotates_on_500() {
         &state,
         &body,
         "req-1",
-        "client-1",
+        &state.caller("client-1"),
         &"127.0.0.1".parse().unwrap(),
         "-",
         "-",
@@ -633,7 +633,7 @@ async fn try_fallback_upstream_transport_error_is_transient_and_counted() {
         &state,
         &body,
         "req-1",
-        "client-1",
+        &state.caller("client-1"),
         &"127.0.0.1".parse().unwrap(),
         "-",
         "-",
@@ -693,13 +693,12 @@ async fn try_fallback_upstream_records_usage_and_budget() {
     budgets.insert("client-1".to_string(), 100u64);
     let mut ep = make_endpoint("gw", Protocol::OpenAI);
     ep.base_url = format!("http://{}", addr);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![ep],
-        client_budgets: budgets,
         ..test_state_base()
-    });
+    }));
 
-    assert!(state.check_budget("client-1").await.is_ok());
+    assert!(state.check_budget(&state.caller("client-1")).await.is_ok());
 
     let body =
         bytes::Bytes::from_static(br#"{"model":"claude-opus-4-7","messages":[],"max_tokens":1}"#);
@@ -707,7 +706,7 @@ async fn try_fallback_upstream_records_usage_and_budget() {
         &state,
         &body,
         "req-1",
-        "client-1",
+        &state.caller("client-1"),
         &"127.0.0.1".parse().unwrap(),
         "-",
         "-",
@@ -734,7 +733,7 @@ async fn try_fallback_upstream_records_usage_and_budget() {
         assert_eq!(map.get("client-1").unwrap().1, 110);
     }
     assert!(
-        state.check_budget("client-1").await.is_err(),
+        state.check_budget(&state.caller("client-1")).await.is_err(),
         "pre_request_gate budget check must see OpenAI-endpoint spend"
     );
 }
@@ -1018,7 +1017,7 @@ async fn fallback_upstream_error_log_escapes_newline_in_body() {
         &state,
         &body,
         "req-lab5729",
-        "client-1",
+        &state.caller("client-1"),
         &"127.0.0.1".parse().unwrap(),
         "-",
         "-",

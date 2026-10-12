@@ -83,7 +83,7 @@ pub(crate) struct Config {
     /// reading it. This splits the read bit out.
     ///
     /// Only meaningful under `[[clients]]`, where identity is credential-derived:
-    /// `validate_clients` rejects the key on the legacy path rather than let it
+    /// `ClientPolicy::build` rejects the key on the legacy path rather than let it
     /// pretend to scope a shared secret it cannot scope.
     #[serde(default)]
     pub(crate) admin_readers: Vec<String>,
@@ -127,6 +127,10 @@ pub(crate) struct Config {
     /// Opt-in encrypted response cache on `/v1/messages` (LAB-933).
     /// Absent, or present with an empty `clients` list = feature entirely inert.
     pub(crate) response_cache: Option<ResponseCacheConfig>,
+    /// The client store this instance reads ordinary clients from
+    /// (docs/client-store.md). Requires `[[clients]]` authentication: the
+    /// operators and admin readers stay in this file.
+    pub(crate) client_store: Option<ClientStoreConfig>,
     /// Reflect upstream `anthropic-ratelimit-*` response headers to callers.
     /// They reveal the pooled capacity of every account behind the proxy, so
     /// this is trusted-network-only. Default: false (LAB-1191).
@@ -160,8 +164,9 @@ pub(crate) struct ClientConfig {
     /// `[response_cache].clients` must name.
     pub(crate) name: String,
     /// Shared secret this client presents as `x-api-key` (or, on the
-    /// OpenAI-compat surface, `Authorization: Bearer`). Compared in constant
-    /// time against the whole table.
+    /// OpenAI-compat surface, `Authorization: Bearer`). Read only by
+    /// `ClientPolicy::build`, which keeps its digest (`key_digest`) and nothing
+    /// else.
     pub(crate) key: String,
     /// Models this client may request. Empty = all models, mirroring
     /// `EndpointConfig.models` semantics. Same exact + `*`-suffix matcher.
@@ -199,6 +204,26 @@ impl std::fmt::Debug for ClientConfig {
         #[cfg(feature = "guard")]
         ds.field("guard", &self.guard);
         ds.finish()
+    }
+}
+
+/// `[client_store]`: where to poll, and the token to poll with.
+#[derive(Deserialize, Clone)]
+pub(crate) struct ClientStoreConfig {
+    /// The store's poll URL: `https://`, or `http://` only over a channel that
+    /// never leaves the instance's own platform.
+    pub(crate) poll_url: String,
+    /// Sent as `Authorization: Bearer` on every poll, for a store that
+    /// requires one. Only ever over `https://`.
+    pub(crate) token: Option<String>,
+}
+
+impl std::fmt::Debug for ClientStoreConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientStoreConfig")
+            .field("poll_url", &self.poll_url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
     }
 }
 

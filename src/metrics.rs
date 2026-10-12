@@ -72,7 +72,7 @@ const TOKEN_TYPES: [&str; 4] = ["input", "output", "cache_creation", "cache_read
 /// (MAX_CLIENT_MODEL_LABELS).
 fn prom_client_model_family(
     buf: &mut String,
-    state: &AppState,
+    policy: &ClientPolicy,
     name: &str,
     help: &str,
     usage: &[((String, String), [u64; 4])],
@@ -80,7 +80,7 @@ fn prom_client_model_family(
     prom_header(buf, name, "counter", help);
     let mut op_model_tokens: HashMap<&str, [u64; 4]> = HashMap::new();
     for ((client, mdl), tokens) in usage {
-        if state.is_operator(client) {
+        if policy.is_operator(client) {
             let e = op_model_tokens.entry(mdl.as_str()).or_insert([0; 4]);
             for i in 0..4 {
                 e[i] += tokens[i];
@@ -242,6 +242,33 @@ struct ClaimMetricsSnap {
     waste_risk: f64,
     reset: Option<u64>,
     status: Option<String>,
+}
+
+/// Account-level waste risk: the most urgent 7d claim, counting only quota the
+/// account can still spend. The Fable band is a carve-out of the general weekly
+/// pool, so it is bounded by the pool's waste risk, as `compute_routing_weight`
+/// bounds it. A live pool that is spent or rejected reads 0, since no claim can
+/// draw on it. A missing pool, or one with no reset data, bounds nothing: a 0.0
+/// from missing data must not erase the band's urgency.
+fn account_waste_risk(claims: &[ClaimMetricsSnap], now_epoch: u64) -> f64 {
+    let pool = claims
+        .iter()
+        .find(|c| c.key == "seven_day")
+        .filter(|c| c.reset.is_none_or(|r| r > now_epoch));
+    let spent = |p: &ClaimMetricsSnap| {
+        p.utilization.is_some_and(|u| u >= 1.0) || p.status.as_deref() == Some("rejected")
+    };
+    if pool.is_some_and(spent) {
+        return 0.0;
+    }
+    let pool_wr = pool.map_or(0.0, |p| p.waste_risk);
+    claims
+        .iter()
+        .map(|c| match c.key.as_str() {
+            FABLE_BAND_CLAIM if pool_wr > 0.0 => c.waste_risk.min(pool_wr),
+            _ => c.waste_risk,
+        })
+        .fold(0.0, f64::max)
 }
 
 #[allow(dead_code)]
@@ -522,10 +549,14 @@ pub(crate) async fn metrics_handler(
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     // AC-4: operator principal required, same gate as /_stats — per-account
-    // utilisation and budget gauges are pool reconnaissance.
-    if let Some(resp) = state.authorize_admin(&client_ip, client_addr, req.headers(), "metrics") {
-        return *resp;
-    }
+    // utilisation and budget gauges are pool reconnaissance. Every per-client
+    // series below reads the policy snapshot this authorized against, except
+    // the cluster figures, which the sync pass computes from its own snapshot
+    // and caches: they follow a policy change on its next pass.
+    let policy = match state.authorize_admin(&client_ip, client_addr, req.headers(), "metrics") {
+        Ok(policy) => policy,
+        Err(resp) => return *resp,
+    };
 
     let now_epoch = AppState::now_epoch();
     let today = now_epoch / 86400;
@@ -1018,22 +1049,24 @@ pub(crate) async fn metrics_handler(
         );
     }
 
-    // Account-level waste risk (max across 7d claims).
+    // Account-level waste risk (max across 7d claims, each bounded by the
+    // weekly pool it draws from; see `account_waste_risk`).
     // Note: refresh_metrics_weights uses a 3-tier claim selection
     // (representative → seven_day → max) for routing_weight/share.
     // This metric intentionally shows the max to surface the worst-case
     // claim regardless of which one the router currently selects.
+    // `anthropic_claim_waste_risk` keeps each claim's raw, unbounded score.
     prom_header(
         &mut buf,
         "anthropic_account_waste_risk",
         "gauge",
-        "Max waste risk across 7d claims (worst-case urgency signal)",
+        "Max waste risk across 7d claims, each bounded by the weekly pool it draws from; 0 when that pool is spent or rejected",
     );
     for s in &snaps {
         if s.passthrough || s.claims.is_empty() {
             continue;
         }
-        let wr = s.claims.iter().map(|c| c.waste_risk).fold(0.0f64, f64::max);
+        let wr = account_waste_risk(&s.claims, now_epoch);
         prom_gauge(
             &mut buf,
             "anthropic_account_waste_risk",
@@ -1216,7 +1249,7 @@ pub(crate) async fn metrics_handler(
     if total_rpm > 0.0 {
         let mut operator_rpm = 0.0f64;
         for (client, (_, rpm)) in &client_rates {
-            if state.is_operator(client) {
+            if policy.is_operator(client) {
                 operator_rpm += rpm;
             } else {
                 prom_gauge(
@@ -1246,7 +1279,7 @@ pub(crate) async fn metrics_handler(
     let mut all_clients: std::collections::HashSet<&String> = client_usage.keys().collect();
     all_clients.extend(client_rates.keys());
     for client in &all_clients {
-        if state.is_operator(client) {
+        if policy.is_operator(client) {
             let t = client_usage.get(*client).copied().unwrap_or([0; 4]);
             for i in 0..4 {
                 op_tokens[i] += t[i];
@@ -1266,7 +1299,7 @@ pub(crate) async fn metrics_handler(
     );
     let mut emitted_operator_token = false;
     for client in &all_clients {
-        if state.is_operator(client) {
+        if policy.is_operator(client) {
             if !emitted_operator_token {
                 for (i, t) in TOKEN_TYPES.iter().enumerate() {
                     prom_counter(
@@ -1296,7 +1329,7 @@ pub(crate) async fn metrics_handler(
     // adds the model dimension so per-model pricing can be applied downstream.
     prom_client_model_family(
         &mut buf,
-        &state,
+        &policy,
         "anthropic_client_model_token_usage_total",
         "Per-client token usage by model and type",
         &client_model_usage,
@@ -1307,7 +1340,7 @@ pub(crate) async fn metrics_handler(
     // spend panels price it with the same `(model, type)` join.
     prom_client_model_family(
         &mut buf,
-        &state,
+        &policy,
         "anthropic_overage_token_usage_total",
         "Per-client token usage served on paid extra usage, by model and type",
         &overage_usage,
@@ -1321,7 +1354,7 @@ pub(crate) async fn metrics_handler(
     );
     let mut emitted_operator_req = false;
     for client in &all_clients {
-        if state.is_operator(client) {
+        if policy.is_operator(client) {
             if !emitted_operator_req {
                 prom_counter(
                     &mut buf,
@@ -1350,7 +1383,7 @@ pub(crate) async fn metrics_handler(
     );
     let mut emitted_operator_rpm = false;
     for client in &all_clients {
-        if state.is_operator(client) {
+        if policy.is_operator(client) {
             if !emitted_operator_rpm {
                 prom_gauge(
                     &mut buf,
@@ -1372,14 +1405,14 @@ pub(crate) async fn metrics_handler(
     }
 
     // Client budgets
-    if !state.client_budgets.is_empty() {
+    if !policy.client_budgets.is_empty() {
         prom_header(
             &mut buf,
             "anthropic_client_budget_limit",
             "gauge",
             "Configured daily token limit",
         );
-        for (client, &limit) in &state.client_budgets {
+        for (client, &limit) in &policy.client_budgets {
             prom_gauge(
                 &mut buf,
                 "anthropic_client_budget_limit",
@@ -1393,7 +1426,7 @@ pub(crate) async fn metrics_handler(
             "gauge",
             "Tokens used today",
         );
-        for client in state.client_budgets.keys() {
+        for client in policy.client_budgets.keys() {
             let used = budget_usage
                 .get(client)
                 .filter(|(day, _)| *day == today)
@@ -1412,7 +1445,7 @@ pub(crate) async fn metrics_handler(
             "gauge",
             "Tokens remaining today",
         );
-        for (client, &limit) in &state.client_budgets {
+        for (client, &limit) in &policy.client_budgets {
             let used = budget_usage
                 .get(client)
                 .filter(|(day, _)| *day == today)
@@ -2020,6 +2053,10 @@ pub(crate) async fn metrics_handler(
         }
     }
 
+    if let Some(store) = &state.client_store {
+        append_client_store_metrics(&mut buf, &store.metrics());
+    }
+
     (
         StatusCode::OK,
         [(
@@ -2029,6 +2066,194 @@ pub(crate) async fn metrics_handler(
         buf,
     )
         .into_response()
+}
+
+/// Unmatched disabled names exported as labels, at most: the count carries
+/// the rest, so the series stay bounded however many there are.
+const MAX_UNMATCHED_DISABLED_LABELS: usize = 5;
+
+/// The client store reader's series (docs/client-store.md). Versions and
+/// digests are labels, never values: a version has 13 digits or more, past
+/// what a float sample keeps exactly.
+fn append_client_store_metrics(buf: &mut String, m: &ClientStoreMetrics) {
+    let gauge = |buf: &mut String, name: &str, help: &str, value: f64| {
+        prom_header(buf, name, "gauge", help);
+        prom_gauge(buf, name, &[], value);
+    };
+    let counter = |buf: &mut String, name: &str, help: &str, value: u64| {
+        prom_header(buf, name, "counter", help);
+        prom_counter(buf, name, &[], value);
+    };
+    let flag = |b: bool| if b { 1.0 } else { 0.0 };
+
+    prom_header(
+        buf,
+        "anthropic_client_store_document",
+        "gauge",
+        "The client store document held, always 1: its version and digest are labels; absent while none is held",
+    );
+    if let Some((version, digest)) = &m.document {
+        let version = version.to_string();
+        prom_gauge(
+            buf,
+            "anthropic_client_store_document",
+            &[("version", &version), ("digest", digest)],
+            1.0,
+        );
+    }
+    prom_header(
+        buf,
+        "anthropic_client_store_restrictions",
+        "gauge",
+        "The restrictions held, always 1: records_version is the highest record version held, as a poll reports it",
+    );
+    let records_version = m.records_version.to_string();
+    prom_gauge(
+        buf,
+        "anthropic_client_store_restrictions",
+        &[("records_version", &records_version)],
+        1.0,
+    );
+    gauge(
+        buf,
+        "anthropic_client_store_restrictions_complete",
+        "1 once a full restrictions part has been merged; until then no ordinary client is served",
+        flag(m.complete),
+    );
+    gauge(
+        buf,
+        "anthropic_client_store_loaded",
+        "1 while a complete set of restrictions and a document are held: /_ready answers 200",
+        flag(m.loaded),
+    );
+    prom_header(
+        buf,
+        "anthropic_client_store_part_full",
+        "gauge",
+        "1 if the last restrictions part merged was full, 0 if partial; absent before the first",
+    );
+    if let Some(full) = m.part_full {
+        prom_gauge(buf, "anthropic_client_store_part_full", &[], flag(full));
+    }
+    gauge(
+        buf,
+        "anthropic_client_store_enabled_ahead",
+        "Enabled records the store left out of its last part for being ahead of its clock",
+        m.enabled_ahead as f64,
+    );
+    prom_header(
+        buf,
+        "anthropic_client_store_alert",
+        "gauge",
+        "1 while the named client store alert is raised",
+    );
+    for (alert, raised) in &m.alerts {
+        prom_gauge(
+            buf,
+            "anthropic_client_store_alert",
+            &[("alert", alert)],
+            flag(*raised),
+        );
+    }
+    gauge(
+        buf,
+        "anthropic_client_store_unmatched_disabled",
+        "Disabled names that match no client this instance knows",
+        m.unmatched_disabled.len() as f64,
+    );
+    prom_header(
+        buf,
+        "anthropic_client_store_unmatched_disabled_name",
+        "gauge",
+        "Up to 5 disabled names that match no client this instance knows, always 1",
+    );
+    for name in m
+        .unmatched_disabled
+        .iter()
+        .take(MAX_UNMATCHED_DISABLED_LABELS)
+    {
+        prom_gauge(
+            buf,
+            "anthropic_client_store_unmatched_disabled_name",
+            &[("name", name)],
+            1.0,
+        );
+    }
+    gauge(
+        buf,
+        "anthropic_client_store_quarantined_clients",
+        "Store clients quarantined on this instance: every key of each name is refused",
+        m.quarantined as f64,
+    );
+    gauge(
+        buf,
+        "anthropic_client_store_revoked_outside_store",
+        "Revoked digests that match a config-file key, which a store cannot revoke: ignored",
+        m.revoked_outside_store as f64,
+    );
+    prom_header(
+        buf,
+        "anthropic_client_store_last_ok_timestamp_seconds",
+        "gauge",
+        "When each poll answer part last arrived and passed its checks; 0 before the first",
+    );
+    for (part, secs) in [
+        ("document", m.document_ok_secs),
+        ("restrictions", m.restrictions_ok_secs),
+    ] {
+        prom_gauge(
+            buf,
+            "anthropic_client_store_last_ok_timestamp_seconds",
+            &[("part", part)],
+            secs as f64,
+        );
+    }
+    counter(
+        buf,
+        "anthropic_client_store_documents_installed_total",
+        "Documents installed from the store",
+        m.documents_installed,
+    );
+    counter(
+        buf,
+        "anthropic_client_store_restrictions_changes_total",
+        "Changes to the restrictions held",
+        m.restrictions_changes,
+    );
+    counter(
+        buf,
+        "anthropic_client_store_documents_refused_ahead_total",
+        "Documents refused for being more than 15 minutes ahead of this instance's clock",
+        m.documents_refused_ahead,
+    );
+    prom_header(
+        buf,
+        "anthropic_client_store_toml_client",
+        "gauge",
+        "Each ordinary client in this instance's config file, always 1",
+    );
+    for client in &m.file_clients {
+        prom_gauge(
+            buf,
+            "anthropic_client_store_toml_client",
+            &[("client", client)],
+            1.0,
+        );
+    }
+    prom_header(
+        buf,
+        "anthropic_client_store_refusals_total",
+        "counter",
+        "Credentials the client store turned away, by reason (disabled/quarantined/unloaded)",
+    );
+    for (reason, n) in &m.refusals {
+        prom_counter(
+            buf,
+            "anthropic_client_store_refusals_total",
+            &[("reason", reason)],
+            *n,
+        );
+    }
 }
 
 #[cfg(test)]

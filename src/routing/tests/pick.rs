@@ -487,6 +487,157 @@ async fn mark_hard_limited_retry_after_overrides_default() {
     );
 }
 
+/// LAB-8497: a capacity 429 as an account with no overage path sends it.
+/// `extra` overrides or adds headers on top of the weekly-spent shape.
+fn spent_429(
+    retry_after: &str,
+    extra: &[(&'static str, &'static str)],
+) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("retry-after", HeaderValue::from_str(retry_after).unwrap());
+    for (name, value) in [
+        ("anthropic-ratelimit-unified-status", "rejected"),
+        (
+            "anthropic-ratelimit-unified-representative-claim",
+            "seven_day",
+        ),
+        ("anthropic-ratelimit-unified-5h-status", "allowed"),
+        ("anthropic-ratelimit-unified-7d-status", "rejected"),
+        ("anthropic-ratelimit-unified-7d-utilization", "1.0"),
+        ("anthropic-ratelimit-unified-overage-status", "rejected"),
+        (
+            "anthropic-ratelimit-unified-overage-disabled-reason",
+            "member_zero_credit_limit",
+        ),
+    ]
+    .iter()
+    .chain(extra)
+    {
+        headers.insert(*name, HeaderValue::from_static(value));
+    }
+    headers
+}
+
+async fn cooldown_secs_after(headers: &reqwest::header::HeaderMap) -> u64 {
+    let state = test_state_with(vec![mk_endpoint("spent", "sk-ant-api-a")]);
+    state.mark_hard_limited(0, headers).await;
+    let info = state.endpoints[0].rate_info.read().await;
+    let until = info.hard_limited_until.unwrap();
+    // Round up: a few microseconds pass between marking and reading.
+    until.duration_since(Instant::now()).as_secs() + 1
+}
+
+/// Move endpoint `idx` to the moment just after its hard limit lapsed: the
+/// 429's data (`last_updated`) still predates the expiry, as it does live.
+async fn lapse_hard_limit(state: &AppState, idx: usize) {
+    let mut info = state.endpoints[idx].rate_info.write().await;
+    info.last_updated = Some(Instant::now() - Duration::from_secs(2));
+    info.hard_limited_until = Some(Instant::now() - Duration::from_secs(1));
+}
+
+/// LAB-8497: a spent weekly window with no overage path cools for
+/// `WEEKLY_SPENT_COOLDOWN`, not the default, whatever the days-long
+/// `retry-after` says.
+#[tokio::test]
+async fn weekly_spent_no_overage_cools_fifteen_minutes() {
+    assert_eq!(cooldown_secs_after(&spent_429("258810", &[])).await, 900);
+}
+
+/// LAB-8497: a `retry-after` shorter than the cap wins — the window resets
+/// sooner than the cap would re-check it.
+#[tokio::test]
+async fn weekly_spent_no_overage_honours_shorter_retry_after() {
+    assert_eq!(cooldown_secs_after(&spent_429("120", &[])).await, 120);
+}
+
+/// LAB-8497: a `retry-after` too large for a `Duration` must not panic the
+/// request; the cap bounds it before conversion.
+#[tokio::test]
+async fn weekly_spent_no_overage_bounds_huge_retry_after() {
+    assert_eq!(cooldown_secs_after(&spent_429("1e300", &[])).await, 900);
+}
+
+/// LAB-8497: without the zero-credit reason the account may still pay for
+/// overage, so a weekly `retry-after` keeps today's default cooldown.
+#[tokio::test]
+async fn weekly_spent_with_overage_path_keeps_default_cooldown() {
+    let mut headers = spent_429("258810", &[]);
+    headers.remove("anthropic-ratelimit-unified-overage-disabled-reason");
+    assert_eq!(cooldown_secs_after(&headers).await, 60);
+}
+
+/// LAB-8497: a spent 5h window on the same account carries the same
+/// overage pair but `7d-status: allowed`; it keeps its own `retry-after`.
+#[tokio::test]
+async fn five_hour_refusal_keeps_its_retry_after() {
+    let headers = spent_429(
+        "955",
+        &[
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "five_hour",
+            ),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+        ],
+    );
+    assert_eq!(cooldown_secs_after(&headers).await, 955);
+}
+
+/// LAB-8497: a spent Fable band (`7d_oi`) with the general week still open
+/// keeps the default cooldown. That the band skips Fable only is covered by
+/// `fable_band_rejected_skips_for_fable_only`.
+#[tokio::test]
+async fn fable_band_refusal_keeps_default_cooldown() {
+    let headers = spent_429(
+        "258810",
+        &[
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.6"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.0"),
+        ],
+    );
+    assert_eq!(cooldown_secs_after(&headers).await, 60);
+}
+
+/// LAB-8497: a spent per-family weekly claim limits that family only, so it
+/// must not lock the account for every model; it keeps the default.
+#[tokio::test]
+async fn per_family_weekly_refusal_keeps_default_cooldown() {
+    let headers = spent_429(
+        "258810",
+        &[(
+            "anthropic-ratelimit-unified-representative-claim",
+            "seven_day_sonnet",
+        )],
+    );
+    assert_eq!(cooldown_secs_after(&headers).await, 60);
+}
+
+/// LAB-8497: the lock lapses on its own, and the account routes again so
+/// the next request or probe re-checks it — the recovery path after an
+/// early reset or extra usage switched on mid-week.
+#[tokio::test]
+async fn weekly_spent_lock_lapses_and_account_routes_again() {
+    let headers = spent_429("258810", &[]);
+    let state = test_state_with(vec![mk_endpoint("spent", "sk-ant-api-a")]);
+    state.update_rate_info(0, &headers).await;
+    state.mark_hard_limited(0, &headers).await;
+    assert_eq!(
+        state.pick_endpoint(None, "claude-opus-4-6", &[]).await,
+        None,
+        "locked account must not route"
+    );
+
+    lapse_hard_limit(&state, 0).await;
+    assert_eq!(
+        state.pick_endpoint(None, "claude-opus-4-6", &[]).await,
+        Some(0),
+        "a lapsed lock must let the account be re-checked"
+    );
+}
+
 #[tokio::test]
 async fn pick_does_not_bias_unknown_accounts() {
     // Unknown accounts get headroom=0.5, known account with 0.1 util gets headroom=0.9

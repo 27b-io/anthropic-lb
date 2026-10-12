@@ -764,14 +764,14 @@ impl FastRequest {
 /// Remove every top-level entry named in `fields` — `ANTHROPIC_FALLBACK_FIELDS`
 /// or `OPENAI_FALLBACK_FIELDS`, the fields with which a body asks the upstream
 /// to serve ANOTHER model. Both `models` gates — the client's
-/// (`client_allows_model`) and the endpoint's (`Endpoint::serves_model`) —
+/// (`Caller::allows_model`) and the endpoint's (`Endpoint::serves_model`) —
 /// read only the top-level `model`, so a restricted attempt
-/// (`AppState::attempt_restricts_models`) loses these fields.
+/// (`Caller::attempt_restricts_models`) loses these fields.
 ///
 /// Every entry of a listed key goes, so a duplicate key cannot keep one
 /// alive. Returns `None` — body untouched — when there is none, or when the
 /// body is not a JSON object: a restricted CLIENT never gets here with one
-/// (`client_allows_model` fails closed on an unreadable model), and an
+/// (`Caller::allows_model` fails closed on an unreadable model), and an
 /// endpoint gate already routes an unreadable body unnarrowed.
 pub(crate) fn strip_top_level_fields(body: &bytes::Bytes, fields: &[&str]) -> Option<bytes::Bytes> {
     let parsed: TopLevelObject = serde_json::from_slice(body).ok()?;
