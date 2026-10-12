@@ -804,13 +804,6 @@ async fn main() {
     // Seed metric weights from restored state so gauges aren't zero on cold start.
     state.refresh_metrics_weights().await;
 
-    // Resume what a restart kept, then poll: the listener opens after the
-    // first answered poll, or after FIRST_POLL_WAIT without one.
-    if let Some(store) = &state.client_store {
-        store.resume(&state).await;
-    }
-    let first_poll = ClientStore::spawn(&state);
-
     let app = build_router(state.clone());
 
     let addr: SocketAddr = config
@@ -825,8 +818,9 @@ async fn main() {
         "anthropic-lb starting"
     );
 
-    await_first_poll(first_poll).await;
-    let listener = tokio::net::TcpListener::bind(addr)
+    // With a client store, the listener opens after the first answered poll,
+    // or after FIRST_POLL_WAIT without one.
+    let listener = bind_after_first_poll(&state, addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
 

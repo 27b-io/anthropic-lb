@@ -21,7 +21,7 @@ fn state_of(reader: &Reader, name: &str) -> Option<(RecordState, u64)> {
 }
 
 fn alert(reader: &Reader, name: &str) -> bool {
-    alerts(reader, &StoreReport::default())
+    alerts(reader, &StoreReport::default(), false)
         .into_iter()
         .find(|(alert, _)| *alert == name)
         .unwrap_or_else(|| panic!("no alert {name}"))

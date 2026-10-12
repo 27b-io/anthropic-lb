@@ -614,7 +614,7 @@ impl RestrictionSet {
 
 /// What a reader holds, and what its polls found. Each poll is built by
 /// `query` and its answer applied by `apply`, both at the reader's clock.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Reader {
     /// The installed document.
     pub(crate) document: Option<Arc<Document>>,
@@ -857,6 +857,12 @@ impl Reader {
             .unwrap_or_default()
     }
 
+    /// Whether the instance is loaded: it holds a document and a complete set
+    /// of restrictions.
+    pub(crate) fn loaded(&self) -> bool {
+        self.set.complete && self.document.is_some()
+    }
+
     /// The last merged part, when one has been.
     pub(crate) fn last_part(&self) -> Option<&PartBody> {
         self.last_part.as_ref().map(|(_, part)| part)
@@ -907,11 +913,14 @@ pub(crate) struct ClientStore {
     /// The config file's ordinary clients, exported one series each so the
     /// operator can see which clients are still to move into the store.
     file_clients: Vec<String>,
+    /// What is held. Only `resume`, before polling starts, and the one poll
+    /// loop write it, so `apply` can build the next reader on a copy without
+    /// losing a write.
     reader: Mutex<Reader>,
     /// What the last policy built had to say (`ClientPolicy::with_store`).
     report: Mutex<StoreReport>,
-    /// Credentials refused by the store's gate, by `StoreRefusal`.
-    refusals: [AtomicU64; 3],
+    /// Credentials refused by the store's gate, indexed by `StoreRefusal`.
+    refusals: [AtomicU64; StoreRefusal::ALL.len()],
     /// Turns true at the first answered poll.
     answered: tokio::sync::watch::Sender<bool>,
     /// Polls failed in a row.
@@ -948,14 +957,12 @@ pub(crate) struct ClientStoreMetrics {
     pub(crate) refusals: Vec<(&'static str, u64)>,
 }
 
-/// What one answer changed, to log and to save once the reader is released.
+/// What one answer changed, to log once the reader is released.
 struct Changed {
     /// The document it installed.
     document: Option<Arc<Document>>,
     /// The set, when it changed.
     set: Option<RestrictionSet>,
-    /// The resume copy, when anything changed.
-    resume: Option<Resume>,
 }
 
 /// The copy a restart resumes from: the document text and the set held.
@@ -982,7 +989,12 @@ fn now_us() -> u64 {
 }
 
 /// The alerts a reader raises, by the `alert` label each is exported under.
-fn alerts(reader: &Reader, report: &StoreReport) -> Vec<(&'static str, bool)> {
+/// `resume_unsaved` is whether the last save of the resume copy failed.
+fn alerts(
+    reader: &Reader,
+    report: &StoreReport,
+    resume_unsaved: bool,
+) -> Vec<(&'static str, bool)> {
     let part = reader.last_part();
     vec![
         ("store_behind", reader.status.store_behind),
@@ -990,6 +1002,7 @@ fn alerts(reader: &Reader, report: &StoreReport) -> Vec<(&'static str, bool)> {
         ("clock_skew", reader.clock_skew()),
         ("restrictions_behind", !reader.behind().is_empty()),
         ("restrictions_partial", part.is_some_and(|p| !p.full)),
+        ("enabled_ahead", part.is_some_and(|p| p.enabled_ahead > 0)),
         ("document_refused", reader.status.document_fault.is_some()),
         (
             "restrictions_refused",
@@ -999,6 +1012,9 @@ fn alerts(reader: &Reader, report: &StoreReport) -> Vec<(&'static str, bool)> {
             "privileged_name",
             !report.privileged_clients.is_empty() || !report.privileged_disabled.is_empty(),
         ),
+        ("quarantined", !report.quarantined.is_empty()),
+        ("revoked_outside_store", report.revoked_outside_store > 0),
+        ("resume_unsaved", resume_unsaved),
     ]
 }
 
@@ -1133,7 +1149,7 @@ impl ClientStore {
 
     /// Start polling, for the life of the process. The receiver turns true at
     /// the first answered poll.
-    pub(crate) fn spawn(state: &Arc<AppState>) -> Option<tokio::sync::watch::Receiver<bool>> {
+    fn spawn(state: &Arc<AppState>) -> Option<tokio::sync::watch::Receiver<bool>> {
         let store = state.client_store.clone()?;
         let answered = store.answered.subscribe();
         let state = state.clone();
@@ -1185,7 +1201,7 @@ impl ClientStore {
     pub(crate) async fn poll(&self, state: &AppState) -> bool {
         let query = self.lock_reader().query(now_us());
         let changed = match self.fetch(&query).await {
-            Ok(answer) => self.apply(state, &answer, now_us()),
+            Ok(answer) => self.apply(state, &answer, now_us()).await,
             Err(e) => Err(e),
         };
         let changed = match changed {
@@ -1197,6 +1213,7 @@ impl ClientStore {
                 if failures == 1 || failures.is_multiple_of(FAILURE_LOG_EVERY) {
                     warn!(error = %e, failures, "client store: poll failed; keeping what is held");
                 }
+                self.save_if_owed().await;
                 return false;
             }
         };
@@ -1210,31 +1227,57 @@ impl ClientStore {
         if let Some(set) = &changed.set {
             log_restrictions(set, "change");
         }
-        self.save(changed.resume).await;
         true
     }
 
-    /// Apply one answer at the reader's clock `now_us`, and install what it
-    /// changed. `Err` when the answer could not be read at all.
-    fn apply(&self, state: &AppState, answer: &[u8], now_us: u64) -> Result<Changed, String> {
-        let mut reader = self.lock_reader();
-        let before = alerts(&reader, &self.lock_report());
-        let applied = reader
+    /// Apply one answer at the reader's clock `now_us`. What it changes is
+    /// built on a copy of the reader, saved to the resume copy, and only then
+    /// installed. So no restriction is enforced, or reported held, before it
+    /// is saved: a crash at any point leaves a resume copy that holds every
+    /// restriction this instance enforced, or no copy at all. The one
+    /// exception, a copy that can be neither written nor removed, is logged
+    /// as an error. A save that
+    /// hangs holds this answer back, and the polls after it, until the disk
+    /// answers; what is held stays enforced meanwhile, and each part's last
+    /// good arrival stops advancing. `Err` when the answer could not be read
+    /// at all.
+    async fn apply(&self, state: &AppState, answer: &[u8], now_us: u64) -> Result<Changed, String> {
+        let (mut next, before) = {
+            let reader = self.lock_reader();
+            (reader.clone(), self.current_alerts(&reader))
+        };
+        let applied = next
             .apply(answer, now_us)
             .map_err(|fault| format!("unreadable answer ({fault})"))?;
         let changed = applied.document_installed || applied.set_changed;
         if changed {
+            self.write_resume(&resume_copy(&next)).await;
+        } else {
+            self.save_if_owed().await;
+        }
+        let mut reader = self.lock_reader();
+        *reader = next;
+        if changed {
             self.publish(state, &reader);
         }
-        log_alert_changes(&reader, &before, &alerts(&reader, &self.lock_report()));
+        log_alert_changes(&reader, &before, &self.current_alerts(&reader));
         Ok(Changed {
             document: reader
                 .document
                 .clone()
                 .filter(|_| applied.document_installed),
             set: applied.set_changed.then(|| reader.set.clone()),
-            resume: changed.then(|| resume_copy(&reader)),
         })
+    }
+
+    /// The alerts this instance raises from what `reader` holds.
+    fn current_alerts(&self, reader: &Reader) -> Vec<(&'static str, bool)> {
+        alerts(reader, &self.lock_report(), self.resume_unsaved())
+    }
+
+    /// Whether the last save of the resume copy failed.
+    fn resume_unsaved(&self) -> bool {
+        self.resume_failures.load(Ordering::Relaxed) > 0
     }
 
     /// GET the poll URL with `query`, and read at most `MAX_ANSWER_BYTES`.
@@ -1282,29 +1325,28 @@ impl ClientStore {
         }
     }
 
-    /// Save the resume copy when an answer changed what is held, and again
-    /// after a save that failed, until one lands.
-    async fn save(&self, changed: Option<Resume>) {
-        let resume = match changed {
-            Some(resume) => resume,
-            None if self.resume_failures.load(Ordering::Relaxed) > 0 => {
-                resume_copy(&self.lock_reader())
-            }
-            None => return,
-        };
-        self.write_resume(&resume).await;
+    /// Save what is held again after a save that failed: it is owed until one
+    /// lands, whether or not the store answers meanwhile.
+    async fn save_if_owed(&self) {
+        if self.resume_unsaved() {
+            let copy = resume_copy(&self.lock_reader());
+            self.write_resume(&copy).await;
+        }
     }
 
     /// Write the resume copy to a sibling, sync it, rename it over the last
     /// copy and sync the directory, so a crash leaves the old copy or the new
     /// one, never a torn one. When the write fails the last copy is removed:
-    /// it is older than what is held, and resuming it after a restart could
-    /// lift a restriction the store has since lost. A restart then waits for
-    /// the store, and the next poll writes again.
+    /// what is about to be enforced is not in it, and resuming it after a
+    /// restart could lift a restriction the store has since lost. A restart
+    /// then waits for the store, and every poll writes again until one lands.
     async fn write_resume(&self, resume: &Resume) {
         let json = serde_json::to_vec(resume).map_err(std::io::Error::other);
         let path = self.resume_path.clone();
-        let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        // `Err((write, removal))`: why the write failed, and why removing the
+        // last copy then failed too, if it did.
+        type Failed = (std::io::Error, Option<std::io::Error>);
+        let written = tokio::task::spawn_blocking(move || -> Result<(), Failed> {
             let write = || -> std::io::Result<()> {
                 use std::io::Write;
                 let json = json?;
@@ -1320,33 +1362,42 @@ impl ClientStore {
                 Ok(())
             };
             write().map_err(|e| match std::fs::remove_file(&path) {
-                Ok(()) => e,
-                Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => e,
-                Err(rm) => std::io::Error::other(format!(
-                    "{e}; the last copy could not be removed either: {rm}"
-                )),
+                Ok(()) => (e, None),
+                Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => (e, None),
+                Err(rm) => (e, Some(rm)),
             })
         })
         .await
-        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
-        match written {
+        .unwrap_or_else(|e| Err((std::io::Error::other(e), None)));
+        let (e, removal) = match written {
             Ok(()) => {
                 let failures = self.resume_failures.swap(0, Ordering::Relaxed);
                 if failures > 0 {
                     info!(failures, "client store: resume copy written again");
                 }
+                return;
             }
-            Err(e) => {
-                let failures = self.resume_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                if failures == 1 || failures.is_multiple_of(FAILURE_LOG_EVERY) {
-                    warn!(
-                        path = %self.resume_path.display(),
-                        error = %e,
-                        failures,
-                        "client store: cannot write the resume copy; the last copy is removed, and the next poll tries again"
-                    );
-                }
-            }
+            Err(failed) => failed,
+        };
+        let failures = self.resume_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures != 1 && !failures.is_multiple_of(FAILURE_LOG_EVERY) {
+            return;
+        }
+        let path = self.resume_path.display();
+        match removal {
+            None => warn!(
+                path = %path,
+                error = %e,
+                failures,
+                "client store: cannot write the resume copy; the last copy is removed, so a restart waits for the store, and every poll tries again"
+            ),
+            Some(rm) => error!(
+                path = %path,
+                error = %e,
+                removal_error = %rm,
+                failures,
+                "client store: cannot write the resume copy or remove the last one; a restart now could resume restrictions older than those enforced; every poll tries again"
+            ),
         }
     }
 
@@ -1362,10 +1413,10 @@ impl ClientStore {
                 .map(|d| (d.version, digest_hex(&d.digest))),
             records_version: reader.set.records_version(now_us()),
             complete: reader.set.complete,
-            loaded: reader.set.complete && reader.document.is_some(),
+            loaded: reader.loaded(),
             part_full: part.map(|p| p.full),
             enabled_ahead: part.map_or(0, |p| p.enabled_ahead),
-            alerts: alerts(&reader, &report),
+            alerts: alerts(&reader, &report, self.resume_unsaved()),
             unmatched_disabled: report.unmatched_disabled.clone(),
             quarantined: report.quarantined.len(),
             revoked_outside_store: report.revoked_outside_store,
@@ -1388,9 +1439,23 @@ impl ClientStore {
     }
 }
 
-/// Wait for the first answered poll, at most `FIRST_POLL_WAIT`: the listener
-/// opens after it, so a request that wakes the instance meets a loaded one.
-pub(crate) async fn await_first_poll(answered: Option<tokio::sync::watch::Receiver<bool>>) {
+/// Boot the reader, then open the listener on `addr`: resume what a restart
+/// kept, start polling, and bind only after the first answered poll, or after
+/// `FIRST_POLL_WAIT` without one, so a request that wakes the instance meets
+/// a loaded one. Without a client store it binds at once.
+pub(crate) async fn bind_after_first_poll(
+    state: &Arc<AppState>,
+    addr: SocketAddr,
+) -> std::io::Result<tokio::net::TcpListener> {
+    if let Some(store) = &state.client_store {
+        store.resume(state).await;
+    }
+    await_first_poll(ClientStore::spawn(state)).await;
+    tokio::net::TcpListener::bind(addr).await
+}
+
+/// Wait for the first answered poll, at most `FIRST_POLL_WAIT`.
+async fn await_first_poll(answered: Option<tokio::sync::watch::Receiver<bool>>) {
     let Some(mut answered) = answered else {
         return;
     };
@@ -1538,6 +1603,10 @@ fn log_alert_changes(
                         )
                     }
                     "clock_skew" => format!("records skipped: {:?}", reader.skipped_ahead),
+                    "enabled_ahead" => format!(
+                        "{} enabled record(s) left out by the store",
+                        reader.last_part().map_or(0, |p| p.enabled_ahead)
+                    ),
                     "document_refused" => {
                         reader.status.document_fault.unwrap_or_default().to_string()
                     }

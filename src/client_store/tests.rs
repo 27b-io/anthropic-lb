@@ -231,20 +231,13 @@ impl Instance {
         )
     }
 
-    /// Apply `answer` at the system clock, as a poll does.
-    fn answer(&self, answer: Vec<u8>) {
+    /// Apply `answer` at the system clock, as a poll does: what it changes
+    /// is saved to the resume copy, then installed.
+    async fn answer(&self, answer: Vec<u8>) {
         self.store
             .apply(&self.state, &answer, now_us())
+            .await
             .expect("readable answer");
-    }
-
-    /// Apply `answer` and save the resume copy, as a poll does.
-    async fn answer_and_save(&self, answer: Vec<u8>) {
-        let changed = self
-            .store
-            .apply(&self.state, &answer, now_us())
-            .expect("readable answer");
-        self.store.save(changed.resume).await;
     }
 
     /// How authenticating `key` turns out: the principal's name, or the

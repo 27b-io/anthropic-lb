@@ -70,12 +70,15 @@ async fn mock_store_poll(
     axum::Json(json!({"document": document, "restrictions": restrictions})).into_response()
 }
 
+/// A local address nothing listens on.
+async fn free_addr() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap()
+}
+
 /// A URL nothing listens on.
 async fn closed_poll_url() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    format!("http://{addr}/_clients/poll")
+    format!("http://{}/_clients/poll", free_addr().await)
 }
 
 // ── The poll ─────────────────────────────────────────────────────────
@@ -165,7 +168,7 @@ async fn a_poll_answered_with_an_error_status_keeps_what_is_held() {
 #[tokio::test]
 async fn the_listener_waits_for_the_first_answered_poll() {
     let store = MockStore {
-        delay: Duration::from_millis(400),
+        delay: Duration::from_secs(1),
         ..Default::default()
     };
     store.hold(
@@ -174,15 +177,26 @@ async fn the_listener_waits_for_the_first_answered_poll() {
     );
     let url = store.serve().await;
     let inst = Instance::new("http://127.0.0.1:9", file_clients(&[]), &url, None);
+    let addr = free_addr().await;
     let started = Instant::now();
-    await_first_poll(ClientStore::spawn(&inst.state)).await;
+    let state = inst.state.clone();
+    let booting = tokio::spawn(async move { bind_after_first_poll(&state, addr).await });
+
+    // Nothing listens while the first poll is unanswered.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        tokio::net::TcpStream::connect(addr).await.is_err(),
+        "the listener opened before the first answered poll"
+    );
+    let _listener = booting.await.unwrap().unwrap();
     let waited = started.elapsed();
-    assert!(waited >= Duration::from_millis(400), "waited {waited:?}");
+    assert!(waited >= Duration::from_secs(1), "waited {waited:?}");
     assert!(waited < FIRST_POLL_WAIT, "waited {waited:?}");
     assert!(
         inst.metrics().loaded,
         "the request that woke it meets a loaded instance"
     );
+    assert!(tokio::net::TcpStream::connect(addr).await.is_ok());
 }
 
 #[tokio::test]
@@ -195,7 +209,9 @@ async fn the_listener_opens_after_3_seconds_with_the_store_down() {
         None,
     );
     let started = Instant::now();
-    await_first_poll(ClientStore::spawn(&inst.state)).await;
+    let _listener = bind_after_first_poll(&inst.state, free_addr().await)
+        .await
+        .unwrap();
     let waited = started.elapsed();
     assert!(waited >= FIRST_POLL_WAIT, "waited {waited:?}");
     assert!(
@@ -210,8 +226,11 @@ async fn the_listener_opens_after_3_seconds_with_the_store_down() {
 
 #[tokio::test]
 async fn without_a_client_store_the_listener_does_not_wait() {
+    let state = Arc::new(test_state_base());
     let started = Instant::now();
-    await_first_poll(None).await;
+    let _listener = bind_after_first_poll(&state, free_addr().await)
+        .await
+        .unwrap();
     assert!(started.elapsed() < Duration::from_millis(100));
 }
 
@@ -233,7 +252,7 @@ async fn every_change_writes_the_resume_copy_with_its_completeness_mark() {
         vec![client("acme", &test_key("acme"))],
         &[digest(2)],
     );
-    inst.answer_and_save(answer(
+    inst.answer(answer(
         doc_part(&doc),
         restrictions_part(&body(false, &[("a", Disabled, now_us() - 1)], &[digest(1)])),
     ))
@@ -248,7 +267,7 @@ async fn every_change_writes_the_resume_copy_with_its_completeness_mark() {
         json!([digest_hex(&digest(1)), digest_hex(&digest(2))])
     );
 
-    inst.answer_and_save(answer(
+    inst.answer(answer(
         doc_part_held(&doc),
         restrictions_part(&body(true, &[], &[])),
     ))
@@ -286,7 +305,7 @@ async fn a_resume_restores_what_was_held_and_is_loaded_only_with_a_complete_set(
     // Before the restart: a document and a partial set.
     let before = Instance::in_dir("http://127.0.0.1:9", clients(), poll_url, None, dir.path());
     before
-        .answer_and_save(answer(doc_part(&doc), restrictions_part(&partial)))
+        .answer(answer(doc_part(&doc), restrictions_part(&partial)))
         .await;
     drop(before);
 
@@ -307,7 +326,7 @@ async fn a_resume_restores_what_was_held_and_is_loaded_only_with_a_complete_set(
 
     // A complete set saved: the restart is loaded at once.
     after
-        .answer_and_save(answer(
+        .answer(answer(
             doc_part_held(&doc),
             restrictions_part(&body(
                 true,
@@ -331,6 +350,139 @@ async fn a_resume_restores_what_was_held_and_is_loaded_only_with_a_complete_set(
     assert_eq!(again.auth(&test_key("beta-2")), Ok("beta".to_string()));
 }
 
+/// A restriction is enforced only once it is saved. While a poll's save of a
+/// new disable is held up, the instance keeps enforcing exactly what its copy
+/// on disk holds, so a crash at that moment loses nothing it enforced.
+/// Enforcing first would leave a window in which a restart resumes the older
+/// copy and serves the disabled name again.
+///
+/// The save is held up by making its sibling a FIFO: opening a FIFO to write
+/// blocks until a reader opens it. Linux only, where syncing a FIFO fails, so
+/// the released save fails and removes the copy.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_restriction_is_enforced_only_once_it_is_saved() {
+    /// Releases the save the FIFO holds up when dropped, so it always
+    /// finishes: the runtime waits for every blocking thread when it shuts
+    /// down, and a failed assertion would otherwise hang the test instead of
+    /// failing it. Opening the FIFO to read and write, which never blocks on
+    /// Linux, releases a save already waiting on it; unlinking it means a
+    /// save that comes later writes a plain file.
+    struct Release(std::path::PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _open = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.0);
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    use std::io::Read;
+    let store = MockStore::default();
+    store.hold(None, Some(body(true, &[], &[])));
+    let url = store.serve().await;
+    let inst = Instance::new(
+        "http://127.0.0.1:9",
+        file_clients(&["file-only"]),
+        &url,
+        None,
+    );
+    let dir = inst._dir.as_ref().unwrap().path().to_path_buf();
+    let path = dir.join("config.client-store.json");
+    assert!(inst.store.poll(&inst.state).await, "the store answered");
+    assert_eq!(
+        inst.auth(&test_key("file-only")),
+        Ok("file-only".to_string())
+    );
+    let saved = std::fs::read(&path).unwrap();
+
+    let fifo = dir.join("config.client-store.json.tmp");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo failed");
+    let _release = Release(fifo.clone());
+    store.hold(
+        None,
+        Some(body(true, &[("file-only", Disabled, now_us() - 1)], &[])),
+    );
+    let (state, reader) = (inst.state.clone(), inst.store.clone());
+    let polling = tokio::spawn(async move { reader.poll(&state).await });
+
+    // The save is held: the disable is neither enforced nor reported held,
+    // and the copy on disk is exactly what is enforced.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!polling.is_finished(), "the save is held up");
+    assert_eq!(
+        inst.auth(&test_key("file-only")),
+        Ok("file-only".to_string()),
+        "enforced before it was saved"
+    );
+    assert!(
+        inst.store.lock_reader().set.records.is_empty(),
+        "reported held before it was saved"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), saved);
+
+    // Released, the save writes a copy that holds the disable, then fails (a
+    // FIFO cannot be synced) and removes the old copy. Only then is the
+    // disable enforced, so a restart now waits for the store instead of
+    // resuming a copy without it.
+    let mut drained = Vec::new();
+    std::fs::File::open(&fifo)
+        .unwrap()
+        .read_to_end(&mut drained)
+        .unwrap();
+    let copy: Value = serde_json::from_slice(&drained).expect("the save wrote a copy");
+    assert_eq!(copy["records"][0]["name"], "file-only");
+    assert_eq!(copy["records"][0]["state"], "disabled");
+    assert!(polling.await.unwrap(), "the store answered");
+    assert_eq!(inst.auth(&test_key("file-only")), Err(403));
+    assert!(!path.exists(), "the copy that lacks the disable is gone");
+}
+
+/// A save that failed is owed until one lands, and is retried even while
+/// the store is away, so the copy catches up with what is enforced as soon
+/// as the disk allows.
+#[tokio::test]
+async fn a_failed_save_is_retried_while_the_store_is_away() {
+    let url = closed_poll_url().await;
+    let inst = Instance::new(
+        "http://127.0.0.1:9",
+        file_clients(&["file-only"]),
+        &url,
+        None,
+    );
+    let dir = inst._dir.as_ref().unwrap().path().to_path_buf();
+    let path = dir.join("config.client-store.json");
+    let blocker = dir.join("config.client-store.json.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    inst.answer(answer(
+        unavailable(),
+        restrictions_part(&body(true, &[("file-only", Disabled, now_us() - 1)], &[])),
+    ))
+    .await;
+    assert!(!path.exists());
+    assert!(inst.alert("resume_unsaved"));
+
+    std::fs::remove_dir(&blocker).unwrap();
+    assert!(!inst.store.poll(&inst.state).await, "the store is away");
+    assert!(path.exists(), "the owed save landed");
+    assert!(!inst.alert("resume_unsaved"));
+    let restarted = Instance::in_dir(
+        "http://127.0.0.1:9",
+        file_clients(&["file-only"]),
+        &url,
+        None,
+        &dir,
+    );
+    restarted.store.resume(&restarted.state).await;
+    assert_eq!(restarted.auth(&test_key("file-only")), Err(403));
+}
+
 /// A save that fails removes the last copy, so a restart in between waits
 /// for the store instead of resuming a copy that lacks what was held. The
 /// next poll saves again, change or not.
@@ -341,7 +493,7 @@ async fn a_failed_save_removes_the_stale_copy_and_is_retried() {
     let poll_url = "https://store.invalid/_clients/poll";
     let clients = || file_clients(&["file-only"]);
     let inst = Instance::in_dir("http://127.0.0.1:9", clients(), poll_url, None, dir.path());
-    inst.answer_and_save(answer(
+    inst.answer(answer(
         unavailable(),
         restrictions_part(&body(true, &[], &[])),
     ))
@@ -352,8 +504,7 @@ async fn a_failed_save_removes_the_stale_copy_and_is_retried() {
     let blocker = dir.path().join("config.client-store.json.tmp");
     std::fs::create_dir(&blocker).unwrap();
     let disabled = restrictions_part(&body(true, &[("file-only", Disabled, now_us() - 1)], &[]));
-    inst.answer_and_save(answer(unavailable(), disabled.clone()))
-        .await;
+    inst.answer(answer(unavailable(), disabled.clone())).await;
     assert_eq!(
         inst.auth(&test_key("file-only")),
         Err(403),
@@ -367,7 +518,7 @@ async fn a_failed_save_removes_the_stale_copy_and_is_retried() {
 
     // The path frees up: the next poll saves, though nothing changed.
     std::fs::remove_dir(&blocker).unwrap();
-    inst.answer_and_save(answer(unavailable(), disabled)).await;
+    inst.answer(answer(unavailable(), disabled)).await;
     assert!(path.exists());
     let restarted = Instance::in_dir("http://127.0.0.1:9", clients(), poll_url, None, dir.path());
     restarted.store.resume(&restarted.state).await;
@@ -618,7 +769,8 @@ async fn the_metrics_export_what_is_held_and_every_alert() {
             &records,
             &[key_digest(&test_key("ops"))],
         )),
-    ));
+    ))
+    .await;
     let addr = serve(build_router(inst.state.clone())).await;
     let metrics = Client::new()
         .get(format!("http://{addr}/metrics"))
@@ -702,17 +854,21 @@ async fn the_metrics_export_what_is_held_and_every_alert() {
             Some("1")
         );
     }
-    // Every alert is exported, raised or not.
-    assert_eq!(count_series(&metrics, "anthropic_client_store_alert"), 8);
-    assert_eq!(
+    // Every alert is exported, raised or not: a store that left records out
+    // as ahead, and a revoked digest it cannot revoke, each raise one.
+    assert_eq!(count_series(&metrics, "anthropic_client_store_alert"), 12);
+    let alert = |name: &str| {
         series(
             &metrics,
             "anthropic_client_store_alert",
-            "alert=\"restrictions_behind\""
+            &format!("alert=\"{name}\""),
         )
-        .as_deref(),
-        Some("0")
-    );
+    };
+    assert_eq!(alert("enabled_ahead").as_deref(), Some("1"));
+    assert_eq!(alert("revoked_outside_store").as_deref(), Some("1"));
+    assert_eq!(alert("quarantined").as_deref(), Some("0"));
+    assert_eq!(alert("resume_unsaved").as_deref(), Some("0"));
+    assert_eq!(alert("restrictions_behind").as_deref(), Some("0"));
     assert_eq!(
         series(
             &metrics,

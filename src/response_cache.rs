@@ -469,8 +469,9 @@ pub(crate) enum AuthRejection {
 }
 
 impl AuthRejection {
-    /// The response to answer with. Boxed, matching `reserve_request_body`:
-    /// an inline `Response` is 128+ bytes on the hot success path
+    /// The response to answer with. Boxed, so `authenticate_throttled`'s
+    /// `Result` stays small on its hot success path, matching
+    /// `reserve_request_body`: an inline `Response` is 128+ bytes
     /// (clippy::result_large_err).
     pub(crate) fn into_response(self) -> Box<Response> {
         Box::new(match self {
@@ -795,7 +796,7 @@ impl AppState {
                     reason = refusal.as_str(),
                     "refused by the client store"
                 );
-                Err(Box::new(refusal.response()))
+                Err(AuthRejection::Refused(refusal).into_response())
             }
             Err(unauthorized @ AuthRejection::Unauthorized) => {
                 let unauthorized = unauthorized.into_response();

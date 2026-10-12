@@ -60,7 +60,7 @@ async fn an_instance_holding_no_restrictions_serves_no_ordinary_client_file_keys
 async fn an_instance_with_a_document_but_no_restrictions_stays_unloaded() {
     let inst = Instance::offline(&["file-only"]);
     let doc = document(wall_ms(), vec![client("acme", &test_key("acme"))], &[]);
-    inst.answer(answer(doc_part(&doc), unavailable()));
+    inst.answer(answer(doc_part(&doc), unavailable())).await;
     assert!(inst.metrics().document.is_some(), "the document is held");
     assert!(!inst.metrics().loaded);
     assert_eq!(inst.auth(&test_key("acme")), Err(503));
@@ -68,7 +68,8 @@ async fn an_instance_with_a_document_but_no_restrictions_stays_unloaded() {
     assert_eq!(inst.auth(&test_key("ops")), ok("ops"));
 
     // The restrictions arrive: loaded.
-    inst.answer(answer(doc_part_held(&doc), full(&[], &[])));
+    inst.answer(answer(doc_part_held(&doc), full(&[], &[])))
+        .await;
     assert!(inst.metrics().loaded);
     assert_eq!(inst.auth(&test_key("acme")), ok("acme"));
     assert_eq!(inst.auth(&test_key("file-only")), ok("file-only"));
@@ -81,7 +82,8 @@ async fn a_disabled_name_refuses_store_and_file_keys_on_a_loaded_and_an_unloaded
     // Unloaded, holding a complete set and no document: the file's clients
     // are served under the restrictions.
     let inst = Instance::offline(&["file-only", "both", "other"]);
-    inst.answer(answer(unavailable(), full(&["file-only", "both"], &[])));
+    inst.answer(answer(unavailable(), full(&["file-only", "both"], &[])))
+        .await;
     assert!(!inst.metrics().loaded);
     assert_eq!(inst.auth(&test_key("file-only")), Err(403));
     assert_eq!(inst.auth(&test_key("both")), Err(403));
@@ -97,7 +99,8 @@ async fn a_disabled_name_refuses_store_and_file_keys_on_a_loaded_and_an_unloaded
     inst.answer(answer(
         unavailable(),
         restrictions_part(&body(false, &[("file-only", Disabled, just_now())], &[])),
-    ));
+    ))
+    .await;
     assert_eq!(inst.auth(&test_key("file-only")), Err(403));
     assert_eq!(inst.auth(&test_key("other")), Err(503));
 
@@ -111,7 +114,8 @@ async fn a_disabled_name_refuses_store_and_file_keys_on_a_loaded_and_an_unloaded
         ],
         &[],
     );
-    inst.answer(answer(doc_part(&doc), full(&["acme", "both"], &[])));
+    inst.answer(answer(doc_part(&doc), full(&["acme", "both"], &[])))
+        .await;
     assert!(inst.metrics().loaded);
     assert_eq!(inst.auth(&test_key("acme")), Err(403));
     assert_eq!(inst.auth(&test_key("both-store")), Err(403));
@@ -124,7 +128,8 @@ async fn a_disabled_name_refuses_store_and_file_keys_on_a_loaded_and_an_unloaded
         &[("acme", Disabled, just_now()), ("both", Enabled, now_us())],
         &[],
     );
-    inst.answer(answer(doc_part_held(&doc), restrictions_part(&enabled)));
+    inst.answer(answer(doc_part_held(&doc), restrictions_part(&enabled)))
+        .await;
     assert_eq!(inst.auth(&test_key("both-store")), ok("both"));
     assert_eq!(inst.auth(&test_key("both")), ok("both"));
     assert_eq!(inst.auth(&test_key("acme")), Err(403));
@@ -133,7 +138,8 @@ async fn a_disabled_name_refuses_store_and_file_keys_on_a_loaded_and_an_unloaded
 #[tokio::test]
 async fn a_disabled_record_naming_a_privileged_principal_refuses_nothing() {
     let inst = Instance::offline(&[]);
-    inst.answer(answer(unavailable(), full(&["ops", "viewer"], &[])));
+    inst.answer(answer(unavailable(), full(&["ops", "viewer"], &[])))
+        .await;
     assert_eq!(inst.auth(&test_key("ops")), ok("ops"));
     assert_eq!(inst.auth(&test_key("viewer")), ok("viewer"));
     assert!(inst.alert("privileged_name"));
@@ -157,7 +163,7 @@ async fn a_quarantined_client_refuses_every_key_of_its_name() {
         ],
         &[],
     );
-    inst.answer(answer(doc_part(&doc), full(&[], &[])));
+    inst.answer(answer(doc_part(&doc), full(&[], &[]))).await;
     assert_eq!(inst.auth(&test_key("both-store")), Err(403));
     assert_eq!(
         inst.auth(&test_key("both")),
@@ -176,6 +182,7 @@ async fn a_quarantined_client_refuses_every_key_of_its_name() {
         .unwrap_err();
     assert_eq!(error_message(rejection).await, "client_quarantined");
     assert_eq!(inst.metrics().quarantined, 1);
+    assert!(inst.alert("quarantined"));
     assert_eq!(
         inst.store.lock_report().quarantined,
         vec![("both".to_string(), "client.daily_budget")]
@@ -211,7 +218,7 @@ async fn a_name_in_the_file_and_the_store_is_one_client_under_the_store_policy()
         )],
         &[],
     );
-    inst.answer(answer(doc_part(&doc), full(&[], &[])));
+    inst.answer(answer(doc_part(&doc), full(&[], &[]))).await;
     // Both key sets authenticate as the one client.
     assert_eq!(inst.auth(&test_key("both")), ok("both"));
     assert_eq!(inst.auth(&test_key("both-store")), ok("both"));
@@ -250,7 +257,7 @@ async fn a_name_in_the_file_and_the_store_keeps_the_file_guard_policy() {
         ],
         &[],
     );
-    inst.answer(answer(doc_part(&doc), full(&[], &[])));
+    inst.answer(answer(doc_part(&doc), full(&[], &[]))).await;
     assert_eq!(
         inst.state.caller("both").guard_policy(),
         crate::guard::GuardPolicy::Block
@@ -276,7 +283,8 @@ async fn a_revoked_digest_refuses_its_store_key_only() {
     inst.answer(answer(
         doc_part(&doc),
         full(&[], &[key_digest(&test_key("acme-1"))]),
-    ));
+    ))
+    .await;
     assert_eq!(inst.auth(&test_key("acme-1")), Err(401));
     assert_eq!(inst.auth(&test_key("acme-2")), ok("acme"));
 }
@@ -293,7 +301,8 @@ async fn a_revoked_digest_outside_the_store_is_ignored_with_an_alert() {
                 key_digest(&test_key("ops")),
             ],
         ),
-    ));
+    ))
+    .await;
     assert_eq!(inst.auth(&test_key("file-only")), ok("file-only"));
     assert_eq!(inst.auth(&test_key("ops")), ok("ops"));
     assert_eq!(inst.metrics().revoked_outside_store, 2);
@@ -310,7 +319,7 @@ async fn a_store_client_named_for_a_privileged_principal_is_ignored() {
         ],
         &[],
     );
-    inst.answer(answer(doc_part(&doc), full(&[], &[])));
+    inst.answer(answer(doc_part(&doc), full(&[], &[]))).await;
     assert_eq!(
         inst.auth(&test_key("store-ops")),
         Err(401),
@@ -349,7 +358,7 @@ async fn a_store_key_that_is_a_config_file_key_quarantines_the_store_client() {
         ],
         &[],
     );
-    inst.answer(answer(doc_part(&doc), full(&[], &[])));
+    inst.answer(answer(doc_part(&doc), full(&[], &[]))).await;
     assert_eq!(inst.auth(&test_key("file-only")), ok("file-only"));
     assert_eq!(inst.auth(&test_key("acme-2")), Err(403));
     assert_eq!(inst.auth(&test_key("same")), Err(403));
@@ -375,7 +384,7 @@ async fn a_pin_to_an_endpoint_this_instance_lacks_is_dropped() {
         )],
         &[],
     );
-    inst.answer(answer(doc_part(&doc), full(&[], &[])));
+    inst.answer(answer(doc_part(&doc), full(&[], &[]))).await;
     assert_eq!(
         inst.state.caller("acme").preferred_endpoints(),
         Some(&["acct-a".to_string()][..])
@@ -406,7 +415,8 @@ async fn store_refusals_never_count_as_failed_credentials() {
             .unwrap_err();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
-    inst.answer(answer(unavailable(), full(&["file-only"], &[])));
+    inst.answer(answer(unavailable(), full(&["file-only"], &[])))
+        .await;
     for _ in 0..(DEFAULT_AUTH_FAILURE_LIMIT * 2) {
         let resp = inst
             .state
@@ -459,7 +469,8 @@ async fn the_gate_and_ready_on_the_wire() {
     assert_eq!(ready().await.unwrap().status(), 503);
 
     let doc = document(wall_ms(), vec![client("acme", &test_key("acme"))], &[]);
-    inst.answer(answer(doc_part(&doc), full(&["file-only"], &[])));
+    inst.answer(answer(doc_part(&doc), full(&["file-only"], &[])))
+        .await;
     assert_eq!(ready().await.unwrap().status(), 200);
     let resp = send(test_key("file-only")).await.unwrap();
     assert_eq!(resp.status(), 403);
