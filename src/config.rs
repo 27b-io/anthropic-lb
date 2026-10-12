@@ -127,6 +127,10 @@ pub(crate) struct Config {
     /// Opt-in encrypted response cache on `/v1/messages` (LAB-933).
     /// Absent, or present with an empty `clients` list = feature entirely inert.
     pub(crate) response_cache: Option<ResponseCacheConfig>,
+    /// The client store this instance reads ordinary clients from
+    /// (docs/client-store.md). Requires `[[clients]]` authentication: the
+    /// operators and admin readers stay in this file.
+    pub(crate) client_store: Option<ClientStoreConfig>,
     /// Reflect upstream `anthropic-ratelimit-*` response headers to callers.
     /// They reveal the pooled capacity of every account behind the proxy, so
     /// this is trusted-network-only. Default: false (LAB-1191).
@@ -200,6 +204,26 @@ impl std::fmt::Debug for ClientConfig {
         #[cfg(feature = "guard")]
         ds.field("guard", &self.guard);
         ds.finish()
+    }
+}
+
+/// `[client_store]`: where to poll, and the token to poll with.
+#[derive(Deserialize, Clone)]
+pub(crate) struct ClientStoreConfig {
+    /// The store's poll URL: `https://`, or `http://` only over a channel that
+    /// never leaves the instance's own platform.
+    pub(crate) poll_url: String,
+    /// Sent as `Authorization: Bearer` on every poll, for a store that
+    /// requires one. Only ever over `https://`.
+    pub(crate) token: Option<String>,
+}
+
+impl std::fmt::Debug for ClientStoreConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientStoreConfig")
+            .field("poll_url", &self.poll_url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
     }
 }
 

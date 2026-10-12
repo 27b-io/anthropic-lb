@@ -1074,7 +1074,8 @@ async fn authenticate_401_returns_json_envelope() {
     let headers = hdrs(&[("x-api-key", &test_key("wrong-key"))]);
     let err = state
         .authenticate(&headers, false)
-        .expect_err("bad key must 401");
+        .expect_err("bad key must 401")
+        .into_response();
     assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
     let json = parse_error_envelope(err).await;
     assert_eq!(json["type"], "error");

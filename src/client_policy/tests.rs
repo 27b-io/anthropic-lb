@@ -470,22 +470,21 @@ fn build_maps_each_key_digest_to_its_principal_and_role() {
     assert_eq!(policy.admin_readers, vec!["viewer".to_string()]);
 }
 
-/// The digest is BLAKE2s-256 over its own purpose tag, so it shares nothing
-/// with the fingerprint a rejected credential is logged under.
+/// The digest is the SHA-256 of the key's text, the digest a client store
+/// keeps for the keys it mints (the corpus's `key_digests` cases check that
+/// side), and it shares nothing with the fingerprint a rejected credential is
+/// logged under.
 #[test]
-fn key_digest_is_tagged_and_unrelated_to_the_logged_fingerprint() {
-    use blake2::{Blake2s256, Digest};
+fn key_digest_is_the_sha256_of_the_key_and_unrelated_to_the_logged_fingerprint() {
+    // FIPS 180-2, appendix B.1.
+    assert_eq!(
+        digest_hex(&key_digest("abc")),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
     let key = test_key("geo");
-    let mut h = Blake2s256::new();
-    h.update(b"anthropic-lb/client-key\x1f");
-    h.update(key.as_bytes());
-    let expected: [u8; 32] = h.finalize().into();
-    assert_eq!(key_digest(&key), expected);
-
-    let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
     assert_ne!(
         credential_fingerprint(Some(key.as_bytes())),
-        hex(&key_digest(&key)[..6]),
+        digest_hex(&key_digest(&key))[..12],
         "a logged fingerprint must not be a prefix of the stored digest"
     );
 }

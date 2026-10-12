@@ -207,6 +207,7 @@ pub(crate) fn test_state_base() -> AppState {
         unsupported_models: Mutex::new(HashMap::new()),
         fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache: None,
+        client_store: None,
     }
 }
 

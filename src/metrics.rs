@@ -2024,6 +2024,10 @@ pub(crate) async fn metrics_handler(
         }
     }
 
+    if let Some(store) = &state.client_store {
+        append_client_store_metrics(&mut buf, &store.metrics());
+    }
+
     (
         StatusCode::OK,
         [(
@@ -2033,6 +2037,194 @@ pub(crate) async fn metrics_handler(
         buf,
     )
         .into_response()
+}
+
+/// Unmatched disabled names exported as labels, at most: the count carries
+/// the rest, so the series stay bounded however many there are.
+const MAX_UNMATCHED_DISABLED_LABELS: usize = 5;
+
+/// The client store reader's series (docs/client-store.md). Versions and
+/// digests are labels, never values: a version has 13 digits or more, past
+/// what a float sample keeps exactly.
+fn append_client_store_metrics(buf: &mut String, m: &ClientStoreMetrics) {
+    let gauge = |buf: &mut String, name: &str, help: &str, value: f64| {
+        prom_header(buf, name, "gauge", help);
+        prom_gauge(buf, name, &[], value);
+    };
+    let counter = |buf: &mut String, name: &str, help: &str, value: u64| {
+        prom_header(buf, name, "counter", help);
+        prom_counter(buf, name, &[], value);
+    };
+    let flag = |b: bool| if b { 1.0 } else { 0.0 };
+
+    prom_header(
+        buf,
+        "anthropic_client_store_document",
+        "gauge",
+        "The client store document held, always 1: its version and digest are labels; absent while none is held",
+    );
+    if let Some((version, digest)) = &m.document {
+        let version = version.to_string();
+        prom_gauge(
+            buf,
+            "anthropic_client_store_document",
+            &[("version", &version), ("digest", digest)],
+            1.0,
+        );
+    }
+    prom_header(
+        buf,
+        "anthropic_client_store_restrictions",
+        "gauge",
+        "The restrictions held, always 1: records_version is the highest record version held, as a poll reports it",
+    );
+    let records_version = m.records_version.to_string();
+    prom_gauge(
+        buf,
+        "anthropic_client_store_restrictions",
+        &[("records_version", &records_version)],
+        1.0,
+    );
+    gauge(
+        buf,
+        "anthropic_client_store_restrictions_complete",
+        "1 once a full restrictions part has been merged; until then no ordinary client is served",
+        flag(m.complete),
+    );
+    gauge(
+        buf,
+        "anthropic_client_store_loaded",
+        "1 while a complete set of restrictions and a document are held: /_ready answers 200",
+        flag(m.loaded),
+    );
+    prom_header(
+        buf,
+        "anthropic_client_store_part_full",
+        "gauge",
+        "1 if the last restrictions part merged was full, 0 if partial; absent before the first",
+    );
+    if let Some(full) = m.part_full {
+        prom_gauge(buf, "anthropic_client_store_part_full", &[], flag(full));
+    }
+    gauge(
+        buf,
+        "anthropic_client_store_enabled_ahead",
+        "Enabled records the store left out of its last part for being ahead of its clock",
+        m.enabled_ahead as f64,
+    );
+    prom_header(
+        buf,
+        "anthropic_client_store_alert",
+        "gauge",
+        "1 while the named client store alert is raised",
+    );
+    for (alert, raised) in &m.alerts {
+        prom_gauge(
+            buf,
+            "anthropic_client_store_alert",
+            &[("alert", alert)],
+            flag(*raised),
+        );
+    }
+    gauge(
+        buf,
+        "anthropic_client_store_unmatched_disabled",
+        "Disabled names that match no client this instance knows",
+        m.unmatched_disabled.len() as f64,
+    );
+    prom_header(
+        buf,
+        "anthropic_client_store_unmatched_disabled_name",
+        "gauge",
+        "Up to 5 disabled names that match no client this instance knows, always 1",
+    );
+    for name in m
+        .unmatched_disabled
+        .iter()
+        .take(MAX_UNMATCHED_DISABLED_LABELS)
+    {
+        prom_gauge(
+            buf,
+            "anthropic_client_store_unmatched_disabled_name",
+            &[("name", name)],
+            1.0,
+        );
+    }
+    gauge(
+        buf,
+        "anthropic_client_store_quarantined_clients",
+        "Store clients quarantined on this instance: every key of each name is refused",
+        m.quarantined as f64,
+    );
+    gauge(
+        buf,
+        "anthropic_client_store_revoked_outside_store",
+        "Revoked digests that match a config-file key, which a store cannot revoke: ignored",
+        m.revoked_outside_store as f64,
+    );
+    prom_header(
+        buf,
+        "anthropic_client_store_last_ok_timestamp_seconds",
+        "gauge",
+        "When each poll answer part last arrived and passed its checks; 0 before the first",
+    );
+    for (part, secs) in [
+        ("document", m.document_ok_secs),
+        ("restrictions", m.restrictions_ok_secs),
+    ] {
+        prom_gauge(
+            buf,
+            "anthropic_client_store_last_ok_timestamp_seconds",
+            &[("part", part)],
+            secs as f64,
+        );
+    }
+    counter(
+        buf,
+        "anthropic_client_store_documents_installed_total",
+        "Documents installed from the store",
+        m.documents_installed,
+    );
+    counter(
+        buf,
+        "anthropic_client_store_restrictions_changes_total",
+        "Changes to the restrictions held",
+        m.restrictions_changes,
+    );
+    counter(
+        buf,
+        "anthropic_client_store_documents_refused_ahead_total",
+        "Documents refused for being more than 15 minutes ahead of this instance's clock",
+        m.documents_refused_ahead,
+    );
+    prom_header(
+        buf,
+        "anthropic_client_store_toml_client",
+        "gauge",
+        "Each ordinary client in this instance's config file, always 1",
+    );
+    for client in &m.file_clients {
+        prom_gauge(
+            buf,
+            "anthropic_client_store_toml_client",
+            &[("client", client)],
+            1.0,
+        );
+    }
+    prom_header(
+        buf,
+        "anthropic_client_store_refusals_total",
+        "counter",
+        "Credentials the client store turned away, by reason (disabled/quarantined/unloaded)",
+    );
+    for (reason, n) in &m.refusals {
+        prom_counter(
+            buf,
+            "anthropic_client_store_refusals_total",
+            &[("reason", reason)],
+            *n,
+        );
+    }
 }
 
 #[cfg(test)]

@@ -817,6 +817,9 @@ pub(crate) struct AppState {
     /// (LAB-933). None = feature off — the no-config case is byte-identical
     /// to pre-cache behaviour (AC1).
     pub(crate) response_cache: Option<ResponseCache>,
+    /// The client store reader, when `[client_store]` is configured. Its
+    /// state feeds `/metrics`; the policy it builds is `client_policy`.
+    pub(crate) client_store: Option<Arc<ClientStore>>,
 }
 
 /// RAII reservation against `AppState::inflight_body_bytes`. Holding it keeps the

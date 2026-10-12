@@ -41,6 +41,7 @@ mod guard;
 mod auto_cache;
 mod breaker;
 mod client_policy;
+mod client_store;
 mod config;
 mod fallback;
 mod handler;
@@ -62,6 +63,7 @@ mod utilization;
 
 use auto_cache::*;
 use client_policy::*;
+use client_store::*;
 use config::*;
 use fallback::*;
 use handler::*;
@@ -318,6 +320,7 @@ fn nested_reader_key(value: &toml::Value, path: &str) -> Option<String> {
 /// production route table and middleware stack rather than a copy of it.
 fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/_ready", axum::routing::get(ready_handler))
         .route("/_stats", axum::routing::get(stats_handler))
         .route("/metrics", axum::routing::get(metrics_handler))
         .route(
@@ -387,6 +390,7 @@ async fn main() {
     drop(config_str);
     config.clients = Vec::new();
     config.proxy_key = None;
+    let client_store_config = config.client_store.take();
 
     // Set up tracing: stderr (info+) always, plus optional debug log file
     {
@@ -558,6 +562,24 @@ async fn main() {
     );
 
     let state_path = PathBuf::from(&config_path).with_extension("state.json");
+
+    // The client store reader, built on the config file's policy. Its resume
+    // copy sits beside the state file, so a restart that keeps one keeps both.
+    let client_store = client_store_config.map(|cfg| {
+        let store = ClientStore::new(
+            &cfg,
+            &client_policy,
+            endpoints.iter().map(|ep| ep.name.clone()).collect(),
+            PathBuf::from(&config_path).with_extension("client-store.json"),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        info!(
+            poll_url = %cfg.poll_url,
+            token = cfg.token.is_some(),
+            "client store enabled — no ordinary client is served until a complete set of restrictions is held"
+        );
+        Arc::new(store)
+    });
 
     // Set up shadow log writer if configured
     let shadow_log_tx = if let Some(ref path) = config.shadow_log {
@@ -764,6 +786,7 @@ async fn main() {
         unsupported_models: Mutex::new(HashMap::new()),
         fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache,
+        client_store,
     });
 
     if state.auto_cache {
@@ -781,6 +804,13 @@ async fn main() {
     // Seed metric weights from restored state so gauges aren't zero on cold start.
     state.refresh_metrics_weights().await;
 
+    // Resume what a restart kept, then poll: the listener opens after the
+    // first answered poll, or after FIRST_POLL_WAIT without one.
+    if let Some(store) = &state.client_store {
+        store.resume(&state).await;
+    }
+    let first_poll = ClientStore::spawn(&state);
+
     let app = build_router(state.clone());
 
     let addr: SocketAddr = config
@@ -795,6 +825,7 @@ async fn main() {
         "anthropic-lb starting"
     );
 
+    await_first_poll(first_poll).await;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
