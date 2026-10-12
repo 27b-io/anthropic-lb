@@ -1009,6 +1009,12 @@ impl ClientStore {
     ) -> Result<Self, String> {
         let poll_url = reqwest::Url::parse(&config.poll_url)
             .map_err(|_| "client_store.poll_url: not a URL".to_string())?;
+        if poll_url.scheme() == "http" {
+            warn!(
+                "client_store.poll_url is plain http: safe only over a channel that never leaves this \
+                 platform, since anyone on the path could rewrite the clients and restrictions it carries"
+            );
+        }
         let authorization = match &config.token {
             Some(token) => {
                 let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
@@ -1272,16 +1278,33 @@ impl ClientStore {
         }
     }
 
+    /// Save the resume copy: written to a sibling, synced, renamed over the
+    /// last copy, and the directory synced, so a crash leaves the old copy or
+    /// the new one, never a torn or rolled-back one.
     async fn write_resume(&self, resume: &Resume) {
-        let Ok(json) = serde_json::to_vec(resume) else {
-            return;
+        let json = match serde_json::to_vec(resume) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!(path = %self.resume_path.display(), error = %e, "client store: cannot serialise the resume copy");
+                return;
+            }
         };
-        let mut tmp = self.resume_path.clone().into_os_string();
-        tmp.push(".tmp");
-        let written = match tokio::fs::write(&tmp, &json).await {
-            Ok(()) => tokio::fs::rename(&tmp, &self.resume_path).await,
-            Err(e) => Err(e),
-        };
+        let path = self.resume_path.clone();
+        let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut tmp = path.clone().into_os_string();
+            tmp.push(".tmp");
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(&json)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::File::open(dir)?.sync_all()?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
         if let Err(e) = written {
             warn!(path = %self.resume_path.display(), error = %e, "client store: cannot write the resume copy");
         }

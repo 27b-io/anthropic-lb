@@ -871,6 +871,14 @@ fn build_rejects_a_poll_url_or_token_it_cannot_use_safely() {
             "poll_url = \"https://store.example/poll\"\ntoken = \"\"",
             "must not be empty",
         ),
+        (
+            "poll_url = \"http://reader:reader-token@store.example/poll\"",
+            "must not carry credentials",
+        ),
+        (
+            "poll_url = \"https://reader-token@store.example/poll\"",
+            "must not carry credentials",
+        ),
     ] {
         let err = refused(&format!("{}\n[client_store]\n{store}\n", one_client()));
         assert!(err.contains(expect), "expected '{expect}' in: {err}");

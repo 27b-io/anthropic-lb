@@ -867,6 +867,14 @@ fn check_client_store(config: &Config, auth_mode: &AuthMode) -> Result<(), Strin
     if !matches!(url.scheme(), "https" | "http") || !url.has_host() {
         return Err("client_store.poll_url: must be an http:// or https:// URL".to_string());
     }
+    // A user or password in the URL would be sent as basic auth, over plain
+    // http too, and the URL is logged at boot.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "client_store.poll_url: must not carry credentials — use client_store.token"
+                .to_string(),
+        );
+    }
     match &store.token {
         Some(token) if token.is_empty() => {
             Err("client_store.token: must not be empty (remove it to poll without one)".to_string())
