@@ -1,6 +1,7 @@
 use crate::*;
 use serde_json::value::RawValue;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::Path;
 
 // ── Client store reader ─────────────────────────────────────────────
 //
@@ -922,7 +923,8 @@ pub(crate) struct ClientStore {
     writer: tokio::sync::Mutex<()>,
     /// What the last policy built had to say (`ClientPolicy::with_store`).
     report: Mutex<StoreReport>,
-    /// Credentials refused by the store's gate, indexed by `StoreRefusal`.
+    /// Credentials refused by the store's gate, one counter per
+    /// `StoreRefusal` (`refusal_counter`).
     refusals: [AtomicU64; StoreRefusal::ALL.len()],
     /// Turns true at the first answered poll.
     answered: tokio::sync::watch::Sender<bool>,
@@ -1090,7 +1092,19 @@ impl ClientStore {
 
     /// Count one credential the store's gate refused.
     pub(crate) fn count_refusal(&self, refusal: StoreRefusal) {
-        self.refusals[refusal as usize].fetch_add(1, Ordering::Relaxed);
+        self.refusal_counter(refusal)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The counter of `refusal`. The match is exhaustive and its indices are
+    /// constants, so a new refusal does not compile until it has a counter
+    /// of its own, in the array `StoreRefusal::ALL` sizes.
+    fn refusal_counter(&self, refusal: StoreRefusal) -> &AtomicU64 {
+        match refusal {
+            StoreRefusal::Disabled => &self.refusals[0],
+            StoreRefusal::Quarantined => &self.refusals[1],
+            StoreRefusal::Unloaded => &self.refusals[2],
+        }
     }
 
     /// Resume from the copy beside the state file, if a restart left one. The
@@ -1340,41 +1354,16 @@ impl ClientStore {
         }
     }
 
-    /// Write the resume copy to a sibling, sync it, rename it over the last
-    /// copy and sync the directory, so a crash leaves the old copy or the new
-    /// one, never a torn one. When the write fails the last copy is removed:
-    /// what is about to be enforced is not in it, and resuming it after a
-    /// restart could lift a restriction the store has since lost. A restart
-    /// then waits for the store, and every poll writes again until one lands.
+    /// Save the resume copy (`save_copy`), and count and log a save that
+    /// failed. What is about to be enforced is not in the last copy, so a
+    /// failed save removes it: a restart then waits for the store, and every
+    /// poll saves again until one lands.
     async fn write_resume(&self, resume: &Resume) {
         let json = serde_json::to_vec(resume).map_err(std::io::Error::other);
         let path = self.resume_path.clone();
-        // `Err((write, removal))`: why the write failed, and why removing the
-        // last copy then failed too, if it did.
-        type Failed = (std::io::Error, Option<std::io::Error>);
-        let written = tokio::task::spawn_blocking(move || -> Result<(), Failed> {
-            let write = || -> std::io::Result<()> {
-                use std::io::Write;
-                let json = json?;
-                let mut tmp = path.clone().into_os_string();
-                tmp.push(".tmp");
-                let mut file = std::fs::File::create(&tmp)?;
-                file.write_all(&json)?;
-                file.sync_all()?;
-                std::fs::rename(&tmp, &path)?;
-                if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                    std::fs::File::open(dir)?.sync_all()?;
-                }
-                Ok(())
-            };
-            write().map_err(|e| match std::fs::remove_file(&path) {
-                Ok(()) => (e, None),
-                Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => (e, None),
-                Err(rm) => (e, Some(rm)),
-            })
-        })
-        .await
-        .unwrap_or_else(|e| Err((std::io::Error::other(e), None)));
+        let written = tokio::task::spawn_blocking(move || save_copy(&path, json))
+            .await
+            .unwrap_or_else(|e| Err((std::io::Error::other(e), None)));
         let (e, removal) = match written {
             Ok(()) => {
                 let failures = self.resume_failures.swap(0, Ordering::Relaxed);
@@ -1402,7 +1391,7 @@ impl ClientStore {
                 error = %e,
                 removal_error = %rm,
                 failures,
-                "client store: cannot write the resume copy or remove the last one; a restart now could resume restrictions older than those enforced; every poll tries again"
+                "client store: cannot write the resume copy or durably remove the last one; a restart now could resume restrictions older than those enforced; every poll tries again"
             ),
         }
     }
@@ -1434,12 +1423,7 @@ impl ClientStore {
             file_clients: self.file_clients.clone(),
             refusals: StoreRefusal::ALL
                 .iter()
-                .map(|r| {
-                    (
-                        r.as_str(),
-                        self.refusals[*r as usize].load(Ordering::Relaxed),
-                    )
-                })
+                .map(|r| (r.as_str(), self.refusal_counter(*r).load(Ordering::Relaxed)))
                 .collect(),
         }
     }
@@ -1491,6 +1475,47 @@ pub(crate) async fn ready_handler(State(state): State<Arc<AppState>>) -> Respons
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "client table not loaded\n").into_response()
     }
+}
+
+/// Why a save of the resume copy failed: the write's error, and the error
+/// that then kept the last copy from being removed, if one did.
+type SaveFailed = (std::io::Error, Option<std::io::Error>);
+
+/// Write `json` as the resume copy at `path`: to a sibling, synced, renamed
+/// over the last copy, and the directory synced, so a crash leaves the old
+/// copy or the new one, never a torn one. When any step fails, the last copy
+/// is removed and the directory synced again, since a removal survives a
+/// power cut only then: a copy that came back could lift a restriction
+/// enforced after it was written.
+fn save_copy(path: &Path, json: std::io::Result<Vec<u8>>) -> Result<(), SaveFailed> {
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let json = json?;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&json)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        sync_parent(path)
+    };
+    write().map_err(|e| {
+        let removed = match std::fs::remove_file(path) {
+            Err(rm) if rm.kind() != std::io::ErrorKind::NotFound => Err(rm),
+            _ => sync_parent(path),
+        };
+        (e, removed.err())
+    })
+}
+
+/// Sync the directory that holds `path`, so a rename or a removal there
+/// survives a power cut.
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// The set a resume copy holds, if every value in it passes the checks a

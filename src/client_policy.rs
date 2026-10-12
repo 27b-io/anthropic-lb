@@ -117,9 +117,8 @@ pub(crate) enum StoreRefusal {
 }
 
 impl StoreRefusal {
-    /// Every refusal, each at the index of its discriminant: the client
-    /// store counts refusals in an array sized by this list and indexed by
-    /// the discriminant, so a new refusal joins it.
+    /// Every refusal, in the order the client store exports them. Its
+    /// refusal counters are sized by this list.
     pub(crate) const ALL: [Self; 3] = [Self::Disabled, Self::Quarantined, Self::Unloaded];
 
     /// The `reason` label it is counted under.

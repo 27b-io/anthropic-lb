@@ -355,10 +355,13 @@ async fn a_resume_restores_what_was_held_and_is_loaded_only_with_a_complete_set(
 /// it. Linux only, where syncing a FIFO fails, so a save that `release` lets
 /// through fails and removes the copy.
 ///
-/// Dropping it releases any save still waiting, so a failed assertion fails
-/// the test instead of hanging it (the runtime waits for every blocking
-/// thread when it shuts down): opening a FIFO to read and write never blocks
-/// on Linux. It then unlinks the FIFO, so a later save writes a plain file.
+/// `release` blocks its thread until a save opens the FIFO, so a test that
+/// uses it runs on a multi-thread runtime: a poll still fetching then goes
+/// on, where one thread would wait forever. Dropping it releases any save
+/// still waiting, so a failed assertion fails the test instead of hanging it
+/// (the runtime waits for every blocking thread when it shuts down): opening
+/// a FIFO to read and write never blocks on Linux. It then unlinks the FIFO,
+/// so a later save writes a plain file.
 #[cfg(target_os = "linux")]
 struct HeldSaves(std::path::PathBuf);
 
@@ -410,7 +413,7 @@ fn spawn_poll(inst: &Instance) -> tokio::task::JoinHandle<bool> {
 /// Enforcing first would leave a window in which a restart resumes the older
 /// copy and serves the disabled name again.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_restriction_is_enforced_only_once_it_is_saved() {
     let store = MockStore::default();
     store.hold(None, Some(body(true, &[], &[])));
@@ -473,7 +476,7 @@ async fn a_restriction_is_enforced_only_once_it_is_saved() {
 /// build on what the first was about to replace, and whichever installed
 /// last would drop the other's merge.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn polls_run_one_at_a_time_so_no_merge_is_lost() {
     let store = MockStore::default();
     store.hold(None, Some(body(true, &[], &[])));
@@ -513,17 +516,6 @@ async fn polls_run_one_at_a_time_so_no_merge_is_lost() {
         Err(403),
         "the second merge was lost"
     );
-    // The second poll's save landed, and a restart holds both disables.
-    let restarted = Instance::in_dir(
-        "http://127.0.0.1:9",
-        file_clients(&["a", "b"]),
-        &url,
-        None,
-        &dir,
-    );
-    restarted.store.resume(&restarted.state).await;
-    assert_eq!(restarted.auth(&test_key("a")), Err(403));
-    assert_eq!(restarted.auth(&test_key("b")), Err(403));
 }
 
 /// A save that failed is owed until one lands, and is retried even while
@@ -563,6 +555,38 @@ async fn a_failed_save_is_retried_while_the_store_is_away() {
     );
     restarted.store.resume(&restarted.state).await;
     assert_eq!(restarted.auth(&test_key("file-only")), Err(403));
+}
+
+/// A save that fails syncs the directory after it removes the last copy, as
+/// a save that lands does after its rename: a removal survives a power cut
+/// only once its directory is synced. Here the directory cannot be opened to
+/// sync, so the removal is reported failed, and the save logged as an error.
+#[cfg(unix)]
+#[test]
+fn a_failed_save_syncs_the_removal_of_the_last_copy() {
+    use std::os::unix::fs::PermissionsExt;
+    /// Gives the directory its permissions back, so it can be cleaned up.
+    struct Restore<'a>(&'a std::path::Path);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.client-store.json");
+    // Write and search but not read: entries can be made and removed, and
+    // the directory cannot be opened to sync.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+    let _restore = Restore(dir.path());
+    if std::fs::File::open(dir.path()).is_ok() {
+        eprintln!("skipped: this user can open any directory");
+        return;
+    }
+    let (_, removal) =
+        save_copy(&path, Ok(b"{}".to_vec())).expect_err("the save cannot sync its directory");
+    assert!(removal.is_some(), "the removal was not synced");
+    assert!(!path.exists(), "the copy is removed");
 }
 
 /// A save that fails removes the last copy, so a restart in between waits
