@@ -257,7 +257,7 @@ async fn every_change_writes_the_resume_copy_with_its_completeness_mark() {
     assert_eq!(saved["complete"], true);
 }
 
-/// A container restarted within the same pod resumes the document, the
+/// A process restarted beside its resume copy resumes the document, the
 /// revocation union and the restrictions, and counts as loaded only when the
 /// saved set is complete.
 #[tokio::test]
