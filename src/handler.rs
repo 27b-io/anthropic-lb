@@ -1379,6 +1379,7 @@ pub(crate) async fn forward_anthropic(
                     status.as_u16(),
                     &ctx,
                     &TokenUsage::default(),
+                    None,
                 );
                 let body = serde_json::json!({
                     "type": "error",
@@ -1413,8 +1414,10 @@ pub(crate) async fn forward_anthropic(
         };
         let mut usage = TokenUsage::default();
         let mut response_model: Option<String> = None;
+        let mut upstream_err = None;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&resp_body_bytes) {
             usage = TokenUsage::from_response_body(&parsed);
+            upstream_err = UpstreamError::from_body(status.as_u16(), &parsed);
             response_model = parsed
                 .get("model")
                 .and_then(|v| v.as_str())
@@ -1479,6 +1482,7 @@ pub(crate) async fn forward_anthropic(
                     status.as_u16(),
                     &ctx,
                     &usage,
+                    upstream_err.as_ref(),
                 );
                 let response = builder
                     .body(Body::from(resp_body_bytes))
@@ -1506,6 +1510,7 @@ pub(crate) async fn forward_anthropic(
             session_key,
             context_window,
             Some(ctx),
+            upstream_err.as_ref(),
         )
         .await;
         let response = builder
