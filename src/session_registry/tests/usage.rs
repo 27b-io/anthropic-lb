@@ -429,6 +429,196 @@ async fn proxied_line_still_logged_on_openai_compat_upstream_error() {
         "merged line should carry the upstream status, got: {}",
         my_lines[0]
     );
+    assert!(
+        my_lines[0].contains(r#"err_type="invalid_request_error""#)
+            && my_lines[0].contains(r#"err="bad request""#),
+        "the line should name the upstream's error type and message, got: {}",
+        my_lines[0]
+    );
+}
+
+// ── LAB-9228: the upstream's reason for a 4xx, on the proxied line ──
+
+/// The `proxied` line for one native `/v1/messages` request tagged `marker`,
+/// sent to an upstream that answers every request with `status` and `body`.
+async fn native_proxied_line(status: StatusCode, body: serde_json::Value, marker: &str) -> String {
+    let buf = log_capture_buf();
+    let upstream = Router::new().fallback(any(move || {
+        let body = body.clone();
+        async move { (status, axum::Json(body)).into_response() }
+    }));
+    let mock_addr = serve(upstream).await;
+    let (app, _state) = test_app(&format!("http://{mock_addr}"), None);
+    let app_addr = serve(app).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{app_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "any")
+        .header("x-client-id", marker)
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), status.as_u16());
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    output
+        .lines()
+        .find(|l| l.contains(marker) && l.contains("proxied"))
+        .unwrap_or_else(|| panic!("no proxied line for {marker}:\n{output}"))
+        .to_string()
+}
+
+fn anthropic_error(err_type: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({"type": "error", "error": {"type": err_type, "message": message}})
+}
+
+/// A forwarded native 4xx names the upstream's error type and message; a 2xx
+/// line carries `-` in both fields.
+#[tokio::test]
+async fn proxied_line_names_upstream_4xx_reason() {
+    let line = native_proxied_line(
+        StatusCode::BAD_REQUEST,
+        anthropic_error("invalid_request_error", "max_tokens: Field required"),
+        "upstream-err-native-400",
+    )
+    .await;
+    assert!(
+        line.contains("status=400")
+            && line.contains(r#"err_type="invalid_request_error""#)
+            && line.contains(r#"err="max_tokens: Field required""#),
+        "a 4xx line should name the upstream reason, got: {line}"
+    );
+
+    let line = native_proxied_line(
+        StatusCode::OK,
+        serde_json::json!({"type": "message", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+        "upstream-err-native-200",
+    )
+    .await;
+    assert!(
+        line.contains("status=200")
+            && line.contains(r#"err_type="-""#)
+            && line.contains(r#"err="-""#),
+        "a 2xx line should carry - in both fields, got: {line}"
+    );
+}
+
+/// A 4xx whose body is not an Anthropic error envelope names nothing.
+#[tokio::test]
+async fn proxied_line_names_nothing_for_a_non_envelope_4xx() {
+    let line = native_proxied_line(
+        StatusCode::BAD_REQUEST,
+        serde_json::json!({"error": {"type": "invalid_request_error", "message": "no top-level type"}}),
+        "upstream-err-native-non-envelope",
+    )
+    .await;
+    assert!(
+        line.contains("status=400")
+            && line.contains(r#"err_type="-""#)
+            && line.contains(r#"err="-""#),
+        "a non-envelope 4xx should carry - in both fields, got: {line}"
+    );
+}
+
+/// `err` is one line and at most 200 characters: control characters become
+/// spaces, and a longer message keeps 199 characters plus a trailing `…`. The
+/// formatter escapes the quotes.
+#[tokio::test]
+async fn proxied_line_err_is_bounded_and_one_line() {
+    // 6 characters, 100 times: 600, with a quote, a newline and a return.
+    let message = "q\"n\nr\r".repeat(100);
+    let line = native_proxied_line(
+        StatusCode::BAD_REQUEST,
+        anthropic_error("invalid_request_error", &message),
+        "upstream-err-native-bounded",
+    )
+    .await;
+    // 33 × 6 + 1 = 199 characters kept, then the cut mark.
+    let expected = format!("{}q…", "q\"n r ".repeat(33));
+    assert_eq!(expected.chars().count(), 200);
+    assert!(
+        line.contains(r#"err="q\"n r q\"n r "#) && line.contains(&format!("err={expected:?} ")),
+        "err should be the flattened 199-character prefix plus …, got: {line}"
+    );
+}
+
+/// The line a rotated rejection writes (here a 404 for a model the account
+/// does not serve) names the reason too; the attempt that then serves it
+/// carries `-`.
+#[tokio::test]
+async fn rotated_rejection_line_names_upstream_reason() {
+    let buf = log_capture_buf();
+    let (reject_url, _hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
+    let (ok_url, _h) = spawn_mock_upstream().await;
+    let reject = mk_endpoint_at("reject", "sk-ant-api-r", &reject_url);
+    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+    healthy.priority = 1;
+    let addr = serve(build_router(test_state_with(vec![reject, healthy]))).await;
+
+    let marker = "upstream-err-rotated";
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-client-id", marker)
+        .body(r#"{"model":"claude-nope-1","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let lines: Vec<&str> = output
+        .lines()
+        .filter(|l| l.contains(marker) && l.contains("proxied"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one line per attempt, got:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        lines[0].contains("status=404")
+            && lines[0].contains(r#"err_type="not_found_error""#)
+            && lines[0].contains(r#"err="model: claude-nope-1""#),
+        "the rotated line should name the upstream reason, got: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("status=200") && lines[1].contains(r#"err_type="-""#),
+        "the serving attempt should carry -, got: {}",
+        lines[1]
+    );
+}
+
+/// Only a 4xx with a complete envelope yields a reason. `err_type` is capped
+/// by `truncate_label`, and a message of exactly 200 characters is kept whole.
+#[test]
+fn upstream_error_from_body_gates_and_bounds() {
+    let envelope = anthropic_error("invalid_request_error", "m");
+    assert!(UpstreamError::from_body(400, &envelope).is_some());
+    assert!(UpstreamError::from_body(499, &envelope).is_some());
+    assert!(UpstreamError::from_body(200, &envelope).is_none());
+    assert!(UpstreamError::from_body(500, &envelope).is_none());
+    for partial in [
+        serde_json::json!({"type": "error", "error": {"type": "t"}}),
+        serde_json::json!({"type": "error", "error": {"message": "m"}}),
+        serde_json::json!({"type": "error", "error": {"type": 1, "message": "m"}}),
+        serde_json::json!({"type": "message", "error": {"type": "t", "message": "m"}}),
+        serde_json::json!("error"),
+    ] {
+        assert!(
+            UpstreamError::from_body(400, &partial).is_none(),
+            "{partial}"
+        );
+    }
+
+    let exact = "é".repeat(200);
+    let long_type = format!("{}\n", "t".repeat(100));
+    let e = UpstreamError::from_body(400, &anthropic_error(&long_type, &exact)).unwrap();
+    assert_eq!(e.message, exact, "a 200-character message is not cut");
+    assert_eq!(e.err_type, truncate_label(&format!("{} ", "t".repeat(100))));
 }
 
 // ── LAB-7593: estimated stream usage is budget-only, in one write ──

@@ -433,11 +433,51 @@ impl ProxiedCtx {
     }
 }
 
+/// Longest `err` on a `proxied` line, in characters, the cut's `…` included.
+const MAX_UPSTREAM_ERR_CHARS: usize = 200;
+
+/// The upstream's own reason for a 4xx, for the `proxied` line: without it
+/// the line says `status=400` and nothing about why, and a client whose
+/// request bodies the proxy never sees cannot be told what it got wrong.
+/// Both values are upstream text, so each is bounded and kept to one line.
+pub(crate) struct UpstreamError {
+    err_type: String,
+    message: String,
+}
+
+impl UpstreamError {
+    /// `error.type` and `error.message` of an Anthropic error envelope
+    /// (`{"type":"error","error":{"type":…,"message":…}}`) answering with a
+    /// 4xx; `None` for any other status or body. Control characters become
+    /// spaces; `err_type` is capped by `truncate_label`, and a message longer
+    /// than `MAX_UPSTREAM_ERR_CHARS` keeps one character fewer plus a `…`.
+    pub(crate) fn from_body(status: u16, body: &serde_json::Value) -> Option<Self> {
+        if !(400..500).contains(&status) || body.get("type")?.as_str()? != "error" {
+            return None;
+        }
+        let err_type = body.pointer("/error/type")?.as_str()?;
+        let message = body.pointer("/error/message")?.as_str()?;
+        let one_line = |c: char| if c.is_control() { ' ' } else { c };
+        let mut chars = message.chars().map(one_line);
+        let mut err: String = chars.by_ref().take(MAX_UPSTREAM_ERR_CHARS).collect();
+        if chars.next().is_some() {
+            err.pop();
+            err.push('…');
+        }
+        Some(Self {
+            err_type: truncate_label(&err_type.chars().map(one_line).collect::<String>()),
+            message: err,
+        })
+    }
+}
+
 /// Emit the single per-request INFO line merging routing context with token
 /// usage. Usage fields are simply zero when nothing was extracted (error
 /// response, client disconnect, upstream failure) — still exactly one line,
 /// still carrying req_id/account/status (AC4), so no separate branch is
-/// needed for the no-usage case.
+/// needed for the no-usage case. `err_type` / `err` are `"-"` unless the
+/// upstream named its reason for a 4xx; they are logged as plain `&str`
+/// fields, so the formatter escapes the upstream text. Never use `%` on them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn log_proxied(
     req_id: &str,
@@ -450,7 +490,10 @@ pub(crate) fn log_proxied(
     status_code: u16,
     ctx: &ProxiedCtx,
     usage: &TokenUsage,
+    upstream_err: Option<&UpstreamError>,
 ) {
+    let (err_type, err) =
+        upstream_err.map_or(("-", "-"), |e| (e.err_type.as_str(), e.message.as_str()));
     match ctx {
         ProxiedCtx::Anthropic {
             client_ver,
@@ -475,6 +518,8 @@ pub(crate) fn log_proxied(
                 model,
                 account,
                 status = status_code,
+                err_type,
+                err,
                 utilization = %utilization,
                 util_5h = %util_5h,
                 util_7d = %util_7d,
@@ -516,6 +561,8 @@ pub(crate) fn log_proxied(
                 model,
                 account,
                 status = status_code,
+                err_type,
+                err,
                 utilization = %utilization,
                 util_5h = %util_5h,
                 util_7d = %util_7d,
@@ -657,6 +704,7 @@ pub(crate) async fn finalize_stream(
         status_code,
         &ctx,
         usage,
+        None,
     );
     let mut log = serde_json::json!({
         "ts": AppState::now_epoch(),
@@ -703,6 +751,7 @@ pub(crate) async fn finalize_non_stream(
     session_key: Option<&str>,
     context_window: u64,
     ctx: Option<ProxiedCtx>,
+    upstream_err: Option<&UpstreamError>,
 ) {
     let client_id = caller.name();
     let usage_model = response_model.unwrap_or(model);
@@ -741,6 +790,7 @@ pub(crate) async fn finalize_non_stream(
             status_code,
             c,
             usage,
+            upstream_err,
         ),
         None => {
             if !usage.is_empty() {

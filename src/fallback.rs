@@ -503,6 +503,7 @@ pub(crate) async fn try_fallback_upstream(
         // OpenAI endpoints carry stub RateLimitInfo — no routing snapshot to
         // merge with; this path keeps its own usage-only log line (LAB-3214).
         None,
+        None,
     )
     .await;
 

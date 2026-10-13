@@ -1064,13 +1064,15 @@ async fn forward_openai_compat_anthropic(
             warn!(req_id, account = endpoint_name, error = %e, "openai-compat: failed to read upstream error body");
             bytes::Bytes::new()
         });
-        let error_msg = serde_json::from_slice::<serde_json::Value>(&error_body)
-            .ok()
-            .and_then(|v| {
-                v.pointer("/error/message")
-                    .and_then(|m| m.as_str())
-                    .map(String::from)
-            });
+        let parsed_error = serde_json::from_slice::<serde_json::Value>(&error_body).ok();
+        let error_msg = parsed_error.as_ref().and_then(|v| {
+            v.pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .map(String::from)
+        });
+        let upstream_err = parsed_error
+            .as_ref()
+            .and_then(|v| UpstreamError::from_body(status.as_u16(), v));
         warn!(
             account = endpoint_name,
             model = ?model,
@@ -1093,6 +1095,7 @@ async fn forward_openai_compat_anthropic(
             status.as_u16(),
             &proxied_ctx,
             &TokenUsage::default(),
+            upstream_err.as_ref(),
         );
 
         // Translate Anthropic error to OpenAI error format so clients
@@ -1350,6 +1353,7 @@ async fn forward_openai_compat_anthropic(
                 status.as_u16(),
                 &proxied_ctx,
                 &TokenUsage::default(),
+                None,
             );
             return ForwardOutcome::Done(Box::new(
                 (StatusCode::BAD_GATEWAY, "failed to read upstream response").into_response(),
@@ -1374,6 +1378,7 @@ async fn forward_openai_compat_anthropic(
                 status.as_u16(),
                 &proxied_ctx,
                 &TokenUsage::default(),
+                None,
             );
             // A 2xx we can't translate is not a success: passing the raw
             // bytes through would hand the client an untranslated payload
@@ -1422,6 +1427,7 @@ async fn forward_openai_compat_anthropic(
         session_key,
         context_window,
         Some(proxied_ctx),
+        None,
     )
     .await;
 
