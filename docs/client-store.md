@@ -232,6 +232,8 @@ The other four are the reader's report:
 | `set_hash` | The hash of the set the reader holds. |
 | `set_complete` | `true` or `false`: the set's completeness mark. |
 
+A reader whose `set_hash` equals the set hash of the records and digests in a store's current part holds exactly that part, so every write in it has reached the reader. Comparing versions cannot show that: a store whose clock steps back can stamp a new write below versions a reader already holds, and that reader's `records_version` already reaches it.
+
 `version` and `records_version` are integers, `digest`, `tag` and `set_hash` are digests, and `set_complete` is `true` or `false`. A store ignores parameters it does not know. It treats a parameter that appears twice or breaks its form as absent, an absent `version` or `records_version` as 0, and an absent `set_complete` as `false`, so a malformed poll gets more of the answer, never less.
 
 The poll travels over HTTPS with the store's certificate validated, or over a channel that never leaves the reader's own platform. The digest and the tag catch corruption, not tampering: anyone who can rewrite an answer can recompute both.

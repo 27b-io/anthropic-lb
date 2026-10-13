@@ -949,12 +949,23 @@ async fn the_metrics_export_what_is_held_and_every_alert() {
         series(&metrics, "anthropic_client_store_document", &doc_labels).as_deref(),
         Some("1")
     );
+    // The set hash beside it is the one a poll reports. Whoever reads both it and the set hash of
+    // the part a store serves can tell whether a write has reached this instance, so it is checked
+    // against the set text of what the part sent (docs/client-store.md, "The set hash"), built here
+    // by hand rather than by the reader.
     let records_version = inst.store.lock_reader().set.records_version(now_us());
+    let mut lines: Vec<String> = records
+        .iter()
+        .map(|(name, _, version)| format!("r {name} disabled {version}\n"))
+        .collect();
+    lines.sort();
+    lines.push(format!("d {}\n", digest_hex(&key_digest(&test_key("ops")))));
+    let set_hash = digest_hex(&sha256(lines.concat().as_bytes()));
     assert_eq!(
         series(
             &metrics,
             "anthropic_client_store_restrictions",
-            &format!("records_version=\"{records_version}\"")
+            &format!("records_version=\"{records_version}\",set_hash=\"{set_hash}\"")
         )
         .as_deref(),
         Some("1")
