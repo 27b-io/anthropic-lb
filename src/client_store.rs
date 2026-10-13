@@ -1097,8 +1097,8 @@ impl ClientStore {
     }
 
     /// The counter of `refusal`. The match is exhaustive and its indices are
-    /// constants, so a new refusal does not compile until it has a counter
-    /// of its own, in the array `StoreRefusal::ALL` sizes.
+    /// constants, so a new refusal does not compile until its arm indexes a
+    /// counter within the array `StoreRefusal::ALL` sizes.
     fn refusal_counter(&self, refusal: StoreRefusal) -> &AtomicU64 {
         match refusal {
             StoreRefusal::Disabled => &self.refusals[0],
@@ -1375,7 +1375,9 @@ impl ClientStore {
             Err(failed) => failed,
         };
         let failures = self.resume_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        if failures != 1 && !failures.is_multiple_of(FAILURE_LOG_EVERY) {
+        // A removal that did not land is never rate-limited: an earlier,
+        // benign failure must not hide it.
+        if removal.is_none() && failures != 1 && !failures.is_multiple_of(FAILURE_LOG_EVERY) {
             return;
         }
         let path = self.resume_path.display();
