@@ -1005,8 +1005,8 @@ pub(crate) struct RoutingCandidate {
     pub(crate) source: &'static str,
 }
 
-/// Bounded memory of the account each affinity key was last routed to, keyed
-/// by `stable_affinity_hash`. Two generations bound it: when the current one
+/// Bounded memory of the account each affinity key was last routed to for a
+/// model, keyed by a hash of both. Two generations bound it: when the current one
 /// fills it becomes the previous, and the old previous is dropped, so an entry
 /// outlives at least `GENERATION` newer keys and the map never holds more than
 /// twice that. A forgotten key's next request reads as its first, never as a
@@ -1059,9 +1059,10 @@ pub(crate) fn rendezvous_score(key: &str, account: &str, weight: f64) -> f64 {
     // appear in a header-derived key.
     hasher.write(&[0]);
     hasher.write(account.as_bytes());
-    // Top 53 bits, centred in their cell: strictly inside (0, 1), so ln(u) is
-    // finite and negative.
-    let u = ((hasher.finish() >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+    // Top 52 bits, centred in their cell: strictly inside (0, 1), so ln(u) is
+    // finite and negative. 52, not 53: `x + 0.5` is exact only below 2^52, and
+    // a rounded-up top value would give u = 1.0 and a score of -inf.
+    let u = ((hasher.finish() >> 12) as f64 + 0.5) / (1u64 << 52) as f64;
     weight / -u.ln()
 }
 

@@ -1234,3 +1234,97 @@ fn affinity_last_pick_is_bounded() {
         "a key two generations old is forgotten"
     );
 }
+
+/// Where `key` goes for `model` right now, without feeding the move signal.
+async fn peek(state: &AppState, key: &str, model: &str) -> usize {
+    let anonymous = state.caller("");
+    state
+        .pick_endpoint_for_client(
+            Some(key),
+            model,
+            &[],
+            &anonymous,
+            FastRequest::STANDARD,
+            false,
+        )
+        .await
+        .unwrap()
+}
+
+/// The move signal is per model: a key whose models sit on different
+/// accounts, because each model's weekly claims weigh the accounts
+/// differently, is not moving when it alternates between them.
+#[tokio::test]
+async fn affinity_alternating_models_is_not_a_move() {
+    let state = prod_pool().await;
+    let sonnet = "claude-sonnet-4-5";
+    let now = AppState::now_epoch();
+    for i in 0..POOL {
+        // The reverse of the opus spread, so the two models rank accounts apart.
+        let util = 0.60 - 0.50 * i as f64 / POOL as f64;
+        set_model_utilization(&state, i, sonnet, util, now + 4 * 86_400).await;
+    }
+    let marker = "lab9360-models";
+    log_capture_buf();
+    let mut key = None;
+    for i in 0..1000 {
+        let k = format!("{marker}-{i}");
+        if peek(&state, &k, OPUS).await != peek(&state, &k, sonnet).await {
+            key = Some(k);
+            break;
+        }
+    }
+    let key = key.expect("a key whose models sit on different accounts");
+    for _ in 0..10 {
+        state.pick_endpoint(Some(&key), OPUS, &[]).await.unwrap();
+        state.pick_endpoint(Some(&key), sonnet, &[]).await.unwrap();
+    }
+    assert_eq!(migrations(&state), [0; 5]);
+    assert_eq!(log_lines(marker), Vec::<String>::new());
+}
+
+/// The stateless trade-off, pinned down: when an account's own weight falls
+/// (here the weekly `allowed_warning` floor engages, cutting its 1 - gate term
+/// from 0.90 to 0.20) while it still passes the overage rule, it loses part
+/// of its sessions once, each counted as `rehomed`. They do not flap back
+/// while the weight holds.
+#[tokio::test]
+async fn affinity_own_weight_drop_rehomes_part_of_its_sessions_once() {
+    let state = prod_pool().await;
+    let marker = "lab9360-weight-drop";
+    log_capture_buf();
+    let keys = keys_hashing_to(&state, HOME, 200, 200_000, marker).await;
+    assert_eq!(keys.len(), 200);
+    for k in &keys {
+        assert_eq!(state.pick_endpoint(Some(k), OPUS, &[]).await, Some(HOME));
+    }
+    set_7d_status(&state, HOME, "allowed_warning").await;
+
+    let mut first = Vec::with_capacity(keys.len());
+    for k in &keys {
+        first.push(state.pick_endpoint(Some(k), OPUS, &[]).await.unwrap());
+    }
+    let moved = first.iter().filter(|&&i| i != HOME).count() as u64;
+    assert!(
+        moved > 0 && moved < keys.len() as u64,
+        "part of the sessions move, not none or all: {moved}"
+    );
+    let mut want = [0; 5];
+    want[MigrationReason::Rehomed as usize] = moved;
+    assert_eq!(
+        migrations(&state),
+        want,
+        "each move counts once, as rehomed"
+    );
+
+    for _ in 0..10 {
+        for (k, &was) in keys.iter().zip(&first) {
+            assert_eq!(state.pick_endpoint(Some(k), OPUS, &[]).await, Some(was));
+        }
+    }
+    assert_eq!(
+        migrations(&state),
+        want,
+        "no further moves while the weight holds"
+    );
+}

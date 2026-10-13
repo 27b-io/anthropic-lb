@@ -1010,10 +1010,12 @@ The hash is stateless, so replicas agree without sharing anything. Each
 account scores a key on its own, so a weight change moves only the keys won
 by or lost from that account, and an account leaving the set moves only its
 own keys. An account whose weight falls (for example when its 5h use climbs
-or a status floor engages) loses its share of keys once; it does not flap.
+or a status floor engages) loses part of its keys once, counted as
+`rehomed`; they do not flap back while the weight holds.
 
 `anthropic_affinity_migrations_total{reason}` counts real moves: a request
-whose account differs from the one this replica last picked for its key.
+whose account differs from the one this replica last picked for its key and
+model.
 A replica remembers up to 16,384 recent keys for this and nothing else;
 routing never reads it. Each move also logs one INFO line,
 `affinity migrated: session moved to another account`, with `reason`,

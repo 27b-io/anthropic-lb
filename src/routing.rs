@@ -374,21 +374,25 @@ impl AppState {
     /// Signal only: count and log a keyed session's move to another account
     /// on this replica (LAB-9360). Called at the first pick of a request, after
     /// routing decided; nothing here changes a pick. A move is a change from
-    /// the account this replica last picked for the key, so a session that
-    /// sits on its replacement logs once, not on every request. The reason
+    /// the account this replica last picked for the key and model, so a
+    /// session that sits on its replacement logs once, not on every request.
+    /// Per model because candidates and weights are: a key alternating models
+    /// may rightly sit on one account per model, which is not a move. The reason
     /// says why the old account lost the key (`MigrationReason`). A pick made
     /// while nothing in the tier passes the overage rule is degraded routing,
     /// not a move, and is recorded without being counted.
     fn record_affinity_pick(
         &self,
         key: &str,
+        model: &str,
         picked: EndpointIdx,
         candidates: &[RoutingCandidate],
         effective: &[&RoutingCandidate],
         tier: u32,
     ) {
-        let last = lock_recovering(&self.affinity_last_pick, "affinity_last_pick")
-            .swap(stable_affinity_hash(key), picked);
+        let key_hash = stable_affinity_hash(&format!("{key}\u{0}{model}"));
+        let last =
+            lock_recovering(&self.affinity_last_pick, "affinity_last_pick").swap(key_hash, picked);
         let Some(from) = last.filter(|&from| from != picked) else {
             return;
         };
@@ -633,7 +637,7 @@ impl AppState {
             let sticky_v2 = self.routing_strategy == RoutingStrategy::StickyWeightedV2;
             match affinity_key {
                 Some(key) if first_pick && sticky_v2 => {
-                    self.record_affinity_pick(key, picked, &candidates, &effective, *tier)
+                    self.record_affinity_pick(key, model, picked, &candidates, &effective, *tier)
                 }
                 _ => {}
             }
