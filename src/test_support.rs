@@ -187,6 +187,7 @@ pub(crate) fn test_state_base() -> AppState {
         body_read_timeout: Duration::from_secs(DEFAULT_BODY_READ_TIMEOUT_SECS),
         body_read_timeout_total: AtomicU64::new(0),
         affinity_migrations: Default::default(),
+        affinity_last_pick: Default::default(),
         pool_exhausted: Default::default(),
         request_durations: Mutex::new(HashMap::new()),
         start_epoch: AppState::now_epoch(),

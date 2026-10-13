@@ -715,10 +715,13 @@ pub(crate) struct AppState {
     /// Count of requests shed because the body was not fully received within
     /// `body_read_timeout`. Exposed as `anthropic_body_read_timeout_total`.
     pub(crate) body_read_timeout_total: AtomicU64,
-    /// Affinity overrides that migrated a session, indexed by `AffinityBind`
-    /// (what bound the sticky account). Exposed as
-    /// `anthropic_affinity_migrations_total{reason="loaded"|"spent"|"floored"}`.
-    pub(crate) affinity_migrations: [AtomicU64; 3],
+    /// Keyed sessions that moved to another account, indexed by
+    /// `MigrationReason`. Exposed as `anthropic_affinity_migrations_total{reason}`.
+    pub(crate) affinity_migrations: [AtomicU64; 5],
+    /// The account each affinity key was last routed to on this replica, so
+    /// `affinity_migrations` counts moves rather than requests. Signal only:
+    /// routing never reads it.
+    pub(crate) affinity_last_pick: Mutex<AffinityLastPick>,
     /// Client-facing pool-exhaustion responses, indexed by `PoolExhaustion`.
     /// Exposed as `anthropic_pool_exhausted_total{kind="rate_limited"|"transient"}`.
     /// The only metric trace of the 429/503 a caller actually received when the
@@ -1000,6 +1003,66 @@ pub(crate) struct RoutingCandidate {
     /// routine status-floor migration logs at INFO, not WARN (LAB-3295).
     pub(crate) gate_floor_bound: bool,
     pub(crate) source: &'static str,
+}
+
+/// Bounded memory of the account each affinity key was last routed to, keyed
+/// by `stable_affinity_hash`. Two generations bound it: when the current one
+/// fills it becomes the previous, and the old previous is dropped, so an entry
+/// outlives at least `GENERATION` newer keys and the map never holds more than
+/// twice that. A forgotten key's next request reads as its first, never as a
+/// move.
+#[derive(Default)]
+pub(crate) struct AffinityLastPick {
+    current: HashMap<u64, EndpointIdx>,
+    previous: HashMap<u64, EndpointIdx>,
+}
+
+impl AffinityLastPick {
+    /// Keys per generation: several times the distinct keys a busy replica
+    /// sees in 30 minutes.
+    pub(crate) const GENERATION: usize = 8192;
+
+    /// Record `endpoint` as the last pick for `key_hash`; return the pick it
+    /// replaces, if this map still remembers one.
+    pub(crate) fn swap(&mut self, key_hash: u64, endpoint: EndpointIdx) -> Option<EndpointIdx> {
+        let last = self
+            .current
+            .insert(key_hash, endpoint)
+            .or_else(|| self.previous.remove(&key_hash));
+        if self.current.len() >= Self::GENERATION {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        last
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.current.len() + self.previous.len()
+    }
+}
+
+/// Weighted rendezvous (highest-random-weight) score of `account` for an
+/// affinity `key`: `weight / -ln(u)`, with `u` drawn uniformly from (0, 1) by
+/// hashing the pair. `-ln(u) / weight` is exponential with rate `weight`, so
+/// the highest score wins with probability `weight / total`. Each account
+/// scores the key on its own, so a weight change moves keys only onto or off
+/// that account, and removing an account moves only its own keys. Hashing the
+/// name rather than the index keeps a key's scores fixed when the candidate
+/// set changes.
+pub(crate) fn rendezvous_score(key: &str, account: &str, weight: f64) -> f64 {
+    use std::hash::Hasher;
+
+    #[allow(deprecated)]
+    let mut hasher = std::hash::SipHasher::new_with_keys(0, 0);
+    hasher.write(key.as_bytes());
+    // The separator keeps ("ab", "c") apart from ("a", "bc"); NUL can't
+    // appear in a header-derived key.
+    hasher.write(&[0]);
+    hasher.write(account.as_bytes());
+    // Top 53 bits, centred in their cell: strictly inside (0, 1), so ln(u) is
+    // finite and negative.
+    let u = ((hasher.finish() >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+    weight / -u.ln()
 }
 
 pub(crate) fn stable_affinity_hash(key: &str) -> u64 {

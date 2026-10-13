@@ -1786,6 +1786,27 @@ async fn metrics_omits_claim_reset_already_in_the_past() {
     );
 }
 
+/// LAB-9360: every `anthropic_affinity_migrations_total` reason is exported
+/// at zero from startup, so a rate() panel has a baseline per reason.
+#[tokio::test]
+async fn metrics_exports_every_affinity_migration_reason_at_zero() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = test_app(&mock_url, None);
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{}/metrics", addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for reason in ["loaded", "spent", "floored", "unavailable", "rehomed"] {
+        let line = format!("anthropic_affinity_migrations_total{{reason=\"{reason}\"}} 0");
+        assert!(body.contains(&line), "missing `{line}`:\n{body}");
+    }
+}
+
 /// AC-3: both `exhaustion_response` arms increment, under their own `kind`, and
 /// both series exist at zero before any exhaustion so a rate() panel has a
 /// baseline instead of "No data". Both arms answer in the JSON error envelope

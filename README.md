@@ -993,6 +993,46 @@ are emitted from process start, so a flat zero is a measurement rather than an
 absence of data. These are independent per-replica event counts — aggregate
 with `sum by (kind)`, where `max` would undercount.
 
+### Session affinity
+
+Under `sticky-weighted-v2`, a request with an affinity key goes to the account
+that wins the key's weighted rendezvous hash among the accounts in its tier
+that pass the overage rule. An account passes while its affinity headroom —
+the smaller of `1 − gate` and its unused weekly quota, where quota due to
+expire within 6 h counts increasingly as unused — is at least `1 − soft_limit` (0.10 at the
+default). So a session stays on its account until that account nears its 5h
+or weekly limit, gets `throttled` or `rejected`, is rate-limited, cooling or
+circuit-broken, or is demoted for overage. The weekly `allowed_warning` floor
+alone does not move it. When no account in the tier passes, the hash runs over
+the whole tier.
+
+The hash is stateless, so replicas agree without sharing anything. Each
+account scores a key on its own, so a weight change moves only the keys won
+by or lost from that account, and an account leaving the set moves only its
+own keys. An account whose weight falls (for example when its 5h use climbs
+or a status floor engages) loses its share of keys once; it does not flap.
+
+`anthropic_affinity_migrations_total{reason}` counts real moves: a request
+whose account differs from the one this replica last picked for its key.
+A replica remembers up to 16,384 recent keys for this and nothing else;
+routing never reads it. Each move also logs one INFO line,
+`affinity migrated: session moved to another account`, with `reason`,
+`from_account` and `to_account`.
+
+| `reason` | The old account |
+|:---------|:----------------|
+| `loaded` | failed the overage rule on its 5h load |
+| `spent` | failed the overage rule on its weekly quota |
+| `floored` | failed the overage rule on a status floor (`throttled`, `rejected`) |
+| `unavailable` | is not a candidate in the request's tier: rate-limited, cooling, circuit-broken, excluded for the model or fast mode, outside the caller's pin, or demoted for overage |
+| `rehomed` | still passes, but another account won the key: its weight rose, or it returned to the set |
+
+All five label values are emitted from process start. The count is per
+replica: when consecutive requests on one key land on different replicas, a
+move can be missed or counted once per replica. Under `dynamic-capacity-v1`
+the counter instead counts every request its two-account override moves, as
+`loaded`, `spent` or `floored`.
+
 ### Request latency, restarts and build identity
 
 `anthropic_http_request_duration_seconds{route, status}` is a histogram of the
@@ -1216,7 +1256,7 @@ The Anthropic↔OpenAI translation layer is not lossless. When an Anthropic-form
 6. Compute time-adjusted utilization per claim window (5h, 7d per model)
 7. Apply status floors (warning ≥ 0.80, throttled ≥ 0.98, rejected = 1.0)
 8. Exclude accounts above soft_limit utilization ceiling
-9. Pick account via headroom-proportional weighted bucket hashing (client affinity)
+9. Pick account: keyed requests by weighted rendezvous hash among accounts passing the overage rule ([Session affinity](#session-affinity)), others by headroom-proportional weighted buckets
 10. Inject auth token + auto-cache header
 11. Forward request to upstream Anthropic API
 12. If 429 → mark rate-limited (propagate to Redis), add to skip list, retry with next account

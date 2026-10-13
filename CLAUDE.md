@@ -123,7 +123,7 @@ Headroom-proportional weighted bucket hashing:
 2. Skip endpoints in the `skip` list (already tried in this retry loop)
 3. Skip hard-limited (429) endpoints
 4. Each remaining endpoint gets a bucket proportional to `(1.0 - utilization)`
-5. Affinity key (client+session hash) provides sticky routing; no-affinity uses Fibonacci scatter
+5. Affinity key (client+session hash) provides sticky routing: under `sticky-weighted-v2` a keyed request takes the weighted rendezvous-hash winner among candidates whose `affinity_headroom` is at least `1 − soft_limit` (LAB-9360; README "Session affinity"); no-affinity uses Fibonacci scatter
 6. On 429 or 5xx/529, the failed endpoint index is added to `skip` and `pick_endpoint` is called again, guaranteeing a different endpoint on retry
 
 ### Token Type Detection

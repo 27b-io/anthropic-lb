@@ -575,7 +575,8 @@ async fn fast_mode_disabled_filters_fast_routing_until_expiry() {
                     "claude-opus-5",
                     &[],
                     &state.caller(""),
-                    FastRequest::FAST
+                    FastRequest::FAST,
+                    false
                 )
                 .await,
             Some(1),
@@ -590,7 +591,8 @@ async fn fast_mode_disabled_filters_fast_routing_until_expiry() {
                 "claude-opus-5",
                 &[],
                 &state.caller(""),
-                FastRequest::FAST
+                FastRequest::FAST,
+                false
             )
             .await,
         Some(1),
@@ -689,7 +691,8 @@ async fn fast_mode_excludes_openai_protocol_endpoints() {
                     "claude-opus-5",
                     &[],
                     &state.caller(""),
-                    FastRequest::FAST
+                    FastRequest::FAST,
+                    false
                 )
                 .await,
             Some(0),

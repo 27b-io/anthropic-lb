@@ -949,36 +949,75 @@ pub(crate) fn top_level_keys_unambiguous(body: &[u8]) -> bool {
 /// `affinity_headroom` is below 50% of the alternative's, stickiness is broken.
 pub(crate) const LEGACY_AFFINITY_OVERRIDE_RATIO: f64 = 0.5;
 
-/// Sticky-weighted override threshold on `affinity_headroom`. Lower than the
-/// legacy algorithm to preserve cache locality and only break stickiness for
-/// egregious disparities.
-pub(crate) const STICKY_WEIGHTED_OVERRIDE_RATIO: f64 = 0.25;
-
-/// Which window bound the sticky account when an affinity override fired.
-/// Label value of `anthropic_affinity_migrations_total{reason}`; also indexes
-/// `AppState::affinity_migrations`.
+/// Which window binds a candidate's `affinity_headroom`.
 #[derive(Clone, Copy)]
 pub(crate) enum AffinityBind {
     /// The effective gate is tighter, bound by raw (time-adjusted) 5h
     /// utilisation or overage — the pool is the bottleneck (operator-actionable).
-    Loaded = 0,
+    Loaded,
     /// Unused weekly quota is tighter — one account's week is nearly spent.
-    Spent = 1,
+    Spent,
     /// The gate is tighter, but set by an Anthropic status floor
     /// (`status_to_floor`) that exceeds raw utilisation — the LB is moving the
     /// session off an account Anthropic flagged, onto fresh capacity. Routine,
     /// not a pool-health signal: logged at INFO, not WARN (LAB-3295).
-    Floored = 2,
+    Floored,
 }
 
 impl AffinityBind {
-    pub(crate) const ALL: [Self; 3] = [Self::Loaded, Self::Spent, Self::Floored];
+    pub(crate) fn as_str(self) -> &'static str {
+        MigrationReason::from(self).as_str()
+    }
+}
+
+/// Why a keyed session left its account. Label value of
+/// `anthropic_affinity_migrations_total{reason}`; also indexes
+/// `AppState::affinity_migrations`. StickyWeightedV2 counts a session's real
+/// moves (LAB-9360); the legacy DynamicCapacityV1 override counts every
+/// request it overrides, under the first three labels.
+#[derive(Clone, Copy)]
+pub(crate) enum MigrationReason {
+    /// The old account failed the overage rule on its 5h load (`AffinityBind::Loaded`).
+    Loaded = 0,
+    /// The old account failed the overage rule on its weekly quota (`AffinityBind::Spent`).
+    Spent = 1,
+    /// The old account failed the overage rule on a status floor (`AffinityBind::Floored`).
+    Floored = 2,
+    /// The old account is not a candidate in this request's tier: hard-limited
+    /// or cooling after a 429, circuit breaker open, excluded for the model or
+    /// for fast mode, outside the caller's pin, or demoted for overage.
+    Unavailable = 3,
+    /// The old account still passes, but another account won the key's hash:
+    /// its weight rose, or it returned to the set.
+    Rehomed = 4,
+}
+
+impl MigrationReason {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Loaded,
+        Self::Spent,
+        Self::Floored,
+        Self::Unavailable,
+        Self::Rehomed,
+    ];
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Loaded => "loaded",
             Self::Spent => "spent",
             Self::Floored => "floored",
+            Self::Unavailable => "unavailable",
+            Self::Rehomed => "rehomed",
+        }
+    }
+}
+
+impl From<AffinityBind> for MigrationReason {
+    fn from(bind: AffinityBind) -> Self {
+        match bind {
+            AffinityBind::Loaded => Self::Loaded,
+            AffinityBind::Spent => Self::Spent,
+            AffinityBind::Floored => Self::Floored,
         }
     }
 }
@@ -1619,17 +1658,17 @@ pub(crate) fn compute_routing_weight(
         None => (gate_5h.max(gate_7d), wr_7d, source_7d),
     };
 
-    // Weekly headroom for the affinity override (`affinity_headroom`): 1.0 when
+    // Weekly headroom for the affinity rule (`affinity_headroom`): 1.0 when
     // unknown or superseded by overage, else the tighter of the primary claim
     // and (Fable) the pool it draws from. Reuses the gate's near-reset ramp so
     // quota expiring within NEAR_RESET_7D_SECS reads as headroom, not "spent":
-    // the bucket weights pull sessions ONTO expiring accounts and the override
-    // must not push them straight back off. Status floors are the gate's job
-    // (`None`). Deliberately not hedged under stale_after_hard_limit — a 429
-    // says nothing about how much of the week is spent.
-    // ponytail: 6h ramp; an account with ≤25% of its week left and 6h–~30h to
-    // reset still reads "spent" while the buckets favour it. Widen the ramp if
-    // that WARN band shows up in prod.
+    // the bucket weights pull sessions ONTO expiring accounts and the affinity
+    // rule must not push them straight back off. Status floors are the gate's
+    // job (`None`). Deliberately not hedged under stale_after_hard_limit — a
+    // 429 says nothing about how much of the week is spent.
+    // ponytail: 6h ramp; an account with less than `1 - soft_limit` of its
+    // week left and 6h–~30h to reset still reads "spent" while the buckets
+    // favour it. Widen the ramp if that `reason="spent"` band shows up in prod.
     let unused_of = |c: &ClaimWindowData| {
         let util =
             time_adjusted_utilization(c.utilization, c.reset, None, NEAR_RESET_7D_SECS, now_epoch)
