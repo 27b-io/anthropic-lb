@@ -772,6 +772,9 @@ async fn pick_proportional_distribution() {
 // open ceiling of 1.0 makes the rule pass everything.
 
 const PROD_SOFT_LIMIT: f64 = 0.90;
+/// Every test here that reads the clock freezes it here first, so reset
+/// windows and waste risk do not drift between the fixture and the router.
+const FIXED_EPOCH: u64 = 1_790_000_000;
 const POOL: usize = 40;
 const OPUS: &str = "claude-opus-4-6";
 /// The account the AC tests' sessions start on.
@@ -911,6 +914,7 @@ const HOUR: u64 = 3600;
 /// re-homes part of an account's keys once when its weight falls.
 #[tokio::test]
 async fn affinity_warning_floor_keeps_the_session() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
     let marker = "lab9360-ac1";
     set_home_weekly(&state, 0.10, 0.80, 4 * 24 * HOUR, "allowed_warning").await;
@@ -933,6 +937,7 @@ async fn affinity_warning_floor_keeps_the_session() {
 /// AC2: a partly spent week (0.88, reset days away) keeps the session.
 #[tokio::test]
 async fn affinity_partly_spent_week_keeps_the_session() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
     let marker = "lab9360-ac2";
     set_home_weekly(&state, 0.20, 0.88, 4 * 24 * HOUR, "allowed_warning").await;
@@ -943,6 +948,7 @@ async fn affinity_partly_spent_week_keeps_the_session() {
 /// AC3: a 5h gate past `soft_limit` moves the session.
 #[tokio::test]
 async fn affinity_session_leaves_a_loaded_5h_window() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
     let marker = "lab9360-ac3-5h";
     let key = seed_session(&state, marker).await;
@@ -955,6 +961,7 @@ async fn affinity_session_leaves_a_loaded_5h_window() {
 /// session, though the gate never carries weekly use.
 #[tokio::test]
 async fn affinity_session_leaves_a_spent_week() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
     let marker = "lab9360-ac3-7d";
     let key = seed_session(&state, marker).await;
@@ -966,6 +973,7 @@ async fn affinity_session_leaves_a_spent_week() {
 /// AC3: the `throttled` status floor (0.98) moves the session.
 #[tokio::test]
 async fn affinity_session_leaves_a_throttled_account() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
     let marker = "lab9360-ac3-throttled";
     let key = seed_session(&state, marker).await;
@@ -977,6 +985,7 @@ async fn affinity_session_leaves_a_throttled_account() {
 /// moves the session.
 #[tokio::test]
 async fn affinity_session_leaves_an_overage_account() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
     let marker = "lab9360-ac3-overage";
     let key = seed_session(&state, marker).await;
@@ -993,6 +1002,7 @@ async fn affinity_session_leaves_an_overage_account() {
 /// session.
 #[tokio::test]
 async fn affinity_session_leaves_a_hard_limited_account() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
     let marker = "lab9360-ac3-429";
     let key = seed_session(&state, marker).await;
@@ -1008,6 +1018,7 @@ async fn affinity_session_leaves_a_hard_limited_account() {
 /// account at 0.95 with its week resetting in 3h keeps its sessions.
 #[tokio::test]
 async fn affinity_quota_near_reset_keeps_the_session() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
     let marker = "lab9360-ac4-stays";
     set_home_weekly(&state, 0.10, 0.95, 3 * HOUR, "allowed_warning").await;
@@ -1019,6 +1030,7 @@ async fn affinity_quota_near_reset_keeps_the_session() {
 /// session leaves.
 #[tokio::test]
 async fn affinity_quota_far_from_reset_moves_the_session() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
     let marker = "lab9360-ac4-moves";
     set_home_weekly(&state, 0.10, 0.95, 3 * HOUR, "allowed_warning").await;
@@ -1031,6 +1043,7 @@ async fn affinity_quota_far_from_reset_moves_the_session() {
 /// and the return counts as `rehomed`: its replacement still passes.
 #[tokio::test]
 async fn affinity_return_to_a_recovered_account_counts_as_rehomed() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
     let marker = "lab9360-rehomed";
     let key = seed_session(&state, marker).await;
@@ -1058,6 +1071,7 @@ async fn affinity_return_to_a_recovered_account_counts_as_rehomed() {
 /// is compared with its last first pick.
 #[tokio::test]
 async fn affinity_retry_repick_is_not_a_move() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
     let marker = "lab9360-retry";
     let key = seed_session(&state, marker).await;
@@ -1073,6 +1087,7 @@ async fn affinity_retry_repick_is_not_a_move() {
 /// the next tier, and no counted move.
 #[tokio::test]
 async fn affinity_nothing_passes_hashes_over_the_tier() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let mut endpoints = pool_endpoints(POOL + 1);
     endpoints[POOL].priority = 1;
     let state = prod_pool_of(endpoints).await;
@@ -1256,6 +1271,7 @@ async fn peek(state: &AppState, key: &str, model: &str) -> usize {
 /// differently, is not moving when it alternates between them.
 #[tokio::test]
 async fn affinity_alternating_models_is_not_a_move() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
     let sonnet = "claude-sonnet-4-5";
     let now = AppState::now_epoch();
@@ -1290,6 +1306,7 @@ async fn affinity_alternating_models_is_not_a_move() {
 /// while the weight holds.
 #[tokio::test]
 async fn affinity_own_weight_drop_rehomes_part_of_its_sessions_once() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
     let marker = "lab9360-weight-drop";
     log_capture_buf();
