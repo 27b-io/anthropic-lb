@@ -708,8 +708,14 @@ async fn repeated_unsafe_failures_are_logged_once_every_failure_log_every() {
         None,
         dir.path(),
     );
-    // A fresh version each call, so every answer changes the set.
-    let disabled = || restrictions_part(&body(true, &[("file-only", Disabled, now_us() - 1)], &[]));
+    // A fresh version each call, so every answer changes the set: a fixed
+    // base in the past plus a counter, not the clock read again.
+    let base = now_us() - 1_000_000;
+    let version = std::cell::Cell::new(base);
+    let disabled = || {
+        version.set(version.get() + 1);
+        restrictions_part(&body(true, &[("file-only", Disabled, version.get())], &[]))
+    };
     let unsafe_lines = || {
         log_lines(&marker)
             .into_iter()
