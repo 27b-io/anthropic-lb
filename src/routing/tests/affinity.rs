@@ -127,22 +127,20 @@ async fn affinity_override_both_rough() {
 
 #[tokio::test]
 async fn affinity_override_preserves_stickiness_with_moderate_disparity() {
-    // With 3 candidates whose weights are moderately different (none below
-    // 0.25 ratio to the best), the override does NOT fire — all three
-    // accounts receive sticky traffic via proportional bucket hashing.
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("primary", "sk-ant-api-a"),
-            mk_endpoint("steve", "sk-ant-api-b"),
-            mk_endpoint("jeff", "sk-ant-api-c"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
-    );
+    // Three accounts whose weekly headroom differs widely, all above
+    // `1 - soft_limit`: every one passes the overage rule, so each keeps the
+    // keyed sessions its rendezvous score wins, however small jeff's 0.15
+    // left looks beside primary's 0.59.
+    let state = sticky_v2_state(vec![
+        mk_endpoint("primary", "sk-ant-api-a"),
+        mk_endpoint("steve", "sk-ant-api-b"),
+        mk_endpoint("jeff", "sk-ant-api-c"),
+    ]);
     let now = AppState::now_epoch();
     // primary is clearly best, steve middling, jeff worst
     set_account_utilization(&state, 0, 0.13, 0.41, now + 10000, now + 300000).await;
     set_account_utilization(&state, 1, 0.15, 0.55, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 2, 0.12, 0.79, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 2, 0.12, 0.85, now + 10000, now + 300000).await;
 
     let mut saw = [false; 3];
     for i in 0..1000 {
@@ -676,19 +674,16 @@ async fn affinity_breaks_on_egregious_disparity() {
 
 #[tokio::test]
 async fn affinity_moderate_disparity_stays_sticky() {
-    // Game theory: moderate 7d difference (0.73 vs 0.41) should NOT
-    // break stickiness. The cache-creation cost outweighs the routing
-    // benefit at this disparity level.
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("primary", "sk-ant-api-a"),
-            mk_endpoint("jeff", "sk-ant-api-b"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
-    );
+    // A wide weekly difference (0.15 left vs 0.59) does not move keyed
+    // sessions while both accounts pass the overage rule: jeff keeps the keys
+    // it wins.
+    let state = sticky_v2_state(vec![
+        mk_endpoint("primary", "sk-ant-api-a"),
+        mk_endpoint("jeff", "sk-ant-api-b"),
+    ]);
     let now = AppState::now_epoch();
     set_account_utilization(&state, 0, 0.13, 0.41, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 1, 0.12, 0.79, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.12, 0.85, now + 10000, now + 300000).await;
 
     // Both accounts should retain their hashed sessions
     let mut primary_picks = 0u32;
@@ -800,12 +795,26 @@ fn pool_endpoints(n: usize) -> Vec<Endpoint> {
 async fn prod_pool_of(endpoints: Vec<Endpoint>) -> Arc<AppState> {
     let n = endpoints.len();
     let state = sticky_v2_state(endpoints);
+    heal_pool(&state, n).await;
+    state
+}
+
+/// Spend the week of accounts `0..n` past `1 - soft_limit`, outside the
+/// near-reset ramp, so no account passes the overage rule.
+async fn spend_pool(state: &AppState, n: usize) {
+    let now = AppState::now_epoch();
+    for i in 0..n {
+        set_account_utilization(state, i, 0.10, 0.95, now + 10_000, now + 4 * 86_400).await;
+    }
+}
+
+/// Give accounts `0..n` the production pool's healthy utilisations.
+async fn heal_pool(state: &AppState, n: usize) {
     let now = AppState::now_epoch();
     for i in 0..n {
         let util_7d = 0.10 + 0.50 * i as f64 / n as f64;
-        set_account_utilization(&state, i, 0.10, util_7d, now + 10_000, now + 4 * 86_400).await;
+        set_account_utilization(state, i, 0.10, util_7d, now + 10_000, now + 4 * 86_400).await;
     }
-    state
 }
 
 async fn prod_pool() -> Arc<AppState> {
@@ -908,8 +917,9 @@ async fn set_home_weekly(
 const HOUR: u64 = 3600;
 
 /// AC1: the weekly `allowed_warning` floor (gate 0.80) leaves headroom 0.20,
-/// which used to sit under 0.25 × a best account at 0.80 and moved the session
-/// on every request. It now keeps the session. The floor is set before the
+/// which the deleted relative override read as too little beside a best
+/// account at 0.80, moving the session on every request. It now keeps the
+/// session. The floor is set before the
 /// session is placed: it cuts the account's weight, and a stateless hash
 /// re-homes part of an account's keys once when its weight falls.
 #[tokio::test]
@@ -1092,21 +1102,19 @@ async fn affinity_nothing_passes_hashes_over_the_tier() {
     endpoints[POOL].priority = 1;
     let state = prod_pool_of(endpoints).await;
     let marker = "lab9360-ac8";
-    let key = seed_session(&state, marker).await;
+    let (key, want) = home_key_spent_pool_moves(&state, POOL + 1, marker).await;
+    assert_ne!(want, HOME, "a degraded pick that stays home cannot count");
+    assert_eq!(state.pick_endpoint(Some(&key), OPUS, &[]).await, Some(HOME));
 
-    let now = AppState::now_epoch();
-    for i in 0..POOL {
-        set_account_utilization(&state, i, 0.10, 0.95, now + 10_000, now + 4 * 86_400).await;
-    }
+    spend_pool(&state, POOL).await;
     let candidates = state.routing_candidates(OPUS, &[]).await;
-    let tier: Vec<&RoutingCandidate> = candidates.iter().filter(|c| c.priority == 0).collect();
     assert!(
-        tier.iter()
+        candidates
+            .iter()
+            .filter(|c| c.priority == 0)
             .all(|c| !state.keeps_affinity(c) && c.gate < state.soft_limit),
         "every tier-0 account is healthy by gate yet fails the overage rule"
     );
-    let want = state.pick_rendezvous(&tier, &key).unwrap().endpoint;
-
     for i in 0..50 {
         assert_eq!(
             state.pick_endpoint(Some(&key), OPUS, &[]).await,
@@ -1114,6 +1122,122 @@ async fn affinity_nothing_passes_hashes_over_the_tier() {
             "pick {i} must hash over the whole tier"
         );
     }
+    assert_eq!(migrations(&state), [0; 5], "a degraded pick is not a move");
+    assert_eq!(log_lines(marker), Vec::<String>::new());
+}
+
+/// A key whose session starts on `HOME` but that the tier-0 hash sends
+/// elsewhere once `spend_pool` fails every tier-0 account, and that account.
+/// Leaves accounts `0..n` healed and the key not yet routed.
+async fn home_key_spent_pool_moves(state: &AppState, n: usize, marker: &str) -> (String, usize) {
+    log_capture_buf();
+    let homed = keys_hashing_to(state, HOME, 20, 50_000, marker).await;
+    spend_pool(state, POOL).await;
+    let candidates = state.routing_candidates(OPUS, &[]).await;
+    let tier: Vec<&RoutingCandidate> = candidates.iter().filter(|c| c.priority == 0).collect();
+    let found = homed.into_iter().find_map(|k| {
+        let away = state.pick_rendezvous(&tier, &k).unwrap().endpoint;
+        (away != HOME).then_some((k, away))
+    });
+    heal_pool(state, n).await;
+    found.expect("a home key that the spent tier hashes elsewhere")
+}
+
+/// LAB-9404: picks made while nothing in the tier passes are not remembered,
+/// so leaving a degraded stretch is not a move. A session on `HOME` is
+/// hashed elsewhere while every account fails the overage rule, and returns
+/// to `HOME` when the tier recovers: that is no move, and nothing counts.
+#[tokio::test]
+async fn affinity_degraded_stretch_is_not_a_move() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9404-degraded-exit";
+    let (key, away) = home_key_spent_pool_moves(&state, POOL, marker).await;
+
+    assert_eq!(state.pick_endpoint(Some(&key), OPUS, &[]).await, Some(HOME));
+    spend_pool(&state, POOL).await;
+    assert_eq!(state.pick_endpoint(Some(&key), OPUS, &[]).await, Some(away));
+    heal_pool(&state, POOL).await;
+    assert_eq!(state.pick_endpoint(Some(&key), OPUS, &[]).await, Some(HOME));
+
+    assert_eq!(
+        migrations(&state),
+        [0; 5],
+        "a degraded stretch is not a move"
+    );
+    assert_eq!(log_lines(marker), Vec::<String>::new());
+}
+
+/// LAB-9404: an account whose gate sits exactly at `soft_limit` fails the
+/// overage rule, as it fails the healthy filter, so its session leaves under
+/// the window that binds it: `loaded` for a 5h gate.
+#[tokio::test]
+async fn affinity_gate_at_soft_limit_leaves_as_loaded() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9404-boundary-label";
+    let key = seed_session(&state, marker).await;
+    let now = AppState::now_epoch();
+    set_account_utilization(
+        &state,
+        HOME,
+        PROD_SOFT_LIMIT,
+        0.30,
+        now + 10_000,
+        now + 4 * 86_400,
+    )
+    .await;
+
+    let candidates = state.routing_candidates(OPUS, &[]).await;
+    let home = &candidates[HOME];
+    assert_eq!(
+        home.gate, state.soft_limit,
+        "home's gate is exactly soft_limit"
+    );
+    assert!(
+        !state.keeps_affinity(home),
+        "the rule agrees with the healthy filter"
+    );
+    assert_session_leaves(&state, &key, marker, MigrationReason::Loaded).await;
+}
+
+/// A degraded tier with one account exactly at `soft_limit` and the rest
+/// above it: no account passes, so keyed picks hash over the whole tier
+/// rather than all landing on the account at the boundary, and none counts.
+#[tokio::test]
+async fn affinity_gate_at_soft_limit_does_not_take_a_degraded_tier() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9404-boundary-pile-on";
+    log_capture_buf();
+    let now = AppState::now_epoch();
+    for i in 0..POOL {
+        let util_5h = if i == HOME { PROD_SOFT_LIMIT } else { 0.95 };
+        set_account_utilization(&state, i, util_5h, 0.30, now + 10_000, now + 4 * 86_400).await;
+    }
+    let candidates = state.routing_candidates(OPUS, &[]).await;
+    let tier: Vec<&RoutingCandidate> = candidates.iter().collect();
+    assert!(
+        tier.iter().all(|c| c.gate >= state.soft_limit),
+        "no account is healthy: the tier is degraded"
+    );
+
+    let keys = 200;
+    let mut home = 0;
+    for i in 0..keys {
+        let key = format!("{marker}-{i}");
+        let picked = state.pick_endpoint(Some(&key), OPUS, &[]).await.unwrap();
+        assert_eq!(
+            picked,
+            state.pick_rendezvous(&tier, &key).unwrap().endpoint,
+            "key {i} must hash over the whole tier"
+        );
+        home += usize::from(picked == HOME);
+    }
+    assert!(
+        home < keys / 4,
+        "{home} of {keys} keys piled onto the boundary account"
+    );
     assert_eq!(migrations(&state), [0; 5], "a degraded pick is not a move");
     assert_eq!(log_lines(marker), Vec::<String>::new());
 }
