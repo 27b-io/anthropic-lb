@@ -938,6 +938,9 @@ pub(crate) struct ClientStore {
     /// Resume copy saves failed in a row. While above 0 a copy is owed, and
     /// every poll tries to save one.
     resume_failures: AtomicU64,
+    /// Of those, the failed saves in a row whose removal of the last copy
+    /// did not land. A landed save or a benign failure ends the run.
+    unsafe_failures: AtomicU64,
 }
 
 /// What `ClientStore::metrics` reports.
@@ -1086,6 +1089,7 @@ impl ClientStore {
             answered: tokio::sync::watch::channel(false).0,
             failures: AtomicU64::new(0),
             resume_failures: AtomicU64::new(0),
+            unsafe_failures: AtomicU64::new(0),
         })
     }
 
@@ -1374,6 +1378,7 @@ impl ClientStore {
         let (e, removal) = match written {
             Ok(()) => {
                 let failures = self.resume_failures.swap(0, Ordering::Relaxed);
+                self.unsafe_failures.store(0, Ordering::Relaxed);
                 if failures > 0 {
                     info!(failures, "client store: resume copy written again");
                 }
@@ -1382,9 +1387,22 @@ impl ClientStore {
             Err(failed) => failed,
         };
         let failures = self.resume_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        // A removal that did not land is never rate-limited: an earlier,
-        // benign failure must not hide it.
+        // A removal that did not land is rate-limited on its own count, so an
+        // earlier, benign failure never hides it: the first of a run is
+        // logged at once, then once every FAILURE_LOG_EVERY.
+        let unsafe_failures = if removal.is_some() {
+            self.unsafe_failures.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.unsafe_failures.store(0, Ordering::Relaxed);
+            0
+        };
         if removal.is_none() && failures != 1 && !failures.is_multiple_of(FAILURE_LOG_EVERY) {
+            return;
+        }
+        if removal.is_some()
+            && unsafe_failures != 1
+            && !unsafe_failures.is_multiple_of(FAILURE_LOG_EVERY)
+        {
             return;
         }
         let path = self.resume_path.display();
@@ -1400,6 +1418,7 @@ impl ClientStore {
                 error = %e,
                 removal_error = %rm,
                 failures,
+                unsafe_failures,
                 "client store: cannot write the resume copy or durably remove the last one; a restart now could resume restrictions older than those enforced; every poll tries again"
             ),
         }

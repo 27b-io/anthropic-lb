@@ -688,6 +688,71 @@ async fn an_unsynced_removal_is_logged_after_a_benign_failure() {
     assert_eq!(unsafe_lines(), 1, "the unsafe second failure is logged");
 }
 
+/// A save whose removal does not land is logged at the first of a run of
+/// them, then once every `FAILURE_LOG_EVERY`, so a directory that stays
+/// broken is not logged once a poll. A benign failure or a landed save ends
+/// the run, and the next unsafe failure is logged at once. The copy's own
+/// path is a directory here, so no user can remove it.
+#[tokio::test]
+async fn repeated_unsafe_failures_are_logged_once_every_failure_log_every() {
+    log_capture_buf();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.client-store.json");
+    let tmp = dir.path().join("config.client-store.json.tmp");
+    let marker = path.display().to_string();
+    let poll_url = "https://store.invalid/_clients/poll";
+    let inst = Instance::in_dir(
+        "http://127.0.0.1:9",
+        file_clients(&["file-only"]),
+        poll_url,
+        None,
+        dir.path(),
+    );
+    // A fresh version each call, so every answer changes the set.
+    let disabled = || restrictions_part(&body(true, &[("file-only", Disabled, now_us() - 1)], &[]));
+    let unsafe_lines = || {
+        log_lines(&marker)
+            .into_iter()
+            .filter(|l| l.contains("ERROR") && l.contains("durably remove"))
+            .count()
+    };
+
+    // The save cannot land, and the last copy cannot be removed.
+    std::fs::create_dir(&tmp).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    for _ in 0..2 * FAILURE_LOG_EVERY {
+        inst.answer(answer(unavailable(), disabled())).await;
+    }
+    assert!(inst.store.resume_unsaved(), "resume_unsaved stays raised");
+    assert_eq!(
+        unsafe_lines(),
+        3,
+        "unsafe failures 1, 60 and 120 are logged"
+    );
+
+    // A benign failure ends the run: the next unsafe failure is logged.
+    std::fs::remove_dir(&path).unwrap();
+    inst.answer(answer(unavailable(), disabled())).await;
+    assert_eq!(unsafe_lines(), 3, "the benign failure is no unsafe line");
+    std::fs::create_dir(&path).unwrap();
+    inst.answer(answer(unavailable(), disabled())).await;
+    assert_eq!(unsafe_lines(), 4, "logged at once after a benign failure");
+    inst.answer(answer(unavailable(), disabled())).await;
+    assert_eq!(unsafe_lines(), 4, "the repeat is rate-limited");
+
+    // A landed save ends the run too.
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::remove_dir(&tmp).unwrap();
+    inst.answer(answer(unavailable(), disabled())).await;
+    assert!(!inst.store.resume_unsaved(), "the save landed");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    std::fs::create_dir(&tmp).unwrap();
+    inst.answer(answer(unavailable(), disabled())).await;
+    assert!(inst.store.resume_unsaved());
+    assert_eq!(unsafe_lines(), 5, "logged at once after a landed save");
+}
+
 #[tokio::test]
 async fn a_resume_copy_that_fails_its_checks_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
