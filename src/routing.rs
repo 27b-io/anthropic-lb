@@ -270,9 +270,9 @@ impl AppState {
             let (picked_headroom, bind) = affinity_headroom(picked);
             let (other_headroom, _) = affinity_headroom(other);
             if picked_headroom < other_headroom * LEGACY_AFFINITY_OVERRIDE_RATIO {
-                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
-                // Loud on purpose — see the StickyWeightedV2 override below for
-                // the cascade rationale. Breaking affinity is a pool-health
+                self.affinity_migrations[MigrationReason::from(bind) as usize]
+                    .fetch_add(1, Ordering::Relaxed);
+                // Loud on purpose. Breaking affinity is a pool-health
                 // warning sign, NOT routine — EXCEPT when a status floor bound
                 // the sticky account (`Floored`): Anthropic flagged it and we're
                 // moving the session onto fresh capacity, which is what the
@@ -312,100 +312,111 @@ impl AppState {
         picked
     }
 
+    /// Whether a keyed session may stay on `c` (LAB-9360): its
+    /// `affinity_headroom` is at least `1 - soft_limit`, so neither its 5h gate
+    /// nor its weekly quota is near the limit. A status floor alone does not
+    /// fail it unless the floor itself crosses `soft_limit` (`throttled`,
+    /// `rejected`); the weekly `allowed_warning` floor (0.80) keeps the session.
+    fn keeps_affinity(&self, c: &RoutingCandidate) -> bool {
+        affinity_headroom(c).0 >= 1.0 - self.soft_limit
+    }
+
+    /// The candidate in `pool` with the highest `rendezvous_score` for `key`.
+    /// Candidates without a positive finite weight never win; `None` when no
+    /// candidate has one.
+    fn pick_rendezvous<'a>(
+        &self,
+        pool: &[&'a RoutingCandidate],
+        key: &str,
+    ) -> Option<&'a RoutingCandidate> {
+        pool.iter()
+            .copied()
+            .filter(|c| c.weight.is_finite() && c.weight > 0.0)
+            .map(|c| {
+                let name = &self.endpoints[c.endpoint].name;
+                (c, rendezvous_score(key, name, c.weight))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(c, _)| c)
+    }
+
+    /// A keyed session goes to the account that wins its rendezvous hash among
+    /// the candidates that pass the overage rule (`keeps_affinity`), so it
+    /// stays on that account until the account fails the rule or leaves the
+    /// candidate set, or another account's weight rises enough to win the key.
+    /// The weights still place new sessions, so expiring quota is burned
+    /// first. An account that fails the rule loses its sessions to their next
+    /// highest score, which spreads them over the pool rather than onto one
+    /// best account. When nothing in the tier passes, the hash runs over the
+    /// whole effective set, as the tier's degraded mode does for load.
+    /// Un-keyed requests scatter over the weighted buckets.
     fn pick_sticky_weighted_v2<'a>(
         &self,
         effective: &[&'a RoutingCandidate],
         total_weight: f64,
         affinity_key: Option<&str>,
     ) -> &'a RoutingCandidate {
-        let mut picked = self.pick_weighted_bucket(effective, total_weight, affinity_key);
+        let Some(key) = affinity_key else {
+            return self.pick_weighted_bucket(effective, total_weight, None);
+        };
+        let passing: Vec<&RoutingCandidate> = effective
+            .iter()
+            .copied()
+            .filter(|c| self.keeps_affinity(c))
+            .collect();
+        self.pick_rendezvous(&passing, key)
+            .or_else(|| self.pick_rendezvous(effective, key))
+            // Unreachable: `pick_endpoint_for_client` only picks from a set
+            // with positive total weight, and every weight is finite.
+            .unwrap_or_else(|| self.pick_weighted_bucket(effective, total_weight, Some(key)))
+    }
 
-        if let Some(key) = affinity_key {
-            let (picked_headroom, bind) = affinity_headroom(picked);
-            let (best, best_headroom) = effective
-                .iter()
-                .map(|c| (*c, affinity_headroom(c).0))
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap();
-            if best.endpoint != picked.endpoint
-                && picked_headroom < best_headroom * STICKY_WEIGHTED_OVERRIDE_RATIO
-            {
-                // The sticky account is out of headroom for this session. Do NOT
-                // migrate to `best` (the global argmax): that target rotates every
-                // request as utilizations drift, so a session chases it across the
-                // whole pool and pays a cold-cache `cache_creation` charge on every
-                // hop (measured in prod: a swept client ran a 1.18 create:read ratio
-                // vs ~0.05 for sticky clients — it created more cache than it ever
-                // read back). Instead re-pick over the healthy remainder using a
-                // SALTED hash of the same affinity key: deterministic per session
-                // (so the cache warms on the replacement and stays there) yet spread
-                // across sessions (distinct keys → distinct replacements), and
-                // independent of which account is momentarily `best`.
-                //
-                // "Healthy" = the override would not flee it: the negation of the
-                // trigger above. Excluding only `picked` let a 7d-spent account
-                // (gate-healthy, big expiring-quota bucket) replace an equally
-                // spent one, which answered the caller with Anthropic's
-                // entitlement 400 (LAB-4719). The floor also excludes `picked`.
-                // Never empty: `best` always clears it, and clearing it means
-                // headroom > 0, so gate < 1 and weight > 0. The `best` fallback
-                // below is therefore unreachable from routing_candidates; it
-                // stays as a guard, and it would still satisfy the floor.
-                let floor = best_headroom * STICKY_WEIGHTED_OVERRIDE_RATIO;
-                let remaining: Vec<&RoutingCandidate> = effective
-                    .iter()
-                    .copied()
-                    .filter(|c| affinity_headroom(c).0 >= floor)
-                    .collect();
-                let remaining_weight: f64 = remaining.iter().map(|c| c.weight).sum();
-                let replacement = if remaining_weight > 0.0 {
-                    // NUL separator can't appear in a header-derived affinity key
-                    // (ip:client:agent:session), so the salted key never collides
-                    // with a real one.
-                    let salted = format!("{key}\u{0}migrate");
-                    self.pick_weighted_bucket(&remaining, remaining_weight, Some(&salted))
-                } else {
-                    best
-                };
-                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
-                // Loud on purpose. Sustained breaking with reason="loaded" means
-                // the pool is the bottleneck — add capacity, don't tune the
-                // ratio. reason="spent" means one account's week is nearly gone
-                // while others are fresh; expect it to cluster before weekly
-                // resets and vanish after. reason="floored" is neither: Anthropic
-                // put a status floor on the sticky account and we're moving the
-                // session onto fresh capacity — the floor doing its job, not a
-                // pool problem. It logs at INFO so the WARN stays a real signal
-                // (LAB-3295); the counter records all three. Field set is
-                // identical across levels — tracing's compile-time level forces
-                // the two arms — so it lives once in this local macro.
-                macro_rules! log_migration {
-                    ($lvl:ident, $msg:literal) => {
-                        $lvl!(
-                            strategy = RoutingStrategy::StickyWeightedV2.as_str(),
-                            affinity = key,
-                            reason = bind.as_str(),
-                            picked_account = self.endpoint_name(picked.endpoint),
-                            picked_headroom = format!("{:.3}", picked_headroom),
-                            replacement_account = self.endpoint_name(replacement.endpoint),
-                            replacement_headroom =
-                                format!("{:.3}", affinity_headroom(replacement).0),
-                            best_account = self.endpoint_name(best.endpoint),
-                            ratio = format!("{:.3}", picked_headroom / best_headroom),
-                            $msg
-                        )
-                    };
-                }
-                if matches!(bind, AffinityBind::Floored) {
-                    log_migration!(info, "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)");
-                } else {
-                    log_migration!(warn, "affinity broken: sticky endpoint out of headroom, migrating session to stable replacement");
-                }
-                picked = replacement;
-            }
+    /// Signal only: count and log a keyed session's move to another account
+    /// on this replica (LAB-9360). Called at the first pick of a request, after
+    /// routing decided; nothing here changes a pick. A move is a change from
+    /// the account this replica last picked for the key and model, so a
+    /// session that sits on its replacement logs once, not on every request.
+    /// Per model because candidates and weights are: a key alternating models
+    /// may rightly sit on one account per model, which is not a move. The reason
+    /// says why the old account lost the key (`MigrationReason`). A pick made
+    /// while nothing in the tier passes the overage rule is degraded routing,
+    /// not a move, and is recorded without being counted.
+    fn record_affinity_pick(
+        &self,
+        key: &str,
+        model: &str,
+        picked: EndpointIdx,
+        candidates: &[RoutingCandidate],
+        effective: &[&RoutingCandidate],
+        tier: u32,
+    ) {
+        let key_hash = stable_affinity_hash(&format!("{key}\u{0}{model}"));
+        let last =
+            lock_recovering(&self.affinity_last_pick, "affinity_last_pick").swap(key_hash, picked);
+        let Some(from) = last.filter(|&from| from != picked) else {
+            return;
+        };
+        if !effective.iter().any(|c| self.keeps_affinity(c)) {
+            return;
         }
-
-        picked
+        let in_effective = effective.iter().any(|c| c.endpoint == from);
+        let reason = match candidates
+            .iter()
+            .find(|c| c.endpoint == from && c.priority == tier)
+        {
+            None => MigrationReason::Unavailable,
+            Some(c) if in_effective && self.keeps_affinity(c) => MigrationReason::Rehomed,
+            Some(c) => affinity_headroom(c).1.into(),
+        };
+        self.affinity_migrations[reason as usize].fetch_add(1, Ordering::Relaxed);
+        info!(
+            strategy = self.routing_strategy.as_str(),
+            affinity = key,
+            reason = reason.as_str(),
+            from_account = self.endpoint_name(from),
+            to_account = self.endpoint_name(picked),
+            "affinity migrated: session moved to another account"
+        );
     }
 
     /// Select from a pre-filtered candidate slice using the configured routing strategy.
@@ -467,7 +478,8 @@ impl AppState {
 
     /// Test-only convenience: pick with no client identity and standard
     /// speed — no pinning, no fast-mode exclusion. Keeps the pre-LAB-2636
-    /// routing tests byte-identical.
+    /// routing tests byte-identical. An empty `skip` counts as a request's
+    /// first pick, as it is in the handlers' first round.
     #[cfg(test)]
     pub(crate) async fn pick_endpoint(
         &self,
@@ -476,8 +488,15 @@ impl AppState {
         skip: &[EndpointIdx],
     ) -> Option<EndpointIdx> {
         let anonymous = self.caller("");
-        self.pick_endpoint_for_client(affinity_key, model, skip, &anonymous, FastRequest::STANDARD)
-            .await
+        self.pick_endpoint_for_client(
+            affinity_key,
+            model,
+            skip,
+            &anonymous,
+            FastRequest::STANDARD,
+            skip.is_empty(),
+        )
+        .await
     }
 
     /// Pick the best available endpoint (account or fallback upstream).
@@ -508,6 +527,9 @@ impl AppState {
     /// `soft_limit` is intra-tier load-shedding and never causes a tier jump. This
     /// guarantees free capacity is fully drained before any paid (overage/upstream)
     /// tier is touched.
+    ///
+    /// `first_pick`: this is the request's first pick, not a retry's re-pick.
+    /// Only a first pick feeds the affinity-move signal (`record_affinity_pick`).
     pub(crate) async fn pick_endpoint_for_client(
         &self,
         affinity_key: Option<&str>,
@@ -515,6 +537,7 @@ impl AppState {
         skip: &[EndpointIdx],
         caller: &Caller,
         fast: FastRequest,
+        first_pick: bool,
     ) -> Option<EndpointIdx> {
         let mut candidates = self.routing_candidates(model, skip).await;
         let fast_disabled = self.fast_mode_disabled_for(fast);
@@ -610,7 +633,15 @@ impl AppState {
                     "pick: tier all soft-limited — degrading within tier"
                 );
             }
-            return Some(self.pick_from_candidates(&effective, total_weight, affinity_key, *tier));
+            let picked = self.pick_from_candidates(&effective, total_weight, affinity_key, *tier);
+            let sticky_v2 = self.routing_strategy == RoutingStrategy::StickyWeightedV2;
+            match affinity_key {
+                Some(key) if first_pick && sticky_v2 => {
+                    self.record_affinity_pick(key, model, picked, &candidates, &effective, *tier)
+                }
+                _ => {}
+            }
+            return Some(picked);
         }
 
         debug!("pick: all tiers exhausted");

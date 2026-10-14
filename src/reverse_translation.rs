@@ -1724,7 +1724,7 @@ pub(crate) async fn openai_chat_handler(
             let mut skip: Vec<EndpointIdx> = entitlement_resp.iter().map(|(i, _)| *i).collect();
             let mut saw_529 = false;
             let mut saw_transient = false;
-            for _attempt in 0..n {
+            for attempt in 0..n {
                 // Pick the next endpoint and dispatch by protocol. Both forwards
                 // return a `ForwardOutcome` so the shared round-gated policy in
                 // `apply_round_outcome` covers both.
@@ -1736,6 +1736,7 @@ pub(crate) async fn openai_chat_handler(
                         &skip,
                         &caller,
                         FastRequest::STANDARD,
+                        retry_round == 0 && attempt == 0,
                     )
                     .await
                 {

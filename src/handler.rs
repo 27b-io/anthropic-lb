@@ -2184,13 +2184,20 @@ pub(crate) async fn proxy_handler(
         let mut skip: Vec<EndpointIdx> = entitlement_resp.iter().map(|(i, _)| *i).collect();
         let mut saw_529 = false;
         let mut saw_transient = false;
-        for _attempt in 0..n {
+        for attempt in 0..n {
             // Pick the next endpoint and dispatch by protocol:
             // `forward_anthropic` (Anthropic) or `try_fallback_upstream`
             // (OpenAI). Both return a `ForwardOutcome` so the shared
             // round-gated policy in `apply_round_outcome` covers both.
             let (outcome, picked_idx): (ForwardOutcome, EndpointIdx) = match state
-                .pick_endpoint_for_client(affinity, &model, &skip, &caller, fast)
+                .pick_endpoint_for_client(
+                    affinity,
+                    &model,
+                    &skip,
+                    &caller,
+                    fast,
+                    retry_round == 0 && attempt == 0,
+                )
                 .await
             {
                 Some(i) => {

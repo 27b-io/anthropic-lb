@@ -1835,20 +1835,20 @@ pub(crate) async fn metrics_handler(
         state.body_read_timeout_total.load(Ordering::Relaxed),
     );
 
-    // Affinity overrides that migrated a session (GH#156), by the window that
-    // bound the sticky account — see the WARN in pick_sticky_weighted_v2.
+    // Keyed sessions that moved to another account, by reason — see
+    // `record_affinity_pick`. Per replica: aggregate with `sum by (reason)`.
     prom_header(
         &mut buf,
         "anthropic_affinity_migrations_total",
         "counter",
-        "Affinity overrides that migrated a session, by the window that bound the sticky account",
+        "Keyed sessions that moved to another account, by reason",
     );
-    for bind in AffinityBind::ALL {
+    for reason in MigrationReason::ALL {
         prom_counter(
             &mut buf,
             "anthropic_affinity_migrations_total",
-            &[("reason", bind.as_str())],
-            state.affinity_migrations[bind as usize].load(Ordering::Relaxed),
+            &[("reason", reason.as_str())],
+            state.affinity_migrations[reason as usize].load(Ordering::Relaxed),
         );
     }
 
