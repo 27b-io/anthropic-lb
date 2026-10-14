@@ -717,7 +717,7 @@ pub(crate) struct AppState {
     pub(crate) body_read_timeout_total: AtomicU64,
     /// Keyed sessions that moved to another account, indexed by
     /// `MigrationReason`. Exposed as `anthropic_affinity_migrations_total{reason}`.
-    pub(crate) affinity_migrations: [AtomicU64; 5],
+    pub(crate) affinity_migrations: [AtomicU64; MigrationReason::ALL.len()],
     /// The account each affinity key was last routed to on this replica, so
     /// `affinity_migrations` counts moves rather than requests. Signal only:
     /// routing never reads it.
@@ -993,8 +993,8 @@ pub(crate) struct RoutingCandidate {
     pub(crate) gate: f64,
     pub(crate) wr: f64,
     /// Unused share of the model's weekly (7d) quota; 1.0 when unknown or
-    /// superseded by overage. Time-free — the affinity override reads this,
-    /// never `wr`/`weight` (see `affinity_headroom`).
+    /// superseded by overage. Time-free: the affinity rule reads this, never
+    /// `wr`/`weight` (see `affinity_headroom`).
     pub(crate) unused_7d: f64,
     pub(crate) weight: f64,
     /// The effective `gate` is set by an Anthropic status floor
