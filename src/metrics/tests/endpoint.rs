@@ -1390,6 +1390,276 @@ async fn refresh_metrics_weights_soft_limit_graceful_degradation() {
     }
 }
 
+// ── routing_share mirrors the picker's priority tiers ───────────
+
+/// An Anthropic endpoint at `priority`.
+fn mk_tiered(name: &str, priority: u32) -> Endpoint {
+    let mut ep = mk_endpoint(name, &format!("sk-ant-api-{name}"));
+    ep.priority = priority;
+    ep
+}
+
+/// Give endpoint `i` 5h-only data at `util`: its gate tracks `util`, its
+/// weight the headroom left.
+async fn set_util(state: &AppState, i: usize, util: f64) {
+    let mut info = state.endpoints[i].rate_info.write().await;
+    info.utilization_5h = Some(util);
+    info.reset_5h = Some(AppState::now_epoch() + 10_000);
+    info.utilization = Some(util);
+    info.claims_7d.clear();
+}
+
+/// Put endpoint `i` in overage: its subscription windows are rejected and
+/// the overage window (30% used) governs, as in production.
+async fn set_overage(state: &AppState, i: usize) {
+    let now = AppState::now_epoch();
+    let mut info = state.endpoints[i].rate_info.write().await;
+    info.utilization_5h = Some(1.0);
+    info.reset_5h = Some(now + 7200);
+    info.status_5h = Some("rejected".to_string());
+    info.claims_7d.clear();
+    info.claims_7d.insert(
+        "seven_day".to_string(),
+        ClaimWindowData {
+            utilization: Some(1.0),
+            reset: Some(now + 302_400),
+            status: Some("rejected".to_string()),
+            ..Default::default()
+        },
+    );
+    info.overage_in_use = true;
+    info.overage_status = Some("allowed".to_string());
+    info.overage_utilization = Some(0.30);
+    info.overage_reset = Some(now + 86_400);
+}
+
+async fn set_hard_limited(state: &AppState, i: usize) {
+    state.endpoints[i]
+        .rate_info
+        .write()
+        .await
+        .hard_limited_until = Some(Instant::now() + Duration::from_secs(600));
+}
+
+fn shares(state: &AppState) -> Vec<f64> {
+    state
+        .endpoints
+        .iter()
+        .map(|ep| f64::from_bits(ep.last_routing_share.load(Ordering::Relaxed)))
+        .collect()
+}
+
+fn weights(state: &AppState) -> Vec<f64> {
+    state
+        .endpoints
+        .iter()
+        .map(|ep| f64::from_bits(ep.last_routing_weight.load(Ordering::Relaxed)))
+        .collect()
+}
+
+fn assert_shares(state: &AppState, want: &[f64]) {
+    let got = shares(state);
+    assert!(
+        got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-9),
+        "shares: got {got:?}, want {want:?}"
+    );
+}
+
+/// The picker serves only from the account the gauge gives the whole share.
+async fn assert_picker_serves(state: &AppState, idx: usize) {
+    for _ in 0..20 {
+        assert_eq!(
+            state.pick_endpoint(None, "claude-sonnet-4-5", &[]).await,
+            Some(idx),
+            "picker must serve the account whose share is 1.0"
+        );
+    }
+}
+
+/// AC1: a priority-2 account reads 0 while priority 1 has weight; the
+/// weight gauge still reports it as it did before.
+#[tokio::test]
+async fn routing_share_zero_for_lower_priority_tier() {
+    let state = test_state_with(vec![
+        mk_tiered("a", 1),
+        mk_tiered("b", 1),
+        mk_tiered("c", 2),
+    ]);
+    for i in 0..3 {
+        set_util(&state, i, 0.20).await;
+    }
+
+    state.refresh_metrics_weights().await;
+
+    assert_shares(&state, &[0.5, 0.5, 0.0]);
+    assert!(
+        weights(&state).iter().all(|&w| w > 0.0),
+        "weight gauge is tier-blind"
+    );
+}
+
+/// AC2: an account serving via overage is demoted by `overage_penalty`,
+/// exactly as `routing_candidates` demotes it.
+#[tokio::test]
+async fn routing_share_zero_for_overage_demoted_account() {
+    // Beside a healthy same-tier account: the overage account reads 0
+    // although it carries weight.
+    let state = test_state_with(vec![mk_tiered("a", 1), mk_tiered("b", 1)]);
+    set_overage(&state, 0).await;
+    set_util(&state, 1, 0.20).await;
+
+    state.refresh_metrics_weights().await;
+
+    assert_shares(&state, &[0.0, 1.0]);
+    assert!(weights(&state)[0] > 0.0, "overage account keeps its weight");
+    assert_picker_serves(&state, 1).await;
+
+    // The demotion is `overage_penalty` (10 in tests), not "last": with
+    // tier 1 hard-limited, the overage account (1 + 10 = 11) outranks a
+    // healthy priority-12 account.
+    let state = test_state_with(vec![
+        mk_tiered("a", 1),
+        mk_tiered("b", 1),
+        mk_tiered("c", 12),
+    ]);
+    assert_eq!(state.overage_penalty, 10);
+    set_overage(&state, 0).await;
+    set_hard_limited(&state, 1).await;
+    set_util(&state, 2, 0.20).await;
+
+    state.refresh_metrics_weights().await;
+
+    assert_shares(&state, &[1.0, 0.0, 0.0]);
+    assert_picker_serves(&state, 0).await;
+}
+
+/// AC3 + AC6: a tier with no weight passes the share to the next tier, by
+/// weight; with no weight anywhere every share reads 0.
+#[tokio::test]
+async fn routing_share_falls_through_exhausted_tier() {
+    let state = test_state_with(vec![
+        mk_tiered("a", 1),
+        mk_tiered("b", 1),
+        mk_tiered("c", 2),
+        mk_tiered("d", 2),
+    ]);
+    set_hard_limited(&state, 0).await;
+    // b: rejected 5h → gate 1.0 → zero weight.
+    set_util(&state, 1, 0.10).await;
+    state.endpoints[1].rate_info.write().await.status_5h = Some("rejected".to_string());
+    set_util(&state, 2, 0.20).await;
+    set_util(&state, 3, 0.60).await;
+
+    state.refresh_metrics_weights().await;
+
+    let w = weights(&state);
+    let total = w[2] + w[3];
+    assert_shares(&state, &[0.0, 0.0, w[2] / total, w[3] / total]);
+    assert!(
+        shares(&state)[2] > shares(&state)[3],
+        "more headroom, more share"
+    );
+
+    // Nothing has weight → all zero.
+    for i in 2..4 {
+        set_hard_limited(&state, i).await;
+    }
+    state.refresh_metrics_weights().await;
+    assert_shares(&state, &[0.0; 4]);
+}
+
+/// AC4: soft limit sheds load within a tier and never moves the share to
+/// the next one.
+#[tokio::test]
+async fn routing_share_soft_limit_degrades_within_tier() {
+    // Serving tier has a healthy account: the soft-limited one reads 0.
+    let state = test_state_with_soft_limit(
+        vec![mk_tiered("a", 1), mk_tiered("b", 1), mk_tiered("c", 2)],
+        0.90,
+    );
+    set_util(&state, 0, 0.20).await;
+    set_util(&state, 1, 0.95).await;
+    set_util(&state, 2, 0.20).await;
+
+    state.refresh_metrics_weights().await;
+    assert_shares(&state, &[1.0, 0.0, 0.0]);
+
+    // Every serving-tier account soft-limited: they share by weight, and
+    // the healthy priority-2 account still reads 0.
+    set_util(&state, 0, 0.95).await;
+    set_util(&state, 1, 0.92).await;
+
+    state.refresh_metrics_weights().await;
+
+    let s = shares(&state);
+    assert!(
+        s[0] > 0.0 && s[1] > 0.0,
+        "degraded tier keeps serving: {s:?}"
+    );
+    assert!(s[1] > s[0], "more headroom, more share: {s:?}");
+    assert!((s[0] + s[1] - 1.0).abs() < 1e-9, "shares sum to 1: {s:?}");
+    assert_eq!(s[2], 0.0, "soft limit never jumps a tier");
+}
+
+/// AC5: an OpenAI endpoint sits in its configured tier with its fixed
+/// weight.
+#[tokio::test]
+async fn routing_share_openai_endpoint_in_configured_tier() {
+    let mut state = test_state_with(vec![]);
+    {
+        let st = Arc::get_mut(&mut state).unwrap();
+        st.endpoints.push(mk_tiered("ep-a", 0));
+        let mut oai = make_endpoint("oai", Protocol::OpenAI);
+        oai.priority = 100;
+        st.endpoints.push(oai);
+    }
+    set_util(&state, 0, 0.20).await;
+
+    state.refresh_metrics_weights().await;
+    assert_shares(&state, &[1.0, 0.0]);
+    assert_eq!(weights(&state)[1], 1.0, "fixed weight unchanged");
+
+    set_hard_limited(&state, 0).await;
+    state.refresh_metrics_weights().await;
+    assert_shares(&state, &[0.0, 1.0]);
+}
+
+/// Accounts `routing_candidates` skips take no share: an Anthropic endpoint
+/// with an open transport breaker, and a hard-limited OpenAI endpoint. Their
+/// weight and gate gauges still read as before.
+#[tokio::test]
+async fn routing_share_skips_unroutable_endpoints() {
+    let mut state = test_state_with(vec![]);
+    {
+        let st = Arc::get_mut(&mut state).unwrap();
+        st.endpoints.push(mk_tiered("a", 1));
+        let mut oai = make_endpoint("oai", Protocol::OpenAI);
+        oai.priority = 1;
+        st.endpoints.push(oai);
+        st.endpoints.push(mk_tiered("c", 2));
+    }
+    set_util(&state, 0, 0.20).await;
+    set_util(&state, 2, 0.20).await;
+    state.endpoints[0]
+        .rate_info
+        .write()
+        .await
+        .transport
+        .open_until = Some(Instant::now() + Duration::from_secs(600));
+    set_hard_limited(&state, 1).await;
+
+    state.refresh_metrics_weights().await;
+
+    assert_shares(&state, &[0.0, 0.0, 1.0]);
+    assert_picker_serves(&state, 2).await;
+    let w = weights(&state);
+    assert!(
+        w[0] > 0.0,
+        "transport breaker leaves the weight gauge as it was"
+    );
+    assert_eq!(w[1], 1.0, "OpenAI fixed weight unchanged");
+}
+
 #[tokio::test]
 async fn metrics_routing_weight_and_share_present() {
     let (mock_url, _handle) = spawn_mock_upstream().await;

@@ -2097,18 +2097,33 @@ impl AppState {
     ///   3. Soft-limit handling matches `pick_account`'s graceful-degradation
     ///      semantics: if at least one account is healthy, soft-limited
     ///      accounts are zeroed; if NO account is healthy, all are kept so
-    ///      the dashboard reflects the still-routable degraded pool.
+    ///      the dashboard reflects the still-routable degraded pool. The weight
+    ///      gauge applies this across the whole pool; the share applies it
+    ///      within each priority tier, as the picker does.
+    ///   4. The share is taken within the priority tier the picker would
+    ///      serve from: tiers in ascending order (configured `priority`, plus
+    ///      `overage_penalty` while an account serves via overage), the first
+    ///      with non-zero weight serves, and every other tier reads 0. Being
+    ///      model-agnostic and per-pool, it cannot mirror per-request state:
+    ///      the Fable demotion of `fable_included = false` accounts (it
+    ///      depends on the request's model), per-client
+    ///      `preferred_endpoints` pins, and fast-mode exclusions.
+    ///   5. Accounts `routing_candidates` skips — an open transport breaker,
+    ///      or a hard limit on an OpenAI endpoint — take no share, so their
+    ///      tier cannot claim traffic the picker sends elsewhere. Their weight
+    ///      and gate gauges still report as before.
     pub(crate) async fn refresh_metrics_weights(&self) {
         let now_epoch = Self::now_epoch();
         let now = Instant::now();
 
-        // Collect (gate, weight) per endpoint. None = excluded entirely
+        // Collect (gate, weight, tier) per endpoint. None = excluded entirely
         // (passthrough or hard-limited — never weighted in any condition).
         // OpenAI endpoints carry no rate-limit data — their representative
         // weight is the fixed (gate 0.0, weight 1.0) candidate that
-        // routing_candidates produces. Anthropic endpoints run the identical
-        // Anthropic computation.
-        let mut entries: Vec<Option<(f64, f64)>> = vec![None; self.endpoints.len()];
+        // routing_candidates produces, at its configured priority. Anthropic
+        // endpoints run the identical Anthropic computation and take the
+        // same overage demotion routing_candidates applies.
+        let mut entries: Vec<Option<MetricsEntry>> = vec![None; self.endpoints.len()];
         for (i, ep) in self.endpoints.iter().enumerate() {
             match ep.protocol {
                 Protocol::OpenAI => {
@@ -2117,14 +2132,33 @@ impl AppState {
                     // emits OpenAI endpoints with a fixed (gate 0.0,
                     // weight 1.0) — an OpenAI endpoint is a real routing
                     // candidate and belongs on dashboards.
-                    entries[i] = Some((0.0, 1.0));
+                    let info = ep.rate_info.read().await;
+                    entries[i] = Some(MetricsEntry {
+                        gate: 0.0,
+                        weight: 1.0,
+                        priority: ep.priority,
+                        routable: metrics_routable(&info, now),
+                    });
                 }
                 Protocol::Anthropic => {
                     if ep.passthrough {
                         continue;
                     }
                     let info = ep.rate_info.read().await;
-                    entries[i] = metrics_gate_weight(&info, now_epoch, now);
+                    entries[i] =
+                        metrics_gate_weight(&info, now_epoch, now).map(|(gate, weight)| {
+                            let priority = if metrics_overage_active(&info, now_epoch) {
+                                ep.priority.saturating_add(self.overage_penalty)
+                            } else {
+                                ep.priority
+                            };
+                            MetricsEntry {
+                                gate,
+                                weight,
+                                priority,
+                                routable: metrics_routable(&info, now),
+                            }
+                        });
                 }
             }
         }
@@ -2132,42 +2166,96 @@ impl AppState {
         self.store_metrics_weights(&entries);
     }
 
-    /// Normalize per-endpoint (gate, weight) pairs into the three gauge atomics
-    /// of each endpoint, applying pick_endpoint's graceful soft-limit
-    /// degradation.
-    fn store_metrics_weights(&self, entries: &[Option<(f64, f64)>]) {
+    /// Store each endpoint's three gauge atomics. The weight gauge applies
+    /// pick_endpoint's graceful soft-limit degradation across the whole pool;
+    /// the share is `metrics_tier_shares`.
+    fn store_metrics_weights(&self, entries: &[Option<MetricsEntry>]) {
         // Mirror pick_endpoint's graceful-degradation: only filter soft-limited
         // members when at least one healthy member exists in the pool.
-        let has_healthy = entries
-            .iter()
-            .any(|e| matches!(e, Some((gate, _)) if *gate < self.soft_limit));
+        let has_healthy = entries.iter().flatten().any(|e| e.gate < self.soft_limit);
 
-        let mut weights = vec![0f64; self.endpoints.len()];
-        for (i, entry) in entries.iter().enumerate() {
-            if let Some((gate, weight)) = entry {
-                if has_healthy && *gate >= self.soft_limit {
-                    continue; // soft-limited and there's a healthy alternative
-                }
-                weights[i] = *weight;
-            }
-        }
-
-        let total: f64 = weights.iter().sum();
+        let shares = self.metrics_tier_shares(entries);
         for (i, ep) in self.endpoints.iter().enumerate() {
-            let w = weights[i];
-            let share = if total > 0.0 { w / total } else { 0.0 };
+            let w = match entries[i] {
+                // Soft-limited with a healthy alternative → zero.
+                Some(e) if !(has_healthy && e.gate >= self.soft_limit) => e.weight,
+                _ => 0.0,
+            };
             // Excluded members (passthrough, hard-limited) report gate=1.0
             // (fully gated) since they receive zero traffic.
-            let gate = entries[i].map(|(g, _)| g).unwrap_or(1.0);
+            let gate = entries[i].map(|e| e.gate).unwrap_or(1.0);
             // Weight, share and gate are independent gauges, not a joint
             // invariant — a torn read across them is harmless.
             ep.last_routing_weight.store(w.to_bits(), Ordering::Relaxed);
             ep.last_routing_share
-                .store(share.to_bits(), Ordering::Relaxed);
+                .store(shares[i].to_bits(), Ordering::Relaxed);
             ep.last_effective_gate
                 .store(gate.to_bits(), Ordering::Relaxed);
         }
     }
+
+    /// The share `pick_endpoint_for_client` would give each entry: tiers are
+    /// walked in ascending priority, a tier prefers its healthy members
+    /// (`gate < soft_limit`) and degrades to its soft-limited ones when it has
+    /// none, and the first tier with non-zero weight takes the whole share.
+    /// All zero when no tier has weight. Unroutable entries are not candidates.
+    fn metrics_tier_shares(&self, entries: &[Option<MetricsEntry>]) -> Vec<f64> {
+        let entries: Vec<Option<MetricsEntry>> =
+            entries.iter().map(|e| e.filter(|e| e.routable)).collect();
+        let mut tiers: Vec<u32> = entries.iter().flatten().map(|e| e.priority).collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+
+        for tier in tiers {
+            let in_tier = |e: &Option<MetricsEntry>| e.filter(|e| e.priority == tier);
+            let has_healthy = entries
+                .iter()
+                .filter_map(in_tier)
+                .any(|e| e.gate < self.soft_limit);
+            let weights: Vec<f64> = entries
+                .iter()
+                .map(|e| match in_tier(e) {
+                    Some(e) if !has_healthy || e.gate < self.soft_limit => e.weight,
+                    _ => 0.0,
+                })
+                .collect();
+            let total: f64 = weights.iter().sum();
+            if total > 0.0 {
+                return weights.into_iter().map(|w| w / total).collect();
+            }
+        }
+        vec![0.0; entries.len()]
+    }
+}
+
+/// One endpoint's representative routing inputs for the metrics gauges.
+/// `priority` is the tier `routing_candidates` would place it in; `routable`
+/// is false when `routing_candidates` would skip it.
+#[derive(Clone, Copy)]
+struct MetricsEntry {
+    gate: f64,
+    weight: f64,
+    priority: u32,
+    routable: bool,
+}
+
+/// Neither hard-limited nor transport-unhealthy: the two skips
+/// `routing_candidates` applies to every protocol.
+fn metrics_routable(info: &RateLimitInfo, now: Instant) -> bool {
+    !info.hard_limited_until.is_some_and(|until| now < until)
+        && !info.transport.open_until.is_some_and(|until| now < until)
+}
+
+/// Whether `info` serves via overage — the same test `compute_routing_weight`
+/// sets `overage_active` from, which `routing_candidates` demotes on.
+fn metrics_overage_active(info: &RateLimitInfo, now_epoch: u64) -> bool {
+    overage_gate(info, now_epoch, stale_after_hard_limit(info)).is_some()
+}
+
+/// Rate data not refreshed since the last hard limit was marked.
+fn stale_after_hard_limit(info: &RateLimitInfo) -> bool {
+    info.hard_limited_until
+        .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until))
 }
 
 /// Per-entry representative `(gate, weight)` for metrics gauges, model-agnostic.
@@ -2181,9 +2269,7 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
         }
     }
 
-    let stale_after_hard_limit = info
-        .hard_limited_until
-        .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
+    let stale_after_hard_limit = stale_after_hard_limit(info);
 
     let gate_5h = gate_5h(info, now_epoch, stale_after_hard_limit);
 
