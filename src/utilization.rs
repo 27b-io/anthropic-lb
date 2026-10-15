@@ -949,43 +949,28 @@ pub(crate) fn top_level_keys_unambiguous(body: &[u8]) -> bool {
 /// `affinity_headroom` is below 50% of the alternative's, stickiness is broken.
 pub(crate) const LEGACY_AFFINITY_OVERRIDE_RATIO: f64 = 0.5;
 
-/// Which window binds a candidate's `affinity_headroom`.
-#[derive(Clone, Copy)]
-pub(crate) enum AffinityBind {
-    /// The effective gate is tighter, bound by raw (time-adjusted) 5h
-    /// utilisation or overage — the pool is the bottleneck (operator-actionable).
-    Loaded,
-    /// Unused weekly quota is tighter — one account's week is nearly spent.
-    Spent,
-    /// The gate is tighter, but set by an Anthropic status floor
-    /// (`status_to_floor`) that exceeds raw utilisation — the LB is moving the
-    /// session off an account Anthropic flagged, onto fresh capacity. Routine,
-    /// not a pool-health signal: logged at INFO, not WARN (LAB-3295).
-    Floored,
-}
-
-impl AffinityBind {
-    pub(crate) fn as_str(self) -> &'static str {
-        MigrationReason::from(self).as_str()
-    }
-}
-
 /// Why a keyed session left its account. Label value of
 /// `anthropic_affinity_migrations_total{reason}`; also indexes
 /// `AppState::affinity_migrations`. StickyWeightedV2 counts a session's real
 /// moves (LAB-9360); the legacy DynamicCapacityV1 override counts every
-/// request it overrides, under the first three labels.
+/// request it overrides, under the first three labels. The first three also
+/// name the window that binds a candidate's `affinity_headroom`.
 #[derive(Clone, Copy)]
 pub(crate) enum MigrationReason {
-    /// The old account failed the overage rule on its 5h load (`AffinityBind::Loaded`).
+    /// The effective gate binds, set by raw (time-adjusted) 5h utilisation or
+    /// overage: the pool is the bottleneck (operator-actionable).
     Loaded = 0,
-    /// The old account failed the overage rule on its weekly quota (`AffinityBind::Spent`).
+    /// Unused weekly quota binds: one account's week is nearly spent.
     Spent = 1,
-    /// The old account failed the overage rule on a status floor (`AffinityBind::Floored`).
+    /// The gate binds, but an Anthropic status floor (`status_to_floor`) set
+    /// it above raw utilisation: the LB is moving the session off an account
+    /// Anthropic flagged, onto fresh capacity. Routine, not a pool-health
+    /// signal: the legacy override logs it at INFO, not WARN (LAB-3295).
     Floored = 2,
     /// The old account is not a candidate in this request's tier: hard-limited
     /// or cooling after a 429, circuit breaker open, excluded for the model or
-    /// for fast mode, outside the caller's pin, or demoted for overage.
+    /// for fast mode, outside the caller's pin, demoted for overage, or the
+    /// request was served from a different tier.
     Unavailable = 3,
     /// The old account still passes, but another account won the key's hash:
     /// its weight rose, or it returned to the set.
@@ -1008,16 +993,6 @@ impl MigrationReason {
             Self::Floored => "floored",
             Self::Unavailable => "unavailable",
             Self::Rehomed => "rehomed",
-        }
-    }
-}
-
-impl From<AffinityBind> for MigrationReason {
-    fn from(bind: AffinityBind) -> Self {
-        match bind {
-            AffinityBind::Loaded => Self::Loaded,
-            AffinityBind::Spent => Self::Spent,
-            AffinityBind::Floored => Self::Floored,
         }
     }
 }
@@ -1054,18 +1029,18 @@ impl PoolExhaustion {
 /// hours at identical load — which migrated 25% of prod sessions off the
 /// FRESHEST accounts in the pool (GH#156). waste_risk stays in the bucket
 /// weights, where burning expiring quota first is the point.
-pub(crate) fn affinity_headroom(c: &RoutingCandidate) -> (f64, AffinityBind) {
+pub(crate) fn affinity_headroom(c: &RoutingCandidate) -> (f64, MigrationReason) {
     let loaded = (1.0 - c.gate).max(0.0);
     if c.unused_7d < loaded {
-        (c.unused_7d, AffinityBind::Spent)
+        (c.unused_7d, MigrationReason::Spent)
     } else if c.gate_floor_bound {
         // Same headroom value as `Loaded` — routing decision unchanged — but a
         // distinct reason so a status-floor-forced migration is not mistaken
         // for pool exhaustion (LAB-3295). Only when the gate (not weekly quota)
         // binds; a genuinely spent week is `Spent` above and stays WARN.
-        (loaded, AffinityBind::Floored)
+        (loaded, MigrationReason::Floored)
     } else {
-        (loaded, AffinityBind::Loaded)
+        (loaded, MigrationReason::Loaded)
     }
 }
 
@@ -1585,7 +1560,7 @@ pub(crate) fn compute_routing_weight(
     // this ticket removes (CodeRabbit on #175). The floor-free call shares
     // `gate_5h`'s inputs, so it is `None` exactly on `gate_5h`'s fallback path,
     // where no floor applies → not floor-bound. False under staleness (gate is a
-    // fixed 0.5). Feeds `AffinityBind::Floored` (LAB-3295).
+    // fixed 0.5). Feeds `MigrationReason::Floored` (LAB-3295).
     let gate_5h_floor_bound = !stale_after_hard_limit
         && time_adjusted_utilization(
             info.utilization_5h,
@@ -1667,8 +1642,9 @@ pub(crate) fn compute_routing_weight(
     // job (`None`). Deliberately not hedged under stale_after_hard_limit — a
     // 429 says nothing about how much of the week is spent.
     // ponytail: 6h ramp; an account with less than `1 - soft_limit` of its
-    // week left and 6h–~30h to reset still reads "spent" while the buckets
-    // favour it. Widen the ramp if that `reason="spent"` band shows up in prod.
+    // week left and more than 6h to reset reads "spent" and holds no keyed
+    // sessions, while waste_risk still weights its un-keyed buckets up as the
+    // reset nears. Widen the ramp if that `reason="spent"` band shows up in prod.
     let unused_of = |c: &ClaimWindowData| {
         let util =
             time_adjusted_utilization(c.utilization, c.reset, None, NEAR_RESET_7D_SECS, now_epoch)
@@ -1687,8 +1663,9 @@ pub(crate) fn compute_routing_weight(
 
     // Floor-bound: the effective `gate` is set by an Anthropic status floor that
     // exceeds raw utilisation, not by raw load or overage. Routine — Anthropic
-    // flagged the account and the LB is migrating the session off it — so the
-    // affinity override logs it at INFO, not a pool-health WARN (LAB-3295).
+    // flagged the account and the LB is migrating the session off it — so a
+    // move off it is labelled `floored`, and the legacy DynamicCapacityV1
+    // override logs it at INFO, not a pool-health WARN (LAB-3295).
     // The 7d gate is a pure status floor (`gate_of` forces util=0), so its
     // winning over gate_5h (which is >= 0) means a non-zero floor bound the gate;
     // the 5h case is `gate_5h_floor_bound`. Overage never floors (its gate comes

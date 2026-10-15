@@ -997,14 +997,15 @@ with `sum by (kind)`, where `max` would undercount.
 
 Under `sticky-weighted-v2`, a request with an affinity key goes to the account
 that wins the key's weighted rendezvous hash among the accounts in its tier
-that pass the overage rule. An account passes while its affinity headroom —
-the smaller of `1 − gate` and its unused weekly quota, where quota due to
-expire within 6 h counts increasingly as unused — is at least `1 − soft_limit` (0.10 at the
+that pass the overage rule. An account passes while its gate is below
+`soft_limit` and its unused weekly quota, where quota due to expire within
+6 h counts increasingly as unused, is at least `1 − soft_limit` (0.10 at the
 default). So a session stays on its account until that account nears its 5h
 or weekly limit, gets `throttled` or `rejected`, is rate-limited, cooling or
 circuit-broken, or is demoted for overage. The weekly `allowed_warning` floor
 alone does not move it. When no account in the tier passes, the hash runs over
-the whole tier.
+the whole tier; such a pick is degraded routing, so it is neither counted as a
+move nor remembered.
 
 The hash is stateless, so replicas agree without sharing anything. Each
 account scores a key on its own, so a weight change moves only the keys won
@@ -1016,7 +1017,8 @@ or a status floor engages) loses part of its keys once, counted as
 `anthropic_affinity_migrations_total{reason}` counts real moves: a request
 whose account differs from the one this replica last picked for its key and
 model.
-A replica remembers up to 16,384 recent keys for this and nothing else;
+A replica remembers at least the last 8,192 (key, model) pairs for this and
+nothing else;
 routing never reads it. Each move also logs one INFO line,
 `affinity migrated: session moved to another account`, with `reason`,
 `from_account` and `to_account`.
@@ -1026,7 +1028,7 @@ routing never reads it. Each move also logs one INFO line,
 | `loaded` | failed the overage rule on its 5h load |
 | `spent` | failed the overage rule on its weekly quota |
 | `floored` | failed the overage rule on a status floor (`throttled`, `rejected`) |
-| `unavailable` | is not a candidate in the request's tier: rate-limited, cooling, circuit-broken, excluded for the model or fast mode, outside the caller's pin, or demoted for overage |
+| `unavailable` | is not a candidate in the request's tier: rate-limited, cooling, circuit-broken, excluded for the model or fast mode, outside the caller's pin, or demoted for overage; or the request was served from a different tier |
 | `rehomed` | still passes, but another account won the key: its weight rose, or it returned to the set |
 
 All five label values are emitted from process start. The count is per

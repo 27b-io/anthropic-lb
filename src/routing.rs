@@ -270,8 +270,7 @@ impl AppState {
             let (picked_headroom, bind) = affinity_headroom(picked);
             let (other_headroom, _) = affinity_headroom(other);
             if picked_headroom < other_headroom * LEGACY_AFFINITY_OVERRIDE_RATIO {
-                self.affinity_migrations[MigrationReason::from(bind) as usize]
-                    .fetch_add(1, Ordering::Relaxed);
+                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
                 // Loud on purpose. Breaking affinity is a pool-health
                 // warning sign, NOT routine — EXCEPT when a status floor bound
                 // the sticky account (`Floored`): Anthropic flagged it and we're
@@ -295,7 +294,7 @@ impl AppState {
                         )
                     };
                 }
-                if matches!(bind, AffinityBind::Floored) {
+                if matches!(bind, MigrationReason::Floored) {
                     log_migration!(info, "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)");
                 } else {
                     log_migration!(warn, "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)");
@@ -312,13 +311,16 @@ impl AppState {
         picked
     }
 
-    /// Whether a keyed session may stay on `c` (LAB-9360): its
-    /// `affinity_headroom` is at least `1 - soft_limit`, so neither its 5h gate
-    /// nor its weekly quota is near the limit. A status floor alone does not
-    /// fail it unless the floor itself crosses `soft_limit` (`throttled`,
-    /// `rejected`); the weekly `allowed_warning` floor (0.80) keeps the session.
+    /// Whether a keyed session may stay on `c` (LAB-9360): its gate is under
+    /// `soft_limit`, exactly as the healthy filter in `pick_endpoint_for_client`
+    /// reads it, and its `affinity_headroom` is at least `1 - soft_limit`, so
+    /// neither its 5h gate nor its weekly quota is near the limit. Outside a
+    /// degraded tier the healthy filter has already enforced the gate, so only
+    /// the weekly half can fail. A status floor alone does not fail it unless
+    /// the floor itself reaches `soft_limit` (`throttled`, `rejected`); the
+    /// weekly `allowed_warning` floor (0.80) keeps the session.
     fn keeps_affinity(&self, c: &RoutingCandidate) -> bool {
-        affinity_headroom(c).0 >= 1.0 - self.soft_limit
+        c.gate < self.soft_limit && affinity_headroom(c).0 >= 1.0 - self.soft_limit
     }
 
     /// The candidate in `pool` with the highest `rendezvous_score` for `key`.
@@ -380,7 +382,8 @@ impl AppState {
     /// may rightly sit on one account per model, which is not a move. The reason
     /// says why the old account lost the key (`MigrationReason`). A pick made
     /// while nothing in the tier passes the overage rule is degraded routing,
-    /// not a move, and is recorded without being counted.
+    /// not a move: it is neither counted nor recorded, so the first pick after
+    /// the tier recovers is compared with the key's last pick before it.
     fn record_affinity_pick(
         &self,
         key: &str,
@@ -390,23 +393,24 @@ impl AppState {
         effective: &[&RoutingCandidate],
         tier: u32,
     ) {
+        if !effective.iter().any(|c| self.keeps_affinity(c)) {
+            return;
+        }
         let key_hash = stable_affinity_hash(&format!("{key}\u{0}{model}"));
         let last =
             lock_recovering(&self.affinity_last_pick, "affinity_last_pick").swap(key_hash, picked);
         let Some(from) = last.filter(|&from| from != picked) else {
             return;
         };
-        if !effective.iter().any(|c| self.keeps_affinity(c)) {
-            return;
-        }
-        let in_effective = effective.iter().any(|c| c.endpoint == from);
+        // A tier candidate that passes the rule is under `soft_limit`, so it
+        // is in `effective` too: the healthy filter reads the same gate.
         let reason = match candidates
             .iter()
             .find(|c| c.endpoint == from && c.priority == tier)
         {
             None => MigrationReason::Unavailable,
-            Some(c) if in_effective && self.keeps_affinity(c) => MigrationReason::Rehomed,
-            Some(c) => affinity_headroom(c).1.into(),
+            Some(c) if self.keeps_affinity(c) => MigrationReason::Rehomed,
+            Some(c) => affinity_headroom(c).1,
         };
         self.affinity_migrations[reason as usize].fetch_add(1, Ordering::Relaxed);
         info!(
