@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.4.0](https://github.com/27b-io/anthropic-lb/compare/v0.3.1...v0.4.0) (2026-10-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* **LAB-8865:** `[[clients]]` names must match ^[a-z0-9][a-z0-9_-]{0,62}$, and names starting with `_` are reserved. A config with any other client name now fails at startup; rename the client everywhere it is named.
+
+### Features
+
+* **LAB-8868:** read ordinary clients from a client store ([#287](https://github.com/27b-io/anthropic-lb/issues/287)) ([c20385b](https://github.com/27b-io/anthropic-lb/commit/c20385be1cb213d81557e656b33252ffb46f2c30))
+* **LAB-9001:** export the set hash held beside records_version ([#292](https://github.com/27b-io/anthropic-lb/issues/292)) ([33e1124](https://github.com/27b-io/anthropic-lb/commit/33e1124540ab223c34b8e724d2a62f13567c3315))
+* **LAB-9228:** name the upstream 4xx reason on the proxied line ([#296](https://github.com/27b-io/anthropic-lb/issues/296)) ([7c25161](https://github.com/27b-io/anthropic-lb/commit/7c251617972df475420583358a3e319349826c00))
+
+
+### Bug Fixes
+
+* **deps:** rustls 0.23.46 + quinn-proto 0.11.19 for RUSTSEC advisories (LAB-9543) ([#300](https://github.com/27b-io/anthropic-lb/issues/300)) ([6f35b73](https://github.com/27b-io/anthropic-lb/commit/6f35b7307412fa385c3321992818a6a54c17a328))
+* **LAB-5627:** fail closed on OpenAI refusal and thinking parts under block ([#277](https://github.com/27b-io/anthropic-lb/issues/277)) ([9300974](https://github.com/27b-io/anthropic-lb/commit/93009741cea567ada9b390e9e24a92991f5cd43f))
+* **LAB-8878:** config parse errors report line and column, not the source text ([#285](https://github.com/27b-io/anthropic-lb/issues/285)) ([02613de](https://github.com/27b-io/anthropic-lb/commit/02613dea79dfefbc401097cdbf4b6b321a1b80dc))
+* **LAB-9067:** never rate-limit a resume save whose removal did not land ([#295](https://github.com/27b-io/anthropic-lb/issues/295)) ([cb2ab13](https://github.com/27b-io/anthropic-lb/commit/cb2ab13cd68677e8757a8fb77a19b7763b388d5c))
+* **LAB-9069:** routing_share gauge mirrors the picker's priority tiers ([#291](https://github.com/27b-io/anthropic-lb/issues/291)) ([7ca1a2f](https://github.com/27b-io/anthropic-lb/commit/7ca1a2f1a0872dd22fe91153f0e68d658e119ad0))
+* **LAB-9167:** bound repeated unsafe-removal error logs in write_resume ([#299](https://github.com/27b-io/anthropic-lb/issues/299)) ([7866bb6](https://github.com/27b-io/anthropic-lb/commit/7866bb60daa867ad7ccde7db55d254d232b680fa))
+* **LAB-9360:** keep keyed sessions on their account until it fails the overage rule ([#297](https://github.com/27b-io/anthropic-lb/issues/297)) ([f8466a5](https://github.com/27b-io/anthropic-lb/commit/f8466a55bd1337f788427a48e2fd3e56d8f2c258))
+* **LAB-9404:** count only policy moves in the affinity signal, and agree with the healthy filter at soft_limit ([#298](https://github.com/27b-io/anthropic-lb/issues/298)) ([ba028d0](https://github.com/27b-io/anthropic-lb/commit/ba028d027f8331ebb305bbdd6f17b0e5dc4ce380))
+* **LAB-9405:** place keyed sessions on waste risk and give a spent week zero weight ([#301](https://github.com/27b-io/anthropic-lb/issues/301)) ([84af16e](https://github.com/27b-io/anthropic-lb/commit/84af16e7f73dc0287a3f09cdffb893b4b4547b60))
+* **LAB-9826:** require a positive weight to count as healthy ([#302](https://github.com/27b-io/anthropic-lb/issues/302)) ([ec57dfd](https://github.com/27b-io/anthropic-lb/commit/ec57dfd029569ba9dba7b45da934768d28a13329))
+* **metrics:** bound account waste risk by the weekly pool (LAB-9068) ([#289](https://github.com/27b-io/anthropic-lb/issues/289)) ([d087a85](https://github.com/27b-io/anthropic-lb/commit/d087a856135da855f6b0f4f28fd35e02a6c2dd67))
+* **routing:** cool a spent weekly window with no overage path for 15 minutes (LAB-8497) ([#280](https://github.com/27b-io/anthropic-lb/issues/280)) ([08710e3](https://github.com/27b-io/anthropic-lb/commit/08710e3b182cb0149399146f10f82fb300faadd5))
+
+
+### Code Refactoring
+
+* **LAB-8865:** one client-policy builder, Principal and key digests ([d0138ea](https://github.com/27b-io/anthropic-lb/commit/d0138ea0b090a29c4a8c3effe3b7338b145ced62))
+
 ## [0.3.1](https://github.com/27b-io/anthropic-lb/compare/v0.3.0...v0.3.1) (2026-10-08)
 
 
