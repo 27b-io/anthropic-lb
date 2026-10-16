@@ -1601,6 +1601,25 @@ async fn routing_share_soft_limit_degrades_within_tier() {
     assert_eq!(s[2], 0.0, "soft limit never jumps a tier");
 }
 
+/// A spent week weighs 0 though its 5h gate is healthy, so it is not the
+/// tier's healthy capacity: the soft-limited account in the same tier takes
+/// the whole share, as the picker serves it.
+#[tokio::test]
+async fn routing_share_spent_week_never_hides_degraded_capacity() {
+    let state = test_state_with_soft_limit(
+        vec![mk_tiered("a", 1), mk_tiered("b", 1), mk_tiered("c", 2)],
+        0.90,
+    );
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, 0, 0.30, 1.0, now + 10_000, now + 3 * 3600).await;
+    set_util(&state, 1, 0.95).await;
+    set_util(&state, 2, 0.20).await;
+
+    state.refresh_metrics_weights().await;
+    assert_shares(&state, &[0.0, 1.0, 0.0]);
+    assert_picker_serves(&state, 1).await;
+}
+
 /// AC5: an OpenAI endpoint sits in its configured tier with its fixed
 /// weight.
 #[tokio::test]
