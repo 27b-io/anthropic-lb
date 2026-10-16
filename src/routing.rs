@@ -339,7 +339,8 @@ impl AppState {
     /// gate can sit low; counting it healthy would let it hold a client's pin
     /// or stand in for a tier's healthy capacity, so the pick returns `None`
     /// while positive-weight capacity goes unused. Pin viability, tier
-    /// membership, the affinity rule and the routing-share gauge all read it.
+    /// membership, the affinity rule and the routing weight and share gauges
+    /// all read it.
     pub(crate) fn is_healthy(&self, gate: f64, weight: f64) -> bool {
         gate < self.soft_limit && weight > 0.0
     }

@@ -2171,13 +2171,16 @@ impl AppState {
     fn store_metrics_weights(&self, entries: &[Option<MetricsEntry>]) {
         // Mirror pick_endpoint's graceful-degradation: only filter soft-limited
         // members when at least one healthy member exists in the pool.
-        let has_healthy = entries.iter().flatten().any(|e| e.gate < self.soft_limit);
+        let has_healthy = entries
+            .iter()
+            .flatten()
+            .any(|e| self.is_healthy(e.gate, e.weight));
 
         let shares = self.metrics_tier_shares(entries);
         for (i, ep) in self.endpoints.iter().enumerate() {
             let w = match entries[i] {
                 // Soft-limited with a healthy alternative → zero.
-                Some(e) if !(has_healthy && e.gate >= self.soft_limit) => e.weight,
+                Some(e) if !has_healthy || self.is_healthy(e.gate, e.weight) => e.weight,
                 _ => 0.0,
             };
             // Excluded members (passthrough, hard-limited) report gate=1.0

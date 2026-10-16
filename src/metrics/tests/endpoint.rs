@@ -1620,6 +1620,23 @@ async fn routing_share_spent_week_never_hides_degraded_capacity() {
     assert_picker_serves(&state, 1).await;
 }
 
+/// The tier-blind weight gauge reads the same healthy filter: with no other
+/// account in the pool, a spent week does not zero the soft-limited account
+/// the picker serves.
+#[tokio::test]
+async fn routing_weight_spent_week_never_hides_degraded_capacity() {
+    let state = test_state_with_soft_limit(vec![mk_tiered("a", 1), mk_tiered("b", 1)], 0.90);
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, 0, 0.30, 1.0, now + 10_000, now + 3 * 3600).await;
+    set_util(&state, 1, 0.95).await;
+
+    state.refresh_metrics_weights().await;
+    let w = weights(&state);
+    assert_eq!(w[0], 0.0, "a spent week weighs 0: {w:?}");
+    assert!(w[1] > 0.0, "the served account keeps its weight: {w:?}");
+    assert_picker_serves(&state, 1).await;
+}
+
 /// AC5: an OpenAI endpoint sits in its configured tier with its fixed
 /// weight.
 #[tokio::test]
