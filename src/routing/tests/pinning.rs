@@ -135,6 +135,43 @@ async fn pinned_client_spills_on_soft_limit_overage() {
     );
 }
 
+/// Spill: the preferred endpoint has spent its week before the reset, so it
+/// weighs 0 though its 5h gate is low. A zero-weight pin must not hold the
+/// client: keyed and un-keyed picks spill to the healthy general endpoint
+/// instead of returning `None` (a client-visible 429).
+#[tokio::test]
+async fn pinned_client_spills_on_spent_week() {
+    for strategy in [
+        RoutingStrategy::DynamicCapacityV1,
+        RoutingStrategy::StickyWeightedV2,
+    ] {
+        let mut state = pinned_test_state();
+        Arc::get_mut(&mut state)
+            .expect("test fixture should be uniquely owned")
+            .routing_strategy = strategy;
+        let now = AppState::now_epoch();
+        set_account_utilization(&state, 0, 0.30, 0.30, now + 10_000, now + 4 * 86_400).await;
+        set_account_utilization(&state, 1, 0.30, 1.0, now + 10_000, now + 3 * 3600).await;
+
+        for key in [None, Some("spent-pin")] {
+            assert_eq!(
+                state
+                    .pick_endpoint_for_client(
+                        key,
+                        "claude-opus-4-6",
+                        &[],
+                        &state.caller("passbolt"),
+                        FastRequest::STANDARD,
+                        true
+                    )
+                    .await,
+                Some(0),
+                "{strategy:?}, key {key:?}: a spent preferred endpoint must spill"
+            );
+        }
+    }
+}
+
 /// Spill: preferred endpoint hard-limited (429) → general pool serves.
 #[tokio::test]
 async fn pinned_client_spills_on_hard_limit() {

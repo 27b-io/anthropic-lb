@@ -322,16 +322,27 @@ impl AppState {
         picked
     }
 
-    /// Whether a keyed session may stay on `c` (LAB-9360): its gate is under
-    /// `soft_limit`, exactly as the healthy filter in `pick_endpoint_for_client`
-    /// reads it, and its `affinity_headroom` is at least `1 - soft_limit`, so
+    /// Whether a keyed session may stay on `c` (LAB-9360): it passes the
+    /// healthy filter (`is_healthy`) that `pick_endpoint_for_client` applies,
+    /// and its `affinity_headroom` is at least `1 - soft_limit`, so
     /// neither its 5h gate nor its weekly quota is near the limit. Outside a
     /// degraded tier the healthy filter has already enforced the gate, so only
     /// the weekly half can fail. A status floor alone does not fail it unless
     /// the floor itself reaches `soft_limit` (`throttled`, `rejected`); the
     /// weekly `allowed_warning` floor (0.80) keeps the session.
     fn keeps_affinity(&self, c: &RoutingCandidate) -> bool {
-        c.gate < self.soft_limit && affinity_headroom(c).0 >= 1.0 - self.soft_limit
+        self.is_healthy(c.gate, c.weight) && affinity_headroom(c).0 >= 1.0 - self.soft_limit
+    }
+
+    /// The healthy filter: a gate under `soft_limit` and a positive routing
+    /// weight. A weekly claim spent before its reset weighs 0 while its 5h
+    /// gate can sit low; counting it healthy would let it hold a client's pin
+    /// or stand in for a tier's healthy capacity, so the pick returns `None`
+    /// while positive-weight capacity goes unused. Pin viability, tier
+    /// membership, the affinity rule and the routing weight and share gauges
+    /// all read it.
+    pub(crate) fn is_healthy(&self, gate: f64, weight: f64) -> bool {
+        gate < self.soft_limit && weight > 0.0
     }
 
     /// The candidate in `pool` with the highest `rendezvous_score` for `key`,
@@ -434,8 +445,8 @@ impl AppState {
         let Some(from) = last.filter(|&from| from != picked) else {
             return;
         };
-        // A tier candidate that passes the rule is under `soft_limit`, so it
-        // is in `effective` too: the healthy filter reads the same gate.
+        // A tier candidate that passes the rule passes `is_healthy`, so it is
+        // in `effective` too: the healthy filter reads the same predicate.
         let reason = match candidates
             .iter()
             .find(|c| c.endpoint == from && c.priority == tier)
@@ -540,7 +551,7 @@ impl AppState {
     /// Per-client pinning (LAB-2636 / #151) runs first: if the caller has a
     /// `[[clients]]` entry with `preferred_endpoints` and at least one of them
     /// is a healthy, undemoted candidate (serves the model, not hard-limited,
-    /// not transport-unhealthy, not skipped, `gate < soft_limit`, and not
+    /// not transport-unhealthy, not skipped, `is_healthy`, and not
     /// priority-demoted for serving via paid overage / always-paid Fable), the
     /// candidate set is restricted to the preferred endpoints. The filter runs
     /// BEFORE tier/affinity/weighted selection, so a prior affinity landing on
@@ -557,7 +568,7 @@ impl AppState {
     /// so a non-entitled pin spills rather than serving.
     ///
     /// Tiers are tried strictly in ascending priority order. Within a tier:
-    /// healthy candidates (`gate < soft_limit`) are preferred; if none are healthy
+    /// healthy candidates (`is_healthy`) are preferred; if none are healthy
     /// the tier degrades to its soft-limited candidates. Only when a tier has zero
     /// total weight (genuinely exhausted) does routing move to the next tier — so
     /// `soft_limit` is intra-tier load-shedding and never causes a tier jump. This
@@ -611,7 +622,7 @@ impl AppState {
                 |c: &RoutingCandidate| c.priority == self.endpoints[c.endpoint].priority;
             if candidates
                 .iter()
-                .any(|c| is_preferred(c) && undemoted(c) && c.gate < self.soft_limit)
+                .any(|c| is_preferred(c) && undemoted(c) && self.is_healthy(c.gate, c.weight))
             {
                 candidates.retain(is_preferred);
             } else {
@@ -644,7 +655,7 @@ impl AppState {
             // Prefer healthy candidates; fall back to soft-limited ones within the tier.
             let healthy: Vec<&RoutingCandidate> = tier_candidates
                 .iter()
-                .filter(|c| c.gate < self.soft_limit)
+                .filter(|c| self.is_healthy(c.gate, c.weight))
                 .copied()
                 .collect();
 

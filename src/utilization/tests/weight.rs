@@ -336,6 +336,39 @@ fn metrics_gate_matches_routing_gate() {
     }
 }
 
+/// The documented limit of `metrics_gate_weight`'s parity: it reads the
+/// representative claim only. With the Fable band as the representative (a
+/// state the API does not produce) and the general pool spent, routing gives
+/// Fable weight 0 while the gauge stays positive. A change that mirrors the
+/// pool cap flips this test; update the doc comment with it.
+#[test]
+fn metrics_parity_covers_representative_claim_only() {
+    let now = 1_000_000;
+    let mut info = RateLimitInfo {
+        utilization_5h: Some(0.30),
+        reset_5h: Some(now + 10_000),
+        representative_claim: Some(FABLE_BAND_CLAIM.into()),
+        ..Default::default()
+    };
+    for (claim, util) in [(FABLE_BAND_CLAIM, 0.30), ("seven_day", 1.0)] {
+        info.claims_7d.insert(
+            claim.into(),
+            ClaimWindowData {
+                utilization: Some(util),
+                reset: Some(now + 3 * 3600),
+                ..Default::default()
+            },
+        );
+    }
+    let rw = compute_routing_weight(&info, "claude-fable-5", now, false).unwrap();
+    assert_eq!(rw.weight, 0.0, "routing caps the band by the spent pool");
+    let (_, weight) = metrics_gate_weight(&info, now, Instant::now()).unwrap();
+    assert!(
+        weight > 0.0,
+        "the gauge reads the representative band alone"
+    );
+}
+
 /// A general weekly claim used up, resetting in 3 hours: inside the 6 h
 /// near-reset ramp, where the affinity rule reads the expiring week as headroom.
 fn spent_week(now: u64, status: &str) -> HashMap<String, ClaimWindowData> {

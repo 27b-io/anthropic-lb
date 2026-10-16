@@ -185,6 +185,54 @@ async fn pick_account_spent_week_tier_falls_through() {
     }
 }
 
+/// A spent account weighs 0 though its 5h gate (0.30) is healthy. It must not
+/// count as the tier's healthy capacity: the same-tier account at gate 0.95
+/// with positive weight serves (degraded within the tier), rather than the
+/// pick returning `None` or dropping to a lower tier.
+#[tokio::test]
+async fn pick_account_spent_week_never_hides_degraded_capacity() {
+    for strategy in [
+        RoutingStrategy::DynamicCapacityV1,
+        RoutingStrategy::StickyWeightedV2,
+    ] {
+        for with_fallback in [false, true] {
+            let mut endpoints = vec![
+                mk_endpoint("spent", "sk-ant-api-a"),
+                mk_endpoint("usable", "sk-ant-api-b"),
+            ];
+            if with_fallback {
+                let mut fallback = mk_endpoint("fallback", "sk-ant-api-c");
+                fallback.priority = 1;
+                endpoints.push(fallback);
+            }
+            let mut state = test_state_with_strategy(endpoints, strategy);
+            Arc::get_mut(&mut state)
+                .expect("test fixture should be uniquely owned")
+                .soft_limit = 0.90;
+
+            let now = AppState::now_epoch();
+            set_account_utilization(&state, 0, 0.30, 1.0, now + 10_000, now + 3 * 3600).await;
+            set_account_utilization(&state, 1, 0.95, 0.30, now + 10_000, now + 4 * 86_400).await;
+            if with_fallback {
+                set_account_utilization(&state, 2, 0.30, 0.30, now + 10_000, now + 4 * 86_400)
+                    .await;
+            }
+
+            for i in 0..50 {
+                let key = format!("spent-healthy-{i}");
+                for affinity in [None, Some(key.as_str())] {
+                    assert_eq!(
+                        state.pick_endpoint(affinity, "claude-opus-4-6", &[]).await,
+                        Some(1),
+                        "{strategy:?}, fallback {with_fallback}, key {affinity:?}: \
+                         the positive-weight account must serve degraded"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn pick_account_multiple_tiers_cascade() {
     // Three tiers: 0, 1, 2. Tier 0 and 1 exhausted → tier 2 gets traffic.
