@@ -2195,7 +2195,7 @@ impl AppState {
 
     /// The share `pick_endpoint_for_client` would give each entry: tiers are
     /// walked in ascending priority, a tier prefers its healthy members
-    /// (`gate < soft_limit`) and degrades to its soft-limited ones when it has
+    /// (`is_healthy`) and degrades to its soft-limited ones when it has
     /// none, and the first tier with non-zero weight takes the whole share.
     /// All zero when no tier has weight. Unroutable entries are not candidates.
     fn metrics_tier_shares(&self, entries: &[Option<MetricsEntry>]) -> Vec<f64> {
@@ -2210,11 +2210,11 @@ impl AppState {
             let has_healthy = entries
                 .iter()
                 .filter_map(in_tier)
-                .any(|e| e.gate < self.soft_limit);
+                .any(|e| self.is_healthy(e.gate, e.weight));
             let weights: Vec<f64> = entries
                 .iter()
                 .map(|e| match in_tier(e) {
-                    Some(e) if !has_healthy || e.gate < self.soft_limit => e.weight,
+                    Some(e) if !has_healthy || self.is_healthy(e.gate, e.weight) => e.weight,
                     _ => 0.0,
                 })
                 .collect();
@@ -2260,6 +2260,14 @@ fn stale_after_hard_limit(info: &RateLimitInfo) -> bool {
 /// Per-entry representative `(gate, weight)` for metrics gauges, model-agnostic.
 /// Returns `None` for hard-limited members (they contribute zero in any state).
 /// Computed purely from a `RateLimitInfo`.
+///
+/// Parity with `compute_routing_weight` covers the representative claim only.
+/// The Fable band's weekly pool cap (`constraining_7d_claims`) is not mirrored:
+/// were the representative the band itself, a spent general `seven_day` pool
+/// would weigh 0 in routing and stay positive here. The API never names the
+/// band as the representative (it arrives as the `7d_oi` triplet, see
+/// `FABLE_BAND_CLAIM`), so in practice the representative is a whole-traffic
+/// claim and the two agree.
 fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Option<(f64, f64)> {
     // Hard-limited members contribute zero (mirrors routing_candidates filter).
     if let Some(until) = info.hard_limited_until {
