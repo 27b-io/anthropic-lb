@@ -1281,6 +1281,15 @@ pub(crate) fn waste_risk(util: Option<f64>, reset_epoch: Option<u64>, now_epoch:
     (unused / remaining_fraction).min(10.0)
 }
 
+/// A weekly claim used up before its reset. `waste_risk` is 0 for it, which
+/// would leave the account its full headroom as routing weight; the weight
+/// is 0 instead, so live requests stop re-probing it with 429s until the
+/// reset and the probe loop re-checks it alone. Unknown utilisation or reset
+/// is never spent.
+fn week_spent(claim: &ClaimWindowData, now_epoch: u64) -> bool {
+    claim.utilization.is_some_and(|u| u >= 1.0) && claim.reset.is_some_and(|r| r > now_epoch)
+}
+
 /// Map a rate-limit status string to a utilization floor.
 /// Unknown non-"allowed" values are treated as warning-level pressure and logged,
 /// so new API statuses degrade gracefully before we add explicit support.
@@ -1680,9 +1689,22 @@ pub(crate) fn compute_routing_weight(
     // rejected migrations ever need to stay loud, split on the floor tier here.
     let gate_floor_bound = !overage_active && (gate_7d > gate_5h || gate_5h_floor_bound);
 
+    // Overage serves a spent week; otherwise the band or the pool it draws
+    // from being spent stops the account. Not hedged under
+    // stale_after_hard_limit: the week was spent before the 429 too.
+    let week_spent = !overage_active
+        && primary_7d
+            .into_iter()
+            .chain(pool_cap_7d)
+            .any(|c| week_spent(c, now_epoch));
+
     let headroom = (1.0 - gate).max(0.01);
     let weight = if wr > 0.0 { wr * headroom } else { headroom };
-    let weight = if gate >= 1.0 { 0.0 } else { weight };
+    let weight = if gate >= 1.0 || week_spent {
+        0.0
+    } else {
+        weight
+    };
 
     Some(RoutingWeight {
         gate_5h,
@@ -2292,6 +2314,7 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
             })
     };
 
+    let spent = representative.is_some_and(|c| week_spent(c, now_epoch));
     let (gate_7d, wr_7d) = if let Some(claim) = representative {
         let g = if stale_after_hard_limit {
             0.5
@@ -2315,13 +2338,13 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
 
     // Overage supersedes the subscription gates exactly as in
     // `compute_routing_weight`: the overage window governs, waste_risk is moot.
-    let (gate, wr) = match overage_gate(info, now_epoch, stale_after_hard_limit) {
-        Some(g) => (g, 0.0),
-        None => (gate_5h.max(gate_7d), wr_7d),
+    let (gate, wr, spent) = match overage_gate(info, now_epoch, stale_after_hard_limit) {
+        Some(g) => (g, 0.0, false),
+        None => (gate_5h.max(gate_7d), wr_7d, spent),
     };
     let headroom = (1.0 - gate).max(0.01);
     let weight = if wr > 0.0 { wr * headroom } else { headroom };
-    let weight = if gate >= 1.0 { 0.0 } else { weight };
+    let weight = if gate >= 1.0 || spent { 0.0 } else { weight };
 
     Some((gate, weight))
 }

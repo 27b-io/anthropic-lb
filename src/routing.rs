@@ -229,8 +229,15 @@ impl AppState {
         total_weight: f64,
         affinity_key: Option<&str>,
     ) -> &'a RoutingCandidate {
+        // The fallback for a target at the very top of the range (float
+        // rounding) is the last bucket with width, never a weight-0 account.
+        let last = effective
+            .iter()
+            .rev()
+            .find(|c| c.weight > 0.0)
+            .unwrap_or_else(|| effective.last().unwrap());
         let walk_buckets = |target: f64| -> &'a RoutingCandidate {
-            let mut picked = effective.last().unwrap();
+            let mut picked = *last;
             let mut cumulative = 0.0;
             for c in effective {
                 cumulative += c.weight;
@@ -269,7 +276,11 @@ impl AppState {
             };
             let (picked_headroom, bind) = affinity_headroom(picked);
             let (other_headroom, _) = affinity_headroom(other);
-            if picked_headroom < other_headroom * LEGACY_AFFINITY_OVERRIDE_RATIO {
+            // A weight-0 account (a spent week) can still read as headroom
+            // near its reset; it must not take the session.
+            if other.weight > 0.0
+                && picked_headroom < other_headroom * LEGACY_AFFINITY_OVERRIDE_RATIO
+            {
                 self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
                 // Loud on purpose. Breaking affinity is a pool-health
                 // warning sign, NOT routine — EXCEPT when a status floor bound
@@ -323,34 +334,55 @@ impl AppState {
         c.gate < self.soft_limit && affinity_headroom(c).0 >= 1.0 - self.soft_limit
     }
 
-    /// The candidate in `pool` with the highest `rendezvous_score` for `key`.
-    /// Candidates without a positive finite weight never win; `None` when no
-    /// candidate has one.
+    /// The candidate in `pool` with the highest `rendezvous_score` for `key`,
+    /// each weighted by `score`. Candidates without a positive finite routing
+    /// weight never win, whatever their score; `None` when no candidate has one.
     fn pick_rendezvous<'a>(
         &self,
         pool: &[&'a RoutingCandidate],
         key: &str,
+        score: impl Fn(&RoutingCandidate) -> f64,
     ) -> Option<&'a RoutingCandidate> {
         pool.iter()
             .copied()
             .filter(|c| c.weight.is_finite() && c.weight > 0.0)
             .map(|c| {
                 let name = &self.endpoints[c.endpoint].name;
-                (c, rendezvous_score(key, name, c.weight))
+                (c, rendezvous_score(key, name, score(c)))
             })
             .max_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(c, _)| c)
     }
 
+    /// `pick_rendezvous` over accounts that pass the overage rule, scored on
+    /// waste risk alone, so a 5h window filling or resetting on a passing
+    /// account moves none of its keys; `keeps_affinity` sheds them once the
+    /// gate reaches `soft_limit`. An account with no waste risk (missing reset
+    /// data) is scored as its lowest-scoring routable peer, never above them.
+    fn pick_keyed<'a>(
+        &self,
+        pool: &[&'a RoutingCandidate],
+        key: &str,
+    ) -> Option<&'a RoutingCandidate> {
+        let floor = pool
+            .iter()
+            .filter(|c| c.weight > 0.0 && c.wr > 0.0)
+            .map(|c| c.wr)
+            .reduce(f64::min)
+            .unwrap_or(1.0);
+        self.pick_rendezvous(pool, key, |c| if c.wr > 0.0 { c.wr } else { floor })
+    }
+
     /// A keyed session goes to the account that wins its rendezvous hash among
-    /// the candidates that pass the overage rule (`keeps_affinity`), so it
-    /// stays on that account until the account fails the rule or leaves the
-    /// candidate set, or another account's weight rises enough to win the key.
-    /// The weights still place new sessions, so expiring quota is burned
-    /// first. An account that fails the rule loses its sessions to their next
-    /// highest score, which spreads them over the pool rather than onto one
-    /// best account. When nothing in the tier passes, the hash runs over the
-    /// whole effective set, as the tier's degraded mode does for load.
+    /// the candidates that pass the overage rule (`keeps_affinity`), scored on
+    /// waste risk (`pick_keyed`), so it stays on that account until the
+    /// account fails the rule or leaves the candidate set, or another
+    /// account's waste risk rises enough to win the key. Waste risk still
+    /// places new sessions, so expiring quota is burned first. An account that
+    /// fails the rule loses its sessions to their next highest score, which
+    /// spreads them over the pool rather than onto one best account. When
+    /// nothing in the tier passes, the hash runs over the whole effective set
+    /// on the full weight, as the tier's degraded mode does for load.
     /// Un-keyed requests scatter over the weighted buckets.
     fn pick_sticky_weighted_v2<'a>(
         &self,
@@ -366,8 +398,8 @@ impl AppState {
             .copied()
             .filter(|c| self.keeps_affinity(c))
             .collect();
-        self.pick_rendezvous(&passing, key)
-            .or_else(|| self.pick_rendezvous(effective, key))
+        self.pick_keyed(&passing, key)
+            .or_else(|| self.pick_rendezvous(effective, key, |c| c.weight))
             // Unreachable: `pick_endpoint_for_client` only picks from a set
             // with positive total weight, and every weight is finite.
             .unwrap_or_else(|| self.pick_weighted_bucket(effective, total_weight, Some(key)))
