@@ -177,7 +177,7 @@ async fn keys_hashing_to(
         let all: Vec<&RoutingCandidate> = candidates.iter().collect();
         return (0..scan)
             .map(|i| format!("{prefix}-{i}"))
-            .filter(|key| state.pick_rendezvous(&all, key).unwrap().endpoint == target_idx)
+            .filter(|key| state.pick_keyed(&all, key).unwrap().endpoint == target_idx)
             .take(want)
             .collect();
     }
@@ -919,9 +919,9 @@ const HOUR: u64 = 3600;
 /// AC1: the weekly `allowed_warning` floor (gate 0.80) leaves headroom 0.20,
 /// which the deleted relative override read as too little beside a best
 /// account at 0.80, moving the session on every request. It now keeps the
-/// session. The floor is set before the
-/// session is placed: it cuts the account's weight, and a stateless hash
-/// re-homes part of an account's keys once when its weight falls.
+/// session. The weekly use is set before the session is placed: it cuts the
+/// account's waste risk, and a stateless hash re-homes part of an account's
+/// keys once when its waste risk falls.
 #[tokio::test]
 async fn affinity_warning_floor_keeps_the_session() {
     let _clock = FrozenClock::at(FIXED_EPOCH);
@@ -1136,7 +1136,10 @@ async fn home_key_spent_pool_moves(state: &AppState, n: usize, marker: &str) -> 
     let candidates = state.routing_candidates(OPUS, &[]).await;
     let tier: Vec<&RoutingCandidate> = candidates.iter().filter(|c| c.priority == 0).collect();
     let found = homed.into_iter().find_map(|k| {
-        let away = state.pick_rendezvous(&tier, &k).unwrap().endpoint;
+        let away = state
+            .pick_rendezvous(&tier, &k, |c| c.weight)
+            .unwrap()
+            .endpoint;
         (away != HOME).then_some((k, away))
     });
     heal_pool(state, n).await;
@@ -1229,7 +1232,10 @@ async fn affinity_gate_at_soft_limit_does_not_take_a_degraded_tier() {
         let picked = state.pick_endpoint(Some(&key), OPUS, &[]).await.unwrap();
         assert_eq!(
             picked,
-            state.pick_rendezvous(&tier, &key).unwrap().endpoint,
+            state
+                .pick_rendezvous(&tier, &key, |c| c.weight)
+                .unwrap()
+                .endpoint,
             "key {i} must hash over the whole tier"
         );
         home += usize::from(picked == HOME);
@@ -1243,20 +1249,23 @@ async fn affinity_gate_at_soft_limit_does_not_take_a_degraded_tier() {
 }
 
 /// Synthetic candidates for the pure picker tests: every account passes the
-/// overage rule, and weights spread 1:10 across the pool.
+/// overage rule, and waste risks, so weights, spread 1:10 across the pool.
 fn spread_candidates(n: usize) -> Vec<RoutingCandidate> {
     (0..n)
-        .map(|i| RoutingCandidate {
-            endpoint: i,
-            priority: 0,
-            gate_5h: 0.10,
-            gate_7d: 0.0,
-            gate: 0.10,
-            wr: 1.0,
-            unused_7d: 0.90,
-            weight: 1.0 + 9.0 * i as f64 / (n - 1) as f64,
-            gate_floor_bound: false,
-            source: "waste_risk",
+        .map(|i| {
+            let wr = 1.0 + 9.0 * i as f64 / (n - 1) as f64;
+            RoutingCandidate {
+                endpoint: i,
+                priority: 0,
+                gate_5h: 0.10,
+                gate_7d: 0.0,
+                gate: 0.10,
+                wr,
+                unused_7d: 0.90,
+                weight: wr * 0.90,
+                gate_floor_bound: false,
+                source: "waste_risk",
+            }
         })
         .collect()
 }
@@ -1270,12 +1279,12 @@ fn keyed_pick(state: &AppState, pool: &[RoutingCandidate], key: &str) -> usize {
         .endpoint
 }
 
-/// AC5: a weight change moves keys only onto the account whose weight rose,
-/// and at most twice its gain in share; removing an account moves only its
-/// own keys. The range walk this replaces shifted every boundary after the
-/// changed account, re-homing keys all over the pool.
+/// AC5: a waste-risk change moves keys only onto the account whose waste
+/// risk rose, and at most twice its gain in share; removing an account moves
+/// only its own keys. The range walk this replaces shifted every boundary
+/// after the changed account, re-homing keys all over the pool.
 #[tokio::test]
-async fn affinity_weight_change_moves_keys_only_onto_or_off_that_account() {
+async fn affinity_waste_risk_change_moves_keys_only_onto_or_off_that_account() {
     let state = sticky_v2_state(pool_endpoints(POOL));
     let pool = spread_candidates(POOL);
     let keys: Vec<String> = (0..10_000).map(|i| format!("lab9360-ac5-{i}")).collect();
@@ -1283,9 +1292,9 @@ async fn affinity_weight_change_moves_keys_only_onto_or_off_that_account() {
 
     let changed = 13;
     let mut reset = pool.clone();
+    reset[changed].wr *= 2.5;
     reset[changed].weight *= 2.5;
-    let share =
-        |p: &[RoutingCandidate]| p[changed].weight / p.iter().map(|c| c.weight).sum::<f64>();
+    let share = |p: &[RoutingCandidate]| p[changed].wr / p.iter().map(|c| c.wr).sum::<f64>();
     let gain = share(&reset) - share(&pool);
     let mut moved = 0;
     for (k, &was) in keys.iter().zip(&before) {
@@ -1293,13 +1302,13 @@ async fn affinity_weight_change_moves_keys_only_onto_or_off_that_account() {
         if now != was {
             assert_eq!(
                 now, changed,
-                "key {k} moved to an account whose weight did not change"
+                "key {k} moved to an account whose waste risk did not change"
             );
             moved += 1;
         }
     }
     let moved_share = moved as f64 / keys.len() as f64;
-    assert!(moved > 0, "a 2.5x weight must win some keys");
+    assert!(moved > 0, "a 2.5x waste risk must win some keys");
     assert!(
         moved_share <= 2.0 * gain,
         "moved {moved_share:.4} of keys for a share gain of {gain:.4}"
@@ -1320,9 +1329,9 @@ async fn affinity_weight_change_moves_keys_only_onto_or_off_that_account() {
 }
 
 /// AC6: over 100,000 keys, every account's key count is within 4 sigma of its
-/// weight share.
+/// waste-risk share.
 #[tokio::test]
-async fn affinity_placement_is_proportional_to_weight() {
+async fn affinity_placement_is_proportional_to_waste_risk() {
     let state = sticky_v2_state(pool_endpoints(POOL));
     let pool = spread_candidates(POOL);
     let n = 100_000;
@@ -1330,9 +1339,9 @@ async fn affinity_placement_is_proportional_to_weight() {
     for i in 0..n {
         counts[keyed_pick(&state, &pool, &format!("lab9360-ac6-{i}"))] += 1;
     }
-    let total: f64 = pool.iter().map(|c| c.weight).sum();
+    let total: f64 = pool.iter().map(|c| c.wr).sum();
     for c in &pool {
-        let s = c.weight / total;
+        let s = c.wr / total;
         let expected = n as f64 * s;
         let sigma = (n as f64 * s * (1.0 - s)).sqrt();
         let got = counts[c.endpoint] as f64;
@@ -1423,23 +1432,23 @@ async fn affinity_alternating_models_is_not_a_move() {
     assert_eq!(log_lines(marker), Vec::<String>::new());
 }
 
-/// The stateless trade-off, pinned down: when an account's own weight falls
-/// (here the weekly `allowed_warning` floor engages, cutting its 1 - gate term
-/// from 0.90 to 0.20) while it still passes the overage rule, it loses part
-/// of its sessions once, each counted as `rehomed`. They do not flap back
-/// while the weight holds.
+/// The stateless trade-off, pinned down: when an account's own waste risk
+/// falls (here its weekly use rises from 0.19 to 0.60, halving it) while it
+/// still passes the overage rule, it loses part of its sessions once, each
+/// counted as `rehomed`. They do not flap back while the waste risk holds.
 #[tokio::test]
-async fn affinity_own_weight_drop_rehomes_part_of_its_sessions_once() {
+async fn affinity_own_waste_risk_drop_rehomes_part_of_its_sessions_once() {
     let _clock = FrozenClock::at(FIXED_EPOCH);
     let state = prod_pool().await;
-    let marker = "lab9360-weight-drop";
+    let marker = "lab9405-wr-drop";
     log_capture_buf();
     let keys = keys_hashing_to(&state, HOME, 200, 200_000, marker).await;
     assert_eq!(keys.len(), 200);
     for k in &keys {
         assert_eq!(state.pick_endpoint(Some(k), OPUS, &[]).await, Some(HOME));
     }
-    set_7d_status(&state, HOME, "allowed_warning").await;
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, HOME, 0.10, 0.60, now + 10_000, now + 4 * 86_400).await;
 
     let mut first = Vec::with_capacity(keys.len());
     for k in &keys {
@@ -1466,6 +1475,134 @@ async fn affinity_own_weight_drop_rehomes_part_of_its_sessions_once() {
     assert_eq!(
         migrations(&state),
         want,
-        "no further moves while the weight holds"
+        "no further moves while the waste risk holds"
     );
+}
+
+/// Set `HOME`'s 5h utilisation alone, leaving its weekly claim and so its
+/// waste risk as `heal_pool` left them.
+async fn set_home_5h(state: &AppState, util_5h: f64) {
+    state.endpoints[HOME].rate_info.write().await.utilization_5h = Some(util_5h);
+}
+
+/// Keyed sessions are placed on waste risk, so a 5h window filling on a
+/// passing account moves none of its sessions: here `HOME`'s gate rises from
+/// 0.20 to 0.85, under `soft_limit`, with every waste risk unchanged.
+#[tokio::test]
+async fn affinity_5h_gate_rise_under_soft_limit_moves_no_session() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9405-5h-rise";
+    log_capture_buf();
+    set_home_5h(&state, 0.20).await;
+    let keys = keys_hashing_to(&state, HOME, 200, 200_000, marker).await;
+    assert_eq!(keys.len(), 200);
+    for k in &keys {
+        assert_eq!(state.pick_endpoint(Some(k), OPUS, &[]).await, Some(HOME));
+    }
+    let wr_before = state.routing_candidates(OPUS, &[]).await[HOME].wr;
+
+    set_home_5h(&state, 0.85).await;
+    let candidates = state.routing_candidates(OPUS, &[]).await;
+    let home = &candidates[HOME];
+    assert!((home.gate - 0.85).abs() < 1e-9, "home's gate is 0.85");
+    assert_eq!(home.wr, wr_before, "home's waste risk is unchanged");
+    assert!(state.keeps_affinity(home), "home still passes the rule");
+
+    for k in &keys {
+        assert_eq!(
+            state.pick_endpoint(Some(k), OPUS, &[]).await,
+            Some(HOME),
+            "key {k} left home on a 5h gate under soft_limit"
+        );
+    }
+    assert_eq!(migrations(&state), [0; 5], "no move, no count");
+    assert_eq!(log_lines(marker), Vec::<String>::new(), "no move, no line");
+}
+
+/// The 5h half of the overage rule still holds: the same account at gate
+/// 0.92, past `soft_limit`, sheds its session as `loaded`.
+#[tokio::test]
+async fn affinity_5h_gate_past_soft_limit_still_sheds() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9405-5h-past";
+    set_home_5h(&state, 0.20).await;
+    let key = seed_session(&state, marker).await;
+    set_home_5h(&state, 0.92).await;
+    assert_session_leaves(&state, &key, marker, MigrationReason::Loaded).await;
+}
+
+/// Synthetic candidates with one waste risk and weights spread 1:10 by gate.
+fn gate_spread_candidates(n: usize) -> Vec<RoutingCandidate> {
+    (0..n)
+        .map(|i| {
+            let gate = 0.89 * i as f64 / (n - 1) as f64;
+            RoutingCandidate {
+                gate_5h: gate,
+                gate,
+                wr: 1.0,
+                weight: 1.0 - gate,
+                ..spread_candidates(n)[i]
+            }
+        })
+        .collect()
+}
+
+/// Over 100,000 keys, each account's count is within 4 sigma of `share`.
+fn assert_counts_match(counts: &[usize], share: impl Fn(usize) -> f64, what: &str) {
+    let n: usize = counts.iter().sum();
+    for (i, &got) in counts.iter().enumerate() {
+        let s = share(i);
+        let expected = n as f64 * s;
+        let sigma = (n as f64 * s * (1.0 - s)).sqrt();
+        assert!(
+            (got as f64 - expected).abs() <= 4.0 * sigma,
+            "{what}: account {i} got {got}, expected {expected:.0} ± {:.0}",
+            4.0 * sigma
+        );
+    }
+}
+
+/// Un-keyed picks still walk the full weight, so they follow the 5h gate;
+/// keyed picks follow waste risk alone, which here is equal everywhere.
+#[tokio::test]
+async fn unkeyed_picks_walk_full_weight_keyed_picks_waste_risk() {
+    let state = sticky_v2_state(pool_endpoints(POOL));
+    let pool = gate_spread_candidates(POOL);
+    let refs: Vec<&RoutingCandidate> = pool.iter().collect();
+    let total: f64 = pool.iter().map(|c| c.weight).sum();
+    let n = 100_000;
+
+    let mut unkeyed = [0usize; POOL];
+    let mut keyed = [0usize; POOL];
+    for i in 0..n {
+        unkeyed[state.pick_sticky_weighted_v2(&refs, total, None).endpoint] += 1;
+        keyed[keyed_pick(&state, &pool, &format!("lab9405-split-{i}"))] += 1;
+    }
+    assert_counts_match(&unkeyed, |i| pool[i].weight / total, "un-keyed");
+    assert_counts_match(&keyed, |_| 1.0 / POOL as f64, "keyed");
+}
+
+/// A passing account with no waste risk (missing reset data) is scored as
+/// its lowest-scoring peer, so it holds no more keys than that peer would.
+#[tokio::test]
+async fn affinity_zero_waste_risk_scores_as_lowest_peer() {
+    let state = sticky_v2_state(pool_endpoints(POOL));
+    let mut pool = spread_candidates(POOL);
+    let blind = 30;
+    pool[blind].wr = 0.0;
+    let floor = pool
+        .iter()
+        .filter(|c| c.wr > 0.0)
+        .map(|c| c.wr)
+        .fold(f64::INFINITY, f64::min);
+    let score = |i: usize| if pool[i].wr > 0.0 { pool[i].wr } else { floor };
+    let total: f64 = (0..POOL).map(score).sum();
+
+    let mut counts = [0usize; POOL];
+    for i in 0..100_000 {
+        counts[keyed_pick(&state, &pool, &format!("lab9405-blind-{i}"))] += 1;
+    }
+    assert_counts_match(&counts, |i| score(i) / total, "keyed");
 }

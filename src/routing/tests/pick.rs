@@ -134,7 +134,9 @@ async fn pick_recovers_after_hard_limit_expires() {
 #[tokio::test]
 async fn pick_ignores_stale_rejected_claim_after_hard_limit() {
     // A "rejected" 7d claim from a 429 response should not permanently block the
-    // account once the hard limit has expired without fresh data.
+    // account once the hard limit has expired without fresh data. A claim used
+    // up to 1.0 before its reset is a spent week, which does block until the
+    // reset (`routing_weight_spent_week_is_zero`), so this one is not.
     let state = test_state_with(vec![mk_endpoint("recovering", "sk-ant-api-a")]);
     let now_epoch = AppState::now_epoch();
 
@@ -148,7 +150,7 @@ async fn pick_ignores_stale_rejected_claim_after_hard_limit() {
         info.claims_7d.insert(
             "seven_day_sonnet".to_string(),
             ClaimWindowData {
-                utilization: Some(1.0),
+                utilization: Some(0.97),
                 reset: Some(now_epoch + 100000),
                 status: Some("rejected".to_string()),
                 ..Default::default()

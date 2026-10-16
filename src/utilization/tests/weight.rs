@@ -272,16 +272,32 @@ fn metrics_gate_matches_routing_gate() {
         ..Default::default()
     };
     let half_ramp = now + (NEAR_RESET_OVERAGE_SECS / 2.0) as u64;
+    let spent = |status: &str| RateLimitInfo {
+        utilization_5h: Some(0.40),
+        reset_5h: Some(now + 7200),
+        status_5h: Some("allowed".to_string()),
+        claims_7d: spent_week(now, status),
+        ..Default::default()
+    };
+    // A weekly-spent 429's cooldown has lapsed with no fresh response since:
+    // the stale path, which holds the gate at 0.5 and skips the rejected claim.
+    let spent_stale = RateLimitInfo {
+        hard_limited_until: Some(Instant::now() - Duration::from_secs(1)),
+        ..spent("rejected")
+    };
+    // (name, info, want gate, want a positive weight)
     let cases = [
         (
             "(a) overage, rejected 7d",
             overage(0.30, now + 86_400),
             0.30,
+            true,
         ),
         (
             "(b) overage, near-reset ramp",
             overage(0.80, half_ramp),
             0.40,
+            true,
         ),
         (
             "(c) overage inactive",
@@ -293,10 +309,19 @@ fn metrics_gate_matches_routing_gate() {
                 ..Default::default()
             },
             WARNING_UTIL_FLOOR,
+            true,
         ),
+        (
+            "(d) week spent",
+            spent("allowed_warning"),
+            WARNING_UTIL_FLOOR,
+            false,
+        ),
+        ("(e) week spent, stale", spent_stale, 0.5, false),
     ];
-    for (name, info, want) in cases {
-        let rw = compute_routing_weight(&info, "claude-sonnet-4-6", now, false).expect(name);
+    for (name, info, want, servable) in cases {
+        let stale = stale_after_hard_limit(&info);
+        let rw = compute_routing_weight(&info, "claude-sonnet-4-6", now, stale).expect(name);
         let (gate, weight) = metrics_gate_weight(&info, now, Instant::now()).expect(name);
         assert_eq!(gate, rw.gate, "{name}: metrics gate != routing gate");
         assert!(
@@ -307,7 +332,112 @@ fn metrics_gate_matches_routing_gate() {
             weight, rw.weight,
             "{name}: metrics weight != routing weight"
         );
-        assert!(weight > 0.0, "{name}: servable account published weight 0");
+        assert_eq!(weight > 0.0, servable, "{name}: weight {weight}");
+    }
+}
+
+/// A general weekly claim used up, resetting in 3 hours: inside the 6 h
+/// near-reset ramp, where the affinity rule reads the expiring week as headroom.
+fn spent_week(now: u64, status: &str) -> HashMap<String, ClaimWindowData> {
+    HashMap::from([(
+        "seven_day".to_string(),
+        ClaimWindowData {
+            utilization: Some(1.0),
+            reset: Some(now + 3 * 3600),
+            status: Some(status.to_string()),
+            last_seen: now,
+        },
+    )])
+}
+
+/// A spent week weighs 0, so no pick lands on the account until its reset,
+/// under the stale path too. `waste_risk` is 0 for a spent week, and the
+/// weight used to fall back to the full headroom.
+#[test]
+fn routing_weight_spent_week_is_zero() {
+    let now = 1_000_000u64;
+    let info = |status: &str| RateLimitInfo {
+        utilization_5h: Some(0.20),
+        reset_5h: Some(now + 7200),
+        claims_7d: spent_week(now, status),
+        ..Default::default()
+    };
+    let rw =
+        compute_routing_weight(&info("allowed_warning"), "claude-sonnet-4-6", now, false).unwrap();
+    assert_eq!(rw.weight, 0.0);
+    assert!(rw.gate < 1.0, "the gate alone does not zero it");
+
+    let rw = compute_routing_weight(&info("rejected"), "claude-sonnet-4-6", now, true)
+        .expect("the stale path skips the rejected-claim check");
+    assert_eq!(rw.weight, 0.0, "stale: the week is still spent");
+}
+
+/// Fable draws on both its band and the general week; either one spent
+/// zeroes the weight.
+#[test]
+fn routing_weight_spent_fable_pool_is_zero() {
+    let now = 1_000_000u64;
+    let mut claims = spent_week(now, "allowed_warning");
+    claims.insert(
+        FABLE_BAND_CLAIM.to_string(),
+        ClaimWindowData {
+            utilization: Some(0.20),
+            reset: Some(now + 302_400),
+            status: Some("allowed".to_string()),
+            last_seen: now,
+        },
+    );
+    let info = RateLimitInfo {
+        utilization_5h: Some(0.20),
+        reset_5h: Some(now + 7200),
+        claims_7d: claims,
+        ..Default::default()
+    };
+    let rw = compute_routing_weight(&info, "claude-fable-5", now, false).unwrap();
+    assert_eq!(rw.weight, 0.0);
+}
+
+/// What the spent-week rule leaves alone: overage serves a spent week, an
+/// account without reset data cannot be judged spent, and a passed reset
+/// has restored the week. Each keeps its headroom as weight.
+#[test]
+fn routing_weight_spent_week_exceptions_keep_headroom() {
+    let now = 1_000_000u64;
+    let with_claim = |reset: Option<u64>| RateLimitInfo {
+        utilization_5h: Some(0.20),
+        reset_5h: Some(now + 7200),
+        claims_7d: HashMap::from([(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: Some(1.0),
+                reset,
+                status: None,
+                last_seen: now,
+            },
+        )]),
+        ..Default::default()
+    };
+    let overage = RateLimitInfo {
+        overage_in_use: true,
+        overage_status: Some("allowed".to_string()),
+        overage_utilization: Some(0.30),
+        overage_reset: Some(now + 86_400),
+        ..with_claim(Some(now + 3 * 3600))
+    };
+    let cases = [
+        ("overage", overage),
+        ("no reset data", with_claim(None)),
+        ("reset passed", with_claim(Some(now - 1))),
+    ];
+    for (name, info) in cases {
+        let rw = compute_routing_weight(&info, "claude-sonnet-4-6", now, false).expect(name);
+        assert!(rw.weight > 0.0, "{name}: weight 0");
+        assert!(
+            (rw.weight - (1.0 - rw.gate)).abs() < 1e-9,
+            "{name}: weight {} is not the headroom {}",
+            rw.weight,
+            1.0 - rw.gate
+        );
     }
 }
 

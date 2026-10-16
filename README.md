@@ -953,6 +953,9 @@ Status is **not** derivable from utilization in either direction, so read it
 rather than thresholding the percentage: an account can sit at 0.98 and still
 be `allowed_warning` — the router keeps routing to it — while another reads
 1.0 and is `rejected`, which makes the router hard-skip it for that claim.
+Whatever its status, an account not in overage whose weekly claim reads 1.0
+before its reset gets routing weight 0 until the reset; the periodic probe
+re-checks it.
 
 Across replicas these are gauges mirroring the same upstream claim, so
 aggregate with `max by (account, claim)`; `sum` multiplies the reading by the
@@ -996,23 +999,27 @@ with `sum by (kind)`, where `max` would undercount.
 ### Session affinity
 
 Under `sticky-weighted-v2`, a request with an affinity key goes to the account
-that wins the key's weighted rendezvous hash among the accounts in its tier
-that pass the overage rule. An account passes while its gate is below
+that wins the key's rendezvous hash, weighted by waste risk, among the accounts
+in its tier that pass the overage rule. An account passes while its gate is below
 `soft_limit` and its unused weekly quota, where quota due to expire within
 6 h counts increasingly as unused, is at least `1 − soft_limit` (0.10 at the
 default). So a session stays on its account until that account nears its 5h
 or weekly limit, gets `throttled` or `rejected`, is rate-limited, cooling or
 circuit-broken, or is demoted for overage. The weekly `allowed_warning` floor
-alone does not move it. When no account in the tier passes, the hash runs over
-the whole tier; such a pick is degraded routing, so it is neither counted as a
-move nor remembered.
+alone does not move it, and neither does 5h load short of `soft_limit`: the
+hash ignores it, so a 5h window filling or resetting moves no session between
+passing accounts. An account without waste-risk data scores as its lowest
+peer. When no account in the tier passes, the hash runs over the whole tier on
+the full routing weight, which does count 5h load; such a pick is degraded
+routing, so it is neither counted as a move nor remembered.
 
 The hash is stateless, so replicas agree without sharing anything. Each
-account scores a key on its own, so a weight change moves only the keys won
-by or lost from that account, and an account leaving the set moves only its
-own keys. An account whose weight falls (for example when its 5h use climbs
-or a status floor engages) loses part of its keys once, counted as
-`rehomed`; they do not flap back while the weight holds.
+account scores a key on its own, so a waste-risk change moves only the keys
+won by or lost from that account, and an account leaving the set moves only
+its own keys. An account whose waste risk falls (its weekly use climbs faster
+than its window runs out) loses part of its keys once, counted as `rehomed`;
+they do not flap back while the waste risk holds. Un-keyed requests still
+scatter over the full routing weight.
 
 `anthropic_affinity_migrations_total{reason}` counts real moves: a request
 whose account differs from the one this replica last picked for its key and
@@ -1029,7 +1036,7 @@ routing never reads it. Each move also logs one INFO line,
 | `spent` | failed the overage rule on its weekly quota |
 | `floored` | failed the overage rule on a status floor (`throttled`, `rejected`) |
 | `unavailable` | is not a candidate in the request's tier: rate-limited, cooling, circuit-broken, excluded for the model or fast mode, outside the caller's pin, or demoted for overage; or the request was served from a different tier |
-| `rehomed` | still passes, but another account won the key: its weight rose, or it returned to the set |
+| `rehomed` | still passes, but another account won the key: its waste risk rose, or it returned to the set |
 
 All five label values are emitted from process start. The count is per
 replica: when consecutive requests on one key land on different replicas, a
@@ -1260,7 +1267,7 @@ The Anthropic↔OpenAI translation layer is not lossless. When an Anthropic-form
 6. Compute time-adjusted utilization per claim window (5h, 7d per model)
 7. Apply status floors (warning ≥ 0.80, throttled ≥ 0.98, rejected = 1.0)
 8. Exclude accounts above soft_limit utilization ceiling
-9. Pick account: keyed requests by weighted rendezvous hash among accounts passing the overage rule ([Session affinity](#session-affinity)), others by headroom-proportional weighted buckets
+9. Pick account: keyed requests by waste-risk-weighted rendezvous hash among accounts passing the overage rule ([Session affinity](#session-affinity)), others by headroom-proportional weighted buckets
 10. Inject auth token + auto-cache header
 11. Forward request to upstream Anthropic API
 12. If 429 → mark rate-limited (propagate to Redis), add to skip list, retry with next account
