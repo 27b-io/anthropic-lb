@@ -193,7 +193,8 @@ probe_interval_secs = 300
 
 # Log sink: also POST every stdout log line, batched as JSON lines
 # ({"_time", "_msg"}), to a collector such as VictoriaLogs. Best effort: a
-# line that finds the 10,000-line queue full, or whose batch fails, is dropped
+# line that finds the queue full (10,000 lines or 16 MiB), or whose batch
+# fails, is dropped
 # (not retried) and counted on /metrics (anthropic_log_sink_lines_*_total).
 # http:// or https:// only; a URL carrying credentials is refused at startup.
 # [log_sink]

@@ -16,6 +16,15 @@ use tokio::sync::mpsc;
 /// Lines held in memory awaiting a POST. A line that finds the queue full is
 /// dropped.
 const QUEUE_LINES: usize = 10_000;
+/// ... and the bytes they may hold together. Lines are bounded in count above,
+/// but a line can carry request-controlled text (a model name, say) of
+/// megabytes, so without this the queue could hold gigabytes while a POST
+/// hangs. A line that would cross it is dropped.
+const QUEUE_BYTES: u64 = 16 << 20;
+/// The longest `_msg` sent; a longer line is cut and marked. Under
+/// VictoriaLogs' default 256 KiB line limit even at the worst JSON escaping
+/// (6 bytes for a control character), so one line cannot fail a whole batch.
+const MAX_LINE_BYTES: usize = 32 << 10;
 /// A batch is POSTed once it holds this many lines, ...
 const MAX_BATCH_LINES: usize = 1_000;
 /// ... or about this many body bytes (the line that crosses it still rides),
@@ -51,9 +60,28 @@ struct Line {
     /// When the line was written, as the fmt layer prints its own timestamp.
     #[serde(rename = "_time")]
     time: String,
-    /// The line exactly as written to stdout, minus its newline.
+    /// The line exactly as written to stdout, minus its newline, cut at
+    /// `MAX_LINE_BYTES`.
     #[serde(rename = "_msg")]
     msg: String,
+}
+
+impl Line {
+    /// What the line holds in memory, as counted against `QUEUE_BYTES`.
+    fn bytes(&self) -> u64 {
+        (self.time.len() + self.msg.len()) as u64
+    }
+}
+
+/// `raw` as `_msg`: lossy UTF-8, and past `MAX_LINE_BYTES` cut and marked with
+/// the original length, so a reader knows the line was longer.
+fn message(raw: &[u8]) -> String {
+    if raw.len() <= MAX_LINE_BYTES {
+        return String::from_utf8_lossy(raw).into_owned();
+    }
+    let mut msg = String::from_utf8_lossy(&raw[..MAX_LINE_BYTES]).into_owned();
+    msg.push_str(&format!(" …[log sink: cut from {} bytes]", raw.len()));
+    msg
 }
 
 pub(crate) struct LogSink {
@@ -66,18 +94,23 @@ pub(crate) struct LogSink {
     dropped: AtomicU64,
     /// Lines accepted into the queue and not yet sent or dropped.
     pending: AtomicU64,
+    /// Bytes of the lines in the queue (not yet taken into a batch), against
+    /// `queue_bytes`. Shared with the flush task, which releases them.
+    queued_bytes: Arc<AtomicU64>,
+    queue_bytes: u64,
 }
 
 impl LogSink {
     /// Build the sink and spawn its flush task. Call from inside the runtime.
     pub(crate) fn start(config: &LogSinkConfig) -> Result<Arc<Self>, String> {
-        Self::start_with(config, QUEUE_LINES, FLUSH_INTERVAL)
+        Self::start_with(config, QUEUE_LINES, QUEUE_BYTES, FLUSH_INTERVAL)
     }
 
-    /// `start`, with the queue size and flush interval a test can shrink.
+    /// `start`, with the queue limits and flush interval a test can shrink.
     fn start_with(
         config: &LogSinkConfig,
         capacity: usize,
+        queue_bytes: u64,
         flush_interval: Duration,
     ) -> Result<Arc<Self>, String> {
         let url = validate_log_sink(config)?;
@@ -95,16 +128,26 @@ impl LogSink {
             None => host.to_string(),
         };
         let (tx, rx) = mpsc::channel(capacity);
+        let queued_bytes = Arc::new(AtomicU64::new(0));
         let sink = Arc::new(Self {
             tx,
             host,
             sent: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             pending: AtomicU64::new(0),
+            queued_bytes: queued_bytes.clone(),
+            queue_bytes,
         });
         // A weak handle: when the last `LogSink` goes, its sender goes with it,
         // the queue closes and the task ends.
-        tokio::spawn(flush(rx, Arc::downgrade(&sink), http, url, flush_interval));
+        tokio::spawn(flush(
+            rx,
+            Arc::downgrade(&sink),
+            queued_bytes,
+            http,
+            url,
+            flush_interval,
+        ));
         Ok(sink)
     }
 
@@ -122,7 +165,7 @@ impl LogSink {
 
     /// Queue one write from the tracing writer, line by line. It runs inside
     /// every event, so it never blocks or awaits: a line that finds the queue
-    /// full or closed is dropped and counted.
+    /// full in lines or bytes, or closed, is dropped and counted.
     pub(crate) fn push(&self, bytes: &[u8]) {
         let mut time: Option<String> = None;
         for raw in bytes.split(|&b| b == b'\n') {
@@ -133,14 +176,23 @@ impl LogSink {
             let line = Line {
                 // Every line of one event carries that event's capture time.
                 time: time.get_or_insert_with(now_rfc3339).clone(),
-                msg: String::from_utf8_lossy(raw).into_owned(),
+                msg: message(raw),
             };
+            let size = line.bytes();
+            // Reserved before the check, so concurrent pushes cannot all pass
+            // it and overshoot together; a refused line gives it back.
+            if self.queued_bytes.fetch_add(size, Ordering::Relaxed) + size > self.queue_bytes {
+                self.queued_bytes.fetch_sub(size, Ordering::Relaxed);
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             // Counted before the send, not after: the flush task can settle
             // the line before this thread runs again, and `pending` must
             // never dip below zero.
             self.pending.fetch_add(1, Ordering::Relaxed);
             if self.tx.try_send(line).is_err() {
                 self.pending.fetch_sub(1, Ordering::Relaxed);
+                self.queued_bytes.fetch_sub(size, Ordering::Relaxed);
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -226,20 +278,27 @@ impl Health {
 async fn flush(
     mut rx: mpsc::Receiver<Line>,
     sink: Weak<LogSink>,
+    queued_bytes: Arc<AtomicU64>,
     http: Client,
     url: reqwest::Url,
     interval: Duration,
 ) {
     let mut health = Health::default();
+    // A line leaves the queue's byte count when it is taken into a batch,
+    // whose own size `MAX_BATCH_BYTES` bounds.
+    let take = |line: &Line, body: &mut Vec<u8>| {
+        queued_bytes.fetch_sub(line.bytes(), Ordering::Relaxed);
+        append_line(body, line);
+    };
     while let Some(first) = rx.recv().await {
         let deadline = tokio::time::Instant::now() + interval;
         let mut body = Vec::new();
-        append_line(&mut body, &first);
+        take(&first, &mut body);
         let mut lines = 1;
         while lines < MAX_BATCH_LINES && body.len() < MAX_BATCH_BYTES {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(line)) => {
-                    append_line(&mut body, &line);
+                    take(&line, &mut body);
                     lines += 1;
                 }
                 // The interval is up, or the queue closed: send what is held.
@@ -330,26 +389,20 @@ pub(crate) struct StdoutTee {
 }
 
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for StdoutTee {
-    type Writer = TeeWriter<'a>;
+    type Writer = &'a StdoutTee;
 
     fn make_writer(&'a self) -> Self::Writer {
-        TeeWriter {
-            sink: self.sink.as_deref(),
-        }
+        self
     }
 }
 
-pub(crate) struct TeeWriter<'a> {
-    sink: Option<&'a LogSink>,
-}
-
-impl std::io::Write for TeeWriter<'_> {
+impl std::io::Write for &StdoutTee {
     /// The fmt layer writes each event with one `write_all`, and this takes
     /// all of it in one call, so one event is one `push`.
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         // The sink first, so a failing stdout (a closed pipe) does not also
         // cost the sink its copy.
-        if let Some(sink) = self.sink {
+        if let Some(sink) = &self.sink {
             sink.push(buf);
         }
         std::io::stdout().lock().write_all(buf)?;

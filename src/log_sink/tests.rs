@@ -73,11 +73,16 @@ async fn spawn_hung_collector() -> (String, Arc<AtomicUsize>) {
 }
 
 fn sink_at(url: &str, capacity: usize, interval: Duration) -> Arc<LogSink> {
+    sink_with(url, capacity, QUEUE_BYTES, interval)
+}
+
+fn sink_with(url: &str, capacity: usize, queue_bytes: u64, interval: Duration) -> Arc<LogSink> {
     LogSink::start_with(
         &LogSinkConfig {
             url: url.to_string(),
         },
         capacity,
+        queue_bytes,
         interval,
     )
     .unwrap()
@@ -96,38 +101,6 @@ async fn eventually(what: &str, within: Duration, mut done: impl FnMut() -> bool
     }
 }
 
-/// Seconds since the epoch of an RFC 3339 UTC timestamp with a fraction, the
-/// one shape `now_rfc3339` writes (`2026-10-17T01:02:03.123456Z`).
-fn rfc3339_epoch(s: &str) -> Option<i64> {
-    let b = s.as_bytes();
-    let shape = b.len() > 21
-        && b[4] == b'-'
-        && b[7] == b'-'
-        && b[10] == b'T'
-        && b[13] == b':'
-        && b[16] == b':'
-        && b[19] == b'.'
-        && s.ends_with('Z')
-        && s[20..s.len() - 1].bytes().all(|c| c.is_ascii_digit());
-    if !shape {
-        return None;
-    }
-    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
-    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
-    let (hh, mm, ss) = (n(11..13)?, n(14..16)?, n(17..19)?);
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
-        return None;
-    }
-    // Days from the civil date (Howard Hinnant's algorithm).
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
-}
-
 // ── Delivery ────────────────────────────────────────────────────────
 
 /// A lone line waits for company no longer than the flush interval, then
@@ -140,6 +113,7 @@ async fn a_lone_line_leaves_within_the_flush_interval() {
     let sink = LogSink::start(&LogSinkConfig { url }).unwrap();
     let line = r#"2026-10-17T00:00:00.000001Z  INFO anthropic_lb: proxied msg="a \"quoted\" tab	and \\ backslash""#;
 
+    let before = now_rfc3339();
     let pushed = Instant::now();
     sink.push(format!("{line}\n").as_bytes());
     eventually("the POST", Duration::from_secs(5), || {
@@ -159,13 +133,18 @@ async fn a_lone_line_leaves_within_the_flush_interval() {
     let rows = post.rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["_msg"], line);
+    // now_rfc3339 is fixed-width UTC, so string order is time order.
     let time = rows[0]["_time"].as_str().unwrap();
-    let epoch = rfc3339_epoch(time).unwrap_or_else(|| panic!("not RFC 3339: {time}"));
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    assert!((now - epoch).abs() < 30, "{time} is not now");
+    let after = now_rfc3339();
+    assert_eq!(
+        time.len(),
+        before.len(),
+        "{time} is not the fmt layer's shape"
+    );
+    assert!(
+        before.as_str() <= time && time <= after.as_str(),
+        "{time} is not between {before} and {after}"
+    );
 }
 
 /// The layer `main` installs ships plain text: with colour on (no `NO_COLOR`
@@ -173,6 +152,12 @@ async fn a_lone_line_leaves_within_the_flush_interval() {
 /// field-name escapes into every `_msg`.
 #[tokio::test]
 async fn the_sink_gets_plain_text_from_the_stdout_layer() {
+    // With NO_COLOR set the default layer is plain anyway, and this would pass
+    // without the code it guards.
+    assert!(
+        std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
+        "unset NO_COLOR to run this test: it proves nothing with colour already off"
+    );
     let (url, posts) = spawn_collector(vec![]).await;
     let sink = sink_at(&url, 16, Duration::from_millis(20));
     let _log = tracing::subscriber::set_default(
@@ -260,12 +245,22 @@ async fn a_batch_is_bounded_by_lines_and_bytes() {
     assert_eq!(sizes, [1_000, 1_000, 500]);
 
     posts.lock().unwrap().clear();
-    let big = "x".repeat(MAX_BATCH_BYTES / 2 + 1);
-    for _ in 0..3 {
+    // Lines at the line cap: a batch fills to MAX_BATCH_BYTES, the line that
+    // crosses it riding along, and the rest leave in the next one.
+    let big = "x".repeat(MAX_LINE_BYTES);
+    let row = serde_json::to_vec(&Line {
+        time: now_rfc3339(),
+        msg: big.clone(),
+    })
+    .unwrap()
+    .len()
+        + 1;
+    let first = MAX_BATCH_BYTES.div_ceil(row);
+    for _ in 0..first + 3 {
         sink.push(big.as_bytes());
     }
     eventually("the byte-bounded batches", Duration::from_secs(5), || {
-        sink.sent() == 2_503
+        sink.sent() == 2_500 + first as u64 + 3
     })
     .await;
     let sizes: Vec<usize> = posts
@@ -274,7 +269,11 @@ async fn a_batch_is_bounded_by_lines_and_bytes() {
         .iter()
         .map(|p| p.rows().len())
         .collect();
-    assert_eq!(sizes, [2, 1], "the line that crosses the cap still rides");
+    assert_eq!(
+        sizes,
+        [first, 3],
+        "the line that crosses the cap still rides"
+    );
 }
 
 // ── Failure ─────────────────────────────────────────────────────────
@@ -302,7 +301,96 @@ async fn a_down_sink_drops_and_settles() {
 
     assert_eq!(sink.dropped(), 3);
     assert_eq!(sink.sent(), 0);
-    assert_eq!(sink.drain(Duration::from_secs(1)).await, 0);
+}
+
+/// Shutdown's drain gives up at its budget and reports what is still
+/// undelivered, rather than waiting on a POST that never answers.
+#[tokio::test]
+async fn drain_stops_at_its_budget() {
+    let (url, accepted) = spawn_hung_collector().await;
+    let sink = sink_at(&url, 8, Duration::from_millis(20));
+
+    sink.push(b"stuck\n");
+    eventually("the hung POST", Duration::from_secs(5), || {
+        accepted.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let started = Instant::now();
+    assert_eq!(sink.drain(Duration::from_millis(100)).await, 1);
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(1),
+        "drain overran its budget: {took:?}"
+    );
+}
+
+/// A line past `MAX_LINE_BYTES` leaves cut, marked with its full length, and
+/// under the line limit a collector such as VictoriaLogs enforces.
+#[tokio::test]
+async fn an_oversized_line_is_cut_and_marked() {
+    let (url, posts) = spawn_collector(vec![]).await;
+    let sink = sink_at(&url, 100, Duration::from_millis(20));
+    let huge = "m".repeat(5 << 20);
+
+    sink.push(format!("model={huge}\n").as_bytes());
+    eventually("the POST", Duration::from_secs(5), || {
+        !posts.lock().unwrap().is_empty()
+    })
+    .await;
+    let (msg, body_len) = {
+        let posts = posts.lock().unwrap();
+        let msg = posts[0].rows()[0]["_msg"].as_str().unwrap().to_string();
+        (msg, posts[0].body.len())
+    };
+    let marker = format!(
+        " …[log sink: cut from {} bytes]",
+        huge.len() + "model=".len()
+    );
+    assert!(
+        msg.ends_with(&marker),
+        "unmarked: …{}",
+        &msg[msg.len() - 60..]
+    );
+    assert_eq!(msg.len(), MAX_LINE_BYTES + marker.len());
+    assert!(
+        body_len < 256 << 10,
+        "over VictoriaLogs' default line limit"
+    );
+    // Counted once the 200 is read, which can trail the collector's record.
+    eventually("the line counted sent", Duration::from_secs(5), || {
+        sink.sent() == 1
+    })
+    .await;
+}
+
+/// The queue is bounded in bytes as well as lines: while a POST hangs, lines
+/// that would take it past `queue_bytes` are dropped at once, and the bytes a
+/// batch takes out are released.
+#[tokio::test]
+async fn the_queue_is_bounded_in_bytes() {
+    let (url, accepted) = spawn_hung_collector().await;
+    let line = "x".repeat(MAX_LINE_BYTES);
+    // Room for three such lines and their timestamps, not four.
+    let budget = 4 * MAX_LINE_BYTES as u64 - 1;
+    let sink = sink_with(&url, 1_000, budget, Duration::from_millis(20));
+
+    sink.push(b"in flight\n");
+    eventually("the hung POST", Duration::from_secs(5), || {
+        accepted.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(
+        sink.queued_bytes.load(Ordering::Relaxed),
+        0,
+        "a batch releases its bytes"
+    );
+
+    for _ in 0..10 {
+        sink.push(format!("{line}\n").as_bytes());
+    }
+    assert_eq!(pending(&sink), 1 + 3);
+    assert_eq!(sink.dropped(), 7);
+    assert!(sink.queued_bytes.load(Ordering::Relaxed) <= budget);
 }
 
 /// A collector that accepts and never answers: while its POST hangs, pushes
