@@ -1270,6 +1270,11 @@ fn spread_candidates(n: usize) -> Vec<RoutingCandidate> {
         .collect()
 }
 
+/// The score `pick_keyed` gives a passing account with waste risk `wr`.
+fn keyed_score(wr: f64) -> f64 {
+    wr.powf(KEYED_WR_EXPONENT)
+}
+
 /// The StickyWeightedV2 keyed pick for `key` over `pool`.
 fn keyed_pick(state: &AppState, pool: &[RoutingCandidate], key: &str) -> usize {
     let refs: Vec<&RoutingCandidate> = pool.iter().collect();
@@ -1294,7 +1299,9 @@ async fn affinity_waste_risk_change_moves_keys_only_onto_or_off_that_account() {
     let mut reset = pool.clone();
     reset[changed].wr *= 2.5;
     reset[changed].weight *= 2.5;
-    let share = |p: &[RoutingCandidate]| p[changed].wr / p.iter().map(|c| c.wr).sum::<f64>();
+    let share = |p: &[RoutingCandidate]| {
+        keyed_score(p[changed].wr) / p.iter().map(|c| keyed_score(c.wr)).sum::<f64>()
+    };
     let gain = share(&reset) - share(&pool);
     let mut moved = 0;
     for (k, &was) in keys.iter().zip(&before) {
@@ -1329,7 +1336,7 @@ async fn affinity_waste_risk_change_moves_keys_only_onto_or_off_that_account() {
 }
 
 /// AC6: over 100,000 keys, every account's key count is within 4 sigma of its
-/// waste-risk share.
+/// share of the damped waste risk (`keyed_score`).
 #[tokio::test]
 async fn affinity_placement_is_proportional_to_waste_risk() {
     let state = sticky_v2_state(pool_endpoints(POOL));
@@ -1339,9 +1346,9 @@ async fn affinity_placement_is_proportional_to_waste_risk() {
     for i in 0..n {
         counts[keyed_pick(&state, &pool, &format!("lab9360-ac6-{i}"))] += 1;
     }
-    let total: f64 = pool.iter().map(|c| c.wr).sum();
+    let total: f64 = pool.iter().map(|c| keyed_score(c.wr)).sum();
     for c in &pool {
-        let s = c.wr / total;
+        let s = keyed_score(c.wr) / total;
         let expected = n as f64 * s;
         let sigma = (n as f64 * s * (1.0 - s)).sqrt();
         let got = counts[c.endpoint] as f64;
@@ -1352,6 +1359,46 @@ async fn affinity_placement_is_proportional_to_waste_risk() {
             4.0 * sigma
         );
     }
+}
+
+/// LAB-9985: the keyed score is damped. When an account's waste risk falls
+/// by a factor f, the share of its keys that leave is one minus its share
+/// after over its share before, close to `1 - f^a`: a 20% drop moves about
+/// 10.6% of its keys at a = 0.5, where the undamped score moved 20%.
+#[tokio::test]
+async fn affinity_waste_risk_drop_moves_damped_share_of_its_keys() {
+    let state = sticky_v2_state(pool_endpoints(POOL));
+    let pool = spread_candidates(POOL);
+    let home = 25;
+    let mut dropped = pool.clone();
+    dropped[home].wr *= 0.8;
+    dropped[home].weight *= 0.8;
+
+    let (mut stayed, mut held) = (0usize, 0usize);
+    for i in 0..200_000 {
+        let k = format!("lab9985-damp-{i}");
+        if keyed_pick(&state, &pool, &k) != home {
+            continue;
+        }
+        held += 1;
+        stayed += usize::from(keyed_pick(&state, &dropped, &k) == home);
+    }
+    let share = |p: &[RoutingCandidate]| {
+        keyed_score(p[home].wr) / p.iter().map(|c| keyed_score(c.wr)).sum::<f64>()
+    };
+    // Lowering one score only loses keys, so P(stay | held) = share after / share before.
+    let p_leave = 1.0 - share(&dropped) / share(&pool);
+    let leave = (held - stayed) as f64 / held as f64;
+    let sigma = (p_leave * (1.0 - p_leave) / held as f64).sqrt();
+    assert!(
+        (leave - p_leave).abs() <= 4.0 * sigma,
+        "{leave:.4} of {held} keys left for an expected {p_leave:.4} ± {:.4}",
+        4.0 * sigma
+    );
+    assert!(
+        leave < 0.15,
+        "a 20% waste-risk drop moved {leave:.3} of the account's keys; undamped it moves ~0.2"
+    );
 }
 
 /// AC7: the move signal's memory stays bounded, and remembers a key across
@@ -1597,7 +1644,7 @@ async fn affinity_zero_waste_risk_scores_as_lowest_peer() {
         .filter(|c| c.wr > 0.0)
         .map(|c| c.wr)
         .fold(f64::INFINITY, f64::min);
-    let score = |i: usize| if pool[i].wr > 0.0 { pool[i].wr } else { floor };
+    let score = |i: usize| keyed_score(if pool[i].wr > 0.0 { pool[i].wr } else { floor });
     let total: f64 = (0..POOL).map(score).sum();
 
     let mut counts = [0usize; POOL];

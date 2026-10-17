@@ -1000,8 +1000,8 @@ with `sum by (kind)`, where `max` would undercount.
 ### Session affinity
 
 Under `sticky-weighted-v2`, a request with an affinity key goes to the account
-that wins the key's rendezvous hash, weighted by waste risk, among the accounts
-in its tier that pass the overage rule. An account passes while its gate is below
+that wins the key's rendezvous hash, weighted by the square root of waste risk,
+among the accounts in its tier that pass the overage rule. An account passes while its gate is below
 `soft_limit` and its unused weekly quota, where quota due to expire within
 6 h counts increasingly as unused, is at least `1 − soft_limit` (0.10 at the
 default). So a session stays on its account until that account nears its 5h
@@ -1019,8 +1019,10 @@ account scores a key on its own, so a waste-risk change moves only the keys
 won by or lost from that account, and an account leaving the set moves only
 its own keys. An account whose waste risk falls (its weekly use climbs faster
 than its window runs out) loses part of its keys once, counted as `rehomed`;
-they do not flap back while the waste risk holds. Un-keyed requests still
-scatter over the full routing weight.
+they do not flap back while the waste risk holds. The square root damps this:
+a waste-risk change of a small fraction d moves about d/2 of the account's
+keys, at the cost of flatter placement, since 4x the waste risk wins 2x the
+keys. Un-keyed requests still scatter over the full routing weight.
 
 `anthropic_affinity_migrations_total{reason}` counts real moves: a request
 whose account differs from the one this replica last picked for its key and
@@ -1268,7 +1270,7 @@ The Anthropic↔OpenAI translation layer is not lossless. When an Anthropic-form
 6. Compute time-adjusted utilization per claim window (5h, 7d per model)
 7. Apply status floors (warning ≥ 0.80, throttled ≥ 0.98, rejected = 1.0)
 8. Exclude accounts above soft_limit utilization ceiling
-9. Pick account: keyed requests by waste-risk-weighted rendezvous hash among accounts passing the overage rule ([Session affinity](#session-affinity)), others by headroom-proportional weighted buckets
+9. Pick account: keyed requests by rendezvous hash weighted on the square root of waste risk among accounts passing the overage rule ([Session affinity](#session-affinity)), others by headroom-proportional weighted buckets
 10. Inject auth token + auto-cache header
 11. Forward request to upstream Anthropic API
 12. If 429 → mark rate-limited (propagate to Redis), add to skip list, retry with next account
