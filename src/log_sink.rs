@@ -311,15 +311,16 @@ async fn flush(
         // which can take up to POST_TIMEOUT, and the batch's own size is
         // bounded by MAX_BATCH_BYTES.
         // A sink already gone still has its last lines posted: the queue keeps
-        // what was sent before the close.
+        // what was sent before it closed.
         if let Some(live) = sink.upgrade() {
             live.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
         }
         let outcome = post(&http, &url, body).await;
-        let Some(sink) = sink.upgrade() else {
-            return;
-        };
-        sink.settle(lines as u64, outcome, &mut health);
+        // Once the sink is gone there is no one to count for, but the closed
+        // queue is still drained, batch by batch, until `recv` says it is empty.
+        if let Some(sink) = sink.upgrade() {
+            sink.settle(lines as u64, outcome, &mut health);
+        }
     }
 }
 

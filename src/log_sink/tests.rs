@@ -391,16 +391,26 @@ fn a_cut_never_splits_a_character() {
 #[tokio::test]
 async fn lines_queued_before_the_sink_goes_are_still_posted() {
     let (url, posts) = spawn_collector(vec![]).await;
-    let sink = sink_at(&url, 100, Duration::from_millis(20));
+    let sink = sink_at(&url, 2 * MAX_BATCH_LINES, Duration::from_millis(20));
+    // More than one batch, so the drain has to outlive the first POST.
+    let total = MAX_BATCH_LINES + 10;
 
-    sink.push(b"last words\n");
+    for i in 0..total {
+        sink.push(format!("last words {i}\n").as_bytes());
+    }
     drop(sink);
-    eventually("the final POST", Duration::from_secs(5), || {
-        !posts.lock().unwrap().is_empty()
+    let rows =
+        |posts: &Posts| -> usize { posts.lock().unwrap().iter().map(|p| p.rows().len()).sum() };
+    eventually("every queued line", Duration::from_secs(5), || {
+        rows(&posts) == total
     })
     .await;
     let posts = posts.lock().unwrap();
-    assert_eq!(posts[0].rows()[0]["_msg"], "last words");
+    assert_eq!(posts.len(), 2, "two batches");
+    assert_eq!(
+        posts[1].rows().last().unwrap()["_msg"],
+        format!("last words {}", total - 1)
+    );
 }
 
 /// A malformed line past the cap is cut and marked like any other, and its
