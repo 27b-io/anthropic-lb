@@ -23,6 +23,17 @@ fn unified_ratelimit_summary(headers: &reqwest::header::HeaderMap) -> String {
 /// Cap on the cooldown for a spent weekly window with no overage path.
 const WEEKLY_SPENT_COOLDOWN: Duration = Duration::from_secs(900);
 
+/// Exponent on waste risk in the keyed rendezvous score (`pick_keyed`). When an
+/// account's score changes by a small relative amount d, about `a * d` of its
+/// keys move, so 0.5 halves the moves a drift in waste risk causes, such as a
+/// busy session burning its own account's week. An account joining or leaving
+/// the set still gains or loses its whole share. The cost is flatter
+/// placement: 4x the waste risk wins 2x the keys. Chosen by replaying a day
+/// of keyed traffic (LAB-9985): rehomes fell 31% at 0.5 and 16% at 0.75, and
+/// every weekly reset in that day still ended fully used. Un-keyed and
+/// degraded picks keep the full weight.
+const KEYED_WR_EXPONENT: f64 = 0.5;
+
 /// A 429 from an account whose weekly window is spent and which has no
 /// credit to spend on overage. Its `retry-after` runs to the weekly reset,
 /// days out, so the default cooldown would re-try it every minute for
@@ -366,10 +377,11 @@ impl AppState {
     }
 
     /// `pick_rendezvous` over accounts that pass the overage rule, scored on
-    /// waste risk alone, so a 5h window filling or resetting on a passing
-    /// account moves none of its keys; `keeps_affinity` sheds them once the
-    /// gate reaches `soft_limit`. An account with no waste risk (missing reset
-    /// data) is scored as its lowest-scoring routable peer, never above them.
+    /// waste risk alone raised to `KEYED_WR_EXPONENT`, so a 5h window filling
+    /// or resetting on a passing account moves none of its keys;
+    /// `keeps_affinity` sheds them once the gate reaches `soft_limit`. An
+    /// account with no waste risk (missing reset data) is scored as its
+    /// lowest-scoring routable peer, never above them.
     fn pick_keyed<'a>(
         &self,
         pool: &[&'a RoutingCandidate],
@@ -381,12 +393,15 @@ impl AppState {
             .map(|c| c.wr)
             .reduce(f64::min)
             .unwrap_or(1.0);
-        self.pick_rendezvous(pool, key, |c| if c.wr > 0.0 { c.wr } else { floor })
+        self.pick_rendezvous(pool, key, |c| {
+            let wr = if c.wr > 0.0 { c.wr } else { floor };
+            wr.powf(KEYED_WR_EXPONENT)
+        })
     }
 
     /// A keyed session goes to the account that wins its rendezvous hash among
     /// the candidates that pass the overage rule (`keeps_affinity`), scored on
-    /// waste risk (`pick_keyed`), so it stays on that account until the
+    /// damped waste risk (`pick_keyed`), so it stays on that account until the
     /// account fails the rule or leaves the candidate set, or another
     /// account's waste risk rises enough to win the key. Waste risk still
     /// places new sessions, so expiring quota is burned first. An account that
