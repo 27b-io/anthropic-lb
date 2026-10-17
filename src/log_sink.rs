@@ -79,7 +79,15 @@ fn message(raw: &[u8]) -> String {
     if raw.len() <= MAX_LINE_BYTES {
         return String::from_utf8_lossy(raw).into_owned();
     }
-    let mut msg = String::from_utf8_lossy(&raw[..MAX_LINE_BYTES]).into_owned();
+    // Back off to a character start, so a valid line is cut between characters
+    // rather than mid-way through one (which would end in U+FFFD). A UTF-8
+    // character has at most 3 continuation bytes; malformed input loses at most
+    // those 3.
+    let mut end = MAX_LINE_BYTES;
+    while end > MAX_LINE_BYTES - 3 && raw[end] & 0xC0 == 0x80 {
+        end -= 1;
+    }
+    let mut msg = String::from_utf8_lossy(&raw[..end]).into_owned();
     msg.push_str(&format!(" …[log sink: cut from {} bytes]", raw.len()));
     msg
 }

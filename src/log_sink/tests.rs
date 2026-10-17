@@ -363,6 +363,22 @@ async fn an_oversized_line_is_cut_and_marked() {
     .await;
 }
 
+/// A cut that would split a multi-byte character backs off to the character's
+/// start, so a valid line ends in whole characters, never U+FFFD.
+#[test]
+fn a_cut_never_splits_a_character() {
+    // 'x' then 2-byte 'é's: the even MAX_LINE_BYTES offset lands mid-character.
+    let raw = format!("x{}", "é".repeat(MAX_LINE_BYTES));
+    let msg = message(raw.as_bytes());
+    let (kept, _marker) = msg.split_once(" …[log sink: cut").unwrap();
+    assert!(
+        !kept.contains('\u{FFFD}'),
+        "a split character became U+FFFD"
+    );
+    assert_eq!(kept.len(), MAX_LINE_BYTES - 1);
+    assert!(kept.ends_with('é'));
+}
+
 /// The queue is bounded in bytes as well as lines: while a POST hangs, lines
 /// that would take it past `queue_bytes` are dropped at once, and the bytes a
 /// batch takes out are released.
