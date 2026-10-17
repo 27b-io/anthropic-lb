@@ -45,6 +45,7 @@ mod client_store;
 mod config;
 mod fallback;
 mod handler;
+mod log_sink;
 mod metrics;
 mod oauth_prompt;
 mod openai_compat;
@@ -67,6 +68,7 @@ use client_store::*;
 use config::*;
 use fallback::*;
 use handler::*;
+use log_sink::*;
 use metrics::*;
 use oauth_prompt::*;
 use openai_compat::*;
@@ -371,6 +373,9 @@ fn load_config(raw: &str) -> Result<(Config, AuthMode, BuiltPolicy), String> {
     let (auth_mode, client_policy) = ClientPolicy::build(&config)?;
     validate_auth_throttle(&config)?;
     validate_rate_limit_cooldown(&config)?;
+    if let Some(log_sink) = &config.log_sink {
+        validate_log_sink(log_sink)?;
+    }
     Ok((config, auth_mode, client_policy))
 }
 
@@ -392,10 +397,17 @@ async fn main() {
     config.proxy_key = None;
     let client_store_config = config.client_store.take();
 
-    // Set up tracing: stderr (info+) always, plus optional debug log file
+    // Started before tracing is set up, so the startup lines reach it too.
+    let log_sink = config
+        .log_sink
+        .as_ref()
+        .map(|cfg| LogSink::start(cfg).unwrap_or_else(|e| panic!("{e}")));
+
+    // Set up tracing: stdout (info+) always, copied to the log sink when one is
+    // configured, plus optional debug log file
     {
         use tracing_subscriber::prelude::*;
-        let stderr_layer = tracing_subscriber::fmt::layer().with_filter(
+        let stdout_layer = stdout_layer(log_sink.clone()).with_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "anthropic_lb=info".into()),
         );
@@ -410,13 +422,16 @@ async fn main() {
                 .with_writer(std::sync::Mutex::new(file))
                 .with_filter(tracing_subscriber::EnvFilter::new("anthropic_lb=debug"));
             tracing_subscriber::registry()
-                .with(stderr_layer)
+                .with(stdout_layer)
                 .with(file_layer)
                 .init();
             eprintln!("debug logging to {debug_path}");
         } else {
-            tracing_subscriber::registry().with(stderr_layer).init();
+            tracing_subscriber::registry().with(stdout_layer).init();
         }
+    }
+    if let Some(sink) = &log_sink {
+        info!(host = sink.host(), "log sink enabled");
     }
 
     let routing_strategy = RoutingStrategy::parse(config.strategy.as_deref())
@@ -788,6 +803,7 @@ async fn main() {
         fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache,
         client_store,
+        log_sink,
     });
 
     if state.auto_cache {
@@ -975,6 +991,14 @@ async fn main() {
     info!("saving state");
     shutdown_state.save_state().await;
     info!("state saved, shutdown complete");
+    // Last, so every line before it, this one included, gets a bounded chance
+    // to leave.
+    if let Some(sink) = &shutdown_state.log_sink {
+        let undelivered = sink.drain(LOG_SINK_SHUTDOWN_DRAIN).await;
+        if undelivered > 0 {
+            warn!(undelivered, "log sink: lines still undelivered at exit");
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

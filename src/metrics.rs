@@ -2060,6 +2060,9 @@ pub(crate) async fn metrics_handler(
     if let Some(store) = &state.client_store {
         append_client_store_metrics(&mut buf, &store.metrics());
     }
+    if let Some(sink) = &state.log_sink {
+        append_log_sink_metrics(&mut buf, sink);
+    }
 
     (
         StatusCode::OK,
@@ -2070,6 +2073,30 @@ pub(crate) async fn metrics_handler(
         buf,
     )
         .into_response()
+}
+
+/// The log sink's delivery counters, exported only while one is configured:
+/// an absent series says the sink is off, where a zero would say it is idle.
+fn append_log_sink_metrics(buf: &mut String, sink: &LogSink) {
+    prom_header(
+        buf,
+        "anthropic_log_sink_lines_sent_total",
+        "counter",
+        "Log lines the log sink delivered: their batch got a 2xx from the collector",
+    );
+    prom_counter(buf, "anthropic_log_sink_lines_sent_total", &[], sink.sent());
+    prom_header(
+        buf,
+        "anthropic_log_sink_lines_dropped_total",
+        "counter",
+        "Log lines the log sink dropped, never retried: the queue was full, or their batch failed, timed out or got a non-2xx answer",
+    );
+    prom_counter(
+        buf,
+        "anthropic_log_sink_lines_dropped_total",
+        &[],
+        sink.dropped(),
+    );
 }
 
 /// Unmatched disabled names exported as labels, at most: the count carries

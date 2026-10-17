@@ -100,7 +100,7 @@ pub(crate) struct Config {
     /// propagation use Redis for cross-replica coordination. None = local-only (single instance).
     pub(crate) redis_url: Option<String>,
     /// Path for debug log file. When set, writes debug-level logs to this file while
-    /// keeping info-level on stderr. For investigating cache/auth behavior.
+    /// keeping info-level on stdout. For investigating cache/auth behavior.
     pub(crate) debug_log: Option<String>,
     /// Priority penalty added to an account's effective priority tier while it is
     /// serving via Anthropic overage (paid extra usage). Keeps free subscription
@@ -131,6 +131,10 @@ pub(crate) struct Config {
     /// (docs/client-store.md). Requires `[[clients]]` authentication: the
     /// operators and admin readers stay in this file.
     pub(crate) client_store: Option<ClientStoreConfig>,
+    /// Also POST every line written to stdout, batched as JSON lines, to a
+    /// collector. Absent = off. Best effort: a line that finds the queue full,
+    /// or whose batch fails, is counted on `/metrics` and never retried.
+    pub(crate) log_sink: Option<LogSinkConfig>,
     /// Reflect upstream `anthropic-ratelimit-*` response headers to callers.
     /// They reveal the pooled capacity of every account behind the proxy, so
     /// this is trusted-network-only. Default: false (LAB-1191).
@@ -225,6 +229,16 @@ impl std::fmt::Debug for ClientStoreConfig {
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .finish()
     }
+}
+
+/// `[log_sink]`: where to POST a copy of every stdout log line.
+#[derive(Deserialize, Clone)]
+pub(crate) struct LogSinkConfig {
+    /// The collector's ingest URL, `http://` or `https://`, taking one JSON
+    /// object per line (`{"_time", "_msg"}`), e.g. VictoriaLogs'
+    /// `/insert/jsonline`. Never logged, as its path or query may hold a
+    /// secret; a URL carrying credentials is refused at startup.
+    pub(crate) url: String,
 }
 
 /// `[response_cache]` — opt-in, client-side-encrypted response cache on

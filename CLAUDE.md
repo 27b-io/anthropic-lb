@@ -111,6 +111,7 @@ Some module names are older than their contents; this is the map.
 | `src/oauth_prompt.rs`, `src/auto_cache.rs` | OAuth system-prompt injection; prompt-cache breakpoint injection (up to 3: last tool, system, last user message) |
 | `src/handler.rs` | `proxy_handler` (main Anthropic proxy): retry / rotation outcomes, the upstream client, header reflection and stripping, guard responses |
 | `src/fallback.rs` | Forwarding to `protocol = "openai"` endpoints (`try_fallback_upstream`, called by both handlers) |
+| `src/log_sink.rs` | The optional HTTP log sink (`[log_sink]`): `StdoutTee`, the fmt layer's stdout writer that also hands each event to `LogSink::push` (bounded queue, never blocks), the batching flush task, the delivery counters on `/metrics` and the shutdown drain |
 | `src/stats.rs`, `src/metrics.rs` | `stats_handler` (`/_stats` JSON); `metrics_handler` (`/metrics` Prometheus) |
 | `src/openai_compat.rs` | OpenAI→Anthropic translation for `/v1/chat/completions` (`translate_*`, `StreamContext`, streaming SSE) |
 | `src/reverse_translation.rs` | Anthropic→OpenAI translation for `openai` endpoints, SSE error frames, and `openai_chat_handler` (the `/v1/chat/completions` handler) |
@@ -212,6 +213,7 @@ Routing consequences (`constraining_7d_claims`):
 | `expose_upstream_ratelimit_headers` | bool? | false | Reflect upstream `anthropic-ratelimit-*` headers to callers (reveals pooled account capacity — trusted networks only, LAB-1191) |
 | `client_store.poll_url` | string? | none | Poll a client store for ordinary clients (`docs/client-store.md`). Requires `[[clients]]`; no ordinary client is served, file keys included, until a complete set of restrictions is held |
 | `client_store.token` | string? | none | Reader token, sent as `Authorization: Bearer`; refused at boot over plain `http://` |
+| `log_sink.url` | string? | none | Also POST every stdout log line to this `http(s)://` collector (e.g. VictoriaLogs `/insert/jsonline`) as JSON lines (`_time`, `_msg`), batched at 1000 lines / ~1 MiB / 1 s. Best effort: queue of 10,000 lines / 16 MiB, lines over 32 KiB cut and marked, overflow and failed batches dropped (never retried) and counted in `anthropic_log_sink_lines_{sent,dropped}_total`. Credentials in the URL are refused; the URL is never logged |
 | `allowed_client_betas` | string[]? | built-in list | Client `anthropic-beta` flags forwarded on OAuth endpoints (`*` suffix wildcard); a configured list REPLACES the default (copy defaults alongside additions); unlisted flags dropped + logged + counted in `anthropic_beta_flag_dropped_total` (LAB-1191). When anything is dropped, top-level body fields belonging to a dropped flag are stripped with it (only on `/v1/messages` + `/v1/messages/count_tokens`), so the feature turns off quietly instead of 400ing upstream — counted in `anthropic_beta_body_field_stripped_total` (LAB-1261). Fields owned by a flag that SURVIVED are protected, which requires `BETA_BODY_FIELDS` to stay total over this list (build-time test); a surviving flag with no row switches the strip off for that request rather than risk deleting its field |
 
 

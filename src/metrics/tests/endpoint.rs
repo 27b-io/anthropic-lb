@@ -608,6 +608,29 @@ async fn metrics_operator_hiding() {
     );
 }
 
+/// The log sink's counters exist only while a sink is configured (their
+/// presence with one is `log_sink::tests::requests_are_unaffected_by_a_hung_sink`):
+/// an absent family says the sink is off, where a zero would say it is idle.
+#[tokio::test]
+async fn metrics_omit_log_sink_counters_without_a_sink() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = test_app(&mock_url, None);
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("anthropic_shadow_log_dropped_total"),
+        "not a full scrape:\n{body}"
+    );
+    assert!(!body.contains("anthropic_log_sink_"), "{body}");
+}
+
 #[tokio::test]
 async fn metrics_help_type_uniqueness() {
     let (mock_url, _handle) = spawn_mock_upstream().await;

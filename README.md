@@ -187,7 +187,7 @@ token = "sk-ant-api03-..."
 | `auth_failure_window_secs` | `u64` | `300` | Failed-auth throttle window |
 | `auto_cache` | `bool` | `true` | Inject prompt caching beta header |
 | `shadow_log` | `String?` | `None` | Path to JSONL shadow log file |
-| `debug_log` | `String?` | `None` | Path to an additional `debug`-level `tracing` log file (see [Logging](#logging)); the stderr stream stays at `info` regardless |
+| `debug_log` | `String?` | `None` | Path to an additional `debug`-level `tracing` log file (see [Logging](#logging)); the stdout stream stays at `info` regardless |
 | `soft_limit` | `f64` | `0.90` | Utilization ceiling — accounts above are excluded from routing |
 | `client_names` | `{IP: name}` | `{}` | IP → client ID mapping |
 | `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
@@ -211,6 +211,7 @@ token = "sk-ant-api03-..."
 | `session_registry_ttl_secs` | `u64` | `1800` | Seconds after a session's last request before its entry is evicted |
 | `client_store.poll_url` | `String` | — | Read ordinary clients from a client store polled at this URL (see [Client store](#client-store-client_store)). Requires `[[clients]]` |
 | `client_store.token` | `String?` | `None` | Sent as `Authorization: Bearer` on every poll; only over `https://` |
+| `log_sink.url` | `String?` | `None` | Also POST every stdout log line, batched as JSON lines, to this `http(s)://` collector (see [Logging](#logging)). A URL carrying credentials is refused at startup |
 
 > [!NOTE]
 > **Strategy normalization**: Both `"dynamic-capacity"` and `"dynamic-capacity-v1"` are accepted in config, but the runtime normalizes to `"dynamic-capacity-v1"` in logs and `/_stats` output. Similarly, `"sticky-weighted"` normalizes to `"sticky-weighted-v2"`.
@@ -1286,7 +1287,7 @@ The Anthropic↔OpenAI translation layer is not lossless. When an Anthropic-form
 
 ## Logging
 
-Structured `tracing` logs go to stderr at `info` level by default (one line
+Structured `tracing` logs go to stdout at `info` level by default (one line
 per request that reaches upstream, carrying routing context — client, model,
 account, status, utilization — and token usage together; on the native
 `/v1/messages` path the line also carries `fp`, the content fingerprint, `-`
@@ -1298,10 +1299,42 @@ characters, `…` included when cut; control characters in either become
 spaces. Both are `-` on every other line, 2xx included. Override the filter
 with `RUST_LOG` (e.g. `RUST_LOG=anthropic_lb=debug`), or set
 `debug_log = "/path/to/file.log"` in the config to additionally write a
-`debug`-level file log alongside the `info`-level stderr stream. At `debug`,
+`debug`-level file log alongside the `info`-level stdout stream. At `debug`,
 the full per-request content fingerprinting detail (`fingerprint`:
 `fp`/`fps`/`bps`) becomes visible — useful for diagnosing routing-affinity
 stickiness, but too high-volume for the default filter.
+
+### Log sink (`[log_sink]`)
+
+Where stdout is not shipped anywhere a log store can read it, the proxy can
+POST a copy of every stdout line to a collector itself:
+
+```toml
+[log_sink]
+url = "http://logs.example:9428/insert/jsonline"   # e.g. VictoriaLogs
+```
+
+With a sink configured, stdout is written without ANSI colour too, so the
+sink's copy is plain text that a log store can search; without one, colour
+is on unless `NO_COLOR` is set, as before. Lines are sent in batches, as
+one JSON object per line
+(`{"_time":"<RFC 3339>","_msg":"<the line as written to stdout>"}`) with
+`content-type: application/x-ndjson`. A batch leaves at 1000 lines, at about
+1 MiB, or one second after its first line, whichever comes first, so a lone
+line arrives within about a second. Delivery is best effort and never slows a
+request: lines wait in a bounded in-memory queue (10,000 lines and 16 MiB), a
+line that finds it full is dropped, a line longer than 32 KiB is cut and marked
+with its full length (comfortably under VictoriaLogs' default 256 KiB line
+limit), and a batch that fails, times out (5 s) or gets a
+non-2xx answer is dropped, not retried. `anthropic_log_sink_lines_sent_total`
+and `anthropic_log_sink_lines_dropped_total` on `/metrics` count both
+outcomes; they are absent when no sink is configured. The proxy logs one
+warning when delivery starts failing and one line when it recovers, with the
+number of lines dropped meanwhile. At shutdown it waits up to 2 s for the
+queue to empty. Redirects are not followed, and the URL is never logged
+(only its host and port). Only `tracing` output goes to the sink: a panic
+message and anything else written straight to stderr stay where the platform
+keeps stderr.
 
 ---
 
