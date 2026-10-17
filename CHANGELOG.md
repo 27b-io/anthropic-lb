@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/27b-io/anthropic-lb/compare/v0.4.0...v0.4.1) (2026-10-17)
+
+
+### Features
+
+* **LAB-9952:** optional HTTP log sink that pushes stdout lines as JSON lines ([#303](https://github.com/27b-io/anthropic-lb/issues/303)) ([bbff773](https://github.com/27b-io/anthropic-lb/commit/bbff77369e99a10807d0c8c172879c313e7246ff))
+
 ## [0.4.0](https://github.com/27b-io/anthropic-lb/compare/v0.3.1...v0.4.0) (2026-10-16)
 
 
