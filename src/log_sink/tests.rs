@@ -76,13 +76,18 @@ fn sink_at(url: &str, capacity: usize, interval: Duration) -> Arc<LogSink> {
     sink_with(url, capacity, QUEUE_BYTES, interval)
 }
 
-fn sink_with(url: &str, capacity: usize, queue_bytes: u64, interval: Duration) -> Arc<LogSink> {
+fn sink_with(
+    url: &str,
+    capacity: usize,
+    max_queued_bytes: u64,
+    interval: Duration,
+) -> Arc<LogSink> {
     LogSink::start_with(
         &LogSinkConfig {
             url: url.to_string(),
         },
         capacity,
-        queue_bytes,
+        max_queued_bytes,
         interval,
     )
     .unwrap()
@@ -330,7 +335,9 @@ async fn drain_stops_at_its_budget() {
 async fn an_oversized_line_is_cut_and_marked() {
     let (url, posts) = spawn_collector(vec![]).await;
     let sink = sink_at(&url, 100, Duration::from_millis(20));
-    let huge = "m".repeat(5 << 20);
+    // Control characters, the worst case for JSON escaping (6 bytes each):
+    // the cut must leave even these under the collector's line limit.
+    let huge = "\u{1}".repeat(5 << 20);
 
     sink.push(format!("model={huge}\n").as_bytes());
     eventually("the POST", Duration::from_secs(5), || {
@@ -380,7 +387,7 @@ fn a_cut_never_splits_a_character() {
 }
 
 /// The queue is bounded in bytes as well as lines: while a POST hangs, lines
-/// that would take it past `queue_bytes` are dropped at once, and the bytes a
+/// that would take it past `max_queued_bytes` are dropped at once, and the bytes a
 /// batch takes out are released.
 #[tokio::test]
 async fn the_queue_is_bounded_in_bytes() {
@@ -432,6 +439,12 @@ async fn a_hung_sink_never_blocks_a_push() {
     assert_eq!(pending(&sink), 1 + 8);
     assert_eq!(sink.dropped(), 500 - 8);
     assert_eq!(sink.sent(), 0);
+    // Each line the full queue refused gave its bytes back: only the 8 queued
+    // lines are counted, or a long outage would leak the budget away for good.
+    let queued: u64 = (0..8)
+        .map(|i| (now_rfc3339().len() + format!("line {i}").len()) as u64)
+        .sum();
+    assert_eq!(sink.queued_bytes.load(Ordering::Relaxed), queued);
 }
 
 /// A 500 drops its batch, unretried; the next batch to get a 200 is sent.

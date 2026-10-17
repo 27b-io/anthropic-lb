@@ -87,8 +87,12 @@ fn message(raw: &[u8]) -> String {
     while end > MAX_LINE_BYTES - 3 && raw[end] & 0xC0 == 0x80 {
         end -= 1;
     }
-    let mut msg = String::from_utf8_lossy(&raw[..end]).into_owned();
-    msg.push_str(&format!(" …[log sink: cut from {} bytes]", raw.len()));
+    let marker = format!(" …[log sink: cut from {} bytes]", raw.len());
+    // Sized up front: growing by push_str would double the capacity, and the
+    // queue's byte budget counts length, so it would hold twice what it counts.
+    let mut msg = String::with_capacity(end + marker.len());
+    msg.push_str(&String::from_utf8_lossy(&raw[..end]));
+    msg.push_str(&marker);
     msg
 }
 
@@ -102,10 +106,10 @@ pub(crate) struct LogSink {
     dropped: AtomicU64,
     /// Lines accepted into the queue and not yet sent or dropped.
     pending: AtomicU64,
-    /// Bytes of the lines in the queue (not yet taken into a batch), against
-    /// `queue_bytes`. Shared with the flush task, which releases them.
-    queued_bytes: Arc<AtomicU64>,
-    queue_bytes: u64,
+    /// Bytes of the lines in the queue, against `max_queued_bytes`. The flush
+    /// task gives a batch's bytes back once it has taken the batch out.
+    queued_bytes: AtomicU64,
+    max_queued_bytes: u64,
 }
 
 impl LogSink {
@@ -118,7 +122,7 @@ impl LogSink {
     fn start_with(
         config: &LogSinkConfig,
         capacity: usize,
-        queue_bytes: u64,
+        max_queued_bytes: u64,
         flush_interval: Duration,
     ) -> Result<Arc<Self>, String> {
         let url = validate_log_sink(config)?;
@@ -136,26 +140,18 @@ impl LogSink {
             None => host.to_string(),
         };
         let (tx, rx) = mpsc::channel(capacity);
-        let queued_bytes = Arc::new(AtomicU64::new(0));
         let sink = Arc::new(Self {
             tx,
             host,
             sent: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             pending: AtomicU64::new(0),
-            queued_bytes: queued_bytes.clone(),
-            queue_bytes,
+            queued_bytes: AtomicU64::new(0),
+            max_queued_bytes,
         });
         // A weak handle: when the last `LogSink` goes, its sender goes with it,
         // the queue closes and the task ends.
-        tokio::spawn(flush(
-            rx,
-            Arc::downgrade(&sink),
-            queued_bytes,
-            http,
-            url,
-            flush_interval,
-        ));
+        tokio::spawn(flush(rx, Arc::downgrade(&sink), http, url, flush_interval));
         Ok(sink)
     }
 
@@ -189,7 +185,7 @@ impl LogSink {
             let size = line.bytes();
             // Reserved before the check, so concurrent pushes cannot all pass
             // it and overshoot together; a refused line gives it back.
-            if self.queued_bytes.fetch_add(size, Ordering::Relaxed) + size > self.queue_bytes {
+            if self.queued_bytes.fetch_add(size, Ordering::Relaxed) + size > self.max_queued_bytes {
                 self.queued_bytes.fetch_sub(size, Ordering::Relaxed);
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -286,33 +282,36 @@ impl Health {
 async fn flush(
     mut rx: mpsc::Receiver<Line>,
     sink: Weak<LogSink>,
-    queued_bytes: Arc<AtomicU64>,
     http: Client,
     url: reqwest::Url,
     interval: Duration,
 ) {
     let mut health = Health::default();
-    // A line leaves the queue's byte count when it is taken into a batch,
-    // whose own size `MAX_BATCH_BYTES` bounds.
-    let take = |line: &Line, body: &mut Vec<u8>| {
-        queued_bytes.fetch_sub(line.bytes(), Ordering::Relaxed);
-        append_line(body, line);
-    };
     while let Some(first) = rx.recv().await {
         let deadline = tokio::time::Instant::now() + interval;
         let mut body = Vec::new();
-        take(&first, &mut body);
+        let mut bytes = first.bytes();
+        append_line(&mut body, &first);
         let mut lines = 1;
         while lines < MAX_BATCH_LINES && body.len() < MAX_BATCH_BYTES {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(line)) => {
-                    take(&line, &mut body);
+                    bytes += line.bytes();
+                    append_line(&mut body, &line);
                     lines += 1;
                 }
                 // The interval is up, or the queue closed: send what is held.
                 Ok(None) | Err(_) => break,
             }
         }
+        // The batch is out of the queue: its bytes go back before the POST,
+        // which can take up to POST_TIMEOUT, and the batch's own size is
+        // bounded by MAX_BATCH_BYTES.
+        let Some(live) = sink.upgrade() else {
+            return;
+        };
+        live.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        drop(live);
         let outcome = post(&http, &url, body).await;
         let Some(sink) = sink.upgrade() else {
             return;
