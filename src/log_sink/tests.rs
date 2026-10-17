@@ -386,6 +386,33 @@ fn a_cut_never_splits_a_character() {
     assert!(kept.ends_with('é'));
 }
 
+/// Lines queued before the last handle goes are still posted: the queue keeps
+/// what was sent before it closed, and the flush task drains it.
+#[tokio::test]
+async fn lines_queued_before_the_sink_goes_are_still_posted() {
+    let (url, posts) = spawn_collector(vec![]).await;
+    let sink = sink_at(&url, 100, Duration::from_millis(20));
+
+    sink.push(b"last words\n");
+    drop(sink);
+    eventually("the final POST", Duration::from_secs(5), || {
+        !posts.lock().unwrap().is_empty()
+    })
+    .await;
+    let posts = posts.lock().unwrap();
+    assert_eq!(posts[0].rows()[0]["_msg"], "last words");
+}
+
+/// A malformed line past the cap is cut and marked like any other, and its
+/// buffer is sized to the converted text, not the raw bytes.
+#[test]
+fn a_malformed_cut_line_is_sized_to_its_text() {
+    let raw = vec![0xFFu8; MAX_LINE_BYTES + 10];
+    let msg = message(&raw);
+    assert!(msg.ends_with(&format!(" …[log sink: cut from {} bytes]", raw.len())));
+    assert_eq!(msg.capacity(), msg.len(), "the cut line was over-allocated");
+}
+
 /// The queue is bounded in bytes as well as lines: while a POST hangs, lines
 /// that would take it past `max_queued_bytes` are dropped at once, and the bytes a
 /// batch takes out are released.

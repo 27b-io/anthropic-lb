@@ -90,8 +90,11 @@ fn message(raw: &[u8]) -> String {
     let marker = format!(" …[log sink: cut from {} bytes]", raw.len());
     // Sized up front: growing by push_str would double the capacity, and the
     // queue's byte budget counts length, so it would hold twice what it counts.
-    let mut msg = String::with_capacity(end + marker.len());
-    msg.push_str(&String::from_utf8_lossy(&raw[..end]));
+    // Sized from the converted text, which malformed input can make up to 3x
+    // `end` (each invalid byte becomes a 3-byte U+FFFD).
+    let kept = String::from_utf8_lossy(&raw[..end]);
+    let mut msg = String::with_capacity(kept.len() + marker.len());
+    msg.push_str(&kept);
     msg.push_str(&marker);
     msg
 }
@@ -307,11 +310,11 @@ async fn flush(
         // The batch is out of the queue: its bytes go back before the POST,
         // which can take up to POST_TIMEOUT, and the batch's own size is
         // bounded by MAX_BATCH_BYTES.
-        let Some(live) = sink.upgrade() else {
-            return;
-        };
-        live.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        drop(live);
+        // A sink already gone still has its last lines posted: the queue keeps
+        // what was sent before the close.
+        if let Some(live) = sink.upgrade() {
+            live.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
         let outcome = post(&http, &url, body).await;
         let Some(sink) = sink.upgrade() else {
             return;
