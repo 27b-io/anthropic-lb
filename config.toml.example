@@ -191,6 +191,14 @@ probe_interval_secs = 300
 # # ttl_secs = 3600                    # default 1h
 # # op_timeout_ms = 250                # fail-open budget per cache op
 
+# Log sink: also POST every stdout log line, batched as JSON lines
+# ({"_time", "_msg"}), to a collector such as VictoriaLogs. Best effort: a
+# line that finds the 10,000-line queue full, or whose batch fails, is dropped
+# (not retried) and counted on /metrics (anthropic_log_sink_lines_*_total).
+# http:// or https:// only; a URL carrying credentials is refused at startup.
+# [log_sink]
+# url = "http://logs.example:9428/insert/jsonline"
+
 # "passthrough" = forward caller's auth headers as-is (for OpenClaw managed tokens)
 # Any other value = inject as the endpoint's own token
 # OAuth tokens (sk-ant-oat*) are injected as Authorization: Bearer

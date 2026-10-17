@@ -823,6 +823,9 @@ pub(crate) struct AppState {
     /// The client store reader, when `[client_store]` is configured. Its
     /// state feeds `/metrics`; the policy it builds is `client_policy`.
     pub(crate) client_store: Option<Arc<ClientStore>>,
+    /// The log sink, when `[log_sink]` is configured: the tracing writer feeds
+    /// it, `/metrics` reads its counters and shutdown drains it.
+    pub(crate) log_sink: Option<Arc<LogSink>>,
 }
 
 /// RAII reservation against `AppState::inflight_body_bytes`. Holding it keeps the

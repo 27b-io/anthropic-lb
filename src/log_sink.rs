@@ -1,0 +1,339 @@
+//! Optional HTTP log sink (`[log_sink]`): every line the proxy writes to stdout
+//! is also POSTed, in batches, as JSON lines to a configured collector.
+//!
+//! For a platform where stdout is not shipped anywhere a log store can read it
+//! within seconds. Delivery is best effort by design, because logging must
+//! never slow a request: the tracing writer only ever `try_send`s into a
+//! bounded queue, and a line that does not fit, or whose batch fails, is
+//! counted as dropped and never retried. That keeps memory bounded and keeps a
+//! slow or dead collector from holding up anything behind it. The counters are
+//! on `/metrics`.
+
+use crate::*;
+use std::sync::Weak;
+use tokio::sync::mpsc;
+
+/// Lines held in memory awaiting a POST. A line that finds the queue full is
+/// dropped.
+const QUEUE_LINES: usize = 10_000;
+/// A batch is POSTed once it holds this many lines, ...
+const MAX_BATCH_LINES: usize = 1_000;
+/// ... or about this many body bytes (the line that crosses it still rides),
+/// ...
+const MAX_BATCH_BYTES: usize = 1 << 20;
+/// ... or this long after its first line arrived, whichever comes first, so a
+/// lone line leaves within about a second.
+const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Whole-POST ceiling. A batch that has not been answered by then is dropped.
+const POST_TIMEOUT: Duration = Duration::from_secs(5);
+const DRAIN_POLL: Duration = Duration::from_millis(50);
+/// How long shutdown waits for the queue to empty: a flush interval plus a POST
+/// to a healthy collector, short enough not to stall a restart.
+pub(crate) const LOG_SINK_SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
+
+/// Boot check for `[log_sink]`, run by `load_config`; returns the parsed URL.
+/// No message quotes the URL, as its path or query may hold a secret.
+pub(crate) fn validate_log_sink(config: &LogSinkConfig) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(&config.url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .ok_or_else(|| "log_sink.url: not an http(s) URL".to_string())?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("log_sink.url: must not carry credentials".to_string());
+    }
+    Ok(url)
+}
+
+/// One stdout line as it is sent: one JSON object per line of the body.
+#[derive(Serialize)]
+struct Line {
+    /// When the line was written, as the fmt layer prints its own timestamp.
+    #[serde(rename = "_time")]
+    time: String,
+    /// The line exactly as written to stdout, minus its newline.
+    #[serde(rename = "_msg")]
+    msg: String,
+}
+
+pub(crate) struct LogSink {
+    tx: mpsc::Sender<Line>,
+    /// The collector's `host:port`: what log lines name. Never the URL.
+    host: String,
+    /// Lines delivered with a 2xx.
+    sent: AtomicU64,
+    /// Lines that found the queue full, or whose batch failed.
+    dropped: AtomicU64,
+    /// Lines accepted into the queue and not yet sent or dropped.
+    pending: AtomicU64,
+}
+
+impl LogSink {
+    /// Build the sink and spawn its flush task. Call from inside the runtime.
+    pub(crate) fn start(config: &LogSinkConfig) -> Result<Arc<Self>, String> {
+        Self::start_with(config, QUEUE_LINES, FLUSH_INTERVAL)
+    }
+
+    /// `start`, with the queue size and flush interval a test can shrink.
+    fn start_with(
+        config: &LogSinkConfig,
+        capacity: usize,
+        flush_interval: Duration,
+    ) -> Result<Arc<Self>, String> {
+        let url = validate_log_sink(config)?;
+        let http = Client::builder()
+            .user_agent(concat!("anthropic-lb/", env!("CARGO_PKG_VERSION")))
+            // A redirect would carry the logs to a host nobody configured.
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(POST_TIMEOUT)
+            .build()
+            .map_err(|e| format!("log_sink: HTTP client: {e}"))?;
+        let host = url.host_str().unwrap_or_default();
+        let host = match url.port_or_known_default() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        let (tx, rx) = mpsc::channel(capacity);
+        let sink = Arc::new(Self {
+            tx,
+            host,
+            sent: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
+        });
+        // A weak handle: when the last `LogSink` goes, its sender goes with it,
+        // the queue closes and the task ends.
+        tokio::spawn(flush(rx, Arc::downgrade(&sink), http, url, flush_interval));
+        Ok(sink)
+    }
+
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub(crate) fn sent(&self) -> u64 {
+        self.sent.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Queue one write from the tracing writer, line by line. It runs inside
+    /// every event, so it never blocks or awaits: a line that finds the queue
+    /// full or closed is dropped and counted.
+    pub(crate) fn push(&self, bytes: &[u8]) {
+        let mut time: Option<String> = None;
+        for raw in bytes.split(|&b| b == b'\n') {
+            let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+            if raw.is_empty() {
+                continue;
+            }
+            let line = Line {
+                // Every line of one event carries that event's capture time.
+                time: time.get_or_insert_with(now_rfc3339).clone(),
+                msg: String::from_utf8_lossy(raw).into_owned(),
+            };
+            // Counted before the send, not after: the flush task can settle
+            // the line before this thread runs again, and `pending` must
+            // never dip below zero.
+            self.pending.fetch_add(1, Ordering::Relaxed);
+            if self.tx.try_send(line).is_err() {
+                self.pending.fetch_sub(1, Ordering::Relaxed);
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Wait until every queued line is sent or dropped, or `budget` passes.
+    /// Returns the lines still undelivered.
+    pub(crate) async fn drain(&self, budget: Duration) -> u64 {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let pending = self.pending.load(Ordering::Relaxed);
+            if pending == 0 || tokio::time::Instant::now() >= deadline {
+                return pending;
+            }
+            tokio::time::sleep(DRAIN_POLL).await;
+        }
+    }
+
+    /// Account for one POSTed batch of `lines`, and log a change of health.
+    fn settle(&self, lines: u64, outcome: Result<(), String>, health: &mut Health) {
+        let dropped_before = self.dropped();
+        let counter = if outcome.is_ok() {
+            &self.sent
+        } else {
+            &self.dropped
+        };
+        counter.fetch_add(lines, Ordering::Relaxed);
+        self.pending.fetch_sub(lines, Ordering::Relaxed);
+        match health.observe(outcome.is_ok(), dropped_before) {
+            Some(Transition::Failing) => warn!(
+                host = self.host.as_str(),
+                reason = outcome.err().unwrap_or_default(),
+                "log sink delivery failing: lines are dropped, not retried, until it recovers"
+            ),
+            Some(Transition::Recovered { dropped }) => info!(
+                host = self.host.as_str(),
+                dropped, "log sink delivery recovered"
+            ),
+            None => {}
+        }
+    }
+}
+
+/// Whether the collector is taking batches. The flush task logs only when this
+/// changes: its own lines go through the sink too, so a line per failed batch
+/// would be noise fed into the very outage it reports.
+#[derive(Default)]
+struct Health {
+    /// While failing: the dropped total when the failure began.
+    failing_since: Option<u64>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Transition {
+    Failing,
+    /// Lines dropped while it was down, queue overflow included.
+    Recovered {
+        dropped: u64,
+    },
+}
+
+impl Health {
+    /// One batch's outcome; `dropped` is the dropped total before it.
+    fn observe(&mut self, delivered: bool, dropped: u64) -> Option<Transition> {
+        match (delivered, self.failing_since) {
+            (false, None) => {
+                self.failing_since = Some(dropped);
+                Some(Transition::Failing)
+            }
+            (true, Some(since)) => {
+                self.failing_since = None;
+                Some(Transition::Recovered {
+                    dropped: dropped.saturating_sub(since),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The queue's one consumer: gather a batch, POST it, settle the counters.
+/// POSTs are sequential; lines keep queueing, bounded, while one is in flight.
+async fn flush(
+    mut rx: mpsc::Receiver<Line>,
+    sink: Weak<LogSink>,
+    http: Client,
+    url: reqwest::Url,
+    interval: Duration,
+) {
+    let mut health = Health::default();
+    while let Some(first) = rx.recv().await {
+        let deadline = tokio::time::Instant::now() + interval;
+        let mut body = Vec::new();
+        append_line(&mut body, &first);
+        let mut lines = 1;
+        while lines < MAX_BATCH_LINES && body.len() < MAX_BATCH_BYTES {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(line)) => {
+                    append_line(&mut body, &line);
+                    lines += 1;
+                }
+                // The interval is up, or the queue closed: send what is held.
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let outcome = post(&http, &url, body).await;
+        let Some(sink) = sink.upgrade() else {
+            return;
+        };
+        sink.settle(lines as u64, outcome, &mut health);
+    }
+}
+
+fn append_line(body: &mut Vec<u8>, line: &Line) {
+    serde_json::to_writer(&mut *body, line).expect("two strings always serialise");
+    body.push(b'\n');
+}
+
+/// POST one batch. The error is a reason safe to log, a status code or the
+/// kind of transport failure, never reqwest's message, which quotes the URL.
+async fn post(http: &Client, url: &reqwest::Url, body: Vec<u8>) -> Result<(), String> {
+    let resp = http
+        .post(url.clone())
+        // Load-bearing: VictoriaLogs answers 200 to a form-encoded body but ingests none of it.
+        .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| {
+            let kind = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else {
+                "request"
+            };
+            kind.to_string()
+        })?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("status {}", resp.status().as_u16()))
+    }
+}
+
+/// Now, as the fmt layer prints it (`2026-10-17T01:02:03.123456Z`), so `_time`
+/// and the timestamp inside `_msg` read alike.
+fn now_rfc3339() -> String {
+    use tracing_subscriber::fmt::time::FormatTime;
+    let mut time = String::with_capacity(32);
+    // Formatting into a String cannot fail.
+    let _ = tracing_subscriber::fmt::time::SystemTime
+        .format_time(&mut tracing_subscriber::fmt::format::Writer::new(&mut time));
+    time
+}
+
+/// The fmt layer's stdout writer: each event goes to stdout byte for byte as
+/// the default writer sends it, and to the sink when one is configured.
+pub(crate) struct StdoutTee {
+    pub(crate) sink: Option<Arc<LogSink>>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for StdoutTee {
+    type Writer = TeeWriter<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TeeWriter {
+            sink: self.sink.as_deref(),
+        }
+    }
+}
+
+pub(crate) struct TeeWriter<'a> {
+    sink: Option<&'a LogSink>,
+}
+
+impl std::io::Write for TeeWriter<'_> {
+    /// The fmt layer writes each event with one `write_all`, and this takes
+    /// all of it in one call, so one event is one `push`.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // The sink first, so a failing stdout (a closed pipe) does not also
+        // cost the sink its copy.
+        if let Some(sink) = self.sink {
+            sink.push(buf);
+        }
+        std::io::stdout().lock().write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stdout().flush()
+    }
+}
+
+#[cfg(test)]
+mod tests;

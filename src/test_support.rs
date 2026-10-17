@@ -211,6 +211,7 @@ pub(crate) fn test_state_base() -> AppState {
         fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache: None,
         client_store: None,
+        log_sink: None,
     }
 }
 
