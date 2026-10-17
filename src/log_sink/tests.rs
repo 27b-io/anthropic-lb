@@ -168,6 +168,35 @@ async fn a_lone_line_leaves_within_the_flush_interval() {
     assert!((now - epoch).abs() < 30, "{time} is not now");
 }
 
+/// The layer `main` installs ships plain text: with colour on (no `NO_COLOR`
+/// in the test environment), a sink's copy would otherwise carry the level and
+/// field-name escapes into every `_msg`.
+#[tokio::test]
+async fn the_sink_gets_plain_text_from_the_stdout_layer() {
+    let (url, posts) = spawn_collector(vec![]).await;
+    let sink = sink_at(&url, 16, Duration::from_millis(20));
+    let _log = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(stdout_layer(Some(sink.clone()))),
+    );
+    // See requests_are_unaffected_by_a_hung_sink: a callsite's cached interest
+    // can predate this scoped subscriber.
+    tracing::callsite::rebuild_interest_cache();
+    tracing::info!(host = "collector:9428", "ansi probe");
+
+    eventually("the POST", Duration::from_secs(5), || {
+        !posts.lock().unwrap().is_empty()
+    })
+    .await;
+    let posts = posts.lock().unwrap();
+    let msg = posts[0].rows()[0]["_msg"].as_str().unwrap().to_string();
+    assert!(msg.contains("ansi probe"), "{msg}");
+    assert!(msg.contains(r#"host="collector:9428""#), "{msg}");
+    assert!(
+        !msg.contains('\x1b'),
+        "escape codes in the sink's copy: {msg:?}"
+    );
+}
+
 /// One write is one event: its lines become one row each, CRLF and empty lines
 /// stripped, invalid UTF-8 replaced, and every row carries the same `_time`.
 #[tokio::test]
@@ -371,11 +400,7 @@ async fn requests_are_unaffected_by_a_hung_sink() {
     // #[tokio::test] runtime is single-threaded.
     let _log = tracing::subscriber::set_default(
         tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(StdoutTee {
-                    sink: Some(sink.clone()),
-                })
+            stdout_layer(Some(sink.clone()))
                 .with_filter(tracing_subscriber::EnvFilter::new("anthropic_lb=info")),
         ),
     );

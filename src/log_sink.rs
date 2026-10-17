@@ -297,8 +297,34 @@ fn now_rfc3339() -> String {
     time
 }
 
+/// The fmt layer that writes stdout, teeing every event to the sink when one is
+/// configured. With a sink it writes plain text: the sink ships what stdout
+/// gets, and colour escapes inside a log store's `_msg` break text search and
+/// field matching. Without one the default stands, `NO_COLOR` included, so the
+/// layer is left alone rather than given `with_ansi(true)`, which would
+/// override `NO_COLOR`.
+pub(crate) fn stdout_layer<S>(
+    sink: Option<Arc<LogSink>>,
+) -> tracing_subscriber::fmt::Layer<
+    S,
+    tracing_subscriber::fmt::format::DefaultFields,
+    tracing_subscriber::fmt::format::Format,
+    StdoutTee,
+>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    let layer = tracing_subscriber::fmt::layer();
+    let layer = if sink.is_some() {
+        layer.with_ansi(false)
+    } else {
+        layer
+    };
+    layer.with_writer(StdoutTee { sink })
+}
+
 /// The fmt layer's stdout writer: each event goes to stdout byte for byte as
-/// the default writer sends it, and to the sink when one is configured.
+/// the layer formatted it, and to the sink when one is configured.
 pub(crate) struct StdoutTee {
     pub(crate) sink: Option<Arc<LogSink>>,
 }

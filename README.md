@@ -1314,7 +1314,10 @@ POST a copy of every stdout line to a collector itself:
 url = "http://logs.example:9428/insert/jsonline"   # e.g. VictoriaLogs
 ```
 
-Lines are sent in batches, as one JSON object per line
+With a sink configured, stdout is written without ANSI colour too, so the
+sink's copy is plain text that a log store can search; without one, colour
+follows the terminal and `NO_COLOR` as before. Lines are sent in batches, as
+one JSON object per line
 (`{"_time":"<RFC 3339>","_msg":"<the line as written to stdout>"}`) with
 `content-type: application/x-ndjson`. A batch leaves at 1000 lines, at about
 1 MiB, or one second after its first line, whichever comes first, so a lone

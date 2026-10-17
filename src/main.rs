@@ -407,14 +407,10 @@ async fn main() {
     // configured, plus optional debug log file
     {
         use tracing_subscriber::prelude::*;
-        let stdout_layer = tracing_subscriber::fmt::layer()
-            .with_writer(StdoutTee {
-                sink: log_sink.clone(),
-            })
-            .with_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "anthropic_lb=info".into()),
-            );
+        let stdout_layer = stdout_layer(log_sink.clone()).with_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "anthropic_lb=info".into()),
+        );
         if let Some(ref debug_path) = config.debug_log {
             let file = std::fs::OpenOptions::new()
                 .create(true)
