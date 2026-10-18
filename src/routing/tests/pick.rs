@@ -436,6 +436,47 @@ async fn legacy_remaining_headers_still_reported_after_cooldown() {
     assert_eq!(info.remaining_tokens, Some(1234));
 }
 
+/// A genuine legacy 0 is real exhaustion, not 429 poison: a later response
+/// with no rate data (a headerless 5xx) or only part of the legacy set must
+/// not erase it, with or without an expired 429 behind it.
+#[tokio::test]
+async fn genuine_legacy_zero_survives_headerless_and_partial_responses() {
+    for after_429 in [false, true] {
+        let state = test_state_with(vec![mk_endpoint("legacy-zero", "sk-ant-api-a")]);
+        if after_429 {
+            let mut h429 = reqwest::header::HeaderMap::new();
+            h429.insert(
+                "x-ratelimit-remaining-tokens",
+                HeaderValue::from_static("0"),
+            );
+            state.mark_hard_limited(0, &h429).await;
+            state.endpoints[0]
+                .rate_info
+                .write()
+                .await
+                .hard_limited_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+
+        let mut h200 = reqwest::header::HeaderMap::new();
+        h200.insert(
+            "x-ratelimit-remaining-tokens",
+            HeaderValue::from_static("0"),
+        );
+        h200.insert("x-ratelimit-limit-tokens", HeaderValue::from_static("1000"));
+        state.update_rate_info(0, &h200).await;
+
+        state
+            .update_rate_info(0, &reqwest::header::HeaderMap::new())
+            .await;
+        let mut partial = reqwest::header::HeaderMap::new();
+        partial.insert("x-ratelimit-limit-tokens", HeaderValue::from_static("1000"));
+        state.update_rate_info(0, &partial).await;
+
+        let info = state.endpoints[0].rate_info.read().await;
+        assert_eq!(info.remaining_tokens, Some(0), "after_429={after_429}");
+    }
+}
+
 /// LAB-8497: the hard-429 WARN carries every unified rate-limit header the
 /// 429 had, prefix stripped, so the log shows why upstream refused. Headers
 /// outside the unified family stay off the line.
