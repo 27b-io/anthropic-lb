@@ -1025,12 +1025,11 @@ impl AppState {
         // A capacity 429 poisons remaining_* to 0 (mark_hard_limited_for), and
         // only the legacy headers below overwrite them. Unified-header accounts
         // never send those, so drop the poison once its hard limit has ended
-        // and a unified response proves the account is answering again.
-        // Requiring unified data keeps a genuine legacy 0 across a headerless
-        // or legacy-only response. Restored and Redis-synced values pass
-        // through here on the next update.
-        let got_unified = got_5h_util || got_7d_util || rep_claim.is_some();
-        if got_unified
+        // and unified utilization is held. While it is, the legacy-token
+        // routing fallback is never read, so a genuine legacy 0 is only
+        // dropped when it no longer steers anything. Restored and Redis-synced
+        // values pass through here on the next update.
+        if info.utilization.is_some()
             && !info
                 .hard_limited_until
                 .is_some_and(|until| Instant::now() < until)
@@ -1073,7 +1072,7 @@ impl AppState {
         // Only advance last_updated when we actually parsed rate-limit data.
         // Responses without rate headers (e.g. 5xx) must not clear
         // stale_after_hard_limit, which relies on last_updated <= hard_limited_until.
-        let parsed_any = got_unified || got_legacy;
+        let parsed_any = got_5h_util || got_7d_util || rep_claim.is_some() || got_legacy;
         if parsed_any {
             info.last_updated = Some(Instant::now());
             info.last_updated_epoch = Some(Self::now_epoch());

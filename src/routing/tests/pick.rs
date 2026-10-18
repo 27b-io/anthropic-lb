@@ -477,6 +477,53 @@ async fn genuine_legacy_zero_survives_headerless_and_partial_responses() {
     }
 }
 
+/// Unified headers that yield no usable utilization (a bare claim label, a
+/// malformed value) leave the legacy-token fallback as the routing signal,
+/// so they must not erase a genuine legacy 0 either.
+#[tokio::test]
+async fn genuine_legacy_zero_survives_unified_headers_without_utilization() {
+    for (name, value) in [
+        (
+            "anthropic-ratelimit-unified-representative-claim",
+            "five_hour",
+        ),
+        ("anthropic-ratelimit-unified-5h-utilization", "not-a-number"),
+    ] {
+        for after_429 in [false, true] {
+            let state = test_state_with(vec![mk_endpoint("legacy-zero", "sk-ant-api-a")]);
+            if after_429 {
+                state
+                    .mark_hard_limited(0, &reqwest::header::HeaderMap::new())
+                    .await;
+                state.endpoints[0]
+                    .rate_info
+                    .write()
+                    .await
+                    .hard_limited_until = Some(Instant::now() - Duration::from_secs(1));
+            }
+
+            let mut legacy = reqwest::header::HeaderMap::new();
+            legacy.insert(
+                "x-ratelimit-remaining-tokens",
+                HeaderValue::from_static("0"),
+            );
+            legacy.insert("x-ratelimit-limit-tokens", HeaderValue::from_static("1000"));
+            state.update_rate_info(0, &legacy).await;
+
+            let mut unified = reqwest::header::HeaderMap::new();
+            unified.insert(name, HeaderValue::from_static(value));
+            state.update_rate_info(0, &unified).await;
+
+            let info = state.endpoints[0].rate_info.read().await;
+            assert_eq!(
+                info.remaining_tokens,
+                Some(0),
+                "{name}: {value}, after_429={after_429}"
+            );
+        }
+    }
+}
+
 /// LAB-8497: the hard-429 WARN carries every unified rate-limit header the
 /// 429 had, prefix stripped, so the log shows why upstream refused. Headers
 /// outside the unified family stay off the line.
