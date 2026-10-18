@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.1](https://github.com/27b-io/anthropic-lb/compare/v0.4.0...v0.4.1) (2026-10-18)
+
+
+### Features
+
+* **LAB-9952:** optional HTTP log sink that pushes stdout lines as JSON lines ([#303](https://github.com/27b-io/anthropic-lb/issues/303)) ([bbff773](https://github.com/27b-io/anthropic-lb/commit/bbff77369e99a10807d0c8c172879c313e7246ff))
+
+
+### Bug Fixes
+
+* **LAB-10006:** clear a 429's zeroed remaining counts once its cooldown ends ([#307](https://github.com/27b-io/anthropic-lb/issues/307)) ([4ca7f12](https://github.com/27b-io/anthropic-lb/commit/4ca7f122b3c394fc036dfd94817838f713a1ca76))
+* **LAB-9952:** account the log sink's queue by allocation, and test its give-back ([#305](https://github.com/27b-io/anthropic-lb/issues/305)) ([08d8727](https://github.com/27b-io/anthropic-lb/commit/08d87274c59033edabf153c25ecc2d53bce50485))
+* **LAB-9985:** damp waste risk in the keyed rendezvous score ([#306](https://github.com/27b-io/anthropic-lb/issues/306)) ([531cad0](https://github.com/27b-io/anthropic-lb/commit/531cad0a532d5f51d27447ec7eb583d1384f7b5e))
+
 ## [0.4.0](https://github.com/27b-io/anthropic-lb/compare/v0.3.1...v0.4.0) (2026-10-16)
 
 
