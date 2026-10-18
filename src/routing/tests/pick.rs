@@ -360,6 +360,170 @@ async fn mark_hard_limited_capacity_429_poisons_state() {
     );
 }
 
+/// A capacity 429 poisons `remaining_*` to 0, and only the legacy
+/// `x-ratelimit-remaining-*` headers ever overwrote it. Unified-header
+/// accounts never send those, so the 0 outlived the cooldown and read as
+/// "no headroom" forever. The first update after the cooldown clears it.
+#[tokio::test]
+async fn capacity_429_poison_clears_after_cooldown_on_unified_update() {
+    let state = test_state_with(vec![mk_endpoint("poison-clear", "sk-ant-api-a")]);
+
+    let mut h429 = reqwest::header::HeaderMap::new();
+    h429.insert(
+        "anthropic-ratelimit-unified-5h-utilization",
+        HeaderValue::from_static("1.0"),
+    );
+    state.mark_hard_limited(0, &h429).await;
+
+    let mut h200 = reqwest::header::HeaderMap::new();
+    h200.insert(
+        "anthropic-ratelimit-unified-5h-utilization",
+        HeaderValue::from_static("0.4"),
+    );
+
+    // Still cooling down: the poison stands.
+    state.update_rate_info(0, &h200).await;
+    {
+        let info = state.endpoints[0].rate_info.read().await;
+        assert_eq!(info.remaining_requests, Some(0));
+        assert_eq!(info.remaining_tokens, Some(0));
+    }
+
+    // Cooldown over.
+    state.endpoints[0]
+        .rate_info
+        .write()
+        .await
+        .hard_limited_until = Some(Instant::now() - Duration::from_secs(1));
+    state.update_rate_info(0, &h200).await;
+
+    let info = state.endpoints[0].rate_info.read().await;
+    assert_eq!(info.remaining_requests, None);
+    assert_eq!(info.remaining_tokens, None);
+}
+
+/// The clear must not touch accounts that report the legacy headers: their
+/// value, a genuine 0 included, comes from the current response.
+#[tokio::test]
+async fn legacy_remaining_headers_still_reported_after_cooldown() {
+    let state = test_state_with(vec![mk_endpoint("legacy", "sk-ant-api-a")]);
+
+    let mut h429 = reqwest::header::HeaderMap::new();
+    h429.insert(
+        "x-ratelimit-remaining-requests",
+        HeaderValue::from_static("0"),
+    );
+    state.mark_hard_limited(0, &h429).await;
+    state.endpoints[0]
+        .rate_info
+        .write()
+        .await
+        .hard_limited_until = Some(Instant::now() - Duration::from_secs(1));
+
+    let mut h200 = reqwest::header::HeaderMap::new();
+    h200.insert(
+        "x-ratelimit-remaining-requests",
+        HeaderValue::from_static("0"),
+    );
+    h200.insert(
+        "x-ratelimit-remaining-tokens",
+        HeaderValue::from_static("1234"),
+    );
+    state.update_rate_info(0, &h200).await;
+
+    let info = state.endpoints[0].rate_info.read().await;
+    assert_eq!(info.remaining_requests, Some(0));
+    assert_eq!(info.remaining_tokens, Some(1234));
+}
+
+/// A genuine legacy 0 is real exhaustion, not 429 poison: a later response
+/// with no rate data (a headerless 5xx) or only part of the legacy set must
+/// not erase it, with or without an expired 429 behind it.
+#[tokio::test]
+async fn genuine_legacy_zero_survives_headerless_and_partial_responses() {
+    for after_429 in [false, true] {
+        let state = test_state_with(vec![mk_endpoint("legacy-zero", "sk-ant-api-a")]);
+        if after_429 {
+            let mut h429 = reqwest::header::HeaderMap::new();
+            h429.insert(
+                "x-ratelimit-remaining-tokens",
+                HeaderValue::from_static("0"),
+            );
+            state.mark_hard_limited(0, &h429).await;
+            state.endpoints[0]
+                .rate_info
+                .write()
+                .await
+                .hard_limited_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+
+        let mut h200 = reqwest::header::HeaderMap::new();
+        h200.insert(
+            "x-ratelimit-remaining-tokens",
+            HeaderValue::from_static("0"),
+        );
+        h200.insert("x-ratelimit-limit-tokens", HeaderValue::from_static("1000"));
+        state.update_rate_info(0, &h200).await;
+
+        state
+            .update_rate_info(0, &reqwest::header::HeaderMap::new())
+            .await;
+        let mut partial = reqwest::header::HeaderMap::new();
+        partial.insert("x-ratelimit-limit-tokens", HeaderValue::from_static("1000"));
+        state.update_rate_info(0, &partial).await;
+
+        let info = state.endpoints[0].rate_info.read().await;
+        assert_eq!(info.remaining_tokens, Some(0), "after_429={after_429}");
+    }
+}
+
+/// Unified headers that yield no usable utilization (a bare claim label, a
+/// malformed value) leave the legacy-token fallback as the routing signal,
+/// so they must not erase a genuine legacy 0 either.
+#[tokio::test]
+async fn genuine_legacy_zero_survives_unified_headers_without_utilization() {
+    for (name, value) in [
+        (
+            "anthropic-ratelimit-unified-representative-claim",
+            "five_hour",
+        ),
+        ("anthropic-ratelimit-unified-5h-utilization", "not-a-number"),
+    ] {
+        for after_429 in [false, true] {
+            let state = test_state_with(vec![mk_endpoint("legacy-zero", "sk-ant-api-a")]);
+            if after_429 {
+                state
+                    .mark_hard_limited(0, &reqwest::header::HeaderMap::new())
+                    .await;
+                state.endpoints[0]
+                    .rate_info
+                    .write()
+                    .await
+                    .hard_limited_until = Some(Instant::now() - Duration::from_secs(1));
+            }
+
+            let mut legacy = reqwest::header::HeaderMap::new();
+            legacy.insert(
+                "x-ratelimit-remaining-tokens",
+                HeaderValue::from_static("0"),
+            );
+            legacy.insert("x-ratelimit-limit-tokens", HeaderValue::from_static("1000"));
+            state.update_rate_info(0, &legacy).await;
+
+            let mut unified = reqwest::header::HeaderMap::new();
+            unified.insert(name, HeaderValue::from_static(value));
+            state.update_rate_info(0, &unified).await;
+
+            let info = state.endpoints[0].rate_info.read().await;
+            assert_eq!(
+                info.remaining_tokens,
+                Some(0),
+                "{name}: {value}, after_429={after_429}"
+            );
+        }
+    }
+}
+
 /// LAB-8497: the hard-429 WARN carries every unified rate-limit header the
 /// 429 had, prefix stripped, so the log shows why upstream refused. Headers
 /// outside the unified family stay off the line.

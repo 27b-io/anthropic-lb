@@ -1022,6 +1022,26 @@ impl AppState {
         }
         info.utilization = max_util;
 
+        // A capacity 429 poisons remaining_* to 0 (mark_hard_limited_for), and
+        // only the legacy headers below overwrite them. Unified-header accounts
+        // never send those, so drop the poison once its hard limit has ended
+        // and unified utilization is held. While it is, the legacy-token
+        // routing fallback is never read, so a genuine legacy 0 is only
+        // dropped when it no longer steers anything. Restored and Redis-synced
+        // values pass through here on the next update.
+        if info.utilization.is_some()
+            && !info
+                .hard_limited_until
+                .is_some_and(|until| Instant::now() < until)
+        {
+            if info.remaining_requests == Some(0) {
+                info.remaining_requests = None;
+            }
+            if info.remaining_tokens == Some(0) {
+                info.remaining_tokens = None;
+            }
+        }
+
         // Legacy headers (still try them)
         let mut got_legacy = false;
         if let Some(v) = headers.get("x-ratelimit-remaining-requests") {
