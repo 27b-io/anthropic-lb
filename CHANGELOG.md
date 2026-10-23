@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/27b-io/anthropic-lb/compare/v0.4.1...v0.4.2) (2026-10-23)
+
+
+### Bug Fixes
+
+* **LAB-10761:** distrust the compromised eMudhra intermediates on all outbound TLS ([#309](https://github.com/27b-io/anthropic-lb/issues/309)) ([a67403b](https://github.com/27b-io/anthropic-lb/commit/a67403b3622d2ea5cdb1c17080ddeb3b15e1c3b9))
+
 ## [0.4.1](https://github.com/27b-io/anthropic-lb/compare/v0.4.0...v0.4.1) (2026-10-18)
 
 
