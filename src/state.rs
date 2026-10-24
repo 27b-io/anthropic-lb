@@ -775,6 +775,10 @@ pub(crate) struct AppState {
     /// Upstream "prompt is too long" 400s by model (LAB-916). Exposed as
     /// `anthropic_prompt_too_long_total`; bounded via `_other` overflow.
     pub(crate) prompt_too_long: Mutex<HashMap<String, u64>>,
+    /// Requests re-sent without `speed` because the model rejects it
+    /// (LAB-4190), by requested model. Exposed as
+    /// `anthropic_speed_unsupported_total`; bounded like `prompt_too_long`.
+    pub(crate) speed_unsupported: Mutex<HashMap<String, u64>>,
     /// Upstream 429s on fast-mode requests, by account (LAB-2675). These are
     /// forwarded to the caller instead of cooling the account — fast mode has
     /// its own rate bucket — so this counter is the only operator-visible

@@ -204,7 +204,7 @@ pub(crate) async fn try_fallback_upstream(
         // 529 storm drained the Anthropic accounts into an OpenAI-protocol
         // LiteLLM gateway).
         // Only the model rejection: this path has never re-sent on an
-        // entitlement 400.
+        // entitlement 400, and forwards a speed 400 unchanged (LAB-4190).
         let model_unsupported =
             serde_json::from_str::<serde_json::Value>(&err_body).is_ok_and(|v| {
                 // Always the endpoint's own bearer token here, never the caller's.

@@ -23,6 +23,11 @@ use crate::*;
 ///     this request (`is_entitlement_exhausted_400`, LAB-4729). The loop
 ///     re-sends ONCE, and a second entitlement 400 — or nothing left to try —
 ///     returns `resp` to the caller.
+///   - `RetryWithoutSpeed(resp)`: the model does not accept `speed`
+///     (`is_speed_unsupported_error`, LAB-4190). `proxy_handler` strips the
+///     field from the request for this and every later attempt and re-sends
+///     to the SAME endpoint at once: no skip, no mark, no rotation spent.
+///     With nothing left to strip, `resp` goes to the caller.
 // Response payloads are boxed so the enum stays small (one word per payload):
 // it rides in the Err of `classify_retry_status`'s Result, where an inline
 // `Response` is 128+ bytes on the hot success path (clippy::result_large_err —
@@ -31,6 +36,7 @@ pub(crate) enum ForwardOutcome {
     Done(Box<Response>),
     RetryRejectedByAccount(Box<Response>),
     RetryEntitlement(Box<Response>),
+    RetryWithoutSpeed(Box<Response>),
     Retry {
         saw_529: bool,
         push_skip: bool,
@@ -138,6 +144,31 @@ fn is_fast_mode_not_enabled_error(status: StatusCode, body: &serde_json::Value) 
             .is_some_and(|m| m == FAST_MODE_NOT_ENABLED_MSG)
 }
 
+/// Upstream text of the model-capability 400 after the quoted model id
+/// (observed 2026-09-29, LAB-4190).
+const SPEED_UNSUPPORTED_SUFFIX: &str =
+    "' does not support the `speed` parameter. This feature is only available on supported models.";
+
+/// True when an upstream 400 says the MODEL does not accept `speed`, whatever
+/// its value (LAB-4190): 400 `{"type":"error","error":{"type":
+/// "invalid_request_error","message":"'<id>' does not support the `speed`
+/// parameter. This feature is only available on supported models."}}`.
+/// Every account gives it, so rotating cannot help; the request is fine
+/// without the field. Exact-matched around the id, and the id is not bound to
+/// the requested model: upstream names the resolved id (`claude-haiku-4-5` →
+/// `claude-haiku-4-5-20251001`). It needs no binding, because the remedy is
+/// per request and learns nothing.
+fn is_speed_unsupported_error(status: StatusCode, body: &serde_json::Value) -> bool {
+    status == StatusCode::BAD_REQUEST
+        && body.pointer("/error/type").and_then(|v| v.as_str()) == Some("invalid_request_error")
+        && body
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .and_then(|m| m.strip_prefix('\''))
+            .and_then(|m| m.strip_suffix(SPEED_UNSUPPORTED_SUFFIX))
+            .is_some_and(|id| !id.is_empty() && !id.contains('\''))
+}
+
 /// Anchor for the entitlement 400 (LAB-4729). Only the first sentence: the
 /// second names who can add more ("Ask your workspace admin …") and varies by
 /// plan, the first is the condition itself.
@@ -173,6 +204,10 @@ pub(crate) enum UpstreamRejection {
     /// `is_fast_mode_not_enabled_error`. Reports this account's org only
     /// when the request asked for fast mode; the caller decides.
     FastModeDisabled,
+    /// `is_speed_unsupported_error`. Model state, not account state: no
+    /// other endpoint serves the request with `speed`, and every endpoint
+    /// serves it without.
+    SpeedUnsupported,
 }
 
 /// Read account or model state out of an upstream error. The classifiers it
@@ -204,6 +239,8 @@ pub(crate) fn classify_rejection(
         UpstreamRejection::Entitlement
     } else if is_fast_mode_not_enabled_error(status, err_body) {
         UpstreamRejection::FastModeDisabled
+    } else if is_speed_unsupported_error(status, err_body) {
+        UpstreamRejection::SpeedUnsupported
     } else {
         return None;
     };
@@ -527,6 +564,9 @@ pub(crate) fn apply_round_outcome(
     }
     match outcome {
         ForwardOutcome::Done(resp) => RetryStep::Return(*resp),
+        // `proxy_handler` acts on a speed rejection before the outcome gets
+        // here, so arriving means nothing was left to strip (LAB-4190).
+        ForwardOutcome::RetryWithoutSpeed(resp) => RetryStep::Return(*resp),
         // Account-level rejection (model outside its plan, LAB-941; org lacks
         // fast mode, LAB-2687): rotate immediately (another account may serve
         // it) but keep the upstream's error in hand for the case where none does.
@@ -1464,6 +1504,20 @@ pub(crate) async fn forward_anthropic(
                     state.note_entitlement_400(endpoint_name);
                     Some(ForwardOutcome::RetryEntitlement)
                 }
+                // The model does not accept `speed` (LAB-4190): every account
+                // rejects it, and none needs to. `proxy_handler` re-sends to
+                // this endpoint without the field. Nothing is learned or
+                // shared, so a forged message can only strip the forger's
+                // own field. Only where `speed` is a top-level Messages field
+                // and the body sent here carries it; otherwise there is
+                // nothing to strip, and the 400 is the caller's.
+                Some(UpstreamRejection::SpeedUnsupported)
+                    if messages_schema && has_top_level_field(req_body, "speed") =>
+                {
+                    state.note_speed_unsupported(req_id, model);
+                    Some(ForwardOutcome::RetryWithoutSpeed)
+                }
+                Some(UpstreamRejection::SpeedUnsupported) => None,
                 None => None,
             };
             if let Some(retry) = rotate {
@@ -1860,7 +1914,9 @@ pub(crate) async fn proxy_handler(
         }
     }
 
-    let (body_bytes, oauth_body_bytes, model, fp, cache_key, is_fast_mode) =
+    // `mut`: a speed rejection strips `speed` from both bodies for every
+    // later attempt, and the request is standard from then on (LAB-4190).
+    let (mut body_bytes, mut oauth_body_bytes, model, fp, cache_key, mut is_fast_mode) =
         if let Ok(mut parsed) = parse {
             // Valid JSON but not an object (`[1]`, `"x"`, `7`, `true`,
             // `null`) can only 400 upstream. Reject it here so it costs no
@@ -2078,7 +2134,7 @@ pub(crate) async fn proxy_handler(
     // passthrough endpoint still sends `speed`, so its mark still counts.
     // `forward_anthropic` itself still gets `is_fast_mode` and narrows it on
     // the strip it actually performs.
-    let fast = FastRequest {
+    let mut fast = FastRequest {
         requested: is_fast_mode,
         stripped_on_oauth: is_fast_mode
             && beta_filter_strips_speed(
@@ -2203,7 +2259,7 @@ pub(crate) async fn proxy_handler(
                 Some(i) => {
                     let ep = &state.endpoints[i];
                     match ep.protocol {
-                        Protocol::Anthropic => {
+                        Protocol::Anthropic => loop {
                             let out = forward_anthropic(
                                 &state,
                                 &parts,
@@ -2224,8 +2280,29 @@ pub(crate) async fn proxy_handler(
                                 request_start,
                             )
                             .await;
-                            (out, i)
-                        }
+                            let ForwardOutcome::RetryWithoutSpeed(resp) = out else {
+                                break (out, i);
+                            };
+                            // The model does not accept `speed` (LAB-4190):
+                            // drop it and re-send to this endpoint now. Both
+                            // bodies carry `speed` or neither does, and once
+                            // it is gone neither can be stripped again, so
+                            // this runs at most once per request. Every later
+                            // attempt, after a 429 or 5xx on the re-send, goes
+                            // out stripped too, and the request is standard
+                            // from here on: for the rate bucket, the fast-mode
+                            // 429 exemption and fast-mode routing exclusion.
+                            let (Some(body), Some(oauth_body)) = (
+                                strip_top_level_fields(&body_bytes, &["speed"]),
+                                strip_top_level_fields(&oauth_body_bytes, &["speed"]),
+                            ) else {
+                                break (ForwardOutcome::Done(resp), i);
+                            };
+                            body_bytes = body;
+                            oauth_body_bytes = oauth_body;
+                            is_fast_mode = false;
+                            fast = FastRequest::STANDARD;
+                        },
                         Protocol::OpenAI => {
                             let out = match openai_fallback_body
                                 .get_or_insert_with(|| build_openai_fallback_body(&body_bytes))

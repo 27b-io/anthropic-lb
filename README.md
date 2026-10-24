@@ -546,6 +546,14 @@ can steer are locked down by default:
   `429`s (`x-should-retry` with no `retry-after` and no rate-limit headers) are
   excluded: those are per-minute limits on the account itself, so they keep
   their usual backoff and rotation whatever speed was requested.
+- **`speed` on a model that does not support it is dropped, not fatal.**
+  Some models reject a top-level `speed` of any value with a `400` ("`'<model>'`
+  does not support the `speed` parameter"), on every account. On
+  `/v1/messages` and `/v1/messages/count_tokens` the proxy removes `speed` and
+  re-sends once to the same account, and the request is served at standard
+  speed. Nothing is cached or marked, and no other account is tried for it; a
+  `passthrough` endpoint forwards the `400` unchanged. Occurrences are counted
+  as `anthropic_speed_unsupported_total{model}`.
 
 ### Known Limitations
 

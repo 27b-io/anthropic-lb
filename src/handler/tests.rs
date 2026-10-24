@@ -11,6 +11,7 @@ mod model_unsupported;
 mod overage_usage;
 mod proxy;
 mod retry;
+mod speed_unsupported;
 mod stalled_client;
 mod stream_charge;
 mod upstream_budget;
