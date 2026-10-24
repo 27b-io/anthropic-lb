@@ -326,7 +326,9 @@ impl ResponseCache {
     /// Read an entry. Every failure mode — no encryption handle, backend
     /// error, decrypt error, timeout — degrades to `None` and the request
     /// proceeds upstream (AC10). Diagnostics carry the key digest only,
-    /// never content (AC5).
+    /// never content (AC5). cachekit-rs (>= 0.10) holds a per-key lock across
+    /// the backend read, so concurrent lookups of one key queue behind each
+    /// other, and any still queued at `op_timeout` count as errors.
     pub(crate) async fn lookup(
         &self,
         client_id: &str,
