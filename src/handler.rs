@@ -1514,7 +1514,6 @@ pub(crate) async fn forward_anthropic(
                 Some(UpstreamRejection::SpeedUnsupported)
                     if messages_schema && has_top_level_field(req_body, "speed") =>
                 {
-                    state.note_speed_unsupported(req_id, model);
                     Some(ForwardOutcome::RetryWithoutSpeed)
                 }
                 Some(UpstreamRejection::SpeedUnsupported) => None,
@@ -2298,6 +2297,7 @@ pub(crate) async fn proxy_handler(
                             ) else {
                                 break (ForwardOutcome::Done(resp), i);
                             };
+                            state.note_speed_unsupported(&req_id, &model);
                             body_bytes = body;
                             oauth_body_bytes = oauth_body;
                             is_fast_mode = false;

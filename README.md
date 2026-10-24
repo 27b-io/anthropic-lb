@@ -551,7 +551,9 @@ can steer are locked down by default:
   does not support the `speed` parameter"), on every account. On
   `/v1/messages` and `/v1/messages/count_tokens` the proxy removes `speed` and
   re-sends once to the same account, and the request is served at standard
-  speed. Nothing is cached or marked, and no other account is tried for it; a
+  speed. Nothing is cached or marked, and the `400` itself does not rotate the
+  request to another account. If the re-send then gets a `429` or `5xx`, normal
+  rotation applies, and the next account receives the body without `speed`. A
   `passthrough` endpoint forwards the `400` unchanged. Occurrences are counted
   as `anthropic_speed_unsupported_total{model}`.
 

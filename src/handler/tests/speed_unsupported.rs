@@ -66,6 +66,19 @@ fn speed_unsupported_classifies_exact_template_only() {
         ),
         None
     );
+    // The request-body veto covers this verdict too: a sent body it cannot
+    // read as an object forwards the 400.
+    assert_eq!(
+        classify_rejection(
+            StatusCode::BAD_REQUEST,
+            &json(SPEED_400_FABLE),
+            Protocol::Anthropic,
+            "claude-fable-5-1",
+            b"[]",
+            false
+        ),
+        None
+    );
 
     let err =
         |ty: &str, msg: &str| serde_json::json!({"type":"error","error":{"type":ty,"message":msg}});
@@ -266,17 +279,28 @@ fn keys(body: &serde_json::Value) -> Vec<String> {
 async fn speed_400_resends_once_to_same_endpoint_without_speed() {
     use std::sync::atomic::Ordering;
     let cases = [
-        ("fast", "sk-ant-api-f", FABLE_FAST),
-        ("standard", "sk-ant-api-f", FABLE_STANDARD),
-        ("streaming", "sk-ant-api-f", FABLE_FAST_STREAM),
-        ("oauth", "sk-ant-oat01-f", FABLE_FAST),
+        ("fast", "sk-ant-api-f", "/v1/messages", FABLE_FAST),
+        ("standard", "sk-ant-api-f", "/v1/messages", FABLE_STANDARD),
+        (
+            "streaming",
+            "sk-ant-api-f",
+            "/v1/messages",
+            FABLE_FAST_STREAM,
+        ),
+        ("oauth", "sk-ant-oat01-f", "/v1/messages", FABLE_FAST),
+        (
+            "count_tokens",
+            "sk-ant-api-f",
+            "/v1/messages/count_tokens",
+            FABLE_FAST,
+        ),
     ];
-    for (kind, token, body) in cases {
+    for (kind, token, path, body) in cases {
         let (url, bodies) = spawn_speed_upstream(Some(SPEED_400_FABLE), Reply::Ok).await;
         let (state, addr, healthy_hits) =
             first_then_healthy_pool(mk_endpoint_at("fable", token, &url)).await;
         for _ in 0..2 {
-            let resp = post(addr, "/v1/messages", body).await;
+            let resp = post(addr, path, body).await;
             assert_eq!(resp.status(), reqwest::StatusCode::OK, "{kind}");
             let text = resp.text().await.unwrap();
             if kind == "streaming" {
