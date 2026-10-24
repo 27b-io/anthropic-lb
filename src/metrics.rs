@@ -617,6 +617,7 @@ pub(crate) async fn metrics_handler(
     let budget_usage = state.lock_budget_usage().clone();
     let cluster_info = state.lock_cluster_info_cache().clone();
     let prompt_too_long = snapshot_counters(&state.prompt_too_long, "prompt_too_long");
+    let speed_unsupported = snapshot_counters(&state.speed_unsupported, "speed_unsupported");
     let fast_mode_429 = snapshot_counters(&state.fast_mode_429, "fast_mode_429");
     let entitlement_400 = snapshot_counters(&state.entitlement_400, "entitlement_400");
     let model_denied: Vec<((String, String), u64)> =
@@ -1605,6 +1606,24 @@ pub(crate) async fn metrics_handler(
         prom_counter(
             &mut buf,
             "anthropic_prompt_too_long_total",
+            &[("model", model.as_str())],
+            *n,
+        );
+    }
+
+    // `speed` stripped for a model that rejects it (LAB-4190). Any sample
+    // means a caller sends `speed` where it cannot apply; each costs one
+    // extra upstream round trip.
+    prom_header(
+        &mut buf,
+        "anthropic_speed_unsupported_total",
+        "counter",
+        "Requests re-sent without `speed` because the model does not support it, by requested model",
+    );
+    for (model, n) in &speed_unsupported {
+        prom_counter(
+            &mut buf,
+            "anthropic_speed_unsupported_total",
             &[("model", model.as_str())],
             *n,
         );

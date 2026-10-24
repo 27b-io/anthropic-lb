@@ -203,6 +203,7 @@ pub(crate) fn test_state_base() -> AppState {
         beta_flags_dropped: Mutex::new(HashMap::new()),
         beta_body_fields_stripped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
+        speed_unsupported: Mutex::new(HashMap::new()),
         fast_mode_429: Mutex::new(HashMap::new()),
         entitlement_400: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),

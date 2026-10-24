@@ -1167,10 +1167,11 @@ async fn forward_openai_compat_anthropic(
                 ForwardOutcome::RetryEntitlement(Box::new(response))
             }
             // The translated request never carries `speed`, so a fast-mode
-            // 400 here cannot describe this account's fast-mode entitlement.
-            Some(UpstreamRejection::FastModeDisabled) | None => {
-                ForwardOutcome::Done(Box::new(response))
-            }
+            // 400 here cannot describe this account's fast-mode entitlement,
+            // and a speed 400 leaves nothing to strip (LAB-4190).
+            Some(UpstreamRejection::FastModeDisabled)
+            | Some(UpstreamRejection::SpeedUnsupported)
+            | None => ForwardOutcome::Done(Box::new(response)),
         };
     }
 

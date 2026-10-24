@@ -16,9 +16,9 @@ pub(crate) const DEFAULT_SESSION_REGISTRY_TTL_SECS: u64 = 1800;
 /// Max sessions returned in the `/_stats` `sessions` array (highest
 /// context-window % first).
 const SESSIONS_STATS_TOP_N: usize = 50;
-/// Cap on distinct model labels in the prompt-too-long counter map (the model
+/// Cap on distinct model labels in each per-model counter map (the model
 /// string is client-controlled; overflow buckets into `_other`).
-const MAX_PROMPT_TOO_LONG_MODELS: usize = 32;
+const MAX_COUNTED_MODELS: usize = 32;
 
 /// `le` boundaries (tokens) for the live session-size distribution on
 /// `/metrics`. Dense around the 200k window edge — that's where sessions
@@ -83,7 +83,7 @@ pub(crate) fn context_window_for(model: &str, has_1m_beta: bool) -> u64 {
         let mut warned =
             lock_recovering(WARNED.get_or_init(Default::default), "unknown_model_warned");
         // Bounded like the client maps: model is client-controlled input.
-        if warned.len() < MAX_PROMPT_TOO_LONG_MODELS && warned.insert(model.to_string()) {
+        if warned.len() < MAX_COUNTED_MODELS && warned.insert(model.to_string()) {
             warn!(model, "unknown model family, assuming 200k context window");
         }
     }
@@ -97,6 +97,20 @@ fn window_pct(tokens: u64, window: u64) -> f64 {
         return 0.0;
     }
     (tokens as f64 / window as f64 * 1000.0).round() / 10.0
+}
+
+/// Count one event for `model` in a per-model counter map. At most
+/// `MAX_COUNTED_MODELS` labels; later models count under `_other`, which
+/// `escape_sentinel` keeps any model's own label off.
+fn count_by_model(counts: &Mutex<HashMap<String, u64>>, name: &'static str, model: &str) {
+    let mut counts = lock_recovering(counts, name);
+    let model_label = escape_sentinel(model, &["other"]);
+    let label = if counts.len() < MAX_COUNTED_MODELS || counts.contains_key(&model_label) {
+        model_label
+    } else {
+        "_other".to_owned()
+    };
+    *counts.entry(label).or_insert(0) += 1;
 }
 
 /// If `body` is the Anthropic "prompt is too long" 400 shape, return its
@@ -188,17 +202,7 @@ impl AppState {
         affinity_key: Option<&str>,
         message: &str,
     ) {
-        {
-            let mut counts = lock_recovering(&self.prompt_too_long, "prompt_too_long");
-            let model_label = escape_sentinel(model, &["other"]);
-            let label =
-                if counts.len() < MAX_PROMPT_TOO_LONG_MODELS || counts.contains_key(&model_label) {
-                    model_label
-                } else {
-                    "_other".to_owned()
-                };
-            *counts.entry(label).or_insert(0) += 1;
-        }
+        count_by_model(&self.prompt_too_long, "prompt_too_long", model);
         let (observed, max) = parse_prompt_too_long(message)
             .map(|(o, m)| (Some(o), Some(m)))
             .unwrap_or((None, None));
@@ -209,6 +213,19 @@ impl AppState {
             observed_tokens = observed,
             max_tokens = max,
             "prompt too long"
+        );
+    }
+
+    /// Count + WARN a request re-sent without `speed` because its model
+    /// rejects the field (LAB-4190), keyed on the requested model. The
+    /// request is served; this is the trace that a caller still sends
+    /// `speed` to a model without speed support.
+    pub(crate) fn note_speed_unsupported(&self, req_id: &str, model: &str) {
+        count_by_model(&self.speed_unsupported, "speed_unsupported", model);
+        warn!(
+            req_id,
+            model = ?model,
+            "model does not support `speed`: re-sending without it to the same account"
         );
     }
 

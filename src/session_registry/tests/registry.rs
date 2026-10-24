@@ -233,7 +233,7 @@ fn prompt_too_long_shape_detection_and_parse() {
 #[test]
 fn prompt_too_long_counter_bounds_model_cardinality() {
     let state = test_state_with(vec![]);
-    for i in 0..(MAX_PROMPT_TOO_LONG_MODELS + 5) {
+    for i in 0..(MAX_COUNTED_MODELS + 5) {
         state.note_prompt_too_long(
             "req",
             &format!("model-{i}"),
@@ -244,7 +244,7 @@ fn prompt_too_long_counter_bounds_model_cardinality() {
     let counts = state.prompt_too_long.lock().unwrap();
     assert_eq!(
         counts.len(),
-        MAX_PROMPT_TOO_LONG_MODELS + 1,
+        MAX_COUNTED_MODELS + 1,
         "distinct models capped, overflow buckets into _other"
     );
     assert_eq!(counts.get("_other"), Some(&5));

@@ -790,6 +790,13 @@ pub(crate) fn strip_top_level_fields(body: &bytes::Bytes, fields: &[&str]) -> Op
     )
 }
 
+/// True when `body` is a JSON object with a top-level `field`: what
+/// `strip_top_level_fields` would remove, without building the stripped body.
+pub(crate) fn has_top_level_field(body: &[u8], field: &str) -> bool {
+    serde_json::from_slice::<TopLevelObject<serde::de::IgnoredAny>>(body)
+        .is_ok_and(|TopLevelObject(entries)| entries.iter().any(|(key, _)| key == field))
+}
+
 /// `fallbacks` asks Anthropic to serve a refusal from another model (LAB-5970).
 /// The `"default"` form names no target at all (Anthropic routes it by refusal
 /// category), so the targets cannot be checked here without hard-coding
