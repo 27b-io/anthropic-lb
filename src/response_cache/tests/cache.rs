@@ -241,7 +241,14 @@ fn response_cache_key_isolates_surface() {
 
 #[test]
 fn response_cache_master_key_validation() {
-    assert!(decode_hex_key(&"ab".repeat(32)).is_ok());
+    assert_eq!(decode_hex_key(&"ab".repeat(32)).unwrap().len(), 32);
+    // cachekit-rs >= 0.9 takes exactly 32 raw bytes. Any other length must
+    // fail at config load, naming the field the operator has to fix.
+    for bytes in [31, 33] {
+        let err =
+            decode_hex_key(&"ab".repeat(bytes)).expect_err("a key that is not 32 bytes must fail");
+        assert!(err.contains("response_cache.master_key"), "got: {err}");
+    }
     assert!(decode_hex_key("deadbeef").is_err(), "short key must fail");
     assert!(
         decode_hex_key(&"a".repeat(63)).is_err(),
@@ -546,6 +553,45 @@ async fn response_cache_backend_sees_only_ciphertext() {
             .await
             .is_none(),
         "cross-tenant read must not decrypt"
+    );
+}
+
+// LAB-10850: cachekit-rs 0.10 binds the namespaced storage key into the
+// AES-GCM AAD, where 0.5 bound the bare key, and a 0.5 entry under the same
+// namespace fails to authenticate on every read until it expires. An entry a
+// pre-upgrade replica wrote must read as a miss, never as an error.
+#[tokio::test]
+async fn response_cache_pre_upgrade_entry_reads_as_miss() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let key = "b".repeat(64);
+    let entry = CachedResponse {
+        status: 200,
+        content_type: "application/json".into(),
+        body: b"{}".to_vec(),
+    };
+    // Exactly what cachekit-rs 0.5 `SecureCache::set` stored: ciphertext
+    // whose AAD binds the bare key, under `alb-resp:<key>`.
+    let plaintext = cachekit::serializer::serialize(&entry).unwrap();
+    let ciphertext = cachekit::EncryptionLayer::new(&TEST_MASTER_KEY, "geo")
+        .unwrap()
+        .encrypt(&plaintext, &key)
+        .unwrap();
+    backend
+        .store
+        .lock()
+        .unwrap()
+        .insert(format!("alb-resp:{key}"), ciphertext);
+
+    let rc = test_response_cache(backend, &["geo"], 500);
+    assert!(rc
+        .lookup("geo", &key, CacheSurface::Messages)
+        .await
+        .is_none());
+    assert_eq!(rc.misses.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        rc.errors.load(Ordering::Relaxed),
+        0,
+        "a pre-upgrade entry must read as a miss, not an error"
     );
 }
 
@@ -913,6 +959,8 @@ async fn response_cache_config_validation() {
 // AC11 (SaaS, live): full round-trip against the real api.cachekit.io.
 // Requires CACHEKIT_API_KEY with write access; deliberately #[ignore]d so CI
 // stays hermetic — run locally with `cargo test -- --ignored` to exercise.
+// CACHEKIT_API_URL (cachekit's own env name) targets another cachekit host
+// the way `response_cache.api_url` does.
 #[tokio::test]
 #[ignore = "requires CACHEKIT_API_KEY and network access to api.cachekit.io"]
 async fn response_cache_cachekitio_live_round_trip() {
@@ -920,10 +968,11 @@ async fn response_cache_cachekitio_live_round_trip() {
         Ok(k) if !k.is_empty() => k,
         _ => panic!("set CACHEKIT_API_KEY to run this test"),
     };
-    let backend = cachekit::backend::cachekitio::CachekitIO::builder()
-        .api_key(api_key)
-        .build()
-        .unwrap();
+    let mut builder = cachekit::backend::cachekitio::CachekitIO::builder().api_key(api_key);
+    if let Ok(url) = std::env::var("CACHEKIT_API_URL") {
+        builder = builder.api_url(url).allow_custom_host(true);
+    }
+    let backend = builder.build().unwrap();
     let rc = test_response_cache(std::sync::Arc::new(backend), &["live-test"], 5_000);
     let key = response_cache_key(
         "live",

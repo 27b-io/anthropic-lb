@@ -48,7 +48,7 @@ impl CacheSurface {
 /// collision could not decrypt another client's entry. The map doubles as
 /// the opt-in allow-list: no entry, no cache (AC2). All values are
 /// encrypted before any storage layer sees them, in-process L1 included
-/// (verified against cachekit-rs 0.5.0 `SecureCache::set_with_ttl`, which
+/// (verified against cachekit-rs 0.11.1 `SecureCache::set_with_ttl`, which
 /// writes ciphertext to both L1 and the backend).
 pub(crate) struct ResponseCache {
     pub(crate) clients: HashMap<String, cachekit::CacheKit>,
@@ -72,7 +72,8 @@ pub(crate) fn key_digest_prefix(key: &str) -> &str {
     &key[..key.len().min(16)]
 }
 
-/// Decode a hex master key, enforcing the 32-byte SecureCache minimum.
+/// Decode a hex master key. cachekit-rs (>= 0.9) takes exactly 32 raw bytes,
+/// so any other length fails here, at config load, naming the config field.
 fn decode_hex_key(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     if !s.is_ascii() || !s.len().is_multiple_of(2) {
@@ -83,9 +84,9 @@ fn decode_hex_key(s: &str) -> Result<Vec<u8>, String> {
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
         .collect::<Result<Vec<u8>, _>>()
         .map_err(|_| "response_cache.master_key contains non-hex characters".to_string())?;
-    if bytes.len() < 32 {
+    if bytes.len() != 32 {
         return Err(format!(
-            "response_cache.master_key must decode to at least 32 bytes, got {}",
+            "response_cache.master_key must decode to exactly 32 bytes (64 hex chars), got {}",
             bytes.len()
         ));
     }
@@ -159,8 +160,12 @@ pub(crate) fn response_cache_key(
 }
 
 impl ResponseCache {
-    /// Storage-key namespace: entries land as `alb-resp:<digest>`.
-    const NAMESPACE: &'static str = "alb-resp";
+    /// Storage-key namespace: entries land as `alb-resp-v2:<digest>`. `-v2`
+    /// since cachekit-rs 0.10 (LAB-10850), which binds the namespaced key
+    /// into the AES-GCM AAD: an entry 0.5 wrote under `alb-resp` would fail
+    /// to authenticate (an error on every read until it expired) rather than
+    /// miss. A fresh namespace makes every pre-upgrade entry a plain miss.
+    const NAMESPACE: &'static str = "alb-resp-v2";
     pub(crate) const DEFAULT_TTL_SECS: u64 = 3600;
     const DEFAULT_OP_TIMEOUT_MS: u64 = 250;
     /// Per-client in-process L1 entries (ciphertext at rest). Together with
@@ -192,7 +197,7 @@ impl ResponseCache {
                     .build()
                     .map_err(|e| format!("response_cache redis backend: {e}"))?;
                 // fred's connection task detaches when the handle drops.
-                // KNOWN LIMITATION (cachekit-rs 0.5.0, flagged upstream):
+                // KNOWN LIMITATION (cachekit-rs 0.11.1, flagged upstream):
                 // auto-reconnect is pub(crate) and unreachable from this
                 // builder, so after a failed initial connect OR any later
                 // Redis outage the client does NOT recover — every cache op
@@ -329,7 +334,7 @@ impl ResponseCache {
         surface: CacheSurface,
     ) -> Option<CachedResponse> {
         let cache = self.clients.get(client_id)?;
-        let op = async { cache.secure()?.get::<CachedResponse>(key).await };
+        let op = async { cache.secure_cache()?.get::<CachedResponse>(key).await };
         match tokio::time::timeout(self.op_timeout, op).await {
             Ok(Ok(Some(entry))) => {
                 self.hits_for(surface).fetch_add(1, Ordering::Relaxed);
@@ -368,7 +373,7 @@ impl ResponseCache {
         let Some(cache) = self.clients.get(client_id) else {
             return;
         };
-        let op = async { cache.secure()?.set(key, entry).await };
+        let op = async { cache.secure_cache()?.set(key, entry).await };
         match tokio::time::timeout(self.op_timeout, op).await {
             Ok(Ok(())) => {
                 self.stores_for(surface).fetch_add(1, Ordering::Relaxed);
