@@ -1540,7 +1540,7 @@ pub(crate) async fn openai_chat_handler(
             warn!(
                 req_id,
                 client = %client_ip,
-                client_id = %client_id,
+                client_id = ?client_id,
                 error = %e,
                 "rejected: request body is not valid JSON"
             );
@@ -1558,7 +1558,7 @@ pub(crate) async fn openai_chat_handler(
         warn!(
             req_id,
             client = %client_ip,
-            client_id = %client_id,
+            client_id = ?client_id,
             "rejected: request body is not a JSON object"
         );
         return openai_invalid_request_response("request body must be a JSON object");
@@ -1570,7 +1570,7 @@ pub(crate) async fn openai_chat_handler(
         warn!(
             req_id,
             client = %client_ip,
-            client_id = %client_id,
+            client_id = ?client_id,
             "rejected: request body has an ambiguous top-level key"
         );
         return openai_invalid_request_response("request body has an ambiguous top-level key");
@@ -1589,7 +1589,7 @@ pub(crate) async fn openai_chat_handler(
         warn!(
             req_id,
             client = %client_ip,
-            client_id = %client_id,
+            client_id = ?client_id,
             "rejected: model is not a non-empty string"
         );
         return openai_invalid_request_response(MODEL_NOT_A_STRING);

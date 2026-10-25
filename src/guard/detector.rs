@@ -706,7 +706,7 @@ impl Detector {
             self.verdicts.record(client_id, self.name, verdict);
             warn!(
                 req_id,
-                client_id = %client_id,
+                client_id = ?client_id,
                 verdict,
                 findings = findings.len(),
                 detections = %detections_summary(&findings),
@@ -734,9 +734,9 @@ impl Detector {
                 (false, false) => "would-block",
             };
             if enforcing && !self.fail_open {
-                warn!(req_id, client_id = %client_id, verdict, reason = GUARD_UNAVAILABLE, cause = kind.label(), "guard detector");
+                warn!(req_id, client_id = ?client_id, verdict, reason = GUARD_UNAVAILABLE, cause = kind.label(), "guard detector");
             } else {
-                info!(req_id, client_id = %client_id, verdict, reason = GUARD_UNAVAILABLE, cause = kind.label(), "guard detector");
+                info!(req_id, client_id = ?client_id, verdict, reason = GUARD_UNAVAILABLE, cause = kind.label(), "guard detector");
             }
         }
         outcome

@@ -1857,7 +1857,7 @@ pub(crate) async fn proxy_handler(
 
     // Debug: dump all inbound request headers
     if tracing::enabled!(tracing::Level::DEBUG) {
-        debug!(req_id, client_id = %client_id, ver = %client_ver, ">>> inbound request");
+        debug!(req_id, client_id = ?client_id, ver = ?client_ver, ">>> inbound request");
         for (k, v) in parts.headers.iter() {
             debug!(req_id, header = %k, value = debug_header_value(k, v), ">>> req header");
         }
@@ -1899,10 +1899,10 @@ pub(crate) async fn proxy_handler(
             warn!(
                 req_id,
                 client = %client_ip,
-                client_id = %client_id,
+                client_id = ?client_id,
                 path = %parts.uri.path(),
                 header,
-                coding = %coding,
+                coding = ?coding,
                 "rejected: request body has a coding the proxy does not decode"
             );
             return proxy_error_response(
@@ -1930,7 +1930,7 @@ pub(crate) async fn proxy_handler(
             warn!(
                 req_id,
                 client = %client_ip,
-                client_id = %client_id,
+                client_id = ?client_id,
                 path = %parts.uri.path(),
                 error = %e,
                 "rejected: request body could not be parsed as JSON"
@@ -1957,7 +1957,7 @@ pub(crate) async fn proxy_handler(
                 warn!(
                     req_id,
                     client = %client_ip,
-                    client_id = %client_id,
+                    client_id = ?client_id,
                     "rejected: request body is not a JSON object"
                 );
                 return proxy_error_response(
@@ -1974,7 +1974,7 @@ pub(crate) async fn proxy_handler(
                 warn!(
                     req_id,
                     client = %client_ip,
-                    client_id = %client_id,
+                    client_id = ?client_id,
                     "rejected: request body has an ambiguous top-level key"
                 );
                 return proxy_error_response(
@@ -2086,9 +2086,9 @@ pub(crate) async fn proxy_handler(
                     .join("|");
                 debug!(
                     req_id,
-                    client_id = %client_id,
-                    session = %session_id,
-                    agent = %agent_id,
+                    client_id = ?client_id,
+                    session = ?session_id,
+                    agent = ?agent_id,
                     model = ?model,
                     fp = %fp,
                     fps = %fps,
@@ -2230,7 +2230,7 @@ pub(crate) async fn proxy_handler(
             if let Some(entry) = rc.lookup(&client_id, key, surface).await {
                 info!(
                     req_id,
-                    client_id = %client_id,
+                    client_id = ?client_id,
                     key_digest = key_digest_prefix(key),
                     "response cache hit"
                 );
