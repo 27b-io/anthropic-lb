@@ -2164,7 +2164,14 @@ async fn metrics_counts_client_facing_pool_exhaustion() {
     );
 
     // The incident shape: every endpoint gated, nothing transient → 429.
-    let resp = exhaustion_response(&state, false, false);
+    let resp = exhaustion_response(
+        &state,
+        false,
+        false,
+        "metrics-test",
+        "",
+        FastRequest::STANDARD,
+    );
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(
         resp.headers().get("retry-after").is_none(),
@@ -2175,9 +2182,23 @@ async fn metrics_counts_client_facing_pool_exhaustion() {
     assert_eq!(json["error"]["type"], "rate_limit_error");
     assert_eq!(json["error"]["message"], "exhausted all endpoints");
     // A 529 round counts as rate-limited too — same 429 to the caller.
-    let _ = exhaustion_response(&state, true, true);
+    let _ = exhaustion_response(
+        &state,
+        true,
+        true,
+        "metrics-test",
+        "",
+        FastRequest::STANDARD,
+    );
     // Transport-only exhaustion is the other arm → retryable 503.
-    let resp = exhaustion_response(&state, true, false);
+    let resp = exhaustion_response(
+        &state,
+        true,
+        false,
+        "metrics-test",
+        "",
+        FastRequest::STANDARD,
+    );
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         resp.headers().get("retry-after").map(|v| v.as_bytes()),
