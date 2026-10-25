@@ -529,7 +529,7 @@ pub(crate) fn log_proxied(
                 req_id,
                 client = %client_ip,
                 client_id,
-                ver = %client_ver,
+                ver = ?client_ver,
                 agent,
                 session,
                 model,
@@ -572,7 +572,7 @@ pub(crate) fn log_proxied(
                 req_id,
                 client = %client_ip,
                 client_id,
-                ver = %client_ver,
+                ver = ?client_ver,
                 agent,
                 session,
                 model,
@@ -1353,7 +1353,7 @@ impl AppState {
         };
         if let Err(retry_after) = budget {
             self.note_client_rejection(client_id, "budget");
-            warn!(client_id = %client_id, retry_after, "rejected: daily token budget exceeded");
+            warn!(client_id = ?client_id, retry_after, "rejected: daily token budget exceeded");
             let mut resp = proxy_error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
@@ -1368,7 +1368,7 @@ impl AppState {
         if let Err(retry_after) = self.check_utilization_limit(caller, model).await {
             self.note_client_rejection(client_id, "utilization");
             warn!(
-                client_id = %client_id,
+                client_id = ?client_id,
                 retry_after = retry_after,
                 "rejected: utilization limit exceeded"
             );
@@ -1386,7 +1386,7 @@ impl AppState {
         if self.is_emergency_brake_active().await {
             self.note_client_rejection(client_id, "brake");
             warn!(
-                client_id = %client_id,
+                client_id = ?client_id,
                 "rejected: emergency brake active"
             );
             // No `retry-after`: the brake is the same condition as
@@ -1430,7 +1430,7 @@ pub(crate) fn deny_admin_reader(req_id: &str, caller: &Caller) -> Option<Box<Res
     }
     warn!(
         req_id,
-        client_id = %caller.name(),
+        client_id = ?caller.name(),
         "rejected: read-only principal has no proxy authority"
     );
     Some(Box::new(proxy_error_response(

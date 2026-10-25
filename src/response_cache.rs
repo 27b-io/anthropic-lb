@@ -878,7 +878,7 @@ impl AppState {
             Some(p) if p.role == Role::Client => {
                 warn!(
                     client = %client_ip,
-                    client_id = %p.name,
+                    client_id = ?p.name,
                     route,
                     "rejected: admin surface requires an operator or read-only principal"
                 );
@@ -993,7 +993,7 @@ impl AppState {
             if policy == guard::GuardPolicy::Block {
                 warn!(
                     req_id,
-                    client_id = %client_id,
+                    client_id = ?client_id,
                     verdict = "block",
                     reason,
                     "guard: unscannable request"
@@ -1002,7 +1002,7 @@ impl AppState {
             }
             info!(
                 req_id,
-                client_id = %client_id,
+                client_id = ?client_id,
                 verdict = "would-block",
                 reason,
                 "guard: unscannable request"
@@ -1070,7 +1070,7 @@ impl AppState {
     ) {
         warn!(
             req_id,
-            client_id = %client_id,
+            client_id = ?client_id,
             verdict,
             findings = findings.len(),
             truncated,
@@ -1133,13 +1133,13 @@ impl AppState {
         };
         if first_time {
             warn!(
-                client_id = %client_id,
+                client_id = ?client_id,
                 model = ?model,
                 "rejected: model not in client allow-list"
             );
         } else {
             debug!(
-                client_id = %client_id,
+                client_id = ?client_id,
                 model = ?model,
                 "rejected: model not in client allow-list"
             );

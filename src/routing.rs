@@ -1560,7 +1560,7 @@ impl AppState {
         if !first_seen.is_empty() {
             warn!(
                 client_id,
-                flags = %first_seen.join(","),
+                flags = ?first_seen.join(","),
                 "dropped client anthropic-beta flags not on the allow-list \
                  (a configured allowed_client_betas REPLACES the default list — \
                  include the defaults plus the flags to permit)"
@@ -1577,7 +1577,7 @@ impl AppState {
         if !repeats.is_empty() {
             debug!(
                 client_id,
-                flags = %repeats.join(","),
+                flags = ?repeats.join(","),
                 "dropped client anthropic-beta flags (previously reported)"
             );
         }
@@ -1636,8 +1636,9 @@ impl AppState {
         }
         drop(map);
         if !first_seen.is_empty() {
-            // `dropped` is sanitized here too: it is logged raw by the sibling
-            // only because a header token cannot carry a newline.
+            // `dropped` is sanitized here too. The sibling logs it unsanitized
+            // but Debug-quoted (`?`): a header value cannot carry a newline,
+            // but a comma-split flag can carry a space, `=` or `"`.
             let context: Vec<String> = dropped
                 .iter()
                 .take(MAX_STRIPPED_FIELDS_PER_REQUEST)

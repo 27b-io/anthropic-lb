@@ -680,7 +680,7 @@ async fn proxy_rejects_unparseable_body_with_envelope_400() {
     let log = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
     let warns = log
         .lines()
-        .filter(|l| l.contains("client_id=unparseable-envelope"))
+        .filter(|l| l.contains(r#"client_id="unparseable-envelope""#))
         .filter(|l| l.contains("rejected: request body could not be parsed as JSON"))
         .filter(|l| l.contains("path=/v1/messages"))
         .count();

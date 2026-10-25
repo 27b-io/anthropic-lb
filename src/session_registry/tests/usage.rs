@@ -437,6 +437,121 @@ async fn proxied_line_still_logged_on_openai_compat_upstream_error() {
     );
 }
 
+// ── LAB-11037: a header-fed log field cannot forge another field ──
+
+/// `(key, raw value)` for each field a logfmt reader sees on `line`: tokens
+/// split on spaces outside a quoted value, and a value in `"…"` runs to the
+/// next unescaped `"`. Tokens without `=` (the message words) are skipped.
+fn logfmt_fields(line: &str) -> Vec<(&str, &str)> {
+    let mut fields = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, c) in line.char_indices().chain([(line.len(), ' ')]) {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ' ' if !quoted => {
+                if let Some(field) = line[start..i].split_once('=') {
+                    fields.push(field);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    fields
+}
+
+/// In legacy mode `client_id` is the caller's own `x-client-id`, and `ver`,
+/// `agent` and `session` come from request headers in every mode. A value
+/// carrying ` client_id=` or a `"` must stay inside its own quoted field, on
+/// the `proxied` line and on a rejection line of both surfaces. Otherwise a
+/// last-field-wins logfmt reader attributes the line to the forged identity.
+#[tokio::test]
+async fn header_fed_log_fields_cannot_forge_another_field() {
+    let buf = log_capture_buf();
+    let upstream = format!(
+        "http://{}",
+        serve(Router::new().fallback(any(mock_anthropic_handler))).await
+    );
+    let native = serve(test_app(&upstream, None).0).await;
+    let openai = serve(test_openai_app(&upstream, None).0).await;
+    let ok_body = r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#;
+    let client = reqwest::Client::new();
+
+    for (addr, path, proxied, rejected) in [
+        (
+            native,
+            "/v1/messages",
+            "proxied",
+            "rejected: request body could not be parsed as JSON",
+        ),
+        (
+            openai,
+            "/v1/chat/completions",
+            "proxied (openai-compat)",
+            "rejected: request body is not valid JSON",
+        ),
+    ] {
+        for (body, message, status) in [(ok_body, proxied, 200), ("{not json", rejected, 400)] {
+            let marker = format!("lab11037{}-{status}", path.replace('/', "-"));
+            let client_id = format!("{marker} client_id=forged");
+            let resp = client
+                .post(format!("http://{addr}{path}"))
+                .header("content-type", "application/json")
+                .header("x-api-key", "any")
+                .header("x-client-id", &client_id)
+                .header("user-agent", r#"claude-cli/"ver=forged"#)
+                .header("x-agent-id", "a agent=forged")
+                .header("x-session-id", "s session=forged")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), status, "{marker}");
+
+            let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            let lines: Vec<&str> = output
+                .lines()
+                .filter(|l| l.contains(&marker) && l.contains(message))
+                .collect();
+            assert_eq!(
+                lines.len(),
+                1,
+                "one `{message}` line for {marker}:\n{output}"
+            );
+            let fields = logfmt_fields(lines[0]);
+            let values = |key: &str| -> Vec<&str> {
+                fields
+                    .iter()
+                    .filter(|(k, _)| *k == key)
+                    .map(|(_, v)| *v)
+                    .collect()
+            };
+            assert_eq!(
+                values("client_id"),
+                [format!("{client_id:?}")],
+                "one quoted client_id on: {}",
+                lines[0]
+            );
+            if status == 200 {
+                for (key, sent) in [
+                    ("ver", r#""ver=forged"#),
+                    ("agent", "a agent=forged"),
+                    ("session", "s session=forged"),
+                ] {
+                    assert_eq!(
+                        values(key),
+                        [format!("{sent:?}")],
+                        "one quoted {key} on: {}",
+                        lines[0]
+                    );
+                }
+            }
+        }
+    }
+}
+
 // ── LAB-9228: the upstream's reason for a 4xx, on the proxied line ──
 
 /// The `proxied` line for one native `/v1/messages` request tagged `marker`,

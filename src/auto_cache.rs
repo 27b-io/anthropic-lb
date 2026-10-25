@@ -159,20 +159,20 @@ pub(crate) fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         for (i, tool) in tools.iter().enumerate() {
             if let Some(cc) = tool.get("cache_control") {
-                debug!(req_id, location = format_args!("tools[{i}]"), cache_control = %cc, "body cache_control");
+                debug!(req_id, location = format_args!("tools[{i}]"), cache_control = ?cc.to_string(), "body cache_control");
                 count += 1;
             }
         }
     }
     if let Some(system) = body.get("system") {
         if let Some(cc) = system.get("cache_control") {
-            debug!(req_id, location = "system", cache_control = %cc, "body cache_control");
+            debug!(req_id, location = "system", cache_control = ?cc.to_string(), "body cache_control");
             count += 1;
         }
         if let Some(arr) = system.as_array() {
             for (i, block) in arr.iter().enumerate() {
                 if let Some(cc) = block.get("cache_control") {
-                    debug!(req_id, location = format_args!("system[{i}]"), cache_control = %cc, "body cache_control");
+                    debug!(req_id, location = format_args!("system[{i}]"), cache_control = ?cc.to_string(), "body cache_control");
                     count += 1;
                 }
             }
@@ -182,7 +182,7 @@ pub(crate) fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
         for (i, msg) in messages.iter().enumerate() {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("-");
             if let Some(cc) = msg.get("cache_control") {
-                debug!(req_id, location = format_args!("messages[{i}]"), role, cache_control = %cc, "body cache_control");
+                debug!(req_id, location = format_args!("messages[{i}]"), role, cache_control = ?cc.to_string(), "body cache_control");
                 count += 1;
             }
             if let Some(content) = msg.get("content") {
@@ -193,7 +193,7 @@ pub(crate) fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
                                 req_id,
                                 location = format_args!("messages[{i}].content[{j}]"),
                                 role,
-                                cache_control = %cc,
+                                cache_control = ?cc.to_string(),
                                 "body cache_control"
                             );
                             count += 1;

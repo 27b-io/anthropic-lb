@@ -602,7 +602,7 @@ pub(crate) fn strip_orphaned_beta_body_fields(
         }
         if !known {
             debug!(
-                flag = %flag,
+                flag = ?flag,
                 "beta body coherence: surviving flag is not in BETA_BODY_FIELDS, \
                  forwarding the body untouched rather than risk deleting a field \
                  it owns"
@@ -1166,7 +1166,7 @@ pub(crate) fn translate_reasoning_effort(value: &serde_json::Value) -> Option<&s
     let effort = value.as_str().filter(|e| EFFORTS.contains(e));
     if effort.is_none() {
         warn!(
-            reasoning_effort = %truncate_label(&value.to_string()),
+            reasoning_effort = ?truncate_label(&value.to_string()),
             "dropping `reasoning_effort`: no Anthropic effort equivalent"
         );
     }
