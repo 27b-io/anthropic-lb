@@ -674,7 +674,7 @@ pub(crate) fn exhaustion_response(
             // Quoted, not Display: both are client input (a legacy caller
             // asserts its own `x-client-id`), and quoting stops a space in
             // either from forging another field on the line. `model` is body
-            // text, so it takes `GoQuoted` (see `log_proxied`).
+            // text, so it takes `GoQuoted` (see its rule).
             client_id = ?client_id,
             model = %GoQuoted(&truncate_label(model)),
             "all endpoints transient-failed after backoff; returning retryable 503"

@@ -442,10 +442,12 @@ async fn proxied_line_still_logged_on_openai_compat_upstream_error() {
 /// `(name, value)` for each field VictoriaLogs' `unpack_logfmt` reads from
 /// `line`, ported from its `logfmtParser.parse` and `tryUnquoteString`: a
 /// value that opens with `"` and is a Go quoted prefix is unquoted, and any
-/// other value runs unquoted to the next space. A word with no `=` (the
-/// message) is skipped: that reader stores it as a field with an empty value,
-/// which it treats as absent, so the `model` in "model unsupported on account"
-/// is not a `model` field. A value opening with `'` or a backtick is not
+/// other value runs unquoted to the next space. A word with no `=` is a field
+/// with an empty value, as that reader stores it, so a bare `client_id` after
+/// the real one blanks it under last-wins. Only the words before the first
+/// `=` (the message) are skipped: anything they set, a later field overrides,
+/// and skipping them keeps the `model` in "model unsupported on account" out
+/// of the `model` values. A value opening with `'` or a backtick is not
 /// modelled and panics. With `strict`, a value that opens with `"` but that
 /// Go cannot unquote panics too, instead of being read the way that reader
 /// reads it: a test of our own lines must fail there, not mis-tokenise.
@@ -457,13 +459,17 @@ fn unpack_logfmt(line: &str, strict: bool) -> Vec<(String, String)> {
             fields.push((name.to_owned(), value.to_owned()));
         }
     };
-    let mut s = line;
+    let (mut s, mut past_message) = (line, false);
     while let Some(n) = s.find(['=', ' ']) {
         let (name, separator) = (&s[..n], s.as_bytes()[n]);
         s = &s[n + 1..];
         if separator == b' ' {
+            if past_message {
+                add(name, "");
+            }
             continue;
         }
+        past_message = true;
         assert!(
             !s.starts_with(['\'', '`']),
             "unmodelled quote after {name}= in: {line}"
@@ -492,6 +498,9 @@ fn unpack_logfmt(line: &str, strict: bool) -> Vec<(String, String)> {
                 return fields;
             }
         }
+    }
+    if past_message {
+        add(s, "");
     }
     fields
 }
@@ -522,6 +531,13 @@ fn unpack_logfmt_reads_a_debug_escape_as_that_reader_does() {
     assert_eq!(field_values(&fields, "status"), ["404"]);
     let strict = std::panic::catch_unwind(|| unpack_logfmt(line, true));
     assert!(strict.is_err(), "strict must refuse a quote Go cannot read");
+
+    // A bare word after the message is an empty field, which blanks the
+    // earlier `client_id` under last-wins.
+    let line = r#"INFO proxied client_id="t" model="m" status=200 client_id"#;
+    let fields = unpack_logfmt(line, true);
+    assert_eq!(field_values(&fields, "client_id"), ["t", ""]);
+    assert_eq!(field_values(&fields, "proxied"), Vec::<&str>::new());
 
     let line = r#"proxied model="claude-x\u0001 client_id=forged \"q\" \\" account="a""#;
     let fields = unpack_logfmt(line, true);
@@ -674,10 +690,8 @@ async fn body_fed_log_fields_cannot_forge_another_field() {
                 lines.iter().any(|l| l.contains("proxied")),
                 "a proxied line for {marker}:\n{output}"
             );
-            // `err` on the `proxied` line has its control characters flattened
-            // to spaces; `error_message` carries the upstream text as is.
-            let upstream_message = format!("model: {model}");
-            let err = upstream_message.replace(|c: char| c.is_control(), " ");
+            // `err` on the `proxied` line and `error_message` carry it as sent.
+            let err = format!("model: {model}");
             for line in lines {
                 let fields = unpack_logfmt(line, true);
                 let client_ids = field_values(&fields, "client_id");
@@ -688,7 +702,7 @@ async fn body_fed_log_fields_cannot_forge_another_field() {
                 for (key, sent) in [
                     ("model", model.as_str()),
                     ("err", err.as_str()),
-                    ("error_message", upstream_message.as_str()),
+                    ("error_message", err.as_str()),
                 ] {
                     let values = field_values(&fields, key);
                     assert!(
@@ -881,9 +895,9 @@ async fn proxied_line_names_nothing_for_a_non_envelope_4xx() {
     );
 }
 
-/// `err` is one line and at most 200 characters: control characters become
-/// spaces, and a longer message keeps 199 characters plus a trailing `…`. The
-/// formatter escapes the quotes.
+/// `err` is one line and at most 200 characters: a longer message keeps 199
+/// characters plus a trailing `…`, and `GoQuoted` escapes its quotes, newlines
+/// and returns, so the line stays whole and the value reads back as kept.
 #[tokio::test]
 async fn proxied_line_err_is_bounded_and_one_line() {
     // 6 characters, 100 times: 600, with a quote, a newline and a return.
@@ -895,12 +909,14 @@ async fn proxied_line_err_is_bounded_and_one_line() {
     )
     .await;
     // 33 × 6 + 1 = 199 characters kept, then the cut mark.
-    let expected = format!("{}q…", "q\"n r ".repeat(33));
+    let expected = format!("{}q…", "q\"n\nr\r".repeat(33));
     assert_eq!(expected.chars().count(), 200);
     assert!(
-        line.contains(r#"err="q\"n r q\"n r "#) && line.contains(&format!("err={expected:?} ")),
-        "err should be the flattened 199-character prefix plus …, got: {line}"
+        line.contains(r#"err="q\"n\nr\rq\"n\nr\r"#),
+        "err should be escaped, got: {line}"
     );
+    let fields = unpack_logfmt(&line, true);
+    assert_eq!(field_values(&fields, "err"), [expected.as_str()], "{line}");
 }
 
 /// The line a rotated rejection writes (here a 404 for a model the account

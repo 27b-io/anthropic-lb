@@ -238,41 +238,30 @@ pub(crate) fn escape_sentinel(label: &str, stems: &[&str]) -> String {
 }
 
 /// Longest value `GoQuoted` writes, in characters, before its `…`. Escaped,
-/// that is about 6 KiB at most, so even the `proxied` line's three such fields
-/// stay well inside the log sink's 32 KiB line cut, which would otherwise end
-/// the line inside an open quote.
+/// that is 10 KiB at most (an escape above U+FFFF is 10 bytes), so even the
+/// `proxied` line's three such fields stay well inside the log sink's 32 KiB
+/// line cut, which would otherwise end the line inside an open quote.
 pub(crate) const MAX_LOGGED_VALUE_CHARS: usize = 1024;
 
-/// A log field value that can hold any Unicode (text from a request body, a
-/// URI path or an upstream), logged as `field = %GoQuoted(s)`. It is written in
-/// double quotes with `"`, `\`, every control character (C0, DEL, C1) and the
-/// invisible format characters escaped as `\n`, `\t`, `\r` or `\uXXXX`, which
-/// Go's `strconv.Unquote` and a JSON decoder both read back. `?` is not enough
-/// for such text: Debug writes `\u{1}`, `\u{ad}` or `\0`, which Go rejects, and
-/// a logfmt reader that unquotes with Go's `strconv` then reads the value
-/// unquoted up to the next space, so a ` client_id=x` inside it parses as a
-/// second field. Any other character is written as is, so printable ASCII
-/// prints the same bytes as `?`. A value longer than `MAX_LOGGED_VALUE_CHARS`
-/// is cut there and marked with `…`.
+/// A log field value from the request body, the URI or an upstream, which can
+/// hold any Unicode, logged as `field = %GoQuoted(s)`. It is written in double
+/// quotes, and every character Debug would escape is escaped in a form Go's
+/// `strconv.Unquote` reads back: `\"`, `\\`, `\n`, `\r`, `\t`, `\uXXXX`, or
+/// `\UXXXXXXXX` above U+FFFF. That covers control, format and other
+/// non-printable characters (bidi controls, the U+E0000 tag block) and
+/// combining marks. Debug's own `\u{1}`, `\0` forms are not Go syntax: a
+/// logfmt reader that unquotes with Go's `strconv` rejects them and reads the
+/// value unquoted up to the next space, so a ` client_id=x` inside it parses as
+/// a second field. Every other character, `'` included, is written as is, so
+/// printable ASCII prints the same bytes as Debug. A value longer than
+/// `MAX_LOGGED_VALUE_CHARS` is cut there and marked with `…`.
+///
+/// The rule for every log field: a value from the request body, the URI or an
+/// upstream is `%GoQuoted(..)`, never `?`, bare or `%`. A request header value
+/// may use Debug (`?` or a bare `&str`), because `HeaderValue::to_str` admits
+/// only visible ASCII and tab. The message is written unquoted, so no caller-
+/// or upstream-fed text is interpolated into it.
 pub(crate) struct GoQuoted<'a>(pub(crate) &'a str);
-
-/// Format characters a viewer renders as nothing or that reorder the text
-/// around them: soft hyphen, zero-width and bidi controls, line and paragraph
-/// separators, the BOM. Debug escaped these, so `GoQuoted` does too. All are
-/// in the BMP, so one `\uXXXX` escape covers each.
-fn is_invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{ad}'
-            | '\u{61c}'
-            | '\u{180e}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{2028}'..='\u{202e}'
-            | '\u{2060}'..='\u{206f}'
-            | '\u{feff}'
-            | '\u{fff9}'..='\u{fffb}'
-    )
-}
 
 impl std::fmt::Display for GoQuoted<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -286,9 +275,11 @@ impl std::fmt::Display for GoQuoted<'_> {
                 '\n' => f.write_str(r"\n")?,
                 '\r' => f.write_str(r"\r")?,
                 '\t' => f.write_str(r"\t")?,
-                c if c.is_control() || is_invisible(c) => {
-                    write!(f, r"\u{:04x}", u32::from(c))?;
-                }
+                '\'' => f.write_char(c)?,
+                c if c.escape_debug().len() > 1 => match u32::from(c) {
+                    v @ ..=0xffff => write!(f, r"\u{v:04x}")?,
+                    v => write!(f, r"\U{v:08x}")?,
+                },
                 c => f.write_char(c)?,
             }
         }

@@ -1638,7 +1638,7 @@ impl AppState {
         if !first_seen.is_empty() {
             // `dropped` is sanitized here too. The sibling logs it unsanitized
             // but Debug-quoted (`?`), the rule for a header value (see
-            // `log_proxied`): a comma-split flag can carry a space, `=` or `"`.
+            // `GoQuoted`): a comma-split flag can carry a space, `=` or `"`.
             let context: Vec<String> = dropped
                 .iter()
                 .take(MAX_STRIPPED_FIELDS_PER_REQUEST)

@@ -1365,44 +1365,30 @@ pub(crate) fn detector_cfg(url: &str) -> guard::detector::DetectorConfig {
 
 // ── LAB-11064: Go strconv unquoting, to read back a logged value ──
 
-/// One Go string escape, `rest` being the bytes after its `\`: the bytes it
-/// stands for and how many bytes of `rest` it spans, or `None` where Go's
-/// `strconv.UnquoteChar` (quote `"`) fails. So Rust Debug's `\u{1}` and `\0`
-/// are `None`, as is `\'`.
-pub(crate) fn go_escape(rest: &[u8]) -> Option<(Vec<u8>, usize)> {
+/// One Go string escape, `rest` being the bytes after its `\`: the character
+/// it stands for and how many bytes of `rest` it spans. Only the escapes a
+/// logged value carries are read (`\n`, `\r`, `\t`, `\\`, `\"`, `\uXXXX`,
+/// `\UXXXXXXXX` naming a scalar value); any other is `None`. Go refuses Rust
+/// Debug's `\u{1}`, `\0` and `\'` too, and for the rest Go defines, `None`
+/// keeps the helper stricter than Go, never looser.
+fn go_escape(rest: &[u8]) -> Option<(char, usize)> {
     // `from_str_radix` alone would also take a leading `+`.
     let hex = |n: usize| {
         let digits = std::str::from_utf8(rest.get(1..=n)?).ok()?;
         if !digits.bytes().all(|d| d.is_ascii_hexdigit()) {
             return None;
         }
-        u32::from_str_radix(digits, 16).ok()
+        let c = char::from_u32(u32::from_str_radix(digits, 16).ok()?)?;
+        Some((c, n + 1))
     };
-    let rune = |v: u32| char::from_u32(v).map(|c| c.to_string().into_bytes());
-    let byte = |b: u8| Some((vec![b], 1));
     match *rest.first()? {
-        b'a' => byte(0x07),
-        b'b' => byte(0x08),
-        b'f' => byte(0x0c),
-        b'n' => byte(b'\n'),
-        b'r' => byte(b'\r'),
-        b't' => byte(b'\t'),
-        b'v' => byte(0x0b),
-        b'\\' => byte(b'\\'),
-        b'"' => byte(b'"'),
-        b'x' => Some((vec![u8::try_from(hex(2)?).ok()?], 3)),
-        b'u' => Some((rune(hex(4)?)?, 5)),
-        b'U' => Some((rune(hex(8)?)?, 9)),
-        d @ b'0'..=b'7' => {
-            let tail = rest.get(1..3)?;
-            if !tail.iter().all(|o| (b'0'..=b'7').contains(o)) {
-                return None;
-            }
-            let v = [d, tail[0], tail[1]]
-                .iter()
-                .fold(0u32, |v, o| (v << 3) | u32::from(o - b'0'));
-            Some((vec![u8::try_from(v).ok()?], 3))
-        }
+        b'n' => Some(('\n', 1)),
+        b'r' => Some(('\r', 1)),
+        b't' => Some(('\t', 1)),
+        b'\\' => Some(('\\', 1)),
+        b'"' => Some(('"', 1)),
+        b'u' => hex(4),
+        b'U' => hex(8),
         _ => None,
     }
 }
@@ -1419,8 +1405,8 @@ pub(crate) fn go_quoted_prefix(s: &str) -> Option<(String, usize)> {
             b'"' => return Some((String::from_utf8_lossy(&out).into_owned(), i + 1)),
             b'\n' => return None,
             b'\\' => {
-                let (bytes, len) = go_escape(&b[i + 1..])?;
-                out.extend(bytes);
+                let (c, len) = go_escape(&b[i + 1..])?;
+                out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
                 i += 1 + len;
             }
             c => {
