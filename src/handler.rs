@@ -651,14 +651,30 @@ pub(crate) fn round_backoff_delay(retry_round: u32, last_saw_529: bool) -> Durat
 /// round that also saw a 529) stays `429` with NO `Retry-After`: recovery there
 /// is on the order of minutes/hours, so a short retry hint would tight-loop the
 /// client into a still-exhausted pool.
+///
+/// When an account that answered reported `model` not found, the 429's message
+/// says so. Status, type and headers do not change: the accounts that were
+/// only cooling were never asked and may serve the model (`pool_cannot_serve`
+/// decides the 404). The bare "exhausted all endpoints" sent callers and
+/// operators chasing capacity when the cause was a model id the accounts that
+/// answered did not know. Both log lines
+/// carry `client_id` and `model`, so an exhaustion is attributable without
+/// correlating timestamps against `proxied` lines.
 pub(crate) fn exhaustion_response(
     state: &AppState,
     last_saw_transient: bool,
     last_saw_529: bool,
+    client_id: &str,
+    model: &str,
 ) -> Response {
     if last_saw_transient && !last_saw_529 {
         state.pool_exhausted[PoolExhaustion::Transient as usize].fetch_add(1, Ordering::Relaxed);
-        warn!("all endpoints transient-failed after backoff; returning retryable 503");
+        warn!(
+            client_id = %client_id,
+            // Debug, not Display: the model is client input.
+            model = ?truncate_label(model),
+            "all endpoints transient-failed after backoff; returning retryable 503"
+        );
         let mut resp = proxy_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "overloaded_error",
@@ -669,12 +685,23 @@ pub(crate) fn exhaustion_response(
         return resp;
     }
     state.pool_exhausted[PoolExhaustion::RateLimited as usize].fetch_add(1, Ordering::Relaxed);
-    warn!("all endpoints exhausted (rate-limited)");
-    proxy_error_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        "rate_limit_error",
-        "exhausted all endpoints",
-    )
+    warn!(
+        client_id = %client_id,
+        model = ?truncate_label(model),
+        "all endpoints exhausted (rate-limited)"
+    );
+    // The model is the caller's own, and a negative-cache hit bounds it to
+    // UNSUPPORTED_MODEL_MAX_BYTES. No account names or counts: those are pool
+    // internals.
+    let message = if state.model_rejected_somewhere(model) {
+        format!(
+            "exhausted all endpoints: accounts that answered report model {model} not found; \
+             the rest are rate-limited or unavailable"
+        )
+    } else {
+        "exhausted all endpoints".to_owned()
+    };
+    proxy_error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &message)
 }
 
 /// Synthesized model-unsupported 404 for the warm negative-cache path: every
@@ -2459,7 +2486,7 @@ pub(crate) async fn proxy_handler(
             return model_unsupported_response(&model, false);
         }
     }
-    exhaustion_response(&state, last_saw_transient, last_saw_529)
+    exhaustion_response(&state, last_saw_transient, last_saw_529, &client_id, &model)
     }
     .await;
 

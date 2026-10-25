@@ -1876,6 +1876,18 @@ impl AppState {
         eligible > 0
     }
 
+    /// True when SOME endpoint whose config allows `model` carries a live
+    /// unsupported-model entry for it: an account that answered said the
+    /// model does not exist. The weak twin of `pool_cannot_serve` — that one
+    /// decides the status, this one only lets `exhaustion_response` name the
+    /// rejection in its retryable 429, so a bad model id does not read as a
+    /// capacity problem.
+    pub(crate) fn model_rejected_somewhere(&self, model: &str) -> bool {
+        self.unsupported_endpoints_for(model)
+            .into_iter()
+            .any(|i| self.endpoints[i].serves_model(model))
+    }
+
     /// Record that `endpoint_idx`'s org has fast mode disabled — the upstream
     /// itself said so (LAB-2687). Fast requests skip it for FAST_MODE_DISABLED_TTL.
     pub(crate) fn note_fast_mode_disabled(&self, endpoint_name: &str, endpoint_idx: usize) {
