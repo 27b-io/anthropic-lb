@@ -671,8 +671,10 @@ pub(crate) fn exhaustion_response(
     if last_saw_transient && !last_saw_529 {
         state.pool_exhausted[PoolExhaustion::Transient as usize].fetch_add(1, Ordering::Relaxed);
         warn!(
-            client_id = %client_id,
-            // Debug, not Display: the model is client input.
+            // Debug, not Display: both are client input (a legacy caller
+            // asserts its own `x-client-id`), and quoting stops a space in
+            // either from forging another field on the line.
+            client_id = ?client_id,
             model = ?truncate_label(model),
             "all endpoints transient-failed after backoff; returning retryable 503"
         );
@@ -687,7 +689,7 @@ pub(crate) fn exhaustion_response(
     }
     state.pool_exhausted[PoolExhaustion::RateLimited as usize].fetch_add(1, Ordering::Relaxed);
     warn!(
-        client_id = %client_id,
+        client_id = ?client_id,
         model = ?truncate_label(model),
         "all endpoints exhausted (rate-limited)"
     );

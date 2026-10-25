@@ -1039,7 +1039,9 @@ async fn rejected_plus_rate_limited_pool() -> SocketAddr {
 
 /// Status, type and headers are today's exhaustion 429; only the message
 /// changes. The rate-limited WARN for this request carries its client and
-/// model.
+/// model, the client quoted: callers pass a self-asserted `x-client-id` that
+/// tries to forge a second `client_id=` field, which must stay inside the one
+/// quoted value.
 async fn assert_exhaustion_names_model(resp: reqwest::Response, client_id: &str) {
     assert_eq!(
         resp.status(),
@@ -1069,7 +1071,7 @@ async fn assert_exhaustion_names_model(resp: reqwest::Response, client_id: &str)
         output
             .lines()
             .any(|l| l.contains("all endpoints exhausted (rate-limited)")
-                && l.contains(&format!("client_id={client_id}"))
+                && l.contains(&format!("client_id={client_id:?}"))
                 && l.contains(r#"model="claude-nope-1""#)),
         "the exhaustion WARN must carry client_id and model, got:\n{output}"
     );
@@ -1082,14 +1084,14 @@ async fn exhaustion_after_model_rejection_names_model_native() {
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .header("content-type", "application/json")
-        .header("x-client-id", "exhaustion-msg-native")
+        .header("x-client-id", "exhaustion-msg-native client_id=forged-native")
         .body(
             r#"{"model":"claude-nope-1","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
         )
         .send()
         .await
         .unwrap();
-    assert_exhaustion_names_model(resp, "exhaustion-msg-native").await;
+    assert_exhaustion_names_model(resp, "exhaustion-msg-native client_id=forged-native").await;
 }
 
 #[tokio::test]
@@ -1099,12 +1101,15 @@ async fn exhaustion_after_model_rejection_names_model_openai_handler() {
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .header("content-type", "application/json")
-        .header("x-client-id", "exhaustion-msg-openai")
+        .header(
+            "x-client-id",
+            "exhaustion-msg-openai client_id=forged-openai",
+        )
         .body(r#"{"model":"claude-nope-1","messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
         .unwrap();
-    assert_exhaustion_names_model(resp, "exhaustion-msg-openai").await;
+    assert_exhaustion_names_model(resp, "exhaustion-msg-openai client_id=forged-openai").await;
 }
 
 /// The message stays bare unless an endpoint eligible for THIS request has
@@ -1160,7 +1165,8 @@ async fn exhaustion_message_stays_bare_without_an_eligible_rejection() {
     );
 }
 
-/// The transient 503's WARN carries the client and model too.
+/// The transient 503's WARN carries the client and model too, the client
+/// quoted so a forged field stays inside its value.
 #[test]
 fn transient_exhaustion_log_carries_client_and_model() {
     let buf = log_capture_buf();
@@ -1169,7 +1175,7 @@ fn transient_exhaustion_log_carries_client_and_model() {
         &state,
         true,
         false,
-        "exhaustion-log-503",
+        "exhaustion-log-503 client_id=forged-503",
         "claude-x-1",
         FastRequest::STANDARD,
     );
@@ -1178,7 +1184,7 @@ fn transient_exhaustion_log_carries_client_and_model() {
     assert!(
         output.lines().any(
             |l| l.contains("all endpoints transient-failed after backoff")
-                && l.contains("client_id=exhaustion-log-503")
+                && l.contains(r#"client_id="exhaustion-log-503 client_id=forged-503""#)
                 && l.contains(r#"model="claude-x-1""#)
         ),
         "the transient WARN must carry client_id and model, got:\n{output}"
