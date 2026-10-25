@@ -84,7 +84,10 @@ pub(crate) fn context_window_for(model: &str, has_1m_beta: bool) -> u64 {
             lock_recovering(WARNED.get_or_init(Default::default), "unknown_model_warned");
         // Bounded like the client maps: model is client-controlled input.
         if warned.len() < MAX_COUNTED_MODELS && warned.insert(model.to_string()) {
-            warn!(model, "unknown model family, assuming 200k context window");
+            warn!(
+                model = %GoQuoted(model),
+                "unknown model family, assuming 200k context window"
+            );
         }
     }
     DEFAULT_CONTEXT_WINDOW
@@ -208,7 +211,7 @@ impl AppState {
             .unwrap_or((None, None));
         warn!(
             req_id,
-            model,
+            model = %GoQuoted(model),
             session = affinity_key.map(session_label).as_deref().unwrap_or("-"),
             observed_tokens = observed,
             max_tokens = max,
@@ -224,7 +227,7 @@ impl AppState {
         count_by_model(&self.speed_unsupported, "speed_unsupported", model);
         warn!(
             req_id,
-            model = ?model,
+            model = %GoQuoted(model),
             "model does not support `speed`: re-sending without it to the same account"
         );
     }
@@ -355,7 +358,7 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
     info!(
         req_id,
         client_id,
-        model,
+        model = %GoQuoted(model),
         account,
         input = usage.input_tokens,
         output = usage.output_tokens,
@@ -493,8 +496,11 @@ impl UpstreamError {
 /// response, client disconnect, upstream failure) — still exactly one line,
 /// still carrying req_id/account/status (AC4), so no separate branch is
 /// needed for the no-usage case. `err_type` / `err` are `"-"` unless the
-/// upstream named its reason for a 4xx; they are logged as plain `&str`
-/// fields, so the formatter escapes the upstream text. Never use `%` on them.
+/// upstream named its reason for a 4xx. A caller- or upstream-fed string is
+/// always quoted: a header value, which holds only visible ASCII and tab, with
+/// Debug (a bare `&str` or `?`), and any other text (`model`, `err_type`,
+/// `err`) with `%GoQuoted(..)`, because Debug's `\u{..}` escapes break a
+/// logfmt reader that unquotes with Go's `strconv`. Never a bare `%`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn log_proxied(
     req_id: &str,
@@ -532,11 +538,11 @@ pub(crate) fn log_proxied(
                 ver = ?client_ver,
                 agent,
                 session,
-                model,
+                model = %GoQuoted(model),
                 account,
                 status = status_code,
-                err_type,
-                err,
+                err_type = %GoQuoted(err_type),
+                err = %GoQuoted(err),
                 utilization = %utilization,
                 util_5h = %util_5h,
                 util_7d = %util_7d,
@@ -575,11 +581,11 @@ pub(crate) fn log_proxied(
                 ver = ?client_ver,
                 agent,
                 session,
-                model,
+                model = %GoQuoted(model),
                 account,
                 status = status_code,
-                err_type,
-                err,
+                err_type = %GoQuoted(err_type),
+                err = %GoQuoted(err),
                 utilization = %utilization,
                 util_5h = %util_5h,
                 util_7d = %util_7d,
@@ -680,7 +686,7 @@ pub(crate) async fn finalize_stream(
         warn!(
             req_id,
             client_id,
-            model,
+            model = %GoQuoted(model),
             account = acct_name,
             status = status_code,
             reason,
@@ -696,7 +702,7 @@ pub(crate) async fn finalize_stream(
         warn!(
             req_id,
             client_id,
-            model,
+            model = %GoQuoted(model),
             account = acct_name,
             status = status_code,
             reason,

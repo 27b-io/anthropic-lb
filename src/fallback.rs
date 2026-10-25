@@ -98,7 +98,7 @@ pub(crate) async fn try_fallback_upstream(
     info!(
         req_id,
         client_id,
-        model,
+        model = %GoQuoted(model),
         upstream = ep.name,
         translate,
         pin = state.pin_status(caller, endpoint_idx),
@@ -194,7 +194,7 @@ pub(crate) async fn try_fallback_upstream(
             req_id,
             upstream = ep.name,
             status = status.as_u16(),
-            body = ?err_body,
+            body = %GoQuoted(&err_body),
             "fallback: unified endpoint returned error"
         );
         // Gateway rejected the MODEL (e.g. LiteLLM "Invalid model name"):
@@ -472,7 +472,7 @@ pub(crate) async fn try_fallback_upstream(
             warn!(
                 req_id,
                 client_id,
-                model,
+                model = %GoQuoted(model),
                 upstream = ep.name,
                 error = %e,
                 "fallback: unified endpoint response body is not valid JSON; usage not recorded"

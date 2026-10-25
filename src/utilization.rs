@@ -1141,7 +1141,7 @@ pub(crate) fn drops_deprecated_temperature(model: &str, value: &serde_json::Valu
         return false;
     }
     warn!(
-        model = ?truncate_label(model),
+        model = %GoQuoted(&truncate_label(model)),
         temperature = %value,
         "dropping `temperature`: deprecated and hard-rejected by this model"
     );
@@ -1166,7 +1166,7 @@ pub(crate) fn translate_reasoning_effort(value: &serde_json::Value) -> Option<&s
     let effort = value.as_str().filter(|e| EFFORTS.contains(e));
     if effort.is_none() {
         warn!(
-            reasoning_effort = ?truncate_label(&value.to_string()),
+            reasoning_effort = %GoQuoted(&truncate_label(&value.to_string())),
             "dropping `reasoning_effort`: no Anthropic effort equivalent"
         );
     }
@@ -1815,9 +1815,9 @@ impl AppState {
         }
         warn!(
             account = endpoint_name,
-            // Debug, not Display: the name is client input, and Display would
+            // Quoted, not Display: the name is client input, and Display would
             // write a newline or escape in it into the log unescaped.
-            model = ?truncate_label(model),
+            model = %GoQuoted(&truncate_label(model)),
             cooldown_secs = UNSUPPORTED_MODEL_TTL.as_secs(),
             "model unsupported on account, routing away"
         );
@@ -1958,7 +1958,7 @@ impl AppState {
             if unsupported.contains(&i) {
                 trace!(
                     endpoint = ep.name,
-                    model,
+                    model = %GoQuoted(model),
                     "pick: skipping, model unsupported on endpoint"
                 );
                 continue;
@@ -2052,7 +2052,7 @@ impl AppState {
                         None => {
                             trace!(
                                 endpoint = ep.name,
-                                model = model,
+                                model = %GoQuoted(model),
                                 "pick: skipping, 7d claim rejected"
                             );
                             continue;

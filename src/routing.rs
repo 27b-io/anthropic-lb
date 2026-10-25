@@ -607,7 +607,7 @@ impl AppState {
             if fast_disabled.contains(&c.endpoint) {
                 trace!(
                     endpoint = self.endpoints[c.endpoint].name,
-                    model,
+                    model = %GoQuoted(model),
                     "pick: skipping, fast mode disabled on endpoint"
                 );
                 return false;
@@ -619,7 +619,7 @@ impl AppState {
             if fast.excludes_openai() && self.endpoints[c.endpoint].protocol == Protocol::OpenAI {
                 trace!(
                     endpoint = self.endpoints[c.endpoint].name,
-                    model,
+                    model = %GoQuoted(model),
                     "pick: skipping, openai-protocol endpoint can't honor speed:\"fast\""
                 );
                 return false;
@@ -645,7 +645,7 @@ impl AppState {
                 // account(s) and will consume shared-pool cache/claims.
                 info!(
                     client_id = caller.name(),
-                    model,
+                    model = %GoQuoted(model),
                     fast_mode_disabled = fast_disabled
                         .iter()
                         .any(|&i| self.endpoint_is_preferred(preferred, i)),
@@ -1637,8 +1637,8 @@ impl AppState {
         drop(map);
         if !first_seen.is_empty() {
             // `dropped` is sanitized here too. The sibling logs it unsanitized
-            // but Debug-quoted (`?`): a header value cannot carry a newline,
-            // but a comma-split flag can carry a space, `=` or `"`.
+            // but Debug-quoted (`?`), the rule for a header value (see
+            // `log_proxied`): a comma-split flag can carry a space, `=` or `"`.
             let context: Vec<String> = dropped
                 .iter()
                 .take(MAX_STRIPPED_FIELDS_PER_REQUEST)

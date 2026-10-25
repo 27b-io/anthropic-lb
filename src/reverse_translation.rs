@@ -642,8 +642,8 @@ pub(crate) fn translate_openai_sse_to_anthropic(
             None => err.to_string(),
         };
         warn!(
-            error_type = err_type,
-            error_message = err_msg,
+            error_type = %GoQuoted(err_type),
+            error_message = %GoQuoted(&err_msg),
             "OpenAI upstream emitted in-band error mid-stream"
         );
         return vec![anthropic_error_sse(&format!("{err_type}: {err_msg}"))];
@@ -913,7 +913,7 @@ async fn forward_openai_compat_anthropic(
     };
     debug!(
         account = endpoint_name,
-        model = ?model,
+        model = %GoQuoted(model),
         body_len = req_body.len(),
         "openai-compat: upstream request"
     );
@@ -1075,9 +1075,9 @@ async fn forward_openai_compat_anthropic(
             .and_then(|v| UpstreamError::from_body(status.as_u16(), v));
         warn!(
             account = endpoint_name,
-            model = ?model,
+            model = %GoQuoted(model),
             status = status.as_u16(),
-            error_message = ?error_msg,
+            error_message = %GoQuoted(error_msg.as_deref().unwrap_or("-")),
             "openai-compat: upstream error"
         );
         // This branch returns before `finalize_non_stream` — log the merged
@@ -1860,7 +1860,10 @@ pub(crate) async fn openai_chat_handler(
             // As in `proxy_handler`: an account that refused this request for
             // extra usage did not refuse the model, so no 404 is synthesized.
             if extra_usage_refuser.is_none() {
-                warn!(model, "model unsupported on all eligible endpoints");
+                warn!(
+                    model = %GoQuoted(&model),
+                    "model unsupported on all eligible endpoints"
+                );
                 return model_unsupported_response(&model, true);
             }
         }

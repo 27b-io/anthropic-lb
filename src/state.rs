@@ -237,6 +237,36 @@ pub(crate) fn escape_sentinel(label: &str, stems: &[&str]) -> String {
     label.to_owned()
 }
 
+/// A log field value that can hold any Unicode (text from a request body, a
+/// URI path or an upstream), logged as `field = %GoQuoted(s)`. It is written in
+/// double quotes with `"`, `\` and every control character (C0, DEL, C1)
+/// escaped as `\n`, `\t`, `\r` or `\u00XX`, which Go's `strconv.Unquote` and a
+/// JSON decoder both read back. `?` is not enough for such text: Debug writes
+/// `\u{1}`, `\u{ad}` or `\0`, which Go rejects, and a logfmt reader that
+/// unquotes with Go's `strconv` then reads the value unquoted up to the next
+/// space, so a ` client_id=x` inside it parses as a second field. Any other
+/// character is written as is, so printable ASCII prints the same bytes as `?`.
+pub(crate) struct GoQuoted<'a>(pub(crate) &'a str);
+
+impl std::fmt::Display for GoQuoted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+        f.write_char('"')?;
+        for c in self.0.chars() {
+            match c {
+                '"' => f.write_str(r#"\""#)?,
+                '\\' => f.write_str(r"\\")?,
+                '\n' => f.write_str(r"\n")?,
+                '\r' => f.write_str(r"\r")?,
+                '\t' => f.write_str(r"\t")?,
+                c if c.is_control() => write!(f, r"\u{:04x}", u32::from(c))?,
+                c => f.write_char(c)?,
+            }
+        }
+        f.write_char('"')
+    }
+}
+
 /// Cap on distinct UNRESERVED 7d claim keys per account. Keys are minted from
 /// the upstream `representative-claim` header — never from client input, but
 /// still an unvalidated remote string, and each one becomes a permanent `claim`
@@ -454,7 +484,7 @@ pub(crate) async fn log_429_details(account_name: &str, resp: reqwest::Response)
     debug!(
         account = account_name,
         headers = headers_fmt.join(" | "),
-        body = body_str,
+        body = %GoQuoted(&body_str),
         "429 response details"
     );
 }

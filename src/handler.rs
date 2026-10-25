@@ -671,11 +671,12 @@ pub(crate) fn exhaustion_response(
     if last_saw_transient && !last_saw_529 {
         state.pool_exhausted[PoolExhaustion::Transient as usize].fetch_add(1, Ordering::Relaxed);
         warn!(
-            // Debug, not Display: both are client input (a legacy caller
+            // Quoted, not Display: both are client input (a legacy caller
             // asserts its own `x-client-id`), and quoting stops a space in
-            // either from forging another field on the line.
+            // either from forging another field on the line. `model` is body
+            // text, so it takes `GoQuoted` (see `log_proxied`).
             client_id = ?client_id,
-            model = ?truncate_label(model),
+            model = %GoQuoted(&truncate_label(model)),
             "all endpoints transient-failed after backoff; returning retryable 503"
         );
         let mut resp = proxy_error_response(
@@ -690,7 +691,7 @@ pub(crate) fn exhaustion_response(
     state.pool_exhausted[PoolExhaustion::RateLimited as usize].fetch_add(1, Ordering::Relaxed);
     warn!(
         client_id = ?client_id,
-        model = ?truncate_label(model),
+        model = %GoQuoted(&truncate_label(model)),
         "all endpoints exhausted (rate-limited)"
     );
     // The model is the caller's own, and a negative-cache hit bounds it to
@@ -1900,7 +1901,7 @@ pub(crate) async fn proxy_handler(
                 req_id,
                 client = %client_ip,
                 client_id = ?client_id,
-                path = %parts.uri.path(),
+                path = %GoQuoted(parts.uri.path()),
                 header,
                 coding = ?coding,
                 "rejected: request body has a coding the proxy does not decode"
@@ -1931,7 +1932,7 @@ pub(crate) async fn proxy_handler(
                 req_id,
                 client = %client_ip,
                 client_id = ?client_id,
-                path = %parts.uri.path(),
+                path = %GoQuoted(parts.uri.path()),
                 error = %e,
                 "rejected: request body could not be parsed as JSON"
             );
@@ -2089,7 +2090,7 @@ pub(crate) async fn proxy_handler(
                     client_id = ?client_id,
                     session = ?session_id,
                     agent = ?agent_id,
-                    model = ?model,
+                    model = %GoQuoted(&model),
                     fp = %fp,
                     fps = %fps,
                     bps = %bps,
@@ -2366,7 +2367,7 @@ pub(crate) async fn proxy_handler(
                                     warn!(
                                         req_id,
                                         upstream = ep.name,
-                                        error = ?msg,
+                                        error = %GoQuoted(msg),
                                         "fallback: request not representable in OpenAI format"
                                     );
                                     // Terminal, not a retry: the request itself
@@ -2478,14 +2479,20 @@ pub(crate) async fn proxy_handler(
             // pool serves the model at standard speed, only fast-mode marks
             // stand in the way; otherwise the model itself is unservable.
             if fast.requested && !state.pool_cannot_serve(&model, FastRequest::STANDARD, None) {
-                warn!(model, "fast mode not enabled on any eligible endpoint");
+                warn!(
+                    model = %GoQuoted(&model),
+                    "fast mode not enabled on any eligible endpoint"
+                );
                 return proxy_error_response(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     FAST_MODE_NOT_ENABLED_MSG,
                 );
             }
-            warn!(model, "model unsupported on all eligible endpoints");
+            warn!(
+                model = %GoQuoted(&model),
+                "model unsupported on all eligible endpoints"
+            );
             return model_unsupported_response(&model, false);
         }
     }
