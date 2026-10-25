@@ -696,8 +696,8 @@ pub(crate) fn translate_sse_event(raw: &str, ctx: &mut StreamContext) -> Option<
                 .and_then(|v| v.as_str())
                 .unwrap_or("upstream error");
             warn!(
-                error_type = err_type,
-                error_message = err_msg,
+                error_type = %GoQuoted(err_type),
+                error_message = %GoQuoted(err_msg),
                 "Anthropic upstream emitted in-band error event mid-stream"
             );
             Some(openai_error_sse(&format!("{err_type}: {err_msg}")))

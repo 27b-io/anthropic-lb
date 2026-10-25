@@ -1362,3 +1362,57 @@ pub(crate) async fn spawn_mock_detector() -> MockDetector {
 pub(crate) fn detector_cfg(url: &str) -> guard::detector::DetectorConfig {
     toml::from_str(&format!("url = \"{url}\"")).expect("detector config")
 }
+
+// ── LAB-11064: Go strconv unquoting, to read back a logged value ──
+
+/// One Go string escape, `rest` being the bytes after its `\`: the character
+/// it stands for and how many bytes of `rest` it spans. Only the escapes a
+/// logged value carries are read (`\n`, `\r`, `\t`, `\\`, `\"`, `\uXXXX`,
+/// `\UXXXXXXXX` naming a scalar value); any other is `None`. Go refuses Rust
+/// Debug's `\u{1}`, `\0` and `\'` too, and for the rest Go defines, `None`
+/// keeps the helper stricter than Go, never looser.
+fn go_escape(rest: &[u8]) -> Option<(char, usize)> {
+    // `from_str_radix` alone would also take a leading `+`.
+    let hex = |n: usize| {
+        let digits = std::str::from_utf8(rest.get(1..=n)?).ok()?;
+        if !digits.bytes().all(|d| d.is_ascii_hexdigit()) {
+            return None;
+        }
+        let c = char::from_u32(u32::from_str_radix(digits, 16).ok()?)?;
+        Some((c, n + 1))
+    };
+    match *rest.first()? {
+        b'n' => Some(('\n', 1)),
+        b'r' => Some(('\r', 1)),
+        b't' => Some(('\t', 1)),
+        b'\\' => Some(('\\', 1)),
+        b'"' => Some(('"', 1)),
+        b'u' => hex(4),
+        b'U' => hex(8),
+        _ => None,
+    }
+}
+
+/// Go's `strconv.QuotedPrefix` then `strconv.Unquote` on `s`, which starts
+/// with `"`: the unquoted value and the quoted prefix's length in bytes, or
+/// `None` where Go returns an error (an unterminated quote, a raw newline, an
+/// escape Go does not define).
+pub(crate) fn go_quoted_prefix(s: &str) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    let (mut i, mut out) = (1, Vec::new());
+    loop {
+        match *b.get(i)? {
+            b'"' => return Some((String::from_utf8_lossy(&out).into_owned(), i + 1)),
+            b'\n' => return None,
+            b'\\' => {
+                let (c, len) = go_escape(&b[i + 1..])?;
+                out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+                i += 1 + len;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+}

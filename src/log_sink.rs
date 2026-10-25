@@ -24,7 +24,7 @@ const QUEUE_BYTES: u64 = 16 << 20;
 /// The longest `_msg` sent; a longer line is cut and marked. Under
 /// VictoriaLogs' default 256 KiB line limit even at the worst JSON escaping
 /// (6 bytes for a control character), so one line cannot fail a whole batch.
-const MAX_LINE_BYTES: usize = 32 << 10;
+pub(crate) const MAX_LINE_BYTES: usize = 32 << 10;
 /// A batch is POSTed once it holds this many lines, ...
 const MAX_BATCH_LINES: usize = 1_000;
 /// ... or about this many body bytes (the line that crosses it still rides),
@@ -368,10 +368,12 @@ fn now_rfc3339() -> String {
 }
 
 /// The fmt layer that writes stdout, teeing every event to the sink when one is
-/// configured. With a sink it writes plain text: the sink ships what stdout
-/// gets, and colour escapes inside a log store's `_msg` break text search and
-/// field matching. Without one the default stands, `NO_COLOR` included, so the
-/// layer is left alone rather than given `with_ansi(true)`, which would
+/// configured. With a sink, or when stdout is not a terminal (a pipe, a
+/// container log), it writes plain text: colour escapes inside a log store's
+/// `_msg` break text search and field matching, and a logfmt reader then sees
+/// each value open with an escape instead of its quote, so reads it unquoted
+/// to the next space. On a terminal the default stands, `NO_COLOR` included,
+/// so the layer is left alone rather than given `with_ansi(true)`, which would
 /// override `NO_COLOR`.
 pub(crate) fn stdout_layer<S>(
     sink: Option<Arc<LogSink>>,
@@ -384,8 +386,9 @@ pub(crate) fn stdout_layer<S>(
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
+    use std::io::IsTerminal;
     let layer = tracing_subscriber::fmt::layer();
-    let layer = if sink.is_some() {
+    let layer = if sink.is_some() || !std::io::stdout().is_terminal() {
         layer.with_ansi(false)
     } else {
         layer

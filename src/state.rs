@@ -237,6 +237,59 @@ pub(crate) fn escape_sentinel(label: &str, stems: &[&str]) -> String {
     label.to_owned()
 }
 
+/// Longest value `GoQuoted` writes, in characters, before its `…`. Escaped,
+/// that is 10 KiB at most (an escape above U+FFFF is 10 bytes), so even the
+/// `proxied` line's three such fields stay well inside the log sink's 32 KiB
+/// line cut, which would otherwise end the line inside an open quote.
+pub(crate) const MAX_LOGGED_VALUE_CHARS: usize = 1024;
+
+/// A log field value from the request body, the URI or an upstream, which can
+/// hold any Unicode, logged as `field = %GoQuoted(s)`. It is written in double
+/// quotes, and every character Debug would escape is escaped in a form Go's
+/// `strconv.Unquote` reads back: `\"`, `\\`, `\n`, `\r`, `\t`, `\uXXXX`, or
+/// `\UXXXXXXXX` above U+FFFF. That covers control, format and other
+/// non-printable characters (bidi controls, the U+E0000 tag block) and
+/// combining marks. Debug's own `\u{1}`, `\0` forms are not Go syntax: a
+/// logfmt reader that unquotes with Go's `strconv` rejects them and reads the
+/// value unquoted up to the next space, so a ` client_id=x` inside it parses as
+/// a second field. Every other character, `'` included, is written as is, so
+/// printable ASCII prints the same bytes as Debug. A value longer than
+/// `MAX_LOGGED_VALUE_CHARS` is cut there and marked with `…`.
+///
+/// The rule for every log field: a value from the request body, the URI or an
+/// upstream is `%GoQuoted(..)`, never `?`, bare or `%`. A request header value
+/// may use Debug (`?` or a bare `&str`), because `HeaderValue::to_str` admits
+/// only visible ASCII and tab. The message is written unquoted, so no caller-
+/// or upstream-fed text is interpolated into it.
+pub(crate) struct GoQuoted<'a>(pub(crate) &'a str);
+
+impl std::fmt::Display for GoQuoted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+        f.write_char('"')?;
+        let mut chars = self.0.chars();
+        for c in chars.by_ref().take(MAX_LOGGED_VALUE_CHARS) {
+            match c {
+                '"' => f.write_str(r#"\""#)?,
+                '\\' => f.write_str(r"\\")?,
+                '\n' => f.write_str(r"\n")?,
+                '\r' => f.write_str(r"\r")?,
+                '\t' => f.write_str(r"\t")?,
+                '\'' => f.write_char(c)?,
+                c if c.escape_debug().len() > 1 => match u32::from(c) {
+                    v @ ..=0xffff => write!(f, r"\u{v:04x}")?,
+                    v => write!(f, r"\U{v:08x}")?,
+                },
+                c => f.write_char(c)?,
+            }
+        }
+        if chars.next().is_some() {
+            f.write_char('…')?;
+        }
+        f.write_char('"')
+    }
+}
+
 /// Cap on distinct UNRESERVED 7d claim keys per account. Keys are minted from
 /// the upstream `representative-claim` header — never from client input, but
 /// still an unvalidated remote string, and each one becomes a permanent `claim`
@@ -454,7 +507,7 @@ pub(crate) async fn log_429_details(account_name: &str, resp: reqwest::Response)
     debug!(
         account = account_name,
         headers = headers_fmt.join(" | "),
-        body = body_str,
+        body = %GoQuoted(&body_str),
         "429 response details"
     );
 }

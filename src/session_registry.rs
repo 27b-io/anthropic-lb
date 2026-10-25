@@ -84,7 +84,10 @@ pub(crate) fn context_window_for(model: &str, has_1m_beta: bool) -> u64 {
             lock_recovering(WARNED.get_or_init(Default::default), "unknown_model_warned");
         // Bounded like the client maps: model is client-controlled input.
         if warned.len() < MAX_COUNTED_MODELS && warned.insert(model.to_string()) {
-            warn!(model, "unknown model family, assuming 200k context window");
+            warn!(
+                model = %GoQuoted(model),
+                "unknown model family, assuming 200k context window"
+            );
         }
     }
     DEFAULT_CONTEXT_WINDOW
@@ -208,7 +211,7 @@ impl AppState {
             .unwrap_or((None, None));
         warn!(
             req_id,
-            model,
+            model = %GoQuoted(model),
             session = affinity_key.map(session_label).as_deref().unwrap_or("-"),
             observed_tokens = observed,
             max_tokens = max,
@@ -224,7 +227,7 @@ impl AppState {
         count_by_model(&self.speed_unsupported, "speed_unsupported", model);
         warn!(
             req_id,
-            model = ?model,
+            model = %GoQuoted(model),
             "model does not support `speed`: re-sending without it to the same account"
         );
     }
@@ -355,7 +358,7 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
     info!(
         req_id,
         client_id,
-        model,
+        model = %GoQuoted(model),
         account,
         input = usage.input_tokens,
         output = usage.output_tokens,
@@ -369,8 +372,8 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
 /// `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`. They say what kind of call this is
 /// (main loop, subagent, compaction, ...), so a cache-write spike can be put
 /// down to compaction or subagent fan-out instead of routing scatter. Each is
-/// `"-"` when absent. Logged as plain `&str` fields, so the formatter escapes
-/// these caller-controlled values; never log them with `%`.
+/// `"-"` when absent. They are caller-controlled header values, logged as
+/// plain `&str` fields under the rule on `GoQuoted`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClientHints {
     pub(crate) request_class: String,
@@ -456,7 +459,7 @@ const MAX_UPSTREAM_ERR_CHARS: usize = 200;
 /// The upstream's own reason for a 4xx, for the `proxied` line: without it
 /// the line says `status=400` and nothing about why, and a client whose
 /// request bodies the proxy never sees cannot be told what it got wrong.
-/// Both values are upstream text, so each is bounded and kept to one line.
+/// Both values are upstream text, so each is bounded.
 pub(crate) struct UpstreamError {
     err_type: String,
     message: String,
@@ -465,24 +468,24 @@ pub(crate) struct UpstreamError {
 impl UpstreamError {
     /// `error.type` and `error.message` of an Anthropic error envelope
     /// (`{"type":"error","error":{"type":…,"message":…}}`) answering with a
-    /// 4xx; `None` for any other status or body. Control characters become
-    /// spaces; `err_type` is capped by `truncate_label`, and a message longer
-    /// than `MAX_UPSTREAM_ERR_CHARS` keeps one character fewer plus a `…`.
+    /// 4xx; `None` for any other status or body. `err_type` is capped by
+    /// `truncate_label`, and a message longer than `MAX_UPSTREAM_ERR_CHARS`
+    /// keeps one character fewer plus a `…`. Both are logged with `GoQuoted`,
+    /// which escapes their control characters.
     pub(crate) fn from_body(status: u16, body: &serde_json::Value) -> Option<Self> {
         if !(400..500).contains(&status) || body.get("type")?.as_str()? != "error" {
             return None;
         }
         let err_type = body.pointer("/error/type")?.as_str()?;
         let message = body.pointer("/error/message")?.as_str()?;
-        let one_line = |c: char| if c.is_control() { ' ' } else { c };
-        let mut chars = message.chars().map(one_line);
+        let mut chars = message.chars();
         let mut err: String = chars.by_ref().take(MAX_UPSTREAM_ERR_CHARS).collect();
         if chars.next().is_some() {
             err.pop();
             err.push('…');
         }
         Some(Self {
-            err_type: truncate_label(&err_type.chars().map(one_line).collect::<String>()),
+            err_type: truncate_label(err_type),
             message: err,
         })
     }
@@ -493,8 +496,10 @@ impl UpstreamError {
 /// response, client disconnect, upstream failure) — still exactly one line,
 /// still carrying req_id/account/status (AC4), so no separate branch is
 /// needed for the no-usage case. `err_type` / `err` are `"-"` unless the
-/// upstream named its reason for a 4xx; they are logged as plain `&str`
-/// fields, so the formatter escapes the upstream text. Never use `%` on them.
+/// upstream named its reason for a 4xx. Every caller- or upstream-fed field
+/// follows the rule on `GoQuoted`: `model`, `err_type` and `err` are
+/// `%GoQuoted(..)`, and the header-fed `ver`, `agent`, `session` and hints are
+/// Debug.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn log_proxied(
     req_id: &str,
@@ -532,11 +537,11 @@ pub(crate) fn log_proxied(
                 ver = ?client_ver,
                 agent,
                 session,
-                model,
+                model = %GoQuoted(model),
                 account,
                 status = status_code,
-                err_type,
-                err,
+                err_type = %GoQuoted(err_type),
+                err = %GoQuoted(err),
                 utilization = %utilization,
                 util_5h = %util_5h,
                 util_7d = %util_7d,
@@ -575,11 +580,11 @@ pub(crate) fn log_proxied(
                 ver = ?client_ver,
                 agent,
                 session,
-                model,
+                model = %GoQuoted(model),
                 account,
                 status = status_code,
-                err_type,
-                err,
+                err_type = %GoQuoted(err_type),
+                err = %GoQuoted(err),
                 utilization = %utilization,
                 util_5h = %util_5h,
                 util_7d = %util_7d,
@@ -680,7 +685,7 @@ pub(crate) async fn finalize_stream(
         warn!(
             req_id,
             client_id,
-            model,
+            model = %GoQuoted(model),
             account = acct_name,
             status = status_code,
             reason,
@@ -696,7 +701,7 @@ pub(crate) async fn finalize_stream(
         warn!(
             req_id,
             client_id,
-            model,
+            model = %GoQuoted(model),
             account = acct_name,
             status = status_code,
             reason,
