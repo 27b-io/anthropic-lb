@@ -1107,32 +1107,56 @@ async fn exhaustion_after_model_rejection_names_model_openai_handler() {
     assert_exhaustion_names_model(resp, "exhaustion-msg-openai").await;
 }
 
-/// The message stays bare unless an endpoint that may serve the model has
-/// rejected it: a rejection of another model, or a mark on an endpoint whose
-/// `models` list excludes the model, is no not-found answer for this one.
+/// The message stays bare unless an endpoint eligible for THIS request has
+/// rejected the model, by the rule `pool_cannot_serve` counts by: a
+/// rejection of another model, a mark on an endpoint whose `models` list
+/// excludes the model, or a mark on an OpenAI-protocol endpoint that a
+/// must-stay-fast request never reaches is no not-found answer for it.
 #[tokio::test]
 async fn exhaustion_message_stays_bare_without_an_eligible_rejection() {
     let mut haiku_only = mk_endpoint("b", "sk-ant-api-b");
     haiku_only.models = vec!["claude-haiku-*".to_string()];
-    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a"), haiku_only]);
+    let state = test_state_with(vec![
+        mk_endpoint("a", "sk-ant-api-a"),
+        haiku_only,
+        make_endpoint("g", Protocol::OpenAI),
+    ]);
     state.note_model_unsupported("a", 0, "claude-other-1");
     state.note_model_unsupported("b", 1, "claude-nope-1");
-    for model in ["claude-nope-1", ""] {
-        let resp = exhaustion_response(&state, false, false, "c", model);
-        let json = parse_error_envelope(Box::new(resp)).await;
+    state.note_model_unsupported("g", 2, "claude-nope-1");
+    let message = |model: &'static str, fast: FastRequest| {
+        let resp = exhaustion_response(&state, false, false, "c", model, fast);
+        async move {
+            let json = parse_error_envelope(Box::new(resp)).await;
+            json["error"]["message"].as_str().unwrap().to_owned()
+        }
+    };
+    for (model, fast, why) in [
+        (
+            "claude-nope-1",
+            FastRequest::FAST,
+            "only ineligible endpoints rejected it",
+        ),
+        ("", FastRequest::STANDARD, "no model"),
+    ] {
         assert_eq!(
-            json["error"]["message"], "exhausted all endpoints",
-            "{model:?}"
+            message(model, fast).await,
+            "exhausted all endpoints",
+            "{why}"
         );
     }
-    state.note_model_unsupported("a", 0, "claude-nope-1");
-    let resp = exhaustion_response(&state, false, false, "c", "claude-nope-1");
-    let json = parse_error_envelope(Box::new(resp)).await;
     assert!(
-        json["error"]["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("claude-nope-1")),
-        "an eligible rejection names the model, got: {json}"
+        message("claude-nope-1", FastRequest::STANDARD)
+            .await
+            .contains("claude-nope-1"),
+        "the OpenAI endpoint is eligible for a standard request"
+    );
+    state.note_model_unsupported("a", 0, "claude-nope-1");
+    assert!(
+        message("claude-nope-1", FastRequest::FAST)
+            .await
+            .contains("claude-nope-1"),
+        "an Anthropic endpoint is eligible for a fast request"
     );
 }
 
@@ -1141,7 +1165,14 @@ async fn exhaustion_message_stays_bare_without_an_eligible_rejection() {
 fn transient_exhaustion_log_carries_client_and_model() {
     let buf = log_capture_buf();
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a")]);
-    let resp = exhaustion_response(&state, true, false, "exhaustion-log-503", "claude-x-1");
+    let resp = exhaustion_response(
+        &state,
+        true,
+        false,
+        "exhaustion-log-503",
+        "claude-x-1",
+        FastRequest::STANDARD,
+    );
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert!(

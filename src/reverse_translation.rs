@@ -1864,7 +1864,14 @@ pub(crate) async fn openai_chat_handler(
                 return model_unsupported_response(&model, true);
             }
         }
-        exhaustion_response(&state, last_saw_transient, last_saw_529, &client_id, &model)
+        exhaustion_response(
+            &state,
+            last_saw_transient,
+            last_saw_529,
+            &client_id,
+            &model,
+            FastRequest::STANDARD,
+        )
     }
     .await;
 

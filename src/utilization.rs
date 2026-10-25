@@ -759,6 +759,16 @@ impl FastRequest {
     pub(crate) fn excludes_openai(self) -> bool {
         self.requested && !self.stripped_on_oauth
     }
+
+    /// True when `ep` may serve this request for `model`: its config allows
+    /// the model, and it is not an OpenAI-protocol endpoint facing a request
+    /// that must stay fast. Such an endpoint can never honor speed:"fast"
+    /// (its translation drops the field) and never accrues a fast-mode mark,
+    /// so counting it as eligible would let a pool with only OpenAI capacity
+    /// left look servable to the exhaustion gate.
+    pub(crate) fn eligible(self, ep: &Endpoint, model: &str) -> bool {
+        ep.serves_model(model) && !(self.excludes_openai() && ep.protocol == Protocol::OpenAI)
+    }
 }
 
 /// Remove every top-level entry named in `fields` — `ANTHROPIC_FALLBACK_FIELDS`
@@ -1857,15 +1867,7 @@ impl AppState {
         excluded.extend(extra_usage_refuser);
         let mut eligible = 0usize;
         for (i, ep) in self.endpoints.iter().enumerate() {
-            if !ep.serves_model(model) {
-                continue;
-            }
-            // An OpenAI-protocol endpoint can never honor speed:"fast" (its
-            // translation drops the field) and never accrues a fast-mode
-            // mark, so it must not count as "eligible" for a fast request —
-            // otherwise a pool with only OpenAI capacity left would look
-            // servable and the exhaustion reply would never fire (LAB-2687).
-            if fast.excludes_openai() && ep.protocol == Protocol::OpenAI {
+            if !fast.eligible(ep, model) {
                 continue;
             }
             eligible += 1;
@@ -1876,16 +1878,17 @@ impl AppState {
         eligible > 0
     }
 
-    /// True when SOME endpoint whose config allows `model` carries a live
-    /// unsupported-model entry for it: an account that answered said the
-    /// model does not exist. The weak twin of `pool_cannot_serve` — that one
-    /// decides the status, this one only lets `exhaustion_response` name the
-    /// rejection in its retryable 429, so a bad model id does not read as a
-    /// capacity problem.
-    pub(crate) fn model_rejected_somewhere(&self, model: &str) -> bool {
+    /// True when SOME endpoint eligible for this request (`FastRequest::eligible`,
+    /// the rule `pool_cannot_serve` counts by) carries a live unsupported-model
+    /// entry for `model`: an account that answered said the model does not
+    /// exist. The weak twin of `pool_cannot_serve` — that one decides the
+    /// status, this one only lets `exhaustion_response` name the rejection in
+    /// its retryable 429, so a bad model id does not read as a capacity
+    /// problem.
+    pub(crate) fn model_rejected_somewhere(&self, model: &str, fast: FastRequest) -> bool {
         self.unsupported_endpoints_for(model)
             .into_iter()
-            .any(|i| self.endpoints[i].serves_model(model))
+            .any(|i| fast.eligible(&self.endpoints[i], model))
     }
 
     /// Record that `endpoint_idx`'s org has fast mode disabled — the upstream
