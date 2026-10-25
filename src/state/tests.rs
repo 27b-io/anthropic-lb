@@ -1325,3 +1325,71 @@ async fn read_body_bounded_logs_read_error_with_req_id() {
         mine[0]
     );
 }
+
+/// `GoQuoted` escapes `"`, `\`, the control characters and the invisible
+/// format characters, in forms Go reads back to the original string, and
+/// writes everything else as is.
+#[test]
+fn go_quoted_round_trips_through_go_unquote() {
+    let escaped: String = ('\0'..='\u{ffff}')
+        .filter(|&c| c.is_control() || is_invisible(c))
+        .collect();
+    for s in [
+        "claude-sonnet-4-6",
+        "q\"b\\s",
+        "tab\tnl\nret\r",
+        "claude-x\u{1} client_id=forged ",
+        "claude-x\u{ad}\u{200b}\u{202e}\u{2028} client_id=forged ",
+        "\u{1f600}é'`\u{301}",
+        escaped.as_str(),
+    ] {
+        let quoted = GoQuoted(s).to_string();
+        assert_eq!(
+            go_quoted_prefix(&quoted),
+            Some((s.to_owned(), quoted.len())),
+            "{quoted}"
+        );
+        assert!(
+            !quoted.chars().any(|c| c.is_control() || is_invisible(c)),
+            "nothing escapable written raw in {quoted:?}"
+        );
+    }
+    assert_eq!(
+        GoQuoted("claude-sonnet-4-6").to_string(),
+        format!("{:?}", "claude-sonnet-4-6")
+    );
+    assert_eq!(
+        GoQuoted("\u{0}\u{7f}\u{85}\u{ad}\u{202e}").to_string(),
+        r#""\u0000\u007f\u0085\u00ad\u202e""#
+    );
+}
+
+/// Every invisible format character `GoQuoted` escapes is one Debug escaped.
+#[test]
+fn go_quoted_escapes_only_what_debug_escaped() {
+    for c in ('\0'..='\u{ffff}').filter(|&c| is_invisible(c)) {
+        assert!(
+            format!("{:?}", c.to_string()).contains(r"\u{"),
+            "U+{:04X} is printable to Debug",
+            u32::from(c)
+        );
+    }
+}
+
+/// A value longer than `MAX_LOGGED_VALUE_CHARS` is cut there and marked, so
+/// the escaped field stays near 6 KiB however long the input is.
+#[test]
+fn go_quoted_cuts_a_long_value() {
+    let fits = "x".repeat(MAX_LOGGED_VALUE_CHARS);
+    assert_eq!(GoQuoted(&fits).to_string(), format!("\"{fits}\""));
+
+    let long = "\u{1}".repeat(40 << 10);
+    let quoted = GoQuoted(&long).to_string();
+    let kept = format!("{}…", "\u{1}".repeat(MAX_LOGGED_VALUE_CHARS));
+    assert_eq!(go_quoted_prefix(&quoted), Some((kept, quoted.len())));
+    assert!(
+        quoted.len() <= 6 * MAX_LOGGED_VALUE_CHARS + 5,
+        "{}",
+        quoted.len()
+    );
+}

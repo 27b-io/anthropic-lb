@@ -237,31 +237,63 @@ pub(crate) fn escape_sentinel(label: &str, stems: &[&str]) -> String {
     label.to_owned()
 }
 
+/// Longest value `GoQuoted` writes, in characters, before its `…`. Escaped,
+/// that is about 6 KiB at most, so even the `proxied` line's three such fields
+/// stay well inside the log sink's 32 KiB line cut, which would otherwise end
+/// the line inside an open quote.
+pub(crate) const MAX_LOGGED_VALUE_CHARS: usize = 1024;
+
 /// A log field value that can hold any Unicode (text from a request body, a
 /// URI path or an upstream), logged as `field = %GoQuoted(s)`. It is written in
-/// double quotes with `"`, `\` and every control character (C0, DEL, C1)
-/// escaped as `\n`, `\t`, `\r` or `\u00XX`, which Go's `strconv.Unquote` and a
-/// JSON decoder both read back. `?` is not enough for such text: Debug writes
-/// `\u{1}`, `\u{ad}` or `\0`, which Go rejects, and a logfmt reader that
-/// unquotes with Go's `strconv` then reads the value unquoted up to the next
-/// space, so a ` client_id=x` inside it parses as a second field. Any other
-/// character is written as is, so printable ASCII prints the same bytes as `?`.
+/// double quotes with `"`, `\`, every control character (C0, DEL, C1) and the
+/// invisible format characters escaped as `\n`, `\t`, `\r` or `\uXXXX`, which
+/// Go's `strconv.Unquote` and a JSON decoder both read back. `?` is not enough
+/// for such text: Debug writes `\u{1}`, `\u{ad}` or `\0`, which Go rejects, and
+/// a logfmt reader that unquotes with Go's `strconv` then reads the value
+/// unquoted up to the next space, so a ` client_id=x` inside it parses as a
+/// second field. Any other character is written as is, so printable ASCII
+/// prints the same bytes as `?`. A value longer than `MAX_LOGGED_VALUE_CHARS`
+/// is cut there and marked with `…`.
 pub(crate) struct GoQuoted<'a>(pub(crate) &'a str);
+
+/// Format characters a viewer renders as nothing or that reorder the text
+/// around them: soft hyphen, zero-width and bidi controls, line and paragraph
+/// separators, the BOM. Debug escaped these, so `GoQuoted` does too. All are
+/// in the BMP, so one `\uXXXX` escape covers each.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{61c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+    )
+}
 
 impl std::fmt::Display for GoQuoted<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use std::fmt::Write;
         f.write_char('"')?;
-        for c in self.0.chars() {
+        let mut chars = self.0.chars();
+        for c in chars.by_ref().take(MAX_LOGGED_VALUE_CHARS) {
             match c {
                 '"' => f.write_str(r#"\""#)?,
                 '\\' => f.write_str(r"\\")?,
                 '\n' => f.write_str(r"\n")?,
                 '\r' => f.write_str(r"\r")?,
                 '\t' => f.write_str(r"\t")?,
-                c if c.is_control() => write!(f, r"\u{:04x}", u32::from(c))?,
+                c if c.is_control() || is_invisible(c) => {
+                    write!(f, r"\u{:04x}", u32::from(c))?;
+                }
                 c => f.write_char(c)?,
             }
+        }
+        if chars.next().is_some() {
+            f.write_char('…')?;
         }
         f.write_char('"')
     }

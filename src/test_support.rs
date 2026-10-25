@@ -1362,3 +1362,71 @@ pub(crate) async fn spawn_mock_detector() -> MockDetector {
 pub(crate) fn detector_cfg(url: &str) -> guard::detector::DetectorConfig {
     toml::from_str(&format!("url = \"{url}\"")).expect("detector config")
 }
+
+// ── LAB-11064: Go strconv unquoting, to read back a logged value ──
+
+/// One Go string escape, `rest` being the bytes after its `\`: the bytes it
+/// stands for and how many bytes of `rest` it spans, or `None` where Go's
+/// `strconv.UnquoteChar` (quote `"`) fails. So Rust Debug's `\u{1}` and `\0`
+/// are `None`, as is `\'`.
+pub(crate) fn go_escape(rest: &[u8]) -> Option<(Vec<u8>, usize)> {
+    // `from_str_radix` alone would also take a leading `+`.
+    let hex = |n: usize| {
+        let digits = std::str::from_utf8(rest.get(1..=n)?).ok()?;
+        if !digits.bytes().all(|d| d.is_ascii_hexdigit()) {
+            return None;
+        }
+        u32::from_str_radix(digits, 16).ok()
+    };
+    let rune = |v: u32| char::from_u32(v).map(|c| c.to_string().into_bytes());
+    let byte = |b: u8| Some((vec![b], 1));
+    match *rest.first()? {
+        b'a' => byte(0x07),
+        b'b' => byte(0x08),
+        b'f' => byte(0x0c),
+        b'n' => byte(b'\n'),
+        b'r' => byte(b'\r'),
+        b't' => byte(b'\t'),
+        b'v' => byte(0x0b),
+        b'\\' => byte(b'\\'),
+        b'"' => byte(b'"'),
+        b'x' => Some((vec![u8::try_from(hex(2)?).ok()?], 3)),
+        b'u' => Some((rune(hex(4)?)?, 5)),
+        b'U' => Some((rune(hex(8)?)?, 9)),
+        d @ b'0'..=b'7' => {
+            let tail = rest.get(1..3)?;
+            if !tail.iter().all(|o| (b'0'..=b'7').contains(o)) {
+                return None;
+            }
+            let v = [d, tail[0], tail[1]]
+                .iter()
+                .fold(0u32, |v, o| (v << 3) | u32::from(o - b'0'));
+            Some((vec![u8::try_from(v).ok()?], 3))
+        }
+        _ => None,
+    }
+}
+
+/// Go's `strconv.QuotedPrefix` then `strconv.Unquote` on `s`, which starts
+/// with `"`: the unquoted value and the quoted prefix's length in bytes, or
+/// `None` where Go returns an error (an unterminated quote, a raw newline, an
+/// escape Go does not define).
+pub(crate) fn go_quoted_prefix(s: &str) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    let (mut i, mut out) = (1, Vec::new());
+    loop {
+        match *b.get(i)? {
+            b'"' => return Some((String::from_utf8_lossy(&out).into_owned(), i + 1)),
+            b'\n' => return None,
+            b'\\' => {
+                let (bytes, len) = go_escape(&b[i + 1..])?;
+                out.extend(bytes);
+                i += 1 + len;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+}

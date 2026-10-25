@@ -439,77 +439,13 @@ async fn proxied_line_still_logged_on_openai_compat_upstream_error() {
 
 // ── LAB-11037, LAB-11064: a caller-fed log field cannot forge another field ──
 
-/// One Go string escape, `rest` being the bytes after its `\`: the bytes it
-/// stands for and how many bytes of `rest` it spans, or `None` where Go's
-/// `strconv.UnquoteChar` (quote `"`) fails. So Rust Debug's `\u{1}` and `\0`
-/// are `None`, as is `\'`.
-fn go_escape(rest: &[u8]) -> Option<(Vec<u8>, usize)> {
-    // `from_str_radix` alone would also take a leading `+`.
-    let hex = |n: usize| {
-        let digits = std::str::from_utf8(rest.get(1..=n)?).ok()?;
-        if !digits.bytes().all(|d| d.is_ascii_hexdigit()) {
-            return None;
-        }
-        u32::from_str_radix(digits, 16).ok()
-    };
-    let rune = |v: u32| char::from_u32(v).map(|c| c.to_string().into_bytes());
-    let byte = |b: u8| Some((vec![b], 1));
-    match *rest.first()? {
-        b'a' => byte(0x07),
-        b'b' => byte(0x08),
-        b'f' => byte(0x0c),
-        b'n' => byte(b'\n'),
-        b'r' => byte(b'\r'),
-        b't' => byte(b'\t'),
-        b'v' => byte(0x0b),
-        b'\\' => byte(b'\\'),
-        b'"' => byte(b'"'),
-        b'x' => Some((vec![u8::try_from(hex(2)?).ok()?], 3)),
-        b'u' => Some((rune(hex(4)?)?, 5)),
-        b'U' => Some((rune(hex(8)?)?, 9)),
-        d @ b'0'..=b'7' => {
-            let tail = rest.get(1..3)?;
-            if !tail.iter().all(|o| (b'0'..=b'7').contains(o)) {
-                return None;
-            }
-            let v = [d, tail[0], tail[1]]
-                .iter()
-                .fold(0u32, |v, o| (v << 3) | u32::from(o - b'0'));
-            Some((vec![u8::try_from(v).ok()?], 3))
-        }
-        _ => None,
-    }
-}
-
-/// Go's `strconv.QuotedPrefix` then `strconv.Unquote` on `s`, which starts
-/// with `"`: the unquoted value and the quoted prefix's length in bytes, or
-/// `None` where Go returns an error (an unterminated quote, a raw newline, an
-/// escape Go does not define).
-fn go_quoted_prefix(s: &str) -> Option<(String, usize)> {
-    let b = s.as_bytes();
-    let (mut i, mut out) = (1, Vec::new());
-    loop {
-        match *b.get(i)? {
-            b'"' => return Some((String::from_utf8_lossy(&out).into_owned(), i + 1)),
-            b'\n' => return None,
-            b'\\' => {
-                let (bytes, len) = go_escape(&b[i + 1..])?;
-                out.extend(bytes);
-                i += 1 + len;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-}
-
 /// `(name, value)` for each field VictoriaLogs' `unpack_logfmt` reads from
 /// `line`, ported from its `logfmtParser.parse` and `tryUnquoteString`: a
 /// value that opens with `"` and is a Go quoted prefix is unquoted, and any
-/// other value runs unquoted to the next space. The message words come back
-/// as names with empty values. A value opening with `'` or a backtick is not
+/// other value runs unquoted to the next space. A word with no `=` (the
+/// message) is skipped: that reader stores it as a field with an empty value,
+/// which it treats as absent, so the `model` in "model unsupported on account"
+/// is not a `model` field. A value opening with `'` or a backtick is not
 /// modelled and panics. With `strict`, a value that opens with `"` but that
 /// Go cannot unquote panics too, instead of being read the way that reader
 /// reads it: a test of our own lines must fail there, not mis-tokenise.
@@ -526,7 +462,6 @@ fn unpack_logfmt(line: &str, strict: bool) -> Vec<(String, String)> {
         let (name, separator) = (&s[..n], s.as_bytes()[n]);
         s = &s[n + 1..];
         if separator == b' ' {
-            add(name, "");
             continue;
         }
         assert!(
@@ -558,17 +493,15 @@ fn unpack_logfmt(line: &str, strict: bool) -> Vec<(String, String)> {
             }
         }
     }
-    add(s, "");
     fields
 }
 
-/// The non-empty values of every `key` field on `fields`, in line order. A
-/// message word comes back as a name with an empty value, so the `model` in
-/// "model unsupported on account" is not a `model` field.
+/// The values of every `key` field on `fields`, in line order, empty ones
+/// included: an empty `client_id=` would blank the real one.
 fn field_values<'a>(fields: &'a [(String, String)], key: &str) -> Vec<&'a str> {
     fields
         .iter()
-        .filter(|(k, v)| k == key && !v.is_empty())
+        .filter(|(k, _)| k == key)
         .map(|(_, v)| v.as_str())
         .collect()
 }
@@ -579,57 +512,25 @@ fn field_values<'a>(fields: &'a [(String, String)], key: &str) -> Vec<&'a str> {
 /// `strict` refuses the same line.
 #[test]
 fn unpack_logfmt_reads_a_debug_escape_as_that_reader_does() {
-    let line = r#"INFO proxied client_id="real-tenant" model="claude-x\u{1} client_id=kody " account="a" status=404"#;
+    let line = r#"INFO proxied client_id="real-tenant" model="claude-x\u{1} client_id=forged " account="a" status=404"#;
     let fields = unpack_logfmt(line, false);
-    assert_eq!(field_values(&fields, "client_id"), ["real-tenant", "kody"]);
+    assert_eq!(
+        field_values(&fields, "client_id"),
+        ["real-tenant", "forged"]
+    );
     assert_eq!(field_values(&fields, "model"), [r#""claude-x\u{1}"#]);
     assert_eq!(field_values(&fields, "status"), ["404"]);
     let strict = std::panic::catch_unwind(|| unpack_logfmt(line, true));
     assert!(strict.is_err(), "strict must refuse a quote Go cannot read");
 
-    let line = r#"proxied model="claude-x\u0001 client_id=kody \"q\" \\" account="a""#;
+    let line = r#"proxied model="claude-x\u0001 client_id=forged \"q\" \\" account="a""#;
     let fields = unpack_logfmt(line, true);
     assert_eq!(field_values(&fields, "client_id"), Vec::<&str>::new());
     assert_eq!(
         field_values(&fields, "model"),
-        ["claude-x\u{1} client_id=kody \"q\" \\"]
+        ["claude-x\u{1} client_id=forged \"q\" \\"]
     );
     assert_eq!(field_values(&fields, "account"), ["a"]);
-}
-
-/// `GoQuoted` escapes exactly `"`, `\` and the control characters, in forms
-/// Go reads back to the original string; everything else is written as is.
-#[test]
-fn go_quoted_round_trips_through_go_unquote() {
-    let all_controls: String = ('\0'..='\u{9f}').filter(|c| c.is_control()).collect();
-    for s in [
-        "claude-sonnet-4-6",
-        "q\"b\\s",
-        "tab\tnl\nret\r",
-        "claude-x\u{1} client_id=forged ",
-        "claude-x\u{ad}\u{200b}\u{202e}\u{2028} client_id=forged ",
-        "\u{1f600}é'`",
-        all_controls.as_str(),
-    ] {
-        let quoted = GoQuoted(s).to_string();
-        assert_eq!(
-            go_quoted_prefix(&quoted),
-            Some((s.to_owned(), quoted.len())),
-            "{quoted}"
-        );
-        assert!(
-            !quoted.chars().any(char::is_control),
-            "no raw control character in {quoted:?}"
-        );
-    }
-    assert_eq!(
-        GoQuoted("claude-sonnet-4-6").to_string(),
-        format!("{:?}", "claude-sonnet-4-6")
-    );
-    assert_eq!(
-        GoQuoted("\u{0}\u{7f}\u{85}\u{ad}").to_string(),
-        "\"\\u0000\\u007f\\u0085\u{ad}\""
-    );
 }
 
 /// In legacy mode `client_id` is the caller's own `x-client-id`, and `ver`,
@@ -801,6 +702,56 @@ async fn body_fed_log_fields_cannot_forge_another_field() {
                     assert_eq!(field_values(&fields, "err"), [err.as_str()], "{line}");
                 }
             }
+        }
+    }
+}
+
+/// A `model` of 40 KiB is cut to `MAX_LOGGED_VALUE_CHARS` on every line, so it
+/// cannot carry the `proxied` line past the log sink's `MAX_LINE_BYTES`, where
+/// the cut would leave the quote open and the rest of the value would read as
+/// fields.
+#[tokio::test]
+async fn a_long_body_fed_value_cannot_push_a_line_past_the_sink_cut() {
+    let buf = log_capture_buf();
+    let upstream = model_not_found_upstream().await;
+    let addr = serve(test_app(&upstream, None).0).await;
+    let marker = "lab11064-long-model";
+    let model = format!(
+        "claude-{marker} {}\u{1} client_id=forged ",
+        "\u{1}".repeat(40 << 10)
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "any")
+        .header("x-client-id", marker)
+        .json(&serde_json::json!({
+            "model": model,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(!resp.status().is_success(), "{}", resp.status());
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let lines: Vec<&str> = output.lines().filter(|l| l.contains(marker)).collect();
+    assert!(
+        lines.iter().any(|l| l.contains("proxied")),
+        "a proxied line for {marker}"
+    );
+    let kept: String = model.chars().take(MAX_LOGGED_VALUE_CHARS).collect();
+    let kept = format!("{kept}…");
+    for line in lines {
+        assert!(line.len() < MAX_LINE_BYTES, "{} bytes", line.len());
+        let fields = unpack_logfmt(line, true);
+        let client_ids = field_values(&fields, "client_id");
+        assert!(
+            client_ids.is_empty() || client_ids == [marker],
+            "no forged client_id"
+        );
+        if line.contains("proxied") {
+            assert_eq!(field_values(&fields, "model"), [kept.as_str()]);
         }
     }
 }
