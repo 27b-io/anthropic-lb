@@ -1327,7 +1327,9 @@ async fn read_body_bounded_logs_read_error_with_req_id() {
 }
 
 /// `GoQuoted` output reads back through Go's unquoting to the original string,
-/// and printable ASCII prints the same bytes as Debug.
+/// and printable ASCII prints the same bytes as Debug. Each character's escape
+/// is checked alone by `go_quoted_escapes_what_debug_escapes`; these check
+/// escapes amid other text.
 #[test]
 fn go_quoted_round_trips_through_go_unquote() {
     for s in [
@@ -1335,9 +1337,6 @@ fn go_quoted_round_trips_through_go_unquote() {
         "q\"b\\s'",
         "tab\tnl\nret\r",
         "claude-x\u{1} client_id=forged ",
-        "claude-x\u{ad}\u{200b}\u{202e}\u{2028} client_id=forged ",
-        "claude-x\u{e0049}\u{e0067}\u{e007f}",
-        "\u{1f600}e\u{301}`",
     ] {
         let quoted = GoQuoted(s).to_string();
         assert_eq!(
@@ -1357,8 +1356,7 @@ fn go_quoted_round_trips_through_go_unquote() {
 }
 
 /// Over every scalar value, `GoQuoted` escapes a character exactly when Debug
-/// does, `'` aside (Debug leaves it raw inside double quotes too), and every
-/// escape reads back through Go's unquoting.
+/// does, and every escape reads back through Go's unquoting.
 #[test]
 fn go_quoted_escapes_what_debug_escapes() {
     for c in (0..=0x10ffff).filter_map(char::from_u32) {
@@ -1381,7 +1379,8 @@ fn go_quoted_escapes_what_debug_escapes() {
 }
 
 /// A value longer than `MAX_LOGGED_VALUE_CHARS` is cut there and marked, so
-/// the escaped field stays within 10 KiB however long the input is.
+/// the escaped field stays within 10 bytes a character, plus its quotes and
+/// `…`, however long the input is.
 #[test]
 fn go_quoted_cuts_a_long_value() {
     let fits = "x".repeat(MAX_LOGGED_VALUE_CHARS);

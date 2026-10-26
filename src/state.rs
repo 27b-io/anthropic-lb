@@ -238,9 +238,13 @@ pub(crate) fn escape_sentinel(label: &str, stems: &[&str]) -> String {
 }
 
 /// Longest value `GoQuoted` writes, in characters, before its `…`. Escaped,
-/// that is 10 KiB at most (an escape above U+FFFF is 10 bytes), so even the
-/// `proxied` line's three such fields stay well inside the log sink's 32 KiB
-/// line cut, which would otherwise end the line inside an open quote.
+/// that is at most 10 bytes a character (an escape above U+FFFF), so 10,245
+/// bytes with the quotes and the `…`. Three such fields come to 30,735 bytes,
+/// next to the log sink's 32 KiB line cut, past which a line loses its later
+/// fields. The `proxied` line's body- and upstream-fed values stay well inside
+/// it because only `model` takes this whole cap there: `err` is held to
+/// `MAX_UPSTREAM_ERR_CHARS` (200 characters) and `err_type` to
+/// `MAX_LABEL_CHARS` (64).
 pub(crate) const MAX_LOGGED_VALUE_CHARS: usize = 1024;
 
 /// A log field value from the request body, the URI or an upstream, which can
@@ -275,6 +279,8 @@ impl std::fmt::Display for GoQuoted<'_> {
                 '\n' => f.write_str(r"\n")?,
                 '\r' => f.write_str(r"\r")?,
                 '\t' => f.write_str(r"\t")?,
+                // `char::escape_debug` writes `\'`, which Go refuses inside
+                // double quotes; a string's Debug leaves `'` raw there too.
                 '\'' => f.write_char(c)?,
                 c if c.escape_debug().len() > 1 => match u32::from(c) {
                     v @ ..=0xffff => write!(f, r"\u{v:04x}")?,

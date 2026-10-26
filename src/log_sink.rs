@@ -74,19 +74,27 @@ impl Line {
 }
 
 /// `raw` as `_msg`: lossy UTF-8, and past `MAX_LINE_BYTES` cut and marked with
-/// the original length, so a reader knows the line was longer.
+/// the original length, so a reader knows the line was longer. The cut keeps
+/// whole fields only (`last_field_end`). A cut inside a quoted value would
+/// leave the quote open, and a logfmt reader would read the rest of the value
+/// as fields; a cut inside a key or a number would leave a different key or a
+/// smaller number. A line with no field end in reach, which the fmt layer
+/// never writes, is cut at the byte.
 fn message(raw: &[u8]) -> String {
     if raw.len() <= MAX_LINE_BYTES {
         return String::from_utf8_lossy(raw).into_owned();
     }
-    // Back off to a character start, so a valid line is cut between characters
-    // rather than mid-way through one (which would end in U+FFFD). A UTF-8
-    // character has at most 3 continuation bytes; malformed input loses at most
-    // those 3.
-    let mut end = MAX_LINE_BYTES;
-    while end > MAX_LINE_BYTES - 3 && raw[end] & 0xC0 == 0x80 {
-        end -= 1;
-    }
+    let end = last_field_end(&raw[..=MAX_LINE_BYTES]).unwrap_or_else(|| {
+        // Back off to a character start, so a valid line is cut between
+        // characters rather than mid-way through one (which would end in
+        // U+FFFD). A UTF-8 character has at most 3 continuation bytes;
+        // malformed input loses at most those 3.
+        let mut end = MAX_LINE_BYTES;
+        while end > MAX_LINE_BYTES - 3 && raw[end] & 0xC0 == 0x80 {
+            end -= 1;
+        }
+        end
+    });
     let marker = format!(" …[log sink: cut from {} bytes]", raw.len());
     // Sized up front: growing by push_str would double the capacity, and the
     // queue's byte budget counts length, so it would hold twice what it counts.
@@ -97,6 +105,106 @@ fn message(raw: &[u8]) -> String {
     msg.push_str(&kept);
     msg.push_str(&marker);
     msg
+}
+
+/// The last space in `s`, the start of a line, at which a logfmt reader that
+/// unquotes with Go's `strconv` (VictoriaLogs' `unpack_logfmt`) ends a field.
+/// Cut there, the line reads as the fields it had up to that point and no
+/// others. The rules are those of VictoriaLogs' `logfmtParser.parse`: a name
+/// runs to `=` or a space, and one a space ends is a field with no value. A
+/// value that opens with a quote Go reads ends at its closing quote, which a
+/// space must follow or the reader stops. Any other value runs to the next
+/// space. Where `s` ends before Go's verdict on a quote is known, the field
+/// before it is the last.
+fn last_field_end(s: &[u8]) -> Option<usize> {
+    let space_from = |i: usize| s[i..].iter().position(|&b| b == b' ').map(|n| i + n);
+    let (mut last, mut i) = (None, 0);
+    while let Some(n) = s[i..].iter().position(|&b| b == b'=' || b == b' ') {
+        let n = i + n;
+        let end = if s[n] == b' ' {
+            Some(n)
+        } else {
+            match logfmt_value(&s[n + 1..]) {
+                LogfmtValue::Bare => space_from(n + 1),
+                LogfmtValue::Quoted(len) => Some(n + 1 + len).filter(|&e| s.get(e) == Some(&b' ')),
+                LogfmtValue::Open => None,
+            }
+        };
+        let Some(end) = end else { break };
+        last = Some(end);
+        i = end + 1;
+    }
+    last
+}
+
+/// How that reader reads a value.
+enum LogfmtValue {
+    /// To the next space: it opens with no quote, or with one Go refuses.
+    Bare,
+    /// A quote Go reads, this many bytes long with its quotes.
+    Quoted(usize),
+    /// A quote still open where the text ends, so Go's verdict is unknown.
+    Open,
+}
+
+/// How that reader reads the value `v` starts, per VictoriaLogs'
+/// `tryUnquoteString`: a `"` or backquote opens a Go string literal
+/// (`strconv.QuotedPrefix`), and a `'` opens text read by
+/// `strconv.UnquoteChar` up to the next unescaped `'`. `push` splits lines at
+/// `\n`, so none holds the raw newline Go refuses inside `"`.
+fn logfmt_value(v: &[u8]) -> LogfmtValue {
+    let Some(&quote @ (b'"' | b'\'' | b'`')) = v.first() else {
+        return LogfmtValue::Bare;
+    };
+    let mut i = 1;
+    loop {
+        match v.get(i) {
+            None => return LogfmtValue::Open,
+            Some(&b) if b == quote => return LogfmtValue::Quoted(i + 1),
+            // A backquoted string has no escapes.
+            Some(b'\\') if quote != b'`' => match go_escape_len(&v[i + 1..], quote) {
+                Ok(len) => i += 1 + len,
+                Err(value) => return value,
+            },
+            Some(_) => i += 1,
+        }
+    }
+}
+
+/// How many bytes of `e`, the text after a `\` inside a `quote`, Go's
+/// `strconv.UnquoteChar` reads as one escape: `\a \b \f \n \r \t \v \\`, the
+/// quote itself, `\x` and two hex digits, three octal digits up to `\377`, and
+/// `\u` or `\U` with four or eight hex digits naming a scalar value. `Bare`
+/// where Go refuses it, `Open` where `e` ends first.
+fn go_escape_len(e: &[u8], quote: u8) -> Result<usize, LogfmtValue> {
+    let first = *e.first().ok_or(LogfmtValue::Open)?;
+    let (digits, radix) = match first {
+        b'a' | b'b' | b'f' | b'n' | b'r' | b't' | b'v' | b'\\' => return Ok(1),
+        c if c == quote => return Ok(1),
+        b'x' => (2, 16),
+        b'u' => (4, 16),
+        b'U' => (8, 16),
+        // The first of three octal digits.
+        b'0'..=b'7' => (2, 8),
+        _ => return Err(LogfmtValue::Bare),
+    };
+    let mut value = if radix == 8 {
+        u32::from(first - b'0')
+    } else {
+        0
+    };
+    for &d in e[1..].iter().take(digits) {
+        let d = char::from(d).to_digit(radix).ok_or(LogfmtValue::Bare)?;
+        value = value * radix + d;
+    }
+    if e.len() <= digits {
+        return Err(LogfmtValue::Open);
+    }
+    let valid = match first {
+        b'u' | b'U' => char::from_u32(value).is_some(),
+        _ => value <= 0xff,
+    };
+    valid.then_some(1 + digits).ok_or(LogfmtValue::Bare)
 }
 
 pub(crate) struct LogSink {

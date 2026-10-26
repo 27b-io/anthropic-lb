@@ -677,7 +677,7 @@ pub(crate) fn poison<T: Send>(mutex: &std::sync::Mutex<T>) {
 /// `MakeWriter` over a shared buffer, so a test can capture what the stderr
 /// layer would have written and inspect it after the request completes.
 #[derive(Clone)]
-struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct CapturedLog(pub(crate) Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for CapturedLog {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -1363,7 +1363,7 @@ pub(crate) fn detector_cfg(url: &str) -> guard::detector::DetectorConfig {
     toml::from_str(&format!("url = \"{url}\"")).expect("detector config")
 }
 
-// ── LAB-11064: Go strconv unquoting, to read back a logged value ──
+// ── Go strconv unquoting and a logfmt reader, to read back a logged value ──
 
 /// One Go string escape, `rest` being the bytes after its `\`: the character
 /// it stands for and how many bytes of `rest` it spans. Only the escapes a
@@ -1396,7 +1396,9 @@ fn go_escape(rest: &[u8]) -> Option<(char, usize)> {
 /// Go's `strconv.QuotedPrefix` then `strconv.Unquote` on `s`, which starts
 /// with `"`: the unquoted value and the quoted prefix's length in bytes, or
 /// `None` where Go returns an error (an unterminated quote, a raw newline, an
-/// escape Go does not define).
+/// escape Go does not define). It is also `None`, stricter than Go, for an
+/// escape `go_escape` does not read (`\a`, `\b`, `\f`, `\v`, `\xNN`, octal),
+/// which Go accepts but no logged value carries.
 pub(crate) fn go_quoted_prefix(s: &str) -> Option<(String, usize)> {
     let b = s.as_bytes();
     let (mut i, mut out) = (1, Vec::new());
@@ -1415,4 +1417,80 @@ pub(crate) fn go_quoted_prefix(s: &str) -> Option<(String, usize)> {
             }
         }
     }
+}
+
+/// `(name, value)` for each field VictoriaLogs' `unpack_logfmt` reads from
+/// `line`, ported from its `logfmtParser.parse` and `tryUnquoteString`: a
+/// value that opens with `"` and is a Go quoted prefix is unquoted, and any
+/// other value runs unquoted to the next space. A word with no `=` is a field
+/// with an empty value, as that reader stores it, so a bare `client_id` after
+/// the real one blanks it under last-wins. Only the words before the first
+/// `=` (the message) are skipped: anything they set, a later field overrides,
+/// and skipping them keeps the `model` in "model unsupported on account" out
+/// of the `model` values. A value opening with `'` or a backtick is not
+/// modelled and panics. With `strict`, a value that opens with `"` but that
+/// Go cannot unquote panics too, instead of being read the way that reader
+/// reads it: a test of our own lines must fail there, not mis-tokenise.
+pub(crate) fn unpack_logfmt(line: &str, strict: bool) -> Vec<(String, String)> {
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut add = |name: &str, value: &str| {
+        let name = name.trim();
+        if !(name.is_empty() && value.is_empty()) {
+            fields.push((name.to_owned(), value.to_owned()));
+        }
+    };
+    let (mut s, mut past_message) = (line, false);
+    while let Some(n) = s.find(['=', ' ']) {
+        let (name, separator) = (&s[..n], s.as_bytes()[n]);
+        s = &s[n + 1..];
+        if separator == b' ' {
+            if past_message {
+                add(name, "");
+            }
+            continue;
+        }
+        past_message = true;
+        assert!(
+            !s.starts_with(['\'', '`']),
+            "unmodelled quote after {name}= in: {line}"
+        );
+        let quoted = s.starts_with('"').then(|| go_quoted_prefix(s)).flatten();
+        assert!(
+            !strict || quoted.is_some() || !s.starts_with('"'),
+            "{name}= opens a quote Go cannot unquote in: {line}"
+        );
+        if let Some((value, len)) = quoted {
+            add(name, &value);
+            s = &s[len..];
+            match s.strip_prefix(' ') {
+                Some(rest) => s = rest,
+                None => return fields,
+            }
+            continue;
+        }
+        match s.split_once(' ') {
+            Some((value, rest)) => {
+                add(name, value);
+                s = rest;
+            }
+            None => {
+                add(name, s);
+                return fields;
+            }
+        }
+    }
+    if past_message {
+        add(s, "");
+    }
+    fields
+}
+
+/// The values of every `key` field on `fields`, in line order, empty ones
+/// included: an empty `client_id=` would blank the real one.
+pub(crate) fn field_values<'a>(fields: &'a [(String, String)], key: &str) -> Vec<&'a str> {
+    fields
+        .iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .collect()
 }

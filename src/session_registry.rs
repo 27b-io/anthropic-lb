@@ -681,6 +681,8 @@ pub(crate) async fn finalize_stream(
         }
     } else {
         // Log structural metadata only — SSE payloads contain user content.
+        // The event names are upstream text, so they are joined into one
+        // `GoQuoted` value: Debug of the list opens with `[`, not a quote.
         let truncated = scanner.event_count > 5;
         warn!(
             req_id,
@@ -692,7 +694,7 @@ pub(crate) async fn finalize_stream(
             elapsed_ms,
             sse_bytes = scanner.bytes_seen,
             sse_event_count = scanner.event_count,
-            sse_events = ?scanner.event_preview,
+            sse_events = %GoQuoted(&scanner.event_preview.join(",")),
             truncated,
             "stream_end_no_usage"
         );
