@@ -498,8 +498,12 @@ impl UpstreamError {
 /// needed for the no-usage case. `err_type` / `err` are `"-"` unless the
 /// upstream named its reason for a 4xx. Every caller- or upstream-fed field
 /// follows the rule on `GoQuoted`: `model`, `err_type` and `err` are
-/// `%GoQuoted(..)`, and the header-fed `ver`, `agent`, `session` and hints are
-/// Debug.
+/// `%GoQuoted(..)`, and the header-fed `client_id`, `ver`, `agent`, `session`
+/// and hints are Debug. Those header-fed values are logged through
+/// `truncate_label`, so no header length can carry the line past the log
+/// sink's `MAX_LINE_BYTES` cut and drop the token counts that end it. Routing,
+/// the session registry and budgets key on the whole values; only the log
+/// clips them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn log_proxied(
     req_id: &str,
@@ -516,6 +520,7 @@ pub(crate) fn log_proxied(
 ) {
     let (err_type, err) =
         upstream_err.map_or(("-", "-"), |e| (e.err_type.as_str(), e.message.as_str()));
+    let [client_id, agent, session] = [client_id, agent, session].map(truncate_label);
     match ctx {
         ProxiedCtx::Anthropic {
             client_ver,
@@ -533,10 +538,10 @@ pub(crate) fn log_proxied(
             info!(
                 req_id,
                 client = %client_ip,
-                client_id,
-                ver = ?client_ver,
-                agent,
-                session,
+                client_id = client_id.as_str(),
+                ver = ?truncate_label(client_ver),
+                agent = agent.as_str(),
+                session = session.as_str(),
                 model = %GoQuoted(model),
                 account,
                 status = status_code,
@@ -551,11 +556,11 @@ pub(crate) fn log_proxied(
                 pin = *pin,
                 total,
                 fp = %fp,
-                request_class = hints.request_class.as_str(),
-                agent_type = hints.agent_type.as_str(),
-                compaction = hints.compaction.as_str(),
-                context_compacted = hints.context_compacted.as_str(),
-                prompt_id = hints.prompt_id.as_str(),
+                request_class = truncate_label(&hints.request_class).as_str(),
+                agent_type = truncate_label(&hints.agent_type).as_str(),
+                compaction = truncate_label(&hints.compaction).as_str(),
+                context_compacted = truncate_label(&hints.context_compacted).as_str(),
+                prompt_id = truncate_label(&hints.prompt_id).as_str(),
                 input = usage.input_tokens,
                 output = usage.output_tokens,
                 cached = usage.cache_read_input_tokens,
@@ -576,10 +581,10 @@ pub(crate) fn log_proxied(
             info!(
                 req_id,
                 client = %client_ip,
-                client_id,
-                ver = ?client_ver,
-                agent,
-                session,
+                client_id = client_id.as_str(),
+                ver = ?truncate_label(client_ver),
+                agent = agent.as_str(),
+                session = session.as_str(),
                 model = %GoQuoted(model),
                 account,
                 status = status_code,

@@ -725,6 +725,16 @@ pub(crate) fn log_capture_buf() -> Arc<Mutex<Vec<u8>>> {
     })
     .clone()
 }
+
+/// Poll `done` every 10 ms until it holds; fail after `within`.
+pub(crate) async fn eventually(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + within;
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 // The test binary's allocator: the system's, counting what each thread
 // allocates, so a test can bound what one call allocates whatever other tests
 // do on their own threads meanwhile. The counter is const-initialised and

@@ -97,15 +97,6 @@ fn pending(sink: &LogSink) -> u64 {
     sink.pending.load(Ordering::Relaxed)
 }
 
-/// Poll `done` every 10 ms until it holds; fail after `within`.
-async fn eventually(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + within;
-    while !done() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
 // ── Delivery ────────────────────────────────────────────────────────
 
 /// A lone line waits for company no longer than the flush interval, then
@@ -577,19 +568,22 @@ fn the_cut_lands_where_a_logfmt_reader_ends_a_field() {
 }
 
 /// A `proxied` line as the fmt layer writes it, made longer than
-/// `MAX_LINE_BYTES` by a header-fed `agent` that ends in
-/// ` client_id=forged zz=1`. The padding is swept so the byte cut would land
-/// on every byte from that text to the end of `input`: `agent`'s closing
-/// quote, every field between them (`model` and `err` with their escapes,
-/// `err_type`, `agent_type`) and the number. Read back strictly, as a
-/// Go-strconv logfmt reader reads it, each cut line holds the uncut line's
-/// first fields, then the cut mark's words, and nothing else: one
-/// `client_id`, the real one, and no `zz`.
+/// `MAX_LINE_BYTES` by padding spliced into its `agent`, which ends in
+/// ` client_id=forged zz=1`. `log_proxied` clips header-fed values, so no
+/// request pads the line this far; the splice keeps every other byte of the
+/// real line. The padding is swept so the byte cut would land on every byte
+/// from that text to the end of `input`: `agent`'s closing quote, every field
+/// between them (`model` and `err` with their escapes, `err_type`,
+/// `agent_type`) and the number. Read back strictly, as a Go-strconv logfmt
+/// reader reads it, each cut line holds the uncut line's first fields, then
+/// the cut mark's words, and nothing else: one `client_id`, the real one, and
+/// no `zz`. And it holds all it can: `agent` once the byte cut would keep its
+/// closing quote, and `input` once it would keep the whole number.
 #[test]
 fn a_header_padded_proxied_line_is_cut_between_fields() {
     let buf = log_capture_buf();
     let req_id = "cut-sweep-proxied";
-    let agent = format!("{} client_id=forged zz=1", "a".repeat(MAX_LINE_BYTES));
+    let agent = "a client_id=forged zz=1";
     let upstream_err = UpstreamError::from_body(
         400,
         &serde_json::json!({
@@ -625,7 +619,7 @@ fn a_header_padded_proxied_line_is_cut_between_fields() {
         "claude-x\u{1} client_id=forged \"q\"",
         "acct-a",
         "10.0.0.1",
-        &agent,
+        agent,
         "s session=forged",
         400,
         &ctx,
@@ -638,12 +632,13 @@ fn a_header_padded_proxied_line_is_cut_between_fields() {
         .find(|l| l.contains(req_id))
         .expect("the proxied line");
 
-    // The fmt layer writes `agent` as it was sent, so the line for another
-    // padding length is this one with that many `a`s.
+    // The fmt layer writes `agent` as it was sent, so the line for a padded
+    // `agent` is this one with that many `a`s.
     let pad = line.find("agent=\"").unwrap() + "agent=\"".len();
     let (head, rest) = line.split_at(pad);
     let rest = rest.trim_start_matches('a');
     assert!(rest.starts_with(" client_id=forged zz=1\""), "{rest}");
+    let quote = " client_id=forged zz=1".len();
     let to = rest.find(" output=").expect("input, then output");
     assert!(rest[..to].contains(" agent_type=") && rest[..to].ends_with(" input=12345"));
     for k in 0..=to {
@@ -671,6 +666,10 @@ fn a_header_padded_proxied_line_is_cut_between_fields() {
         assert_eq!(fields, &uncut[..fields.len()], "{k}: {kept}");
         assert_eq!(field_values(fields, "client_id"), ["real-tenant"], "{k}");
         assert!(field_values(fields, "zz").is_empty(), "{k}");
+        let agent = field_values(fields, "agent");
+        assert_eq!(agent.is_empty(), k <= quote, "{k}: agent {agent:?}");
+        let input: &[&str] = if k == to { &["12345"] } else { &[] };
+        assert_eq!(field_values(fields, "input"), input, "{k}: input");
     }
 }
 

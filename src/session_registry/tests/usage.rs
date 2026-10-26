@@ -592,18 +592,16 @@ async fn sse_event_names_cannot_forge_another_field() {
     // The stream is finalized on a detached task, after the client's end of
     // stream.
     let mut line = None;
-    for _ in 0..100 {
+    eventually("a stream_end_no_usage line", Duration::from_secs(5), || {
         let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         line = output
             .lines()
             .find(|l| l.contains(marker) && l.contains("stream_end_no_usage"))
             .map(str::to_owned);
-        if line.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let line = line.expect("a stream_end_no_usage line");
+        line.is_some()
+    })
+    .await;
+    let line = line.unwrap();
     let fields = unpack_logfmt(&line, true);
     let sent = format!("{event},message_stop");
     assert_eq!(
@@ -748,6 +746,184 @@ async fn a_long_body_fed_value_cannot_push_a_line_past_the_sink_cut() {
         if line.contains("proxied") {
             assert_eq!(field_values(&fields, "model"), [kept.as_str()]);
         }
+    }
+}
+
+/// Both `proxied` lines with every value at its cap, escaped as wide as it can
+/// be: each header-fed value 64 KiB of `"` (two bytes escaped, the widest a
+/// header value takes), `model` past `MAX_LOGGED_VALUE_CHARS` and `err_type`
+/// and `err` past their caps, all in a character above U+FFFF (ten bytes
+/// escaped), and every number at its longest. Each line fits the log sink's
+/// `MAX_LINE_BYTES`, so the sink sends it whole, and its token counts read
+/// back as given. The header-fed values read back clipped by `truncate_label`.
+#[test]
+fn a_proxied_line_at_every_cap_fits_the_sink_cut() {
+    let buf = log_capture_buf();
+    let header = "\"".repeat(64 << 10);
+    let wide = |chars: usize| "\u{e0049}".repeat(chars + 1);
+    let upstream_err = UpstreamError::from_body(
+        400,
+        &anthropic_error(&wide(MAX_LABEL_CHARS), &wide(MAX_UPSTREAM_ERR_CHARS)),
+    );
+    let usage = TokenUsage {
+        input_tokens: u64::MAX,
+        output_tokens: u64::MAX - 1,
+        cache_read_input_tokens: u64::MAX - 2,
+        cache_creation_input_tokens: u64::MAX - 3,
+    };
+    let (utilization, util_5h, util_7d) = ("100.00", "100.00", "100.00");
+    let anthropic = ProxiedCtx::Anthropic {
+        client_ver: header.clone(),
+        utilization: utilization.to_owned(),
+        util_5h: util_5h.to_owned(),
+        util_7d: util_7d.to_owned(),
+        constraint: "7d_sonnet",
+        overage: false,
+        served_on_overage: false,
+        pin: "spilled",
+        total: u64::MAX,
+        fp: "0123456789ab".to_owned(),
+        hints: ClientHints {
+            request_class: header.clone(),
+            agent_type: header.clone(),
+            compaction: header.clone(),
+            context_compacted: header.clone(),
+            prompt_id: header.clone(),
+        },
+    };
+    let openai = ProxiedCtx::OpenaiCompat {
+        client_ver: header.clone(),
+        utilization: utilization.to_owned(),
+        util_5h: util_5h.to_owned(),
+        util_7d: util_7d.to_owned(),
+        constraint: "7d_sonnet",
+        served_on_overage: false,
+        pin: "spilled",
+        stream: false,
+    };
+
+    for (req_id, ctx) in [
+        ("ffff:18446744073709551614", &anthropic),
+        ("ffff:18446744073709551615", &openai),
+    ] {
+        log_proxied(
+            req_id,
+            &header,
+            &wide(MAX_LOGGED_VALUE_CHARS),
+            "acct-a",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            &header,
+            &header,
+            499,
+            ctx,
+            &usage,
+            upstream_err.as_ref(),
+        );
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let line = output
+            .lines()
+            .find(|l| l.contains(req_id))
+            .expect("the proxied line");
+        assert!(line.len() <= MAX_LINE_BYTES, "{} bytes", line.len());
+
+        let fields = unpack_logfmt(line, true);
+        for (key, sent) in [
+            ("input", usage.input_tokens),
+            ("output", usage.output_tokens),
+            ("cached", usage.cache_read_input_tokens),
+            ("cache_write", usage.cache_creation_input_tokens),
+        ] {
+            assert_eq!(field_values(&fields, key), [sent.to_string()], "{key}");
+        }
+        let mut header_fed = vec!["client_id", "ver", "agent", "session"];
+        if matches!(ctx, ProxiedCtx::Anthropic { .. }) {
+            header_fed.extend(["request_class", "agent_type", "compaction"]);
+            header_fed.extend(["context_compacted", "prompt_id"]);
+        }
+        let clipped = truncate_label(&header);
+        for key in header_fed {
+            assert_eq!(field_values(&fields, key), [clipped.as_str()], "{key}");
+        }
+    }
+}
+
+/// Every header that feeds a `proxied` field, sent at 16 KiB of `"` through
+/// the router on both surfaces: well past the log sink's `MAX_LINE_BYTES`
+/// together, yet inside hyper's default limit on a request head. The line
+/// still fits the cut, and its token counts read back as the upstream reported
+/// them.
+#[tokio::test]
+async fn long_request_headers_cannot_push_a_proxied_line_past_the_sink_cut() {
+    let buf = log_capture_buf();
+    let upstream = Router::new().fallback(any(|| async {
+        axum::Json(serde_json::json!({
+            "id": "msg_long_headers",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 22,
+                "cache_read_input_tokens": 33,
+                "cache_creation_input_tokens": 44,
+            },
+        }))
+    }));
+    let upstream = format!("http://{}", serve(upstream).await);
+    let native = serve(test_app(&upstream, None).0).await;
+    let openai = serve(test_openai_app(&upstream, None).0).await;
+    let pad = "\"".repeat(16 << 10);
+    let client = reqwest::Client::new();
+
+    for (addr, path, message) in [
+        (native, "/v1/messages", "proxied"),
+        (openai, "/v1/chat/completions", "proxied (openai-compat)"),
+    ] {
+        let marker = format!("long-headers{}", path.replace('/', "-"));
+        let mut request = client
+            .post(format!("http://{addr}{path}"))
+            .header("content-type", "application/json")
+            .header("x-api-key", "any")
+            .header("x-client-id", format!("{marker}{pad}"))
+            .header("user-agent", format!("claude-cli/{pad}"));
+        for name in [
+            "x-agent-id",
+            "x-claude-code-session-id",
+            "x-session-id",
+            "x-claude-code-request-class",
+            "x-claude-code-agent-type",
+            "x-claude-code-compaction",
+            "x-claude-code-context-compacted",
+            "x-claude-code-prompt-id",
+        ] {
+            request = request.header(name, &pad);
+        }
+        let resp = request
+            .body(r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{marker}");
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let line = output
+            .lines()
+            .find(|l| l.contains(&marker) && l.contains(message))
+            .unwrap_or_else(|| panic!("no `{message}` line for {marker}"));
+        assert!(line.len() <= MAX_LINE_BYTES, "{} bytes", line.len());
+        let fields = unpack_logfmt(line, true);
+        for (key, sent) in [
+            ("input", "11"),
+            ("output", "22"),
+            ("cached", "33"),
+            ("cache_write", "44"),
+        ] {
+            assert_eq!(field_values(&fields, key), [sent], "{key}: {line}");
+        }
+        let client_id = truncate_label(&format!("{marker}{pad}"));
+        assert_eq!(field_values(&fields, "client_id"), [client_id.as_str()]);
     }
 }
 

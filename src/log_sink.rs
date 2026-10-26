@@ -78,8 +78,9 @@ impl Line {
 /// whole fields only (`last_field_end`). A cut inside a quoted value would
 /// leave the quote open, and a logfmt reader would read the rest of the value
 /// as fields; a cut inside a key or a number would leave a different key or a
-/// smaller number. A line with no field end in reach, which the fmt layer
-/// never writes, is cut at the byte.
+/// smaller number. A line with no field end in reach is cut at the byte. The
+/// fmt layer opens every event with a timestamp and a space, but `push` splits
+/// an event at `\n`, so a later line of a multi-line event can be one.
 fn message(raw: &[u8]) -> String {
     if raw.len() <= MAX_LINE_BYTES {
         return String::from_utf8_lossy(raw).into_owned();

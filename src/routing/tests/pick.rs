@@ -586,6 +586,11 @@ async fn mark_hard_limited_logs_unified_headers() {
 /// logfmt reader reads it, and adds no field.
 #[tokio::test]
 async fn upstream_fed_rate_limit_log_fields_read_back_whole() {
+    // The global subscriber goes in first, so the scoped one below is never
+    // the only one registered. Were it alone, a callsite first hit on another
+    // test's thread would ask only that thread's default, which is none, and
+    // cache "never" for this test too.
+    log_capture_buf();
     let buf = Arc::new(Mutex::new(Vec::new()));
     // TRACE, for `rate info updated`, on this test's thread only.
     let _log = tracing::subscriber::set_default(
@@ -595,9 +600,6 @@ async fn upstream_fed_rate_limit_log_fields_read_back_whole() {
             .with_env_filter(tracing_subscriber::EnvFilter::new("anthropic_lb=trace"))
             .finish(),
     );
-    // A callsite another test's thread registered first can cache "never"
-    // for a scoped subscriber; the rebuild re-reads it with this one in place.
-    tracing::callsite::rebuild_interest_cache();
     let state = test_state_with(vec![mk_endpoint("forge-fields", "sk-ant-api-a")]);
     let forged = |v: &str| format!("{v} client_id=forged");
 
