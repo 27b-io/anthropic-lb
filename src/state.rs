@@ -207,9 +207,10 @@ pub(crate) const MAX_CLIENT_MODEL_LABELS: usize = 256;
 
 /// Max chars retained from a caller-controlled string used as a metric label,
 /// echoed in an error body, or logged from a request header on the `proxied`
-/// line. The model field is bounded only by the request
-/// body cap, so an untruncated copy would be retained for the process lifetime
-/// and re-serialized on every `/metrics` scrape.
+/// line (`MAX_LOGGED_VALUE_CHARS` states that line's bound). The model field
+/// is bounded only by the request body cap, so an untruncated copy would be
+/// retained for the process lifetime and re-serialized on every `/metrics`
+/// scrape.
 pub(crate) const MAX_LABEL_CHARS: usize = 64;
 
 /// Truncate a caller-controlled string to `MAX_LABEL_CHARS`, marking that it

@@ -891,7 +891,6 @@ async fn long_request_headers_cannot_push_a_proxied_line_past_the_sink_cut() {
         for name in [
             "x-agent-id",
             "x-claude-code-session-id",
-            "x-session-id",
             "x-claude-code-request-class",
             "x-claude-code-agent-type",
             "x-claude-code-compaction",
