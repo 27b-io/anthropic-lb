@@ -205,8 +205,9 @@ pub(crate) const MAX_CLIENT_REJECTION_LABELS: usize = 64;
 /// generous slack.
 pub(crate) const MAX_CLIENT_MODEL_LABELS: usize = 256;
 
-/// Max chars retained from a caller-controlled string used as a metric label
-/// or echoed in an error body. The model field is bounded only by the request
+/// Max chars retained from a caller-controlled string used as a metric label,
+/// echoed in an error body, or logged from a request header on the `proxied`
+/// line. The model field is bounded only by the request
 /// body cap, so an untruncated copy would be retained for the process lifetime
 /// and re-serialized on every `/metrics` scrape.
 pub(crate) const MAX_LABEL_CHARS: usize = 64;
@@ -238,13 +239,15 @@ pub(crate) fn escape_sentinel(label: &str, stems: &[&str]) -> String {
 }
 
 /// Longest value `GoQuoted` writes, in characters, before its `…`. Escaped,
-/// that is at most 10 bytes a character (an escape above U+FFFF), so 10,245
-/// bytes with the quotes and the `…`. Three such fields come to 30,735 bytes,
-/// next to the log sink's 32 KiB line cut, past which a line loses its later
-/// fields. The `proxied` line's body- and upstream-fed values stay well inside
-/// it because only `model` takes this whole cap there: `err` is held to
-/// `MAX_UPSTREAM_ERR_CHARS` (200 characters) and `err_type` to
-/// `MAX_LABEL_CHARS` (64).
+/// that is at most 10 bytes a character (an escape above U+FFFF), so three
+/// such fields come close to the log sink's `MAX_LINE_BYTES` cut, past which a
+/// line loses its later fields, the token counts among them. The whole
+/// `proxied` line stays inside it because only `model` takes this cap there:
+/// `err` is held to `MAX_UPSTREAM_ERR_CHARS`, and `err_type` and every
+/// header-fed value (`client_id`, `ver`, `agent`, `session`, the hints) to
+/// `MAX_LABEL_CHARS`. A header value escapes to at most 2 bytes a character.
+/// `a_proxied_line_at_every_cap_fits_the_sink_cut` holds both `proxied` lines,
+/// every value at its cap, to the cut.
 pub(crate) const MAX_LOGGED_VALUE_CHARS: usize = 1024;
 
 /// A log field value from the request body, the URI or an upstream, which can

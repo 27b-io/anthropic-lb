@@ -1307,9 +1307,13 @@ when the body was unparseable). When the upstream answers a 4xx with an
 Anthropic error envelope, the line (`proxied` or `proxied (openai-compat)`)
 names its reason: `err_type` is the upstream `error.type`, cut to 64
 characters plus `…` when longer, and `err` its `error.message`, at most 200
-characters, `…` included when cut; control characters in either become
-spaces. Both are `-` on every other line, 2xx included. Override the filter
-with `RUST_LOG` (e.g. `RUST_LOG=anthropic_lb=debug`), or set
+characters, `…` included when cut; control characters in either are
+escaped. Both are `-` on every other line, 2xx included. Values the line
+takes from request headers (`ver`, `agent`, `session`, the `x-claude-code-*`
+hints, and `client_id` when no `[[clients]]` is configured) are cut to 64
+characters plus `…` when longer, so no header can push the line past the log
+sink's 32 KiB cut; routing and budgets still use the whole value. Override
+the filter with `RUST_LOG` (e.g. `RUST_LOG=anthropic_lb=debug`), or set
 `debug_log = "/path/to/file.log"` in the config to additionally write a
 `debug`-level file log alongside the `info`-level stdout stream. At `debug`,
 the full per-request content fingerprinting detail (`fingerprint`:
