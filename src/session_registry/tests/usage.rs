@@ -439,84 +439,8 @@ async fn proxied_line_still_logged_on_openai_compat_upstream_error() {
 
 // ── LAB-11037, LAB-11064: a caller-fed log field cannot forge another field ──
 
-/// `(name, value)` for each field VictoriaLogs' `unpack_logfmt` reads from
-/// `line`, ported from its `logfmtParser.parse` and `tryUnquoteString`: a
-/// value that opens with `"` and is a Go quoted prefix is unquoted, and any
-/// other value runs unquoted to the next space. A word with no `=` is a field
-/// with an empty value, as that reader stores it, so a bare `client_id` after
-/// the real one blanks it under last-wins. Only the words before the first
-/// `=` (the message) are skipped: anything they set, a later field overrides,
-/// and skipping them keeps the `model` in "model unsupported on account" out
-/// of the `model` values. A value opening with `'` or a backtick is not
-/// modelled and panics. With `strict`, a value that opens with `"` but that
-/// Go cannot unquote panics too, instead of being read the way that reader
-/// reads it: a test of our own lines must fail there, not mis-tokenise.
-fn unpack_logfmt(line: &str, strict: bool) -> Vec<(String, String)> {
-    let mut fields: Vec<(String, String)> = Vec::new();
-    let mut add = |name: &str, value: &str| {
-        let name = name.trim();
-        if !(name.is_empty() && value.is_empty()) {
-            fields.push((name.to_owned(), value.to_owned()));
-        }
-    };
-    let (mut s, mut past_message) = (line, false);
-    while let Some(n) = s.find(['=', ' ']) {
-        let (name, separator) = (&s[..n], s.as_bytes()[n]);
-        s = &s[n + 1..];
-        if separator == b' ' {
-            if past_message {
-                add(name, "");
-            }
-            continue;
-        }
-        past_message = true;
-        assert!(
-            !s.starts_with(['\'', '`']),
-            "unmodelled quote after {name}= in: {line}"
-        );
-        let quoted = s.starts_with('"').then(|| go_quoted_prefix(s)).flatten();
-        assert!(
-            !strict || quoted.is_some() || !s.starts_with('"'),
-            "{name}= opens a quote Go cannot unquote in: {line}"
-        );
-        if let Some((value, len)) = quoted {
-            add(name, &value);
-            s = &s[len..];
-            match s.strip_prefix(' ') {
-                Some(rest) => s = rest,
-                None => return fields,
-            }
-            continue;
-        }
-        match s.split_once(' ') {
-            Some((value, rest)) => {
-                add(name, value);
-                s = rest;
-            }
-            None => {
-                add(name, s);
-                return fields;
-            }
-        }
-    }
-    if past_message {
-        add(s, "");
-    }
-    fields
-}
-
-/// The values of every `key` field on `fields`, in line order, empty ones
-/// included: an empty `client_id=` would blank the real one.
-fn field_values<'a>(fields: &'a [(String, String)], key: &str) -> Vec<&'a str> {
-    fields
-        .iter()
-        .filter(|(k, _)| k == key)
-        .map(|(_, v)| v.as_str())
-        .collect()
-}
-
-/// The helper reads a line the way that reader does, so it reproduces the
-/// forge Debug quoting allowed: Go rejects `\u{1}`, the value is read
+/// `unpack_logfmt` reads a line the way VictoriaLogs does, so it reproduces
+/// the forge Debug quoting allowed: Go rejects `\u{1}`, the value is read
 /// unquoted to the next space, and the rest parses as a second `client_id`.
 /// `strict` refuses the same line.
 #[test]
@@ -632,6 +556,64 @@ async fn header_fed_log_fields_cannot_forge_another_field() {
     }
 }
 
+/// An upstream's SSE `event:` names are upstream text. The
+/// `stream_end_no_usage` line carries them as one quoted value, so a name
+/// holding ` client_id=forged` reads back inside it and adds no field.
+#[tokio::test]
+async fn sse_event_names_cannot_forge_another_field() {
+    let buf = log_capture_buf();
+    let event = "x client_id=forged y";
+    let body = format!(
+        "event: {event}\ndata: {{}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+    );
+    let upstream = Router::new().fallback(any(move || {
+        let body = body.clone();
+        async move { ([("content-type", "text/event-stream")], body) }
+    }));
+    let upstream = format!("http://{}", serve(upstream).await);
+    let addr = serve(test_app(&upstream, None).0).await;
+    let marker = "sse-event-name-forge";
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "any")
+        .header("x-client-id", marker)
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.bytes().await.unwrap();
+
+    // The stream is finalized on a detached task, after the client's end of
+    // stream.
+    let mut line = None;
+    for _ in 0..100 {
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        line = output
+            .lines()
+            .find(|l| l.contains(marker) && l.contains("stream_end_no_usage"))
+            .map(str::to_owned);
+        if line.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let line = line.expect("a stream_end_no_usage line");
+    let fields = unpack_logfmt(&line, true);
+    let sent = format!("{event},message_stop");
+    assert_eq!(
+        field_values(&fields, "sse_events"),
+        [sent.as_str()],
+        "{line}"
+    );
+    assert_eq!(field_values(&fields, "client_id"), [marker], "{line}");
+}
+
 /// An upstream that answers every request as Anthropic answers an unknown
 /// model: a 404 whose message names the request body's own `model`.
 async fn model_not_found_upstream() -> String {
@@ -722,8 +704,7 @@ async fn body_fed_log_fields_cannot_forge_another_field() {
 
 /// A `model` of 40 KiB is cut to `MAX_LOGGED_VALUE_CHARS` on every line, so it
 /// cannot carry the `proxied` line past the log sink's `MAX_LINE_BYTES`, where
-/// the cut would leave the quote open and the rest of the value would read as
-/// fields.
+/// the sink would cut the fields after it, the token counts among them.
 #[tokio::test]
 async fn a_long_body_fed_value_cannot_push_a_line_past_the_sink_cut() {
     let buf = log_capture_buf();

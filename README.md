@@ -1335,11 +1335,11 @@ one JSON object per line
 1 MiB, or one second after its first line, whichever comes first, so a lone
 line arrives within about a second. Delivery is best effort and never slows a
 request: lines wait in a bounded in-memory queue (10,000 lines and 16 MiB), a
-line that finds it full is dropped, a line longer than 32 KiB is cut and marked
-with its full length (comfortably under VictoriaLogs' default 256 KiB line
-limit), and a batch that fails, times out (5 s) or gets a
-non-2xx answer is dropped, not retried. `anthropic_log_sink_lines_sent_total`
-and `anthropic_log_sink_lines_dropped_total` on `/metrics` count both
+line that finds it full is dropped, a line longer than 32 KiB is cut after its
+last whole field and marked with its full length (comfortably under
+VictoriaLogs' default 256 KiB line limit), and a batch that fails, times out
+(5 s) or gets a non-2xx answer is dropped, not retried.
+`anthropic_log_sink_lines_sent_total` and `anthropic_log_sink_lines_dropped_total` on `/metrics` count both
 outcomes; they are absent when no sink is configured. The proxy logs one
 warning when delivery starts failing and one line when it recovers, with the
 number of lines dropped meanwhile. At shutdown it waits up to 2 s for the

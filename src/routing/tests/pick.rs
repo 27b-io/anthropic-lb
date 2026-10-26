@@ -580,6 +580,75 @@ async fn mark_hard_limited_logs_unified_headers() {
     assert!(!line.contains("req_not_logged"), "{line}");
 }
 
+/// `status_5h`, `status_7d`, `claim` and `retry_after_raw` come from upstream
+/// headers, or from Redis. Each is one quoted value, `-` when absent, so text
+/// holding a space and ` client_id=forged` reads back whole, as a Go-strconv
+/// logfmt reader reads it, and adds no field.
+#[tokio::test]
+async fn upstream_fed_rate_limit_log_fields_read_back_whole() {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    // TRACE, for `rate info updated`, on this test's thread only.
+    let _log = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(CapturedLog(buf.clone()))
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new("anthropic_lb=trace"))
+            .finish(),
+    );
+    // A callsite another test's thread registered first can cache "never"
+    // for a scoped subscriber; the rebuild re-reads it with this one in place.
+    tracing::callsite::rebuild_interest_cache();
+    let state = test_state_with(vec![mk_endpoint("forge-fields", "sk-ant-api-a")]);
+    let forged = |v: &str| format!("{v} client_id=forged");
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in [
+        ("anthropic-ratelimit-unified-5h-status", forged("allowed")),
+        (
+            "anthropic-ratelimit-unified-representative-claim",
+            forged("five_hour"),
+        ),
+        (
+            "anthropic-ratelimit-unified-7d-utilization",
+            "0.5".to_owned(),
+        ),
+        (
+            "anthropic-ratelimit-unified-7d-status",
+            forged("allowed_warning"),
+        ),
+    ] {
+        headers.insert(name, HeaderValue::from_str(&value).unwrap());
+    }
+    state.update_rate_info(0, &headers).await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("retry-after", HeaderValue::from_str(&forged("7")).unwrap());
+    state.mark_hard_limited(0, &headers).await;
+    state
+        .mark_hard_limited(0, &reqwest::header::HeaderMap::new())
+        .await;
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let lines = |message: &str| -> Vec<&str> {
+        output
+            .lines()
+            .filter(|l| l.contains("forge-fields") && l.contains(message))
+            .collect()
+    };
+    let (rate, limited) = (lines("rate info updated"), lines("hard rate-limited"));
+    assert_eq!((rate.len(), limited.len()), (1, 2), "{output}");
+    for (line, key, sent) in [
+        (rate[0], "status_5h", forged("allowed")),
+        (rate[0], "status_7d", forged("allowed_warning")),
+        (rate[0], "claim", forged("five_hour")),
+        (limited[0], "retry_after_raw", forged("7")),
+        (limited[1], "retry_after_raw", "-".to_owned()),
+    ] {
+        let fields = unpack_logfmt(line, true);
+        assert_eq!(field_values(&fields, key), [sent.as_str()], "{line}");
+        assert!(field_values(&fields, "client_id").is_empty(), "{line}");
+    }
+}
+
 #[tokio::test]
 async fn mark_hard_limited_burst_exponential_backoff() {
     // Consecutive burst 429s should produce increasing cooldowns.
