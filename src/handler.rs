@@ -969,6 +969,26 @@ pub(crate) fn strip_client_identity_headers(headers: &mut axum::http::HeaderMap)
     }
 }
 
+/// Headers a browser adds to an extension's or page's `fetch`, which the
+/// caller cannot remove (`Origin` and `Sec-Fetch-*` are forbidden request
+/// headers). Relayed upstream, `Origin` makes Anthropic treat the request as
+/// a browser CORS call, and an organisation that disallows those answers 401
+/// even with a valid key (LAB-11390). The upstream call is server-to-server,
+/// so none of them describe it. Stripped unconditionally: unlike
+/// `CLIENT_IDENTITY_HEADERS`, no operator wants them relayed.
+pub(crate) fn strip_browser_context_headers(headers: &mut axum::http::HeaderMap) {
+    headers.remove("origin");
+    headers.remove("referer");
+    let sec_fetch: Vec<_> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("sec-fetch-"))
+        .cloned()
+        .collect();
+    for name in sec_fetch {
+        headers.remove(name);
+    }
+}
+
 /// Forward one Anthropic-protocol request to a single `Endpoint`. The caller
 /// passes the picked endpoint and its pool index (used for `skip` and usage
 /// accounting).
@@ -1027,6 +1047,7 @@ pub(crate) async fn forward_anthropic(
     headers.remove("host");
     headers.remove("content-length"); // body size may change after cache injection
     headers.remove("accept-encoding"); // need plaintext SSE to extract token usage
+    strip_browser_context_headers(&mut headers);
     if !state.forward_caller_identity {
         strip_client_identity_headers(&mut headers);
     }

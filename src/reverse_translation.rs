@@ -875,6 +875,7 @@ async fn forward_openai_compat_anthropic(
     }
     headers.remove("content-length"); // body size changes after translation
     headers.remove("accept-encoding"); // we need plaintext to translate the response
+    strip_browser_context_headers(&mut headers);
     if !state.forward_caller_identity {
         strip_client_identity_headers(&mut headers);
     }
