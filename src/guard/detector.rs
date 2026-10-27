@@ -812,21 +812,14 @@ fn chunk(text: &str, size: usize, overlap: usize) -> Vec<(usize, &str)> {
     let mut out = Vec::new();
     let mut start = 0;
     while start < text.len() {
-        let end = floor_char_boundary(text, (start + size).min(text.len()));
+        let end = text.floor_char_boundary((start + size).min(text.len()));
         out.push((start, &text[start..end]));
         if end == text.len() {
             break;
         }
-        start = floor_char_boundary(text, end - overlap);
+        start = text.floor_char_boundary(end - overlap);
     }
     out
-}
-
-fn floor_char_boundary(s: &str, mut i: usize) -> usize {
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
 }
 
 /// TEI `/predict` request for a batch: each input is its own one-element list

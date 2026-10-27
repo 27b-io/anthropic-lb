@@ -337,11 +337,7 @@ pub(crate) const MAX_STRIPPED_FIELDS_PER_REQUEST: usize = 8;
 /// is the log side, where the plain-text subscriber would otherwise let an
 /// embedded newline forge whole log LINES.
 pub(crate) fn sanitize_metric_key(raw: &str, max_len: usize) -> String {
-    let mut end = raw.len().min(max_len);
-    while !raw.is_char_boundary(end) {
-        end -= 1;
-    }
-    let clipped = &raw[..end];
+    let clipped = &raw[..raw.floor_char_boundary(max_len)];
     if clipped.is_empty()
         || !clipped
             .chars()
