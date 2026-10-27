@@ -406,6 +406,7 @@ Every install logs the document's exact bytes as base64, with its version and di
 | **Failed-auth throttle** | `auth_failure_limit` / `auth_failure_window_secs` | Further invalid credentials get 429 + `retry-after` per client IP after repeated failures; valid credentials always pass | on (10 / 300s) |
 | **Trusted proxies** | `trusted_proxies = ["192.0.2.0/24"]` | Real client IP recovered from `x-forwarded-for` behind a listed LB | header ignored |
 | **Caller-identity privacy** | `forward_caller_identity = false` | Caller IP and `x-client-id`/`x-agent-id`/`x-session-id` headers dropped before the upstream request | **stripped** |
+| **Browser-context headers** | always | `origin`, `referer` and `sec-fetch-*` dropped before the upstream request: a forwarded `Origin` makes Anthropic answer a browser caller's valid request with a CORS 401 | **stripped** |
 | **Model allow-list** | `clients[].models` | Rejects models outside a client's list (403) | all models |
 
 IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are held and matched as digests. Startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`), and a presented credential that short never matches.
