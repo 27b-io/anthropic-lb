@@ -546,8 +546,8 @@ pub(crate) fn compute_pressure_status(effective_util: f64, caller: &Caller) -> &
     };
 
     // Upgrade status if client's utilization limit proximity exceeds 80%
-    if let Some(limit) = caller.utilization_limit() {
-        if effective_util >= limit * 0.80 {
+    if let Some(limit) = caller.utilization_limit()
+        && effective_util >= limit * 0.80 {
             status = match status {
                 "healthy" => "elevated",
                 "elevated" => "critical",
@@ -555,7 +555,6 @@ pub(crate) fn compute_pressure_status(effective_util: f64, caller: &Caller) -> &
                 _ => status,
             };
         }
-    }
 
     status
 }

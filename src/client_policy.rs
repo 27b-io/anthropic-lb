@@ -947,13 +947,12 @@ fn check_credentials(config: &Config, auth_mode: &AuthMode) -> Result<(), String
     }
     // AC-13: a static bearer credential on a public ingress gets scanned;
     // below 32 characters the keyspace is the vulnerability.
-    if let Some(ref key) = config.proxy_key {
-        if key.len() < MIN_KEY_LEN {
+    if let Some(ref key) = config.proxy_key
+        && key.len() < MIN_KEY_LEN {
             return Err(format!(
                 "config: proxy_key is shorter than {MIN_KEY_LEN} characters — generate one with `openssl rand -hex 32`"
             ));
         }
-    }
     for c in &config.clients {
         if c.key.len() < MIN_KEY_LEN {
             return Err(format!(

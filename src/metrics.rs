@@ -734,8 +734,8 @@ pub(crate) async fn metrics_handler(
         }
         // Overage window — emitted only while overage is actively serving, so the
         // metric's presence itself signals an account on paid extra usage.
-        if s.overage_in_use {
-            if let Some(u) = s.overage_utilization {
+        if s.overage_in_use
+            && let Some(u) = s.overage_utilization {
                 prom_gauge(
                     &mut buf,
                     "anthropic_account_utilization",
@@ -743,7 +743,6 @@ pub(crate) async fn metrics_handler(
                     u,
                 );
             }
-        }
     }
 
     // Rate-limit status (ordinal: 0=allowed, 1=allowed_warning, 2=throttled, 3=rejected)

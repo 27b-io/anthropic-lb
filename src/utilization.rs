@@ -1973,8 +1973,8 @@ impl AppState {
                     // cooldown bounds the window.
                     {
                         let info = ep.rate_info.read().await;
-                        if let Some(until) = info.hard_limited_until {
-                            if now < until {
+                        if let Some(until) = info.hard_limited_until
+                            && now < until {
                                 trace!(
                                     endpoint = ep.name,
                                     hard_limited_secs = until.duration_since(now).as_secs(),
@@ -1982,9 +1982,8 @@ impl AppState {
                                 );
                                 continue;
                             }
-                        }
-                        if let Some(until) = info.transport.open_until {
-                            if now < until {
+                        if let Some(until) = info.transport.open_until
+                            && now < until {
                                 trace!(
                                     endpoint = ep.name,
                                     unhealthy_secs = until.duration_since(now).as_secs(),
@@ -1992,7 +1991,6 @@ impl AppState {
                                 );
                                 continue;
                             }
-                        }
                     }
                     // Push a fixed candidate at the configured priority. This
                     // is one of the three named `match protocol` sites (see
@@ -2017,8 +2015,8 @@ impl AppState {
                 }
                 Protocol::Anthropic => {
                     let info = ep.rate_info.read().await;
-                    if let Some(until) = info.hard_limited_until {
-                        if now < until {
+                    if let Some(until) = info.hard_limited_until
+                        && now < until {
                             trace!(
                                 endpoint = ep.name,
                                 hard_limited_secs = until.duration_since(now).as_secs(),
@@ -2026,11 +2024,10 @@ impl AppState {
                             );
                             continue;
                         }
-                    }
                     // Transport circuit breaker — independent of the 429 path
                     // above (rate limit ≠ transport health).
-                    if let Some(until) = info.transport.open_until {
-                        if now < until {
+                    if let Some(until) = info.transport.open_until
+                        && now < until {
                             trace!(
                                 endpoint = ep.name,
                                 unhealthy_secs = until.duration_since(now).as_secs(),
@@ -2038,7 +2035,6 @@ impl AppState {
                             );
                             continue;
                         }
-                    }
                     let stale_after_hard_limit = info
                         .hard_limited_until
                         .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
@@ -2295,11 +2291,10 @@ fn stale_after_hard_limit(info: &RateLimitInfo) -> bool {
 /// claim and the two agree.
 fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Option<(f64, f64)> {
     // Hard-limited members contribute zero (mirrors routing_candidates filter).
-    if let Some(until) = info.hard_limited_until {
-        if now < until {
+    if let Some(until) = info.hard_limited_until
+        && now < until {
             return None;
         }
-    }
 
     let stale_after_hard_limit = stale_after_hard_limit(info);
 

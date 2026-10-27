@@ -1310,11 +1310,10 @@ async fn pick_prefers_near_reset_account() {
     // Run 100 picks without affinity to see distribution
     let mut a_count = 0;
     for _ in 0..100 {
-        if let Some(idx) = state.pick_endpoint(None, "", &[]).await {
-            if idx == 0 {
+        if let Some(idx) = state.pick_endpoint(None, "", &[]).await
+            && idx == 0 {
                 a_count += 1;
             }
-        }
     }
     // A's effective = max(adj_5h, adj_7d) = max(0.95*0.167, 0.30) = 0.30
     // B's effective = max(0.60, 0.50) = 0.60 (5h outside discount zone)
@@ -1359,11 +1358,10 @@ async fn pick_throttled_excludes() {
 
     let mut b_count = 0;
     for _ in 0..100 {
-        if let Some(idx) = state.pick_endpoint(None, "", &[]).await {
-            if idx == 1 {
+        if let Some(idx) = state.pick_endpoint(None, "", &[]).await
+            && idx == 1 {
                 b_count += 1;
             }
-        }
     }
     // A is throttled → effective=0.98 → excluded by soft_limit=0.90
     // B gets all traffic
@@ -1411,11 +1409,9 @@ async fn pick_model_specific_7d_throttled_claim_excludes() {
         if let Some(idx) = state
             .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
             .await
-        {
-            if idx == 1 {
+            && idx == 1 {
                 b_count += 1;
             }
-        }
     }
 
     assert_eq!(
@@ -1453,11 +1449,10 @@ async fn pick_mid_block_unchanged() {
 
     let mut b_count = 0;
     for _ in 0..100 {
-        if let Some(idx) = state.pick_endpoint(None, "", &[]).await {
-            if idx == 1 {
+        if let Some(idx) = state.pick_endpoint(None, "", &[]).await
+            && idx == 1 {
                 b_count += 1;
             }
-        }
     }
     // A: effective=max(0.80, 0.40)=0.80, headroom=0.20
     // B: effective=max(0.40, 0.30)=0.40, headroom=0.60

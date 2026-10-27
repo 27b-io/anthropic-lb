@@ -93,14 +93,13 @@ use utilization::*;
 /// `warn!`). Priority collision with an openai endpoint stays a soft warning.
 fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
     for ep in endpoints {
-        if let Some(url) = ep.base_url.as_deref() {
-            if !url.starts_with("https://") {
+        if let Some(url) = ep.base_url.as_deref()
+            && !url.starts_with("https://") {
                 return Err(format!(
                     "endpoint '{}': base_url must start with https:// (got '{}')",
                     ep.name, url
                 ));
             }
-        }
         match ep.protocol {
             Protocol::OpenAI => {
                 if ep.base_url.is_none() {

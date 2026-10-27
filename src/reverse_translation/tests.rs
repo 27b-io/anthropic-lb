@@ -878,11 +878,10 @@ async fn openai_chat_streaming_fence_strip_gated_on_response_format() {
             if data == "[DONE]" {
                 continue;
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data)
+                && let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
                     content.push_str(c);
                 }
-            }
         }
         content
     }
@@ -965,11 +964,10 @@ async fn openai_chat_streaming() {
     for line in body.lines() {
         if line == "data: [DONE]" {
             got_done = true;
-        } else if let Some(data) = line.strip_prefix("data: ") {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+        } else if let Some(data) = line.strip_prefix("data: ")
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
                 chunks.push(v);
             }
-        }
     }
 
     assert!(got_done, "should have [DONE] sentinel");

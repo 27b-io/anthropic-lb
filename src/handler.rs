@@ -557,11 +557,10 @@ pub(crate) fn apply_round_outcome(
     // answer (LAB-4729): the re-send's 404, or the 429 of a merely rate-limited
     // pool, is the truer terminal cause. The endpoint stays, so the one-shot is
     // still spent and the refuser still skipped.
-    if !matches!(outcome, ForwardOutcome::RetryEntitlement(_)) {
-        if let Some((_, stashed)) = entitlement_resp.as_mut() {
+    if !matches!(outcome, ForwardOutcome::RetryEntitlement(_))
+        && let Some((_, stashed)) = entitlement_resp.as_mut() {
             *stashed = None;
         }
-    }
     match outcome {
         ForwardOutcome::Done(resp) => RetryStep::Return(*resp),
         // `proxy_handler` acts on a speed rejection before the outcome gets
@@ -1516,11 +1515,10 @@ pub(crate) async fn forward_anthropic(
                 .map(str::to_owned);
             // Count + trace upstream context-window overflows (LAB-916). The
             // 400 itself is forwarded below byte-for-byte, as before.
-            if status.as_u16() == 400 {
-                if let Some(msg) = prompt_too_long_message(&parsed) {
+            if status.as_u16() == 400
+                && let Some(msg) = prompt_too_long_message(&parsed) {
                     state.note_prompt_too_long(req_id, model, session_key, msg);
                 }
-            }
             // THIS account rejected the request — model outside its plan
             // (LAB-941) or fast mode not enabled on its org (LAB-2687):
             // negative-cache it and rotate — another account may serve it.
@@ -1916,8 +1914,8 @@ pub(crate) async fn proxy_handler(
 
     // Refused before the parse: a coded body can pass the `--` test below, or
     // even parse as JSON, as raw bytes.
-    if !body_bytes.is_empty() {
-        if let Some((header, coding)) = undecoded_body_coding(&parts.headers) {
+    if !body_bytes.is_empty()
+        && let Some((header, coding)) = undecoded_body_coding(&parts.headers) {
             warn!(
                 req_id,
                 client = %client_ip,
@@ -1933,7 +1931,6 @@ pub(crate) async fn proxy_handler(
                 &format!("request body {header} '{coding}' is not supported"),
             );
         }
-    }
 
     // Parse body once for model extraction, optional cache injection, and
     // the fast-mode flag that picks the rate bucket and routing pool downstream.
@@ -1947,8 +1944,8 @@ pub(crate) async fn proxy_handler(
     // line, and no JSON text starts with `--`. With codings refused above,
     // these bytes are the ones the upstream reads. Keyed on the bytes alone:
     // the client controls the path and the `Content-Type`.
-    if let Err(e) = &parse {
-        if !body_bytes.is_empty() && !body_bytes.starts_with(b"--") {
+    if let Err(e) = &parse
+        && !body_bytes.is_empty() && !body_bytes.starts_with(b"--") {
             warn!(
                 req_id,
                 client = %client_ip,
@@ -1963,7 +1960,6 @@ pub(crate) async fn proxy_handler(
                 "request body could not be parsed as JSON",
             );
         }
-    }
 
     // `mut`: a speed rejection strips `speed` from both bodies for every
     // later attempt, and the request is standard from then on (LAB-4190).
@@ -2247,9 +2243,9 @@ pub(crate) async fn proxy_handler(
     // opted-in clients; a hit then never touches an upstream — no rate-limit
     // headroom burned, no budget decrement, no usage recorded (AC9). Only
     // the hit counter and a digest-only log line observe it (AC5).
-    if let Some((key, surface)) = cache_key.as_ref().map(|(k, s)| (k.as_str(), *s)) {
-        if let Some(rc) = &state.response_cache {
-            if let Some(entry) = rc.lookup(&client_id, key, surface).await {
+    if let Some((key, surface)) = cache_key.as_ref().map(|(k, s)| (k.as_str(), *s))
+        && let Some(rc) = &state.response_cache
+            && let Some(entry) = rc.lookup(&client_id, key, surface).await {
                 info!(
                     req_id,
                     client_id = ?client_id,
@@ -2258,8 +2254,6 @@ pub(crate) async fn proxy_handler(
                 );
                 return cached_hit_response(entry);
             }
-        }
-    }
 
     let n = state.endpoints.len();
     let mut last_saw_529 = false;
@@ -2455,11 +2449,10 @@ pub(crate) async fn proxy_handler(
     // whenever no other account was attempted after it, so a pool whose other
     // accounts are hard-limited or cooling still gets it.
     let (extra_usage_refuser, entitlement_resp) = entitlement_resp.unzip();
-    if !last_saw_529 && !last_saw_transient {
-        if let Some(resp) = entitlement_resp.flatten() {
+    if !last_saw_529 && !last_saw_transient
+        && let Some(resp) = entitlement_resp.flatten() {
             return resp;
         }
-    }
     // A pool exhausted by account-level rejections alone (no 529/transient
     // in the final round, and the negative caches agree EVERY eligible
     // account rejects) returns the upstream's own error — truthful when no
