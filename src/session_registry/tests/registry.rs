@@ -74,9 +74,11 @@ fn session_registry_evicts_by_ttl() {
         assert!(map.contains_key("new"));
     }
     // The /_stats snapshot ALSO filters expired entries before any prune runs.
-    assert!(state
-        .sessions_snapshot(&state.current_client_policy(), 1_000 + 1801 + 1801)
-        .is_empty());
+    assert!(
+        state
+            .sessions_snapshot(&state.current_client_policy(), 1_000 + 1801 + 1801)
+            .is_empty()
+    );
 }
 
 #[test]

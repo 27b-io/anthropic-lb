@@ -1072,7 +1072,10 @@ mod redis_integration {
             .await;
         assert_eq!(conn.get::<_, Option<u64>>(&key).await.unwrap(), Some(5));
         assert!(
-            state.check_budget(&state.caller("poison-cli")).await.is_ok(),
+            state
+                .check_budget(&state.caller("poison-cli"))
+                .await
+                .is_ok(),
             "deliberate pin: a reachable redis counter (5) is authoritative over larger local state (165)"
         );
 
@@ -1608,10 +1611,12 @@ mod redis_integration {
         state
             .record_budget_usage(&state.caller("degrade-cli"), 50)
             .await;
-        assert!(state
-            .check_budget(&state.caller("degrade-cli"))
-            .await
-            .is_ok());
+        assert!(
+            state
+                .check_budget(&state.caller("degrade-cli"))
+                .await
+                .is_ok()
+        );
 
         kill_proxy(kill).await;
 
@@ -1689,10 +1694,12 @@ mod redis_integration {
         state
             .record_budget_usage(&state.caller("recover-cli"), 50)
             .await;
-        assert!(state
-            .check_budget(&state.caller("recover-cli"))
-            .await
-            .is_ok());
+        assert!(
+            state
+                .check_budget(&state.caller("recover-cli"))
+                .await
+                .is_ok()
+        );
 
         kill_proxy(kill).await;
 
@@ -1831,10 +1838,12 @@ mod redis_integration {
             "coordination gate must be closed before the first connect"
         );
         let ops = std::time::Instant::now();
-        assert!(state
-            .check_budget(&state.caller("startup-cli"))
-            .await
-            .is_ok());
+        assert!(
+            state
+                .check_budget(&state.caller("startup-cli"))
+                .await
+                .is_ok()
+        );
         state
             .record_budget_usage(&state.caller("startup-cli"), 50)
             .await;

@@ -292,13 +292,14 @@ impl AppState {
         {
             let info = ep.rate_info.read().await;
             if let Some(until) = info.hard_limited_until
-                && Instant::now() < until {
-                    debug!(
-                        endpoint = ep.name,
-                        "skipping probe, endpoint is hard-limited"
-                    );
-                    return;
-                }
+                && Instant::now() < until
+            {
+                debug!(
+                    endpoint = ep.name,
+                    "skipping probe, endpoint is hard-limited"
+                );
+                return;
+            }
         }
 
         // Local freshness check: skip if this model's 7d claim was recently refreshed.

@@ -514,7 +514,10 @@ pub(crate) fn lock_recovering<'a, T>(
     match mutex.lock() {
         Ok(g) => g,
         Err(poisoned) => {
-            warn!(lock = name, "mutex was poisoned by a panicking holder; recovered its data and cleared the poison");
+            warn!(
+                lock = name,
+                "mutex was poisoned by a panicking holder; recovered its data and cleared the poison"
+            );
             mutex.clear_poison();
             poisoned.into_inner()
         }
@@ -735,14 +738,15 @@ pub(crate) async fn metrics_handler(
         // Overage window — emitted only while overage is actively serving, so the
         // metric's presence itself signals an account on paid extra usage.
         if s.overage_in_use
-            && let Some(u) = s.overage_utilization {
-                prom_gauge(
-                    &mut buf,
-                    "anthropic_account_utilization",
-                    &[("account", &s.name), ("window", "overage")],
-                    u,
-                );
-            }
+            && let Some(u) = s.overage_utilization
+        {
+            prom_gauge(
+                &mut buf,
+                "anthropic_account_utilization",
+                &[("account", &s.name), ("window", "overage")],
+                u,
+            );
+        }
     }
 
     // Rate-limit status (ordinal: 0=allowed, 1=allowed_warning, 2=throttled, 3=rejected)

@@ -384,9 +384,10 @@ pub(crate) fn translate_openai_response_to_anthropic(
 
     // Text content
     if let Some(text) = message.get("content").and_then(|c| c.as_str())
-        && !text.is_empty() {
-            content_blocks.push(serde_json::json!({"type": "text", "text": text}));
-        }
+        && !text.is_empty()
+    {
+        content_blocks.push(serde_json::json!({"type": "text", "text": text}));
+    }
 
     // Tool calls → tool_use blocks
     if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
@@ -652,13 +653,15 @@ pub(crate) fn translate_openai_sse_to_anthropic(
 
     // Capture model from first chunk
     if let Some(model) = parsed.get("model").and_then(|v| v.as_str())
-        && ctx.model.is_empty() {
-            ctx.model = model.to_string();
-        }
+        && ctx.model.is_empty()
+    {
+        ctx.model = model.to_string();
+    }
     if let Some(id) = parsed.get("id").and_then(|v| v.as_str())
-        && let Some(stripped) = id.strip_prefix("chatcmpl-") {
-            ctx.id = format!("msg_{}", stripped);
-        }
+        && let Some(stripped) = id.strip_prefix("chatcmpl-")
+    {
+        ctx.id = format!("msg_{}", stripped);
+    }
 
     let delta = match parsed.pointer("/choices/0/delta") {
         Some(d) => d,
@@ -690,36 +693,37 @@ pub(crate) fn translate_openai_sse_to_anthropic(
 
     // Text content delta
     if let Some(text) = delta.get("content").and_then(|c| c.as_str())
-        && !text.is_empty() {
-            if !ctx.in_text_block {
-                // Close tool block if open
-                if ctx.in_tool_use {
-                    events.push(make_anthropic_event(
-                        "content_block_stop",
-                        &serde_json::json!({"type": "content_block_stop", "index": ctx.block_index}),
-                    ));
-                    ctx.in_tool_use = false;
-                }
-                ctx.block_index += 1;
-                ctx.in_text_block = true;
+        && !text.is_empty()
+    {
+        if !ctx.in_text_block {
+            // Close tool block if open
+            if ctx.in_tool_use {
                 events.push(make_anthropic_event(
-                    "content_block_start",
-                    &serde_json::json!({
-                        "type": "content_block_start",
-                        "index": ctx.block_index,
-                        "content_block": {"type": "text", "text": ""}
-                    }),
+                    "content_block_stop",
+                    &serde_json::json!({"type": "content_block_stop", "index": ctx.block_index}),
                 ));
+                ctx.in_tool_use = false;
             }
+            ctx.block_index += 1;
+            ctx.in_text_block = true;
             events.push(make_anthropic_event(
-                "content_block_delta",
+                "content_block_start",
                 &serde_json::json!({
-                    "type": "content_block_delta",
+                    "type": "content_block_start",
                     "index": ctx.block_index,
-                    "delta": {"type": "text_delta", "text": text}
+                    "content_block": {"type": "text", "text": ""}
                 }),
             ));
         }
+        events.push(make_anthropic_event(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": ctx.block_index,
+                "delta": {"type": "text_delta", "text": text}
+            }),
+        ));
+    }
 
     // Tool calls
     if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
@@ -1103,9 +1107,10 @@ async fn forward_openai_compat_anthropic(
                 // Count + trace context-window overflows here too (LAB-916) —
                 // this path consumes the same Anthropic windows as the native one.
                 if status.as_u16() == 400
-                    && let Some(msg) = prompt_too_long_message(&parsed) {
-                        state.note_prompt_too_long(req_id, model, session_key, msg);
-                    }
+                    && let Some(msg) = prompt_too_long_message(&parsed)
+                {
+                    state.note_prompt_too_long(req_id, model, session_key, msg);
+                }
                 // Same model-rejection detection as the native path (LAB-941),
                 // and the same entitlement 400 (LAB-4729).
                 rejection =
@@ -1270,14 +1275,15 @@ async fn forward_openai_compat_anthropic(
             if !ctx.terminal.reached() && !client_gone {
                 let remaining = splitter.remainder();
                 if !remaining.trim().is_empty()
-                    && let Some(translated) = translate_sse_event(&remaining, &mut ctx) {
-                        if translated.ends_with("data: [DONE]\n\n") && !ctx.terminal.errored {
-                            ctx.terminal.completed = true;
-                        }
-                        if !relay_send(&tx, translated.into(), &req_id_clone).await {
-                            client_gone = true;
-                        }
+                    && let Some(translated) = translate_sse_event(&remaining, &mut ctx)
+                {
+                    if translated.ends_with("data: [DONE]\n\n") && !ctx.terminal.errored {
+                        ctx.terminal.completed = true;
                     }
+                    if !relay_send(&tx, translated.into(), &req_id_clone).await {
+                        client_gone = true;
+                    }
+                }
             }
 
             // Ensure [DONE] is always sent (skip once any terminator is out —
@@ -1836,10 +1842,12 @@ pub(crate) async fn openai_chat_handler(
         // Entitlement 400 first, outside the rejection gate — as in
         // `proxy_handler` (LAB-4729).
         let (extra_usage_refuser, entitlement_resp) = entitlement_resp.unzip();
-        if !last_saw_529 && !last_saw_transient
-            && let Some(resp) = entitlement_resp.flatten() {
-                return resp;
-            }
+        if !last_saw_529
+            && !last_saw_transient
+            && let Some(resp) = entitlement_resp.flatten()
+        {
+            return resp;
+        }
         // Same rejection-exhaustion rule as `proxy_handler` (LAB-941, as
         // generalised by LAB-2687), in the OpenAI error shape this handler's
         // clients parse. Never `fast`: the OpenAI→Anthropic translation

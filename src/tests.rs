@@ -386,10 +386,12 @@ fn auth_throttle_rejects_a_zero_window_while_enabled() {
     .unwrap_err();
     assert!(err.contains("auth_failure_window_secs"), "{err}");
     // Explicitly disabled throttle: a zero window is fine because it is never read.
-    assert!(validate_auth_throttle(&cfg(&format!(
-        "proxy_key = \"{STRONG_KEY}\"\nauth_failure_limit = 0\nauth_failure_window_secs = 0\n"
-    )))
-    .is_ok());
+    assert!(
+        validate_auth_throttle(&cfg(&format!(
+            "proxy_key = \"{STRONG_KEY}\"\nauth_failure_limit = 0\nauth_failure_window_secs = 0\n"
+        )))
+        .is_ok()
+    );
 }
 
 /// Every rule that used to be a `main()` panic is now reachable from
@@ -398,7 +400,10 @@ fn auth_throttle_rejects_a_zero_window_while_enabled() {
 fn load_config_refuses_what_main_used_to_panic_on() {
     let base = "listen = \"0.0.0.0:8080\"\nallow_unauthenticated = true\n";
     for (fragment, needle) in [
-        ("[client_utilization_limits]\ngeo = 2.0\n", "client_utilization_limits.geo"),
+        (
+            "[client_utilization_limits]\ngeo = 2.0\n",
+            "client_utilization_limits.geo",
+        ),
         ("operators = [\"-\"]\n", "operators cannot contain '-'"),
         (
             "[response_cache]\nbackend = \"redis\"\nredis_url = \"redis://localhost\"\nmaster_key = \"00\"\nclients = [\"-\"]\n",

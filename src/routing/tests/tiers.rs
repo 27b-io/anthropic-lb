@@ -493,9 +493,11 @@ fn is_operator_checks_configured_operator() {
             }),
     );
 
-    assert!(state
-        .current_client_policy()
-        .is_operator("special-operator"));
+    assert!(
+        state
+            .current_client_policy()
+            .is_operator("special-operator")
+    );
     assert!(!state.current_client_policy().is_operator("regular-client"));
 }
 

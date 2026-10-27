@@ -317,9 +317,15 @@ impl AppState {
                     };
                 }
                 if matches!(bind, MigrationReason::Floored) {
-                    log_migration!(info, "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)");
+                    log_migration!(
+                        info,
+                        "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)"
+                    );
                 } else {
-                    log_migration!(warn, "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)");
+                    log_migration!(
+                        warn,
+                        "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)"
+                    );
                 }
                 picked = other;
             }
@@ -777,14 +783,15 @@ impl AppState {
         for (name, value) in headers.iter() {
             let name_str = name.as_str();
             if (name_str.contains("ratelimit") || name_str.contains("retry"))
-                && let Ok(v) = value.to_str() {
-                    tracing::trace!(
-                        account = endpoint_name,
-                        header = name_str,
-                        value = v,
-                        "rate-limit header"
-                    );
-                }
+                && let Ok(v) = value.to_str()
+            {
+                tracing::trace!(
+                    account = endpoint_name,
+                    header = name_str,
+                    value = v,
+                    "rate-limit header"
+                );
+            }
         }
 
         // Parse representative claim FIRST — determines where 7d data is stored.
@@ -863,21 +870,23 @@ impl AppState {
         // Sanity-capped: 5h window can't reset >5h out, 7d can't reset >7d out (Bug #6).
         if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-reset")
             && let Ok(s) = v.to_str()
-                && let Ok(epoch) = s.parse::<u64>()
-                    && epoch <= now_epoch + 18000 {
-                        info.reset_5h = Some(epoch);
-                    }
+            && let Ok(epoch) = s.parse::<u64>()
+            && epoch <= now_epoch + 18000
+        {
+            info.reset_5h = Some(epoch);
+        }
         // 7d reset → only update existing claims_7d entries. Creating a placeholder
         // with utilization=None would shadow real fallback entries in resolve_7d_claim
         // (model-specific key takes priority over "seven_day" via or_else).
         if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-reset")
             && let Ok(s) = v.to_str()
-                && let Ok(epoch) = s.parse::<u64>()
-                    && epoch <= now_epoch + 604800
-                        && let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
-                            entry.reset = Some(epoch);
-                            entry.last_seen = now_epoch;
-                        }
+            && let Ok(epoch) = s.parse::<u64>()
+            && epoch <= now_epoch + 604800
+            && let Some(entry) = info.claims_7d.get_mut(claim_key_7d)
+        {
+            entry.reset = Some(epoch);
+            entry.last_seen = now_epoch;
+        }
 
         // Capture per-window status. These signal API-side pressure (burst limits, concurrent
         // request limits, per-model sub-limits) that raw utilization percentages don't reflect.
@@ -893,10 +902,11 @@ impl AppState {
         // 7d status → only update existing claims_7d entries (same shadowing concern).
         if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-status") {
             if let Ok(s) = v.to_str()
-                && let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
-                    entry.status = Some(s.to_string());
-                    entry.last_seen = now_epoch;
-                }
+                && let Some(entry) = info.claims_7d.get_mut(claim_key_7d)
+            {
+                entry.status = Some(s.to_string());
+                entry.last_seen = now_epoch;
+            }
         } else if got_7d_util {
             // Status absent but util present → pressure subsided for this claim
             if let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
@@ -916,35 +926,36 @@ impl AppState {
         // shadowing rule as the general 7d claim).
         if let Some(v) = headers.get("anthropic-ratelimit-unified-7d_oi-utilization")
             && let Ok(s) = v.to_str()
-                && let Ok(util) = s.parse::<f64>() {
-                    let first_sighting = !info.claims_7d.contains_key(FABLE_BAND_CLAIM);
-                    let entry = info
-                        .claims_7d
-                        .entry(FABLE_BAND_CLAIM.to_string())
-                        .or_default();
-                    entry.utilization = Some(util.clamp(0.0, 1.0));
-                    entry.last_seen = now_epoch;
-                    entry.reset = headers
-                        .get("anthropic-ratelimit-unified-7d_oi-reset")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .filter(|&epoch| epoch <= now_epoch + 604800) // 7d sanity cap
-                        .or(entry.reset);
-                    // Status absent within a present triplet = pressure subsided
-                    // (same semantics as the general 7d claim, Bug #1).
-                    entry.status = headers
-                        .get("anthropic-ratelimit-unified-7d_oi-status")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
-                    if first_sighting {
-                        info!(
-                            account = endpoint_name,
-                            utilization = util,
-                            "fable band claim first observed (7d_oi headers) — \
+            && let Ok(util) = s.parse::<f64>()
+        {
+            let first_sighting = !info.claims_7d.contains_key(FABLE_BAND_CLAIM);
+            let entry = info
+                .claims_7d
+                .entry(FABLE_BAND_CLAIM.to_string())
+                .or_default();
+            entry.utilization = Some(util.clamp(0.0, 1.0));
+            entry.last_seen = now_epoch;
+            entry.reset = headers
+                .get("anthropic-ratelimit-unified-7d_oi-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|&epoch| epoch <= now_epoch + 604800) // 7d sanity cap
+                .or(entry.reset);
+            // Status absent within a present triplet = pressure subsided
+            // (same semantics as the general 7d claim, Bug #1).
+            entry.status = headers
+                .get("anthropic-ratelimit-unified-7d_oi-status")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            if first_sighting {
+                info!(
+                    account = endpoint_name,
+                    utilization = util,
+                    "fable band claim first observed (7d_oi headers) — \
                              fable-aware routing active for this account"
-                        );
-                    }
-                }
+                );
+            }
+        }
 
         // Overage (paid extra usage) — account-level, covers whichever subscription
         // window is exhausted. `overage-in-use` is always overwritten: header absent
@@ -1034,25 +1045,29 @@ impl AppState {
         // Legacy headers (still try them)
         let mut got_legacy = false;
         if let Some(v) = headers.get("x-ratelimit-remaining-requests")
-            && let Ok(s) = v.to_str() {
-                info.remaining_requests = s.parse().ok();
-                got_legacy = true;
-            }
+            && let Ok(s) = v.to_str()
+        {
+            info.remaining_requests = s.parse().ok();
+            got_legacy = true;
+        }
         if let Some(v) = headers.get("x-ratelimit-remaining-tokens")
-            && let Ok(s) = v.to_str() {
-                info.remaining_tokens = s.parse().ok();
-                got_legacy = true;
-            }
+            && let Ok(s) = v.to_str()
+        {
+            info.remaining_tokens = s.parse().ok();
+            got_legacy = true;
+        }
         if let Some(v) = headers.get("x-ratelimit-limit-requests")
-            && let Ok(s) = v.to_str() {
-                info.limit_requests = s.parse().ok();
-                got_legacy = true;
-            }
+            && let Ok(s) = v.to_str()
+        {
+            info.limit_requests = s.parse().ok();
+            got_legacy = true;
+        }
         if let Some(v) = headers.get("x-ratelimit-limit-tokens")
-            && let Ok(s) = v.to_str() {
-                info.limit_tokens = s.parse().ok();
-                got_legacy = true;
-            }
+            && let Ok(s) = v.to_str()
+        {
+            info.limit_tokens = s.parse().ok();
+            got_legacy = true;
+        }
 
         // Only advance last_updated when we actually parsed rate-limit data.
         // Responses without rate headers (e.g. 5xx) must not clear
@@ -1116,9 +1131,10 @@ impl AppState {
             let key = format!("alb:rate:{}", endpoint_name);
             tokio::spawn(async move {
                 if let Ok(json) = serde_json::to_string(&rate_data)
-                    && let Err(e) = redis_set_ex(&conn, &key, json, ttl as i64).await {
-                        tracing::warn!(error = %e, "redis rate info write failed");
-                    }
+                    && let Err(e) = redis_set_ex(&conn, &key, json, ttl as i64).await
+                {
+                    tracing::warn!(error = %e, "redis rate info write failed");
+                }
             });
         }
     }
@@ -1354,45 +1370,45 @@ impl AppState {
         if let Ok(values) = redis.mget::<Vec<Option<String>>, _>(rate_keys).await {
             for (i, val) in values.iter().enumerate() {
                 if let Some(json) = val
-                    && let Ok(remote) = serde_json::from_str::<RedisRateInfo>(json) {
-                        let mut info = targets[i].rate_info.write().await;
-                        // "Most recent wins": only apply remote data if it's newer
-                        // Both ages use wall-clock epoch to avoid mixed-clock-domain bugs
-                        let local_age = info
-                            .last_updated_epoch
-                            .map(|epoch| now_epoch.saturating_sub(epoch))
-                            .unwrap_or(u64::MAX);
-                        let remote_age = now_epoch.saturating_sub(remote.updated_at);
-                        if remote_age < local_age {
-                            info.utilization = remote.utilization;
-                            info.utilization_5h = remote.utilization_5h;
-                            info.utilization_7d = remote.utilization_7d;
-                            info.reset_5h = remote.reset_5h;
-                            info.reset_7d = remote.reset_7d;
-                            info.status_5h = remote.status_5h;
-                            info.status_7d = remote.status_7d;
-                            info.claims_7d = bound_ingested_claims(remote.claims_7d);
-                            // Truncated to match the keys `bound_ingested_claims`
-                            // just wrote — see the same pairing in `load_state`.
-                            info.representative_claim =
-                                remote.representative_claim.as_deref().map(truncate_label);
-                            info.remaining_requests = remote.remaining_requests;
-                            info.remaining_tokens = remote.remaining_tokens;
-                            info.limit_requests = remote.limit_requests;
-                            info.limit_tokens = remote.limit_tokens;
-                            info.overage_in_use = remote.overage_in_use;
-                            info.overage_status = remote.overage_status;
-                            info.overage_utilization = remote.overage_utilization;
-                            info.overage_reset = remote.overage_reset;
-                            info.last_updated = Some(now_instant);
-                            info.last_updated_epoch = Some(remote.updated_at);
-                            trace!(
-                                endpoint = targets[i].name,
-                                remote_age,
-                                "synced rate info from redis"
-                            );
-                        }
+                    && let Ok(remote) = serde_json::from_str::<RedisRateInfo>(json)
+                {
+                    let mut info = targets[i].rate_info.write().await;
+                    // "Most recent wins": only apply remote data if it's newer
+                    // Both ages use wall-clock epoch to avoid mixed-clock-domain bugs
+                    let local_age = info
+                        .last_updated_epoch
+                        .map(|epoch| now_epoch.saturating_sub(epoch))
+                        .unwrap_or(u64::MAX);
+                    let remote_age = now_epoch.saturating_sub(remote.updated_at);
+                    if remote_age < local_age {
+                        info.utilization = remote.utilization;
+                        info.utilization_5h = remote.utilization_5h;
+                        info.utilization_7d = remote.utilization_7d;
+                        info.reset_5h = remote.reset_5h;
+                        info.reset_7d = remote.reset_7d;
+                        info.status_5h = remote.status_5h;
+                        info.status_7d = remote.status_7d;
+                        info.claims_7d = bound_ingested_claims(remote.claims_7d);
+                        // Truncated to match the keys `bound_ingested_claims`
+                        // just wrote — see the same pairing in `load_state`.
+                        info.representative_claim =
+                            remote.representative_claim.as_deref().map(truncate_label);
+                        info.remaining_requests = remote.remaining_requests;
+                        info.remaining_tokens = remote.remaining_tokens;
+                        info.limit_requests = remote.limit_requests;
+                        info.limit_tokens = remote.limit_tokens;
+                        info.overage_in_use = remote.overage_in_use;
+                        info.overage_status = remote.overage_status;
+                        info.overage_utilization = remote.overage_utilization;
+                        info.overage_reset = remote.overage_reset;
+                        info.last_updated = Some(now_instant);
+                        info.last_updated_epoch = Some(remote.updated_at);
+                        trace!(
+                            endpoint = targets[i].name,
+                            remote_age, "synced rate info from redis"
+                        );
                     }
+                }
             }
         }
 
@@ -1406,14 +1422,15 @@ impl AppState {
                 if let Some(csv) = val {
                     let mut parts = csv.splitn(3, ',');
                     if let (Some(w_str), Some(s_str)) = (parts.next(), parts.next())
-                        && let (Ok(w), Ok(s)) = (w_str.parse::<f64>(), s_str.parse::<f64>()) {
-                            targets[i].weight.store(w.to_bits(), Ordering::Relaxed);
-                            targets[i].share.store(s.to_bits(), Ordering::Relaxed);
-                            // Gate is optional (backward compat with older publishers)
-                            if let Some(Ok(g)) = parts.next().map(|g| g.parse::<f64>()) {
-                                targets[i].gate.store(g.to_bits(), Ordering::Relaxed);
-                            }
+                        && let (Ok(w), Ok(s)) = (w_str.parse::<f64>(), s_str.parse::<f64>())
+                    {
+                        targets[i].weight.store(w.to_bits(), Ordering::Relaxed);
+                        targets[i].share.store(s.to_bits(), Ordering::Relaxed);
+                        // Gate is optional (backward compat with older publishers)
+                        if let Some(Ok(g)) = parts.next().map(|g| g.parse::<f64>()) {
+                            targets[i].gate.store(g.to_bits(), Ordering::Relaxed);
                         }
+                    }
                 }
             }
         }

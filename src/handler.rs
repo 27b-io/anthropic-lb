@@ -120,8 +120,7 @@ fn is_gateway_model_rejection(msg: &str, model: &str) -> bool {
 /// upstream response exists. The matcher requires this exact string, so if
 /// upstream rewords it, rotation stops and the 400 reaches the client as it
 /// did before LAB-2687.
-const FAST_MODE_NOT_ENABLED_MSG: &str =
-    "Fast mode is not enabled for your organization. An organization admin must enable this feature.";
+const FAST_MODE_NOT_ENABLED_MSG: &str = "Fast mode is not enabled for your organization. An organization admin must enable this feature.";
 
 /// True when an upstream 400 says this ACCOUNT's org has fast mode disabled
 /// (LAB-2687): 400 `{"type":"error","error":{"type":"invalid_request_error",
@@ -558,9 +557,10 @@ pub(crate) fn apply_round_outcome(
     // pool, is the truer terminal cause. The endpoint stays, so the one-shot is
     // still spent and the refuser still skipped.
     if !matches!(outcome, ForwardOutcome::RetryEntitlement(_))
-        && let Some((_, stashed)) = entitlement_resp.as_mut() {
-            *stashed = None;
-        }
+        && let Some((_, stashed)) = entitlement_resp.as_mut()
+    {
+        *stashed = None;
+    }
     match outcome {
         ForwardOutcome::Done(resp) => RetryStep::Return(*resp),
         // `proxy_handler` acts on a speed rejection before the outcome gets
@@ -1516,9 +1516,10 @@ pub(crate) async fn forward_anthropic(
             // Count + trace upstream context-window overflows (LAB-916). The
             // 400 itself is forwarded below byte-for-byte, as before.
             if status.as_u16() == 400
-                && let Some(msg) = prompt_too_long_message(&parsed) {
-                    state.note_prompt_too_long(req_id, model, session_key, msg);
-                }
+                && let Some(msg) = prompt_too_long_message(&parsed)
+            {
+                state.note_prompt_too_long(req_id, model, session_key, msg);
+            }
             // THIS account rejected the request — model outside its plan
             // (LAB-941) or fast mode not enabled on its org (LAB-2687):
             // negative-cache it and rotate — another account may serve it.
@@ -1915,22 +1916,23 @@ pub(crate) async fn proxy_handler(
     // Refused before the parse: a coded body can pass the `--` test below, or
     // even parse as JSON, as raw bytes.
     if !body_bytes.is_empty()
-        && let Some((header, coding)) = undecoded_body_coding(&parts.headers) {
-            warn!(
-                req_id,
-                client = %client_ip,
-                client_id = ?client_id,
-                path = %GoQuoted(parts.uri.path()),
-                header,
-                coding = ?coding,
-                "rejected: request body has a coding the proxy does not decode"
-            );
-            return proxy_error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                &format!("request body {header} '{coding}' is not supported"),
-            );
-        }
+        && let Some((header, coding)) = undecoded_body_coding(&parts.headers)
+    {
+        warn!(
+            req_id,
+            client = %client_ip,
+            client_id = ?client_id,
+            path = %GoQuoted(parts.uri.path()),
+            header,
+            coding = ?coding,
+            "rejected: request body has a coding the proxy does not decode"
+        );
+        return proxy_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("request body {header} '{coding}' is not supported"),
+        );
+    }
 
     // Parse body once for model extraction, optional cache injection, and
     // the fast-mode flag that picks the rate bucket and routing pool downstream.
@@ -1945,21 +1947,23 @@ pub(crate) async fn proxy_handler(
     // these bytes are the ones the upstream reads. Keyed on the bytes alone:
     // the client controls the path and the `Content-Type`.
     if let Err(e) = &parse
-        && !body_bytes.is_empty() && !body_bytes.starts_with(b"--") {
-            warn!(
-                req_id,
-                client = %client_ip,
-                client_id = ?client_id,
-                path = %GoQuoted(parts.uri.path()),
-                error = %e,
-                "rejected: request body could not be parsed as JSON"
-            );
-            return proxy_error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "request body could not be parsed as JSON",
-            );
-        }
+        && !body_bytes.is_empty()
+        && !body_bytes.starts_with(b"--")
+    {
+        warn!(
+            req_id,
+            client = %client_ip,
+            client_id = ?client_id,
+            path = %GoQuoted(parts.uri.path()),
+            error = %e,
+            "rejected: request body could not be parsed as JSON"
+        );
+        return proxy_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "request body could not be parsed as JSON",
+        );
+    }
 
     // `mut`: a speed rejection strips `speed` from both bodies for every
     // later attempt, and the request is standard from then on (LAB-4190).

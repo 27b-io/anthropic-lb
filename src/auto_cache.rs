@@ -31,10 +31,11 @@ pub(crate) fn inject_cache_breakpoints(body: &mut serde_json::Value) -> CacheInj
     // 1. Tools — add cache_control to last tool
     if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut())
         && let Some(last) = tools.last_mut()
-            && let Some(obj) = last.as_object_mut() {
-                obj.insert("cache_control".to_string(), cache_marker.clone());
-                result.tools = true;
-            }
+        && let Some(obj) = last.as_object_mut()
+    {
+        obj.insert("cache_control".to_string(), cache_marker.clone());
+        result.tools = true;
+    }
 
     // 2. System — string → array conversion, or annotate last block
     if let Some(system) = body.get_mut("system") {
@@ -47,10 +48,11 @@ pub(crate) fn inject_cache_breakpoints(body: &mut serde_json::Value) -> CacheInj
             result.system = true;
         } else if let Some(arr) = system.as_array_mut()
             && let Some(last) = arr.last_mut()
-                && let Some(obj) = last.as_object_mut() {
-                    obj.insert("cache_control".to_string(), cache_marker.clone());
-                    result.system = true;
-                }
+            && let Some(obj) = last.as_object_mut()
+        {
+            obj.insert("cache_control".to_string(), cache_marker.clone());
+            result.system = true;
+        }
     }
 
     // 3. Messages — find last user message, annotate its content
@@ -59,21 +61,23 @@ pub(crate) fn inject_cache_breakpoints(body: &mut serde_json::Value) -> CacheInj
             .iter_mut()
             .rev()
             .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-            && let Some(content) = last_user.get_mut("content") {
-                if let Some(text) = content.as_str().map(String::from) {
-                    *content = serde_json::json!([{
-                        "type": "text",
-                        "text": text,
-                        "cache_control": cache_marker,
-                    }]);
-                    result.messages = true;
-                } else if let Some(arr) = content.as_array_mut()
-                    && let Some(last) = arr.last_mut()
-                        && let Some(obj) = last.as_object_mut() {
-                            obj.insert("cache_control".to_string(), cache_marker.clone());
-                            result.messages = true;
-                        }
-            }
+        && let Some(content) = last_user.get_mut("content")
+    {
+        if let Some(text) = content.as_str().map(String::from) {
+            *content = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": cache_marker,
+            }]);
+            result.messages = true;
+        } else if let Some(arr) = content.as_array_mut()
+            && let Some(last) = arr.last_mut()
+            && let Some(obj) = last.as_object_mut()
+        {
+            obj.insert("cache_control".to_string(), cache_marker.clone());
+            result.messages = true;
+        }
+    }
 
     result
 }
@@ -177,20 +181,21 @@ pub(crate) fn debug_dump_cache_control(body: &serde_json::Value, req_id: &str) {
                 count += 1;
             }
             if let Some(content) = msg.get("content")
-                && let Some(arr) = content.as_array() {
-                    for (j, block) in arr.iter().enumerate() {
-                        if let Some(cc) = block.get("cache_control") {
-                            debug!(
-                                req_id,
-                                location = format_args!("messages[{i}].content[{j}]"),
-                                role = %GoQuoted(role),
-                                cache_control = %GoQuoted(&cc.to_string()),
-                                "body cache_control"
-                            );
-                            count += 1;
-                        }
+                && let Some(arr) = content.as_array()
+            {
+                for (j, block) in arr.iter().enumerate() {
+                    if let Some(cc) = block.get("cache_control") {
+                        debug!(
+                            req_id,
+                            location = format_args!("messages[{i}].content[{j}]"),
+                            role = %GoQuoted(role),
+                            cache_control = %GoQuoted(&cc.to_string()),
+                            "body cache_control"
+                        );
+                        count += 1;
                     }
                 }
+            }
         }
     }
     let msg_count = body

@@ -242,8 +242,8 @@ fn a_disabled_record_far_ahead_merges() {
 }
 
 #[test]
-fn an_enabled_record_more_than_15_minutes_ahead_is_ignored_with_a_skew_alert_until_the_clock_is_fixed(
-) {
+fn an_enabled_record_more_than_15_minutes_ahead_is_ignored_with_a_skew_alert_until_the_clock_is_fixed()
+ {
     let mut reader = Reader::default();
     merge(
         &mut reader,

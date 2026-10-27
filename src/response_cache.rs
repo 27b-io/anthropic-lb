@@ -230,7 +230,7 @@ impl ResponseCache {
             other => {
                 return Err(format!(
                     "response_cache.backend must be \"cachekitio\" or \"redis\", got \"{other}\""
-                ))
+                ));
             }
         };
         Self::from_parts(
@@ -601,9 +601,9 @@ impl AuthThrottle {
                             .iter()
                             .min_by_key(|(_, (start, count))| (*count, *start))
                             .map(|(k, _)| *k)
-                        {
-                            entries.remove(&victim);
-                        }
+                    {
+                        entries.remove(&victim);
+                    }
                 }
                 entries.insert(ip, (Instant::now(), 1));
             }

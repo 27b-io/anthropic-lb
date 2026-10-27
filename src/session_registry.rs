@@ -980,16 +980,17 @@ impl AppState {
     fn shadow_log(&self, entry: serde_json::Value) {
         if let Some(ref tx) = self.shadow_log_tx
             && let Ok(line) = serde_json::to_string(&entry)
-                && tx.try_send(line).is_err() {
-                    let dropped = self.shadow_log_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                    // Rate-limit warning: log at powers of 2 to avoid log spam
-                    if dropped.is_power_of_two() {
-                        warn!(
-                            total_dropped = dropped,
-                            "shadow log channel full, entries being dropped"
-                        );
-                    }
-                }
+            && tx.try_send(line).is_err()
+        {
+            let dropped = self.shadow_log_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            // Rate-limit warning: log at powers of 2 to avoid log spam
+            if dropped.is_power_of_two() {
+                warn!(
+                    total_dropped = dropped,
+                    "shadow log channel full, entries being dropped"
+                );
+            }
+        }
     }
 
     /// Check if the caller is within its daily token budget. Returns Ok(()), or Err with the
@@ -1036,9 +1037,11 @@ impl AppState {
 
         // Local fallback
         if let Some(&(day, used)) = self.lock_budget_usage().get(client_id)
-            && day == today && used >= limit {
-                return Err(retry_after);
-            }
+            && day == today
+            && used >= limit
+        {
+            return Err(retry_after);
+        }
         Ok(())
     }
 
@@ -1259,10 +1262,11 @@ impl AppState {
                 _ => info.reset_5h.or(info.reset_7d), // unified best-effort
             };
             if let Some(r) = reset_epoch
-                && r > now_epoch {
-                    let secs = r - now_epoch;
-                    nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
-                }
+                && r > now_epoch
+            {
+                let secs = r - now_epoch;
+                nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
+            }
         }
 
         if all_above && any_compatible && any_known {

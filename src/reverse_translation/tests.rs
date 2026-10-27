@@ -361,19 +361,19 @@ fn reverse_sse_no_duplicate_message_stop() {
 
     // Start message
     translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
     // Text
     translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
     // Finish — emits message_stop
     let finish_events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        &mut ctx,
+    );
     let stop_count = finish_events
         .iter()
         .filter(|e| e.contains("message_stop"))
@@ -630,25 +630,25 @@ fn reverse_sse_basic_text() {
 
     // First chunk with role
     let events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
     assert!(ctx.message_started);
     assert!(events.iter().any(|e| e.contains("message_start")));
 
     // Text delta
     let events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
     assert!(events.iter().any(|e| e.contains("text_delta")));
     assert!(events.iter().any(|e| e.contains("Hello")));
 
     // Finish
     let events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        &mut ctx,
+    );
     assert!(events.iter().any(|e| e.contains("message_delta")));
     assert!(events.iter().any(|e| e.contains("end_turn")));
     assert!(events.iter().any(|e| e.contains("message_stop")));
@@ -660,9 +660,9 @@ fn reverse_sse_tool_use() {
 
     // Tool call start
     let events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
     assert!(ctx.message_started);
     assert!(ctx.in_tool_use);
     assert!(events.iter().any(|e| e.contains("content_block_start")));
@@ -671,16 +671,16 @@ fn reverse_sse_tool_use() {
 
     // Tool arguments delta
     let events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\"\"}}]},\"finish_reason\":null}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\"\"}}]},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
     assert!(events.iter().any(|e| e.contains("input_json_delta")));
 
     // Finish
     let events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        &mut ctx,
+    );
     assert!(events.iter().any(|e| e.contains("content_block_stop")));
     assert!(events.iter().any(|e| e.contains("tool_use")));
 }
@@ -879,9 +879,10 @@ async fn openai_chat_streaming_fence_strip_gated_on_response_format() {
                 continue;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data)
-                && let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
-                    content.push_str(c);
-                }
+                && let Some(c) = v["choices"][0]["delta"]["content"].as_str()
+            {
+                content.push_str(c);
+            }
         }
         content
     }
@@ -965,9 +966,10 @@ async fn openai_chat_streaming() {
         if line == "data: [DONE]" {
             got_done = true;
         } else if let Some(data) = line.strip_prefix("data: ")
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                chunks.push(v);
-            }
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(data)
+        {
+            chunks.push(v);
+        }
     }
 
     assert!(got_done, "should have [DONE] sentinel");

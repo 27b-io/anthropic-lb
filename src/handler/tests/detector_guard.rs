@@ -2,7 +2,7 @@
 //! a mock sidecar. Tier 0's scanners are left out (`Guard::with_detector`) so
 //! every verdict here is the detector's.
 
-use super::content_guard::{spawn_guard_body_upstream, TEST_ENDPOINT_TOKEN};
+use super::content_guard::{TEST_ENDPOINT_TOKEN, spawn_guard_body_upstream};
 use super::*;
 use crate::guard::detector::Lane;
 use crate::guard::{Detector, GuardPolicy};

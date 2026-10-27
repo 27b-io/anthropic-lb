@@ -16,8 +16,8 @@
 //! Findings carry **offsets only, never the matched text** — into logs, metrics,
 //! and the 400 body alike. The matched secret never leaves the scanner.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1191,9 +1191,10 @@ mod tests {
         assert!(findings.iter().all(|f| f.scanner == "secrets_scanner"));
         assert!(findings.iter().all(|f| f.end > f.start));
         // Negative: ordinary prose.
-        assert!(s
-            .scan(&input("the quick brown fox jumps over the lazy dog"))
-            .is_empty());
+        assert!(
+            s.scan(&input("the quick brown fox jumps over the lazy dog"))
+                .is_empty()
+        );
     }
 
     #[test]
