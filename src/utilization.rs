@@ -1065,11 +1065,7 @@ pub(crate) fn extract_client_version(ua: &str) -> Option<&str> {
     let ver = ua
         .split_once('/')
         .map(|(_, rest)| rest.split_once(' ').map_or(rest, |(ver, _)| ver))?;
-    if ver.is_empty() {
-        None
-    } else {
-        Some(ver)
-    }
+    if ver.is_empty() { None } else { Some(ver) }
 }
 
 /// Used to look up model-specific rate-limit claims (e.g., "seven_day_sonnet").
@@ -1969,25 +1965,25 @@ impl AppState {
                     // cooldown bounds the window.
                     {
                         let info = ep.rate_info.read().await;
-                        if let Some(until) = info.hard_limited_until {
-                            if now < until {
-                                trace!(
-                                    endpoint = ep.name,
-                                    hard_limited_secs = until.duration_since(now).as_secs(),
-                                    "pick: skipping hard-limited endpoint"
-                                );
-                                continue;
-                            }
+                        if let Some(until) = info.hard_limited_until
+                            && now < until
+                        {
+                            trace!(
+                                endpoint = ep.name,
+                                hard_limited_secs = until.duration_since(now).as_secs(),
+                                "pick: skipping hard-limited endpoint"
+                            );
+                            continue;
                         }
-                        if let Some(until) = info.transport.open_until {
-                            if now < until {
-                                trace!(
-                                    endpoint = ep.name,
-                                    unhealthy_secs = until.duration_since(now).as_secs(),
-                                    "pick: skipping transport-unhealthy endpoint"
-                                );
-                                continue;
-                            }
+                        if let Some(until) = info.transport.open_until
+                            && now < until
+                        {
+                            trace!(
+                                endpoint = ep.name,
+                                unhealthy_secs = until.duration_since(now).as_secs(),
+                                "pick: skipping transport-unhealthy endpoint"
+                            );
+                            continue;
                         }
                     }
                     // Push a fixed candidate at the configured priority. This
@@ -2013,27 +2009,27 @@ impl AppState {
                 }
                 Protocol::Anthropic => {
                     let info = ep.rate_info.read().await;
-                    if let Some(until) = info.hard_limited_until {
-                        if now < until {
-                            trace!(
-                                endpoint = ep.name,
-                                hard_limited_secs = until.duration_since(now).as_secs(),
-                                "pick: skipping hard-limited endpoint"
-                            );
-                            continue;
-                        }
+                    if let Some(until) = info.hard_limited_until
+                        && now < until
+                    {
+                        trace!(
+                            endpoint = ep.name,
+                            hard_limited_secs = until.duration_since(now).as_secs(),
+                            "pick: skipping hard-limited endpoint"
+                        );
+                        continue;
                     }
                     // Transport circuit breaker — independent of the 429 path
                     // above (rate limit ≠ transport health).
-                    if let Some(until) = info.transport.open_until {
-                        if now < until {
-                            trace!(
-                                endpoint = ep.name,
-                                unhealthy_secs = until.duration_since(now).as_secs(),
-                                "pick: skipping transport-unhealthy endpoint"
-                            );
-                            continue;
-                        }
+                    if let Some(until) = info.transport.open_until
+                        && now < until
+                    {
+                        trace!(
+                            endpoint = ep.name,
+                            unhealthy_secs = until.duration_since(now).as_secs(),
+                            "pick: skipping transport-unhealthy endpoint"
+                        );
+                        continue;
                     }
                     let stale_after_hard_limit = info
                         .hard_limited_until
@@ -2291,10 +2287,10 @@ fn stale_after_hard_limit(info: &RateLimitInfo) -> bool {
 /// claim and the two agree.
 fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Option<(f64, f64)> {
     // Hard-limited members contribute zero (mirrors routing_candidates filter).
-    if let Some(until) = info.hard_limited_until {
-        if now < until {
-            return None;
-        }
+    if let Some(until) = info.hard_limited_until
+        && now < until
+    {
+        return None;
     }
 
     let stale_after_hard_limit = stale_after_hard_limit(info);

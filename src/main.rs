@@ -1,11 +1,11 @@
 use axum::{
+    Router,
     body::Body,
     extract::State,
     http::{HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
-    Router,
 };
 use fred::{
     clients::RedisClient,
@@ -23,8 +23,8 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -93,13 +93,13 @@ use utilization::*;
 /// `warn!`). Priority collision with an openai endpoint stays a soft warning.
 fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
     for ep in endpoints {
-        if let Some(url) = ep.base_url.as_deref() {
-            if !url.starts_with("https://") {
-                return Err(format!(
-                    "endpoint '{}': base_url must start with https:// (got '{}')",
-                    ep.name, url
-                ));
-            }
+        if let Some(url) = ep.base_url.as_deref()
+            && !url.starts_with("https://")
+        {
+            return Err(format!(
+                "endpoint '{}': base_url must start with https:// (got '{}')",
+                ep.name, url
+            ));
         }
         match ep.protocol {
             Protocol::OpenAI => {
@@ -558,7 +558,9 @@ async fn main() {
             );
         }
         AuthMode::SharedKey(_) => {
-            warn!("legacy shared proxy_key in use — every caller shares one identity; migrate to [[clients]] (see README §Client Setup)");
+            warn!(
+                "legacy shared proxy_key in use — every caller shares one identity; migrate to [[clients]] (see README §Client Setup)"
+            );
         }
         AuthMode::Open => {
             // ClientPolicy::build allows this mode only with the flag

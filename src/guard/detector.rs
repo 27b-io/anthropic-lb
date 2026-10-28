@@ -47,7 +47,7 @@ use futures_util::future::join_all;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use super::{detections_summary, DurationHistogram, Finding, GuardPolicy, VerdictCounts};
+use super::{DurationHistogram, Finding, GuardPolicy, VerdictCounts, detections_summary};
 use crate::breaker::Breaker;
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 2000;

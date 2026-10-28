@@ -291,14 +291,14 @@ impl AppState {
         // Check if hard-limited — don't waste a request
         {
             let info = ep.rate_info.read().await;
-            if let Some(until) = info.hard_limited_until {
-                if Instant::now() < until {
-                    debug!(
-                        endpoint = ep.name,
-                        "skipping probe, endpoint is hard-limited"
-                    );
-                    return;
-                }
+            if let Some(until) = info.hard_limited_until
+                && Instant::now() < until
+            {
+                debug!(
+                    endpoint = ep.name,
+                    "skipping probe, endpoint is hard-limited"
+                );
+                return;
             }
         }
 

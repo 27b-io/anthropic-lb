@@ -414,9 +414,11 @@ async fn second_speed_400_reaches_caller_unchanged() {
         ),
         (2, 0)
     );
-    assert!(metrics(addr)
-        .await
-        .contains(r#"anthropic_speed_unsupported_total{model="claude-fable-5-1"} 1"#));
+    assert!(
+        metrics(addr)
+            .await
+            .contains(r#"anthropic_speed_unsupported_total{model="claude-fable-5-1"} 1"#)
+    );
 }
 
 /// AC-4 / AC-5: a 429 on the re-send follows the normal policy, cooling the

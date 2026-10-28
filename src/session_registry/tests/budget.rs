@@ -5,10 +5,12 @@ use super::*;
 #[tokio::test]
 async fn budget_check_no_limit_configured() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
-    assert!(state
-        .check_budget(&state.caller("any-client"))
-        .await
-        .is_ok());
+    assert!(
+        state
+            .check_budget(&state.caller("any-client"))
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]

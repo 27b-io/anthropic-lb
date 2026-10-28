@@ -490,8 +490,8 @@ pub(crate) async fn spawn_flaky_upstream(
     dead_first: usize,
     body: &'static [u8],
 ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let hits = Arc::new(AtomicUsize::new(0));
     let h = hits.clone();
@@ -507,9 +507,9 @@ pub(crate) async fn spawn_flaky_upstream(
             let mut buf = [0u8; 4096];
             let _ = s.read(&mut buf).await; // drain the request before responding
             let head = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
-                );
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
             let _ = s.write_all(head.as_bytes()).await;
             let _ = s.write_all(body).await;
             let _ = s.flush().await;
@@ -540,8 +540,8 @@ pub(crate) async fn spawn_status_then_ok_upstream(
     bad_head: &'static str,
     ok_body: &'static [u8],
 ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let hits = Arc::new(AtomicUsize::new(0));
     let h = hits.clone();

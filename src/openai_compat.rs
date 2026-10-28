@@ -121,13 +121,13 @@ fn make_openai_chunk(
 /// base64 source; anything else (including malformed data URLs) becomes a url
 /// source so upstream rejects it with a real error instead of us dropping it.
 fn openai_image_part_to_anthropic(url: &str) -> serde_json::Value {
-    if let Some(rest) = url.strip_prefix("data:") {
-        if let Some((media_type, data)) = rest.split_once(";base64,") {
-            return serde_json::json!({
-                "type": "image",
-                "source": {"type": "base64", "media_type": media_type, "data": data},
-            });
-        }
+    if let Some(rest) = url.strip_prefix("data:")
+        && let Some((media_type, data)) = rest.split_once(";base64,")
+    {
+        return serde_json::json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": data},
+        });
     }
     serde_json::json!({
         "type": "image",
@@ -206,11 +206,7 @@ pub(crate) fn translate_openai_to_anthropic(body: &serde_json::Value) -> serde_j
                         let has_tool_result = arr.iter().any(|el| {
                             el.get("type").and_then(|t| t.as_str()) == Some("tool_result")
                         });
-                        if has_tool_result {
-                            Some(arr)
-                        } else {
-                            None
-                        }
+                        if has_tool_result { Some(arr) } else { None }
                     } else {
                         None
                     }

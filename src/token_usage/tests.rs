@@ -189,9 +189,11 @@ fn inject_auth_non_oauth_token_uses_x_api_key() {
         inject_account_auth(&mut headers, token, false, &default_betas());
         assert_eq!(headers.get("x-api-key").unwrap(), token);
         assert!(headers.get("authorization").is_none());
-        assert!(headers
-            .get("anthropic-dangerous-direct-browser-access")
-            .is_none());
+        assert!(
+            headers
+                .get("anthropic-dangerous-direct-browser-access")
+                .is_none()
+        );
     }
 }
 

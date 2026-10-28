@@ -230,7 +230,7 @@ impl ResponseCache {
             other => {
                 return Err(format!(
                     "response_cache.backend must be \"cachekitio\" or \"redis\", got \"{other}\""
-                ))
+                ));
             }
         };
         Self::from_parts(
@@ -596,14 +596,13 @@ impl AuthThrottle {
                     // attacker's escape hatch).
                     let window = self.window;
                     entries.retain(|_, (start, _)| start.elapsed() < window);
-                    if entries.len() >= self.capacity {
-                        if let Some(victim) = entries
+                    if entries.len() >= self.capacity
+                        && let Some(victim) = entries
                             .iter()
                             .min_by_key(|(_, (start, count))| (*count, *start))
                             .map(|(k, _)| *k)
-                        {
-                            entries.remove(&victim);
-                        }
+                    {
+                        entries.remove(&victim);
                     }
                 }
                 entries.insert(ip, (Instant::now(), 1));

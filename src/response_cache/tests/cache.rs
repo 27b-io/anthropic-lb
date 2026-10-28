@@ -806,10 +806,11 @@ async fn response_cache_redis_backend_fails_open_when_down() {
         .expect("dead redis must not be a config error")
         .expect("allow-list is non-empty");
     let started = std::time::Instant::now();
-    assert!(rc
-        .lookup("geo", &"a".repeat(64), CacheSurface::Messages)
-        .await
-        .is_none());
+    assert!(
+        rc.lookup("geo", &"a".repeat(64), CacheSurface::Messages)
+            .await
+            .is_none()
+    );
     assert!(started.elapsed() < Duration::from_secs(5));
     assert!(rc.errors.load(Ordering::Relaxed) >= 1);
 }

@@ -247,11 +247,11 @@ async fn affinity_override_spreads_across_pool_not_single_best() {
         destinations.insert(idx);
     }
     assert!(
-            destinations.len() >= 2,
-            "overridden sessions herded onto {} account(s) {:?}; expected spread across the healthy pool",
-            destinations.len(),
-            destinations,
-        );
+        destinations.len() >= 2,
+        "overridden sessions herded onto {} account(s) {:?}; expected spread across the healthy pool",
+        destinations.len(),
+        destinations,
+    );
 }
 
 /// Regression (GH#156 / LAB-2684): two accounts under IDENTICAL load whose

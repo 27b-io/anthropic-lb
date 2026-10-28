@@ -104,7 +104,7 @@ async fn proxy_returns_502_when_upstream_body_read_fails() {
             tokio::spawn(async move {
                 let mut buf = [0u8; 8192];
                 let _ = sock.read(&mut buf).await; // best-effort drain request
-                                                   // Promise 4096 bytes, send a partial JSON prefix, then close.
+                // Promise 4096 bytes, send a partial JSON prefix, then close.
                 let _ = sock
                         .write_all(
                             b"HTTP/1.1 200 OK\r\n\
@@ -343,8 +343,7 @@ async fn proxy_preserves_key_order_when_auto_cache_mutates() {
         .unwrap();
     });
 
-    let input_body =
-            "{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}";
+    let input_body = "{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}";
     let expected_body = "{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"max_tokens\":1}";
 
     let client = Client::new();
