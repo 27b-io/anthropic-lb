@@ -1287,12 +1287,15 @@ impl AppState {
         }
     }
 
-    /// Sync shared state from Redis: hard limits + rate info.
-    /// Called periodically by background task.
-    pub(crate) async fn sync_from_redis(&self) {
+    /// Sync shared state from Redis. Every scope syncs hard limits, flushes
+    /// transport errors and refreshes the cluster info (budgets, heartbeats);
+    /// `SyncScope::Full` also syncs rate info and routing weights.
+    /// Called periodically by background task. Returns whether the rate-info
+    /// read ran and succeeded, which only a `Full` tick attempts.
+    pub(crate) async fn sync_from_redis(&self, scope: SyncScope) -> bool {
         let redis = match self.coordination_redis() {
             Some(r) => r,
-            None => return,
+            None => return false,
         };
         let now_epoch = Self::now_epoch();
         let now_instant = Instant::now();
@@ -1361,13 +1364,29 @@ impl AppState {
             }
         }
 
-        // 2. Sync rate info (MGET for all targets in one round-trip)
+        // 2. Flush this replica's transport-error deltas into the shared Redis
+        //    hash so the fleet-wide by-kind count is visible cluster-wide.
+        //    Drains the local accumulator; the cluster_info refresh below then
+        //    reads the freshly-flushed total back via HGETALL.
+        self.flush_transport_errors().await;
+
+        // 3. Refresh cluster info cache for /_stats endpoint
+        let info = self.cluster_info().await;
+        *self.lock_cluster_info_cache() = info;
+
+        if scope == SyncScope::Fast {
+            return false;
+        }
+
+        // 4. Sync rate info (MGET for all targets in one round-trip)
         let rate_keys: Vec<String> = targets
             .iter()
             .map(|t| format!("alb:rate:{}", t.name))
             .collect();
 
-        if let Ok(values) = redis.mget::<Vec<Option<String>>, _>(rate_keys).await {
+        let rate_reply = redis.mget::<Vec<Option<String>>, _>(rate_keys).await;
+        let rate_synced = rate_reply.is_ok();
+        if let Ok(values) = rate_reply {
             for (i, val) in values.iter().enumerate() {
                 if let Some(json) = val
                     && let Ok(remote) = serde_json::from_str::<RedisRateInfo>(json)
@@ -1412,7 +1431,7 @@ impl AppState {
             }
         }
 
-        // 3. Sync precomputed routing weights (published by probing pod)
+        // 5. Sync precomputed routing weights (published by probing pod)
         let weight_keys: Vec<String> = targets
             .iter()
             .map(|t| format!("alb:weight:{}", t.name))
@@ -1434,16 +1453,7 @@ impl AppState {
                 }
             }
         }
-
-        // 4. Flush this replica's transport-error deltas into the shared Redis
-        //    hash so the fleet-wide by-kind count is visible cluster-wide.
-        //    Drains the local accumulator; the cluster_info refresh below then
-        //    reads the freshly-flushed total back via HGETALL.
-        self.flush_transport_errors().await;
-
-        // 5. Refresh cluster info cache for /_stats endpoint
-        let info = self.cluster_info().await;
-        *self.lock_cluster_info_cache() = info;
+        rate_synced
     }
 
     /// Lock the transport-error accumulator via `lock_recovering`. Every

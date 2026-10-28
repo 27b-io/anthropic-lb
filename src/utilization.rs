@@ -138,6 +138,63 @@ pub(crate) const REDIS_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 /// permanence.
 pub(crate) const REDIS_STARTUP_GRACE: Duration = Duration::from_secs(5);
 
+/// Period of the Redis sync loop. Every tick reads the hard limits, the
+/// budget counters and the transport-error hash and writes this instance's
+/// heartbeat, so a 429 cooldown reaches every instance within this period.
+pub(crate) const REDIS_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Period of the sync loop's rate-info and routing-weight reads. Each is an
+/// MGET over every account, and the rate-info values are JSON, so these two
+/// reads carry most of the loop's bytes; sync traffic grows with accounts ×
+/// instances. An instance applies its own upstream responses at once, so
+/// only its view of the other instances' traffic lags, by up to this period.
+pub(crate) const REDIS_SLOW_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+
+const _: () = assert!(
+    REDIS_SLOW_SYNC_INTERVAL
+        .as_secs()
+        .is_multiple_of(REDIS_SYNC_INTERVAL.as_secs()),
+    "the slow sync period must be a whole number of sync ticks"
+);
+
+/// Which reads one `sync_from_redis` tick makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncScope {
+    /// Hard limits, budgets, heartbeats and transport errors.
+    Fast,
+    /// `Fast` plus every account's rate info and routing weight.
+    Full,
+}
+
+/// Picks each sync tick's scope. The first tick and every
+/// `REDIS_SLOW_SYNC_INTERVAL / REDIS_SYNC_INTERVAL`th after it are `Full`, and
+/// a full tick stays due until its rate-info read lands. So an instance that
+/// starts before Redis answers pulls the fleet's rate view on its first tick
+/// that reaches Redis, not a slow period later.
+#[derive(Debug, Default)]
+pub(crate) struct SyncCadence {
+    tick: u64,
+}
+
+impl SyncCadence {
+    pub(crate) fn scope(&self) -> SyncScope {
+        const FULL_EVERY: u64 = REDIS_SLOW_SYNC_INTERVAL.as_secs() / REDIS_SYNC_INTERVAL.as_secs();
+        if self.tick.is_multiple_of(FULL_EVERY) {
+            SyncScope::Full
+        } else {
+            SyncScope::Fast
+        }
+    }
+
+    /// Record the tick just run; `rate_synced` is what `sync_from_redis`
+    /// returned for it.
+    pub(crate) fn advance(&mut self, rate_synced: bool) {
+        if self.scope() == SyncScope::Fast || rate_synced {
+            self.tick = self.tick.wrapping_add(1);
+        }
+    }
+}
+
 /// Build the coordination Redis client and spawn its connection task WITHOUT
 /// waiting for the first connect (LAB-1639). `Err` only for an unparseable
 /// URL — an unreachable backend is not an error here.
