@@ -170,9 +170,11 @@ fn legacy_proxy_key_still_authenticates_and_yields_no_principal() {
         "legacy path has no principal — identity stays header/IP-derived"
     );
 
-    assert!(state
-        .authenticate(&hdrs(&[("x-api-key", &test_key("nope"))]), false)
-        .is_err());
+    assert!(
+        state
+            .authenticate(&hdrs(&[("x-api-key", &test_key("nope"))]), false)
+            .is_err()
+    );
     assert!(state.authenticate(&hyper::HeaderMap::new(), false).is_err());
 }
 
@@ -197,11 +199,13 @@ fn legacy_proxy_key_leaves_x_client_id_resolution_intact() {
 #[test]
 fn open_proxy_authenticates_every_request() {
     let state = test_state_with(vec![]);
-    assert!(state
-        .authenticate(&hyper::HeaderMap::new(), false)
-        .unwrap()
-        .principal
-        .is_none());
+    assert!(
+        state
+            .authenticate(&hyper::HeaderMap::new(), false)
+            .unwrap()
+            .principal
+            .is_none()
+    );
 }
 
 // ── Keys held and matched as digests ──
@@ -218,11 +222,13 @@ fn open_proxy_ignores_whatever_credential_is_presented() {
                 ("x-api-key", &key),
                 ("authorization", &format!("Bearer {key}")),
             ]);
-            assert!(state
-                .authenticate(&headers, allow_bearer)
-                .unwrap()
-                .principal
-                .is_none());
+            assert!(
+                state
+                    .authenticate(&headers, allow_bearer)
+                    .unwrap()
+                    .principal
+                    .is_none()
+            );
         }
     }
 }
@@ -238,11 +244,13 @@ fn legacy_shared_key_is_held_and_matched_as_a_digest() {
         "the state holds the digest, not the key"
     );
     let bearer = hdrs(&[("authorization", &format!("Bearer {key}"))]);
-    assert!(state
-        .authenticate(&bearer, true)
-        .unwrap()
-        .principal
-        .is_none());
+    assert!(
+        state
+            .authenticate(&bearer, true)
+            .unwrap()
+            .principal
+            .is_none()
+    );
     assert!(
         state.authenticate(&bearer, false).is_err(),
         "the native surface still reads only x-api-key"
@@ -263,10 +271,12 @@ fn a_short_presented_key_never_matches_and_is_counted_and_throttled() {
         }),
     );
     // Guard against a vacuous pass: the table really holds the short key.
-    assert!(state
-        .current_client_policy()
-        .principals
-        .contains_key(&key_digest(&short)));
+    assert!(
+        state
+            .current_client_policy()
+            .principals
+            .contains_key(&key_digest(&short))
+    );
 
     let ip = test_ip();
     let peer: SocketAddr = "10.0.0.7:40000".parse().unwrap();
@@ -445,9 +455,11 @@ fn model_matcher_refuses_a_comma_model_under_a_list() {
         &test_key("k1"),
         &["claude-haiku-*"],
     )]);
-    assert!(!state
-        .caller("limited")
-        .allows_model("claude-haiku-4-5,claude-opus-5"));
+    assert!(
+        !state
+            .caller("limited")
+            .allows_model("claude-haiku-4-5,claude-opus-5")
+    );
 }
 
 #[test]
@@ -468,9 +480,11 @@ fn client_allow_list_hit_miss_wildcard_and_empty() {
     // miss
     assert!(!state.caller("limited").allows_model("claude-opus-5"));
     // a near-miss on the exact pattern is still a miss
-    assert!(!state
-        .caller("limited")
-        .allows_model("claude-sonnet-4-6-extra"));
+    assert!(
+        !state
+            .caller("limited")
+            .allows_model("claude-sonnet-4-6-extra")
+    );
     // empty list = all models
     assert!(state.caller("unlimited").allows_model("claude-opus-5"));
     // unknown client (legacy path only) = all models
@@ -655,15 +669,19 @@ async fn model_denial_increments_counter_per_client_and_model() {
         &["claude-haiku-*"],
     )]);
     for _ in 0..3 {
-        assert!(state
-            .pre_request_gate("-", &state.caller("limited"), "claude-opus-5")
-            .await
-            .is_err());
+        assert!(
+            state
+                .pre_request_gate("-", &state.caller("limited"), "claude-opus-5")
+                .await
+                .is_err()
+        );
     }
-    assert!(state
-        .pre_request_gate("-", &state.caller("limited"), "claude-fable-5")
-        .await
-        .is_err());
+    assert!(
+        state
+            .pre_request_gate("-", &state.caller("limited"), "claude-fable-5")
+            .await
+            .is_err()
+    );
 
     let counts = state.model_denied.lock().unwrap();
     assert_eq!(
@@ -730,17 +748,21 @@ async fn model_denial_literal_other_model_does_not_alias_overflow_bucket() {
         &test_key("k1"),
         &["claude-haiku-*"],
     )]);
-    assert!(state
-        .pre_request_gate("-", &state.caller("limited"), "_other")
-        .await
-        .is_err());
+    assert!(
+        state
+            .pre_request_gate("-", &state.caller("limited"), "_other")
+            .await
+            .is_err()
+    );
     for i in 0..(MAX_MODEL_DENIED_LABELS + 25) {
         state.note_model_denied(&state.caller("limited"), &format!("junk-model-{i}"));
     }
-    assert!(state
-        .pre_request_gate("-", &state.caller("limited"), "_other")
-        .await
-        .is_err());
+    assert!(
+        state
+            .pre_request_gate("-", &state.caller("limited"), "_other")
+            .await
+            .is_err()
+    );
 
     let counts = state.model_denied.lock().unwrap();
     assert_eq!(
@@ -768,10 +790,12 @@ async fn model_denial_escape_keeps_other_and_dunder_other_distinct() {
     // Bare `other` guards the leading-`_` requirement: without it, `other`
     // would be escaped onto `_other` and pre-claim the overflow bucket.
     for model in ["other", "_other", "__other"] {
-        assert!(state
-            .pre_request_gate("-", &state.caller("limited"), model)
-            .await
-            .is_err());
+        assert!(
+            state
+                .pre_request_gate("-", &state.caller("limited"), model)
+                .await
+                .is_err()
+        );
     }
 
     let counts = state.model_denied.lock().unwrap();
@@ -1004,10 +1028,12 @@ async fn metrics_exposes_the_model_denial_counter() {
         }),
     );
     let app = build_router(state.clone());
-    assert!(state
-        .pre_request_gate("-", &state.caller("limited"), "claude-opus-5")
-        .await
-        .is_err());
+    assert!(
+        state
+            .pre_request_gate("-", &state.caller("limited"), "claude-opus-5")
+            .await
+            .is_err()
+    );
 
     let addr = serve(app).await;
     let body = Client::new()

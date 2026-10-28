@@ -77,7 +77,7 @@ async fn cluster_info_returns_none_without_redis() {
 async fn sync_from_redis_noop_without_redis() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
     // Should not panic or error when redis is None
-    state.sync_from_redis().await;
+    state.sync_from_redis(SyncScope::Full).await;
     // Cluster cache should remain None
     assert!(state.cluster_info_cache.lock().unwrap().is_none());
 }
@@ -95,7 +95,7 @@ async fn sync_and_publish_handle_endpoint_pool_without_redis() {
         st.endpoints.push(make_endpoint("ep-oai", Protocol::OpenAI));
     }
     // Both paths must be no-ops (redis is None) and must not panic.
-    state.sync_from_redis().await;
+    state.sync_from_redis(SyncScope::Full).await;
     state.publish_routing_weights().await;
     assert!(state.cluster_info_cache.lock().unwrap().is_none());
 }
@@ -211,7 +211,7 @@ async fn hard_limit_unchanged_by_sync_without_redis() {
     }
 
     // sync_from_redis should not touch it when redis is None
-    state.sync_from_redis().await;
+    state.sync_from_redis(SyncScope::Full).await;
 
     let info = state.endpoints[0].rate_info.read().await;
     assert!(info.hard_limited_until.is_some());

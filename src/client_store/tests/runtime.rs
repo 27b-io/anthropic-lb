@@ -1068,12 +1068,14 @@ async fn the_metrics_export_what_is_held_and_every_alert() {
         5
     );
     for name in ["u1", "u2", "u3", "u4", "u5"] {
-        assert!(series(
-            &metrics,
-            "anthropic_client_store_unmatched_disabled_name",
-            &format!("name=\"{name}\"")
-        )
-        .is_some());
+        assert!(
+            series(
+                &metrics,
+                "anthropic_client_store_unmatched_disabled_name",
+                &format!("name=\"{name}\"")
+            )
+            .is_some()
+        );
     }
     assert_eq!(
         series(&metrics, "anthropic_client_store_revoked_outside_store", "").as_deref(),
@@ -1128,12 +1130,14 @@ async fn the_metrics_export_what_is_held_and_every_alert() {
         .as_deref(),
         Some("1")
     );
-    assert!(series(
-        &metrics,
-        "anthropic_client_store_last_ok_timestamp_seconds",
-        "part=\"document\""
-    )
-    .is_some_and(|s| s != "0"));
+    assert!(
+        series(
+            &metrics,
+            "anthropic_client_store_last_ok_timestamp_seconds",
+            "part=\"document\""
+        )
+        .is_some_and(|s| s != "0")
+    );
     assert_eq!(
         count_series(&metrics, "anthropic_client_store_refusals_total"),
         3

@@ -173,10 +173,12 @@ async fn limit_all_below() {
     );
     set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
     set_account_utilization(&state, 1, 0.60, 0.50, now + 10000, now + 100000).await;
-    assert!(state
-        .check_utilization_limit(&state.caller("testclient"), "")
-        .await
-        .is_ok());
+    assert!(
+        state
+            .check_utilization_limit(&state.caller("testclient"), "")
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -226,19 +228,23 @@ async fn limit_one_below() {
     );
     set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
     set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
-    assert!(state
-        .check_utilization_limit(&state.caller("testclient"), "")
-        .await
-        .is_ok());
+    assert!(
+        state
+            .check_utilization_limit(&state.caller("testclient"), "")
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
 async fn limit_no_config() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
-    assert!(state
-        .check_utilization_limit(&state.caller("anyone"), "")
-        .await
-        .is_ok());
+    assert!(
+        state
+            .check_utilization_limit(&state.caller("anyone"), "")
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -259,10 +265,12 @@ async fn limit_operator_bypass() {
     set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
     // Operator bypasses everything
     assert_eq!(state.caller("ray").principal.role, Role::Operator);
-    assert!(state
-        .pre_request_gate("-", &state.caller("ray"), "")
-        .await
-        .is_ok());
+    assert!(
+        state
+            .pre_request_gate("-", &state.caller("ray"), "")
+            .await
+            .is_ok()
+    );
     // Non-operator does not bypass
     assert_eq!(state.caller("gastown").principal.role, Role::Client);
 }
@@ -397,15 +405,19 @@ async fn emergency_operator_bypass() {
     set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
     assert!(state.is_emergency_brake_active().await);
     // Operator bypasses pre_request_gate even during emergency
-    assert!(state
-        .pre_request_gate("-", &state.caller("ray"), "")
-        .await
-        .is_ok());
+    assert!(
+        state
+            .pre_request_gate("-", &state.caller("ray"), "")
+            .await
+            .is_ok()
+    );
     // Non-operator gets blocked
-    assert!(state
-        .pre_request_gate("-", &state.caller("gastown"), "")
-        .await
-        .is_err());
+    assert!(
+        state
+            .pre_request_gate("-", &state.caller("gastown"), "")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -927,10 +939,12 @@ async fn gate_allows_model_inside_client_allow_list() {
         &test_key("k1"),
         &["claude-haiku-*"],
     )]);
-    assert!(state
-        .pre_request_gate("-", &state.caller("limited"), "claude-haiku-4-5")
-        .await
-        .is_ok());
+    assert!(
+        state
+            .pre_request_gate("-", &state.caller("limited"), "claude-haiku-4-5")
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -998,10 +1012,12 @@ async fn gate_429_budget_returns_json_envelope_with_retry_after() {
         let json = parse_error_envelope(err).await;
         assert_eq!(json["type"], "error");
         assert_eq!(json["error"]["type"], "rate_limit_error");
-        assert!(json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("daily token budget exceeded"));
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("daily token budget exceeded")
+        );
     }
 }
 
@@ -1030,10 +1046,12 @@ async fn gate_429_utilization_returns_json_envelope() {
     let json = parse_error_envelope(err).await;
     assert_eq!(json["type"], "error");
     assert_eq!(json["error"]["type"], "rate_limit_error");
-    assert!(json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("utilization limit exceeded"));
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("utilization limit exceeded")
+    );
 }
 
 /// The brake is the same condition as `exhaustion_response`'s rate-limited
@@ -1062,10 +1080,12 @@ async fn gate_429_emergency_brake_returns_json_envelope_without_retry_after() {
     let json = parse_error_envelope(err).await;
     assert_eq!(json["type"], "error");
     assert_eq!(json["error"]["type"], "rate_limit_error");
-    assert!(json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("emergency"));
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("emergency")
+    );
 }
 
 #[tokio::test]

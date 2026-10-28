@@ -1104,11 +1104,13 @@ fn json_mode_stream_message_stop_safety_net_flushes_buffer() {
         "index": 0,
         "delta": {"type": "text_delta", "text": "```json\n{\"ok\":true}\n```"},
     });
-    assert!(translate_sse_event(
-        &format!("event: content_block_delta\ndata: {payload}"),
-        &mut ctx
-    )
-    .is_none());
+    assert!(
+        translate_sse_event(
+            &format!("event: content_block_delta\ndata: {payload}"),
+            &mut ctx
+        )
+        .is_none()
+    );
 
     let output = translate_sse_event(
         "event: message_stop\ndata: {\"type\":\"message_stop\"}",

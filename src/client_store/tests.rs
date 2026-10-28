@@ -1,5 +1,5 @@
 use super::*;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 mod corpus;
 mod reader;

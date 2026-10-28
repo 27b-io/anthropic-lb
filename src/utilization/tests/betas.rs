@@ -399,6 +399,16 @@ fn dropped_beta_flag_keys_are_length_bounded() {
     );
 }
 
+#[test]
+fn dropped_beta_flag_keys_truncate_on_char_boundary() {
+    // A 4-byte char straddling the limit is dropped whole, not split.
+    let state = test_state_with(vec![]);
+    let head = "x".repeat(MAX_DROPPED_BETA_FLAG_LEN - 1);
+    state.record_dropped_beta_flags("t", &[format!("{head}\u{1F980}tail")]);
+    let map = state.beta_flags_dropped.lock().unwrap();
+    assert_eq!(map.keys().collect::<Vec<_>>(), [&head]);
+}
+
 // ---------------------------------------------------------------------------
 // LAB-1261 — header/body coherence for the `anthropic-beta` allow-list.
 //

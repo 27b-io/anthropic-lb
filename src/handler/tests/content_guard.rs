@@ -47,8 +47,8 @@ fn guard_block_client() -> ClientConfig {
 /// returns a minimal valid response with rate-limit headers. Returns the
 /// listener address and the shared capture buffer.
 #[cfg(feature = "guard")]
-pub(super) async fn spawn_guard_body_upstream(
-) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<u8>>>) {
+pub(super) async fn spawn_guard_body_upstream()
+-> (String, std::sync::Arc<tokio::sync::Mutex<Vec<u8>>>) {
     let captured: std::sync::Arc<tokio::sync::Mutex<Vec<u8>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let cap = captured.clone();
@@ -1924,7 +1924,7 @@ async fn guard_block_forwards_conversation_without_user_turn() {
 #[tokio::test]
 async fn guard_hook_logs_fail_closed_cause_under_every_policy() {
     use crate::guard::{
-        ScanInput, ScanOutcome, MAX_SCAN_BYTES, REASON_MESSAGE_UNREADABLE, REASON_SCAN_TRUNCATED,
+        MAX_SCAN_BYTES, REASON_MESSAGE_UNREADABLE, REASON_SCAN_TRUNCATED, ScanInput, ScanOutcome,
     };
     let buf = log_capture_buf();
     let mut clients = guard_non_block_clients();

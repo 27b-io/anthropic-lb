@@ -100,7 +100,7 @@ async fn spawn_endless_sse_upstream(
 fn wake_writer_per_slice(s: &tokio::net::TcpStream) {
     use std::ffi::{c_int, c_void};
     use std::os::fd::AsRawFd;
-    extern "C" {
+    unsafe extern "C" {
         fn setsockopt(fd: c_int, level: c_int, name: c_int, val: *const c_void, len: u32) -> c_int;
     }
     const IPPROTO_TCP: c_int = 6;

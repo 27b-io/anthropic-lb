@@ -1,6 +1,6 @@
 use crate::*;
-use std::collections::hash_map::Entry;
 use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 use std::sync::PoisonError;
 
 // ── Client policy ───────────────────────────────────────────────────
@@ -746,7 +746,7 @@ fn check_clients(
                 return Err(format!(
                     "client '{}': duplicate key (already used by another client)",
                     c.name
-                ))
+                ));
             }
             Entry::Vacant(slot) => {
                 slot.insert(principal(config, &c.name));
@@ -830,7 +830,9 @@ fn check_clients(
         return Err(format!(
             "endpoint '{}': token = \"passthrough\" is incompatible with [[clients]] — passthrough forwards the caller's auth headers upstream, which would leak client keys to {}",
             ep.name,
-            ep.base_url.as_deref().unwrap_or("https://api.anthropic.com")
+            ep.base_url
+                .as_deref()
+                .unwrap_or("https://api.anthropic.com")
         ));
     }
 
@@ -947,12 +949,12 @@ fn check_credentials(config: &Config, auth_mode: &AuthMode) -> Result<(), String
     }
     // AC-13: a static bearer credential on a public ingress gets scanned;
     // below 32 characters the keyspace is the vulnerability.
-    if let Some(ref key) = config.proxy_key {
-        if key.len() < MIN_KEY_LEN {
-            return Err(format!(
-                "config: proxy_key is shorter than {MIN_KEY_LEN} characters — generate one with `openssl rand -hex 32`"
-            ));
-        }
+    if let Some(ref key) = config.proxy_key
+        && key.len() < MIN_KEY_LEN
+    {
+        return Err(format!(
+            "config: proxy_key is shorter than {MIN_KEY_LEN} characters — generate one with `openssl rand -hex 32`"
+        ));
     }
     for c in &config.clients {
         if c.key.len() < MIN_KEY_LEN {

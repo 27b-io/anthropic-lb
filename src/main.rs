@@ -1,11 +1,11 @@
 use axum::{
+    Router,
     body::Body,
     extract::State,
     http::{HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
-    Router,
 };
 use fred::{
     clients::RedisClient,
@@ -23,8 +23,8 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -93,13 +93,13 @@ use utilization::*;
 /// `warn!`). Priority collision with an openai endpoint stays a soft warning.
 fn validate_endpoints(endpoints: &[EndpointConfig]) -> Result<(), String> {
     for ep in endpoints {
-        if let Some(url) = ep.base_url.as_deref() {
-            if !url.starts_with("https://") {
-                return Err(format!(
-                    "endpoint '{}': base_url must start with https:// (got '{}')",
-                    ep.name, url
-                ));
-            }
+        if let Some(url) = ep.base_url.as_deref()
+            && !url.starts_with("https://")
+        {
+            return Err(format!(
+                "endpoint '{}': base_url must start with https:// (got '{}')",
+                ep.name, url
+            ));
         }
         match ep.protocol {
             Protocol::OpenAI => {
@@ -558,7 +558,9 @@ async fn main() {
             );
         }
         AuthMode::SharedKey(_) => {
-            warn!("legacy shared proxy_key in use — every caller shares one identity; migrate to [[clients]] (see README §Client Setup)");
+            warn!(
+                "legacy shared proxy_key in use — every caller shares one identity; migrate to [[clients]] (see README §Client Setup)"
+            );
         }
         AuthMode::Open => {
             // ClientPolicy::build allows this mode only with the flag
@@ -654,8 +656,12 @@ async fn main() {
             internal_command_timeout: Duration::from_secs(5),
             ..Default::default()
         };
-        // 0 = retry forever; delays 100ms → 30s, doubling.
-        let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
+        // 0 = retry forever; delays 100ms → 5s, doubling. The cap bounds how
+        // long the LB stays local-only after the backend is reachable again:
+        // at 30s it came back 19-27s after Redis or its tunnel returned,
+        // at 5s within one cap. A reconnect attempt every 5s per replica
+        // costs the backend nothing during an outage.
+        let policy = ReconnectPolicy::new_exponential(0, 100, 5_000, 2);
         match start_coordination_redis(url.as_str(), perf, conn_config, policy) {
             Ok(client) => Some(client),
             // Log only `kind()` (a fixed enum, e.g. `Url`/`Config`) — never
@@ -795,6 +801,7 @@ async fn main() {
         beta_flags_dropped: Mutex::new(HashMap::new()),
         beta_body_fields_stripped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
+        speed_unsupported: Mutex::new(HashMap::new()),
         fast_mode_429: Mutex::new(HashMap::new()),
         entitlement_400: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
@@ -908,15 +915,21 @@ async fn main() {
         tokio::spawn(async move {
             // Wait for initial startup to complete
             tokio::time::sleep(Duration::from_secs(5)).await;
-            info!("starting redis state sync (5s interval)");
+            info!(
+                interval_secs = REDIS_SYNC_INTERVAL.as_secs(),
+                rate_interval_secs = REDIS_SLOW_SYNC_INTERVAL.as_secs(),
+                "starting redis state sync"
+            );
+            let mut cadence = SyncCadence::default();
             loop {
-                sync_state.sync_from_redis().await;
+                let rate_synced = sync_state.sync_from_redis(cadence.scope()).await;
+                cadence.advance(rate_synced);
                 // Heartbeat: register this instance
                 if let Some(redis) = sync_state.coordination_redis() {
                     let key = format!("alb:heartbeat:{instance_id}");
                     let _ = redis_set_ex(redis, &key, AppState::now_epoch().to_string(), 30).await;
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(REDIS_SYNC_INTERVAL).await;
             }
         });
     }

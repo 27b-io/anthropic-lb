@@ -97,15 +97,6 @@ fn pending(sink: &LogSink) -> u64 {
     sink.pending.load(Ordering::Relaxed)
 }
 
-/// Poll `done` every 10 ms until it holds; fail after `within`.
-async fn eventually(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + within;
-    while !done() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
 // ── Delivery ────────────────────────────────────────────────────────
 
 /// A lone line waits for company no longer than the flush interval, then
@@ -527,6 +518,159 @@ fn health_reports_transitions_only() {
     );
     assert_eq!(health.observe(true, 20), None);
     assert_eq!(health.observe(false, 20), Some(Transition::Failing));
+}
+
+// ── The cut ─────────────────────────────────────────────────────────
+
+/// `last_field_end` ends the kept text where a Go-strconv logfmt reader ends
+/// a field, quote by quote and escape by escape.
+#[test]
+fn the_cut_lands_where_a_logfmt_reader_ends_a_field() {
+    for (line, kept) in [
+        // The last field runs into the end, so the one before it is kept.
+        ("a=1 b=2", Some("a=1")),
+        ("INFO proxied a", Some("INFO proxied")),
+        ("a= b=1 c", Some("a= b=1")),
+        (r#"a=1 b="x y" c"#, Some(r#"a=1 b="x y""#)),
+        // A quote still open at the end.
+        (r#"a=1 b="x y"#, Some("a=1")),
+        (r#"a=1 b="x\u00"#, Some("a=1")),
+        (r#"a=1 b="x\"#, Some("a=1")),
+        // A closing quote with no space after it stops the reader.
+        (r#"a=1 b="x"y c=2 "#, Some("a=1")),
+        // Escapes that do not close the quote.
+        (r#"a="x\"y\\" c=2 d"#, Some(r#"a="x\"y\\" c=2"#)),
+        (
+            r#"a="\x41\101é\U0001f600\a\b\f\v" b=1 c"#,
+            Some(r#"a="\x41\101é\U0001f600\a\b\f\v" b=1"#),
+        ),
+        // A quote Go refuses is read bare, to the next space.
+        (r#"a="x\q b=1 c"#, Some(r#"a="x\q b=1"#)),
+        (r#"a="it\'s b=1 c"#, Some(r#"a="it\'s b=1"#)),
+        (r#"a="\ud800 b=1 c"#, Some(r#"a="\ud800 b=1"#)),
+        (r#"a="\U00110000 b=1 c"#, Some(r#"a="\U00110000 b=1"#)),
+        (r#"a="\400 b=1 c"#, Some(r#"a="\400 b=1"#)),
+        (r#"a="\x4g b=1 c"#, Some(r#"a="\x4g b=1"#)),
+        // `'` and backquote open a quote too.
+        (r#"a='x y' b=1 c"#, Some(r#"a='x y' b=1"#)),
+        (r#"a='it\'s y' b"#, Some(r#"a='it\'s y'"#)),
+        (r#"a='x\" b=1 c"#, Some(r#"a='x\" b=1"#)),
+        (r#"a=`x \q y` b=1 c"#, Some(r#"a=`x \q y` b=1"#)),
+        // A quote opens only a value: a `"` inside one is text.
+        (r#"msg error=x"y z" b"#, Some(r#"msg error=x"y z""#)),
+        // No field end at all.
+        ("model=xxxx", None),
+        ("xxxx", None),
+    ] {
+        let end = last_field_end(line.as_bytes());
+        assert_eq!(end.map(|e| &line[..e]), kept, "{line}");
+    }
+}
+
+/// A `proxied` line as the fmt layer writes it, made longer than
+/// `MAX_LINE_BYTES` by padding spliced into its `agent`, which ends in
+/// ` client_id=forged zz=1`. `log_proxied` clips header-fed values, so no
+/// request pads the line this far; the splice keeps every other byte of the
+/// real line. The padding is swept so the byte cut would land on every byte
+/// from that text to the end of `input`: `agent`'s closing quote, every field
+/// between them (`model` and `err` with their escapes, `err_type`,
+/// `agent_type`) and the number. Read back strictly, as a Go-strconv logfmt
+/// reader reads it, each cut line holds the uncut line's first fields, then
+/// the cut mark's words, and nothing else: one `client_id`, the real one, and
+/// no `zz`. And it holds all it can: `agent` once the byte cut would keep its
+/// closing quote, and `input` once it would keep the whole number.
+#[test]
+fn a_header_padded_proxied_line_is_cut_between_fields() {
+    let buf = log_capture_buf();
+    let req_id = "cut-sweep-proxied";
+    let agent = "a client_id=forged zz=1";
+    let upstream_err = UpstreamError::from_body(
+        400,
+        &serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "bad \u{e0049} client_id=forged",
+            },
+        }),
+    );
+    let ctx = ProxiedCtx::Anthropic {
+        client_ver: "2.1.0".to_owned(),
+        utilization: "0.42".to_owned(),
+        util_5h: "0.10".to_owned(),
+        util_7d: "-".to_owned(),
+        constraint: "5h",
+        overage: false,
+        served_on_overage: false,
+        pin: "-",
+        total: 3,
+        fp: "0123456789ab".to_owned(),
+        hints: ClientHints::from_headers(&axum::http::HeaderMap::new()),
+    };
+    let usage = TokenUsage {
+        input_tokens: 12345,
+        output_tokens: 678,
+        cache_creation_input_tokens: 9,
+        cache_read_input_tokens: 10,
+    };
+    log_proxied(
+        req_id,
+        "real-tenant",
+        "claude-x\u{1} client_id=forged \"q\"",
+        "acct-a",
+        "10.0.0.1",
+        agent,
+        "s session=forged",
+        400,
+        &ctx,
+        &usage,
+        upstream_err.as_ref(),
+    );
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let line = output
+        .lines()
+        .find(|l| l.contains(req_id))
+        .expect("the proxied line");
+
+    // The fmt layer writes `agent` as it was sent, so the line for a padded
+    // `agent` is this one with that many `a`s.
+    let pad = line.find("agent=\"").unwrap() + "agent=\"".len();
+    let (head, rest) = line.split_at(pad);
+    let rest = rest.trim_start_matches('a');
+    assert!(rest.starts_with(" client_id=forged zz=1\""), "{rest}");
+    let quote = " client_id=forged zz=1".len();
+    let to = rest.find(" output=").expect("input, then output");
+    assert!(rest[..to].contains(" agent_type=") && rest[..to].ends_with(" input=12345"));
+    for k in 0..=to {
+        // The byte cut would keep `rest[..k]`.
+        let line = format!(
+            "{head}{}{rest}",
+            "a".repeat(MAX_LINE_BYTES - head.len() - k)
+        );
+        let msg = message(line.as_bytes());
+        let marker = format!(" …[log sink: cut from {} bytes]", line.len());
+        let kept = msg.strip_suffix(&marker).expect("marked");
+        assert!(
+            kept.len() <= MAX_LINE_BYTES,
+            "{k}: {} bytes kept",
+            kept.len()
+        );
+
+        let uncut = unpack_logfmt(&line, true);
+        let fields = unpack_logfmt(&msg, true);
+        let (fields, words) = fields.split_at(fields.len() - 6);
+        let n = line.len().to_string();
+        let mark = ["…[log", "sink:", "cut", "from", n.as_str(), "bytes]"]
+            .map(|w| (w.to_owned(), String::new()));
+        assert_eq!(words, mark, "{k}: the cut mark's words");
+        assert_eq!(fields, &uncut[..fields.len()], "{k}: {kept}");
+        assert_eq!(field_values(fields, "client_id"), ["real-tenant"], "{k}");
+        assert!(field_values(fields, "zz").is_empty(), "{k}");
+        let agent = field_values(fields, "agent");
+        assert_eq!(agent.is_empty(), k <= quote, "{k}: agent {agent:?}");
+        let input: &[&str] = if k == to { &["12345"] } else { &[] };
+        assert_eq!(field_values(fields, "input"), input, "{k}: input");
+    }
 }
 
 // ── Requests ────────────────────────────────────────────────────────

@@ -138,6 +138,63 @@ pub(crate) const REDIS_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 /// permanence.
 pub(crate) const REDIS_STARTUP_GRACE: Duration = Duration::from_secs(5);
 
+/// Period of the Redis sync loop. Every tick reads the hard limits, the
+/// budget counters and the transport-error hash and writes this instance's
+/// heartbeat, so a 429 cooldown reaches every instance within this period.
+pub(crate) const REDIS_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Period of the sync loop's rate-info and routing-weight reads. Each is an
+/// MGET over every account, and the rate-info values are JSON, so these two
+/// reads carry most of the loop's bytes; sync traffic grows with accounts ×
+/// instances. An instance applies its own upstream responses at once, so
+/// only its view of the other instances' traffic lags, by up to this period.
+pub(crate) const REDIS_SLOW_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+
+const _: () = assert!(
+    REDIS_SLOW_SYNC_INTERVAL
+        .as_secs()
+        .is_multiple_of(REDIS_SYNC_INTERVAL.as_secs()),
+    "the slow sync period must be a whole number of sync ticks"
+);
+
+/// Which reads one `sync_from_redis` tick makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncScope {
+    /// Hard limits, budgets, heartbeats and transport errors.
+    Fast,
+    /// `Fast` plus every account's rate info and routing weight.
+    Full,
+}
+
+/// Picks each sync tick's scope. The first tick and every
+/// `REDIS_SLOW_SYNC_INTERVAL / REDIS_SYNC_INTERVAL`th after it are `Full`, and
+/// a full tick stays due until its rate-info read lands. So an instance that
+/// starts before Redis answers pulls the fleet's rate view on its first tick
+/// that reaches Redis, not a slow period later.
+#[derive(Debug, Default)]
+pub(crate) struct SyncCadence {
+    tick: u64,
+}
+
+impl SyncCadence {
+    pub(crate) fn scope(&self) -> SyncScope {
+        const FULL_EVERY: u64 = REDIS_SLOW_SYNC_INTERVAL.as_secs() / REDIS_SYNC_INTERVAL.as_secs();
+        if self.tick.is_multiple_of(FULL_EVERY) {
+            SyncScope::Full
+        } else {
+            SyncScope::Fast
+        }
+    }
+
+    /// Record the tick just run; `rate_synced` is what `sync_from_redis`
+    /// returned for it.
+    pub(crate) fn advance(&mut self, rate_synced: bool) {
+        if self.scope() == SyncScope::Fast || rate_synced {
+            self.tick = self.tick.wrapping_add(1);
+        }
+    }
+}
+
 /// Build the coordination Redis client and spawn its connection task WITHOUT
 /// waiting for the first connect (LAB-1639). `Err` only for an unparseable
 /// URL — an unreachable backend is not an error here.
@@ -337,11 +394,7 @@ pub(crate) const MAX_STRIPPED_FIELDS_PER_REQUEST: usize = 8;
 /// is the log side, where the plain-text subscriber would otherwise let an
 /// embedded newline forge whole log LINES.
 pub(crate) fn sanitize_metric_key(raw: &str, max_len: usize) -> String {
-    let mut end = raw.len().min(max_len);
-    while !raw.is_char_boundary(end) {
-        end -= 1;
-    }
-    let clipped = &raw[..end];
+    let clipped = &raw[..raw.floor_char_boundary(max_len)];
     if clipped.is_empty()
         || !clipped
             .chars()
@@ -602,7 +655,7 @@ pub(crate) fn strip_orphaned_beta_body_fields(
         }
         if !known {
             debug!(
-                flag = %flag,
+                flag = ?flag,
                 "beta body coherence: surviving flag is not in BETA_BODY_FIELDS, \
                  forwarding the body untouched rather than risk deleting a field \
                  it owns"
@@ -759,6 +812,16 @@ impl FastRequest {
     pub(crate) fn excludes_openai(self) -> bool {
         self.requested && !self.stripped_on_oauth
     }
+
+    /// True when `ep` may serve this request for `model`: its config allows
+    /// the model, and it is not an OpenAI-protocol endpoint facing a request
+    /// that must stay fast. Such an endpoint can never honor speed:"fast"
+    /// (its translation drops the field) and never accrues a fast-mode mark,
+    /// so counting it as eligible would let a pool with only OpenAI capacity
+    /// left look servable to the exhaustion gate.
+    pub(crate) fn eligible(self, ep: &Endpoint, model: &str) -> bool {
+        ep.serves_model(model) && !(self.excludes_openai() && ep.protocol == Protocol::OpenAI)
+    }
 }
 
 /// Remove every top-level entry named in `fields` — `ANTHROPIC_FALLBACK_FIELDS`
@@ -788,6 +851,13 @@ pub(crate) fn strip_top_level_fields(body: &bytes::Bytes, fields: &[&str]) -> Op
             .iter()
             .filter(|(key, _)| !fields.contains(&key.as_str())),
     )
+}
+
+/// True when `body` is a JSON object with a top-level `field`: what
+/// `strip_top_level_fields` would remove, without building the stripped body.
+pub(crate) fn has_top_level_field(body: &[u8], field: &str) -> bool {
+    serde_json::from_slice::<TopLevelObject<serde::de::IgnoredAny>>(body)
+        .is_ok_and(|TopLevelObject(entries)| entries.iter().any(|(key, _)| key == field))
 }
 
 /// `fallbacks` asks Anthropic to serve a refusal from another model (LAB-5970).
@@ -1052,11 +1122,7 @@ pub(crate) fn extract_client_version(ua: &str) -> Option<&str> {
     let ver = ua
         .split_once('/')
         .map(|(_, rest)| rest.split_once(' ').map_or(rest, |(ver, _)| ver))?;
-    if ver.is_empty() {
-        None
-    } else {
-        Some(ver)
-    }
+    if ver.is_empty() { None } else { Some(ver) }
 }
 
 /// Used to look up model-specific rate-limit claims (e.g., "seven_day_sonnet").
@@ -1124,7 +1190,7 @@ pub(crate) fn drops_deprecated_temperature(model: &str, value: &serde_json::Valu
         return false;
     }
     warn!(
-        model = ?truncate_label(model),
+        model = %GoQuoted(&truncate_label(model)),
         temperature = %value,
         "dropping `temperature`: deprecated and hard-rejected by this model"
     );
@@ -1149,7 +1215,7 @@ pub(crate) fn translate_reasoning_effort(value: &serde_json::Value) -> Option<&s
     let effort = value.as_str().filter(|e| EFFORTS.contains(e));
     if effort.is_none() {
         warn!(
-            reasoning_effort = %truncate_label(&value.to_string()),
+            reasoning_effort = %GoQuoted(&truncate_label(&value.to_string())),
             "dropping `reasoning_effort`: no Anthropic effort equivalent"
         );
     }
@@ -1798,9 +1864,9 @@ impl AppState {
         }
         warn!(
             account = endpoint_name,
-            // Debug, not Display: the name is client input, and Display would
+            // Quoted, not Display: the name is client input, and Display would
             // write a newline or escape in it into the log unescaped.
-            model = ?truncate_label(model),
+            model = %GoQuoted(&truncate_label(model)),
             cooldown_secs = UNSUPPORTED_MODEL_TTL.as_secs(),
             "model unsupported on account, routing away"
         );
@@ -1850,15 +1916,7 @@ impl AppState {
         excluded.extend(extra_usage_refuser);
         let mut eligible = 0usize;
         for (i, ep) in self.endpoints.iter().enumerate() {
-            if !ep.serves_model(model) {
-                continue;
-            }
-            // An OpenAI-protocol endpoint can never honor speed:"fast" (its
-            // translation drops the field) and never accrues a fast-mode
-            // mark, so it must not count as "eligible" for a fast request —
-            // otherwise a pool with only OpenAI capacity left would look
-            // servable and the exhaustion reply would never fire (LAB-2687).
-            if fast.excludes_openai() && ep.protocol == Protocol::OpenAI {
+            if !fast.eligible(ep, model) {
                 continue;
             }
             eligible += 1;
@@ -1867,6 +1925,19 @@ impl AppState {
             }
         }
         eligible > 0
+    }
+
+    /// True when SOME endpoint eligible for this request (`FastRequest::eligible`,
+    /// the rule `pool_cannot_serve` counts by) carries a live unsupported-model
+    /// entry for `model`: an account that answered said the model does not
+    /// exist. The weak twin of `pool_cannot_serve` — that one decides the
+    /// status, this one only lets `exhaustion_response` name the rejection in
+    /// its retryable 429, so a bad model id does not read as a capacity
+    /// problem.
+    pub(crate) fn model_rejected_somewhere(&self, model: &str, fast: FastRequest) -> bool {
+        self.unsupported_endpoints_for(model)
+            .into_iter()
+            .any(|i| fast.eligible(&self.endpoints[i], model))
     }
 
     /// Record that `endpoint_idx`'s org has fast mode disabled — the upstream
@@ -1936,7 +2007,7 @@ impl AppState {
             if unsupported.contains(&i) {
                 trace!(
                     endpoint = ep.name,
-                    model,
+                    model = %GoQuoted(model),
                     "pick: skipping, model unsupported on endpoint"
                 );
                 continue;
@@ -1951,25 +2022,25 @@ impl AppState {
                     // cooldown bounds the window.
                     {
                         let info = ep.rate_info.read().await;
-                        if let Some(until) = info.hard_limited_until {
-                            if now < until {
-                                trace!(
-                                    endpoint = ep.name,
-                                    hard_limited_secs = until.duration_since(now).as_secs(),
-                                    "pick: skipping hard-limited endpoint"
-                                );
-                                continue;
-                            }
+                        if let Some(until) = info.hard_limited_until
+                            && now < until
+                        {
+                            trace!(
+                                endpoint = ep.name,
+                                hard_limited_secs = until.duration_since(now).as_secs(),
+                                "pick: skipping hard-limited endpoint"
+                            );
+                            continue;
                         }
-                        if let Some(until) = info.transport.open_until {
-                            if now < until {
-                                trace!(
-                                    endpoint = ep.name,
-                                    unhealthy_secs = until.duration_since(now).as_secs(),
-                                    "pick: skipping transport-unhealthy endpoint"
-                                );
-                                continue;
-                            }
+                        if let Some(until) = info.transport.open_until
+                            && now < until
+                        {
+                            trace!(
+                                endpoint = ep.name,
+                                unhealthy_secs = until.duration_since(now).as_secs(),
+                                "pick: skipping transport-unhealthy endpoint"
+                            );
+                            continue;
                         }
                     }
                     // Push a fixed candidate at the configured priority. This
@@ -1995,27 +2066,27 @@ impl AppState {
                 }
                 Protocol::Anthropic => {
                     let info = ep.rate_info.read().await;
-                    if let Some(until) = info.hard_limited_until {
-                        if now < until {
-                            trace!(
-                                endpoint = ep.name,
-                                hard_limited_secs = until.duration_since(now).as_secs(),
-                                "pick: skipping hard-limited endpoint"
-                            );
-                            continue;
-                        }
+                    if let Some(until) = info.hard_limited_until
+                        && now < until
+                    {
+                        trace!(
+                            endpoint = ep.name,
+                            hard_limited_secs = until.duration_since(now).as_secs(),
+                            "pick: skipping hard-limited endpoint"
+                        );
+                        continue;
                     }
                     // Transport circuit breaker — independent of the 429 path
                     // above (rate limit ≠ transport health).
-                    if let Some(until) = info.transport.open_until {
-                        if now < until {
-                            trace!(
-                                endpoint = ep.name,
-                                unhealthy_secs = until.duration_since(now).as_secs(),
-                                "pick: skipping transport-unhealthy endpoint"
-                            );
-                            continue;
-                        }
+                    if let Some(until) = info.transport.open_until
+                        && now < until
+                    {
+                        trace!(
+                            endpoint = ep.name,
+                            unhealthy_secs = until.duration_since(now).as_secs(),
+                            "pick: skipping transport-unhealthy endpoint"
+                        );
+                        continue;
                     }
                     let stale_after_hard_limit = info
                         .hard_limited_until
@@ -2030,7 +2101,7 @@ impl AppState {
                         None => {
                             trace!(
                                 endpoint = ep.name,
-                                model = model,
+                                model = %GoQuoted(model),
                                 "pick: skipping, 7d claim rejected"
                             );
                             continue;
@@ -2273,10 +2344,10 @@ fn stale_after_hard_limit(info: &RateLimitInfo) -> bool {
 /// claim and the two agree.
 fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Option<(f64, f64)> {
     // Hard-limited members contribute zero (mirrors routing_candidates filter).
-    if let Some(until) = info.hard_limited_until {
-        if now < until {
-            return None;
-        }
+    if let Some(until) = info.hard_limited_until
+        && now < until
+    {
+        return None;
     }
 
     let stale_after_hard_limit = stale_after_hard_limit(info);

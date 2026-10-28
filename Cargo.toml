@@ -1,7 +1,12 @@
 [package]
 name = "anthropic-lb"
-version = "0.4.1"
-edition = "2021"
+version = "0.4.2"
+edition = "2024"
+# Edition 2024 defaults to resolver 3, which holds dependencies back to versions
+# whose `rust-version` the declared MSRV satisfies. This crate raises its
+# toolchain floor rather than pinning old dependencies, so keep resolver 2's
+# newest-compatible selection on purpose.
+resolver = "2"
 description = "Load-balancing reverse proxy for multiple Anthropic API accounts with dynamic capacity routing"
 license = "MIT"
 repository = "https://github.com/27b-io/anthropic-lb"

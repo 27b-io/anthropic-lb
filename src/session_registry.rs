@@ -16,9 +16,9 @@ pub(crate) const DEFAULT_SESSION_REGISTRY_TTL_SECS: u64 = 1800;
 /// Max sessions returned in the `/_stats` `sessions` array (highest
 /// context-window % first).
 const SESSIONS_STATS_TOP_N: usize = 50;
-/// Cap on distinct model labels in the prompt-too-long counter map (the model
+/// Cap on distinct model labels in each per-model counter map (the model
 /// string is client-controlled; overflow buckets into `_other`).
-const MAX_PROMPT_TOO_LONG_MODELS: usize = 32;
+const MAX_COUNTED_MODELS: usize = 32;
 
 /// `le` boundaries (tokens) for the live session-size distribution on
 /// `/metrics`. Dense around the 200k window edge — that's where sessions
@@ -83,8 +83,11 @@ pub(crate) fn context_window_for(model: &str, has_1m_beta: bool) -> u64 {
         let mut warned =
             lock_recovering(WARNED.get_or_init(Default::default), "unknown_model_warned");
         // Bounded like the client maps: model is client-controlled input.
-        if warned.len() < MAX_PROMPT_TOO_LONG_MODELS && warned.insert(model.to_string()) {
-            warn!(model, "unknown model family, assuming 200k context window");
+        if warned.len() < MAX_COUNTED_MODELS && warned.insert(model.to_string()) {
+            warn!(
+                model = %GoQuoted(model),
+                "unknown model family, assuming 200k context window"
+            );
         }
     }
     DEFAULT_CONTEXT_WINDOW
@@ -97,6 +100,20 @@ fn window_pct(tokens: u64, window: u64) -> f64 {
         return 0.0;
     }
     (tokens as f64 / window as f64 * 1000.0).round() / 10.0
+}
+
+/// Count one event for `model` in a per-model counter map. At most
+/// `MAX_COUNTED_MODELS` labels; later models count under `_other`, which
+/// `escape_sentinel` keeps any model's own label off.
+fn count_by_model(counts: &Mutex<HashMap<String, u64>>, name: &'static str, model: &str) {
+    let mut counts = lock_recovering(counts, name);
+    let model_label = escape_sentinel(model, &["other"]);
+    let label = if counts.len() < MAX_COUNTED_MODELS || counts.contains_key(&model_label) {
+        model_label
+    } else {
+        "_other".to_owned()
+    };
+    *counts.entry(label).or_insert(0) += 1;
 }
 
 /// If `body` is the Anthropic "prompt is too long" 400 shape, return its
@@ -188,27 +205,30 @@ impl AppState {
         affinity_key: Option<&str>,
         message: &str,
     ) {
-        {
-            let mut counts = lock_recovering(&self.prompt_too_long, "prompt_too_long");
-            let model_label = escape_sentinel(model, &["other"]);
-            let label =
-                if counts.len() < MAX_PROMPT_TOO_LONG_MODELS || counts.contains_key(&model_label) {
-                    model_label
-                } else {
-                    "_other".to_owned()
-                };
-            *counts.entry(label).or_insert(0) += 1;
-        }
+        count_by_model(&self.prompt_too_long, "prompt_too_long", model);
         let (observed, max) = parse_prompt_too_long(message)
             .map(|(o, m)| (Some(o), Some(m)))
             .unwrap_or((None, None));
         warn!(
             req_id,
-            model,
+            model = %GoQuoted(model),
             session = affinity_key.map(session_label).as_deref().unwrap_or("-"),
             observed_tokens = observed,
             max_tokens = max,
             "prompt too long"
+        );
+    }
+
+    /// Count + WARN a request re-sent without `speed` because its model
+    /// rejects the field (LAB-4190), keyed on the requested model. The
+    /// request is served; this is the trace that a caller still sends
+    /// `speed` to a model without speed support.
+    pub(crate) fn note_speed_unsupported(&self, req_id: &str, model: &str) {
+        count_by_model(&self.speed_unsupported, "speed_unsupported", model);
+        warn!(
+            req_id,
+            model = %GoQuoted(model),
+            "model does not support `speed`: re-sending without it to the same account"
         );
     }
 
@@ -338,7 +358,7 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
     info!(
         req_id,
         client_id,
-        model,
+        model = %GoQuoted(model),
         account,
         input = usage.input_tokens,
         output = usage.output_tokens,
@@ -352,8 +372,8 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
 /// `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`. They say what kind of call this is
 /// (main loop, subagent, compaction, ...), so a cache-write spike can be put
 /// down to compaction or subagent fan-out instead of routing scatter. Each is
-/// `"-"` when absent. Logged as plain `&str` fields, so the formatter escapes
-/// these caller-controlled values; never log them with `%`.
+/// `"-"` when absent. They are caller-controlled header values, logged as
+/// plain `&str` fields under the rule on `GoQuoted`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClientHints {
     pub(crate) request_class: String,
@@ -439,7 +459,7 @@ const MAX_UPSTREAM_ERR_CHARS: usize = 200;
 /// The upstream's own reason for a 4xx, for the `proxied` line: without it
 /// the line says `status=400` and nothing about why, and a client whose
 /// request bodies the proxy never sees cannot be told what it got wrong.
-/// Both values are upstream text, so each is bounded and kept to one line.
+/// Both values are upstream text, so each is bounded.
 pub(crate) struct UpstreamError {
     err_type: String,
     message: String,
@@ -448,24 +468,24 @@ pub(crate) struct UpstreamError {
 impl UpstreamError {
     /// `error.type` and `error.message` of an Anthropic error envelope
     /// (`{"type":"error","error":{"type":…,"message":…}}`) answering with a
-    /// 4xx; `None` for any other status or body. Control characters become
-    /// spaces; `err_type` is capped by `truncate_label`, and a message longer
-    /// than `MAX_UPSTREAM_ERR_CHARS` keeps one character fewer plus a `…`.
+    /// 4xx; `None` for any other status or body. `err_type` is capped by
+    /// `truncate_label`, and a message longer than `MAX_UPSTREAM_ERR_CHARS`
+    /// keeps one character fewer plus a `…`. Both are logged with `GoQuoted`,
+    /// which escapes their control characters.
     pub(crate) fn from_body(status: u16, body: &serde_json::Value) -> Option<Self> {
         if !(400..500).contains(&status) || body.get("type")?.as_str()? != "error" {
             return None;
         }
         let err_type = body.pointer("/error/type")?.as_str()?;
         let message = body.pointer("/error/message")?.as_str()?;
-        let one_line = |c: char| if c.is_control() { ' ' } else { c };
-        let mut chars = message.chars().map(one_line);
+        let mut chars = message.chars();
         let mut err: String = chars.by_ref().take(MAX_UPSTREAM_ERR_CHARS).collect();
         if chars.next().is_some() {
             err.pop();
             err.push('…');
         }
         Some(Self {
-            err_type: truncate_label(&err_type.chars().map(one_line).collect::<String>()),
+            err_type: truncate_label(err_type),
             message: err,
         })
     }
@@ -476,8 +496,14 @@ impl UpstreamError {
 /// response, client disconnect, upstream failure) — still exactly one line,
 /// still carrying req_id/account/status (AC4), so no separate branch is
 /// needed for the no-usage case. `err_type` / `err` are `"-"` unless the
-/// upstream named its reason for a 4xx; they are logged as plain `&str`
-/// fields, so the formatter escapes the upstream text. Never use `%` on them.
+/// upstream named its reason for a 4xx. Every caller- or upstream-fed field
+/// follows the rule on `GoQuoted`: `model`, `err_type` and `err` are
+/// `%GoQuoted(..)`, and the header-fed `client_id`, `ver`, `agent`, `session`
+/// and hints are Debug. Those header-fed values are logged through
+/// `truncate_label`, so no header length can carry the line past the log
+/// sink's `MAX_LINE_BYTES` cut and drop the token counts that end it. Routing,
+/// the session registry and budgets key on the whole values; only the log
+/// clips them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn log_proxied(
     req_id: &str,
@@ -494,6 +520,7 @@ pub(crate) fn log_proxied(
 ) {
     let (err_type, err) =
         upstream_err.map_or(("-", "-"), |e| (e.err_type.as_str(), e.message.as_str()));
+    let [client_id, agent, session] = [client_id, agent, session].map(truncate_label);
     match ctx {
         ProxiedCtx::Anthropic {
             client_ver,
@@ -511,15 +538,15 @@ pub(crate) fn log_proxied(
             info!(
                 req_id,
                 client = %client_ip,
-                client_id,
-                ver = %client_ver,
-                agent,
-                session,
-                model,
+                client_id = client_id.as_str(),
+                ver = ?truncate_label(client_ver),
+                agent = agent.as_str(),
+                session = session.as_str(),
+                model = %GoQuoted(model),
                 account,
                 status = status_code,
-                err_type,
-                err,
+                err_type = %GoQuoted(err_type),
+                err = %GoQuoted(err),
                 utilization = %utilization,
                 util_5h = %util_5h,
                 util_7d = %util_7d,
@@ -529,11 +556,11 @@ pub(crate) fn log_proxied(
                 pin = *pin,
                 total,
                 fp = %fp,
-                request_class = hints.request_class.as_str(),
-                agent_type = hints.agent_type.as_str(),
-                compaction = hints.compaction.as_str(),
-                context_compacted = hints.context_compacted.as_str(),
-                prompt_id = hints.prompt_id.as_str(),
+                request_class = truncate_label(&hints.request_class).as_str(),
+                agent_type = truncate_label(&hints.agent_type).as_str(),
+                compaction = truncate_label(&hints.compaction).as_str(),
+                context_compacted = truncate_label(&hints.context_compacted).as_str(),
+                prompt_id = truncate_label(&hints.prompt_id).as_str(),
                 input = usage.input_tokens,
                 output = usage.output_tokens,
                 cached = usage.cache_read_input_tokens,
@@ -554,15 +581,15 @@ pub(crate) fn log_proxied(
             info!(
                 req_id,
                 client = %client_ip,
-                client_id,
-                ver = %client_ver,
-                agent,
-                session,
-                model,
+                client_id = client_id.as_str(),
+                ver = ?truncate_label(client_ver),
+                agent = agent.as_str(),
+                session = session.as_str(),
+                model = %GoQuoted(model),
                 account,
                 status = status_code,
-                err_type,
-                err,
+                err_type = %GoQuoted(err_type),
+                err = %GoQuoted(err),
                 utilization = %utilization,
                 util_5h = %util_5h,
                 util_7d = %util_7d,
@@ -659,18 +686,20 @@ pub(crate) async fn finalize_stream(
         }
     } else {
         // Log structural metadata only — SSE payloads contain user content.
+        // The event names are upstream text, so they are joined into one
+        // `GoQuoted` value: Debug of the list opens with `[`, not a quote.
         let truncated = scanner.event_count > 5;
         warn!(
             req_id,
             client_id,
-            model,
+            model = %GoQuoted(model),
             account = acct_name,
             status = status_code,
             reason,
             elapsed_ms,
             sse_bytes = scanner.bytes_seen,
             sse_event_count = scanner.event_count,
-            sse_events = ?scanner.event_preview,
+            sse_events = %GoQuoted(&scanner.event_preview.join(",")),
             truncated,
             "stream_end_no_usage"
         );
@@ -679,7 +708,7 @@ pub(crate) async fn finalize_stream(
         warn!(
             req_id,
             client_id,
-            model,
+            model = %GoQuoted(model),
             account = acct_name,
             status = status_code,
             reason,
@@ -949,18 +978,17 @@ impl AppState {
 
     /// Write a shadow log entry (fire-and-forget).
     fn shadow_log(&self, entry: serde_json::Value) {
-        if let Some(ref tx) = self.shadow_log_tx {
-            if let Ok(line) = serde_json::to_string(&entry) {
-                if tx.try_send(line).is_err() {
-                    let dropped = self.shadow_log_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                    // Rate-limit warning: log at powers of 2 to avoid log spam
-                    if dropped.is_power_of_two() {
-                        warn!(
-                            total_dropped = dropped,
-                            "shadow log channel full, entries being dropped"
-                        );
-                    }
-                }
+        if let Some(ref tx) = self.shadow_log_tx
+            && let Ok(line) = serde_json::to_string(&entry)
+            && tx.try_send(line).is_err()
+        {
+            let dropped = self.shadow_log_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            // Rate-limit warning: log at powers of 2 to avoid log spam
+            if dropped.is_power_of_two() {
+                warn!(
+                    total_dropped = dropped,
+                    "shadow log channel full, entries being dropped"
+                );
             }
         }
     }
@@ -1008,10 +1036,11 @@ impl AppState {
         }
 
         // Local fallback
-        if let Some(&(day, used)) = self.lock_budget_usage().get(client_id) {
-            if day == today && used >= limit {
-                return Err(retry_after);
-            }
+        if let Some(&(day, used)) = self.lock_budget_usage().get(client_id)
+            && day == today
+            && used >= limit
+        {
+            return Err(retry_after);
         }
         Ok(())
     }
@@ -1232,11 +1261,11 @@ impl AppState {
                     .or(info.reset_7d),
                 _ => info.reset_5h.or(info.reset_7d), // unified best-effort
             };
-            if let Some(r) = reset_epoch {
-                if r > now_epoch {
-                    let secs = r - now_epoch;
-                    nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
-                }
+            if let Some(r) = reset_epoch
+                && r > now_epoch
+            {
+                let secs = r - now_epoch;
+                nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
             }
         }
 
@@ -1336,7 +1365,7 @@ impl AppState {
         };
         if let Err(retry_after) = budget {
             self.note_client_rejection(client_id, "budget");
-            warn!(client_id = %client_id, retry_after, "rejected: daily token budget exceeded");
+            warn!(client_id = ?client_id, retry_after, "rejected: daily token budget exceeded");
             let mut resp = proxy_error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
@@ -1351,7 +1380,7 @@ impl AppState {
         if let Err(retry_after) = self.check_utilization_limit(caller, model).await {
             self.note_client_rejection(client_id, "utilization");
             warn!(
-                client_id = %client_id,
+                client_id = ?client_id,
                 retry_after = retry_after,
                 "rejected: utilization limit exceeded"
             );
@@ -1369,7 +1398,7 @@ impl AppState {
         if self.is_emergency_brake_active().await {
             self.note_client_rejection(client_id, "brake");
             warn!(
-                client_id = %client_id,
+                client_id = ?client_id,
                 "rejected: emergency brake active"
             );
             // No `retry-after`: the brake is the same condition as
@@ -1413,7 +1442,7 @@ pub(crate) fn deny_admin_reader(req_id: &str, caller: &Caller) -> Option<Box<Res
     }
     warn!(
         req_id,
-        client_id = %caller.name(),
+        client_id = ?caller.name(),
         "rejected: read-only principal has no proxy authority"
     );
     Some(Box::new(proxy_error_response(

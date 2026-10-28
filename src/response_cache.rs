@@ -235,7 +235,7 @@ impl ResponseCache {
             other => {
                 return Err(format!(
                     "response_cache.backend must be \"cachekitio\" or \"redis\", got \"{other}\""
-                ))
+                ));
             }
         };
         Self::from_parts(
@@ -603,14 +603,13 @@ impl AuthThrottle {
                     // attacker's escape hatch).
                     let window = self.window;
                     entries.retain(|_, (start, _)| start.elapsed() < window);
-                    if entries.len() >= self.capacity {
-                        if let Some(victim) = entries
+                    if entries.len() >= self.capacity
+                        && let Some(victim) = entries
                             .iter()
                             .min_by_key(|(_, (start, count))| (*count, *start))
                             .map(|(k, _)| *k)
-                        {
-                            entries.remove(&victim);
-                        }
+                    {
+                        entries.remove(&victim);
                     }
                 }
                 entries.insert(ip, (Instant::now(), 1));
@@ -885,7 +884,7 @@ impl AppState {
             Some(p) if p.role == Role::Client => {
                 warn!(
                     client = %client_ip,
-                    client_id = %p.name,
+                    client_id = ?p.name,
                     route,
                     "rejected: admin surface requires an operator or read-only principal"
                 );
@@ -1000,7 +999,7 @@ impl AppState {
             if policy == guard::GuardPolicy::Block {
                 warn!(
                     req_id,
-                    client_id = %client_id,
+                    client_id = ?client_id,
                     verdict = "block",
                     reason,
                     "guard: unscannable request"
@@ -1009,7 +1008,7 @@ impl AppState {
             }
             info!(
                 req_id,
-                client_id = %client_id,
+                client_id = ?client_id,
                 verdict = "would-block",
                 reason,
                 "guard: unscannable request"
@@ -1077,7 +1076,7 @@ impl AppState {
     ) {
         warn!(
             req_id,
-            client_id = %client_id,
+            client_id = ?client_id,
             verdict,
             findings = findings.len(),
             truncated,
@@ -1140,14 +1139,14 @@ impl AppState {
         };
         if first_time {
             warn!(
-                client_id = %client_id,
-                model = ?model,
+                client_id = ?client_id,
+                model = %GoQuoted(&model),
                 "rejected: model not in client allow-list"
             );
         } else {
             debug!(
-                client_id = %client_id,
-                model = ?model,
+                client_id = ?client_id,
+                model = %GoQuoted(&model),
                 "rejected: model not in client allow-list"
             );
         }

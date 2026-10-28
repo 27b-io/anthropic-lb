@@ -131,6 +131,18 @@ const CLIENT_IDENTITY_HEADER_SAMPLES: &[(&str, &str)] = &[
     ("x-session-id", "sess-7"),
 ];
 
+/// What a browser adds to an extension's or page's `fetch` (LAB-11390). The
+/// caller cannot remove these: `Origin` and the `Sec-Fetch-*` set are forbidden
+/// request headers.
+const BROWSER_CONTEXT_HEADER_SAMPLES: &[(&str, &str)] = &[
+    ("origin", "chrome-extension://abcdefghijklmnop"),
+    ("referer", "moz-extension://0f1e2d3c/background.html"),
+    ("sec-fetch-site", "none"),
+    ("sec-fetch-mode", "cors"),
+    ("sec-fetch-dest", "empty"),
+    ("sec-fetch-storage-access", "active"),
+];
+
 #[test]
 fn identity_header_samples_cover_the_production_list() {
     let mut prod: Vec<&str> = CLIENT_IDENTITY_HEADERS.to_vec();
@@ -143,8 +155,8 @@ fn identity_header_samples_cover_the_production_list() {
     assert_eq!(prod, samples, "extend both lists together");
 }
 
-/// Send one request carrying every caller-identity header (plus an unrelated
-/// custom header) through the proxy to an Anthropic-protocol upstream and
+/// Send one request carrying every caller-identity and browser-context header
+/// (plus an unrelated custom header) through the proxy to an Anthropic-protocol upstream and
 /// return the headers that upstream actually received.
 async fn upstream_headers_seen(
     path: &str,
@@ -164,7 +176,10 @@ async fn upstream_headers_seen(
         .post(format!("http://{addr}{path}"))
         .header("content-type", "application/json")
         .header("x-custom-trace", "keep-me");
-    for &(name, value) in CLIENT_IDENTITY_HEADER_SAMPLES {
+    for &(name, value) in CLIENT_IDENTITY_HEADER_SAMPLES
+        .iter()
+        .chain(BROWSER_CONTEXT_HEADER_SAMPLES)
+    {
         req = req.header(name, value);
     }
     let resp = req.body(body.to_string()).send().await.unwrap();
@@ -193,6 +208,17 @@ fn assert_identity_headers_absent(seen: &axum::http::HeaderMap) {
     );
 }
 
+/// Stripped whatever `forward_caller_identity` says: forwarded, `Origin` makes
+/// Anthropic reject a pooled account's request with a CORS 401 (LAB-11390).
+fn assert_browser_context_headers_absent(seen: &axum::http::HeaderMap) {
+    for &(name, _) in BROWSER_CONTEXT_HEADER_SAMPLES {
+        assert!(
+            !seen.contains_key(name),
+            "{name} must never reach the upstream (LAB-11390)"
+        );
+    }
+}
+
 fn assert_identity_headers_relayed(seen: &axum::http::HeaderMap) {
     for &(name, value) in CLIENT_IDENTITY_HEADER_SAMPLES {
         assert_eq!(
@@ -213,6 +239,7 @@ async fn messages_path_strips_caller_identity_headers_upstream_by_default() {
     )
     .await;
     assert_identity_headers_absent(&seen);
+    assert_browser_context_headers_absent(&seen);
 }
 
 /// Same contract on the OpenAI-compat → Anthropic translation path, which
@@ -226,6 +253,7 @@ async fn chat_completions_path_strips_caller_identity_headers_upstream_by_defaul
     )
     .await;
     assert_identity_headers_absent(&seen);
+    assert_browser_context_headers_absent(&seen);
 }
 
 /// The operator escape hatch relays every entry unchanged.
@@ -238,6 +266,7 @@ async fn forward_caller_identity_true_relays_headers_on_messages_path() {
     )
     .await;
     assert_identity_headers_relayed(&seen);
+    assert_browser_context_headers_absent(&seen);
 }
 
 #[tokio::test]
@@ -249,6 +278,7 @@ async fn forward_caller_identity_true_relays_headers_on_chat_completions_path() 
     )
     .await;
     assert_identity_headers_relayed(&seen);
+    assert_browser_context_headers_absent(&seen);
 }
 
 /// GH #97 regression: a 429 from a `Protocol::OpenAI` endpoint must set a

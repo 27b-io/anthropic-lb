@@ -205,10 +205,12 @@ pub(crate) const MAX_CLIENT_REJECTION_LABELS: usize = 64;
 /// generous slack.
 pub(crate) const MAX_CLIENT_MODEL_LABELS: usize = 256;
 
-/// Max chars retained from a caller-controlled string used as a metric label
-/// or echoed in an error body. The model field is bounded only by the request
-/// body cap, so an untruncated copy would be retained for the process lifetime
-/// and re-serialized on every `/metrics` scrape.
+/// Max chars retained from a caller-controlled string used as a metric label,
+/// echoed in an error body, or logged from a request header on the `proxied`
+/// line (`MAX_LOGGED_VALUE_CHARS` states that line's bound). The model field
+/// is bounded only by the request body cap, so an untruncated copy would be
+/// retained for the process lifetime and re-serialized on every `/metrics`
+/// scrape.
 pub(crate) const MAX_LABEL_CHARS: usize = 64;
 
 /// Truncate a caller-controlled string to `MAX_LABEL_CHARS`, marking that it
@@ -235,6 +237,67 @@ pub(crate) fn escape_sentinel(label: &str, stems: &[&str]) -> String {
         return format!("_{label}");
     }
     label.to_owned()
+}
+
+/// Longest value `GoQuoted` writes, in characters, before its `…`. Escaped,
+/// that is at most 10 bytes a character (an escape above U+FFFF), so three
+/// such fields come close to the log sink's `MAX_LINE_BYTES` cut, past which a
+/// line loses its later fields, the token counts among them. The whole
+/// `proxied` line stays inside it because only `model` takes this cap there:
+/// `err` is held to `MAX_UPSTREAM_ERR_CHARS`, and `err_type` and every
+/// header-fed value (`client_id`, `ver`, `agent`, `session`, the hints) to
+/// `MAX_LABEL_CHARS`. A header value escapes to at most 2 bytes a character.
+/// `a_proxied_line_at_every_cap_fits_the_sink_cut` holds both `proxied` lines,
+/// every value at its cap, to the cut.
+pub(crate) const MAX_LOGGED_VALUE_CHARS: usize = 1024;
+
+/// A log field value from the request body, the URI or an upstream, which can
+/// hold any Unicode, logged as `field = %GoQuoted(s)`. It is written in double
+/// quotes, and every character Debug would escape is escaped in a form Go's
+/// `strconv.Unquote` reads back: `\"`, `\\`, `\n`, `\r`, `\t`, `\uXXXX`, or
+/// `\UXXXXXXXX` above U+FFFF. That covers control, format and other
+/// non-printable characters (bidi controls, the U+E0000 tag block) and
+/// combining marks. Debug's own `\u{1}`, `\0` forms are not Go syntax: a
+/// logfmt reader that unquotes with Go's `strconv` rejects them and reads the
+/// value unquoted up to the next space, so a ` client_id=x` inside it parses as
+/// a second field. Every other character, `'` included, is written as is, so
+/// printable ASCII prints the same bytes as Debug. A value longer than
+/// `MAX_LOGGED_VALUE_CHARS` is cut there and marked with `…`.
+///
+/// The rule for every log field: a value from the request body, the URI or an
+/// upstream is `%GoQuoted(..)`, never `?`, bare or `%`. A request header value
+/// may use Debug (`?` or a bare `&str`), because `HeaderValue::to_str` admits
+/// only visible ASCII and tab. The message is written unquoted, so no caller-
+/// or upstream-fed text is interpolated into it.
+pub(crate) struct GoQuoted<'a>(pub(crate) &'a str);
+
+impl std::fmt::Display for GoQuoted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+        f.write_char('"')?;
+        let mut chars = self.0.chars();
+        for c in chars.by_ref().take(MAX_LOGGED_VALUE_CHARS) {
+            match c {
+                '"' => f.write_str(r#"\""#)?,
+                '\\' => f.write_str(r"\\")?,
+                '\n' => f.write_str(r"\n")?,
+                '\r' => f.write_str(r"\r")?,
+                '\t' => f.write_str(r"\t")?,
+                // `char::escape_debug` writes `\'`, which Go refuses inside
+                // double quotes; a string's Debug leaves `'` raw there too.
+                '\'' => f.write_char(c)?,
+                c if c.escape_debug().len() > 1 => match u32::from(c) {
+                    v @ ..=0xffff => write!(f, r"\u{v:04x}")?,
+                    v => write!(f, r"\U{v:08x}")?,
+                },
+                c => f.write_char(c)?,
+            }
+        }
+        if chars.next().is_some() {
+            f.write_char('…')?;
+        }
+        f.write_char('"')
+    }
 }
 
 /// Cap on distinct UNRESERVED 7d claim keys per account. Keys are minted from
@@ -454,7 +517,7 @@ pub(crate) async fn log_429_details(account_name: &str, resp: reqwest::Response)
     debug!(
         account = account_name,
         headers = headers_fmt.join(" | "),
-        body = body_str,
+        body = %GoQuoted(&body_str),
         "429 response details"
     );
 }
@@ -483,15 +546,15 @@ pub(crate) fn compute_pressure_status(effective_util: f64, caller: &Caller) -> &
     };
 
     // Upgrade status if client's utilization limit proximity exceeds 80%
-    if let Some(limit) = caller.utilization_limit() {
-        if effective_util >= limit * 0.80 {
-            status = match status {
-                "healthy" => "elevated",
-                "elevated" => "critical",
-                "critical" => "emergency",
-                _ => status,
-            };
-        }
+    if let Some(limit) = caller.utilization_limit()
+        && effective_util >= limit * 0.80
+    {
+        status = match status {
+            "healthy" => "elevated",
+            "elevated" => "critical",
+            "critical" => "emergency",
+            _ => status,
+        };
     }
 
     status
@@ -775,6 +838,10 @@ pub(crate) struct AppState {
     /// Upstream "prompt is too long" 400s by model (LAB-916). Exposed as
     /// `anthropic_prompt_too_long_total`; bounded via `_other` overflow.
     pub(crate) prompt_too_long: Mutex<HashMap<String, u64>>,
+    /// Requests re-sent without `speed` because the model rejects it
+    /// (LAB-4190), by requested model. Exposed as
+    /// `anthropic_speed_unsupported_total`; bounded like `prompt_too_long`.
+    pub(crate) speed_unsupported: Mutex<HashMap<String, u64>>,
     /// Upstream 429s on fast-mode requests, by account (LAB-2675). These are
     /// forwarded to the caller instead of cooling the account — fast mode has
     /// its own rate bucket — so this counter is the only operator-visible
@@ -876,7 +943,7 @@ impl AppState {
                     return Some(BodyReservation {
                         state: Arc::clone(self),
                         bytes,
-                    })
+                    });
                 }
                 Err(actual) => cur = actual,
             }

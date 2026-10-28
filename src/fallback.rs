@@ -98,7 +98,7 @@ pub(crate) async fn try_fallback_upstream(
     info!(
         req_id,
         client_id,
-        model,
+        model = %GoQuoted(model),
         upstream = ep.name,
         translate,
         pin = state.pin_status(caller, endpoint_idx),
@@ -194,7 +194,7 @@ pub(crate) async fn try_fallback_upstream(
             req_id,
             upstream = ep.name,
             status = status.as_u16(),
-            body = ?err_body,
+            body = %GoQuoted(&err_body),
             "fallback: unified endpoint returned error"
         );
         // Gateway rejected the MODEL (e.g. LiteLLM "Invalid model name"):
@@ -204,7 +204,7 @@ pub(crate) async fn try_fallback_upstream(
         // 529 storm drained the Anthropic accounts into an OpenAI-protocol
         // LiteLLM gateway).
         // Only the model rejection: this path has never re-sent on an
-        // entitlement 400.
+        // entitlement 400, and forwards a speed 400 unchanged (LAB-4190).
         let model_unsupported =
             serde_json::from_str::<serde_json::Value>(&err_body).is_ok_and(|v| {
                 // Always the endpoint's own bearer token here, never the caller's.
@@ -472,7 +472,7 @@ pub(crate) async fn try_fallback_upstream(
             warn!(
                 req_id,
                 client_id,
-                model,
+                model = %GoQuoted(model),
                 upstream = ep.name,
                 error = %e,
                 "fallback: unified endpoint response body is not valid JSON; usage not recorded"

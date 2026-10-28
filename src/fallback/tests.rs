@@ -26,12 +26,12 @@ async fn mock_openai_upstream_handler(req: Request<Body>) -> Response {
 
     if is_streaming {
         let sse = [
-                "data: {\"id\":\"chatcmpl-fb1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
-                "data: {\"id\":\"chatcmpl-fb1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Fallback\"},\"finish_reason\":null}]}\n\n",
-                "data: {\"id\":\"chatcmpl-fb1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\" works\"},\"finish_reason\":null}]}\n\n",
-                "data: {\"id\":\"chatcmpl-fb1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-                "data: [DONE]\n\n",
-            ];
+            "data: {\"id\":\"chatcmpl-fb1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-fb1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Fallback\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-fb1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\" works\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-fb1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ];
         return Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")

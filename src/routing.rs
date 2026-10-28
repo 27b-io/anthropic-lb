@@ -317,9 +317,15 @@ impl AppState {
                     };
                 }
                 if matches!(bind, MigrationReason::Floored) {
-                    log_migration!(info, "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)");
+                    log_migration!(
+                        info,
+                        "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)"
+                    );
                 } else {
-                    log_migration!(warn, "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)");
+                    log_migration!(
+                        warn,
+                        "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)"
+                    );
                 }
                 picked = other;
             }
@@ -607,7 +613,7 @@ impl AppState {
             if fast_disabled.contains(&c.endpoint) {
                 trace!(
                     endpoint = self.endpoints[c.endpoint].name,
-                    model,
+                    model = %GoQuoted(model),
                     "pick: skipping, fast mode disabled on endpoint"
                 );
                 return false;
@@ -619,7 +625,7 @@ impl AppState {
             if fast.excludes_openai() && self.endpoints[c.endpoint].protocol == Protocol::OpenAI {
                 trace!(
                     endpoint = self.endpoints[c.endpoint].name,
-                    model,
+                    model = %GoQuoted(model),
                     "pick: skipping, openai-protocol endpoint can't honor speed:\"fast\""
                 );
                 return false;
@@ -645,7 +651,7 @@ impl AppState {
                 // account(s) and will consume shared-pool cache/claims.
                 info!(
                     client_id = caller.name(),
-                    model,
+                    model = %GoQuoted(model),
                     fast_mode_disabled = fast_disabled
                         .iter()
                         .any(|&i| self.endpoint_is_preferred(preferred, i)),
@@ -776,15 +782,15 @@ impl AppState {
         // Debug: log all ratelimit headers
         for (name, value) in headers.iter() {
             let name_str = name.as_str();
-            if name_str.contains("ratelimit") || name_str.contains("retry") {
-                if let Ok(v) = value.to_str() {
-                    tracing::trace!(
-                        account = endpoint_name,
-                        header = name_str,
-                        value = v,
-                        "rate-limit header"
-                    );
-                }
+            if (name_str.contains("ratelimit") || name_str.contains("retry"))
+                && let Ok(v) = value.to_str()
+            {
+                tracing::trace!(
+                    account = endpoint_name,
+                    header = name_str,
+                    value = v,
+                    "rate-limit header"
+                );
             }
         }
 
@@ -862,29 +868,24 @@ impl AppState {
 
         // Capture per-window reset timestamps (epoch seconds).
         // Sanity-capped: 5h window can't reset >5h out, 7d can't reset >7d out (Bug #6).
-        if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-reset") {
-            if let Ok(s) = v.to_str() {
-                if let Ok(epoch) = s.parse::<u64>() {
-                    if epoch <= now_epoch + 18000 {
-                        info.reset_5h = Some(epoch);
-                    }
-                }
-            }
+        if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-reset")
+            && let Ok(s) = v.to_str()
+            && let Ok(epoch) = s.parse::<u64>()
+            && epoch <= now_epoch + 18000
+        {
+            info.reset_5h = Some(epoch);
         }
         // 7d reset → only update existing claims_7d entries. Creating a placeholder
         // with utilization=None would shadow real fallback entries in resolve_7d_claim
         // (model-specific key takes priority over "seven_day" via or_else).
-        if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-reset") {
-            if let Ok(s) = v.to_str() {
-                if let Ok(epoch) = s.parse::<u64>() {
-                    if epoch <= now_epoch + 604800 {
-                        if let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
-                            entry.reset = Some(epoch);
-                            entry.last_seen = now_epoch;
-                        }
-                    }
-                }
-            }
+        if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-reset")
+            && let Ok(s) = v.to_str()
+            && let Ok(epoch) = s.parse::<u64>()
+            && epoch <= now_epoch + 604800
+            && let Some(entry) = info.claims_7d.get_mut(claim_key_7d)
+        {
+            entry.reset = Some(epoch);
+            entry.last_seen = now_epoch;
         }
 
         // Capture per-window status. These signal API-side pressure (burst limits, concurrent
@@ -900,11 +901,11 @@ impl AppState {
         }
         // 7d status → only update existing claims_7d entries (same shadowing concern).
         if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-status") {
-            if let Ok(s) = v.to_str() {
-                if let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
-                    entry.status = Some(s.to_string());
-                    entry.last_seen = now_epoch;
-                }
+            if let Ok(s) = v.to_str()
+                && let Some(entry) = info.claims_7d.get_mut(claim_key_7d)
+            {
+                entry.status = Some(s.to_string());
+                entry.last_seen = now_epoch;
             }
         } else if got_7d_util {
             // Status absent but util present → pressure subsided for this claim
@@ -923,37 +924,36 @@ impl AppState {
         // exactly like every other claim. Anchored on the utilization header so
         // a partial triplet never creates a utilization-less placeholder (same
         // shadowing rule as the general 7d claim).
-        if let Some(v) = headers.get("anthropic-ratelimit-unified-7d_oi-utilization") {
-            if let Ok(s) = v.to_str() {
-                if let Ok(util) = s.parse::<f64>() {
-                    let first_sighting = !info.claims_7d.contains_key(FABLE_BAND_CLAIM);
-                    let entry = info
-                        .claims_7d
-                        .entry(FABLE_BAND_CLAIM.to_string())
-                        .or_default();
-                    entry.utilization = Some(util.clamp(0.0, 1.0));
-                    entry.last_seen = now_epoch;
-                    entry.reset = headers
-                        .get("anthropic-ratelimit-unified-7d_oi-reset")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .filter(|&epoch| epoch <= now_epoch + 604800) // 7d sanity cap
-                        .or(entry.reset);
-                    // Status absent within a present triplet = pressure subsided
-                    // (same semantics as the general 7d claim, Bug #1).
-                    entry.status = headers
-                        .get("anthropic-ratelimit-unified-7d_oi-status")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
-                    if first_sighting {
-                        info!(
-                            account = endpoint_name,
-                            utilization = util,
-                            "fable band claim first observed (7d_oi headers) — \
+        if let Some(v) = headers.get("anthropic-ratelimit-unified-7d_oi-utilization")
+            && let Ok(s) = v.to_str()
+            && let Ok(util) = s.parse::<f64>()
+        {
+            let first_sighting = !info.claims_7d.contains_key(FABLE_BAND_CLAIM);
+            let entry = info
+                .claims_7d
+                .entry(FABLE_BAND_CLAIM.to_string())
+                .or_default();
+            entry.utilization = Some(util.clamp(0.0, 1.0));
+            entry.last_seen = now_epoch;
+            entry.reset = headers
+                .get("anthropic-ratelimit-unified-7d_oi-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|&epoch| epoch <= now_epoch + 604800) // 7d sanity cap
+                .or(entry.reset);
+            // Status absent within a present triplet = pressure subsided
+            // (same semantics as the general 7d claim, Bug #1).
+            entry.status = headers
+                .get("anthropic-ratelimit-unified-7d_oi-status")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            if first_sighting {
+                info!(
+                    account = endpoint_name,
+                    utilization = util,
+                    "fable band claim first observed (7d_oi headers) — \
                              fable-aware routing active for this account"
-                        );
-                    }
-                }
+                );
             }
         }
 
@@ -1044,29 +1044,29 @@ impl AppState {
 
         // Legacy headers (still try them)
         let mut got_legacy = false;
-        if let Some(v) = headers.get("x-ratelimit-remaining-requests") {
-            if let Ok(s) = v.to_str() {
-                info.remaining_requests = s.parse().ok();
-                got_legacy = true;
-            }
+        if let Some(v) = headers.get("x-ratelimit-remaining-requests")
+            && let Ok(s) = v.to_str()
+        {
+            info.remaining_requests = s.parse().ok();
+            got_legacy = true;
         }
-        if let Some(v) = headers.get("x-ratelimit-remaining-tokens") {
-            if let Ok(s) = v.to_str() {
-                info.remaining_tokens = s.parse().ok();
-                got_legacy = true;
-            }
+        if let Some(v) = headers.get("x-ratelimit-remaining-tokens")
+            && let Ok(s) = v.to_str()
+        {
+            info.remaining_tokens = s.parse().ok();
+            got_legacy = true;
         }
-        if let Some(v) = headers.get("x-ratelimit-limit-requests") {
-            if let Ok(s) = v.to_str() {
-                info.limit_requests = s.parse().ok();
-                got_legacy = true;
-            }
+        if let Some(v) = headers.get("x-ratelimit-limit-requests")
+            && let Ok(s) = v.to_str()
+        {
+            info.limit_requests = s.parse().ok();
+            got_legacy = true;
         }
-        if let Some(v) = headers.get("x-ratelimit-limit-tokens") {
-            if let Ok(s) = v.to_str() {
-                info.limit_tokens = s.parse().ok();
-                got_legacy = true;
-            }
+        if let Some(v) = headers.get("x-ratelimit-limit-tokens")
+            && let Ok(s) = v.to_str()
+        {
+            info.limit_tokens = s.parse().ok();
+            got_legacy = true;
         }
 
         // Only advance last_updated when we actually parsed rate-limit data.
@@ -1085,9 +1085,9 @@ impl AppState {
             util_5h = ?info.utilization_5h,
             reset_5h = ?info.reset_5h,
             reset_7d = ?info.reset_7d,
-            status_5h = ?info.status_5h,
-            status_7d = ?info.status_7d,
-            claim = ?info.representative_claim,
+            status_5h = %GoQuoted(info.status_5h.as_deref().unwrap_or("-")),
+            status_7d = %GoQuoted(info.status_7d.as_deref().unwrap_or("-")),
+            claim = %GoQuoted(info.representative_claim.as_deref().unwrap_or("-")),
             n_claims_7d = info.claims_7d.len(),
             remaining_requests = ?info.remaining_requests,
             remaining_tokens = ?info.remaining_tokens,
@@ -1130,10 +1130,10 @@ impl AppState {
             let conn = redis.clone();
             let key = format!("alb:rate:{}", endpoint_name);
             tokio::spawn(async move {
-                if let Ok(json) = serde_json::to_string(&rate_data) {
-                    if let Err(e) = redis_set_ex(&conn, &key, json, ttl as i64).await {
-                        tracing::warn!(error = %e, "redis rate info write failed");
-                    }
+                if let Ok(json) = serde_json::to_string(&rate_data)
+                    && let Err(e) = redis_set_ex(&conn, &key, json, ttl as i64).await
+                {
+                    tracing::warn!(error = %e, "redis rate info write failed");
                 }
             });
         }
@@ -1209,7 +1209,7 @@ impl AppState {
         warn!(
             account = endpoint_name,
             cooldown_secs = cooldown.as_secs(),
-            retry_after_raw = ?raw_retry_after,
+            retry_after_raw = %GoQuoted(raw_retry_after.as_deref().unwrap_or("-")),
             burst = is_burst_limit,
             consecutive_burst = info.consecutive_burst_429s,
             unified = unified_ratelimit_summary(headers),
@@ -1287,12 +1287,15 @@ impl AppState {
         }
     }
 
-    /// Sync shared state from Redis: hard limits + rate info.
-    /// Called periodically by background task.
-    pub(crate) async fn sync_from_redis(&self) {
+    /// Sync shared state from Redis. Every scope syncs hard limits, flushes
+    /// transport errors and refreshes the cluster info (budgets, heartbeats);
+    /// `SyncScope::Full` also syncs rate info and routing weights.
+    /// Called periodically by background task. Returns whether the rate-info
+    /// read ran and succeeded, which only a `Full` tick attempts.
+    pub(crate) async fn sync_from_redis(&self, scope: SyncScope) -> bool {
         let redis = match self.coordination_redis() {
             Some(r) => r,
-            None => return,
+            None => return false,
         };
         let now_epoch = Self::now_epoch();
         let now_instant = Instant::now();
@@ -1361,59 +1364,74 @@ impl AppState {
             }
         }
 
-        // 2. Sync rate info (MGET for all targets in one round-trip)
+        // 2. Flush this replica's transport-error deltas into the shared Redis
+        //    hash so the fleet-wide by-kind count is visible cluster-wide.
+        //    Drains the local accumulator; the cluster_info refresh below then
+        //    reads the freshly-flushed total back via HGETALL.
+        self.flush_transport_errors().await;
+
+        // 3. Refresh cluster info cache for /_stats endpoint
+        let info = self.cluster_info().await;
+        *self.lock_cluster_info_cache() = info;
+
+        if scope == SyncScope::Fast {
+            return false;
+        }
+
+        // 4. Sync rate info (MGET for all targets in one round-trip)
         let rate_keys: Vec<String> = targets
             .iter()
             .map(|t| format!("alb:rate:{}", t.name))
             .collect();
 
-        if let Ok(values) = redis.mget::<Vec<Option<String>>, _>(rate_keys).await {
+        let rate_reply = redis.mget::<Vec<Option<String>>, _>(rate_keys).await;
+        let rate_synced = rate_reply.is_ok();
+        if let Ok(values) = rate_reply {
             for (i, val) in values.iter().enumerate() {
-                if let Some(json) = val {
-                    if let Ok(remote) = serde_json::from_str::<RedisRateInfo>(json) {
-                        let mut info = targets[i].rate_info.write().await;
-                        // "Most recent wins": only apply remote data if it's newer
-                        // Both ages use wall-clock epoch to avoid mixed-clock-domain bugs
-                        let local_age = info
-                            .last_updated_epoch
-                            .map(|epoch| now_epoch.saturating_sub(epoch))
-                            .unwrap_or(u64::MAX);
-                        let remote_age = now_epoch.saturating_sub(remote.updated_at);
-                        if remote_age < local_age {
-                            info.utilization = remote.utilization;
-                            info.utilization_5h = remote.utilization_5h;
-                            info.utilization_7d = remote.utilization_7d;
-                            info.reset_5h = remote.reset_5h;
-                            info.reset_7d = remote.reset_7d;
-                            info.status_5h = remote.status_5h;
-                            info.status_7d = remote.status_7d;
-                            info.claims_7d = bound_ingested_claims(remote.claims_7d);
-                            // Truncated to match the keys `bound_ingested_claims`
-                            // just wrote — see the same pairing in `load_state`.
-                            info.representative_claim =
-                                remote.representative_claim.as_deref().map(truncate_label);
-                            info.remaining_requests = remote.remaining_requests;
-                            info.remaining_tokens = remote.remaining_tokens;
-                            info.limit_requests = remote.limit_requests;
-                            info.limit_tokens = remote.limit_tokens;
-                            info.overage_in_use = remote.overage_in_use;
-                            info.overage_status = remote.overage_status;
-                            info.overage_utilization = remote.overage_utilization;
-                            info.overage_reset = remote.overage_reset;
-                            info.last_updated = Some(now_instant);
-                            info.last_updated_epoch = Some(remote.updated_at);
-                            trace!(
-                                endpoint = targets[i].name,
-                                remote_age,
-                                "synced rate info from redis"
-                            );
-                        }
+                if let Some(json) = val
+                    && let Ok(remote) = serde_json::from_str::<RedisRateInfo>(json)
+                {
+                    let mut info = targets[i].rate_info.write().await;
+                    // "Most recent wins": only apply remote data if it's newer
+                    // Both ages use wall-clock epoch to avoid mixed-clock-domain bugs
+                    let local_age = info
+                        .last_updated_epoch
+                        .map(|epoch| now_epoch.saturating_sub(epoch))
+                        .unwrap_or(u64::MAX);
+                    let remote_age = now_epoch.saturating_sub(remote.updated_at);
+                    if remote_age < local_age {
+                        info.utilization = remote.utilization;
+                        info.utilization_5h = remote.utilization_5h;
+                        info.utilization_7d = remote.utilization_7d;
+                        info.reset_5h = remote.reset_5h;
+                        info.reset_7d = remote.reset_7d;
+                        info.status_5h = remote.status_5h;
+                        info.status_7d = remote.status_7d;
+                        info.claims_7d = bound_ingested_claims(remote.claims_7d);
+                        // Truncated to match the keys `bound_ingested_claims`
+                        // just wrote — see the same pairing in `load_state`.
+                        info.representative_claim =
+                            remote.representative_claim.as_deref().map(truncate_label);
+                        info.remaining_requests = remote.remaining_requests;
+                        info.remaining_tokens = remote.remaining_tokens;
+                        info.limit_requests = remote.limit_requests;
+                        info.limit_tokens = remote.limit_tokens;
+                        info.overage_in_use = remote.overage_in_use;
+                        info.overage_status = remote.overage_status;
+                        info.overage_utilization = remote.overage_utilization;
+                        info.overage_reset = remote.overage_reset;
+                        info.last_updated = Some(now_instant);
+                        info.last_updated_epoch = Some(remote.updated_at);
+                        trace!(
+                            endpoint = targets[i].name,
+                            remote_age, "synced rate info from redis"
+                        );
                     }
                 }
             }
         }
 
-        // 3. Sync precomputed routing weights (published by probing pod)
+        // 5. Sync precomputed routing weights (published by probing pod)
         let weight_keys: Vec<String> = targets
             .iter()
             .map(|t| format!("alb:weight:{}", t.name))
@@ -1422,29 +1440,20 @@ impl AppState {
             for (i, val) in values.iter().enumerate() {
                 if let Some(csv) = val {
                     let mut parts = csv.splitn(3, ',');
-                    if let (Some(w_str), Some(s_str)) = (parts.next(), parts.next()) {
-                        if let (Ok(w), Ok(s)) = (w_str.parse::<f64>(), s_str.parse::<f64>()) {
-                            targets[i].weight.store(w.to_bits(), Ordering::Relaxed);
-                            targets[i].share.store(s.to_bits(), Ordering::Relaxed);
-                            // Gate is optional (backward compat with older publishers)
-                            if let Some(Ok(g)) = parts.next().map(|g| g.parse::<f64>()) {
-                                targets[i].gate.store(g.to_bits(), Ordering::Relaxed);
-                            }
+                    if let (Some(w_str), Some(s_str)) = (parts.next(), parts.next())
+                        && let (Ok(w), Ok(s)) = (w_str.parse::<f64>(), s_str.parse::<f64>())
+                    {
+                        targets[i].weight.store(w.to_bits(), Ordering::Relaxed);
+                        targets[i].share.store(s.to_bits(), Ordering::Relaxed);
+                        // Gate is optional (backward compat with older publishers)
+                        if let Some(Ok(g)) = parts.next().map(|g| g.parse::<f64>()) {
+                            targets[i].gate.store(g.to_bits(), Ordering::Relaxed);
                         }
                     }
                 }
             }
         }
-
-        // 4. Flush this replica's transport-error deltas into the shared Redis
-        //    hash so the fleet-wide by-kind count is visible cluster-wide.
-        //    Drains the local accumulator; the cluster_info refresh below then
-        //    reads the freshly-flushed total back via HGETALL.
-        self.flush_transport_errors().await;
-
-        // 5. Refresh cluster info cache for /_stats endpoint
-        let info = self.cluster_info().await;
-        *self.lock_cluster_info_cache() = info;
+        rate_synced
     }
 
     /// Lock the transport-error accumulator via `lock_recovering`. Every
@@ -1533,10 +1542,7 @@ impl AppState {
         let truncated: Vec<String> = dropped
             .iter()
             .map(|f| {
-                let mut end = f.len().min(MAX_DROPPED_BETA_FLAG_LEN);
-                while !f.is_char_boundary(end) {
-                    end -= 1;
-                }
+                let end = f.floor_char_boundary(MAX_DROPPED_BETA_FLAG_LEN);
                 // A literal `_other` flag must not land on the overflow key.
                 escape_sentinel(&f[..end], &["other"])
             })
@@ -1560,7 +1566,7 @@ impl AppState {
         if !first_seen.is_empty() {
             warn!(
                 client_id,
-                flags = %first_seen.join(","),
+                flags = ?first_seen.join(","),
                 "dropped client anthropic-beta flags not on the allow-list \
                  (a configured allowed_client_betas REPLACES the default list — \
                  include the defaults plus the flags to permit)"
@@ -1577,7 +1583,7 @@ impl AppState {
         if !repeats.is_empty() {
             debug!(
                 client_id,
-                flags = %repeats.join(","),
+                flags = ?repeats.join(","),
                 "dropped client anthropic-beta flags (previously reported)"
             );
         }
@@ -1636,8 +1642,9 @@ impl AppState {
         }
         drop(map);
         if !first_seen.is_empty() {
-            // `dropped` is sanitized here too: it is logged raw by the sibling
-            // only because a header token cannot carry a newline.
+            // `dropped` is sanitized here too. The sibling logs it unsanitized
+            // but Debug-quoted (`?`), the rule for a header value (see
+            // `GoQuoted`): a comma-split flag can carry a space, `=` or `"`.
             let context: Vec<String> = dropped
                 .iter()
                 .take(MAX_STRIPPED_FIELDS_PER_REQUEST)

@@ -406,6 +406,7 @@ Every install logs the document's exact bytes as base64, with its version and di
 | **Failed-auth throttle** | `auth_failure_limit` / `auth_failure_window_secs` | Further invalid credentials get 429 + `retry-after` per client IP after repeated failures; valid credentials always pass | on (10 / 300s) |
 | **Trusted proxies** | `trusted_proxies = ["192.0.2.0/24"]` | Real client IP recovered from `x-forwarded-for` behind a listed LB | header ignored |
 | **Caller-identity privacy** | `forward_caller_identity = false` | Caller IP and `x-client-id`/`x-agent-id`/`x-session-id` headers dropped before the upstream request | **stripped** |
+| **Browser-context headers** | always | `origin`, `referer` and `sec-fetch-*` dropped before the upstream request: a forwarded `Origin` makes Anthropic answer a browser caller's valid request with a CORS 401 | **stripped** |
 | **Model allow-list** | `clients[].models` | Rejects models outside a client's list (403) | all models |
 
 IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are held and matched as digests. Startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`), and a presented credential that short never matches.
@@ -546,6 +547,16 @@ can steer are locked down by default:
   `429`s (`x-should-retry` with no `retry-after` and no rate-limit headers) are
   excluded: those are per-minute limits on the account itself, so they keep
   their usual backoff and rotation whatever speed was requested.
+- **`speed` on a model that does not support it is dropped, not fatal.**
+  Some models reject a top-level `speed` of any value with a `400` ("`'<model>'`
+  does not support the `speed` parameter"), on every account. On
+  `/v1/messages` and `/v1/messages/count_tokens` the proxy removes `speed` and
+  re-sends once to the same account, and the request is served at standard
+  speed. Nothing is cached or marked, and the `400` itself does not rotate the
+  request to another account. If the re-send then gets a `429` or `5xx`, normal
+  rotation applies, and the next account receives the body without `speed`. A
+  `passthrough` endpoint forwards the `400` unchanged. Occurrences are counted
+  as `anthropic_speed_unsupported_total{model}`.
 
 ### Known Limitations
 
@@ -1297,9 +1308,13 @@ when the body was unparseable). When the upstream answers a 4xx with an
 Anthropic error envelope, the line (`proxied` or `proxied (openai-compat)`)
 names its reason: `err_type` is the upstream `error.type`, cut to 64
 characters plus `…` when longer, and `err` its `error.message`, at most 200
-characters, `…` included when cut; control characters in either become
-spaces. Both are `-` on every other line, 2xx included. Override the filter
-with `RUST_LOG` (e.g. `RUST_LOG=anthropic_lb=debug`), or set
+characters, `…` included when cut; control characters in either are
+escaped. Both are `-` on every other line, 2xx included. Values the line
+takes from request headers (`ver`, `agent`, `session`, the `x-claude-code-*`
+hints, and `client_id` when no `[[clients]]` is configured) are cut to 64
+characters plus `…` when longer, so no header can push the line past the log
+sink's 32 KiB cut; routing and budgets still use the whole value. Override
+the filter with `RUST_LOG` (e.g. `RUST_LOG=anthropic_lb=debug`), or set
 `debug_log = "/path/to/file.log"` in the config to additionally write a
 `debug`-level file log alongside the `info`-level stdout stream. At `debug`,
 the full per-request content fingerprinting detail (`fingerprint`:
@@ -1325,11 +1340,11 @@ one JSON object per line
 1 MiB, or one second after its first line, whichever comes first, so a lone
 line arrives within about a second. Delivery is best effort and never slows a
 request: lines wait in a bounded in-memory queue (10,000 lines and 16 MiB), a
-line that finds it full is dropped, a line longer than 32 KiB is cut and marked
-with its full length (comfortably under VictoriaLogs' default 256 KiB line
-limit), and a batch that fails, times out (5 s) or gets a
-non-2xx answer is dropped, not retried. `anthropic_log_sink_lines_sent_total`
-and `anthropic_log_sink_lines_dropped_total` on `/metrics` count both
+line that finds it full is dropped, a line longer than 32 KiB is cut after its
+last whole field and marked with its full length (comfortably under
+VictoriaLogs' default 256 KiB line limit), and a batch that fails, times out
+(5 s) or gets a non-2xx answer is dropped, not retried.
+`anthropic_log_sink_lines_sent_total` and `anthropic_log_sink_lines_dropped_total` on `/metrics` count both
 outcomes; they are absent when no sink is configured. The proxy logs one
 warning when delivery starts failing and one line when it recovers, with the
 number of lines dropped meanwhile. At shutdown it waits up to 2 s for the
@@ -1377,7 +1392,7 @@ redis_url = "redis://redis.example.com:6379"
 |:--------------|:----------|:------------|
 | **Budget counters** | Atomic `INCRBY` per request | Immediate |
 | **Hard limits (429)** | `SETEX` on mark + background sync | Immediate local, ~5s cross-replica |
-| **Rate info** | JSON blob per account | ~5s (background sync) |
+| **Rate info** | JSON blob per account | Immediate local, ~30s cross-replica |
 | **Replica heartbeats** | `SET EX 30` per instance | ~5s |
 
 **Fail-open**: All Redis *operations* degrade gracefully. If a syntactically valid `redis_url` is unreachable, each replica falls back to local-only state and reconnects in the background. No request is ever blocked by a Redis error. A `redis_url` that fails to *parse* (e.g. a rotated password containing an unescaped `/`, `?`, or `#`) is a config error, not a connectivity one — it fails startup outright rather than silently running without the shared state an operator asked for.

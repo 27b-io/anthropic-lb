@@ -50,3 +50,44 @@ fn start_coordination_redis_rejects_numeric_password_prefix_mis_route() {
         "a numeric password-prefix must not silently mis-route to the wrong host"
     );
 }
+
+// Rate info and routing weights are read once per slow period, everything
+// else every tick. The first tick is a full sync, so a fresh instance starts
+// with the fleet's rate view rather than its own empty one. The real-Redis
+// `sync_from_redis_fast_tick_skips_rate_and_weight_reads` pins what each
+// scope reads.
+#[test]
+fn sync_cadence_reads_rate_and_weights_once_per_slow_period() {
+    assert!(
+        (30..=60).contains(&REDIS_SLOW_SYNC_INTERVAL.as_secs()),
+        "the slow period trades sync bytes against how stale the other instances' rate view gets"
+    );
+    let ticks_per_period = REDIS_SLOW_SYNC_INTERVAL.as_secs() / REDIS_SYNC_INTERVAL.as_secs();
+    let mut cadence = SyncCadence::default();
+    for period in 0..3 {
+        assert_eq!(cadence.scope(), SyncScope::Full, "period {period}");
+        cadence.advance(true);
+        for tick in 1..ticks_per_period {
+            assert_eq!(
+                cadence.scope(),
+                SyncScope::Fast,
+                "period {period} tick {tick}"
+            );
+            cadence.advance(false);
+        }
+    }
+}
+
+// A full tick whose rate read did not land (Redis not yet connected at boot,
+// or the read failed) stays due: otherwise an instance that connects just
+// after its first tick routes on an empty rate view for a whole slow period.
+#[test]
+fn sync_cadence_keeps_a_full_tick_due_until_its_rate_read_lands() {
+    let mut cadence = SyncCadence::default();
+    for _ in 0..3 {
+        cadence.advance(false);
+        assert_eq!(cadence.scope(), SyncScope::Full);
+    }
+    cadence.advance(true);
+    assert_eq!(cadence.scope(), SyncScope::Fast);
+}
