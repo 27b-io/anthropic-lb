@@ -656,8 +656,12 @@ async fn main() {
             internal_command_timeout: Duration::from_secs(5),
             ..Default::default()
         };
-        // 0 = retry forever; delays 100ms → 30s, doubling.
-        let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
+        // 0 = retry forever; delays 100ms → 5s, doubling. The cap bounds how
+        // long the LB stays local-only after the backend is reachable again:
+        // at 30s it came back 19-27s after Redis or its tunnel returned,
+        // at 5s within one cap. A reconnect attempt every 5s per replica
+        // costs the backend nothing during an outage.
+        let policy = ReconnectPolicy::new_exponential(0, 100, 5_000, 2);
         match start_coordination_redis(url.as_str(), perf, conn_config, policy) {
             Ok(client) => Some(client),
             // Log only `kind()` (a fixed enum, e.g. `Url`/`Config`) — never
