@@ -5,6 +5,8 @@
 # together; the binary is static, so the bookworm base needs nothing extra.
 # Inert unless an entrypoint starts it. Run it at `--loglevel info` or quieter:
 # at debug it logs the WebSocket request headers, Access client secret included.
+# cloudflared is Apache-2.0; the runtime base already ships that license text at
+# /usr/share/common-licenses/Apache-2.0, and cloudflared publishes no NOTICE file.
 FROM cloudflare/cloudflared:2026.10.5@sha256:1b1d34d0a9c0bfca9de72db8460d328db3f19edd2b96169114e3e893a97bbe53 AS cloudflared
 
 FROM rust:bookworm AS builder
