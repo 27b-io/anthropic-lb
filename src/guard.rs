@@ -232,11 +232,7 @@ impl ScanInput {
         let truncated = text.len() > MAX_SCAN_BYTES;
         if truncated {
             // Truncate at the largest UTF-8 char boundary <= the cap.
-            let mut end = MAX_SCAN_BYTES;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
+            text.truncate(text.floor_char_boundary(MAX_SCAN_BYTES));
         }
         ScanOutcome::Scannable(ScanInput { text, truncated })
     }
@@ -1307,6 +1303,17 @@ mod tests {
             "scanned bytes {} exceeded cap {MAX_SCAN_BYTES}",
             si.text().len()
         );
+    }
+
+    #[test]
+    fn scan_input_cap_backs_off_to_char_boundary() {
+        // A 4-byte char straddling the cap is dropped whole, not split.
+        let head = "a".repeat(MAX_SCAN_BYTES - 1);
+        let body =
+            json!({"messages": [{"role": "user", "content": format!("{head}\u{1F980}tail")}]});
+        let si = scannable(ScanInput::from_body(&body));
+        assert!(si.truncated(), "a body over the cap must report truncation");
+        assert_eq!(si.text(), head);
     }
 
     #[test]

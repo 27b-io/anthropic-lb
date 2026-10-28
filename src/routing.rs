@@ -1533,10 +1533,7 @@ impl AppState {
         let truncated: Vec<String> = dropped
             .iter()
             .map(|f| {
-                let mut end = f.len().min(MAX_DROPPED_BETA_FLAG_LEN);
-                while !f.is_char_boundary(end) {
-                    end -= 1;
-                }
+                let end = f.floor_char_boundary(MAX_DROPPED_BETA_FLAG_LEN);
                 // A literal `_other` flag must not land on the overflow key.
                 escape_sentinel(&f[..end], &["other"])
             })
