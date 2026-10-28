@@ -909,15 +909,21 @@ async fn main() {
         tokio::spawn(async move {
             // Wait for initial startup to complete
             tokio::time::sleep(Duration::from_secs(5)).await;
-            info!("starting redis state sync (5s interval)");
+            info!(
+                interval_secs = REDIS_SYNC_INTERVAL.as_secs(),
+                rate_interval_secs = REDIS_SLOW_SYNC_INTERVAL.as_secs(),
+                "starting redis state sync"
+            );
+            let mut tick: u64 = 0;
             loop {
-                sync_state.sync_from_redis().await;
+                sync_state.sync_from_redis(SyncScope::for_tick(tick)).await;
                 // Heartbeat: register this instance
                 if let Some(redis) = sync_state.coordination_redis() {
                     let key = format!("alb:heartbeat:{instance_id}");
                     let _ = redis_set_ex(redis, &key, AppState::now_epoch().to_string(), 30).await;
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tick = tick.wrapping_add(1);
+                tokio::time::sleep(REDIS_SYNC_INTERVAL).await;
             }
         });
     }

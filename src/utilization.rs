@@ -138,6 +138,47 @@ pub(crate) const REDIS_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 /// permanence.
 pub(crate) const REDIS_STARTUP_GRACE: Duration = Duration::from_secs(5);
 
+/// Period of the Redis sync loop. Every tick reads the hard limits, the
+/// budget counters and the transport-error hash and writes this instance's
+/// heartbeat, so a 429 cooldown reaches every instance within this period.
+pub(crate) const REDIS_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Period of the sync loop's rate-info and routing-weight reads. Each is an
+/// MGET over every account, and the rate-info values are JSON, so these two
+/// reads carry most of the loop's bytes; sync traffic grows with accounts ×
+/// instances. An instance applies its own upstream responses at once, so
+/// only its view of the other instances' traffic lags, by up to this period.
+pub(crate) const REDIS_SLOW_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+
+const _: () = assert!(
+    REDIS_SLOW_SYNC_INTERVAL
+        .as_secs()
+        .is_multiple_of(REDIS_SYNC_INTERVAL.as_secs()),
+    "the slow sync period must be a whole number of sync ticks"
+);
+
+/// Which reads one `sync_from_redis` tick makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncScope {
+    /// Hard limits, budgets, heartbeats and transport errors.
+    Fast,
+    /// `Fast` plus every account's rate info and routing weight.
+    Full,
+}
+
+impl SyncScope {
+    /// Scope of the sync loop's `tick`th tick, counting from 0. Tick 0 is
+    /// `Full`, so a fresh instance learns the fleet's rate view at once.
+    pub(crate) fn for_tick(tick: u64) -> Self {
+        const FULL_EVERY: u64 = REDIS_SLOW_SYNC_INTERVAL.as_secs() / REDIS_SYNC_INTERVAL.as_secs();
+        if tick.is_multiple_of(FULL_EVERY) {
+            Self::Full
+        } else {
+            Self::Fast
+        }
+    }
+}
+
 /// Build the coordination Redis client and spawn its connection task WITHOUT
 /// waiting for the first connect (LAB-1639). `Err` only for an unparseable
 /// URL — an unreachable backend is not an error here.

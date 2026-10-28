@@ -1287,9 +1287,11 @@ impl AppState {
         }
     }
 
-    /// Sync shared state from Redis: hard limits + rate info.
+    /// Sync shared state from Redis. Every scope syncs hard limits, flushes
+    /// transport errors and refreshes the cluster info (budgets, heartbeats);
+    /// `SyncScope::Full` also syncs rate info and routing weights.
     /// Called periodically by background task.
-    pub(crate) async fn sync_from_redis(&self) {
+    pub(crate) async fn sync_from_redis(&self, scope: SyncScope) {
         let redis = match self.coordination_redis() {
             Some(r) => r,
             None => return,
@@ -1361,7 +1363,21 @@ impl AppState {
             }
         }
 
-        // 2. Sync rate info (MGET for all targets in one round-trip)
+        // 2. Flush this replica's transport-error deltas into the shared Redis
+        //    hash so the fleet-wide by-kind count is visible cluster-wide.
+        //    Drains the local accumulator; the cluster_info refresh below then
+        //    reads the freshly-flushed total back via HGETALL.
+        self.flush_transport_errors().await;
+
+        // 3. Refresh cluster info cache for /_stats endpoint
+        let info = self.cluster_info().await;
+        *self.lock_cluster_info_cache() = info;
+
+        if scope == SyncScope::Fast {
+            return;
+        }
+
+        // 4. Sync rate info (MGET for all targets in one round-trip)
         let rate_keys: Vec<String> = targets
             .iter()
             .map(|t| format!("alb:rate:{}", t.name))
@@ -1413,7 +1429,7 @@ impl AppState {
             }
         }
 
-        // 3. Sync precomputed routing weights (published by probing pod)
+        // 5. Sync precomputed routing weights (published by probing pod)
         let weight_keys: Vec<String> = targets
             .iter()
             .map(|t| format!("alb:weight:{}", t.name))
@@ -1435,16 +1451,6 @@ impl AppState {
                 }
             }
         }
-
-        // 4. Flush this replica's transport-error deltas into the shared Redis
-        //    hash so the fleet-wide by-kind count is visible cluster-wide.
-        //    Drains the local accumulator; the cluster_info refresh below then
-        //    reads the freshly-flushed total back via HGETALL.
-        self.flush_transport_errors().await;
-
-        // 5. Refresh cluster info cache for /_stats endpoint
-        let info = self.cluster_info().await;
-        *self.lock_cluster_info_cache() = info;
     }
 
     /// Lock the transport-error accumulator via `lock_recovering`. Every

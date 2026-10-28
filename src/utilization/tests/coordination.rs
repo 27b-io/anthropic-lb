@@ -50,3 +50,24 @@ fn start_coordination_redis_rejects_numeric_password_prefix_mis_route() {
         "a numeric password-prefix must not silently mis-route to the wrong host"
     );
 }
+
+// Rate info and routing weights are read once per slow period, everything
+// else every tick. Tick 0 is a full sync, so a fresh instance starts with the
+// fleet's rate view rather than its own empty one. The real-Redis
+// `sync_from_redis_fast_tick_skips_rate_and_weight_reads` pins what each
+// scope reads.
+#[test]
+fn sync_scope_reads_rate_and_weights_once_per_slow_period() {
+    assert!(
+        (30..=60).contains(&REDIS_SLOW_SYNC_INTERVAL.as_secs()),
+        "the slow period trades sync bytes against how stale the other instances' rate view gets"
+    );
+    let ticks_per_period = REDIS_SLOW_SYNC_INTERVAL.as_secs() / REDIS_SYNC_INTERVAL.as_secs();
+    for period in 0..3 {
+        let first = period * ticks_per_period;
+        assert_eq!(SyncScope::for_tick(first), SyncScope::Full, "tick {first}");
+        for tick in first + 1..first + ticks_per_period {
+            assert_eq!(SyncScope::for_tick(tick), SyncScope::Fast, "tick {tick}");
+        }
+    }
+}

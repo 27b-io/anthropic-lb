@@ -1392,7 +1392,7 @@ redis_url = "redis://redis.example.com:6379"
 |:--------------|:----------|:------------|
 | **Budget counters** | Atomic `INCRBY` per request | Immediate |
 | **Hard limits (429)** | `SETEX` on mark + background sync | Immediate local, ~5s cross-replica |
-| **Rate info** | JSON blob per account | ~5s (background sync) |
+| **Rate info** | JSON blob per account | Immediate local, ~30s cross-replica |
 | **Replica heartbeats** | `SET EX 30` per instance | ~5s |
 
 **Fail-open**: All Redis *operations* degrade gracefully. If a syntactically valid `redis_url` is unreachable, each replica falls back to local-only state and reconnects in the background. No request is ever blocked by a Redis error. A `redis_url` that fails to *parse* (e.g. a rotated password containing an unescaped `/`, `?`, or `#`) is a config error, not a connectivity one — it fails startup outright rather than silently running without the shared state an operator asked for.

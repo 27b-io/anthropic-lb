@@ -62,6 +62,7 @@ mod redis_integration {
         PassthroughNoHardMark = 19,
         PassthroughNotSynced = 20,
         ClusterBudgetGaugeAfterSwap = 21,
+        FastTickSkipsSlowReads = 22,
     }
 
     impl Db {
@@ -505,7 +506,7 @@ mod redis_integration {
             .await
             .unwrap();
 
-        state.sync_from_redis().await;
+        state.sync_from_redis(SyncScope::Full).await;
 
         let after = Instant::now();
         let until = state.endpoints[0]
@@ -603,7 +604,7 @@ mod redis_integration {
         let _: () = conn.set("alb:rate:ri-remote-newer", newer).await.unwrap();
         let _: () = conn.set("alb:rate:ri-remote-older", older).await.unwrap();
 
-        state.sync_from_redis().await;
+        state.sync_from_redis(SyncScope::Full).await;
 
         {
             let info = state.endpoints[0].rate_info.read().await;
@@ -659,7 +660,7 @@ mod redis_integration {
             .await
             .unwrap();
 
-        state.sync_from_redis().await;
+        state.sync_from_redis(SyncScope::Full).await;
 
         let read = |a: &AtomicU64| f64::from_bits(a.load(Ordering::Relaxed));
         assert_eq!(read(&state.endpoints[0].last_routing_weight), 0.5);
@@ -878,7 +879,7 @@ mod redis_integration {
             "a fresh replica starts with an empty mirror"
         );
 
-        state.sync_from_redis().await;
+        state.sync_from_redis(SyncScope::Full).await;
 
         assert_eq!(
             state.budget_usage.lock().unwrap().get("seed-cli").copied(),
@@ -928,7 +929,7 @@ mod redis_integration {
         // AC2: a counter that fell BEHIND the mirror (an INCRBY lost while
         // Redis was away) must not lower the enforcement floor.
         let _: () = conn.set(&key, 1_000u64).await.unwrap();
-        state.sync_from_redis().await;
+        state.sync_from_redis(SyncScope::Full).await;
         assert_eq!(
             state.budget_usage.lock().unwrap().get("seed-cli").copied(),
             Some((today, 1_516_491)),
@@ -1634,7 +1635,7 @@ mod redis_integration {
         // without hanging. (Their redis writes are fire-and-forget
         // tokio::spawn tasks whose failures are swallowed by design — this
         // asserts the synchronous paths, not the spawned writes.)
-        state.sync_from_redis().await;
+        state.sync_from_redis(SyncScope::Full).await;
         state.publish_routing_weights().await;
         state.signal_hard_limit_recovery("degrade-ep").await;
 
@@ -1838,7 +1839,7 @@ mod redis_integration {
         state
             .record_budget_usage(&state.caller("startup-cli"), 50)
             .await;
-        state.sync_from_redis().await;
+        state.sync_from_redis(SyncScope::Full).await;
         state.publish_routing_weights().await;
         assert!(
             state.cluster_info().await.is_none(),
@@ -1989,7 +1990,7 @@ mod redis_integration {
                 .unwrap();
         }
 
-        state.sync_from_redis().await;
+        state.sync_from_redis(SyncScope::Full).await;
 
         let pooled = state.endpoints[1].rate_info.read().await;
         assert!(pooled.hard_limited_until.is_some());
@@ -2005,5 +2006,74 @@ mod redis_integration {
             (None, None),
             "a synced rate view must not pin a passthrough endpoint"
         );
+    }
+
+    /// A fast tick syncs hard limits, budgets and cluster info but reads no
+    /// rate info or routing weights; the next full tick reads those too.
+    /// Pairs with the pure `sync_scope_reads_rate_and_weights_once_per_slow_period`.
+    #[tokio::test]
+    async fn sync_from_redis_fast_tick_skips_rate_and_weight_reads() {
+        let Some((mut conn, fred)) = redis_test_conn(Db::FastTickSkipsSlowReads).await else {
+            return;
+        };
+        avoid_utc_midnight().await;
+        let now_epoch = AppState::now_epoch();
+        let today = now_epoch / 86400;
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("scope-cli".to_string(), 2_000_000u64)].into())
+                .install(AppState {
+                    endpoints: vec![make_endpoint("scope-ep", Protocol::Anthropic)],
+                    redis: Some(fred),
+                    ..test_state_base()
+                }),
+        );
+        let rate = serde_json::to_string(&remote_rate_info(now_epoch, 0.9)).unwrap();
+        let _: () = conn
+            .set("alb:hard:scope-ep", now_epoch + 600)
+            .await
+            .unwrap();
+        let _: () = conn.set("alb:rate:scope-ep", rate).await.unwrap();
+        let _: () = conn
+            .set("alb:weight:scope-ep", "0.5,0.25,0.9")
+            .await
+            .unwrap();
+        let _: () = conn
+            .set(format!("alb:budget:scope-cli:{today}"), 1_234u64)
+            .await
+            .unwrap();
+        let ep = &state.endpoints[0];
+        let weight = || f64::from_bits(ep.last_routing_weight.load(Ordering::Relaxed));
+
+        state.sync_from_redis(SyncScope::Fast).await;
+
+        assert!(
+            ep.rate_info.read().await.hard_limited_until.is_some(),
+            "a fast tick must sync hard limits"
+        );
+        assert_eq!(
+            state.budget_usage.lock().unwrap().get("scope-cli").copied(),
+            Some((today, 1_234)),
+            "a fast tick must sync budgets"
+        );
+        assert!(
+            state.cluster_info_cache.lock().unwrap().is_some(),
+            "a fast tick must refresh cluster info"
+        );
+        assert_eq!(
+            ep.rate_info.read().await.utilization,
+            None,
+            "a fast tick must not read rate info"
+        );
+        assert_eq!(weight(), 0.0, "a fast tick must not read routing weights");
+
+        state.sync_from_redis(SyncScope::Full).await;
+
+        assert_eq!(
+            ep.rate_info.read().await.utilization,
+            Some(0.9),
+            "a full tick must read rate info"
+        );
+        assert_eq!(weight(), 0.5, "a full tick must read routing weights");
     }
 }
