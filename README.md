@@ -1472,7 +1472,10 @@ not replayed — they described the original exchange.
 
 **Fail-open:** a slow, dead, or misconfigured cache backend never blocks a
 request. Every cache operation is bounded by `op_timeout_ms`; on any error the
-request proceeds upstream exactly as if the cache did not exist. Hit / miss /
+request proceeds upstream exactly as if the cache did not exist. With
+`backend = "redis"`, a connection dropped mid-run reconnects on its own (backoff
+up to 30 s), but if Redis is unreachable when the process starts, every cache
+operation fails open until the next restart. Hit / miss /
 store / error counters are exposed on `/metrics`, one series per endpoint
 (`anthropic_response_cache_*_total{surface="messages"}` and
 `{surface="count_tokens"}`).

@@ -583,10 +583,11 @@ async fn response_cache_pre_upgrade_entry_reads_as_miss() {
         .insert(format!("alb-resp:{key}"), ciphertext);
 
     let rc = test_response_cache(backend, &["geo"], 500);
-    assert!(rc
-        .lookup("geo", &key, CacheSurface::Messages)
-        .await
-        .is_none());
+    assert!(
+        rc.lookup("geo", &key, CacheSurface::Messages)
+            .await
+            .is_none()
+    );
     assert_eq!(rc.misses.load(Ordering::Relaxed), 1);
     assert_eq!(
         rc.errors.load(Ordering::Relaxed),

@@ -48,7 +48,7 @@ impl CacheSurface {
 /// collision could not decrypt another client's entry. The map doubles as
 /// the opt-in allow-list: no entry, no cache (AC2). All values are
 /// encrypted before any storage layer sees them, in-process L1 included
-/// (verified against cachekit-rs 0.11.1 `SecureCache::set_with_ttl`, which
+/// (verified against cachekit-rs 0.13.1 `SecureCache::set_with_ttl`, which
 /// writes ciphertext to both L1 and the backend).
 pub(crate) struct ResponseCache {
     pub(crate) clients: HashMap<String, cachekit::CacheKit>,
@@ -192,16 +192,19 @@ impl ResponseCache {
                     .redis_url
                     .as_deref()
                     .ok_or("response_cache.redis_url is required for backend = \"redis\"")?;
+                // auto_reconnect: after a Redis outage the connection comes
+                // back on its own (backoff 100 ms → 30 s, cachekit's fixed
+                // policy); until then every op fails open within op_timeout.
                 let b = cachekit::backend::redis::RedisBackend::builder()
                     .url(url)
+                    .auto_reconnect()
                     .build()
                     .map_err(|e| format!("response_cache redis backend: {e}"))?;
                 // fred's connection task detaches when the handle drops.
-                // KNOWN LIMITATION (cachekit-rs 0.11.1, flagged upstream):
-                // auto-reconnect is pub(crate) and unreachable from this
-                // builder, so after a failed initial connect OR any later
-                // Redis outage the client does NOT recover — every cache op
-                // errors (fail-open, bounded by op_timeout per op) until the
+                // KNOWN LIMITATION (cachekit-rs 0.13.1): the reconnect policy
+                // covers only a connection that was once established. The
+                // builder keeps fred's fail_fast on, so a failed INITIAL
+                // connect leaves every cache op erroring (fail-open) until the
                 // process restarts. Watch anthropic_response_cache_errors_total.
                 match b.connect().await {
                     Ok(_handle) => info!("response cache redis backend connected"),
@@ -326,7 +329,7 @@ impl ResponseCache {
     /// Read an entry. Every failure mode — no encryption handle, backend
     /// error, decrypt error, timeout — degrades to `None` and the request
     /// proceeds upstream (AC10). Diagnostics carry the key digest only,
-    /// never content (AC5). cachekit-rs (>= 0.10) holds a per-key lock across
+    /// never content (AC5). cachekit-rs (after 0.5) holds a per-key lock across
     /// the backend read, so concurrent lookups of one key queue behind each
     /// other, and any still queued at `op_timeout` count as errors.
     pub(crate) async fn lookup(
