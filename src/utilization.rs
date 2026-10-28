@@ -166,15 +166,31 @@ pub(crate) enum SyncScope {
     Full,
 }
 
-impl SyncScope {
-    /// Scope of the sync loop's `tick`th tick, counting from 0. Tick 0 is
-    /// `Full`, so a fresh instance learns the fleet's rate view at once.
-    pub(crate) fn for_tick(tick: u64) -> Self {
+/// Picks each sync tick's scope. The first tick and every
+/// `REDIS_SLOW_SYNC_INTERVAL / REDIS_SYNC_INTERVAL`th after it are `Full`, and
+/// a full tick stays due until its rate-info read lands. So an instance that
+/// starts before Redis answers pulls the fleet's rate view on its first tick
+/// that reaches Redis, not a slow period later.
+#[derive(Debug, Default)]
+pub(crate) struct SyncCadence {
+    tick: u64,
+}
+
+impl SyncCadence {
+    pub(crate) fn scope(&self) -> SyncScope {
         const FULL_EVERY: u64 = REDIS_SLOW_SYNC_INTERVAL.as_secs() / REDIS_SYNC_INTERVAL.as_secs();
-        if tick.is_multiple_of(FULL_EVERY) {
-            Self::Full
+        if self.tick.is_multiple_of(FULL_EVERY) {
+            SyncScope::Full
         } else {
-            Self::Fast
+            SyncScope::Fast
+        }
+    }
+
+    /// Record the tick just run; `rate_synced` is what `sync_from_redis`
+    /// returned for it.
+    pub(crate) fn advance(&mut self, rate_synced: bool) {
+        if self.scope() == SyncScope::Fast || rate_synced {
+            self.tick = self.tick.wrapping_add(1);
         }
     }
 }

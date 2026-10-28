@@ -914,15 +914,15 @@ async fn main() {
                 rate_interval_secs = REDIS_SLOW_SYNC_INTERVAL.as_secs(),
                 "starting redis state sync"
             );
-            let mut tick: u64 = 0;
+            let mut cadence = SyncCadence::default();
             loop {
-                sync_state.sync_from_redis(SyncScope::for_tick(tick)).await;
+                let rate_synced = sync_state.sync_from_redis(cadence.scope()).await;
+                cadence.advance(rate_synced);
                 // Heartbeat: register this instance
                 if let Some(redis) = sync_state.coordination_redis() {
                     let key = format!("alb:heartbeat:{instance_id}");
                     let _ = redis_set_ex(redis, &key, AppState::now_epoch().to_string(), 30).await;
                 }
-                tick = tick.wrapping_add(1);
                 tokio::time::sleep(REDIS_SYNC_INTERVAL).await;
             }
         });

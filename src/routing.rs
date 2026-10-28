@@ -1290,11 +1290,12 @@ impl AppState {
     /// Sync shared state from Redis. Every scope syncs hard limits, flushes
     /// transport errors and refreshes the cluster info (budgets, heartbeats);
     /// `SyncScope::Full` also syncs rate info and routing weights.
-    /// Called periodically by background task.
-    pub(crate) async fn sync_from_redis(&self, scope: SyncScope) {
+    /// Called periodically by background task. Returns whether the rate-info
+    /// read ran and succeeded, which only a `Full` tick attempts.
+    pub(crate) async fn sync_from_redis(&self, scope: SyncScope) -> bool {
         let redis = match self.coordination_redis() {
             Some(r) => r,
-            None => return,
+            None => return false,
         };
         let now_epoch = Self::now_epoch();
         let now_instant = Instant::now();
@@ -1374,7 +1375,7 @@ impl AppState {
         *self.lock_cluster_info_cache() = info;
 
         if scope == SyncScope::Fast {
-            return;
+            return false;
         }
 
         // 4. Sync rate info (MGET for all targets in one round-trip)
@@ -1383,7 +1384,9 @@ impl AppState {
             .map(|t| format!("alb:rate:{}", t.name))
             .collect();
 
-        if let Ok(values) = redis.mget::<Vec<Option<String>>, _>(rate_keys).await {
+        let rate_reply = redis.mget::<Vec<Option<String>>, _>(rate_keys).await;
+        let rate_synced = rate_reply.is_ok();
+        if let Ok(values) = rate_reply {
             for (i, val) in values.iter().enumerate() {
                 if let Some(json) = val {
                     if let Ok(remote) = serde_json::from_str::<RedisRateInfo>(json) {
@@ -1451,6 +1454,7 @@ impl AppState {
                 }
             }
         }
+        rate_synced
     }
 
     /// Lock the transport-error accumulator via `lock_recovering`. Every

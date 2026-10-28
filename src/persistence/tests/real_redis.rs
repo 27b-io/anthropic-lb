@@ -1634,8 +1634,12 @@ mod redis_integration {
         // The periodic sync tick and the publish wrappers must return
         // without hanging. (Their redis writes are fire-and-forget
         // tokio::spawn tasks whose failures are swallowed by design — this
-        // asserts the synchronous paths, not the spawned writes.)
-        state.sync_from_redis(SyncScope::Full).await;
+        // asserts the synchronous paths, not the spawned writes.) The failed
+        // rate read keeps the full tick due (`SyncCadence`).
+        assert!(
+            !state.sync_from_redis(SyncScope::Full).await,
+            "a full tick against a dead backend must not report its rate read as landed"
+        );
         state.publish_routing_weights().await;
         state.signal_hard_limit_recovery("degrade-ep").await;
 
@@ -1839,7 +1843,11 @@ mod redis_integration {
         state
             .record_budget_usage(&state.caller("startup-cli"), 50)
             .await;
-        state.sync_from_redis(SyncScope::Full).await;
+        // Skipped, so the first full tick stays due until Redis answers.
+        assert!(
+            !state.sync_from_redis(SyncScope::Full).await,
+            "a full tick skipped before the first connect must not report its rate read as landed"
+        );
         state.publish_routing_weights().await;
         assert!(
             state.cluster_info().await.is_none(),
@@ -2008,9 +2016,21 @@ mod redis_integration {
         );
     }
 
-    /// A fast tick syncs hard limits, budgets and cluster info but reads no
-    /// rate info or routing weights; the next full tick reads those too.
-    /// Pairs with the pure `sync_scope_reads_rate_and_weights_once_per_slow_period`.
+    /// Whole seconds since `key` was last read or written (`OBJECT IDLETIME`).
+    /// The query itself is not an access, so it shows whether a sync read a key
+    /// even when the read's result was thrown away.
+    async fn idle_secs(conn: &mut redis::aio::ConnectionManager, key: &str) -> u64 {
+        redis::cmd("OBJECT")
+            .arg("IDLETIME")
+            .arg(key)
+            .query_async(conn)
+            .await
+            .unwrap()
+    }
+
+    /// A fast tick reads hard limits and budgets and refreshes cluster info,
+    /// but never reads the rate-info or routing-weight keys; the next full
+    /// tick reads both. Pairs with the pure `sync_cadence_*` tests.
     #[tokio::test]
     async fn sync_from_redis_fast_tick_skips_rate_and_weight_reads() {
         let Some((mut conn, fred)) = redis_test_conn(Db::FastTickSkipsSlowReads).await else {
@@ -2038,15 +2058,31 @@ mod redis_integration {
             .set("alb:weight:scope-ep", "0.5,0.25,0.9")
             .await
             .unwrap();
-        let _: () = conn
-            .set(format!("alb:budget:scope-cli:{today}"), 1_234u64)
-            .await
-            .unwrap();
+        let budget_key = format!("alb:budget:scope-cli:{today}");
+        let _: () = conn.set(&budget_key, 1_234u64).await.unwrap();
         let ep = &state.endpoints[0];
         let weight = || f64::from_bits(ep.last_routing_weight.load(Ordering::Relaxed));
+        // Idle time has one-second resolution: after 3 s every seeded key
+        // reads at least 2, and a key a tick reads drops back to 0 or 1.
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
-        state.sync_from_redis(SyncScope::Fast).await;
+        assert!(
+            !state.sync_from_redis(SyncScope::Fast).await,
+            "a fast tick must not report a rate read"
+        );
 
+        for key in ["alb:hard:scope-ep", budget_key.as_str()] {
+            assert!(
+                idle_secs(&mut conn, key).await <= 1,
+                "a fast tick must read {key}"
+            );
+        }
+        for key in ["alb:rate:scope-ep", "alb:weight:scope-ep"] {
+            assert!(
+                idle_secs(&mut conn, key).await >= 2,
+                "a fast tick must not read {key}"
+            );
+        }
         assert!(
             ep.rate_info.read().await.hard_limited_until.is_some(),
             "a fast tick must sync hard limits"
@@ -2067,8 +2103,17 @@ mod redis_integration {
         );
         assert_eq!(weight(), 0.0, "a fast tick must not read routing weights");
 
-        state.sync_from_redis(SyncScope::Full).await;
+        assert!(
+            state.sync_from_redis(SyncScope::Full).await,
+            "a full tick must report its rate read"
+        );
 
+        for key in ["alb:rate:scope-ep", "alb:weight:scope-ep"] {
+            assert!(
+                idle_secs(&mut conn, key).await <= 1,
+                "a full tick must read {key}"
+            );
+        }
         assert_eq!(
             ep.rate_info.read().await.utilization,
             Some(0.9),
