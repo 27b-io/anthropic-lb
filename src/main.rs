@@ -656,8 +656,12 @@ async fn main() {
             internal_command_timeout: Duration::from_secs(5),
             ..Default::default()
         };
-        // 0 = retry forever; delays 100ms → 30s, doubling.
-        let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
+        // 0 = retry forever; delays 100ms → 5s, doubling. The cap bounds how
+        // long the LB stays local-only after the backend is reachable again:
+        // at 30s it came back 19-27s after Redis or its tunnel returned,
+        // at 5s within one cap. A reconnect attempt every 5s per replica
+        // costs the backend nothing during an outage.
+        let policy = ReconnectPolicy::new_exponential(0, 100, 5_000, 2);
         match start_coordination_redis(url.as_str(), perf, conn_config, policy) {
             Ok(client) => Some(client),
             // Log only `kind()` (a fixed enum, e.g. `Url`/`Config`) — never
@@ -671,7 +675,8 @@ async fn main() {
 
     // LAB-933: opt-in encrypted response cache. Invalid CONFIG fails startup
     // — an operator who configured a cache must not silently run without
-    // one. An unreachable BACKEND does not: operations fail open per-request.
+    // one. An unreachable BACKEND does not: cachekitio ops fail open
+    // per-request, and Redis unreachable at startup disables the cache.
     let response_cache = match config.response_cache {
         Some(ref cfg) => match ResponseCache::from_config(cfg).await {
             Ok(Some(rc)) => {
@@ -683,10 +688,8 @@ async fn main() {
                 );
                 Some(rc)
             }
-            Ok(None) => {
-                info!("response_cache configured with an empty client allow-list — inert");
-                None
-            }
+            // `from_config` logged why: an empty allow-list or unreachable Redis.
+            Ok(None) => None,
             Err(msg) => panic!("response_cache config error: {msg}"),
         },
         None => None,
