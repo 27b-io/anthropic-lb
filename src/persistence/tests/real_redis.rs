@@ -2238,12 +2238,13 @@ mod redis_integration {
         .await
         .expect("valid response_cache config")
         .expect("allow-list is non-empty");
+        let rc = Arc::new(rc);
         let surface = CacheSurface::Messages;
-        let entry = CachedResponse {
+        let entry = Arc::new(CachedResponse {
             status: 200,
             content_type: "application/json".to_string(),
             body: vec![7u8; 64 * 1024],
-        };
+        });
         let seq = AtomicU64::new(0);
         let fresh_key = || format!("{:064x}", seq.fetch_add(1, Ordering::Relaxed));
         let misses = || rc.misses_for(surface).load(Ordering::Relaxed);
@@ -2252,10 +2253,15 @@ mod redis_integration {
         };
 
         kill_proxy(kill).await;
+        // All at once, before any has timed out: a burst of responses landing
+        // just as Redis dies.
         let writes = 4 * AbandonGate::CAP;
+        let mut burst = tokio::task::JoinSet::new();
         for _ in 0..writes {
-            rc.store("geo", &fresh_key(), &entry, surface).await;
+            let (rc, entry, key) = (rc.clone(), entry.clone(), fresh_key());
+            burst.spawn(async move { rc.store("geo", &key, &entry, surface).await });
         }
+        burst.join_all().await;
         assert_eq!(
             rc.errors_for(surface).load(Ordering::Relaxed),
             writes,

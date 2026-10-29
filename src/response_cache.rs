@@ -72,13 +72,23 @@ pub(crate) struct ResponseCache {
 /// Bounds what a Redis outage can pile up in memory (LAB-10850). An op
 /// abandoned at `op_timeout` is still queued in fred, value included, until
 /// the connection is back: fred skips a queued command only when its OWN
-/// command timeout fired, and cachekit-rs 0.13 exposes no queue bound. So
-/// after `CAP` abandoned ops in a row the cache stops writing and lets one
-/// read through per probe interval. The first op Redis answers reopens it;
-/// fred answers in queue order, so by then everything queued before it has
-/// drained. Worst case held during an outage: about `CAP` entries plus one
-/// small GET per interval.
+/// command timeout fired, and cachekit-rs 0.13 exposes no queue bound.
+///
+/// A write reaches fred only while writes in flight plus ops abandoned since
+/// Redis last answered stay at or under `CAP`, so fred never holds more than
+/// `CAP` values. Reads carry no value; they pass until `CAP` ops are
+/// abandoned. From then on the gate is closed: no op passes, and one PING per
+/// probe interval (under `op_timeout`) checks Redis. Any answer from Redis,
+/// PING included, clears the abandoned count and reopens the gate: fred
+/// answers in queue order, so everything queued before it has drained.
+/// A lookup that times out waiting on cachekit's per-key lock counts as
+/// abandoned too, though it never reached fred: a burst of identical lookups
+/// can close the gate on a healthy Redis, until the next PING reopens it.
 pub(crate) struct AbandonGate {
+    /// The backend the probe PINGs, the same one every op goes through.
+    backend: cachekit::SharedBackend,
+    writes_in_flight: AtomicU64,
+    /// Ops abandoned since Redis last answered; fred may still hold them.
     abandoned: AtomicU64,
     /// Millis since `epoch` before which no probe may start.
     next_probe_ms: AtomicU64,
@@ -90,8 +100,10 @@ impl AbandonGate {
     pub(crate) const CAP: u64 = 16;
     pub(crate) const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
-    fn new(probe_interval: Duration) -> Self {
+    fn new(backend: cachekit::SharedBackend, probe_interval: Duration) -> Self {
         Self {
+            backend,
+            writes_in_flight: AtomicU64::new(0),
             abandoned: AtomicU64::new(0),
             next_probe_ms: AtomicU64::new(0),
             probe_interval,
@@ -99,15 +111,38 @@ impl AbandonGate {
         }
     }
 
-    /// Whether an op may reach the backend. Below `CAP` every op may; at or
-    /// above it, writes never do and one read per `probe_interval` does.
-    fn admit(&self, read: bool) -> bool {
-        if self.abandoned.load(Ordering::Relaxed) < Self::CAP {
-            return true;
+    fn is_closed(&self) -> bool {
+        self.abandoned.load(Ordering::SeqCst) >= Self::CAP
+    }
+
+    /// A slot for one backend op, or `None` if the op must fail open
+    /// without reaching fred. A closed gate first lets the op that wins the
+    /// probe slot PING Redis, and admits it if Redis answered.
+    async fn admit(&self, write: bool, op_timeout: Duration) -> Option<Slot<'_>> {
+        if self.is_closed() && self.probe_due() {
+            let ping = Slot(Some((self, false)));
+            match tokio::time::timeout(op_timeout, self.backend.health()).await {
+                Ok(Ok(_)) => ping.answered(),
+                Ok(Err(_)) => ping.finished(),
+                Err(_) => drop(ping),
+            }
         }
-        if !read {
-            return false;
+        if self.is_closed() {
+            return None;
         }
+        if !write {
+            return Some(Slot(Some((self, false))));
+        }
+        // Reserve before checking, so concurrent writes cannot all pass.
+        let in_flight = self.writes_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        if in_flight + self.abandoned.load(Ordering::SeqCst) > Self::CAP {
+            self.writes_in_flight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Slot(Some((self, true))))
+    }
+
+    fn probe_due(&self) -> bool {
         let now = self.epoch.elapsed().as_millis() as u64;
         let next = self.next_probe_ms.load(Ordering::Relaxed);
         now >= next
@@ -121,22 +156,52 @@ impl AbandonGate {
                 )
                 .is_ok()
     }
+}
 
-    fn abandoned(&self) {
-        if self.abandoned.fetch_add(1, Ordering::Relaxed) + 1 == Self::CAP {
-            warn!(
-                cap = Self::CAP,
-                probe_ms = self.probe_interval.as_millis() as u64,
-                "response cache: Redis ops keep timing out — writes paused, probing with one read per interval"
-            );
+/// One admitted backend op (`None` inside: no gate). Dropped without an
+/// outcome — timed out, or the caller's future cancelled — it counts as
+/// abandoned, since fred may still hold it.
+pub(crate) struct Slot<'a>(Option<(&'a AbandonGate, bool)>);
+
+impl Slot<'_> {
+    /// Redis answered: a miss, a completed write or a PING. A hit does not
+    /// count, as it may have come from L1.
+    fn answered(mut self) {
+        if let Some((gate, write)) = self.0.take() {
+            let was = gate.abandoned.swap(0, Ordering::SeqCst);
+            Self::release(gate, write);
+            if was >= AbandonGate::CAP {
+                info!("response cache: Redis answered again — gate reopened");
+            }
         }
     }
 
-    /// Redis answered an op: a miss or a completed write. A hit proves
-    /// nothing, as it may have come from L1.
-    fn answered(&self) {
-        if self.abandoned.swap(0, Ordering::Relaxed) >= Self::CAP {
-            info!("response cache: Redis answered again — writes resumed");
+    /// Done without showing that Redis answered: a hit or an error.
+    fn finished(mut self) {
+        if let Some((gate, write)) = self.0.take() {
+            Self::release(gate, write);
+        }
+    }
+
+    fn release(gate: &AbandonGate, write: bool) {
+        if write {
+            gate.writes_in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        if let Some((gate, write)) = self.0.take() {
+            // Count it abandoned before releasing, so the sum never dips.
+            if gate.abandoned.fetch_add(1, Ordering::SeqCst) + 1 == AbandonGate::CAP {
+                warn!(
+                    cap = AbandonGate::CAP,
+                    probe_ms = gate.probe_interval.as_millis() as u64,
+                    "response cache: Redis ops keep timing out — cache paused, PINGing Redis once per interval"
+                );
+            }
+            Self::release(gate, write);
         }
     }
 }
@@ -263,7 +328,7 @@ impl ResponseCache {
             return Ok(None);
         }
         let master_key = decode_hex_key(&cfg.master_key)?;
-        let (backend, gate): (cachekit::SharedBackend, _) = match cfg.backend.as_str() {
+        let (backend, redis): (cachekit::SharedBackend, _) = match cfg.backend.as_str() {
             "redis" => {
                 let url = cfg
                     .redis_url
@@ -275,27 +340,14 @@ impl ResponseCache {
                 // and `AbandonGate` bounds what the outage leaves queued. It
                 // also recycles a connection with a reply pending past
                 // cachekit's 5 s command timeout, far past any op_timeout.
-                let b = cachekit::backend::redis::RedisBackend::builder()
-                    .url(url)
-                    .auto_reconnect()
-                    .build()
-                    .map_err(|e| format!("response_cache redis backend: {e}"))?;
-                // fred's connection task detaches when the handle drops.
-                // KNOWN LIMITATION (cachekit-rs 0.13.1): the reconnect policy
-                // covers only a connection that was once established. The
-                // builder keeps fred's fail_fast on, so after a failed INITIAL
-                // connect nothing ever reads fred's queue: every op would sit
-                // there, value included, until the process restarts. So the
-                // cache is disabled instead, until the next restart.
-                if let Err(e) = b.connect().await {
-                    error!(error = %e, "response cache redis connect failed — cache disabled until restart (fail-open)");
-                    return Ok(None);
-                }
-                info!("response cache redis backend connected");
-                (
-                    std::sync::Arc::new(b),
-                    Some(AbandonGate::new(AbandonGate::PROBE_INTERVAL)),
-                )
+                let b = std::sync::Arc::new(
+                    cachekit::backend::redis::RedisBackend::builder()
+                        .url(url)
+                        .auto_reconnect()
+                        .build()
+                        .map_err(|e| format!("response_cache redis backend: {e}"))?,
+                );
+                (b.clone(), Some(b))
             }
             "cachekitio" => {
                 let api_key = cfg
@@ -323,14 +375,34 @@ impl ResponseCache {
                 ));
             }
         };
-        Self::from_parts(
+        // Every config check runs before the connect below, so an invalid
+        // config fails startup whether or not Redis is up.
+        let rc = Self::from_parts(
             backend,
             &cfg.clients,
             &master_key,
             Duration::from_secs(cfg.ttl_secs.unwrap_or(Self::DEFAULT_TTL_SECS)),
             Duration::from_millis(cfg.op_timeout_ms.unwrap_or(Self::DEFAULT_OP_TIMEOUT_MS)),
-        )
-        .map(|rc| Some(Self { gate, ..rc }))
+        )?;
+        let Some(redis) = redis else {
+            return Ok(Some(rc));
+        };
+        // fred's connection task detaches when the handle drops.
+        // KNOWN LIMITATION (cachekit-rs 0.13.1): the reconnect policy covers
+        // only a connection that was once established. The builder keeps
+        // fred's fail_fast on, so after a failed INITIAL connect nothing ever
+        // reads fred's queue: every op would sit there, value included, until
+        // the process restarts. So the cache is disabled instead, until the
+        // next restart.
+        if let Err(e) = redis.connect().await {
+            error!(error = %e, "response cache redis connect failed — cache disabled until restart (fail-open)");
+            return Ok(None);
+        }
+        info!("response cache redis backend connected");
+        Ok(Some(Self {
+            gate: Some(AbandonGate::new(redis, AbandonGate::PROBE_INTERVAL)),
+            ..rc
+        }))
     }
 
     /// Assemble per-client caches over a shared backend. Split out from
@@ -409,9 +481,13 @@ impl ResponseCache {
         }
     }
 
-    /// Whether a `read` or write may reach the backend; always, without a gate.
-    fn admit(&self, read: bool) -> bool {
-        self.gate.as_ref().is_none_or(|gate| gate.admit(read))
+    /// A slot for one backend op, or `None` if the gate refuses it. Without
+    /// a gate every op gets one.
+    async fn admit(&self, write: bool) -> Option<Slot<'_>> {
+        match &self.gate {
+            Some(gate) => gate.admit(write, self.op_timeout).await,
+            None => Some(Slot(None)),
+        }
     }
 
     /// Read an entry. Every failure mode — no encryption handle, backend
@@ -427,33 +503,31 @@ impl ResponseCache {
         surface: CacheSurface,
     ) -> Option<CachedResponse> {
         let cache = self.clients.get(client_id)?;
-        if !self.admit(true) {
+        let Some(slot) = self.admit(false).await else {
             // No per-op log: `AbandonGate` warned once when it closed.
             self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
             return None;
-        }
+        };
         let op = async { cache.secure_cache()?.get::<CachedResponse>(key).await };
         match tokio::time::timeout(self.op_timeout, op).await {
             Ok(Ok(Some(entry))) => {
+                slot.finished();
                 self.hits_for(surface).fetch_add(1, Ordering::Relaxed);
                 Some(entry)
             }
             Ok(Ok(None)) => {
-                if let Some(gate) = &self.gate {
-                    gate.answered();
-                }
+                slot.answered();
                 self.misses_for(surface).fetch_add(1, Ordering::Relaxed);
                 None
             }
             Ok(Err(e)) => {
+                slot.finished();
                 self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
                 warn!(key_digest = key_digest_prefix(key), error = %e, "response cache read failed — proceeding upstream");
                 None
             }
             Err(_) => {
-                if let Some(gate) = &self.gate {
-                    gate.abandoned();
-                }
+                drop(slot); // abandoned: fred may still hold the GET
                 self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
                 warn!(
                     key_digest = key_digest_prefix(key),
@@ -477,26 +551,23 @@ impl ResponseCache {
         let Some(cache) = self.clients.get(client_id) else {
             return;
         };
-        if !self.admit(false) {
+        let Some(slot) = self.admit(true).await else {
             self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
             return;
-        }
+        };
         let op = async { cache.secure_cache()?.set(key, entry).await };
         match tokio::time::timeout(self.op_timeout, op).await {
             Ok(Ok(())) => {
-                if let Some(gate) = &self.gate {
-                    gate.answered();
-                }
+                slot.answered();
                 self.stores_for(surface).fetch_add(1, Ordering::Relaxed);
             }
             Ok(Err(e)) => {
+                slot.finished();
                 self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
                 warn!(key_digest = key_digest_prefix(key), error = %e, "response cache write failed — skipped");
             }
             Err(_) => {
-                if let Some(gate) = &self.gate {
-                    gate.abandoned();
-                }
+                drop(slot); // abandoned: fred may still hold the SET and its value
                 self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
                 warn!(
                     key_digest = key_digest_prefix(key),

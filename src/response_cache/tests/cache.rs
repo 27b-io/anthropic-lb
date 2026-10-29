@@ -79,6 +79,7 @@ struct StallableBackend {
     stalled: AtomicBool,
     gets: AtomicU64,
     sets: AtomicU64,
+    pings: AtomicU64,
 }
 
 impl StallableBackend {
@@ -113,7 +114,14 @@ impl cachekit::backend::Backend for StallableBackend {
         Ok(false)
     }
     async fn health(&self) -> Result<cachekit::backend::HealthStatus, cachekit::BackendError> {
-        Err(cachekit::BackendError::timeout("stallable"))
+        self.pings.fetch_add(1, Ordering::Relaxed);
+        self.stall_if_set().await;
+        Ok(cachekit::backend::HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
+            backend_type: "stallable".to_string(),
+            details: HashMap::new(),
+        })
     }
 }
 
@@ -878,15 +886,15 @@ async fn response_cache_metrics_absent_without_config() {
 }
 
 // LAB-10850: a Redis backend parks every op abandoned at op_timeout in
-// fred's queue until the connection is back. After `CAP` abandoned ops in a
-// row, writes stop reaching it and reads probe once per interval; the first
-// answer reopens it.
+// fred's queue until the connection is back. After `CAP` abandoned ops the
+// gate closes: no op reaches the backend, and one PING per interval checks
+// Redis. A PING answer reopens it, even when every request is an L1 hit.
 #[tokio::test]
-async fn response_cache_abandon_gate_bounds_ops_during_an_outage() {
+async fn response_cache_abandon_gate_closes_and_reopens_on_ping() {
     let probe_interval = Duration::from_millis(500);
     let backend = Arc::new(StallableBackend::default());
     let mut rc = test_response_cache(backend.clone(), &["geo"], 20);
-    rc.gate = Some(AbandonGate::new(probe_interval));
+    rc.gate = Some(AbandonGate::new(backend.clone(), probe_interval));
     let surface = CacheSurface::Messages;
     let entry = CachedResponse {
         status: 200,
@@ -898,48 +906,88 @@ async fn response_cache_abandon_gate_bounds_ops_during_an_outage() {
         (
             backend.gets.load(Ordering::Relaxed),
             backend.sets.load(Ordering::Relaxed),
+            backend.pings.load(Ordering::Relaxed),
         )
     };
+    let hot = key(999);
+    rc.store("geo", &hot, &entry, surface).await;
 
     backend.stalled.store(true, Ordering::Relaxed);
-    for i in 0..AbandonGate::CAP + 10 {
+    for i in 0..AbandonGate::CAP {
         rc.store("geo", &key(i), &entry, surface).await;
     }
+    rc.store("geo", &key(100), &entry, surface).await;
+    assert!(rc.lookup("geo", &key(101), surface).await.is_none());
     assert_eq!(
         reached(),
-        (0, AbandonGate::CAP),
-        "writes past the cap never reach the backend"
+        (0, AbandonGate::CAP + 1, 1),
+        "a closed gate passes no op, and PINGs once per interval"
     );
     assert_eq!(
         rc.errors_for(surface).load(Ordering::Relaxed),
-        AbandonGate::CAP + 10,
-        "every skipped write still counts as an error"
+        AbandonGate::CAP + 2,
+        "every refused op still counts as an error"
     );
 
-    assert!(rc.lookup("geo", &key(100), surface).await.is_none());
-    assert!(rc.lookup("geo", &key(101), surface).await.is_none());
-    assert_eq!(reached().0, 1, "one probe read per interval");
     tokio::time::sleep(probe_interval).await;
-    assert!(rc.lookup("geo", &key(102), surface).await.is_none());
-    assert_eq!(reached().0, 2, "the next interval allows the next probe");
+    assert!(
+        rc.lookup("geo", &hot, surface).await.is_none(),
+        "no L1 hit is served while the gate is closed"
+    );
+    assert_eq!(reached().2, 2, "the next interval PINGs again");
 
     backend.stalled.store(false, Ordering::Relaxed);
-    rc.store("geo", &key(103), &entry, surface).await;
-    assert_eq!(reached().1, AbandonGate::CAP, "a write does not probe");
     tokio::time::sleep(probe_interval).await;
-    assert!(rc.lookup("geo", &key(104), surface).await.is_none());
-    assert_eq!(
-        rc.misses_for(surface).load(Ordering::Relaxed),
-        1,
-        "the probe is answered"
+    assert!(
+        rc.lookup("geo", &hot, surface).await.is_some(),
+        "the PING answer reopens the gate for an L1 hit"
     );
-    rc.store("geo", &key(105), &entry, surface).await;
-    assert_eq!(
-        reached(),
-        (3, AbandonGate::CAP + 1),
-        "an answer reopens writes"
+    rc.store("geo", &key(102), &entry, surface).await;
+    assert_eq!(reached(), (0, AbandonGate::CAP + 2, 3));
+    assert_eq!(rc.stores_for(surface).load(Ordering::Relaxed), 2);
+}
+
+// LAB-10850: the cap holds for writes started together, before any has
+// timed out, and a write whose caller gives up still holds its place.
+#[tokio::test]
+async fn response_cache_abandon_gate_caps_concurrent_and_cancelled_writes() {
+    let backend = Arc::new(StallableBackend::default());
+    backend.stalled.store(true, Ordering::Relaxed);
+    let mut rc = test_response_cache(backend.clone(), &["geo"], 200);
+    rc.gate = Some(AbandonGate::new(
+        backend.clone(),
+        AbandonGate::PROBE_INTERVAL,
+    ));
+    let rc = Arc::new(rc);
+    let entry = Arc::new(CachedResponse {
+        status: 200,
+        content_type: "application/json".to_string(),
+        body: b"{}".to_vec(),
+    });
+    let store = |i: u64| {
+        let (rc, entry) = (rc.clone(), entry.clone());
+        async move {
+            rc.store("geo", &format!("{i:064x}"), &entry, CacheSurface::Messages)
+                .await;
+        }
+    };
+
+    // Cancelled long before op_timeout: fred may still hold the SET.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), store(0))
+            .await
+            .is_err()
     );
-    assert_eq!(rc.stores_for(surface).load(Ordering::Relaxed), 1);
+    let mut writes = tokio::task::JoinSet::new();
+    for i in 1..=40 {
+        writes.spawn(store(i));
+    }
+    writes.join_all().await;
+    assert_eq!(
+        backend.sets.load(Ordering::Relaxed),
+        AbandonGate::CAP,
+        "the cancelled write plus concurrent ones never exceed the cap"
+    );
 }
 
 // AC11 (redis): the real fred-backed RedisBackend against a dead port at
@@ -962,6 +1010,16 @@ async fn response_cache_redis_backend_unreachable_at_startup_disables_cache() {
         .expect("from_config must not hang on a dead redis")
         .expect("dead redis must not be a config error");
     assert!(rc.is_none(), "a dead redis at startup disables the cache");
+
+    // A dead Redis must not hide a config error that a live one would raise.
+    let sentinel = ResponseCacheConfig {
+        clients: vec!["-".to_string()],
+        ..cfg
+    };
+    assert!(
+        ResponseCache::from_config(&sentinel).await.is_err(),
+        "the \"-\" client is refused even while Redis is down"
+    );
 }
 
 // AC11 (SaaS): CachekitIO backend constructs through the same config path,

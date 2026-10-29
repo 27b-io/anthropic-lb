@@ -1480,10 +1480,13 @@ request proceeds upstream exactly as if the cache did not exist. With
   until the next restart.
 - A connection dropped mid-run reconnects on its own, with backoff up to 30 s.
   The Redis driver keeps each operation that timed out queued in memory, value
-  included, and replays it once Redis is back. So after 16 timeouts in a row
-  the cache stops writing and probes with one read every 5 s, until Redis
-  answers. An outage therefore holds at most about 16 entries plus those
-  small reads.
+  included, and replays it once Redis is back. So a write is sent only while
+  writes in flight plus operations timed out since Redis last answered number
+  16 or fewer: an outage holds at most 16 written entries. Reads carry no
+  entry and are sent until 16 operations have timed out. Then the cache
+  pauses: no operation is sent, L1 hits included, and a PING checks Redis
+  every 5 s. The first answer resumes it. Operations the cache skips count as
+  errors.
 - A connection with a reply pending for more than 5 s is closed and
   re-established.
 
