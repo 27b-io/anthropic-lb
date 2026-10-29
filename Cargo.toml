@@ -1,6 +1,6 @@
 [package]
 name = "anthropic-lb"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 # Edition 2024 defaults to resolver 3, which holds dependencies back to versions
 # whose `rust-version` the declared MSRV satisfies. This crate raises its
