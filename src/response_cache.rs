@@ -88,11 +88,15 @@ pub(crate) struct ResponseCache {
 /// drained. An op abandoned later may sit behind the answered one and stays
 /// counted.
 ///
+/// That queue-order argument needs one ordered connection, so only
+/// `redis://` and `rediss://` URLs are accepted, never a cluster.
+///
 /// Cancelled requests and lookups that time out on cachekit's per-key lock
 /// count as abandoned too, though they may never have reached fred, so a
-/// healthy Redis can close the gate. The first PING is therefore sent at
-/// once, and its reply reopens the gate; only a PING that times out pushes
-/// the next one a probe interval out.
+/// healthy Redis can close the gate. A PING is therefore sent at once when
+/// the gate closes, and again at once after any answer that leaves it
+/// closed. Only a PING that times out or is refused pushes the next one a
+/// probe interval out.
 pub(crate) struct AbandonGate {
     /// The backend the probe PINGs, the same one every op goes through.
     backend: cachekit::SharedBackend,
@@ -103,7 +107,8 @@ pub(crate) struct AbandonGate {
 /// Held only for a few integer updates, never across an await.
 struct GateCounts {
     writes_in_flight: u64,
-    /// Ops abandoned since Redis last answered; fred may still hold them.
+    /// Abandoned ops not yet known drained, always the latest abandoned;
+    /// fred may still hold them.
     abandoned: u64,
     /// Every op ever abandoned. A slot records it at admission, so an answer
     /// can tell which abandonments came after its op was admitted.
@@ -212,7 +217,11 @@ impl Slot<'_> {
         // The ops still counted are always the latest ones abandoned, so
         // keeping those abandoned after this op's admission is a `min`.
         counts.abandoned = was.min(counts.abandoned_ever - held.abandoned_ever_at_admit);
-        if was >= AbandonGate::CAP && counts.abandoned < AbandonGate::CAP {
+        if counts.abandoned >= AbandonGate::CAP {
+            // Still closed by ops abandoned after this one was admitted. Redis
+            // just answered, so PING again now rather than an interval out.
+            counts.next_probe = std::time::Instant::now();
+        } else if was >= AbandonGate::CAP {
             info!("response cache: Redis answered again — gate reopened");
         }
     }
@@ -243,7 +252,7 @@ impl Drop for Slot<'_> {
             warn!(
                 cap = AbandonGate::CAP,
                 probe_ms = held.gate.probe_interval.as_millis() as u64,
-                "response cache: Redis ops keep timing out — cache paused, PINGing Redis once per interval"
+                "response cache: Redis ops keep timing out — cache paused, PINGing Redis now, then every interval while it does not answer"
             );
         }
     }
@@ -377,6 +386,13 @@ impl ResponseCache {
                     .redis_url
                     .as_deref()
                     .ok_or("response_cache.redis_url is required for backend = \"redis\"")?;
+                // `AbandonGate` relies on one connection answering in order;
+                // fred would also take a cluster URL, which does not.
+                if !(url.starts_with("redis://") || url.starts_with("rediss://")) {
+                    return Err(
+                        "response_cache.redis_url must start with redis:// or rediss://".into(),
+                    );
+                }
                 // auto_reconnect: after a Redis outage the connection comes
                 // back on its own (backoff 100 ms → 30 s, cachekit's fixed
                 // policy); until then every op fails open within op_timeout,

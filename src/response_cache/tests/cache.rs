@@ -1015,6 +1015,9 @@ async fn response_cache_abandon_gate_late_answer_keeps_newer_abandonments() {
         closed(&gate),
         "a late answer must not forget newer abandonments"
     );
+    // That answer makes the next PING due at once; hold it off to show the
+    // gate refuses ops meanwhile.
+    gate.counts().next_probe = std::time::Instant::now() + Duration::from_secs(3600);
     assert!(gate.admit(true, deadline()).await.is_none());
 
     // The PING is admitted after every abandonment, so its answer clears them.
@@ -1079,11 +1082,52 @@ async fn response_cache_abandon_gate_probe_shares_the_op_timeout() {
     let elapsed = started.elapsed();
     assert_eq!(backend.pings.load(Ordering::Relaxed), 1);
     assert_eq!(
+        gate.counts().abandoned,
+        1,
+        "the PING answered and reopened the gate; only the GET was abandoned"
+    );
+    assert_eq!(
         rc.misses_for(surface).load(Ordering::Relaxed),
         0,
         "the GET ran past the budget left after the PING ({elapsed:?})"
     );
     assert_eq!(rc.errors_for(surface).load(Ordering::Relaxed), 1);
+    assert!(
+        elapsed < budget + Duration::from_millis(30),
+        "the lookup took {elapsed:?} against a {budget:?} budget"
+    );
+}
+
+// LAB-10850: ops admitted before the gate closed and abandoned while the
+// PING is in flight keep it closed after the PONG. Redis just answered, so
+// the next PING goes at once instead of an interval out.
+#[tokio::test]
+async fn response_cache_abandon_gate_answer_while_still_closed_probes_at_once() {
+    let backend = Arc::new(StallableBackend::default());
+    let gate = AbandonGate::new(backend.clone(), AbandonGate::PROBE_INTERVAL);
+    let far = tokio::time::Instant::now() + Duration::from_secs(1);
+    let mut reads = Vec::new();
+    for _ in 0..2 * AbandonGate::CAP {
+        reads.push(
+            gate.admit(false, far)
+                .await
+                .expect("reads pass an open gate"),
+        );
+    }
+    let late = reads.split_off(AbandonGate::CAP as usize);
+    drop(reads);
+    let ping = gate.probe_slot().expect("a close PINGs at once");
+    drop(late);
+    ping.answered();
+    assert_eq!(
+        gate.counts().abandoned,
+        AbandonGate::CAP,
+        "ops abandoned after the PING's admission stay counted"
+    );
+    assert!(
+        gate.probe_slot().is_some(),
+        "an answer that leaves the gate closed makes the next PING due now"
+    );
 }
 
 // AC11 (redis): the real fred-backed RedisBackend against a dead port at
@@ -1108,6 +1152,10 @@ async fn response_cache_redis_backend_unreachable_at_startup_disables_cache() {
     assert!(rc.is_none(), "a dead redis at startup disables the cache");
 
     // A dead Redis must not hide a config error that a live one would raise.
+    let cluster = ResponseCacheConfig {
+        redis_url: Some("redis-cluster://127.0.0.1:1".to_string()),
+        ..cfg.clone()
+    };
     let sentinel = ResponseCacheConfig {
         clients: vec!["-".to_string()],
         ..cfg
@@ -1115,6 +1163,11 @@ async fn response_cache_redis_backend_unreachable_at_startup_disables_cache() {
     assert!(
         ResponseCache::from_config(&sentinel).await.is_err(),
         "the \"-\" client is refused even while Redis is down"
+    );
+    // `AbandonGate` needs one connection answering in order.
+    assert!(
+        ResponseCache::from_config(&cluster).await.is_err(),
+        "a cluster URL is refused"
     );
 }
 
