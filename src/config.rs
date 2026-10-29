@@ -255,8 +255,8 @@ pub(crate) struct ResponseCacheConfig {
     /// Cache backend: "cachekitio" (SaaS, rides the existing reqwest/rustls
     /// stack) or "redis" (local Redis/Valkey via cachekit's fred client).
     pub(crate) backend: String,
-    /// Hex-encoded master key for client-side encryption; must decode to at
-    /// least 32 bytes. Per-client keys are derived from it via HKDF-SHA256
+    /// Hex-encoded master key for client-side encryption; must decode to
+    /// exactly 32 bytes (64 hex chars, `openssl rand -hex 32`). Per-client keys are derived from it via HKDF-SHA256
     /// with the client_id as tenant, so clients are cryptographically
     /// isolated from each other (AC7), not just key-string separated.
     pub(crate) master_key: String,

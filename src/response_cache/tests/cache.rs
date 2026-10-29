@@ -72,6 +72,62 @@ impl cachekit::backend::Backend for ErroringBackend {
     }
 }
 
+/// Backend that hangs like `SlowBackend` while `stalled`, answers like an
+/// empty store otherwise, and counts the calls that reach it.
+#[derive(Default)]
+struct StallableBackend {
+    stalled: AtomicBool,
+    /// Latency of every op while not stalled.
+    delay_ms: AtomicU64,
+    gets: AtomicU64,
+    sets: AtomicU64,
+    pings: AtomicU64,
+}
+
+impl StallableBackend {
+    async fn stall_if_set(&self) {
+        if self.stalled.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(self.delay_ms.load(Ordering::Relaxed))).await;
+    }
+}
+
+#[async_trait::async_trait]
+impl cachekit::backend::Backend for StallableBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, cachekit::BackendError> {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        self.stall_if_set().await;
+        Ok(None)
+    }
+    async fn set(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), cachekit::BackendError> {
+        self.sets.fetch_add(1, Ordering::Relaxed);
+        self.stall_if_set().await;
+        Ok(())
+    }
+    async fn delete(&self, _key: &str) -> Result<bool, cachekit::BackendError> {
+        Ok(false)
+    }
+    async fn exists(&self, _key: &str) -> Result<bool, cachekit::BackendError> {
+        Ok(false)
+    }
+    async fn health(&self) -> Result<cachekit::backend::HealthStatus, cachekit::BackendError> {
+        self.pings.fetch_add(1, Ordering::Relaxed);
+        self.stall_if_set().await;
+        Ok(cachekit::backend::HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
+            backend_type: "stallable".to_string(),
+            details: HashMap::new(),
+        })
+    }
+}
+
 /// Backend where every operation hangs well past any op timeout (AC10).
 struct SlowBackend;
 
@@ -241,7 +297,14 @@ fn response_cache_key_isolates_surface() {
 
 #[test]
 fn response_cache_master_key_validation() {
-    assert!(decode_hex_key(&"ab".repeat(32)).is_ok());
+    assert_eq!(decode_hex_key(&"ab".repeat(32)).unwrap().len(), 32);
+    // cachekit-rs >= 0.9 takes exactly 32 raw bytes. Any other length must
+    // fail at config load, naming the field the operator has to fix.
+    for bytes in [31, 33] {
+        let err =
+            decode_hex_key(&"ab".repeat(bytes)).expect_err("a key that is not 32 bytes must fail");
+        assert!(err.contains("response_cache.master_key"), "got: {err}");
+    }
     assert!(decode_hex_key("deadbeef").is_err(), "short key must fail");
     assert!(
         decode_hex_key(&"a".repeat(63)).is_err(),
@@ -549,6 +612,46 @@ async fn response_cache_backend_sees_only_ciphertext() {
     );
 }
 
+// LAB-10850: cachekit-rs 0.10 binds the namespaced storage key into the
+// AES-GCM AAD, where 0.5 bound the bare key, and a 0.5 entry under the same
+// namespace fails to authenticate on every read until it expires. An entry a
+// pre-upgrade replica wrote must read as a miss, never as an error.
+#[tokio::test]
+async fn response_cache_pre_upgrade_entry_reads_as_miss() {
+    let backend = std::sync::Arc::new(RecordingBackend::default());
+    let key = "b".repeat(64);
+    let entry = CachedResponse {
+        status: 200,
+        content_type: "application/json".into(),
+        body: b"{}".to_vec(),
+    };
+    // Exactly what cachekit-rs 0.5 `SecureCache::set` stored: ciphertext
+    // whose AAD binds the bare key, under `alb-resp:<key>`.
+    let plaintext = cachekit::serializer::serialize(&entry).unwrap();
+    let ciphertext = cachekit::EncryptionLayer::new(&TEST_MASTER_KEY, "geo")
+        .unwrap()
+        .encrypt(&plaintext, &key)
+        .unwrap();
+    backend
+        .store
+        .lock()
+        .unwrap()
+        .insert(format!("alb-resp:{key}"), ciphertext);
+
+    let rc = test_response_cache(backend, &["geo"], 500);
+    assert!(
+        rc.lookup("geo", &key, CacheSurface::Messages)
+            .await
+            .is_none()
+    );
+    assert_eq!(rc.misses.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        rc.errors.load(Ordering::Relaxed),
+        0,
+        "a pre-upgrade entry must read as a miss, not an error"
+    );
+}
+
 // AC10: a dead backend degrades to normal proxying, never an error response.
 #[tokio::test]
 async fn response_cache_fails_open_on_backend_error() {
@@ -785,11 +888,209 @@ async fn response_cache_metrics_absent_without_config() {
     assert!(!text.contains("anthropic_response_cache"));
 }
 
-// AC11 (redis): the real fred-backed RedisBackend against a dead port —
-// construction succeeds (connectivity is a runtime concern), operations
-// fail open within the timeout budget.
+// LAB-10850: a Redis backend parks every op abandoned at op_timeout in
+// fred's queue until the connection is back. After `CAP` abandoned ops the
+// gate closes: no op reaches the backend, and one PING per interval checks
+// Redis. A PING answer reopens it, even when every request is an L1 hit.
 #[tokio::test]
-async fn response_cache_redis_backend_fails_open_when_down() {
+async fn response_cache_abandon_gate_closes_and_reopens_on_ping() {
+    let probe_interval = Duration::from_millis(500);
+    let backend = Arc::new(StallableBackend::default());
+    let mut rc = test_response_cache(backend.clone(), &["geo"], 20);
+    rc.gate = Some(AbandonGate::new(backend.clone(), probe_interval));
+    let surface = CacheSurface::Messages;
+    let entry = CachedResponse {
+        status: 200,
+        content_type: "application/json".to_string(),
+        body: b"{}".to_vec(),
+    };
+    let key = |i: u64| format!("{i:064x}");
+    let reached = || {
+        (
+            backend.gets.load(Ordering::Relaxed),
+            backend.sets.load(Ordering::Relaxed),
+            backend.pings.load(Ordering::Relaxed),
+        )
+    };
+    let hot = key(999);
+    rc.store("geo", &hot, &entry, surface).await;
+
+    backend.stalled.store(true, Ordering::Relaxed);
+    for i in 0..AbandonGate::CAP {
+        rc.store("geo", &key(i), &entry, surface).await;
+    }
+    rc.store("geo", &key(100), &entry, surface).await;
+    assert!(rc.lookup("geo", &key(101), surface).await.is_none());
+    assert_eq!(
+        reached(),
+        (0, AbandonGate::CAP + 1, 1),
+        "a closed gate passes no op, and PINGs once per interval"
+    );
+    assert_eq!(
+        rc.errors_for(surface).load(Ordering::Relaxed),
+        AbandonGate::CAP + 2,
+        "every refused op still counts as an error"
+    );
+
+    tokio::time::sleep(probe_interval).await;
+    assert!(
+        rc.lookup("geo", &hot, surface).await.is_none(),
+        "no L1 hit is served while the gate is closed"
+    );
+    assert_eq!(reached().2, 2, "the next interval PINGs again");
+
+    backend.stalled.store(false, Ordering::Relaxed);
+    tokio::time::sleep(probe_interval).await;
+    assert!(
+        rc.lookup("geo", &hot, surface).await.is_some(),
+        "the PING answer reopens the gate for an L1 hit"
+    );
+    rc.store("geo", &key(102), &entry, surface).await;
+    assert_eq!(reached(), (0, AbandonGate::CAP + 2, 3));
+    assert_eq!(rc.stores_for(surface).load(Ordering::Relaxed), 2);
+}
+
+// LAB-10850: the cap holds for writes started together, before any has
+// timed out, and a write whose caller gives up still holds its place.
+#[tokio::test]
+async fn response_cache_abandon_gate_caps_concurrent_and_cancelled_writes() {
+    let backend = Arc::new(StallableBackend::default());
+    backend.stalled.store(true, Ordering::Relaxed);
+    let mut rc = test_response_cache(backend.clone(), &["geo"], 200);
+    rc.gate = Some(AbandonGate::new(
+        backend.clone(),
+        AbandonGate::PROBE_INTERVAL,
+    ));
+    let rc = Arc::new(rc);
+    let entry = Arc::new(CachedResponse {
+        status: 200,
+        content_type: "application/json".to_string(),
+        body: b"{}".to_vec(),
+    });
+    let store = |i: u64| {
+        let (rc, entry) = (rc.clone(), entry.clone());
+        async move {
+            rc.store("geo", &format!("{i:064x}"), &entry, CacheSurface::Messages)
+                .await;
+        }
+    };
+
+    // Cancelled long before op_timeout: fred may still hold the SET.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), store(0))
+            .await
+            .is_err()
+    );
+    let mut writes = tokio::task::JoinSet::new();
+    for i in 1..=40 {
+        writes.spawn(store(i));
+    }
+    writes.join_all().await;
+    assert_eq!(
+        backend.sets.load(Ordering::Relaxed),
+        AbandonGate::CAP,
+        "the cancelled write plus concurrent ones never exceed the cap"
+    );
+}
+
+// LAB-10850: an answer clears only the ops abandoned before the answered op
+// was admitted. A reply that was ready before an outage but read after it
+// says nothing about the ops queued since.
+#[tokio::test]
+async fn response_cache_abandon_gate_late_answer_keeps_newer_abandonments() {
+    let backend = Arc::new(StallableBackend::default());
+    let gate = AbandonGate::new(backend.clone(), AbandonGate::PROBE_INTERVAL);
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(1);
+    let closed = |gate: &AbandonGate| gate.counts().abandoned >= AbandonGate::CAP;
+
+    let old = gate.admit(false, deadline()).await.expect("open gate");
+    for _ in 0..AbandonGate::CAP {
+        drop(gate.admit(true, deadline()).await.expect("under the cap"));
+    }
+    assert!(closed(&gate));
+    // No probe until the end: only the answers this test hands in count.
+    gate.counts().next_probe = std::time::Instant::now() + Duration::from_secs(3600);
+    old.answered();
+    assert!(
+        closed(&gate),
+        "a late answer must not forget newer abandonments"
+    );
+    assert!(gate.admit(true, deadline()).await.is_none());
+
+    // The PING is admitted after every abandonment, so its answer clears them.
+    gate.counts().next_probe = std::time::Instant::now();
+    gate.probe_slot().expect("probe due").answered();
+    assert!(!closed(&gate), "an answer to a newer op reopens the gate");
+}
+
+// LAB-10850: cancelled requests close the gate even on a healthy Redis, so
+// one tenant could pause the cache for all. Each close PINGs at once, and the
+// reply reopens the gate for the very request that sent it.
+#[tokio::test]
+async fn response_cache_abandon_gate_false_close_reopens_at_once() {
+    let backend = Arc::new(StallableBackend::default());
+    let mut rc = test_response_cache(backend.clone(), &["geo"], 100);
+    rc.gate = Some(AbandonGate::new(
+        backend.clone(),
+        AbandonGate::PROBE_INTERVAL,
+    ));
+    let gate = rc.gate.as_ref().unwrap();
+    let surface = CacheSurface::Messages;
+    let far = tokio::time::Instant::now() + Duration::from_secs(1);
+    for round in 1..=2 {
+        for _ in 0..AbandonGate::CAP {
+            // A request cancelled mid-op, on a live backend.
+            drop(gate.admit(true, far).await.expect("gate open"));
+        }
+        assert!(rc.lookup("geo", &"e".repeat(64), surface).await.is_none());
+        assert_eq!(
+            (
+                backend.pings.load(Ordering::Relaxed),
+                rc.misses_for(surface).load(Ordering::Relaxed),
+            ),
+            (round, round),
+            "close {round} PINGs at once and the lookup reaches Redis"
+        );
+    }
+}
+
+// LAB-10850: the probe runs inside the probing op's own op_timeout, so a
+// closed gate never stretches a request past it.
+#[tokio::test]
+async fn response_cache_abandon_gate_probe_shares_the_op_timeout() {
+    let budget = Duration::from_millis(100);
+    let backend = Arc::new(StallableBackend::default());
+    let mut rc = test_response_cache(backend.clone(), &["geo"], budget.as_millis() as u64);
+    rc.gate = Some(AbandonGate::new(
+        backend.clone(),
+        AbandonGate::PROBE_INTERVAL,
+    ));
+    let gate = rc.gate.as_ref().unwrap();
+    let far = tokio::time::Instant::now() + Duration::from_secs(1);
+    for _ in 0..AbandonGate::CAP {
+        drop(gate.admit(true, far).await.expect("under the cap"));
+    }
+
+    // PING and GET take 70 ms each: together they would overrun the budget.
+    backend.delay_ms.store(70, Ordering::Relaxed);
+    let surface = CacheSurface::Messages;
+    let started = std::time::Instant::now();
+    assert!(rc.lookup("geo", &"d".repeat(64), surface).await.is_none());
+    let elapsed = started.elapsed();
+    assert_eq!(backend.pings.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        rc.misses_for(surface).load(Ordering::Relaxed),
+        0,
+        "the GET ran past the budget left after the PING ({elapsed:?})"
+    );
+    assert_eq!(rc.errors_for(surface).load(Ordering::Relaxed), 1);
+}
+
+// AC11 (redis): the real fred-backed RedisBackend against a dead port at
+// startup — not a config error, but the cache is disabled, so no op queues
+// in a fred client that will never connect.
+#[tokio::test]
+async fn response_cache_redis_backend_unreachable_at_startup_disables_cache() {
     let cfg = ResponseCacheConfig {
         clients: vec!["geo".to_string()],
         backend: "redis".to_string(),
@@ -803,16 +1104,18 @@ async fn response_cache_redis_backend_fails_open_when_down() {
     let rc = tokio::time::timeout(Duration::from_secs(10), ResponseCache::from_config(&cfg))
         .await
         .expect("from_config must not hang on a dead redis")
-        .expect("dead redis must not be a config error")
-        .expect("allow-list is non-empty");
-    let started = std::time::Instant::now();
+        .expect("dead redis must not be a config error");
+    assert!(rc.is_none(), "a dead redis at startup disables the cache");
+
+    // A dead Redis must not hide a config error that a live one would raise.
+    let sentinel = ResponseCacheConfig {
+        clients: vec!["-".to_string()],
+        ..cfg
+    };
     assert!(
-        rc.lookup("geo", &"a".repeat(64), CacheSurface::Messages)
-            .await
-            .is_none()
+        ResponseCache::from_config(&sentinel).await.is_err(),
+        "the \"-\" client is refused even while Redis is down"
     );
-    assert!(started.elapsed() < Duration::from_secs(5));
-    assert!(rc.errors.load(Ordering::Relaxed) >= 1);
 }
 
 // AC11 (SaaS): CachekitIO backend constructs through the same config path,
@@ -914,6 +1217,8 @@ async fn response_cache_config_validation() {
 // AC11 (SaaS, live): full round-trip against the real api.cachekit.io.
 // Requires CACHEKIT_API_KEY with write access; deliberately #[ignore]d so CI
 // stays hermetic — run locally with `cargo test -- --ignored` to exercise.
+// CACHEKIT_API_URL (cachekit's own env name) targets another cachekit host
+// the way `response_cache.api_url` does.
 #[tokio::test]
 #[ignore = "requires CACHEKIT_API_KEY and network access to api.cachekit.io"]
 async fn response_cache_cachekitio_live_round_trip() {
@@ -921,10 +1226,11 @@ async fn response_cache_cachekitio_live_round_trip() {
         Ok(k) if !k.is_empty() => k,
         _ => panic!("set CACHEKIT_API_KEY to run this test"),
     };
-    let backend = cachekit::backend::cachekitio::CachekitIO::builder()
-        .api_key(api_key)
-        .build()
-        .unwrap();
+    let mut builder = cachekit::backend::cachekitio::CachekitIO::builder().api_key(api_key);
+    if let Ok(url) = std::env::var("CACHEKIT_API_URL") {
+        builder = builder.api_url(url).allow_custom_host(true);
+    }
+    let backend = builder.build().unwrap();
     let rc = test_response_cache(std::sync::Arc::new(backend), &["live-test"], 5_000);
     let key = response_cache_key(
         "live",
